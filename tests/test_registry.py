@@ -88,3 +88,16 @@ def test_target_id_requires_non_empty_string_and_probe_cannot_validate_backwards
     reg.create_draft(item); reg.validate("one-way", "v1"); reg.probe("one-way", "v1")
     with pytest.raises(ValueError, match="state"):
         reg.validate("one-way", "v1")
+
+
+def test_malformed_probe_result_is_explicit_failure_and_audit_sink_is_non_blocking():
+    class Malformed(FakeAdapter):
+        def probe(self, mapping):
+            return None
+    audits = []
+    reg = MappingRegistry(adapters={"fake": Malformed()}, audit_sink=lambda event: (_ for _ in ()).throw(RuntimeError("audit down")))
+    reg.create_draft(mv())
+    reg.validate("m", "v1")
+    with pytest.raises(ValueError, match="probe"):
+        reg.probe("m", "v1")
+    assert reg.diagnostics

@@ -46,10 +46,14 @@ class MappingRegistry:
         self._active: dict[str, tuple[str, str]] = {}
         self._history: dict[str, list[tuple[str, str]]] = {}
         self._lock = threading.RLock()
+        self.diagnostics: list[dict[str, Any]] = []
 
     def _audit(self, action: str, record: MappingRecord) -> None:
         if self.audit_sink:
-            self.audit_sink({"action": action, "mappingId": record.mapping.mappingId, "version": record.version, "commandKey": record.mapping.commandKey, "status": record.status})
+            try:
+                self.audit_sink({"action": action, "mappingId": record.mapping.mappingId, "version": record.version, "commandKey": record.mapping.commandKey, "status": record.status})
+            except Exception as exc:
+                self.diagnostics.append({"message": "audit sink failed", "error": str(exc)})
 
     def _key(self, mapping_id: str, version: str) -> tuple[str, str]:
         return mapping_id, version
@@ -146,8 +150,17 @@ class MappingRegistry:
         if adapter is None:
             result = AdapterResult(status="unavailable", error=f"no adapter for {rec.mapping.transport.value}")
         else:
-            result = adapter.probe(rec.mapping)
-        if result.status not in {"probed", "available", "succeeded", "ok"}:
+            try:
+                result = adapter.probe(rec.mapping)
+            except Exception as exc:
+                result = AdapterResult(status="failed", error=f"adapter probe failed: {exc}")
+        if not isinstance(result, AdapterResult):
+            result = AdapterResult(status="unavailable", error="adapter probe returned invalid result")
+        probe_status = getattr(result, "status", None)
+        if not isinstance(probe_status, str) or not probe_status.strip():
+            result = AdapterResult(status="unavailable", error="adapter probe returned result without status")
+            probe_status = result.status
+        if probe_status.lower() not in {"probed", "available", "succeeded", "ok"}:
             raise ValueError(result.error or "capability probe failed")
         rec = MappingRecord(rec.mapping, "probed", rec.target_id, result)
         self._records[(mapping_id, version)] = rec
