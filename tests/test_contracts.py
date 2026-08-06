@@ -11,6 +11,7 @@ from packages.control_core.models import (
     CommandStatus,
     MappingVersion,
     PlanDraft,
+    RobotState,
     TargetProfile,
     Transport,
 )
@@ -220,3 +221,22 @@ def test_capability_schema_alias_serializes_without_shadow_warning():
         safetyMode="normal",
     )
     assert snapshot.model_dump(by_alias=True)["schema"] == {"type": "object"}
+
+
+def test_domain_nested_snapshots_are_deeply_immutable():
+    request = _request(payload={"nested": {"items": [1]}})
+    with pytest.raises(TypeError):
+        request.payload["nested"]["items"].append(2)
+    definition = CommandDefinition(commandKey="x", commandVersion="1", payloadSchema={"properties": {"x": {"type": "number"}}}, transports=["fake"])
+    with pytest.raises(TypeError):
+        definition.payloadSchema["properties"]["x"]["type"] = "string"
+    receipt = CommandReceipt(commandId="x", status="succeeded", result={"items": [{"ok": True}]})
+    with pytest.raises(TypeError):
+        receipt.result["items"].append({"ok": False})
+    plan = PlanDraft(planId="p", robotId="r", steps=[{"stepId": "a", "commandKey": "a", "payload": {"x": [1]}}])
+    with pytest.raises(TypeError):
+        plan.steps[0].payload["x"].append(2)
+    state = RobotState(robotId="r", details={"nested": {"v": [1]}})
+    with pytest.raises(TypeError):
+        state.details["nested"]["v"].append(2)
+    assert isinstance(request.model_dump(mode="json")["payload"]["nested"]["items"], list)

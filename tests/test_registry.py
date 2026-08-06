@@ -1,14 +1,21 @@
 import pytest
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 
 from packages.control_core.adapters import FakeAdapter, AdapterResult, RobotAgentAdapter
-from packages.control_core.models import MappingVersion
+from packages.control_core.models import CommandDefinition, CommandRequest, MappingVersion
 from packages.control_core.registry import MappingRegistry
+from packages.control_core.runtime import ActionRuntime
 
 
 def mv(version="v1", transport="fake", key="move.forward", mapping_id="m"):
     return MappingVersion(mappingId=mapping_id, version=version, commandKey=key, transport=transport, mapping={"topic": "/move"})
+
+
+def callback_request(cid):
+    now = datetime.now(timezone.utc)
+    return CommandRequest(commandId=cid, robotId=f"robot-{cid}", source="manual", transport="fake", commandKey="move.forward", commandVersion="1", expiresAt=now + timedelta(seconds=30), idempotencyKey=f"idem-{cid}", sessionId="s", traceId=f"trace-{cid}")
 
 
 def test_mapping_lifecycle_probe_activate_and_rollback():
@@ -142,3 +149,20 @@ def test_blocking_audit_sink_does_not_hold_registry_lock_for_reads():
     start = time.monotonic(); assert reg.get("m", "v1").status == "draft"
     assert time.monotonic() - start < 0.5
     release.set(); thread.join(timeout=2); assert not thread.is_alive()
+
+
+def test_event_and_audit_callbacks_are_serialized():
+    # Runtime/registry callbacks can be non-thread-safe; only one callback may
+    # execute at a time even when operations run concurrently.
+    active = [0]; maximum = [0]; guard = threading.Lock()
+    def callback(_event):
+        with guard:
+            active[0] += 1; maximum[0] = max(maximum[0], active[0])
+        time.sleep(0.03)
+        with guard:
+            active[0] -= 1
+    runtime = ActionRuntime(adapters={"fake": FakeAdapter()}, event_sink=callback)
+    threads = [threading.Thread(target=lambda i=i: runtime.dispatch(callback_request(f"cb{i}"), CommandDefinition(commandKey="move.forward", commandVersion="1", transports=["fake"]), mv(mapping_id=f"cb-map-{i}"))) for i in range(2)]
+    for thread in threads: thread.start()
+    for thread in threads: thread.join(timeout=2)
+    assert maximum[0] == 1

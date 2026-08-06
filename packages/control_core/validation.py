@@ -24,13 +24,17 @@ class FrozenDict(dict):
     __setitem__ = __delitem__ = clear = pop = popitem = setdefault = update = __ior__ = _immutable
 
 
-class FrozenList(tuple):
-    """Tuple-backed JSON array exposing mutation names with clear errors."""
+class FrozenList(list):
+    """List-compatible JSON array that rejects all in-place mutations."""
+
+    def __init__(self, values=()):
+        super().__init__(values)
 
     def _immutable(self, *args, **kwargs):
         raise TypeError("mapping version values are immutable")
 
     append = extend = insert = pop = remove = reverse = sort = __iadd__ = __imul__ = _immutable
+    __setitem__ = __delitem__ = _immutable
 
 
 def _json_value(value: Any, *, freeze: bool = False) -> Any:
@@ -121,6 +125,12 @@ def freeze_json_object(value: Mapping[str, Any]) -> FrozenDict:
 
     if not isinstance(value, Mapping):
         raise ValueError("value must be a JSON object")
+    return _json_value(value, freeze=True)
+
+
+def freeze_json_value(value: Any) -> Any:
+    """Validate and recursively freeze any JSON-compatible value."""
+
     return _json_value(value, freeze=True)
 
 

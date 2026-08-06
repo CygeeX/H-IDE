@@ -15,6 +15,7 @@ from typing import Any, Callable, Mapping
 
 from .adapters import AdapterResult, CommandAdapter
 from .models import CommandDefinition, CommandKind, CommandReceipt, CommandRequest, CommandStatus, MappingVersion
+from .registry import validate_mapping_safety
 from .validation import utc_now, validate_command_request
 
 
@@ -62,6 +63,7 @@ class ActionRuntime:
         # A local diagnostic trail is intentionally small and dependency-free.
         self.diagnostics: list[dict[str, Any]] = []
         self._event_queue: list[dict[str, Any]] = []
+        self._event_flush_lock = threading.Lock()
 
     @staticmethod
     def _adapter_key(value: Any) -> str:
@@ -87,16 +89,27 @@ class ActionRuntime:
         self._event_queue.append(event)
 
     def _flush_events(self) -> None:
-        with self._lock:
-            events = self._event_queue
-            self._event_queue = []
-        if not self.event_sink:
+        # A callback already being flushed by another caller must not make a
+        # safety operation wait; the current flusher drains events queued while
+        # its callback was running.
+        if not self._event_flush_lock.acquire(blocking=False):
             return
-        for event in events:
-            try:
-                self.event_sink(event)
-            except Exception as exc:
-                self._warn("event sink failed", exc=exc)
+        try:
+            while True:
+                with self._lock:
+                    events = self._event_queue
+                    self._event_queue = []
+                if not self.event_sink:
+                    break
+                if not events:
+                    break
+                for event in events:
+                    try:
+                        self.event_sink(event)
+                    except Exception as exc:
+                        self._warn("event sink failed", exc=exc)
+        finally:
+            self._event_flush_lock.release()
 
     @staticmethod
     def _normalize_result(value: Any, operation: str) -> AdapterResult:
@@ -152,6 +165,13 @@ class ActionRuntime:
         if epoch is not None and self._safety_owners.get(robot_id) == (epoch, owner):
             self._safety_owners.pop(robot_id, None)
             self._safety_barriers.discard(robot_id)
+
+    def _transfer_safety_barrier(self, robot_id: str, from_owner: str, to_owner: str) -> int | None:
+        current = self._safety_owners.get(robot_id)
+        if current is None or current[1] != from_owner:
+            return None
+        self._safety_owners[robot_id] = (current[0], to_owner)
+        return current[0]
 
     def _cancel_external(self, action: _InFlight | None, command_id: str) -> str | None:
         """Call adapter cancellation outside the lock and return a warning."""
@@ -211,21 +231,35 @@ class ActionRuntime:
         self._flush_events()
         if isinstance(context, CommandReceipt):
             return context
-        adapter, motion, cancel_actions, is_safety, safety_epoch, safety_owner = context
+        adapter, motion, cancel_actions, is_safety, safety_epoch, safety_owner, pre_failure = context
         # Safety commands may displace an old lease. Its receipt is terminal
         # before any external cancellation is attempted.
+        cancel_warnings: list[str] = []
         for old_req, old_action in cancel_actions:
             warning = self._cancel_external(old_action, old_req.commandId)
             if warning:
+                cancel_warnings.append(warning)
                 with self._lock:
                     self._receipt(old_req, CommandStatus.CANCELLED, error=warning, completedAt=self.clock(), safetyStop=True, safetyWarning=warning)
-                self._flush_events()
+        self._flush_events()
+        if adapter is None:
+            with self._lock:
+                details = pre_failure or "adapter unavailable"
+                if cancel_warnings:
+                    details = f"{details}; previous cancellation failed: {'; '.join(cancel_warnings)}"
+                receipt = self._receipt(request, CommandStatus.FAILED, error=details, completedAt=self.clock(), safetyStop=is_safety, safetyWarning=(cancel_warnings[0] if cancel_warnings else None))
+                if is_safety:
+                    self._clear_safety_barrier(request.robotId, safety_owner, safety_epoch)
+            self._flush_events()
+            return receipt
         try:
             outcome = self._normalize_result(adapter.dispatch(request, mapping), "dispatch")
         except Exception as exc:
             outcome = AdapterResult(status="failed", error=f"adapter dispatch failed: {exc}")
         with self._lock:
             receipt = self._finish_dispatch(request, mapping, outcome, motion, is_safety, safety_epoch, safety_owner)
+            if cancel_warnings and is_safety:
+                receipt = self._receipt(request, CommandStatus.FAILED, error=f"previous cancellation failed: {'; '.join(cancel_warnings)}", completedAt=self.clock(), safetyStop=True, safetyWarning=cancel_warnings[0])
         self._flush_events()
         return receipt
 
@@ -248,6 +282,10 @@ class ActionRuntime:
             return self._rejected(request, mapping, "command definition mismatch")
         if mapping.commandKey != request.commandKey or mapping.transport != request.transport:
             return self._rejected(request, mapping, "mapping mismatch")
+        try:
+            validate_mapping_safety(mapping)
+        except ValueError as exc:
+            return self._rejected(request, mapping, str(exc))
         if self._adapter_key(request.transport) not in {self._adapter_key(t) for t in definition.transports}:
             return self._rejected(request, mapping, "transport is not supported by command definition")
         try:
@@ -282,6 +320,8 @@ class ActionRuntime:
         self._receipt(request, CommandStatus.ACCEPTED)
         adapter = self.adapters.get(self._adapter_key(request.transport))
         if adapter is None:
+            if is_safety and cancel_actions:
+                return (None, motion, cancel_actions, is_safety, safety_epoch, safety_owner, "adapter unavailable")
             if is_safety:
                 self._clear_safety_barrier(robot, safety_owner, safety_epoch)
             return self._receipt(request, CommandStatus.FAILED, error="adapter unavailable", completedAt=self.clock())
@@ -289,7 +329,7 @@ class ActionRuntime:
         if motion:
             self._leases[robot] = _Lease(request.commandId, min(request.expiresAt, self.clock() + lease_duration))
         self._inflight[request.commandId] = _InFlight(request, mapping, adapter, motion, definition.kind)
-        return (adapter, motion, cancel_actions, is_safety, safety_epoch, safety_owner)
+        return (adapter, motion, cancel_actions, is_safety, safety_epoch, safety_owner, None)
 
     def _finish_dispatch(self, request: CommandRequest, mapping: MappingVersion, outcome: AdapterResult, motion: bool, is_safety: bool = False, safety_epoch: int | None = None, safety_owner: str = "") -> CommandReceipt:
         current = self._receipts[request.commandId]
@@ -333,7 +373,10 @@ class ActionRuntime:
                 return current
             action = self._inflight.get(command_id)
             owner = f"cancel:{command_id}"
-            safety_epoch = self._claim_safety_barrier(request.robotId, owner)
+            if action is not None and action.kind is CommandKind.SAFETY:
+                safety_epoch = self._transfer_safety_barrier(request.robotId, f"dispatch:{command_id}", owner)
+            else:
+                safety_epoch = self._claim_safety_barrier(request.robotId, owner)
             self._release_lease(request.robotId, command_id)
             self._receipt(request, CommandStatus.CANCELLED, completedAt=self.clock(), safetyStop=True)
         self._flush_events()

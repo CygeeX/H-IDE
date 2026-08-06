@@ -13,6 +13,31 @@ from .adapters import AdapterResult, CommandAdapter
 from .models import MappingVersion, Transport
 
 
+def validate_mapping_safety(mapping: MappingVersion) -> None:
+    """Pure validation for transport/mapping values safe to dispatch."""
+    if mapping.transport not in set(Transport):
+        raise ValueError("transport is not allowlisted")
+    banned_tokens = ("script", "endpoint", "exec", "shell", "url")
+
+    def walk(value: Any) -> None:
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                raw_key = unicodedata.normalize("NFKC", str(key)).casefold()
+                if not raw_key.isascii():
+                    raise ValueError(f"mapping field {key} contains unsupported characters")
+                normalized = re.sub(r"[^a-z0-9]", "", raw_key)
+                if any(token in normalized for token in banned_tokens) or normalized in {"command", "commandline", "run"}:
+                    raise ValueError(f"mapping field {key} is not allowed")
+                walk(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                walk(item)
+        elif isinstance(value, str) and (urlparse(value).scheme in {"http", "https", "file", "ftp", "javascript", "data", "ws", "wss"} or value.startswith(("//", "\\\\")) or "://" in value):
+            raise ValueError("arbitrary URL access is not allowed")
+
+    walk(mapping.mapping)
+
+
 @dataclass(frozen=True)
 class MappingRecord:
     mapping: MappingVersion
@@ -49,21 +74,32 @@ class MappingRegistry:
         self._probing: set[tuple[str, str]] = set()
         self.diagnostics: list[dict[str, Any]] = []
         self._audit_queue: list[dict[str, Any]] = []
+        self._audit_flush_lock = threading.Lock()
 
     def _audit(self, action: str, record: MappingRecord) -> None:
         self._audit_queue.append({"action": action, "mappingId": record.mapping.mappingId, "version": record.version, "commandKey": record.mapping.commandKey, "status": record.status})
 
     def _flush_audits(self) -> None:
-        with self._lock:
-            events = self._audit_queue
-            self._audit_queue = []
-        if self.audit_sink:
-            for event in events:
-                try:
-                    self.audit_sink(event)
-                except Exception as exc:
-                    with self._lock:
-                        self.diagnostics.append({"message": "audit sink failed", "error": str(exc)})
+        if not self._audit_flush_lock.acquire(blocking=False):
+            return
+        try:
+            while True:
+                with self._lock:
+                    events = self._audit_queue
+                    self._audit_queue = []
+                if self.audit_sink:
+                    if not events:
+                        break
+                    for event in events:
+                        try:
+                            self.audit_sink(event)
+                        except Exception as exc:
+                            with self._lock:
+                                self.diagnostics.append({"message": "audit sink failed", "error": str(exc)})
+                else:
+                    break
+        finally:
+            self._audit_flush_lock.release()
 
     def _key(self, mapping_id: str, version: str) -> tuple[str, str]:
         return mapping_id, version
@@ -104,27 +140,7 @@ class MappingRegistry:
         except KeyError as exc:
             raise ValueError("mapping version not found") from exc
 
-    @staticmethod
-    def _static_validate(mapping: MappingVersion) -> None:
-        if mapping.transport not in set(Transport):
-            raise ValueError("transport is not allowlisted")
-        banned_tokens = ("script", "endpoint", "exec", "shell", "url")
-        def walk(value: Any) -> None:
-            if isinstance(value, Mapping):
-                for key, item in value.items():
-                    raw_key = unicodedata.normalize("NFKC", str(key)).casefold()
-                    if not raw_key.isascii():
-                        raise ValueError(f"mapping field {key} contains unsupported characters")
-                    normalized = re.sub(r"[^a-z0-9]", "", raw_key)
-                    if any(token in normalized for token in banned_tokens) or normalized in {"command", "commandline", "run"}:
-                        raise ValueError(f"mapping field {key} is not allowed")
-                    walk(item)
-            elif isinstance(value, (list, tuple)):
-                for item in value:
-                    walk(item)
-            elif isinstance(value, str) and (urlparse(value).scheme in {"http", "https", "file", "ftp", "javascript", "data", "ws", "wss"} or value.startswith(("//", "\\\\")) or "://" in value):
-                raise ValueError("arbitrary URL access is not allowed")
-        walk(mapping.mapping)
+    _static_validate = staticmethod(validate_mapping_safety)
 
     @staticmethod
     def _mapping_target(mapping: MappingVersion) -> str | None:
@@ -263,4 +279,4 @@ class MappingRegistry:
             return self._require(mapping_id, version)
 
 
-__all__ = ["MappingRecord", "MappingRegistry"]
+__all__ = ["MappingRecord", "MappingRegistry", "validate_mapping_safety"]

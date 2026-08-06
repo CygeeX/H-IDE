@@ -354,3 +354,52 @@ def test_command_kind_not_command_key_substring_controls_safety_and_motion():
     receipt = runtime.dispatch(scan, definition("nonstop.scan", CommandKind.NON_MOTION), mapping("nonstop.scan"))
     assert receipt.status.value == "running"
     assert adapter.cancellations == []
+
+
+def test_safety_adapter_unavailable_still_cancels_old_motion_and_keeps_barrier():
+    class BlockingCancel(FakeAdapter):
+        def __init__(self):
+            super().__init__(result=AdapterResult(status="running")); self.started = threading.Event(); self.release = threading.Event()
+        def cancel(self, command_id):
+            self.started.set(); self.release.wait(timeout=2); return AdapterResult(status="cancelled")
+    adapter = BlockingCancel(); runtime = ActionRuntime(adapters={"fake": adapter})
+    runtime.dispatch(request(), definition(), mapping())
+    runtime.adapters.pop("fake")
+    result = []
+    stop = threading.Thread(target=lambda: result.append(runtime.dispatch(request("stop-missing", "stop-missing", key="stop"), definition("stop", "safety"), mapping("stop"))))
+    stop.start(); assert adapter.started.wait(timeout=1)
+    blocked = runtime.dispatch(request("after-missing", "after-missing"), definition(), mapping())
+    assert blocked.status.value == "rejected"
+    adapter.release.set(); stop.join(timeout=2)
+    assert not stop.is_alive() and result[0].status.value == "failed"
+
+
+def test_runtime_rejects_unsafe_mapping_without_registry():
+    adapter = FakeAdapter()
+    runtime = ActionRuntime(adapters={"fake": adapter})
+    unsafe = mapping()
+    # MappingVersion is immutable, so construct the unsafe snapshot directly.
+    unsafe = MappingVersion(mappingId="unsafe", version="v1", commandKey="move.forward", transport="fake", mapping={"scriptPath": "run.sh"})
+    receipt = runtime.dispatch(request(), definition(), unsafe)
+    assert receipt.status.value == "rejected"
+    assert "not allowed" in (receipt.error or "")
+    assert adapter.dispatches == []
+
+
+def test_cancel_running_safety_keeps_its_barrier_until_external_cancel_returns():
+    class Blocking(FakeAdapter):
+        def __init__(self):
+            super().__init__(result=AdapterResult(status="running")); self.cancel_started = threading.Event(); self.release = threading.Event(); self.dispatch_started = threading.Event()
+        def dispatch(self, req, mapping):
+            self.dispatch_started.set(); return self.result
+        def cancel(self, command_id):
+            self.cancel_started.set(); self.release.wait(timeout=2); return AdapterResult(status="cancelled")
+    adapter = Blocking(); runtime = ActionRuntime(adapters={"fake": adapter})
+    safety = request("stop-running", "stop-running", key="stop")
+    worker = threading.Thread(target=lambda: runtime.dispatch(safety, definition("stop", "safety"), mapping("stop")))
+    worker.start(); assert adapter.dispatch_started.wait(timeout=1)
+    cancel_thread = threading.Thread(target=lambda: runtime.cancel("stop-running")); cancel_thread.start(); assert adapter.cancel_started.wait(timeout=1)
+    blocked = runtime.dispatch(request("after-safety", "after-safety"), definition(), mapping())
+    assert blocked.status.value == "rejected"
+    adapter.release.set(); cancel_thread.join(timeout=2); worker.join(timeout=2)
+    assert not cancel_thread.is_alive() and not worker.is_alive()

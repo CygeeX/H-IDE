@@ -13,6 +13,7 @@ from .validation import (
     as_utc,
     ensure_acyclic_steps,
     freeze_json_object,
+    freeze_json_value,
     non_empty_id,
     require_json_schema,
     validate_expiry,
@@ -101,8 +102,9 @@ class CommandDefinition(ContractModel):
         default_factory=dict,
         alias="payload_schema",
         validation_alias=AliasChoices("payload_schema", "schema"),
+        validate_default=True,
     )
-    transports: list[Transport] = Field(default_factory=lambda: list(Transport))
+    transports: list[Transport] = Field(default_factory=lambda: list(Transport), validate_default=True)
     kind: CommandKind = CommandKind.MOTION
     description: str | None = None
 
@@ -114,14 +116,15 @@ class CommandDefinition(ContractModel):
     @field_validator("payloadSchema")
     @classmethod
     def _schema(cls, value):
-        return require_json_schema(value)
+        return freeze_json_object(require_json_schema(value))
 
     @field_validator("transports")
     @classmethod
     def _transports(cls, value):
         if not value:
             raise ValueError("at least one transport is required")
-        return list(dict.fromkeys(value))
+        from .validation import FrozenList
+        return FrozenList(dict.fromkeys(value))
 
 
 class CommandRequest(ContractModel):
@@ -131,7 +134,7 @@ class CommandRequest(ContractModel):
     transport: Transport
     commandKey: str = Field(..., alias="command_key")
     commandVersion: str = Field(..., alias="command_version")
-    payload: dict[str, Any] = Field(default_factory=dict)
+    payload: dict[str, Any] = Field(default_factory=dict, validate_default=True)
     issuedAt: datetime = Field(default_factory=utc_now, alias="issued_at")
     expiresAt: datetime = Field(..., alias="expires_at")
     idempotencyKey: str = Field(..., alias="idempotency_key")
@@ -148,6 +151,11 @@ class CommandRequest(ContractModel):
     def _timestamps(cls, value):
         return as_utc(value)
 
+    @field_validator("payload")
+    @classmethod
+    def _payload(cls, value):
+        return freeze_json_object(value)
+
     @model_validator(mode="after")
     def _lifetime(self):
         issued, expires = validate_expiry(self.issuedAt, self.expiresAt)
@@ -159,18 +167,24 @@ class CommandRequest(ContractModel):
 class PlanStep(ContractModel):
     stepId: str = Field(..., alias="step_id")
     commandKey: str = Field(..., alias="command_key")
-    payload: dict[str, Any] = Field(default_factory=dict)
-    dependsOn: list[str] = Field(default_factory=list, alias="depends_on")
+    payload: dict[str, Any] = Field(default_factory=dict, validate_default=True)
+    dependsOn: list[str] = Field(default_factory=list, alias="depends_on", validate_default=True)
 
     @field_validator("stepId", "commandKey")
     @classmethod
     def _ids(cls, value: str, info):
         return non_empty_id(value, info.field_name)
 
+    @field_validator("payload")
+    @classmethod
+    def _payload(cls, value):
+        return freeze_json_object(value)
+
     @field_validator("dependsOn")
     @classmethod
     def _dependencies(cls, value):
-        return [non_empty_id(item, "dependsOn item") for item in value]
+        from .validation import FrozenList
+        return FrozenList(non_empty_id(item, "dependsOn item") for item in value)
 
 
 class PlanDraft(ContractModel):
@@ -189,6 +203,12 @@ class PlanDraft(ContractModel):
     @classmethod
     def _timestamps(cls, value):
         return None if value is None else as_utc(value)
+
+    @field_validator("steps")
+    @classmethod
+    def _freeze_steps(cls, value):
+        from .validation import FrozenList
+        return FrozenList(value)
 
     @model_validator(mode="after")
     def _dag_and_expiry(self):
@@ -209,7 +229,7 @@ class CommandReceipt(ContractModel):
     acceptedAt: datetime = Field(default_factory=utc_now, alias="accepted_at")
     startedAt: datetime | None = Field(default=None, alias="started_at")
     completedAt: datetime | None = Field(default=None, alias="completed_at")
-    result: Any = None
+    result: Any = Field(default=None, validate_default=True)
     error: str | None = None
 
     @field_validator("commandId")
@@ -227,6 +247,11 @@ class CommandReceipt(ContractModel):
     def _timestamps(cls, value):
         return None if value is None else as_utc(value)
 
+    @field_validator("result")
+    @classmethod
+    def _result(cls, value):
+        return freeze_json_value(value)
+
 
 class RobotState(ContractModel):
     robotId: str = Field(..., alias="robot_id")
@@ -234,7 +259,7 @@ class RobotState(ContractModel):
     connected: bool = True
     lastSeenAt: datetime | None = Field(default=None, alias="last_seen_at")
     safetyMode: SafetyMode = Field(default=SafetyMode.NORMAL, alias="safety_mode")
-    details: dict[str, Any] = Field(default_factory=dict)
+    details: dict[str, Any] = Field(default_factory=dict, validate_default=True)
 
     @field_validator("robotId")
     @classmethod
@@ -246,12 +271,17 @@ class RobotState(ContractModel):
     def _timestamp(cls, value):
         return None if value is None else as_utc(value)
 
+    @field_validator("details")
+    @classmethod
+    def _details(cls, value):
+        return freeze_json_object(value)
+
 
 class CapabilitySnapshot(ContractModel):
     agent: str
     protocol: str
-    schema_: dict[str, Any] = Field(default_factory=dict, alias="schema", serialization_alias="schema")
-    capabilities: list[str] = Field(default_factory=list)
+    schema_: dict[str, Any] = Field(default_factory=dict, alias="schema", serialization_alias="schema", validate_default=True)
+    capabilities: list[str] = Field(default_factory=list, validate_default=True)
     safetyMode: SafetyMode = Field(default=SafetyMode.NORMAL, alias="safety_mode")
     robotId: str | None = Field(default=None, alias="robot_id")
 
@@ -269,12 +299,13 @@ class CapabilitySnapshot(ContractModel):
     @field_validator("schema_")
     @classmethod
     def _schema(cls, value):
-        return require_json_schema(value)
+        return freeze_json_object(require_json_schema(value))
 
     @field_validator("capabilities")
     @classmethod
     def _caps(cls, value):
-        return [non_empty_id(item, "capability") for item in value]
+        from .validation import FrozenList
+        return FrozenList(non_empty_id(item, "capability") for item in value)
 
     @field_validator("robotId")
     @classmethod
@@ -298,12 +329,17 @@ class TargetProfile(ContractModel):
         alias="lease_seconds",
         validation_alias=AliasChoices("lease_seconds", "lease"),
     )
-    metadata: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict, validate_default=True)
 
     @field_validator("targetId")
     @classmethod
     def _target_id(cls, value):
         return non_empty_id(value, "targetId")
+
+    @field_validator("metadata")
+    @classmethod
+    def _metadata(cls, value):
+        return freeze_json_object(value)
 
 
 class MappingVersion(ContractModel):
