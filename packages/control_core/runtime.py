@@ -145,6 +145,8 @@ class ActionRuntime:
         self._mappings[request.commandId] = mapping
 
         try:
+            if request.expiresAt <= self.clock():
+                return self._rejected(request, mapping, "expiresAt is in the past")
             validate_command_request(request)
         except ValueError as exc:
             return self._rejected(request, mapping, str(exc))
@@ -225,14 +227,18 @@ class ActionRuntime:
         if current.status in {CommandStatus.SUCCEEDED, CommandStatus.FAILED, CommandStatus.CANCELLED, CommandStatus.EXPIRED, CommandStatus.REJECTED}:
             return current
         adapter = self.adapters.get(self._adapter_key(request.transport))
+        if not adapter:
+            self._leases.pop(request.robotId, None)
+            return self._receipt(request, CommandStatus.FAILED, error="adapter unavailable during cancel", completedAt=self.clock(), safetyStop=True, safetyWarning="adapter unavailable during cancel")
         if adapter:
             try:
                 outcome = adapter.cancel(command_id)
             except Exception as exc:
                 outcome = AdapterResult(status="failed", error=str(exc))
-            if str(outcome.status).lower() in {"failed", "unavailable", "unknown"}:
+            status = str(getattr(outcome, "status", "")).lower()
+            if status not in {"cancelled", "canceled"}:
                 self._leases.pop(request.robotId, None)
-                message = outcome.error or "cancel failed"
+                message = getattr(outcome, "error", None) or ("cancel returned no confirmation" if not status else f"adapter returned {status} while cancelling")
                 return self._receipt(request, CommandStatus.FAILED, error=message, completedAt=self.clock(), safetyStop=True, safetyWarning=message)
         self._leases.pop(request.robotId, None)
         return self._receipt(request, CommandStatus.CANCELLED, completedAt=self.clock())

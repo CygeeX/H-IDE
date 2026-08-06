@@ -138,3 +138,30 @@ def test_cancel_unknown_result_is_not_success_and_releases_lease():
     result = runtime.cancel("c1")
     assert result.status.value == "failed"
     assert "no confirmation" in (result.error or "")
+
+
+def test_cancel_missing_or_unstructured_adapter_never_claims_cancelled():
+    adapter = FakeAdapter(result=AdapterResult(status="running"))
+    runtime = ActionRuntime(adapters={})
+    runtime.dispatch(request(), definition(), mapping())
+    missing = runtime.cancel("c1")
+    assert missing.status.value == "failed"
+
+    class EmptyCancel(FakeAdapter):
+        def cancel(self, command_id):
+            return None
+    adapter2 = EmptyCancel(result=AdapterResult(status="running"))
+    runtime2 = ActionRuntime(adapters={"fake": adapter2})
+    runtime2.dispatch(request(), definition(), mapping())
+    empty = runtime2.cancel("c1")
+    assert empty.status.value == "failed"
+
+
+def test_runtime_uses_injected_clock_for_expiry():
+    now = [datetime.now(timezone.utc)]
+    runtime = ActionRuntime(adapters={"fake": FakeAdapter()}, clock=lambda: now[0])
+    req = request()
+    now[0] += timedelta(minutes=1)
+    receipt = runtime.dispatch(req, definition(), mapping())
+    assert receipt.status.value == "rejected"
+    assert "expiresAt" in (receipt.error or "")

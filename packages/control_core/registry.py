@@ -59,7 +59,7 @@ class MappingRegistry:
             return self._create_draft(mapping, target_id)
 
     def _create_draft(self, mapping: MappingVersion, target_id: str | None = None) -> MappingRecord:
-        if target_id is not None and not str(target_id).strip():
+        if target_id is not None and (not isinstance(target_id, str) or not target_id.strip()):
             raise ValueError("target_id must be non-empty")
         if target_id is not None and self.allowed_targets is not None and target_id not in self.allowed_targets:
             raise ValueError("target is not allowlisted")
@@ -126,7 +126,7 @@ class MappingRegistry:
 
     def _validate(self, mapping_id: str, version: str) -> MappingRecord:
         rec = self._require(mapping_id, version)
-        if rec.status not in {"draft", "validated", "probed"}:
+        if rec.status not in {"draft", "validated"}:
             raise ValueError("invalid mapping state for validation")
         self._static_validate(rec.mapping)
         rec = MappingRecord(rec.mapping, "validated", rec.target_id, rec.probe)

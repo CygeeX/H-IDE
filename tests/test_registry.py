@@ -78,3 +78,13 @@ def test_allowed_targets_are_defensively_copied_and_unicode_confusables_rejected
         bad = MappingVersion(mappingId=key, version="v1", commandKey="move.forward", transport="fake", mapping={key: "x", "targetId": "r1"})
         with pytest.raises(ValueError):
             reg.create_draft(bad)
+
+
+def test_target_id_requires_non_empty_string_and_probe_cannot_validate_backwards():
+    reg = MappingRegistry(adapters={"fake": FakeAdapter()})
+    with pytest.raises(ValueError, match="target_id"):
+        reg.create_draft(mv(mapping_id="num-target"), target_id=123)
+    item = mv(mapping_id="one-way")
+    reg.create_draft(item); reg.validate("one-way", "v1"); reg.probe("one-way", "v1")
+    with pytest.raises(ValueError, match="state"):
+        reg.validate("one-way", "v1")
