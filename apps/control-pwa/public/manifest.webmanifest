@@ -1,0 +1,11 @@
+{
+  "name": "Robot Action Console",
+  "short_name": "Action Console",
+  "description": "工作站机器人行动控制台",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#080e19",
+  "theme_color": "#0b1220",
+  "lang": "zh-CN",
+  "icons": []
+}
