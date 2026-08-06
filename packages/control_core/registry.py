@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import contextmanager
 import re
 import threading
 import unicodedata
@@ -119,10 +120,15 @@ class MappingRegistry:
         self._audit_queue: list[dict[str, Any]] = []
         self._audit_flush_lock = threading.Lock()
         self._audit_worker_pending = False
+        # API lifecycle routes can stage audit records until their SQLite
+        # mapping transaction commits.  While deferred, no background worker
+        # may observe the temporary sink and publish a false transition.
+        self._audit_deferred = False
+        self._deferred_events: list[dict[str, Any]] | None = None
 
     def _audit(self, action: str, record: MappingRecord) -> None:
         self._audit_queue.append({"action": action, "mappingId": record.mapping.mappingId, "version": record.version, "commandKey": record.mapping.commandKey, "status": record.status})
-        if self.audit_sink and not self._audit_worker_pending and self._audit_flush_lock.locked():
+        if self.audit_sink and not self._audit_deferred and not self._audit_worker_pending and self._audit_flush_lock.locked():
             self._audit_worker_pending = True
             threading.Thread(target=self._audit_worker, daemon=True).start()
 
@@ -161,6 +167,9 @@ class MappingRegistry:
                 return
 
     def _flush_audits(self) -> None:
+        if self._audit_deferred:
+            self.drain_deferred_audits()
+            return
         if not self._audit_flush_lock.acquire(blocking=False):
             self._schedule_audit_worker()
             return
@@ -177,6 +186,61 @@ class MappingRegistry:
                     break
         finally:
             self._audit_flush_lock.release()
+
+    def drain_deferred_audits(self) -> None:
+        """Move queued events into the active deferred transaction list."""
+        with self._lock:
+            if not self._audit_deferred or self._deferred_events is None:
+                return
+            if self._audit_queue:
+                self._deferred_events.extend(self._audit_queue)
+                self._audit_queue = []
+
+    @contextmanager
+    def defer_audits(self):
+        """Stage registry audit events until the caller's durable commit.
+
+        The flush lock is held while the sink is replaced, which first waits
+        for any already-running worker.  ``_audit_deferred`` prevents a
+        registry operation from starting another worker while the temporary
+        sink is installed.  All queued events are returned to the caller and
+        are therefore either committed with the mapping transaction or
+        discarded together with the in-memory snapshot.
+        """
+        events: list[dict[str, Any]] = []
+        self._audit_flush_lock.acquire()
+        previous_sink: Callable[[dict[str, Any]], None] | None = None
+        previous_deferred = False
+        previous_events: list[dict[str, Any]] | None = None
+        try:
+            with self._lock:
+                previous_sink = self.audit_sink
+                previous_deferred = self._audit_deferred
+                previous_events = self._deferred_events
+                pending = self._audit_queue
+                self._audit_queue = []
+                self._audit_deferred = True
+                self._deferred_events = events
+                self.audit_sink = events.append
+            # Events queued before this transaction belong to the previous
+            # operation; deliver them before changing the sink's ownership.
+            if pending and previous_sink is not None:
+                self._deliver_audits(pending)
+            elif pending:
+                events.extend(pending)
+            yield events
+        finally:
+            with self._lock:
+                pending = self._audit_queue
+                self._audit_queue = []
+            events.extend(pending)
+            with self._lock:
+                self.audit_sink = previous_sink
+                self._audit_deferred = previous_deferred
+                self._deferred_events = previous_events
+            self._audit_flush_lock.release()
+            if not previous_deferred:
+                self._schedule_audit_worker()
 
     def _key(self, mapping_id: str, version: str) -> tuple[str, str]:
         return mapping_id, version

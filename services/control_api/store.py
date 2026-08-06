@@ -14,7 +14,7 @@ import json
 from pathlib import Path
 import sqlite3
 import threading
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 from pydantic import BaseModel
 
@@ -34,6 +34,41 @@ class CommandClaim:
     owned: bool
     conflict: bool
     record: dict[str, Any] | None
+
+
+class MappingPointerConflict(ValueError):
+    """The durable active pointer changed since a lifecycle operation began."""
+
+    def __init__(
+        self,
+        command_key: str,
+        expected: tuple[str, str] | None,
+        actual: tuple[str, str] | None,
+    ) -> None:
+        self.command_key = command_key
+        self.expected = expected
+        self.actual = actual
+        super().__init__(
+            f"active mapping pointer changed for {command_key}: "
+            f"expected {expected!r}, found {actual!r}"
+        )
+
+
+class MappingStateConflict(ValueError):
+    """A stale snapshot attempted to overwrite a newer mapping row."""
+
+    def __init__(self, mapping_id: str, version: str, existing: str, incoming: str) -> None:
+        self.mapping_id = mapping_id
+        self.version = version
+        self.existing = existing
+        self.incoming = incoming
+        super().__init__(
+            f"mapping {mapping_id}/{version} changed concurrently "
+            f"(stored={existing}, incoming={incoming})"
+        )
+
+
+_MAPPING_POINTER_UNSET = object()
 
 
 def _jsonable(value: Any) -> Any:
@@ -499,13 +534,139 @@ class SQLiteStore:
     def save_mapping(self, record: MappingRecord) -> None:
         self.save_mapping_batch([record], active=record.mapping if record.status == "active" else None)
 
-    def save_mapping_batch(self, records: list[MappingRecord] | tuple[MappingRecord, ...], *, active: Any = None) -> None:
-        """Persist mapping snapshots and the active pointer in one transaction."""
+    @staticmethod
+    def _pointer_value(value: Any) -> tuple[str, str] | None:
+        """Normalize a mapping/version pointer supplied by an API caller."""
+        if value is None:
+            return None
+        if isinstance(value, MappingRecord):
+            value = value.mapping
+        if isinstance(value, (tuple, list)):
+            if len(value) != 2:
+                raise ValueError("mapping pointer must contain mapping id and version")
+            mapping_id, version = value
+        else:
+            payload = dict(_jsonable(value))
+            mapping_id = payload.get("mappingId") or payload.get("mapping_id")
+            version = payload.get("version")
+        if not all(isinstance(item, str) and item for item in (mapping_id, version)):
+            raise ValueError("mapping pointer requires mapping id and version")
+        return str(mapping_id), str(version)
+
+    @staticmethod
+    def _mapping_command_key(value: Any) -> str:
+        payload = dict(_jsonable(value.mapping if isinstance(value, MappingRecord) else value))
+        command_key = payload.get("commandKey") or payload.get("command_key")
+        if not isinstance(command_key, str) or not command_key:
+            raise ValueError("mapping commandKey is required")
+        return command_key
+
+    def _check_mapping_row_transition(
+        self,
+        mapping_id: str,
+        version: str,
+        payload_json: str,
+        status: str,
+        target_id: str | None,
+        probe_json: str | None,
+    ) -> None:
+        """Reject stale or backwards snapshots before an upsert can overwrite data."""
+        row = self._connection.execute(
+            "SELECT payload_json, status, target_id, probe_json FROM mappings WHERE mapping_id = ? AND version = ?",
+            (mapping_id, version),
+        ).fetchone()
+        if row is None:
+            return
+        try:
+            old_payload = _decode(row["payload_json"])
+            new_payload = _decode(payload_json)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise MappingStateConflict(mapping_id, version, str(row["status"]), status) from exc
+        # MappingVersion is immutable once a version is published.  In
+        # particular, a stale process must never replace an active row with a
+        # draft carrying a different topic or target.
+        if old_payload != new_payload or row["target_id"] != target_id:
+            raise MappingStateConflict(mapping_id, version, str(row["status"]), status)
+        old_status = str(row["status"])
+        old_probe_json = row["probe_json"]
+        probe_equal = old_probe_json == probe_json
+        if not probe_equal and old_probe_json is not None and probe_json is not None:
+            try:
+                probe_equal = _decode(old_probe_json) == _decode(probe_json)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                probe_equal = False
+        if not probe_equal:
+            # A probe result is part of the durable lifecycle snapshot.  Once
+            # one process has published a result, a stale concurrent probe may
+            # not overwrite it merely because both rows have status=probed.
+            # Allow a transition from an unprobed row, and idempotent writes
+            # carrying the same result.
+            if not (old_probe_json is None and probe_json is not None and old_status in {"draft", "validated"}):
+                raise MappingStateConflict(mapping_id, version, str(row["status"]), status)
+        if old_status == status:
+            # Draft creation is insert-only at the API boundary.  A second app
+            # presenting the same draft is still a conflict, while idempotent
+            # lifecycle persistence (validated/probed/active/superseded) is
+            # harmless.
+            if status == "draft":
+                raise MappingStateConflict(mapping_id, version, old_status, status)
+            return
+        allowed = {
+            "draft": {"validated"},
+            "validated": {"probed"},
+            "probed": {"active"},
+            "active": {"superseded"},
+            "superseded": {"active"},
+        }
+        if status not in allowed.get(old_status, set()):
+            raise MappingStateConflict(mapping_id, version, old_status, status)
+
+    def save_mapping_batch(
+        self,
+        records: list[MappingRecord] | tuple[MappingRecord, ...],
+        *,
+        active: Any = None,
+        expected_active: Any = _MAPPING_POINTER_UNSET,
+        audit_events: Iterable[Mapping[str, Any]] | None = None,
+    ) -> None:
+        """Persist mapping snapshots, pointer CAS, and staged audits atomically.
+
+        ``expected_active`` is intentionally distinct from ``None``: omitted
+        means a caller does not participate in pointer CAS, while ``None``
+        means it expects no pointer for the command being activated.  The
+        compare and all row/pointer/audit writes happen under ``BEGIN
+        IMMEDIATE`` so separate app processes cannot publish stale transitions.
+        """
         values = [self._mapping_values(record) for record in records]
+        active_pointer = None if active is None else self._pointer_value(active)
+        command_key: str | None = None
+        if active is not None:
+            command_key = self._mapping_command_key(active)
+        elif expected_active is not _MAPPING_POINTER_UNSET:
+            if not values:
+                raise ValueError("command key is required for mapping pointer CAS")
+            # A non-activation CAS is uncommon, but deriving the key keeps the
+            # repository API safe for direct callers as well.
+            command_key = self._mapping_command_key(records[0].mapping)
+        expected_pointer = (
+            None if expected_active is None else self._pointer_value(expected_active)
+        ) if expected_active is not _MAPPING_POINTER_UNSET else _MAPPING_POINTER_UNSET
+        staged_audits = list(audit_events or ())
         with self._lock:
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
+                if expected_pointer is not _MAPPING_POINTER_UNSET:
+                    row = self._connection.execute(
+                        "SELECT mapping_id, version FROM mapping_active WHERE command_key = ?",
+                        (command_key,),
+                    ).fetchone()
+                    actual_pointer = None if row is None else (str(row["mapping_id"]), str(row["version"]))
+                    if actual_pointer != expected_pointer:
+                        raise MappingPointerConflict(str(command_key), expected_pointer, actual_pointer)
                 for mapping_id, version, payload_json, status, target_id, probe_json in values:
+                    self._check_mapping_row_transition(
+                        mapping_id, version, payload_json, status, target_id, probe_json
+                    )
                     self._connection.execute(
                         """
                         INSERT INTO mappings(mapping_id, version, payload_json, status, target_id, probe_json, updated_at)
@@ -519,17 +680,20 @@ class SQLiteStore:
                         """,
                         (mapping_id, version, payload_json, status, target_id, probe_json, self._now()),
                     )
-                if active is not None:
-                    active_payload = dict(_jsonable(active))
-                    command_key = active_payload.get("commandKey") or active_payload.get("command_key")
-                    mapping_id = active_payload.get("mappingId") or active_payload.get("mapping_id")
-                    version = active_payload.get("version")
+                if active_pointer is not None:
+                    mapping_id, version = active_pointer
                     if not all(isinstance(item, str) and item for item in (command_key, mapping_id, version)):
                         raise ValueError("active mapping identity is required")
                     self._connection.execute(
                         "INSERT INTO mapping_active(command_key, mapping_id, version, updated_at) VALUES (?, ?, ?, ?) "
                         "ON CONFLICT(command_key) DO UPDATE SET mapping_id=excluded.mapping_id, version=excluded.version, updated_at=excluded.updated_at",
                         (command_key, mapping_id, version, self._now()),
+                    )
+                for event in staged_audits:
+                    payload = dict(_jsonable(event))
+                    self._connection.execute(
+                        "INSERT INTO audits(payload_json, created_at) VALUES (?, ?)",
+                        (_encode(payload), self._now()),
                     )
                 self._connection.commit()
             except Exception:
@@ -747,4 +911,9 @@ class SQLiteStore:
             self._connection.close()
 
 
-__all__ = ["CommandClaim", "SQLiteStore"]
+__all__ = [
+    "CommandClaim",
+    "MappingPointerConflict",
+    "MappingStateConflict",
+    "SQLiteStore",
+]

@@ -46,6 +46,19 @@ class _SlowCountingAdapter(FakeAdapter):
         return AdapterResult(status="succeeded")
 
 
+class _TaggedProbeAdapter(FakeAdapter):
+    def __init__(self, tag, entered, release):
+        super().__init__()
+        self._tag = tag
+        self._entered = entered
+        self._release = release
+
+    def probe(self, mapping):
+        self._entered.set()
+        assert self._release.wait(timeout=3)
+        return AdapterResult(status="probed", details={"tag": self._tag})
+
+
 def auth():
     return {"Authorization": f"Bearer {TOKEN}"}
 
@@ -319,6 +332,167 @@ def test_concurrent_mapping_activate_keeps_registry_and_sqlite_pointer_consisten
     memory_active = context.registry.active("move.forward").mappingId
     sqlite_active = context.store.get_active_pointer("move.forward")[0]
     assert memory_active == sqlite_active
+
+
+def test_two_app_mapping_activate_uses_sqlite_pointer_cas(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "multi-app-mapping.db")
+    app_one = create_app(db_path=db_path, auth_token=TOKEN)
+    client_one = TestClient(app_one)
+    for mapping_id in ("multi-b", "multi-c"):
+        body = mapping_body(mapping_id=mapping_id)
+        assert client_one.post("/api/v1/mappings/drafts", headers=auth(), json=body).status_code == 200
+        assert client_one.post(f"/api/v1/mappings/{mapping_id}/v1/validate", headers=auth()).status_code == 200
+        assert client_one.post(f"/api/v1/mappings/{mapping_id}/v1/probe", headers=auth()).status_code == 200
+    app_two = create_app(db_path=db_path, auth_token=TOKEN)
+    client_two = TestClient(app_two)
+    entered_one = threading.Event(); entered_two = threading.Event()
+    release_one = threading.Event(); release_two = threading.Event()
+    original_one = app_one.state.control.registry.activate
+    original_two = app_two.state.control.registry.activate
+
+    def activate_one(mapping_id, version):
+        record = original_one(mapping_id, version)
+        if mapping_id == "multi-b":
+            entered_one.set(); assert release_one.wait(timeout=3)
+        return record
+
+    def activate_two(mapping_id, version):
+        record = original_two(mapping_id, version)
+        if mapping_id == "multi-c":
+            entered_two.set(); assert release_two.wait(timeout=3)
+        return record
+
+    monkeypatch.setattr(app_one.state.control.registry, "activate", activate_one)
+    monkeypatch.setattr(app_two.state.control.registry, "activate", activate_two)
+    responses = {}
+
+    def run_one():
+        responses["one"] = client_one.post("/api/v1/mappings/multi-b/v1/activate", headers=auth())
+
+    def run_two():
+        responses["two"] = client_two.post("/api/v1/mappings/multi-c/v1/activate", headers=auth())
+
+    first = threading.Thread(target=run_one); first.start(); assert entered_one.wait(timeout=3)
+    second = threading.Thread(target=run_two); second.start(); assert entered_two.wait(timeout=3)
+    release_two.set(); second.join(timeout=3); assert not second.is_alive()
+    release_one.set(); first.join(timeout=3); assert not first.is_alive()
+    assert responses["two"].status_code == 200
+    assert responses["one"].status_code == 409
+    assert app_one.state.store.get_active_pointer("move.forward")[0] == "multi-c"
+    assert app_one.state.control.registry.active("move.forward").mappingId == "multi-c"
+
+
+def test_two_app_mapping_probe_does_not_overwrite_newer_probe_snapshot(tmp_path):
+    db_path = str(tmp_path / "multi-app-probe.db")
+    app_one = create_app(db_path=db_path, auth_token=TOKEN)
+    client_one = TestClient(app_one)
+    body = mapping_body(mapping_id="multi-probe")
+    assert client_one.post("/api/v1/mappings/drafts", headers=auth(), json=body).status_code == 200
+    assert client_one.post("/api/v1/mappings/multi-probe/v1/validate", headers=auth()).status_code == 200
+    app_two = create_app(db_path=db_path, auth_token=TOKEN)
+    client_two = TestClient(app_two)
+    entered_one, entered_two = threading.Event(), threading.Event()
+    release_one, release_two = threading.Event(), threading.Event()
+    app_one.state.control.registry.adapters["fake"] = _TaggedProbeAdapter("one", entered_one, release_one)
+    app_two.state.control.registry.adapters["fake"] = _TaggedProbeAdapter("two", entered_two, release_two)
+    responses = {}
+
+    def run_one():
+        responses["one"] = client_one.post("/api/v1/mappings/multi-probe/v1/probe", headers=auth())
+
+    def run_two():
+        responses["two"] = client_two.post("/api/v1/mappings/multi-probe/v1/probe", headers=auth())
+
+    first = threading.Thread(target=run_one); first.start(); assert entered_one.wait(timeout=3)
+    second = threading.Thread(target=run_two); second.start(); assert entered_two.wait(timeout=3)
+    release_two.set(); second.join(timeout=3); assert not second.is_alive()
+    release_one.set(); first.join(timeout=3); assert not first.is_alive()
+    assert responses["two"].status_code == 200
+    assert responses["one"].status_code == 409
+    row = app_one.state.store.get_mapping("multi-probe", "v1")
+    assert row["probe"]["details"]["tag"] == "two"
+    assert app_one.state.control.registry.get("multi-probe", "v1").probe.details["tag"] == "two"
+
+
+def test_stale_mapping_draft_cannot_downgrade_active_row(tmp_path):
+    db_path = str(tmp_path / "stale-draft.db")
+    stale = TestClient(create_app(db_path=db_path, auth_token=TOKEN))
+    winner = TestClient(create_app(db_path=db_path, auth_token=TOKEN))
+    body = mapping_body(mapping_id="shared-stale")
+    assert winner.post("/api/v1/mappings/drafts", headers=auth(), json=body).status_code == 200
+    for action in ("validate", "probe", "activate"):
+        assert winner.post(f"/api/v1/mappings/shared-stale/v1/{action}", headers=auth()).status_code == 200
+    stale_body = dict(body); stale_body["mapping"] = {"topic": "/stale-overwrite"}
+    response = stale.post("/api/v1/mappings/drafts", headers=auth(), json=stale_body)
+    assert response.status_code in {409, 422}
+    active = winner.get("/api/v1/mappings/active/move.forward", headers=auth()).json()
+    assert active["mappingId"] == "shared-stale"
+    assert active["mapping"]["topic"] == "/move.forward"
+
+
+def test_mapping_draft_save_barrier_rejects_snapshot_after_lifecycle_commit(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "stale-draft-barrier.db")
+    winner_app = create_app(db_path=db_path, auth_token=TOKEN)
+    stale_app = create_app(db_path=db_path, auth_token=TOKEN)
+    winner = TestClient(winner_app)
+    stale = TestClient(stale_app)
+    body = mapping_body(mapping_id="barrier-stale")
+    assert winner.post("/api/v1/mappings/drafts", headers=auth(), json=body).status_code == 200
+    entered, release = threading.Event(), threading.Event()
+    original_save = stale_app.state.control.store.save_mapping_batch
+
+    def blocked_save(*args, **kwargs):
+        entered.set()
+        assert release.wait(timeout=3)
+        return original_save(*args, **kwargs)
+
+    monkeypatch.setattr(stale_app.state.control.store, "save_mapping_batch", blocked_save)
+    response_holder = {}
+
+    def create_stale_draft():
+        response_holder["response"] = stale.post("/api/v1/mappings/drafts", headers=auth(), json=body)
+
+    worker = threading.Thread(target=create_stale_draft)
+    worker.start()
+    assert entered.wait(timeout=3)
+    for action in ("validate", "probe", "activate"):
+        assert winner.post(f"/api/v1/mappings/barrier-stale/v1/{action}", headers=auth()).status_code == 200
+    release.set()
+    worker.join(timeout=3)
+    assert not worker.is_alive()
+    assert response_holder["response"].status_code == 409
+    assert winner.get("/api/v1/mappings/active/move.forward", headers=auth()).json()["mappingId"] == "barrier-stale"
+
+
+def test_mapping_persistence_failure_does_not_publish_lifecycle_audit(monkeypatch):
+    app = create_app(auth_token=TOKEN)
+    client = TestClient(app)
+    body = mapping_body(mapping_id="audit-atomic")
+    assert client.post("/api/v1/mappings/drafts", headers=auth(), json=body).status_code == 200
+    assert client.post("/api/v1/mappings/audit-atomic/v1/validate", headers=auth()).status_code == 200
+    assert client.post("/api/v1/mappings/audit-atomic/v1/probe", headers=auth()).status_code == 200
+    original = app.state.control.store.save_mapping_batch
+
+    def fail_persistence(*args, **kwargs):
+        raise RuntimeError("injected mapping persistence failure")
+
+    monkeypatch.setattr(app.state.control.store, "save_mapping_batch", fail_persistence)
+    response = client.post("/api/v1/mappings/audit-atomic/v1/activate", headers=auth())
+    assert response.status_code == 503
+    monkeypatch.setattr(app.state.control.store, "save_mapping_batch", original)
+    row = app.state.control.store.get_mapping("audit-atomic", "v1")
+    assert row["status"] == "probed"
+    assert app.state.control.registry.get("audit-atomic", "v1").status == "probed"
+    assert not any(
+        event.get("mappingId") == "audit-atomic" and event.get("action") == "activated"
+        for event in app.state.control.store.list_audits()
+    )
+    retry = client.post("/api/v1/mappings/audit-atomic/v1/activate", headers=auth())
+    assert retry.status_code == 200
+    assert any(
+        event.get("mappingId") == "audit-atomic" and event.get("action") == "activated"
+        for event in app.state.control.store.list_audits()
+    )
 
 
 def test_command_rejects_mapping_target_bound_to_another_robot():
@@ -609,6 +783,12 @@ def test_restart_preserves_estop_robot_state_and_rejects_motion_but_allows_stop(
     assert robot["connected"] is False
     motion = restarted.post("/api/v1/commands", headers=auth(), json=command_body(idempotencyKey="estop-motion"))
     assert motion.status_code in {409, 422}
+    gripper = restarted.post(
+        "/api/v1/commands",
+        headers=auth(),
+        json=command_body(commandKey="gripper.open", idempotencyKey="estop-gripper"),
+    )
+    assert gripper.status_code in {409, 422}
     stop = restarted.post(
         "/api/v1/commands",
         headers=auth(),

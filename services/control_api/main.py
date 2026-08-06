@@ -42,7 +42,12 @@ from packages.control_core.models import (
 from packages.control_core.registry import MappingRecord, MappingRegistry, mapping_target_values
 from packages.control_core.runtime import ActionRuntime
 
-from .store import SQLiteStore, _jsonable
+from .store import (
+    MappingPointerConflict,
+    MappingStateConflict,
+    SQLiteStore,
+    _jsonable,
+)
 
 
 def _plain(value: Any) -> Any:
@@ -142,8 +147,8 @@ def _payload_expired(payload: Mapping[str, Any] | Any) -> bool:
 
 
 def _motion_safety_error(robot: Mapping[str, Any], definition: CommandDefinition) -> str | None:
-    """Reject motion at the API boundary when the persisted robot is unsafe."""
-    if definition.kind is not CommandKind.MOTION:
+    """Reject every non-safety action when the persisted robot is unsafe."""
+    if definition.kind is CommandKind.SAFETY:
         return None
     status = str(robot.get("status", "unknown")).lower()
     safety_mode = str(robot.get("safetyMode", robot.get("safety_mode", "unknown"))).lower()
@@ -354,6 +359,79 @@ class _ControlContext:
             return False
         return True
 
+    def reload_mappings(self) -> None:
+        """Reconcile this process's registry with the durable SQLite view.
+
+        A pointer CAS can lose after another app instance commits a mapping
+        transition.  Restoring a fresh registry snapshot prevents the losing
+        process from serving or mutating the stale in-memory active pointer.
+        No registry lifecycle methods are used here, so reconciliation emits
+        no audits and performs no adapter probes.
+        """
+        fresh = MappingRegistry(adapters=self.adapters, audit_sink=None)
+        persisted = self.store.list_mappings()
+        restored_rows: list[Mapping[str, Any]] = []
+        for row in persisted:
+            if not isinstance(row, Mapping):
+                continue
+            mapping_payload = row.get("mapping")
+            if not isinstance(mapping_payload, Mapping):
+                continue
+            try:
+                mapping = MappingVersion.model_validate(mapping_payload)
+                status = str(row.get("status", "draft"))
+                if status not in {"draft", "validated", "probed", "active", "superseded"}:
+                    continue
+                target_id = row.get("targetId")
+                probe_payload = row.get("probe")
+                probe = None
+                if isinstance(probe_payload, Mapping):
+                    try:
+                        probe = AdapterResult(**dict(probe_payload))
+                    except (TypeError, ValueError, ValidationError):
+                        probe = AdapterResult(status="failed", error="persisted probe is invalid")
+                fresh.restore_record(MappingRecord(mapping=mapping, status=status, target_id=target_id, probe=probe))
+                restored_rows.append(row)
+            except (ValueError, ValidationError):
+                continue
+
+        grouped: dict[str, list[Mapping[str, Any]]] = {}
+        for row in restored_rows:
+            mapping_payload = row.get("mapping")
+            if not isinstance(mapping_payload, Mapping):
+                continue
+            command_key = mapping_payload.get("commandKey") or mapping_payload.get("command_key")
+            if isinstance(command_key, str) and command_key:
+                grouped.setdefault(command_key, []).append(row)
+        pointers = self.store.list_active_pointers()
+        for command_key, rows in grouped.items():
+            pointer = pointers.get(command_key)
+            if pointer is None:
+                active_rows = [row for row in rows if row.get("status") == "active"]
+                if active_rows:
+                    active_rows.sort(key=lambda row: row.get("updatedAt", ""))
+                    payload = active_rows[-1].get("mapping")
+                    if isinstance(payload, Mapping):
+                        pointer = (payload.get("mappingId"), payload.get("version"))
+            if pointer and all(isinstance(item, str) and item for item in pointer):
+                try:
+                    fresh.restore_active_pointer(command_key, pointer[0], pointer[1])
+                except ValueError:
+                    continue
+            history: list[tuple[str, str]] = []
+            for row in sorted(rows, key=lambda item: item.get("updatedAt", "")):
+                if row.get("status") != "superseded":
+                    continue
+                payload = row.get("mapping")
+                if not isinstance(payload, Mapping):
+                    continue
+                mapping_id, version = payload.get("mappingId"), payload.get("version")
+                if isinstance(mapping_id, str) and mapping_id and isinstance(version, str) and version:
+                    history.append((mapping_id, version))
+            if history:
+                fresh.restore_history(command_key, history)
+        self.registry.restore_state(fresh.snapshot_state())
+
     def definition(self, command_key: str, version: str | None = None) -> CommandDefinition:
         requested = version or "1"
         definition = self.definitions.get((command_key, requested))
@@ -521,15 +599,31 @@ def create_app(
         context.store.save_command(persisted_request, receipt)
         return receipt
 
-    def _save_mapping_change(context: _ControlContext, record: MappingRecord, previous: MappingVersion | None = None) -> None:
+    def _save_mapping_change(
+        context: _ControlContext,
+        record: MappingRecord,
+        previous: MappingVersion | None = None,
+        *,
+        audit_events: list[Mapping[str, Any]] | None = None,
+    ) -> None:
         records = [record]
         if previous is not None and (previous.mappingId, previous.version) != (record.mapping.mappingId, record.version):
             try:
                 records.insert(0, context.registry.get(previous.mappingId, previous.version))
-            except ValueError:
-                pass
+            except ValueError as exc:
+                raise MappingStateConflict(
+                    previous.mappingId,
+                    previous.version,
+                    "missing",
+                    "superseded",
+                ) from exc
         active = record.mapping if record.status == "active" else None
-        context.store.save_mapping_batch(records, active=active)
+        kwargs: dict[str, Any] = {}
+        if active is not None:
+            kwargs["expected_active"] = None if previous is None else (previous.mappingId, previous.version)
+        if audit_events is not None:
+            kwargs["audit_events"] = audit_events
+        context.store.save_mapping_batch(records, active=active, **kwargs)
 
     @app.get("/api/v1/robots", dependencies=[Depends(require_auth)])
     def list_robots(context: _ControlContext = Depends(get_context)):
@@ -634,6 +728,9 @@ def create_app(
 
     @app.post("/api/v1/mappings/drafts", dependencies=[Depends(require_auth)])
     def create_mapping_draft(body: dict[str, Any], context: _ControlContext = Depends(get_context)):
+        # Parsing is side-effect free; registry insertion and durable save are
+        # deliberately enclosed by the same mutation lock as lifecycle
+        # operations so a draft cannot race a validate/probe/activate snapshot.
         try:
             mapping_data = dict(body)
             explicit_targets = [mapping_data.pop(name) for name in ("targetId", "target_id") if name in mapping_data]
@@ -641,11 +738,32 @@ def create_app(
                 raise ValueError("target aliases conflict")
             target_id = explicit_targets[0] if explicit_targets else None
             mapping = MappingVersion.model_validate(mapping_data)
-            record = context.registry.create_draft(mapping, target_id=target_id)
         except (ValidationError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        _save_mapping_change(context, record)
-        return _mapping_json(record)
+        with mapping_mutation_lock:
+            snapshot = context.registry.snapshot_state()
+            audit_events: list[Mapping[str, Any]] = []
+            try:
+                with context.registry.defer_audits() as audit_events:
+                    record = context.registry.create_draft(mapping, target_id=target_id)
+                    context.registry.drain_deferred_audits()
+                    _save_mapping_change(context, record, audit_events=audit_events)
+                return _mapping_json(record)
+            except (MappingPointerConflict, MappingStateConflict) as exc:
+                context.registry.restore_state(snapshot)
+                try:
+                    context.reload_mappings()
+                except Exception:
+                    # Keep the pre-transition snapshot if reconciliation itself
+                    # is unavailable; the durable write was already rejected.
+                    context.registry.restore_state(snapshot)
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            except ValueError as exc:
+                context.registry.restore_state(snapshot)
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            except Exception as exc:
+                context.registry.restore_state(snapshot)
+                raise HTTPException(status_code=503, detail="mapping persistence failed; draft was not committed") from exc
 
     @app.get("/api/v1/mappings", dependencies=[Depends(require_auth)])
     def list_mappings(context: _ControlContext = Depends(get_context)):
@@ -659,6 +777,7 @@ def create_app(
         def route(mapping_id: str, version: str, context: _ControlContext = Depends(get_context)):
             with mapping_mutation_lock:
                 snapshot = context.registry.snapshot_state()
+                audit_events: list[Mapping[str, Any]] = []
                 try:
                     previous = None
                     if action == "activate":
@@ -668,11 +787,27 @@ def create_app(
                         except ValueError:
                             previous = None
                     method = getattr(context.registry, action)
-                    record = method(mapping_id, version)
-                    _save_mapping_change(context, record, previous)
+                    with context.registry.defer_audits() as audit_events:
+                        record = method(mapping_id, version)
+                        context.registry.drain_deferred_audits()
+                        _save_mapping_change(context, record, previous, audit_events=audit_events)
                     return _mapping_json(record)
+                except (MappingPointerConflict, MappingStateConflict) as exc:
+                    context.registry.restore_state(snapshot)
+                    try:
+                        context.reload_mappings()
+                    except Exception:
+                        context.registry.restore_state(snapshot)
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
                 except ValueError as exc:
                     context.registry.restore_state(snapshot)
+                    # A failed probe does not mutate its durable mapping row,
+                    # but its diagnostic audit remains useful.  Successful
+                    # lifecycle audits stay staged and are discarded on any
+                    # persistence failure.
+                    for event in audit_events:
+                        if event.get("action") == "probe_failed":
+                            context.store.record_audit(event)
                     raise HTTPException(status_code=409, detail=str(exc)) from exc
                 except Exception as exc:
                     # Do not report a successful lifecycle transition when the
@@ -692,14 +827,24 @@ def create_app(
         version = None if not body else body.get("version")
         with mapping_mutation_lock:
             snapshot = context.registry.snapshot_state()
+            audit_events: list[Mapping[str, Any]] = []
             try:
                 try:
                     previous = context.registry.active(command_key)
                 except ValueError:
                     previous = None
-                record = context.registry.rollback(command_key, version=version)
-                _save_mapping_change(context, record, previous)
+                with context.registry.defer_audits() as audit_events:
+                    record = context.registry.rollback(command_key, version=version)
+                    context.registry.drain_deferred_audits()
+                    _save_mapping_change(context, record, previous, audit_events=audit_events)
                 return _mapping_json(record)
+            except (MappingPointerConflict, MappingStateConflict) as exc:
+                context.registry.restore_state(snapshot)
+                try:
+                    context.reload_mappings()
+                except Exception:
+                    context.registry.restore_state(snapshot)
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
             except ValueError as exc:
                 context.registry.restore_state(snapshot)
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
