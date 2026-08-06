@@ -119,6 +119,8 @@ def test_blocking_probe_does_not_hold_registry_lock_for_reads_or_activation():
     assert adapter.started.wait(timeout=1)
     start = time.monotonic(); record = reg.get("m", "v1"); elapsed = time.monotonic() - start
     assert record.status == "validated" and elapsed < 0.5
+    with pytest.raises(ValueError, match="already being probed"):
+        reg.probe("m", "v1")
     adapter.release.set(); worker.join(timeout=2)
 
 
@@ -127,3 +129,16 @@ def test_unavailable_adapter_operations_return_explicit_statuses():
     mapping = mv()
     for result in (adapter.discover("r1"), adapter.probe(mapping), adapter.cancel("c1"), adapter.query("c1")):
         assert result.status in {"unavailable", "failed"}
+
+
+def test_blocking_audit_sink_does_not_hold_registry_lock_for_reads():
+    entered = threading.Event(); release = threading.Event()
+    def sink(event):
+        if event["action"] == "draft":
+            entered.set(); release.wait(timeout=2)
+    reg = MappingRegistry(adapters={"fake": FakeAdapter()}, audit_sink=sink)
+    thread = threading.Thread(target=lambda: reg.create_draft(mv()))
+    thread.start(); assert entered.wait(timeout=1)
+    start = time.monotonic(); assert reg.get("m", "v1").status == "draft"
+    assert time.monotonic() - start < 0.5
+    release.set(); thread.join(timeout=2); assert not thread.is_alive()

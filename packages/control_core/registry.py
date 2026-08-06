@@ -48,20 +48,31 @@ class MappingRegistry:
         self._lock = threading.RLock()
         self._probing: set[tuple[str, str]] = set()
         self.diagnostics: list[dict[str, Any]] = []
+        self._audit_queue: list[dict[str, Any]] = []
 
     def _audit(self, action: str, record: MappingRecord) -> None:
+        self._audit_queue.append({"action": action, "mappingId": record.mapping.mappingId, "version": record.version, "commandKey": record.mapping.commandKey, "status": record.status})
+
+    def _flush_audits(self) -> None:
+        with self._lock:
+            events = self._audit_queue
+            self._audit_queue = []
         if self.audit_sink:
-            try:
-                self.audit_sink({"action": action, "mappingId": record.mapping.mappingId, "version": record.version, "commandKey": record.mapping.commandKey, "status": record.status})
-            except Exception as exc:
-                self.diagnostics.append({"message": "audit sink failed", "error": str(exc)})
+            for event in events:
+                try:
+                    self.audit_sink(event)
+                except Exception as exc:
+                    with self._lock:
+                        self.diagnostics.append({"message": "audit sink failed", "error": str(exc)})
 
     def _key(self, mapping_id: str, version: str) -> tuple[str, str]:
         return mapping_id, version
 
     def create_draft(self, mapping: MappingVersion, target_id: str | None = None) -> MappingRecord:
         with self._lock:
-            return self._create_draft(mapping, target_id)
+            record = self._create_draft(mapping, target_id)
+        self._flush_audits()
+        return record
 
     def _create_draft(self, mapping: MappingVersion, target_id: str | None = None) -> MappingRecord:
         if target_id is not None and (not isinstance(target_id, str) or not target_id.strip()):
@@ -129,7 +140,9 @@ class MappingRegistry:
         with self._lock:
             if (mapping_id, version) in self._probing:
                 raise ValueError("mapping is currently being probed")
-            return self._validate(mapping_id, version)
+            record = self._validate(mapping_id, version)
+        self._flush_audits()
+        return record
 
     def _validate(self, mapping_id: str, version: str) -> MappingRecord:
         rec = self._require(mapping_id, version)
@@ -156,40 +169,42 @@ class MappingRegistry:
             mapping = rec.mapping
             target_id = rec.target_id
             adapter = self.adapters.get(mapping.transport.value)
-        try:
-            if adapter is None:
-                result = AdapterResult(status="unavailable", error=f"no adapter for {mapping.transport.value}")
-            else:
-                try:
-                    result = adapter.probe(mapping)
-                except Exception as exc:
-                    result = AdapterResult(status="failed", error=f"adapter probe failed: {exc}")
-            if not isinstance(result, AdapterResult):
-                result = AdapterResult(status="unavailable", error="adapter probe returned invalid result")
-            probe_status = getattr(result, "status", None)
-            if not isinstance(probe_status, str) or not probe_status.strip():
-                result = AdapterResult(status="unavailable", error="adapter probe returned result without status")
-                probe_status = result.status
-            good = probe_status.lower() in {"probed", "available", "succeeded", "ok"}
-        finally:
-            with self._lock:
-                self._probing.discard(key)
+        if adapter is None:
+            result = AdapterResult(status="unavailable", error=f"no adapter for {mapping.transport.value}")
+        else:
+            try:
+                result = adapter.probe(mapping)
+            except Exception as exc:
+                result = AdapterResult(status="failed", error=f"adapter probe failed: {exc}")
+        if not isinstance(result, AdapterResult):
+            result = AdapterResult(status="unavailable", error="adapter probe returned invalid result")
+        probe_status = getattr(result, "status", None)
+        if not isinstance(probe_status, str) or not probe_status.strip():
+            result = AdapterResult(status="unavailable", error="adapter probe returned result without status")
+            probe_status = result.status
+        good = probe_status.lower() in {"probed", "available", "succeeded", "ok"}
         with self._lock:
-            current = self._records.get(key)
-            if current is None or current.mapping != mapping or current.status not in {"validated", "probed"}:
-                raise ValueError("mapping changed while probing")
-            if not good:
-                raise ValueError(result.error or "capability probe failed")
-            rec = MappingRecord(mapping, "probed", target_id, result)
-            self._records[key] = rec
-            self._audit("probed", rec)
-            return rec
+            try:
+                current = self._records.get(key)
+                if current is None or current.mapping != mapping or current.status not in {"validated", "probed"}:
+                    raise ValueError("mapping changed while probing")
+                if not good:
+                    raise ValueError(result.error or "capability probe failed")
+                rec = MappingRecord(mapping, "probed", target_id, result)
+                self._records[key] = rec
+                self._audit("probed", rec)
+            finally:
+                self._probing.discard(key)
+        self._flush_audits()
+        return rec
 
     def activate(self, mapping_id: str, version: str) -> MappingRecord:
         with self._lock:
             if (mapping_id, version) in self._probing:
                 raise ValueError("mapping is currently being probed")
-            return self._activate(mapping_id, version)
+            record = self._activate(mapping_id, version)
+        self._flush_audits()
+        return record
 
     def _activate(self, mapping_id: str, version: str) -> MappingRecord:
         rec = self._require(mapping_id, version)
@@ -240,7 +255,8 @@ class MappingRegistry:
             rec = MappingRecord(rec.mapping, "active", rec.target_id, rec.probe)
             self._records[target] = rec
             self._audit("rollback", rec)
-            return rec
+        self._flush_audits()
+        return rec
 
     def get(self, mapping_id: str, version: str) -> MappingRecord:
         with self._lock:

@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 from packages.control_core.adapters import FakeAdapter, AdapterResult
-from packages.control_core.models import CommandDefinition, CommandRequest, MappingVersion
+from packages.control_core.models import CommandDefinition, CommandKind, CommandRequest, MappingVersion
 from packages.control_core.runtime import ActionRuntime
 from concurrent.futures import ThreadPoolExecutor
 import threading
@@ -18,8 +18,8 @@ def request(cid="c1", idem="i1", key="move.forward", transport="fake"):
     )
 
 
-def definition(key="move.forward"):
-    return CommandDefinition(commandKey=key, commandVersion="1", transports=["fake"])
+def definition(key="move.forward", kind="motion"):
+    return CommandDefinition(commandKey=key, commandVersion="1", transports=["fake"], kind=kind)
 
 
 def mapping(key="move.forward", version="v1"):
@@ -103,7 +103,7 @@ def test_stop_prioritizes_and_closes_old_lease_even_when_cancel_fails():
     runtime = ActionRuntime(adapters={"fake": adapter}, event_sink=events.append)
     runtime.dispatch(request("c1", "i1"), definition(), mapping())
     stop_req = request("stop-1", "stop-1", key="stop", transport="fake")
-    runtime.dispatch(stop_req, definition("stop"), mapping("stop", "v1"))
+    runtime.dispatch(stop_req, definition("stop", "safety"), mapping("stop", "v1"))
     old = runtime.receipt("c1")
     assert old.status.value == "cancelled"
     assert "transport down" in (old.error or "")
@@ -224,7 +224,7 @@ def test_stop_can_interrupt_blocking_motion_dispatch():
     worker = threading.Thread(target=lambda: runtime.dispatch(request(), definition(), mapping()))
     worker.start(); assert adapter.started.wait(timeout=1)
     stop = request("stop-2", "stop-2", key="stop")
-    stop_receipt = runtime.dispatch(stop, definition("stop"), mapping("stop"))
+    stop_receipt = runtime.dispatch(stop, definition("stop", "safety"), mapping("stop"))
     assert adapter.cancelled.is_set()
     assert runtime.receipt("c1").status.value == "cancelled"
     assert stop_receipt.status.value == "succeeded"
@@ -247,7 +247,7 @@ def test_stop_barrier_blocks_new_motion_until_stop_cancel_finishes():
     old_thread = threading.Thread(target=lambda: runtime.dispatch(request(), definition(), mapping()))
     old_thread.start(); assert adapter.move_started.wait(timeout=1)
     stop_result = []
-    stop_thread = threading.Thread(target=lambda: stop_result.append(runtime.dispatch(request("stop-3", "stop-3", key="stop"), definition("stop"), mapping("stop"))))
+    stop_thread = threading.Thread(target=lambda: stop_result.append(runtime.dispatch(request("stop-3", "stop-3", key="stop"), definition("stop", "safety"), mapping("stop"))))
     stop_thread.start(); assert adapter.cancel_started.wait(timeout=1)
     blocked = runtime.dispatch(request("c3", "i3"), definition(), mapping("move.forward", "v3"))
     assert blocked.status.value == "rejected"
@@ -272,11 +272,85 @@ def test_old_stop_cancel_cannot_clear_new_stop_epoch_barrier():
             return AdapterResult(status="cancelled")
     adapter = TwoStops(); runtime = ActionRuntime(adapters={"fake": adapter})
     a_result = []; b_result = []
-    a = threading.Thread(target=lambda: a_result.append(runtime.dispatch(request("stop-a", "stop-a", key="stop"), definition("stop"), mapping("stop", "a"))))
+    a = threading.Thread(target=lambda: a_result.append(runtime.dispatch(request("stop-a", "stop-a", key="stop"), definition("stop", "safety"), mapping("stop", "a"))))
     a.start(); assert adapter.a_started.wait(timeout=1)
-    b = threading.Thread(target=lambda: b_result.append(runtime.dispatch(request("stop-b", "stop-b", key="stop"), definition("stop"), mapping("stop", "b"))))
+    b = threading.Thread(target=lambda: b_result.append(runtime.dispatch(request("stop-b", "stop-b", key="stop"), definition("stop", "safety"), mapping("stop", "b"))))
     b.start(); assert adapter.b_started.wait(timeout=1)
     assert runtime.cancel("stop-a").status.value == "cancelled"
     blocked = runtime.dispatch(request("after-stop", "after-stop"), definition(), mapping())
     assert blocked.status.value == "rejected"
     adapter.release_a.set(); adapter.release_b.set(); a.join(timeout=2); b.join(timeout=2)
+
+
+def test_blocking_cancel_barrier_rejects_new_motion_until_cancel_finishes():
+    class BlockingCancel(FakeAdapter):
+        def __init__(self):
+            super().__init__(result=AdapterResult(status="running"))
+            self.cancel_started = threading.Event(); self.cancel_release = threading.Event()
+        def cancel(self, command_id):
+            self.cancel_started.set(); self.cancel_release.wait(timeout=2)
+            return AdapterResult(status="cancelled")
+    adapter = BlockingCancel(); runtime = ActionRuntime(adapters={"fake": adapter})
+    runtime.dispatch(request(), definition(), mapping())
+    cancel_result = []
+    thread = threading.Thread(target=lambda: cancel_result.append(runtime.cancel("c1")))
+    thread.start(); assert adapter.cancel_started.wait(timeout=1)
+    blocked = runtime.dispatch(request("c2", "i2"), definition(), mapping("move.forward", "v2"))
+    assert blocked.status.value == "rejected"
+    adapter.cancel_release.set(); thread.join(timeout=2)
+    assert not thread.is_alive() and cancel_result[0].status.value == "cancelled"
+
+
+def test_blocking_expiry_barrier_rejects_new_motion_until_safety_cancel_finishes():
+    class BlockingCancel(FakeAdapter):
+        def __init__(self):
+            super().__init__(result=AdapterResult(status="running"))
+            self.cancel_started = threading.Event(); self.cancel_release = threading.Event()
+        def cancel(self, command_id):
+            self.cancel_started.set(); self.cancel_release.wait(timeout=2)
+            return AdapterResult(status="cancelled")
+    now = [datetime.now(timezone.utc)]
+    adapter = BlockingCancel(); runtime = ActionRuntime(adapters={"fake": adapter}, clock=lambda: now[0])
+    runtime.dispatch(request(), definition(), mapping(), lease_seconds=1)
+    now[0] += timedelta(seconds=2)
+    thread = threading.Thread(target=runtime.tick); thread.start(); assert adapter.cancel_started.wait(timeout=1)
+    blocked = runtime.dispatch(request("c2", "i2"), definition(), mapping("move.forward", "v2"))
+    assert blocked.status.value == "rejected"
+    adapter.cancel_release.set(); thread.join(timeout=2)
+    assert not thread.is_alive()
+
+
+def test_invalid_lease_seconds_reject_before_running_or_dispatch():
+    for index, value in enumerate(("bad", float("nan"), float("inf"), -1)):
+        adapter = FakeAdapter()
+        events = []
+        runtime = ActionRuntime(adapters={"fake": adapter}, event_sink=events.append)
+        receipt = runtime.dispatch(request(f"c{index}", f"i{index}"), definition(), mapping(), lease_seconds=value)
+        assert receipt.status.value == "rejected"
+        assert adapter.dispatches == []
+        assert [event["status"] for event in events] == ["rejected"]
+
+
+def test_blocking_event_sink_does_not_hold_runtime_lock_against_cancel():
+    entered = threading.Event(); release = threading.Event()
+    def sink(event):
+        if event["status"] == "accepted" and not entered.is_set():
+            entered.set(); release.wait(timeout=2)
+    adapter = FakeAdapter(result=AdapterResult(status="running"))
+    runtime = ActionRuntime(adapters={"fake": adapter}, event_sink=sink)
+    dispatch_thread = threading.Thread(target=lambda: runtime.dispatch(request(), definition(), mapping()))
+    dispatch_thread.start(); assert entered.wait(timeout=1)
+    cancel_thread = threading.Thread(target=lambda: runtime.cancel("c1")); cancel_thread.start()
+    cancel_thread.join(timeout=0.5)
+    assert not cancel_thread.is_alive()
+    release.set(); dispatch_thread.join(timeout=2)
+
+
+def test_command_kind_not_command_key_substring_controls_safety_and_motion():
+    adapter = FakeAdapter(result=AdapterResult(status="running"))
+    runtime = ActionRuntime(adapters={"fake": adapter})
+    runtime.dispatch(request(), definition(), mapping())
+    scan = request("scan", "scan", key="nonstop.scan")
+    receipt = runtime.dispatch(scan, definition("nonstop.scan", CommandKind.NON_MOTION), mapping("nonstop.scan"))
+    assert receipt.status.value == "running"
+    assert adapter.cancellations == []

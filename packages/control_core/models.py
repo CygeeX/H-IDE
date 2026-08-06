@@ -46,6 +46,12 @@ class Transport(_ValueEnum):
     FAKE = "fake"
 
 
+class CommandKind(_ValueEnum):
+    MOTION = "motion"
+    SAFETY = "safety"
+    NON_MOTION = "non_motion"
+
+
 class CommandStatus(_ValueEnum):
     PENDING = "pending"
     ACCEPTED = "accepted"
@@ -97,6 +103,7 @@ class CommandDefinition(ContractModel):
         validation_alias=AliasChoices("payload_schema", "schema"),
     )
     transports: list[Transport] = Field(default_factory=lambda: list(Transport))
+    kind: CommandKind = CommandKind.MOTION
     description: str | None = None
 
     @field_validator("commandKey", "commandVersion")
@@ -339,6 +346,7 @@ __all__ = [
     "CommandDefinition",
     "CommandReceipt",
     "CommandRequest",
+    "CommandKind",
     "CommandSource",
     "Source",
     "CommandStatus",

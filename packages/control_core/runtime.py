@@ -9,11 +9,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import math
 import threading
 from typing import Any, Callable, Mapping
 
 from .adapters import AdapterResult, CommandAdapter
-from .models import CommandDefinition, CommandReceipt, CommandRequest, CommandStatus, MappingVersion
+from .models import CommandDefinition, CommandKind, CommandReceipt, CommandRequest, CommandStatus, MappingVersion
 from .validation import utc_now, validate_command_request
 
 
@@ -29,6 +30,7 @@ class _InFlight:
     mapping: MappingVersion
     adapter: CommandAdapter
     motion: bool
+    kind: CommandKind
 
 
 class ActionRuntime:
@@ -43,38 +45,36 @@ class ActionRuntime:
         self.adapters = dict(adapters or {})
         self.event_sink = event_sink
         self.clock = clock
-        self.lease_seconds = max(0.0, float(lease_seconds))
+        self.lease_seconds = float(lease_seconds)
+        if not math.isfinite(self.lease_seconds) or self.lease_seconds < 0:
+            raise ValueError("lease_seconds must be finite and non-negative")
         self._receipts: dict[str, CommandReceipt] = {}
         self._idempotency: dict[str, str] = {}
         self._requests: dict[str, CommandRequest] = {}
+        self._definitions: dict[str, CommandDefinition] = {}
         self._mappings: dict[str, MappingVersion] = {}
         self._leases: dict[str, _Lease] = {}
         self._inflight: dict[str, _InFlight] = {}
-        self._stop_barriers: set[str] = set()
-        self._stop_epochs: dict[str, int] = {}
-        self._stop_owners: dict[str, tuple[int, str]] = {}
+        self._safety_barriers: set[str] = set()
+        self._safety_epochs: dict[str, int] = {}
+        self._safety_owners: dict[str, tuple[int, str]] = {}
         self._lock = threading.RLock()
         # A local diagnostic trail is intentionally small and dependency-free.
         self.diagnostics: list[dict[str, Any]] = []
+        self._event_queue: list[dict[str, Any]] = []
 
     @staticmethod
     def _adapter_key(value: Any) -> str:
         return getattr(value, "value", value)
 
-    @staticmethod
-    def _priority(key: str) -> bool:
-        normalized = key.lower().replace("_", ".").replace("-", ".")
-        return any(token in normalized for token in ("stop", "cancel", "estop", "emergency"))
-
     def _warn(self, message: str, *, exc: Exception | None = None) -> None:
         item: dict[str, Any] = {"message": message}
         if exc is not None:
             item["error"] = str(exc)
-        self.diagnostics.append(item)
+        with self._lock:
+            self.diagnostics.append(item)
 
     def _event(self, request: CommandRequest, mapping: MappingVersion, status: CommandStatus, **extra: Any) -> None:
-        if not self.event_sink:
-            return
         event = {
             "commandId": request.commandId,
             "robotId": request.robotId,
@@ -84,10 +84,19 @@ class ActionRuntime:
             "at": self.clock(),
         }
         event.update(extra)
-        try:
-            self.event_sink(event)
-        except Exception as exc:
-            self._warn("event sink failed", exc=exc)
+        self._event_queue.append(event)
+
+    def _flush_events(self) -> None:
+        with self._lock:
+            events = self._event_queue
+            self._event_queue = []
+        if not self.event_sink:
+            return
+        for event in events:
+            try:
+                self.event_sink(event)
+            except Exception as exc:
+                self._warn("event sink failed", exc=exc)
 
     @staticmethod
     def _normalize_result(value: Any, operation: str) -> AdapterResult:
@@ -130,10 +139,19 @@ class ActionRuntime:
         if lease is not None and lease.command_id == command_id:
             self._leases.pop(robot_id, None)
 
-    def _clear_stop_barrier(self, robot_id: str, command_id: str, epoch: int | None) -> None:
-        if epoch is not None and self._stop_owners.get(robot_id) == (epoch, command_id):
-            self._stop_owners.pop(robot_id, None)
-            self._stop_barriers.discard(robot_id)
+    def _claim_safety_barrier(self, robot_id: str, owner: str, *, supersede: bool = False) -> int | None:
+        if robot_id in self._safety_barriers and not supersede:
+            return None
+        epoch = self._safety_epochs.get(robot_id, 0) + 1
+        self._safety_epochs[robot_id] = epoch
+        self._safety_owners[robot_id] = (epoch, owner)
+        self._safety_barriers.add(robot_id)
+        return epoch
+
+    def _clear_safety_barrier(self, robot_id: str, owner: str, epoch: int | None) -> None:
+        if epoch is not None and self._safety_owners.get(robot_id) == (epoch, owner):
+            self._safety_owners.pop(robot_id, None)
+            self._safety_barriers.discard(robot_id)
 
     def _cancel_external(self, action: _InFlight | None, command_id: str) -> str | None:
         """Call adapter cancellation outside the lock and return a warning."""
@@ -149,7 +167,7 @@ class ActionRuntime:
         return None
 
     def _expire_leases(self) -> None:
-        actions: list[tuple[CommandRequest, _InFlight | None]] = []
+        actions: list[tuple[CommandRequest, _InFlight | None, str, int | None]] = []
         now = self.clock()
         with self._lock:
             expired = [robot for robot, lease in self._leases.items() if lease.expires_at <= now]
@@ -158,15 +176,19 @@ class ActionRuntime:
                 req = self._requests.get(lease.command_id)
                 action = self._inflight.get(lease.command_id)
                 if req:
-                    mapping = self._mappings[req.commandId]
+                    owner = f"expiry:{req.commandId}"
+                    epoch = self._claim_safety_barrier(req.robotId, owner)
                     self._receipt(req, CommandStatus.EXPIRED, error="motion lease expired", completedAt=now, safetyStop=True)
-                    actions.append((req, action))
-        for req, action in actions:
+                    actions.append((req, action, owner, epoch))
+        self._flush_events()
+        for req, action, owner, epoch in actions:
             warning = self._cancel_external(action, req.commandId)
-            if warning:
-                with self._lock:
+            with self._lock:
+                if warning:
                     if self._receipts.get(req.commandId, None) is not None:
                         self._receipt(req, CommandStatus.EXPIRED, error=f"motion lease expired; {warning}", completedAt=now, safetyStop=True, safetyWarning=warning)
+                self._clear_safety_barrier(req.robotId, owner, epoch)
+            self._flush_events()
 
     def tick(self) -> None:
         """Expire stale leases and issue adapter safety cancellation."""
@@ -186,22 +208,26 @@ class ActionRuntime:
         cancel_actions: list[tuple[CommandRequest, _InFlight | None]] = []
         with self._lock:
             context = self._begin_dispatch(request, definition, mapping, lease_seconds)
-            if isinstance(context, CommandReceipt):
-                return context
-            adapter, motion, cancel_actions, is_stop, stop_epoch = context
-            # Stop commands may have displaced an old lease.  Their receipt is
-            # terminal before any external cancellation is attempted.
+        self._flush_events()
+        if isinstance(context, CommandReceipt):
+            return context
+        adapter, motion, cancel_actions, is_safety, safety_epoch, safety_owner = context
+        # Safety commands may displace an old lease. Its receipt is terminal
+        # before any external cancellation is attempted.
         for old_req, old_action in cancel_actions:
             warning = self._cancel_external(old_action, old_req.commandId)
             if warning:
                 with self._lock:
                     self._receipt(old_req, CommandStatus.CANCELLED, error=warning, completedAt=self.clock(), safetyStop=True, safetyWarning=warning)
+                self._flush_events()
         try:
             outcome = self._normalize_result(adapter.dispatch(request, mapping), "dispatch")
         except Exception as exc:
             outcome = AdapterResult(status="failed", error=f"adapter dispatch failed: {exc}")
         with self._lock:
-            return self._finish_dispatch(request, mapping, outcome, motion, is_stop, stop_epoch)
+            receipt = self._finish_dispatch(request, mapping, outcome, motion, is_safety, safety_epoch, safety_owner)
+        self._flush_events()
+        return receipt
 
     def _begin_dispatch(self, request: CommandRequest, definition: CommandDefinition, mapping: MappingVersion, lease_seconds: float | None):
         if request.commandId in self._receipts:
@@ -210,6 +236,7 @@ class ActionRuntime:
             return self._receipts[self._idempotency[request.idempotencyKey]]
         self._idempotency[request.idempotencyKey] = request.commandId
         self._requests[request.commandId] = request
+        self._definitions[request.commandId] = definition
         self._mappings[request.commandId] = mapping
         try:
             if request.expiresAt <= self.clock():
@@ -223,15 +250,24 @@ class ActionRuntime:
             return self._rejected(request, mapping, "mapping mismatch")
         if self._adapter_key(request.transport) not in {self._adapter_key(t) for t in definition.transports}:
             return self._rejected(request, mapping, "transport is not supported by command definition")
+        try:
+            seconds = self.lease_seconds if lease_seconds is None else float(lease_seconds)
+        except (TypeError, ValueError, OverflowError):
+            return self._rejected(request, mapping, "leaseSeconds must be finite and non-negative")
+        if not math.isfinite(seconds) or seconds < 0:
+            return self._rejected(request, mapping, "leaseSeconds must be finite and non-negative")
+        try:
+            lease_duration = timedelta(seconds=seconds)
+        except OverflowError:
+            return self._rejected(request, mapping, "leaseSeconds is outside the supported range")
         robot = request.robotId
-        is_stop = self._priority(request.commandKey)
-        stop_epoch: int | None = None
+        is_safety = definition.kind is CommandKind.SAFETY
+        motion = definition.kind is CommandKind.MOTION
+        safety_owner = f"dispatch:{request.commandId}"
+        safety_epoch: int | None = None
         cancel_actions: list[tuple[CommandRequest, _InFlight | None]] = []
-        if is_stop:
-            stop_epoch = self._stop_epochs.get(robot, 0) + 1
-            self._stop_epochs[robot] = stop_epoch
-            self._stop_barriers.add(robot)
-            self._stop_owners[robot] = (stop_epoch, request.commandId)
+        if is_safety:
+            safety_epoch = self._claim_safety_barrier(robot, safety_owner, supersede=True)
             active = self._leases.pop(robot, None)
             if active:
                 prior_req = self._requests.get(active.command_id)
@@ -239,52 +275,50 @@ class ActionRuntime:
                 if prior_req:
                     self._receipt(prior_req, CommandStatus.CANCELLED, completedAt=self.clock(), safetyStop=True)
                     cancel_actions.append((prior_req, prior_action))
-        elif robot in self._stop_barriers:
-            return self._rejected(request, mapping, "robot stop barrier is active")
-        elif robot in self._leases:
+        elif motion and robot in self._safety_barriers:
+            return self._rejected(request, mapping, "robot safety barrier is active")
+        elif motion and robot in self._leases:
             return self._rejected(request, mapping, "robot motion lease is held")
         self._receipt(request, CommandStatus.ACCEPTED)
         adapter = self.adapters.get(self._adapter_key(request.transport))
         if adapter is None:
-            if is_stop:
-                self._clear_stop_barrier(robot, request.commandId, stop_epoch)
+            if is_safety:
+                self._clear_safety_barrier(robot, safety_owner, safety_epoch)
             return self._receipt(request, CommandStatus.FAILED, error="adapter unavailable", completedAt=self.clock())
         self._receipt(request, CommandStatus.RUNNING, startedAt=self.clock())
-        motion = not self._priority(request.commandKey)
         if motion:
-            seconds = self.lease_seconds if lease_seconds is None else max(0.0, float(lease_seconds))
-            self._leases[robot] = _Lease(request.commandId, min(request.expiresAt, self.clock() + timedelta(seconds=seconds)))
-        self._inflight[request.commandId] = _InFlight(request, mapping, adapter, motion)
-        return (adapter, motion, cancel_actions, is_stop, stop_epoch)
+            self._leases[robot] = _Lease(request.commandId, min(request.expiresAt, self.clock() + lease_duration))
+        self._inflight[request.commandId] = _InFlight(request, mapping, adapter, motion, definition.kind)
+        return (adapter, motion, cancel_actions, is_safety, safety_epoch, safety_owner)
 
-    def _finish_dispatch(self, request: CommandRequest, mapping: MappingVersion, outcome: AdapterResult, motion: bool, is_stop: bool = False, stop_epoch: int | None = None) -> CommandReceipt:
+    def _finish_dispatch(self, request: CommandRequest, mapping: MappingVersion, outcome: AdapterResult, motion: bool, is_safety: bool = False, safety_epoch: int | None = None, safety_owner: str = "") -> CommandReceipt:
         current = self._receipts[request.commandId]
         if current.status not in {CommandStatus.RUNNING, CommandStatus.ACCEPTED}:
             self._inflight.pop(request.commandId, None)
-            if is_stop:
-                self._clear_stop_barrier(request.robotId, request.commandId, stop_epoch)
+            if is_safety:
+                self._clear_safety_barrier(request.robotId, safety_owner, safety_epoch)
             return current
         status = str(outcome.status).lower()
         if status in {"succeeded", "success", "ok", "completed"}:
             receipt = self._receipt(request, CommandStatus.SUCCEEDED, result=outcome.result, completedAt=self.clock())
             self._release_lease(request.robotId, request.commandId)
             self._inflight.pop(request.commandId, None)
-            if is_stop:
-                self._clear_stop_barrier(request.robotId, request.commandId, stop_epoch)
+            if is_safety:
+                self._clear_safety_barrier(request.robotId, safety_owner, safety_epoch)
             return receipt
         if status in {"cancelled", "canceled"}:
             receipt = self._receipt(request, CommandStatus.CANCELLED, error=outcome.error, completedAt=self.clock())
             self._release_lease(request.robotId, request.commandId)
             self._inflight.pop(request.commandId, None)
-            if is_stop:
-                self._clear_stop_barrier(request.robotId, request.commandId, stop_epoch)
+            if is_safety:
+                self._clear_safety_barrier(request.robotId, safety_owner, safety_epoch)
             return receipt
         if status in {"running", "accepted", "pending"}:
             return current
         self._release_lease(request.robotId, request.commandId)
         self._inflight.pop(request.commandId, None)
-        if is_stop:
-            self._clear_stop_barrier(request.robotId, request.commandId, stop_epoch)
+        if is_safety:
+            self._clear_safety_barrier(request.robotId, safety_owner, safety_epoch)
         return self._receipt(request, CommandStatus.FAILED, error=outcome.error or f"adapter returned {outcome.status}", completedAt=self.clock())
 
     submit = dispatch
@@ -298,19 +332,20 @@ class ActionRuntime:
             if current.status in {CommandStatus.SUCCEEDED, CommandStatus.FAILED, CommandStatus.CANCELLED, CommandStatus.EXPIRED, CommandStatus.REJECTED}:
                 return current
             action = self._inflight.get(command_id)
-            stop_epoch = self._stop_owners.get(request.robotId, (None, None))[0] if self._priority(request.commandKey) else None
+            owner = f"cancel:{command_id}"
+            safety_epoch = self._claim_safety_barrier(request.robotId, owner)
             self._release_lease(request.robotId, command_id)
             self._receipt(request, CommandStatus.CANCELLED, completedAt=self.clock(), safetyStop=True)
+        self._flush_events()
         warning = self._cancel_external(action, command_id)
-        if warning:
-            with self._lock:
-                if self._priority(request.commandKey):
-                    self._clear_stop_barrier(request.robotId, request.commandId, stop_epoch)
-                return self._receipt(request, CommandStatus.FAILED, error=warning, completedAt=self.clock(), safetyStop=True, safetyWarning=warning)
         with self._lock:
-            if self._priority(request.commandKey):
-                self._clear_stop_barrier(request.robotId, request.commandId, stop_epoch)
-        return self.receipt(command_id)
+            if warning:
+                receipt = self._receipt(request, CommandStatus.FAILED, error=warning, completedAt=self.clock(), safetyStop=True, safetyWarning=warning)
+            else:
+                receipt = self._receipts[command_id]
+            self._clear_safety_barrier(request.robotId, owner, safety_epoch)
+        self._flush_events()
+        return receipt
 
     def receipt(self, command_id: str) -> CommandReceipt:
         with self._lock:
