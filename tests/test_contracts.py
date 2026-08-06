@@ -164,10 +164,37 @@ def test_future_issued_request_and_expired_plan_are_rejected():
 
 def test_assignment_revalidates_request_fields():
     request = _request()
+    original_id = request.commandId
+    original_expiry = request.expiresAt
     with pytest.raises(ValidationError):
         request.commandId = ""
+    assert request.commandId == original_id
     with pytest.raises(ValidationError):
         request.expiresAt = datetime.now(timezone.utc) - timedelta(seconds=1)
+    assert request.expiresAt == original_expiry
+
+
+def test_cross_field_future_assignment_rolls_back_all_request_fields():
+    request = _request()
+    original_issued = request.issuedAt
+    original_expiry = request.expiresAt
+    with pytest.raises(ValidationError):
+        request.issuedAt = datetime.now(timezone.utc) + timedelta(minutes=1)
+    assert request.issuedAt == original_issued
+    assert request.expiresAt == original_expiry
+
+
+def test_plan_assignment_failure_does_not_leave_expired_value():
+    plan = PlanDraft(
+        planId="plan-rollback",
+        robotId="robot-1",
+        steps=[{"stepId": "a", "commandKey": "a"}],
+        expiresAt=datetime.now(timezone.utc) + timedelta(minutes=1),
+    )
+    original = plan.expiresAt
+    with pytest.raises(ValidationError):
+        plan.expiresAt = datetime.now(timezone.utc) - timedelta(seconds=1)
+    assert plan.expiresAt == original
 
 
 def test_capability_schema_alias_serializes_without_shadow_warning():

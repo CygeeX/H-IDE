@@ -74,7 +74,16 @@ class SafetyMode(_ValueEnum):
 
 
 class ContractModel(BaseModel):
-    model_config = ConfigDict(populate_by_name=True, extra="forbid", validate_assignment=True)
+    # Domain messages are snapshots.  Use ``model_copy(update=...)`` to create
+    # a new version rather than mutating an accepted command or plan in place.
+    # This also makes failed cross-field validation unable to leave partial
+    # assignments behind.
+    model_config = ConfigDict(
+        populate_by_name=True,
+        extra="forbid",
+        frozen=True,
+        validate_assignment=True,
+    )
 
 
 class CommandDefinition(ContractModel):
