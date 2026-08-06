@@ -132,6 +132,20 @@ def test_mapping_nested_values_are_immutable_and_dump_as_json():
     assert dumped["mapping"]["nested"]["topic"] == "/gripper/open"
 
 
+def test_mapping_default_values_are_also_deeply_immutable():
+    mapping = MappingVersion(
+        mappingId="mapping-default",
+        version="v1",
+        commandKey="gripper.open",
+        transport="fake",
+    )
+    with pytest.raises(TypeError):
+        mapping.mapping["topic"] = "/gripper/open"
+    with pytest.raises(TypeError):
+        mapping.payloadSchema["type"] = "object"
+    assert mapping.model_dump(mode="json")["mapping"] == {}
+
+
 def test_json_schema_rejects_non_json_values():
     with pytest.raises(ValidationError):
         CommandDefinition(commandKey="x", commandVersion="1", payloadSchema={"bad": {1, 2}})

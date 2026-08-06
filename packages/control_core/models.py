@@ -306,8 +306,12 @@ class MappingVersion(ContractModel):
     version: str
     commandKey: str = Field(..., alias="command_key")
     transport: Transport
-    mapping: dict[str, Any] = Field(default_factory=dict)
-    payloadSchema: dict[str, Any] = Field(default_factory=dict, alias="payload_schema")
+    mapping: dict[str, Any] = Field(default_factory=dict, validate_default=True)
+    payloadSchema: dict[str, Any] = Field(
+        default_factory=dict,
+        alias="payload_schema",
+        validate_default=True,
+    )
     createdAt: datetime = Field(default_factory=utc_now, alias="created_at")
 
     @field_validator("mappingId", "version", "commandKey")
