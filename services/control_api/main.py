@@ -9,12 +9,10 @@ it is never used as a second command execution path.
 from __future__ import annotations
 
 import asyncio
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from hmac import compare_digest
 import os
 from pathlib import Path
-import re
-import unicodedata
 import uuid
 from typing import Any, Mapping
 
@@ -39,7 +37,7 @@ from packages.control_core.models import (
     Transport,
     utc_now,
 )
-from packages.control_core.registry import MappingRecord, MappingRegistry
+from packages.control_core.registry import MappingRecord, MappingRegistry, mapping_target_values
 from packages.control_core.runtime import ActionRuntime
 
 from .store import SQLiteStore, _jsonable
@@ -90,19 +88,13 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex}"
 
 
+class _CommandIdentityConflict(ValueError):
+    """A command id is already owned by another idempotency key."""
+
+
 def _embedded_mapping_target(mapping: MappingVersion) -> str | None:
-    targets: list[str] = []
-    for key, value in mapping.mapping.items():
-        normalized = re.sub(r"[^a-z0-9]", "", unicodedata.normalize("NFKC", str(key)).casefold())
-        if normalized in {"targetid", "target"}:
-            if not isinstance(value, str) or not value.strip():
-                raise ValueError("mapping target must be a non-empty string")
-            targets.append(value.strip())
-    if not targets:
-        return None
-    if len(set(targets)) != 1:
-        raise ValueError("mapping target aliases conflict")
-    return targets[0]
+    targets = mapping_target_values(mapping.mapping)
+    return targets[0] if targets else None
 
 
 def _mapping_target_binding(record: MappingRecord) -> str | None:
@@ -126,6 +118,27 @@ def _mapping_target_binding(record: MappingRecord) -> str | None:
     return embedded
 
 
+def _payload_expired(payload: Mapping[str, Any] | Any) -> bool:
+    """Check a persisted plan expiry without relying on creation-time validation."""
+    if not isinstance(payload, Mapping):
+        return False
+    raw = payload.get("expiresAt", payload.get("expires_at"))
+    if raw is None:
+        return False
+    if isinstance(raw, datetime):
+        value = raw
+    elif isinstance(raw, str):
+        try:
+            value = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+    else:
+        return False
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc) <= utc_now()
+
+
 class _ControlContext:
     def __init__(self, store: SQLiteStore, token: str, adapters: Mapping[str | Transport, CommandAdapter]):
         self.store = store
@@ -137,7 +150,9 @@ class _ControlContext:
         self.runtime = ActionRuntime(adapters=normalized, event_sink=store.record_event)
 
     def seed(self) -> None:
-        self.store.reset_confirming_drafts()
+        # A process restart cannot know whether a robot accepted each step of
+        # an in-flight confirmation.  Mark it unknown; never silently replay.
+        self.store.recover_confirming_drafts()
         robot = RobotState(
             robotId="robot-1",
             status=RobotStatus.ONLINE,
@@ -188,6 +203,37 @@ class _ControlContext:
         if persisted:
             for row in persisted:
                 self._restore_mapping(row)
+            # The active pointer is the atomic source of truth.  Historical
+            # superseded rows are retained solely for explicit rollback.
+            grouped: dict[str, list[Mapping[str, Any]]] = {}
+            for row in persisted:
+                command_key = row["mapping"].get("commandKey") or row["mapping"].get("command_key")
+                if isinstance(command_key, str):
+                    grouped.setdefault(command_key, []).append(row)
+            pointers = self.store.list_active_pointers()
+            for command_key, rows in grouped.items():
+                pointer = pointers.get(command_key)
+                if pointer is None:
+                    active_rows = [row for row in rows if row.get("status") == "active"]
+                    if active_rows:
+                        active_rows.sort(key=lambda row: row.get("updatedAt", ""))
+                        pointer = (
+                            active_rows[-1]["mapping"].get("mappingId"),
+                            active_rows[-1]["mapping"].get("version"),
+                        )
+                if pointer and all(isinstance(item, str) and item for item in pointer):
+                    try:
+                        self.registry.restore_active_pointer(command_key, pointer[0], pointer[1])
+                    except ValueError:
+                        continue
+                history = []
+                for row in sorted(rows, key=lambda row: row.get("updatedAt", "")):
+                    if row.get("status") == "superseded":
+                        mapping_payload = row["mapping"]
+                        history.append((mapping_payload.get("mappingId"), mapping_payload.get("version")))
+                history = [item for item in history if all(isinstance(part, str) and part for part in item)]
+                if history:
+                    self.registry.restore_history(command_key, history)
         else:
             for definition in definitions:
                 mapping = MappingVersion(
@@ -219,28 +265,23 @@ class _ControlContext:
         # also duplicate lifecycle audit records.  The persisted transition
         # order is already the source of truth; registry operations below are
         # only an in-memory replay.
-        audit_sink = self.registry.audit_sink
-        self.registry.audit_sink = None
         try:
             mapping = MappingVersion.model_validate(row["mapping"])
             target_id = row.get("targetId")
             status = str(row.get("status", "draft"))
-            record = self.registry.create_draft(mapping, target_id=target_id)
-            if status in {"validated", "probed", "active", "superseded"}:
-                record = self.registry.validate(mapping.mappingId, mapping.version)
-            if status in {"probed", "active", "superseded"}:
-                record = self.registry.probe(mapping.mappingId, mapping.version)
-            if status in {"active", "superseded"}:
-                # Replaying superseded activations rebuilds the registry's
-                # rollback history while the chronological store order keeps
-                # the persisted active pointer as the final one.
-                record = self.registry.activate(mapping.mappingId, mapping.version)
+            probe_payload = row.get("probe")
+            probe = None
+            if isinstance(probe_payload, Mapping):
+                try:
+                    probe = AdapterResult(**dict(probe_payload))
+                except (TypeError, ValueError):
+                    probe = AdapterResult(status="failed", error="persisted probe is invalid")
+            record = MappingRecord(mapping=mapping, status=status, target_id=target_id, probe=probe)
+            self.registry.restore_record(record)
         except (ValueError, ValidationError):
             # Ignore stale/corrupt rows during startup; the repository remains
             # readable and callers can submit a new validated mapping.
             return
-        finally:
-            self.registry.audit_sink = audit_sink
 
     def definition(self, command_key: str, version: str | None = None) -> CommandDefinition:
         requested = version or "1"
@@ -276,7 +317,16 @@ def create_app(
     context = _ControlContext(store, token, adapter_map)
     context.seed()
 
-    app = FastAPI(title="Robot Action Control API", version="0.1.0")
+    # The control surface is authenticated; exposing an unauthenticated schema
+    # would disclose robot capabilities and command contracts.  Operators can
+    # publish a separately authenticated schema if needed.
+    app = FastAPI(
+        title="Robot Action Control API",
+        version="0.1.0",
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
     app.state.control = context
     app.state.store = store
     app.state.runtime = context.runtime
@@ -334,25 +384,42 @@ def create_app(
             raise AssertionError("unreachable")
 
     def _dispatch_and_save(context: _ControlContext, request: CommandRequest, definition: CommandDefinition, mapping: MappingVersion) -> CommandReceipt:
-        existing = context.store.get_command_record(request.commandId)
-        receipt = context.runtime.dispatch(request, definition, mapping)
-        if existing is None:
-            # An idempotency retry can return a receipt owned by an earlier
-            # command ID.  Persist that original immutable request instead of
-            # overwriting it with the retry's payload.
-            persisted_request = context.runtime._requests.get(receipt.commandId, request)
-            context.store.save_command(persisted_request, receipt)
+        claim = context.store.claim_command(request)
+        if not claim.owned:
+            if claim.conflict:
+                raise _CommandIdentityConflict("commandId is already bound to another idempotencyKey")
+            if not claim.record:
+                raise RuntimeError("idempotency claim lost without a durable record")
+            try:
+                return CommandReceipt.model_validate(claim.record["receipt"])
+            except ValidationError as exc:
+                raise RuntimeError("persisted command receipt is invalid") from exc
+        try:
+            receipt = context.runtime.dispatch(request, definition, mapping)
+        except Exception as exc:
+            # A claimed row must become terminal even if an unexpected runtime
+            # exception crosses the API boundary; otherwise retries could
+            # dispatch an unknown command after a restart.
+            receipt = CommandReceipt(
+                commandId=request.commandId,
+                robotId=request.robotId,
+                status="failed",
+                error=f"runtime dispatch failed: {exc}",
+                completedAt=utc_now(),
+            )
+        persisted_request = context.runtime._requests.get(request.commandId, request)
+        context.store.save_command(persisted_request, receipt)
         return receipt
 
     def _save_mapping_change(context: _ControlContext, record: MappingRecord, previous: MappingVersion | None = None) -> None:
+        records = [record]
         if previous is not None and (previous.mappingId, previous.version) != (record.mapping.mappingId, record.version):
             try:
-                # Persist the superseded pointer before the new active one so
-                # updated_at remains a replayable transition sequence.
-                context.store.save_mapping(context.registry.get(previous.mappingId, previous.version))
+                records.insert(0, context.registry.get(previous.mappingId, previous.version))
             except ValueError:
                 pass
-        context.store.save_mapping(record)
+        active = record.mapping if record.status == "active" else None
+        context.store.save_mapping_batch(records, active=active)
 
     @app.get("/api/v1/robots", dependencies=[Depends(require_auth)])
     def list_robots(context: _ControlContext = Depends(get_context)):
@@ -370,6 +437,22 @@ def create_app(
         requested_source = body.get("source")
         if requested_source is not None and str(requested_source).lower() != CommandSource.MANUAL.value:
             raise HTTPException(status_code=422, detail="manual endpoint requires source=manual")
+        # Resolve durable identity before looking up a robot, definition, or
+        # mapping.  A retry must return its original receipt even after a
+        # deployment changed or removed the mapping used by that command.
+        supplied_key = body.get("idempotencyKey", body.get("idempotency_key"))
+        if isinstance(supplied_key, str) and supplied_key:
+            existing = context.store.get_command_by_idempotency(supplied_key)
+            if existing is not None:
+                return existing["receipt"]
+        supplied_command_id = body.get("commandId", body.get("command_id"))
+        if isinstance(supplied_command_id, str) and supplied_command_id:
+            existing = context.store.get_command_record(supplied_command_id)
+            if existing is not None:
+                existing_key = existing.get("idempotencyKey")
+                if existing_key == supplied_key:
+                    return existing["receipt"]
+                raise HTTPException(status_code=409, detail="commandId is already bound to another idempotencyKey")
         robot_id = body.get("robotId", body.get("robot_id"))
         if not isinstance(robot_id, str) or context.store.get_robot(robot_id) is None:
             raise HTTPException(status_code=404, detail="robot not found")
@@ -393,7 +476,10 @@ def create_app(
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         if target is not None and target != request.robotId:
             raise HTTPException(status_code=422, detail="mapping target does not match robotId")
-        receipt = _dispatch_and_save(context, request, definition, mapping)
+        try:
+            receipt = _dispatch_and_save(context, request, definition, mapping)
+        except _CommandIdentityConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return _receipt_json(receipt)
 
     @app.get("/api/v1/commands", dependencies=[Depends(require_auth)])
@@ -409,8 +495,20 @@ def create_app(
 
     @app.post("/api/v1/commands/{command_id}/cancel", dependencies=[Depends(require_auth)])
     def cancel_command(command_id: str, context: _ControlContext = Depends(get_context)):
-        if context.store.get_command(command_id) is None:
+        persisted_record = context.store.get_command_record(command_id)
+        if persisted_record is None:
             raise HTTPException(status_code=404, detail="command not found")
+        persisted_receipt = persisted_record["receipt"]
+        persisted_status = str(persisted_receipt.get("status", "")).lower()
+        if persisted_status in {"succeeded", "failed", "cancelled", "canceled", "expired", "rejected"}:
+            return persisted_receipt
+        # Runtime state is intentionally in-memory.  A restarted process must
+        # not pretend it can cancel an adapter operation it does not own.
+        if command_id not in context.runtime._requests or command_id not in context.runtime._receipts:
+            raise HTTPException(
+                status_code=409,
+                detail="command is persisted but runtime ownership is unavailable after restart; reconciliation required",
+            )
         try:
             receipt = context.runtime.cancel(command_id)
         except ValueError as exc:
@@ -483,8 +581,6 @@ def create_app(
     @app.post("/api/v1/assistant/drafts", dependencies=[Depends(require_auth)])
     def create_assistant_draft(body: dict[str, Any], context: _ControlContext = Depends(get_context)):
         draft_id = body.get("draftId", body.get("draft_id")) or body.get("planId", body.get("plan_id")) or _new_id("draft")
-        if context.store.get_assistant_draft(draft_id) is not None:
-            raise HTTPException(status_code=409, detail="assistant draft already exists")
         plan_data = dict(body)
         plan_data.pop("draftId", None)
         plan_data.pop("draft_id", None)
@@ -494,7 +590,8 @@ def create_app(
         except ValidationError as exc:
             fail_validation(exc)
             raise AssertionError("unreachable")
-        context.store.save_assistant_draft(draft_id, _plain(plan), status="draft")
+        if not context.store.save_assistant_draft(draft_id, _plain(plan), status="draft"):
+            raise HTTPException(status_code=409, detail="assistant draft already exists")
         return {"draftId": draft_id, "status": "draft", "plan": _plain(plan)}
 
     @app.get("/api/v1/assistant/drafts/{draft_id}", dependencies=[Depends(require_auth)])
@@ -512,14 +609,48 @@ def create_app(
         if stored is None:
             raise HTTPException(status_code=404, detail="assistant draft not found")
         if stored["status"] != "draft":
-            raise HTTPException(status_code=409, detail="assistant draft is already confirmed")
+            raise HTTPException(status_code=409, detail=f"assistant draft is not confirmable (status={stored['status']})")
+        if _payload_expired(stored.get("plan", {})):
+            context.store.set_assistant_draft_status(
+                draft_id, "expired", expected_status="draft", error="assistant plan has expired"
+            )
+            raise HTTPException(status_code=409, detail="assistant plan has expired")
         if not context.store.claim_assistant_draft(draft_id):
             raise HTTPException(status_code=409, detail="assistant draft is already being confirmed")
+
+        raw_execution = stored.get("execution")
+        execution_invalid = not isinstance(raw_execution, Mapping)
+        execution: dict[str, Any] = dict(raw_execution) if isinstance(raw_execution, Mapping) else {}
+        execution.setdefault("steps", [])
+        execution.setdefault("receipts", [])
+        if not isinstance(execution["steps"], list) or not isinstance(execution["receipts"], list):
+            execution_invalid = True
+            execution = {"steps": [], "receipts": []}
+        receipts: list[CommandReceipt] = []
+
+        def terminal_failure(status: str, message: str) -> HTTPException:
+            context.store.set_assistant_draft_status(
+                draft_id,
+                status,
+                expected_status="confirming",
+                execution=execution,
+                error=message,
+            )
+            return HTTPException(status_code=409, detail=message)
+
         try:
+            if execution_invalid:
+                raise terminal_failure("failed", "stored assistant execution state is invalid")
+            if _payload_expired(stored.get("plan", {})):
+                raise terminal_failure("expired", "assistant plan has expired")
             plan = PlanDraft.model_validate(stored["plan"])
         except ValidationError as exc:
-            context.store.set_assistant_draft_status(draft_id, "draft")
-            raise HTTPException(status_code=409, detail="stored assistant draft is invalid") from exc
+            message = str(exc)
+            if "expiresAt is in the past" in message or "expires_at" in message and "past" in message:
+                raise terminal_failure("expired", "assistant plan has expired") from exc
+            raise terminal_failure("failed", "stored assistant draft is invalid") from exc
+        except HTTPException:
+            raise
         try:
             # Resolve every step before dispatching any of them, preserving the
             # confirmation gate and preventing a partially unknown plan.
@@ -537,7 +668,6 @@ def create_app(
                 if target is not None and target != plan.robotId:
                     raise HTTPException(status_code=409, detail="mapping target does not match robotId")
                 resolved.append((step, definition, mapping))
-            receipts: list[CommandReceipt] = []
             for step, definition, mapping in resolved:
                 request = _build_request(
                     {
@@ -557,11 +687,44 @@ def create_app(
                 )
                 receipt = _dispatch_and_save(context, request, definition, mapping)
                 receipts.append(receipt)
-            context.store.set_assistant_draft_status(draft_id, "confirmed")
+                execution["steps"].append(
+                    {
+                        "stepId": step.stepId,
+                        "commandId": receipt.commandId,
+                        "status": receipt.status.value,
+                        "receipt": _receipt_json(receipt),
+                    }
+                )
+                execution["receipts"].append(_receipt_json(receipt))
+                if not context.store.update_assistant_execution(draft_id, execution):
+                    raise terminal_failure("unknown", "assistant confirmation ownership was lost")
+                if receipt.status.value in {"failed", "rejected", "cancelled", "expired"}:
+                    status = "partial" if len(receipts) > 1 or any(
+                        item.get("status") == "succeeded" for item in execution["steps"][:-1]
+                    ) else "failed"
+                    raise terminal_failure(status, receipt.error or f"assistant step {step.stepId} did not succeed")
+            if not context.store.set_assistant_draft_status(
+                draft_id, "confirmed", expected_status="confirming", execution=execution
+            ):
+                raise terminal_failure("unknown", "assistant confirmation ownership was lost")
             return {"draftId": draft_id, "status": "confirmed", "receipts": [_receipt_json(receipt) for receipt in receipts]}
-        except Exception:
-            context.store.set_assistant_draft_status(draft_id, "draft")
+        except HTTPException as exc:
+            # Resolution can fail before the first adapter call (for example
+            # a removed command definition or active mapping).  It is still a
+            # terminal confirmation attempt; leaving ``confirming`` here
+            # would make a later restart look like an ambiguous replay.
+            current = context.store.get_assistant_draft(draft_id)
+            if current is not None and current.get("status") == "confirming":
+                status = "partial" if execution["steps"] else "failed"
+                detail = str(exc.detail)
+                raise terminal_failure(status, detail) from exc
             raise
+        except _CommandIdentityConflict as exc:
+            status = "partial" if execution["steps"] else "failed"
+            raise terminal_failure(status, str(exc)) from exc
+        except Exception as exc:
+            status = "partial" if execution["steps"] else "failed"
+            raise terminal_failure(status, f"assistant confirmation failed: {exc}") from exc
 
     # Singular aliases keep clients that model a single assistant draft or
     # mapping draft compatible without duplicating execution logic.

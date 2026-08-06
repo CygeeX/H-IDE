@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
 import threading
+import time
 import warnings
 
 import pytest
@@ -15,6 +16,34 @@ from services.control_api.store import SQLiteStore
 
 
 TOKEN = "test-token"
+
+
+class _SequenceAdapter(FakeAdapter):
+    """Deterministic adapter used to make a plan fail after one step."""
+
+    def __init__(self, results):
+        super().__init__()
+        self._results = list(results)
+        self._lock = threading.Lock()
+
+    def dispatch(self, request, mapping):
+        self.dispatches.append((request, mapping))
+        with self._lock:
+            if self._results:
+                return self._results.pop(0)
+        return AdapterResult(status="succeeded")
+
+
+class _SlowCountingAdapter(FakeAdapter):
+    def __init__(self):
+        super().__init__()
+        self._lock = threading.Lock()
+
+    def dispatch(self, request, mapping):
+        with self._lock:
+            self.dispatches.append((request, mapping))
+        time.sleep(0.08)
+        return AdapterResult(status="succeeded")
 
 
 def auth():
@@ -303,3 +332,160 @@ def test_store_events_are_written_during_concurrent_requests(tmp_path):
     events = client.get("/api/v1/events", headers=auth()).json()
     assert len(events) >= 5
     assert len({event["commandId"] for event in events}) == 3
+
+
+def test_idempotency_is_durable_across_restart(tmp_path):
+    db_path = str(tmp_path / "idempotency.db")
+    first_adapter = FakeAdapter()
+    first = TestClient(create_app(db_path=db_path, auth_token=TOKEN, adapters={"fake": first_adapter}))
+    original = first.post("/api/v1/commands", headers=auth(), json=command_body(idempotencyKey="restart-key"))
+    assert original.status_code == 200
+
+    second_adapter = FakeAdapter()
+    restarted = TestClient(create_app(db_path=db_path, auth_token=TOKEN, adapters={"fake": second_adapter}))
+    retry = restarted.post(
+        "/api/v1/commands",
+        headers=auth(),
+        json=command_body(idempotencyKey="restart-key", payload={"mustNotRunAgain": True}),
+    )
+    assert retry.status_code == 200
+    assert retry.json() == original.json()
+    assert second_adapter.dispatches == []
+
+
+def test_same_idempotency_key_is_claimed_once_under_concurrency(tmp_path):
+    adapter = _SlowCountingAdapter()
+    app = create_app(db_path=str(tmp_path / "concurrent-idem.db"), auth_token=TOKEN, adapters={"fake": adapter})
+    client = TestClient(app)
+    body = command_body(idempotencyKey="one-owner")
+
+    def submit():
+        return client.post("/api/v1/commands", headers=auth(), json=body)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(lambda _: submit(), range(2)))
+    assert [response.status_code for response in responses] == [200, 200]
+    assert len(adapter.dispatches) == 1
+    assert len({response.json()["commandId"] for response in responses}) == 1
+
+
+def test_command_id_conflict_never_dispatches_twice():
+    adapter = FakeAdapter()
+    client = TestClient(create_app(auth_token=TOKEN, adapters={"fake": adapter}))
+    first = client.post(
+        "/api/v1/commands",
+        headers=auth(),
+        json=command_body(commandId="fixed-command", idempotencyKey="fixed-key"),
+    )
+    assert first.status_code == 200
+    conflict = client.post(
+        "/api/v1/commands",
+        headers=auth(),
+        json=command_body(commandId="fixed-command", idempotencyKey="different-key"),
+    )
+    assert conflict.status_code == 409
+    assert len(adapter.dispatches) == 1
+
+
+def test_assistant_partial_failure_is_durable_and_not_replayed():
+    adapter = _SequenceAdapter(
+        [AdapterResult(status="succeeded", result={"step": 1}), AdapterResult(status="failed", error="step failed")]
+    )
+    app = create_app(auth_token=TOKEN, adapters={"fake": adapter})
+    client = TestClient(app)
+    draft = client.post(
+        "/api/v1/assistant/drafts",
+        headers=auth(),
+        json={
+            "draftId": "partial-plan",
+            "robotId": "robot-1",
+            "steps": [
+                {"stepId": "first", "commandKey": "move.forward", "payload": {}},
+                {"stepId": "second", "commandKey": "gripper.open", "payload": {}},
+            ],
+        },
+    )
+    assert draft.status_code == 200
+    failed = client.post("/api/v1/assistant/drafts/partial-plan/confirm", headers=auth())
+    assert failed.status_code == 409
+    stored = client.get("/api/v1/assistant/drafts/partial-plan", headers=auth()).json()
+    assert stored["status"] == "partial"
+    assert len(stored["execution"]["steps"]) == 2
+    assert len(adapter.dispatches) == 2
+    assert client.post("/api/v1/assistant/drafts/partial-plan/confirm", headers=auth()).status_code == 409
+    assert len(adapter.dispatches) == 2
+
+
+def test_assistant_resolution_failure_is_terminal_not_replayable():
+    client = TestClient(create_app(auth_token=TOKEN))
+    created = client.post(
+        "/api/v1/assistant/drafts",
+        headers=auth(),
+        json={
+            "draftId": "unresolvable-plan",
+            "robotId": "robot-1",
+            "steps": [{"stepId": "missing", "commandKey": "does.not.exist", "payload": {}}],
+        },
+    )
+    assert created.status_code == 200
+    assert client.post("/api/v1/assistant/drafts/unresolvable-plan/confirm", headers=auth()).status_code == 409
+    stored = client.get("/api/v1/assistant/drafts/unresolvable-plan", headers=auth()).json()
+    assert stored["status"] == "failed"
+    assert client.post("/api/v1/assistant/drafts/unresolvable-plan/confirm", headers=auth()).status_code == 409
+
+
+def test_restart_recovery_marks_confirming_plan_unknown(tmp_path):
+    db_path = str(tmp_path / "confirming.db")
+    first = create_app(db_path=db_path, auth_token=TOKEN)
+    first.state.store.save_assistant_draft(
+        "interrupted-plan",
+        {
+            "planId": "interrupted-plan",
+            "robotId": "robot-1",
+            "steps": [{"stepId": "step", "commandKey": "move.forward", "payload": {}}],
+        },
+    )
+    assert first.state.store.claim_assistant_draft("interrupted-plan")
+    restarted_adapter = FakeAdapter()
+    restarted = TestClient(create_app(db_path=db_path, auth_token=TOKEN, adapters={"fake": restarted_adapter}))
+    recovered = restarted.get("/api/v1/assistant/drafts/interrupted-plan", headers=auth()).json()
+    assert recovered["status"] == "unknown"
+    assert restarted.post("/api/v1/assistant/drafts/interrupted-plan/confirm", headers=auth()).status_code == 409
+    assert restarted_adapter.dispatches == []
+
+
+def test_restart_running_command_cancel_is_explicitly_unavailable(tmp_path):
+    db_path = str(tmp_path / "running.db")
+    running_adapter = FakeAdapter(result=AdapterResult(status="running"))
+    first = TestClient(create_app(db_path=db_path, auth_token=TOKEN, adapters={"fake": running_adapter}))
+    submitted = first.post("/api/v1/commands", headers=auth(), json=command_body(idempotencyKey="running-restart"))
+    assert submitted.status_code == 200
+    command_id = submitted.json()["commandId"]
+    restarted = TestClient(create_app(db_path=db_path, auth_token=TOKEN, adapters={"fake": FakeAdapter()}))
+    cancelled = restarted.post(f"/api/v1/commands/{command_id}/cancel", headers=auth())
+    assert cancelled.status_code in {409, 503}
+    assert restarted.get(f"/api/v1/commands/{command_id}", headers=auth()).json()["status"] == "running"
+
+
+def test_nested_mapping_target_alias_is_bound_and_checked():
+    adapter = FakeAdapter()
+    client = TestClient(create_app(auth_token=TOKEN, adapters={"fake": adapter}))
+    body = mapping_body(mapping_id="nested-target")
+    body["mapping"] = {"transport": {"target_id": "robot-2", "topic": "/move"}}
+    assert client.post("/api/v1/mappings/drafts", headers=auth(), json=body).status_code == 200
+    for action in ("validate", "probe", "activate"):
+        assert client.post(f"/api/v1/mappings/nested-target/v1/{action}", headers=auth()).status_code == 200
+    response = client.post(
+        "/api/v1/commands",
+        headers=auth(),
+        json=command_body(idempotencyKey="nested-target-command", mappingId="nested-target", mappingVersion="v1"),
+    )
+    assert response.status_code == 422
+    assert adapter.dispatches == []
+
+
+def test_openapi_and_docs_are_not_public():
+    client = TestClient(create_app(auth_token=TOKEN))
+    assert client.get("/openapi.json").status_code == 404
+    assert client.get("/docs").status_code == 404
+    assert client.get("/redoc").status_code == 404

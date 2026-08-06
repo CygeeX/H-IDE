@@ -39,6 +39,32 @@ def validate_mapping_safety(mapping: MappingVersion) -> None:
     walk(mapping.mapping)
 
 
+def mapping_target_values(value: Any) -> tuple[str, ...]:
+    """Collect target aliases recursively from an untrusted mapping payload."""
+    targets: list[str] = []
+
+    def walk(item: Any) -> None:
+        if isinstance(item, Mapping):
+            for key, child in item.items():
+                normalized = re.sub(
+                    r"[^a-z0-9]", "", unicodedata.normalize("NFKC", str(key)).casefold()
+                )
+                if normalized in {"targetid", "target"}:
+                    if not isinstance(child, str) or not child.strip():
+                        raise ValueError("target must be a non-empty string")
+                    targets.append(child.strip())
+                else:
+                    walk(child)
+        elif isinstance(item, (list, tuple)):
+            for child in item:
+                walk(child)
+
+    walk(value)
+    if len(set(targets)) > 1:
+        raise ValueError("mapping target aliases conflict")
+    return tuple(targets)
+
+
 def _snapshot_probe_result(value: Any) -> AdapterResult:
     if not isinstance(value, AdapterResult):
         return AdapterResult(status="unavailable", error="adapter probe returned invalid result")
@@ -202,18 +228,8 @@ class MappingRegistry:
 
     @staticmethod
     def _mapping_target(mapping: MappingVersion) -> str | None:
-        targets: list[str] = []
-        for key, value in mapping.mapping.items():
-            normalized = re.sub(r"[^a-z0-9]", "", unicodedata.normalize("NFKC", str(key)).casefold())
-            if normalized in {"targetid", "target"}:
-                if not isinstance(value, str) or not value.strip():
-                    raise ValueError("target must be a non-empty string")
-                targets.append(value.strip())
-        if not targets:
-            return None
-        if len(set(targets)) != 1:
-            raise ValueError("mapping target aliases conflict")
-        return targets[0]
+        targets = mapping_target_values(mapping.mapping)
+        return targets[0] if targets else None
 
     def validate(self, mapping_id: str, version: str) -> MappingRecord:
         with self._lock:
@@ -340,5 +356,28 @@ class MappingRegistry:
         with self._lock:
             return self._require(mapping_id, version)
 
+    def restore_record(self, record: MappingRecord) -> None:
+        """Hydrate a persisted snapshot without probing or emitting audits."""
+        with self._lock:
+            key = self._key(record.mapping.mappingId, record.mapping.version)
+            if key in self._records:
+                raise ValueError("mapping version already exists")
+            self._records[key] = record
 
-__all__ = ["MappingRecord", "MappingRegistry", "validate_mapping_safety"]
+    def restore_active_pointer(self, command_key: str, mapping_id: str, version: str) -> None:
+        """Hydrate the durable active pointer after all snapshots are loaded."""
+        with self._lock:
+            record = self._require(mapping_id, version)
+            self._active[command_key] = (mapping_id, version)
+            self._history.setdefault(command_key, [])
+            if record.status != "active":
+                self._records[(mapping_id, version)] = MappingRecord(
+                    record.mapping, "active", record.target_id, record.probe
+                )
+
+    def restore_history(self, command_key: str, history: list[tuple[str, str]]) -> None:
+        with self._lock:
+            self._history[command_key] = list(history)
+
+
+__all__ = ["MappingRecord", "MappingRegistry", "mapping_target_values", "validate_mapping_safety"]

@@ -8,7 +8,7 @@ can be reopened by another app instance.
 
 from __future__ import annotations
 
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -20,6 +20,20 @@ from pydantic import BaseModel
 
 from packages.control_core.models import CapabilitySnapshot, CommandReceipt, CommandRequest, RobotState
 from packages.control_core.registry import MappingRecord
+
+
+@dataclass(frozen=True)
+class CommandClaim:
+    """Result of the durable command idempotency claim.
+
+    ``owned`` is true only for the request that inserted the durable row.
+    A caller seeing ``conflict`` supplied a command id already owned by a
+    different idempotency key; neither case is allowed to dispatch again.
+    """
+
+    owned: bool
+    conflict: bool
+    record: dict[str, Any] | None
 
 
 def _jsonable(value: Any) -> Any:
@@ -77,6 +91,7 @@ class SQLiteStore:
                 );
                 CREATE TABLE IF NOT EXISTS commands (
                     command_id TEXT PRIMARY KEY,
+                    idempotency_key TEXT,
                     request_json TEXT NOT NULL,
                     receipt_json TEXT NOT NULL,
                     status TEXT NOT NULL,
@@ -107,12 +122,95 @@ class SQLiteStore:
                     draft_id TEXT PRIMARY KEY,
                     payload_json TEXT NOT NULL,
                     status TEXT NOT NULL,
+                    execution_json TEXT NOT NULL DEFAULT '{}',
+                    error TEXT,
                     created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS mapping_active (
+                    command_key TEXT PRIMARY KEY,
+                    mapping_id TEXT NOT NULL,
+                    version TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
                 """
             )
+            # Existing installations predate the durable idempotency and
+            # assistant execution columns.  Migrate in place rather than
+            # requiring operators to delete a command database.
+            self._ensure_column("commands", "idempotency_key", "TEXT")
+            self._ensure_column("assistant_drafts", "execution_json", "TEXT NOT NULL DEFAULT '{}'" )
+            self._ensure_column("assistant_drafts", "error", "TEXT")
+            self._backfill_idempotency_keys()
+            self._connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS commands_idempotency_key_uq "
+                "ON commands(idempotency_key) WHERE idempotency_key IS NOT NULL"
+            )
+            self._backfill_mapping_pointers()
             self._connection.commit()
+
+    def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        columns = {
+            str(row["name"])
+            for row in self._connection.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column not in columns:
+            self._connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    def _backfill_idempotency_keys(self) -> None:
+        rows = self._connection.execute(
+            "SELECT command_id, request_json, idempotency_key FROM commands ORDER BY created_at, command_id"
+        ).fetchall()
+        seen: set[str] = set()
+        for row in rows:
+            key = row["idempotency_key"]
+            if not isinstance(key, str) or not key:
+                try:
+                    request = _decode(row["request_json"])
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    request = {}
+                key = request.get("idempotencyKey") or request.get("idempotency_key")
+            if not isinstance(key, str) or not key:
+                key = f"legacy:{row['command_id']}"
+            # A legacy database may contain duplicate keys because no unique
+            # constraint existed.  Preserve every command while making the
+            # first row's key authoritative for future retries.
+            candidate = key
+            if candidate in seen:
+                candidate = f"{key}:legacy:{row['command_id']}"
+                suffix = 1
+                while candidate in seen:
+                    suffix += 1
+                    candidate = f"{key}:legacy:{row['command_id']}:{suffix}"
+            seen.add(candidate)
+            if row["idempotency_key"] != candidate:
+                self._connection.execute(
+                    "UPDATE commands SET idempotency_key = ? WHERE command_id = ?",
+                    (candidate, row["command_id"]),
+                )
+
+    def _backfill_mapping_pointers(self) -> None:
+        """Infer active pointers once for databases created before the table."""
+        existing = self._connection.execute("SELECT COUNT(*) AS n FROM mapping_active").fetchone()["n"]
+        if existing:
+            return
+        rows = self._connection.execute(
+            "SELECT payload_json, mapping_id, version, updated_at FROM mappings "
+            "WHERE status = 'active' ORDER BY updated_at, mapping_id, version"
+        ).fetchall()
+        for row in rows:
+            try:
+                payload = _decode(row["payload_json"])
+                command_key = payload.get("commandKey") or payload.get("command_key")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                command_key = None
+            if isinstance(command_key, str) and command_key:
+                self._connection.execute(
+                    "INSERT INTO mapping_active(command_key, mapping_id, version, updated_at) "
+                    "VALUES (?, ?, ?, ?) ON CONFLICT(command_key) DO UPDATE SET "
+                    "mapping_id=excluded.mapping_id, version=excluded.version, updated_at=excluded.updated_at",
+                    (command_key, row["mapping_id"], row["version"], row["updated_at"]),
+                )
 
     @staticmethod
     def _now() -> str:
@@ -181,41 +279,147 @@ class SQLiteStore:
             row = self._connection.execute("SELECT payload_json FROM capabilities WHERE robot_id = ?", (robot_id,)).fetchone()
         return None if row is None else _decode(row["payload_json"])
 
-    def save_command(self, request: CommandRequest | Mapping[str, Any], receipt: CommandReceipt | Mapping[str, Any]) -> None:
+    def _command_identity(self, request_payload: Mapping[str, Any]) -> tuple[str, str]:
+        command_id = request_payload.get("commandId") or request_payload.get("command_id")
+        idempotency_key = request_payload.get("idempotencyKey") or request_payload.get("idempotency_key")
+        if not isinstance(command_id, str) or not command_id:
+            raise ValueError("commandId is required")
+        if not isinstance(idempotency_key, str) or not idempotency_key:
+            raise ValueError("idempotencyKey is required")
+        return command_id, idempotency_key
+
+    @staticmethod
+    def _command_record_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "request": _decode(row["request_json"]),
+            "receipt": _decode(row["receipt_json"]),
+            "idempotencyKey": row["idempotency_key"],
+        }
+
+    def claim_command(
+        self,
+        request: CommandRequest | Mapping[str, Any],
+        receipt: CommandReceipt | Mapping[str, Any] | None = None,
+    ) -> CommandClaim:
+        """Atomically claim a command idempotency key before adapter dispatch.
+
+        The placeholder receipt makes a command visible to concurrent callers
+        while the owner is talking to the robot.  SQLite's write transaction
+        and unique index make this safe across threads and process restarts.
+        """
         request_payload = self._request_payload(request)
-        receipt_payload = self._receipt_payload(receipt)
-        command_id = receipt_payload.get("commandId") or receipt_payload.get("command_id") or request_payload.get("commandId")
+        command_id, idempotency_key = self._command_identity(request_payload)
+        if receipt is None:
+            receipt_payload = {
+                "commandId": command_id,
+                "robotId": request_payload.get("robotId") or request_payload.get("robot_id"),
+                "status": "accepted",
+                "acceptedAt": self._now(),
+                "startedAt": None,
+                "completedAt": None,
+                "result": None,
+                "error": None,
+            }
+        else:
+            receipt_payload = self._receipt_payload(receipt)
         status = receipt_payload.get("status")
         if hasattr(status, "value"):
             status = status.value
-        if not isinstance(command_id, str) or not command_id:
-            raise ValueError("commandId is required")
+        if not isinstance(status, str) or not status:
+            status = "accepted"
+        receipt_payload["status"] = status
+        now = self._now()
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                by_id = self._connection.execute(
+                    "SELECT command_id, idempotency_key, request_json, receipt_json FROM commands WHERE command_id = ?",
+                    (command_id,),
+                ).fetchone()
+                if by_id is not None:
+                    self._connection.commit()
+                    record = self._command_record_from_row(by_id)
+                    return CommandClaim(False, record.get("idempotencyKey") != idempotency_key, record)
+                by_key = self._connection.execute(
+                    "SELECT command_id, idempotency_key, request_json, receipt_json FROM commands WHERE idempotency_key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if by_key is not None:
+                    self._connection.commit()
+                    return CommandClaim(False, False, self._command_record_from_row(by_key))
+                self._connection.execute(
+                    "INSERT INTO commands(command_id, idempotency_key, request_json, receipt_json, status, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (command_id, idempotency_key, _encode(request_payload), _encode(receipt_payload), status, now, now),
+                )
+                self._connection.commit()
+                return CommandClaim(True, False, {"request": request_payload, "receipt": receipt_payload, "idempotencyKey": idempotency_key})
+            except sqlite3.IntegrityError:
+                self._connection.rollback()
+                row = self._connection.execute(
+                    "SELECT command_id, idempotency_key, request_json, receipt_json FROM commands "
+                    "WHERE command_id = ? OR idempotency_key = ? ORDER BY command_id LIMIT 1",
+                    (command_id, idempotency_key),
+                ).fetchone()
+                if row is None:
+                    raise
+                record = self._command_record_from_row(row)
+                return CommandClaim(False, row["command_id"] == command_id and row["idempotency_key"] != idempotency_key, record)
+            except Exception:
+                self._connection.rollback()
+                raise
+
+    def save_command(self, request: CommandRequest | Mapping[str, Any], receipt: CommandReceipt | Mapping[str, Any]) -> None:
+        """Persist a receipt without replacing the immutable request identity."""
+        request_payload = self._request_payload(request)
+        receipt_payload = self._receipt_payload(receipt)
+        command_id, idempotency_key = self._command_identity(request_payload)
+        receipt_id = receipt_payload.get("commandId") or receipt_payload.get("command_id")
+        if receipt_id != command_id:
+            raise ValueError("receipt commandId does not match request")
+        status = receipt_payload.get("status")
+        if hasattr(status, "value"):
+            status = status.value
         if not isinstance(status, str):
             status = str(status)
         now = self._now()
         with self._lock:
-            self._connection.execute(
-                """
-                INSERT INTO commands(command_id, request_json, receipt_json, status, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(command_id) DO UPDATE SET
-                    request_json=excluded.request_json,
-                    receipt_json=excluded.receipt_json,
-                    status=excluded.status,
-                    updated_at=excluded.updated_at
-                """,
-                (command_id, _encode(request_payload), _encode(receipt_payload), status, now, now),
-            )
+            row = self._connection.execute(
+                "SELECT request_json, idempotency_key FROM commands WHERE command_id = ?", (command_id,)
+            ).fetchone()
+            if row is None:
+                # Keep direct repository users compatible, but still enforce
+                # the same unique identity rules as the claim path.
+                self._connection.execute(
+                    "INSERT INTO commands(command_id, idempotency_key, request_json, receipt_json, status, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (command_id, idempotency_key, _encode(request_payload), _encode(receipt_payload), status, now, now),
+                )
+            else:
+                if row["idempotency_key"] != idempotency_key:
+                    raise ValueError("command identity conflict")
+                self._connection.execute(
+                    "UPDATE commands SET receipt_json = ?, status = ?, updated_at = ? WHERE command_id = ?",
+                    (_encode(receipt_payload), status, now, command_id),
+                )
             self._connection.commit()
 
     def get_command_record(self, command_id: str) -> dict[str, Any] | None:
         with self._lock:
             row = self._connection.execute(
-                "SELECT request_json, receipt_json FROM commands WHERE command_id = ?", (command_id,)
+                "SELECT request_json, receipt_json, idempotency_key FROM commands WHERE command_id = ?", (command_id,)
             ).fetchone()
         if row is None:
             return None
-        return {"request": _decode(row["request_json"]), "receipt": _decode(row["receipt_json"])}
+        return self._command_record_from_row(row)
+
+    def get_command_by_idempotency(self, idempotency_key: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT request_json, receipt_json, idempotency_key FROM commands WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+        return None if row is None else self._command_record_from_row(row)
 
     def get_command(self, command_id: str) -> dict[str, Any] | None:
         record = self.get_command_record(command_id)
@@ -235,27 +439,63 @@ class SQLiteStore:
         probe_payload = None if record.probe is None else dict(_jsonable(record.probe))
         return mapping_payload, record.status, record.target_id, probe_payload
 
-    def save_mapping(self, record: MappingRecord) -> None:
+    def _mapping_values(self, record: MappingRecord) -> tuple[str, str, str, str, str | None, str | None]:
         mapping_payload, status, target_id, probe_payload = self._mapping_payload(record)
         mapping_id = mapping_payload.get("mappingId")
         version = mapping_payload.get("version")
         if not isinstance(mapping_id, str) or not isinstance(version, str):
             raise ValueError("mapping identity is required")
+        command_key = mapping_payload.get("commandKey") or mapping_payload.get("command_key")
+        if not isinstance(command_key, str) or not command_key:
+            raise ValueError("mapping commandKey is required")
+        return (
+            mapping_id,
+            version,
+            _encode(mapping_payload),
+            status,
+            target_id,
+            None if probe_payload is None else _encode(probe_payload),
+        )
+
+    def save_mapping(self, record: MappingRecord) -> None:
+        self.save_mapping_batch([record], active=record.mapping if record.status == "active" else None)
+
+    def save_mapping_batch(self, records: list[MappingRecord] | tuple[MappingRecord, ...], *, active: Any = None) -> None:
+        """Persist mapping snapshots and the active pointer in one transaction."""
+        values = [self._mapping_values(record) for record in records]
         with self._lock:
-            self._connection.execute(
-                """
-                INSERT INTO mappings(mapping_id, version, payload_json, status, target_id, probe_json, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(mapping_id, version) DO UPDATE SET
-                    payload_json=excluded.payload_json,
-                    status=excluded.status,
-                    target_id=excluded.target_id,
-                    probe_json=excluded.probe_json,
-                    updated_at=excluded.updated_at
-                """,
-                (mapping_id, version, _encode(mapping_payload), status, target_id, None if probe_payload is None else _encode(probe_payload), self._now()),
-            )
-            self._connection.commit()
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                for mapping_id, version, payload_json, status, target_id, probe_json in values:
+                    self._connection.execute(
+                        """
+                        INSERT INTO mappings(mapping_id, version, payload_json, status, target_id, probe_json, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(mapping_id, version) DO UPDATE SET
+                            payload_json=excluded.payload_json,
+                            status=excluded.status,
+                            target_id=excluded.target_id,
+                            probe_json=excluded.probe_json,
+                            updated_at=excluded.updated_at
+                        """,
+                        (mapping_id, version, payload_json, status, target_id, probe_json, self._now()),
+                    )
+                if active is not None:
+                    active_payload = dict(_jsonable(active))
+                    command_key = active_payload.get("commandKey") or active_payload.get("command_key")
+                    mapping_id = active_payload.get("mappingId") or active_payload.get("mapping_id")
+                    version = active_payload.get("version")
+                    if not all(isinstance(item, str) and item for item in (command_key, mapping_id, version)):
+                        raise ValueError("active mapping identity is required")
+                    self._connection.execute(
+                        "INSERT INTO mapping_active(command_key, mapping_id, version, updated_at) VALUES (?, ?, ?, ?) "
+                        "ON CONFLICT(command_key) DO UPDATE SET mapping_id=excluded.mapping_id, version=excluded.version, updated_at=excluded.updated_at",
+                        (command_key, mapping_id, version, self._now()),
+                    )
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
 
     def list_mappings(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -282,6 +522,18 @@ class SQLiteStore:
             "probe": probe,
             "updatedAt": row["updated_at"],
         }
+
+    def get_active_pointer(self, command_key: str) -> tuple[str, str] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT mapping_id, version FROM mapping_active WHERE command_key = ?", (command_key,)
+            ).fetchone()
+        return None if row is None else (str(row["mapping_id"]), str(row["version"]))
+
+    def list_active_pointers(self) -> dict[str, tuple[str, str]]:
+        with self._lock:
+            rows = self._connection.execute("SELECT command_key, mapping_id, version FROM mapping_active").fetchall()
+        return {str(row["command_key"]): (str(row["mapping_id"]), str(row["version"])) for row in rows}
 
     def record_event(self, event: Mapping[str, Any]) -> dict[str, Any]:
         payload = dict(_jsonable(event))
@@ -338,25 +590,27 @@ class SQLiteStore:
             result.append(payload)
         return result
 
-    def save_assistant_draft(self, draft_id: str, payload: Mapping[str, Any], *, status: str = "draft") -> None:
+    def save_assistant_draft(self, draft_id: str, payload: Mapping[str, Any], *, status: str = "draft") -> bool:
+        """Insert an immutable draft; never overwrite an existing plan."""
         if not isinstance(draft_id, str) or not draft_id:
             raise ValueError("draft_id is required")
         now = self._now()
         with self._lock:
-            self._connection.execute(
+            cursor = self._connection.execute(
                 """
-                INSERT INTO assistant_drafts(draft_id, payload_json, status, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(draft_id) DO UPDATE SET payload_json=excluded.payload_json, status=excluded.status, updated_at=excluded.updated_at
+                INSERT INTO assistant_drafts(draft_id, payload_json, status, execution_json, error, created_at, updated_at)
+                VALUES (?, ?, ?, '{}', NULL, ?, ?)
+                ON CONFLICT(draft_id) DO NOTHING
                 """,
                 (draft_id, _encode(payload), status, now, now),
             )
             self._connection.commit()
+            return cursor.rowcount == 1
 
     def get_assistant_draft(self, draft_id: str) -> dict[str, Any] | None:
         with self._lock:
             row = self._connection.execute(
-                "SELECT payload_json, status, created_at, updated_at FROM assistant_drafts WHERE draft_id = ?",
+                "SELECT payload_json, status, execution_json, error, created_at, updated_at FROM assistant_drafts WHERE draft_id = ?",
                 (draft_id,),
             ).fetchone()
         if row is None:
@@ -365,15 +619,39 @@ class SQLiteStore:
             "draftId": draft_id,
             "plan": _decode(row["payload_json"]),
             "status": row["status"],
+            "execution": _decode(row["execution_json"] or "{}"),
+            "error": row["error"],
             "createdAt": row["created_at"],
             "updatedAt": row["updated_at"],
         }
 
-    def set_assistant_draft_status(self, draft_id: str, status: str) -> bool:
+    def set_assistant_draft_status(
+        self,
+        draft_id: str,
+        status: str,
+        *,
+        expected_status: str | None = None,
+        execution: Mapping[str, Any] | None = None,
+        error: str | None = None,
+    ) -> bool:
         with self._lock:
+            clauses = ["status = ?", "updated_at = ?"]
+            values: list[Any] = [status, self._now()]
+            if execution is not None:
+                clauses.append("execution_json = ?")
+                values.append(_encode(execution))
+            if error is not None:
+                clauses.append("error = ?")
+                values.append(error)
+            elif status in {"confirmed", "draft", "unknown"}:
+                clauses.append("error = NULL")
+            values.append(draft_id)
+            where = "draft_id = ?"
+            if expected_status is not None:
+                where += " AND status = ?"
+                values.append(expected_status)
             cursor = self._connection.execute(
-                "UPDATE assistant_drafts SET status = ?, updated_at = ? WHERE draft_id = ?",
-                (status, self._now(), draft_id),
+                f"UPDATE assistant_drafts SET {', '.join(clauses)} WHERE {where}", values
             )
             self._connection.commit()
             return cursor.rowcount == 1
@@ -389,17 +667,38 @@ class SQLiteStore:
             return cursor.rowcount == 1
 
     def reset_confirming_drafts(self) -> None:
-        """Recover drafts left mid-confirmation by a process restart."""
+        """Compatibility alias; interrupted confirmations are not replayable."""
+        self.recover_confirming_drafts()
+
+    def recover_confirming_drafts(self) -> None:
+        """Mark interrupted confirmations unknown rather than resetting them."""
         with self._lock:
             self._connection.execute(
-                "UPDATE assistant_drafts SET status = 'draft', updated_at = ? WHERE status = 'confirming'",
-                (self._now(),),
+                "UPDATE assistant_drafts SET status = 'unknown', error = ?, updated_at = ? WHERE status = 'confirming'",
+                ("confirmation interrupted by process restart; reconciliation required", self._now()),
             )
             self._connection.commit()
+
+    def update_assistant_execution(
+        self,
+        draft_id: str,
+        execution: Mapping[str, Any],
+        *,
+        expected_status: str = "confirming",
+    ) -> bool:
+        """CAS update of durable per-step receipts while a plan is confirming."""
+        with self._lock:
+            cursor = self._connection.execute(
+                "UPDATE assistant_drafts SET execution_json = ?, updated_at = ? "
+                "WHERE draft_id = ? AND status = ?",
+                (_encode(execution), self._now(), draft_id, expected_status),
+            )
+            self._connection.commit()
+            return cursor.rowcount == 1
 
     def close(self) -> None:
         with self._lock:
             self._connection.close()
 
 
-__all__ = ["SQLiteStore"]
+__all__ = ["CommandClaim", "SQLiteStore"]
