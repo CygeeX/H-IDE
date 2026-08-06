@@ -440,12 +440,21 @@ class MappingRegistry:
         """Hydrate the durable active pointer after all snapshots are loaded."""
         with self._lock:
             record = self._require(mapping_id, version)
+            # A pointer is not permission to promote an arbitrary persisted
+            # row.  Only a row that completed a successful capability probe
+            # may become dispatchable after restart; draft/validated or
+            # corrupt rows must fall back to a known-safe mapping instead of
+            # bypassing the lifecycle gate.
+            if record.status != "active":
+                raise ValueError("active pointer does not reference an active mapping")
+            if record.mapping.commandKey != command_key:
+                raise ValueError("active pointer command key does not match mapping")
+            if record.probe is None or str(record.probe.status).lower() not in {
+                "probed", "available", "succeeded", "ok"
+            }:
+                raise ValueError("active pointer does not reference a probed mapping")
             self._active[command_key] = (mapping_id, version)
             self._history.setdefault(command_key, [])
-            if record.status != "active":
-                self._records[(mapping_id, version)] = MappingRecord(
-                    record.mapping, "active", record.target_id, record.probe
-                )
 
     def restore_history(self, command_key: str, history: list[tuple[str, str]]) -> None:
         with self._lock:

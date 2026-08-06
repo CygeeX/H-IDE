@@ -69,6 +69,7 @@ class MappingStateConflict(ValueError):
 
 
 _MAPPING_POINTER_UNSET = object()
+_MAPPING_PROBE_UNSET = object()
 
 
 def _jsonable(value: Any) -> Any:
@@ -569,6 +570,7 @@ class SQLiteStore:
         status: str,
         target_id: str | None,
         probe_json: str | None,
+        expected_probe: Any = _MAPPING_PROBE_UNSET,
     ) -> None:
         """Reject stale or backwards snapshots before an upsert can overwrite data."""
         row = self._connection.execute(
@@ -589,20 +591,33 @@ class SQLiteStore:
             raise MappingStateConflict(mapping_id, version, str(row["status"]), status)
         old_status = str(row["status"])
         old_probe_json = row["probe_json"]
-        probe_equal = old_probe_json == probe_json
-        if not probe_equal and old_probe_json is not None and probe_json is not None:
-            try:
-                probe_equal = _decode(old_probe_json) == _decode(probe_json)
-            except (TypeError, ValueError, json.JSONDecodeError):
-                probe_equal = False
-        if not probe_equal:
-            # A probe result is part of the durable lifecycle snapshot.  Once
-            # one process has published a result, a stale concurrent probe may
-            # not overwrite it merely because both rows have status=probed.
-            # Allow a transition from an unprobed row, and idempotent writes
-            # carrying the same result.
-            if not (old_probe_json is None and probe_json is not None and old_status in {"draft", "validated"}):
+
+        def probe_value(raw: Any) -> Any:
+            if raw is None:
+                return None
+            if isinstance(raw, str):
+                try:
+                    return _decode(raw)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    return raw
+            return _jsonable(raw)
+
+        old_probe = probe_value(old_probe_json)
+        if expected_probe is not _MAPPING_PROBE_UNSET:
+            # Probe is an optimistic-CAS field.  A caller may intentionally
+            # refresh an already-probed mapping, but only if the snapshot it
+            # read before probing is still the durable snapshot.  This lets a
+            # sequential capability refresh succeed while preventing an older
+            # concurrent result from overwriting a newer one.
+            if old_probe != probe_value(expected_probe):
                 raise MappingStateConflict(mapping_id, version, str(row["status"]), status)
+        else:
+            probe_equal = old_probe == probe_value(probe_json)
+            if not probe_equal:
+                # Without an explicit probe CAS token, retain the conservative
+                # repository behaviour for direct callers.
+                if not (old_probe is None and probe_json is not None and old_status in {"draft", "validated"}):
+                    raise MappingStateConflict(mapping_id, version, str(row["status"]), status)
         if old_status == status:
             # Draft creation is insert-only at the API boundary.  A second app
             # presenting the same draft is still a conflict, while idempotent
@@ -628,6 +643,7 @@ class SQLiteStore:
         active: Any = None,
         expected_active: Any = _MAPPING_POINTER_UNSET,
         audit_events: Iterable[Mapping[str, Any]] | None = None,
+        expected_probes: Mapping[tuple[str, str], Any] | None = None,
     ) -> None:
         """Persist mapping snapshots, pointer CAS, and staged audits atomically.
 
@@ -665,7 +681,15 @@ class SQLiteStore:
                         raise MappingPointerConflict(str(command_key), expected_pointer, actual_pointer)
                 for mapping_id, version, payload_json, status, target_id, probe_json in values:
                     self._check_mapping_row_transition(
-                        mapping_id, version, payload_json, status, target_id, probe_json
+                        mapping_id,
+                        version,
+                        payload_json,
+                        status,
+                        target_id,
+                        probe_json,
+                        _MAPPING_PROBE_UNSET
+                        if expected_probes is None or (mapping_id, version) not in expected_probes
+                        else expected_probes[(mapping_id, version)],
                     )
                     self._connection.execute(
                         """

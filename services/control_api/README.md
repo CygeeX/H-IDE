@@ -1,7 +1,9 @@
 # Control API
 
 `services.control_api.main:create_app` builds an isolated FastAPI control
-plane.  Every route requires `Authorization: Bearer <token>`; the websocket
+plane, and the module-level `services.control_api.main:app` is the single
+process entry point used by Docker/systemd. Every route requires
+`Authorization: Bearer <token>`; the websocket
 also accepts the token as `?token=` for browser clients.
 
 Interactive OpenAPI, Swagger, and ReDoc endpoints are disabled by default
@@ -12,7 +14,10 @@ present under `apps/control-pwa/dist`, is mounted as public static assets; it
 contains no command authority without the authenticated API token.
 
 The default development token is `dev-token`.  Deployments should pass
-`auth_token=` or set `CONTROL_API_TOKEN`.
+`auth_token=` or set `CONTROL_API_TOKEN`. When `create_app()` is called without
+an explicit `db_path`, it reads `CONTROL_DB_PATH` (falling back to `:memory:`),
+so service restarts retain commands, mappings and audits when a file path is
+configured.
 
 ## Routes
 
@@ -49,5 +54,7 @@ The default development token is `dev-token`.  Deployments should pass
 All command execution is routed through immutable `CommandRequest`,
 `CommandDefinition`, and `MappingVersion` objects and then `ActionRuntime`.
 The API additionally rejects an embedded mapping target that does not match
-the request robot.  Direct in-process runtime callers remain responsible for
-that binding check.
+the request robot.  Non-safety actions fail closed unless the persisted robot
+state is explicitly connected and in an online/degraded, normal/degraded
+safety state; `stop` remains a `SAFETY` command. Direct in-process runtime
+callers remain responsible for that binding and robot-state check.

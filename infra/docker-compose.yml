@@ -60,7 +60,7 @@ services:
     volumes:
       - control-data:/data
     restart: unless-stopped
-    command: ["uvicorn", "services.control_api.main:create_app", "--factory", "--host", "127.0.0.1", "--port", "8080", "--workers", "1"]
+    command: ["uvicorn", "services.control_api.main:app", "--host", "127.0.0.1", "--port", "8080", "--workers", "1"]
 
 volumes:
   control-data:

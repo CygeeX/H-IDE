@@ -150,14 +150,21 @@ def _motion_safety_error(robot: Mapping[str, Any], definition: CommandDefinition
     """Reject every non-safety action when the persisted robot is unsafe."""
     if definition.kind is CommandKind.SAFETY:
         return None
-    status = str(robot.get("status", "unknown")).lower()
-    safety_mode = str(robot.get("safetyMode", robot.get("safety_mode", "unknown"))).lower()
-    if robot.get("connected") is False:
-        return "robot is disconnected"
-    if status in {"offline", "estop"}:
-        return f"robot status {status} does not allow motion"
-    if safety_mode in {"stopped", "estop", "unknown"}:
-        return f"robot safety mode {safety_mode} does not allow motion"
+
+    # The repository accepts a JSON boundary for forward compatibility, but
+    # an unsafe or malformed snapshot must fail closed.  Check the raw
+    # connected flag before Pydantic's permissive coercions, then validate the
+    # complete state contract and allow only explicitly safe states.
+    if not isinstance(robot, Mapping) or robot.get("connected") is not True:
+        return "robot connection state is not confirmed safe"
+    try:
+        state = RobotState.model_validate(robot)
+    except (TypeError, ValueError, ValidationError):
+        return "robot state is invalid or unknown"
+    if state.status not in {RobotStatus.ONLINE, RobotStatus.DEGRADED}:
+        return f"robot status {state.status.value} does not allow motion"
+    if state.safetyMode not in {SafetyMode.NORMAL, SafetyMode.DEGRADED}:
+        return f"robot safety mode {state.safetyMode.value} does not allow motion"
     return None
 
 
@@ -200,25 +207,38 @@ class _ControlContext:
             transport=Transport.FAKE,
             mapping={"targetId": robot_id, "topic": f"/{definition.commandKey}"},
         )
-        try:
+        for _attempt in range(3):
             try:
-                record = self.registry.get(mapping.mappingId, mapping.version)
+                try:
+                    record = self.registry.get(mapping.mappingId, mapping.version)
+                except ValueError:
+                    record = self.registry.create_draft(mapping)
+                    self.store.save_mapping(record)
+                if record.status == "draft":
+                    record = self.registry.validate(mapping.mappingId, mapping.version)
+                    self.store.save_mapping(record)
+                if record.status == "validated":
+                    record = self.registry.probe(mapping.mappingId, mapping.version)
+                    self.store.save_mapping(record)
+                if record.status == "probed":
+                    record = self.registry.activate(mapping.mappingId, mapping.version)
+                    self.store.save_mapping(record)
+                return
             except ValueError:
-                record = self.registry.create_draft(mapping)
-                self.store.save_mapping(record)
-            if record.status == "draft":
-                record = self.registry.validate(mapping.mappingId, mapping.version)
-                self.store.save_mapping(record)
-            if record.status == "validated":
-                record = self.registry.probe(mapping.mappingId, mapping.version)
-                self.store.save_mapping(record)
-            if record.status == "probed":
-                record = self.registry.activate(mapping.mappingId, mapping.version)
-                self.store.save_mapping(record)
-        except ValueError:
-            # A custom adapter may intentionally be unavailable.  The mapping
-            # remains absent and the API reports a controlled error.
-            return
+                # Two app processes can seed the same deterministic mapping at
+                # the same time.  Reconcile the local registry with the row
+                # that won the durable transition, then retry the remaining
+                # lifecycle step instead of leaving this process with a draft-
+                # only in-memory view.  An unavailable adapter still exits
+                # after the bounded attempts and remains an explicit error.
+                try:
+                    self.reload_mappings()
+                except Exception:
+                    pass
+        # A custom adapter may intentionally be unavailable.  The mapping
+        # remains in its durable intermediate state and the API reports a
+        # controlled error until a later restart/reconciliation.
+        return
 
     def seed(self) -> None:
         # A process restart cannot know whether a robot accepted each step of
@@ -296,19 +316,7 @@ class _ControlContext:
             pointers = self.store.list_active_pointers()
             for command_key, rows in grouped.items():
                 pointer = pointers.get(command_key)
-                if pointer is None:
-                    active_rows = [row for row in rows if row.get("status") == "active"]
-                    if active_rows:
-                        active_rows.sort(key=lambda row: row.get("updatedAt", ""))
-                        pointer = (
-                            active_rows[-1]["mapping"].get("mappingId"),
-                            active_rows[-1]["mapping"].get("version"),
-                        )
-                if pointer and all(isinstance(item, str) and item for item in pointer):
-                    try:
-                        self.registry.restore_active_pointer(command_key, pointer[0], pointer[1])
-                    except ValueError:
-                        continue
+                self._restore_safe_pointer(self.registry, command_key, rows, pointer)
                 history = []
                 for row in sorted(rows, key=lambda row: row.get("updatedAt", "")):
                     if row.get("status") == "superseded":
@@ -359,6 +367,45 @@ class _ControlContext:
             return False
         return True
 
+    @staticmethod
+    def _restore_safe_pointer(
+        registry: MappingRegistry,
+        command_key: str,
+        rows: list[Mapping[str, Any]],
+        pointer: tuple[str, str] | None,
+    ) -> bool:
+        """Restore only an active, successfully probed durable mapping.
+
+        A corrupt/stale ``mapping_active`` pointer must never promote a draft
+        row during process startup.  If the pointer is unusable, choose the
+        newest safe active snapshot; the caller can seed a default when none
+        exists.
+        """
+        candidates: list[tuple[str, str]] = []
+        if pointer and all(isinstance(item, str) and item for item in pointer):
+            candidates.append(pointer)
+        active_rows = [
+            row for row in rows
+            if row.get("status") == "active" and isinstance(row.get("probe"), Mapping)
+        ]
+        active_rows.sort(key=lambda row: row.get("updatedAt", ""), reverse=True)
+        for row in active_rows:
+            payload = row.get("mapping")
+            if not isinstance(payload, Mapping):
+                continue
+            mapping_id, version = payload.get("mappingId"), payload.get("version")
+            if isinstance(mapping_id, str) and mapping_id and isinstance(version, str) and version:
+                candidate = (mapping_id, version)
+                if candidate not in candidates:
+                    candidates.append(candidate)
+        for mapping_id, version in candidates:
+            try:
+                registry.restore_active_pointer(command_key, mapping_id, version)
+                return True
+            except ValueError:
+                continue
+        return False
+
     def reload_mappings(self) -> None:
         """Reconcile this process's registry with the durable SQLite view.
 
@@ -406,18 +453,7 @@ class _ControlContext:
         pointers = self.store.list_active_pointers()
         for command_key, rows in grouped.items():
             pointer = pointers.get(command_key)
-            if pointer is None:
-                active_rows = [row for row in rows if row.get("status") == "active"]
-                if active_rows:
-                    active_rows.sort(key=lambda row: row.get("updatedAt", ""))
-                    payload = active_rows[-1].get("mapping")
-                    if isinstance(payload, Mapping):
-                        pointer = (payload.get("mappingId"), payload.get("version"))
-            if pointer and all(isinstance(item, str) and item for item in pointer):
-                try:
-                    fresh.restore_active_pointer(command_key, pointer[0], pointer[1])
-                except ValueError:
-                    continue
+            self._restore_safe_pointer(fresh, command_key, rows, pointer)
             history: list[tuple[str, str]] = []
             for row in sorted(rows, key=lambda item: item.get("updatedAt", "")):
                 if row.get("status") != "superseded":
@@ -459,7 +495,7 @@ class _ControlContext:
 
 
 def create_app(
-    db_path: str = ":memory:",
+    db_path: str | None = None,
     auth_token: str | None = None,
     adapters: Mapping[str | Transport, CommandAdapter] | None = None,
     watchdog_interval: float = 0.1,
@@ -469,7 +505,11 @@ def create_app(
     token = auth_token or os.getenv("CONTROL_API_TOKEN", "dev-token")
     adapter_map: dict[str | Transport, CommandAdapter] = dict(adapters or {})
     adapter_map.setdefault("fake", FakeAdapter())
-    store = SQLiteStore(db_path)
+    # An explicit path remains useful for tests and embedded callers.  The
+    # deployment factory uses CONTROL_DB_PATH so a uvicorn restart does not
+    # silently fall back to an ephemeral in-memory repository.
+    resolved_db_path = db_path if db_path is not None else (os.getenv("CONTROL_DB_PATH") or ":memory:")
+    store = SQLiteStore(resolved_db_path)
     context = _ControlContext(store, token, adapter_map)
     context.seed()
 
@@ -605,6 +645,7 @@ def create_app(
         previous: MappingVersion | None = None,
         *,
         audit_events: list[Mapping[str, Any]] | None = None,
+        expected_probes: Mapping[tuple[str, str], Any] | None = None,
     ) -> None:
         records = [record]
         if previous is not None and (previous.mappingId, previous.version) != (record.mapping.mappingId, record.version):
@@ -623,6 +664,8 @@ def create_app(
             kwargs["expected_active"] = None if previous is None else (previous.mappingId, previous.version)
         if audit_events is not None:
             kwargs["audit_events"] = audit_events
+        if expected_probes is not None:
+            kwargs["expected_probes"] = expected_probes
         context.store.save_mapping_batch(records, active=active, **kwargs)
 
     @app.get("/api/v1/robots", dependencies=[Depends(require_auth)])
@@ -780,6 +823,15 @@ def create_app(
                 audit_events: list[Mapping[str, Any]] = []
                 try:
                     previous = None
+                    expected_probes = None
+                    if action == "probe":
+                        # Capture the durable probe snapshot before invoking
+                        # an external adapter.  The store checks this token in
+                        # the same transaction as the new result.
+                        durable = context.store.get_mapping(mapping_id, version)
+                        expected_probes = {
+                            (mapping_id, version): None if durable is None else durable.get("probe")
+                        }
                     if action == "activate":
                         current = context.registry.get(mapping_id, version).mapping
                         try:
@@ -790,7 +842,13 @@ def create_app(
                     with context.registry.defer_audits() as audit_events:
                         record = method(mapping_id, version)
                         context.registry.drain_deferred_audits()
-                        _save_mapping_change(context, record, previous, audit_events=audit_events)
+                        _save_mapping_change(
+                            context,
+                            record,
+                            previous,
+                            audit_events=audit_events,
+                            expected_probes=expected_probes,
+                        )
                     return _mapping_json(record)
                 except (MappingPointerConflict, MappingStateConflict) as exc:
                     context.registry.restore_state(snapshot)

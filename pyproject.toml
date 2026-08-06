@@ -25,5 +25,4 @@ pythonpath = ["."]
 addopts = "-q"
 
 [tool.setuptools.packages.find]
-include = ["packages*"]
-
+include = ["packages*", "services*"]

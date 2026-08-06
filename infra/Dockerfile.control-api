@@ -18,4 +18,8 @@ RUN useradd --create-home --uid 10001 control && mkdir -p /data && chown -R cont
 USER control
 ENV CONTROL_DB_PATH=/data/control.db
 EXPOSE 8080
-CMD ["uvicorn", "services.control_api.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]
+# The module exposes one initialized ``app`` object.  Using it directly avoids
+# importing the module once for ``app = create_app()`` and a second time for a
+# factory invocation (which would create duplicate SQLite connections and
+# runtime watchdogs).
+CMD ["uvicorn", "services.control_api.main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]

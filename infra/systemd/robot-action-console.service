@@ -12,7 +12,11 @@ Group=robot-control
 WorkingDirectory=/opt/robot-action-console
 EnvironmentFile=-/etc/robot-action-console/control-api.env
 Environment=CONTROL_API_PORT=8080
-ExecStart=/opt/robot-action-console/.venv/bin/uvicorn services.control_api.main:create_app --factory --host 127.0.0.1 --port ${CONTROL_API_PORT} --workers 1
+Environment=CONTROL_DB_PATH=/var/lib/robot-action-console/control.db
+StateDirectory=robot-action-console
+# Use the module-level app so importing the service does not initialize a
+# second store/watchdog through a factory call.
+ExecStart=/opt/robot-action-console/.venv/bin/uvicorn services.control_api.main:app --host 127.0.0.1 --port ${CONTROL_API_PORT} --workers 1
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=3s
