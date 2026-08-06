@@ -162,8 +162,10 @@ class MappingRegistry:
         return record
 
     def _create_draft(self, mapping: MappingVersion, target_id: str | None = None) -> MappingRecord:
-        if target_id is not None and (not isinstance(target_id, str) or not target_id.strip()):
-            raise ValueError("target_id must be non-empty")
+        if target_id is not None:
+            if not isinstance(target_id, str) or not target_id.strip():
+                raise ValueError("target_id must be non-empty")
+            target_id = target_id.strip()
         if target_id is not None and self.allowed_targets is not None and target_id not in self.allowed_targets:
             raise ValueError("target is not allowlisted")
         self._static_validate(mapping)
@@ -315,7 +317,7 @@ class MappingRegistry:
     def rollback(self, command_key: str, version: str | None = None) -> MappingRecord:
         with self._lock:
             history = self._history.get(command_key, [])
-            target = next((item for item in history if item[1] == version), None) if version else (history[-1] if history else None)
+            target = next((item for item in reversed(history) if item[1] == version), None) if version else (history[-1] if history else None)
             if target is None:
                 raise ValueError("no previous mapping to rollback")
             rec = self._records.get(target)

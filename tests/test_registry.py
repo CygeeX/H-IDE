@@ -55,6 +55,23 @@ def test_active_pointer_keeps_mapping_id_and_versions_are_superseded():
     assert reg.get("m1", "v1").status == "superseded"
 
 
+def test_rollback_explicit_version_uses_most_recent_duplicate_version():
+    reg = MappingRegistry(adapters={"fake": FakeAdapter()})
+    for mapping_id in ("m1", "m2", "m3"):
+        item = mv("v1", mapping_id=mapping_id)
+        reg.create_draft(item)
+        reg.validate(mapping_id, "v1")
+        reg.probe(mapping_id, "v1")
+        reg.activate(mapping_id, "v1")
+
+    first = reg.rollback("move.forward", version="v1")
+    assert first.mapping.mappingId == "m2"
+    assert reg.active("move.forward").mappingId == "m2"
+    second = reg.rollback("move.forward", version="v1")
+    assert second.mapping.mappingId == "m3"
+    assert reg.active("move.forward").mappingId == "m3"
+
+
 def test_allowed_target_must_be_present_and_registered_and_dangerous_variants_rejected():
     reg = MappingRegistry(adapters={"fake": FakeAdapter()}, allowed_targets={"r1"})
     with pytest.raises(ValueError, match="target"):
@@ -106,6 +123,19 @@ def test_embedded_target_is_snapshotted_as_record_target_id():
     record = reg.create_draft(item)
     assert record.target_id == "r1"
     assert reg.get("embedded-target", "v1").target_id == "r1"
+
+
+def test_explicit_target_id_is_trimmed_before_allowlist_and_storage():
+    reg = MappingRegistry(adapters={"fake": FakeAdapter()}, allowed_targets={"r1"})
+    item = MappingVersion(
+        mappingId="explicit-target",
+        version="v1",
+        commandKey="move.forward",
+        transport="fake",
+        mapping={"targetId": "r1"},
+    )
+    record = reg.create_draft(item, target_id=" r1 ")
+    assert record.target_id == "r1"
 
 
 def test_target_id_requires_non_empty_string_and_probe_cannot_validate_backwards():
