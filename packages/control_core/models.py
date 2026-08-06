@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
+import copy
 from typing import Any
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -91,6 +92,15 @@ class ContractModel(BaseModel):
         frozen=True,
         validate_assignment=True,
     )
+
+    def model_copy(self, *, update: dict[str, Any] | None = None, deep: bool = False):
+        """Return a revalidated snapshot instead of Pydantic's unchecked copy."""
+        data = self.model_dump(mode="python", by_alias=False)
+        if deep:
+            data = copy.deepcopy(data)
+        if update:
+            data.update(update)
+        return type(self).model_validate(data)
 
 
 class CommandDefinition(ContractModel):

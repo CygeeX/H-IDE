@@ -23,6 +23,17 @@ class FrozenDict(dict):
 
     __setitem__ = __delitem__ = clear = pop = popitem = setdefault = update = __ior__ = _immutable
 
+    def __copy__(self):
+        return type(self)(self)
+
+    def __deepcopy__(self, memo):
+        import copy
+        result = type(self)()
+        memo[id(self)] = result
+        for key, value in self.items():
+            dict.__setitem__(result, key, copy.deepcopy(value, memo))
+        return result
+
 
 class FrozenList(list):
     """List-compatible JSON array that rejects all in-place mutations."""
@@ -35,6 +46,16 @@ class FrozenList(list):
 
     append = extend = insert = pop = remove = reverse = sort = __iadd__ = __imul__ = _immutable
     __setitem__ = __delitem__ = _immutable
+
+    def __copy__(self):
+        return type(self)(self)
+
+    def __deepcopy__(self, memo):
+        import copy
+        result = type(self)()
+        memo[id(self)] = result
+        list.extend(result, (copy.deepcopy(item, memo) for item in self))
+        return result
 
 
 def _json_value(value: Any, *, freeze: bool = False) -> Any:

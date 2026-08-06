@@ -18,12 +18,12 @@ def request(cid="c1", idem="i1", key="move.forward", transport="fake"):
     )
 
 
-def definition(key="move.forward", kind="motion"):
-    return CommandDefinition(commandKey=key, commandVersion="1", transports=["fake"], kind=kind)
+def definition(key="move.forward", kind="motion", transport="fake"):
+    return CommandDefinition(commandKey=key, commandVersion="1", transports=[transport], kind=kind)
 
 
-def mapping(key="move.forward", version="v1"):
-    return MappingVersion(mappingId="m", version=version, commandKey=key, transport="fake")
+def mapping(key="move.forward", version="v1", transport="fake"):
+    return MappingVersion(mappingId="m", version=version, commandKey=key, transport=transport)
 
 
 def test_dispatch_lifecycle_and_event_context():
@@ -421,3 +421,39 @@ def test_safety_cancel_failure_with_running_stop_remains_recoverable():
     recovered = runtime.cancel("stop-recover")
     assert recovered.status.value == "cancelled"
     assert not runtime._safety_barriers
+
+
+def test_non_json_success_result_becomes_failed_and_cleans_motion_state():
+    adapter = FakeAdapter(result=AdapterResult(status="succeeded", result=object()))
+    runtime = ActionRuntime(adapters={"fake": adapter})
+    receipt = runtime.dispatch(request(), definition(), mapping())
+    assert receipt.status.value == "failed"
+    assert "result" in (receipt.error or "")
+    assert not runtime._leases and not runtime._inflight
+
+
+def test_non_json_success_result_cleans_safety_barrier():
+    adapter = FakeAdapter(result=AdapterResult(status="succeeded", result={"ok": object()}))
+    runtime = ActionRuntime(adapters={"fake": adapter})
+    receipt = runtime.dispatch(request("stop-json", "stop-json", key="stop"), definition("stop", "safety"), mapping("stop"))
+    assert receipt.status.value == "failed"
+    assert not runtime._safety_barriers and not runtime._inflight
+
+
+def test_failed_safety_b_does_not_clear_a_pending_cancel_barrier():
+    class BlockingCancel(FakeAdapter):
+        def __init__(self):
+            super().__init__(result=AdapterResult(status="running")); self.started = threading.Event(); self.release = threading.Event()
+        def cancel(self, command_id):
+            self.started.set(); self.release.wait(timeout=2); return AdapterResult(status="cancelled")
+    adapter = BlockingCancel(); runtime = ActionRuntime(adapters={"fake": adapter})
+    runtime.dispatch(request(), definition(), mapping())
+    a_result = []
+    a = threading.Thread(target=lambda: a_result.append(runtime.dispatch(request("stop-a-missing", "stop-a-missing", key="stop", transport="http"), definition("stop", "safety", "http"), mapping("stop", "a", "http"))))
+    a.start(); assert adapter.started.wait(timeout=1)
+    b = runtime.dispatch(request("stop-b-missing", "stop-b-missing", key="stop", transport="http"), definition("stop", "safety", "http"), mapping("stop", "b", "http"))
+    assert b.status.value == "failed"
+    blocked = runtime.dispatch(request("after-b", "after-b"), definition(), mapping())
+    assert blocked.status.value == "rejected"
+    adapter.release.set(); a.join(timeout=2)
+    assert not a.is_alive()

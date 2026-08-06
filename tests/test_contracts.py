@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import copy
 
 import pytest
 from pydantic import ValidationError
@@ -240,3 +241,24 @@ def test_domain_nested_snapshots_are_deeply_immutable():
     with pytest.raises(TypeError):
         state.details["nested"]["v"].append(2)
     assert isinstance(request.model_dump(mode="json")["payload"]["nested"]["items"], list)
+
+
+def test_model_copy_update_revalidates_and_preserves_deep_freeze():
+    mapping = MappingVersion(mappingId="copy", version="v1", commandKey="move", transport="fake", mapping={"nested": {"x": [1]}})
+    copied = mapping.model_copy(update={"mapping": {"nested": {"x": [2]}}})
+    with pytest.raises(TypeError):
+        copied.mapping["nested"]["x"].append(3)
+    with pytest.raises(ValidationError):
+        mapping.model_copy(update={"version": ""})
+    with pytest.raises(ValidationError):
+        mapping.model_copy(update={"transport": "telnet"})
+
+
+def test_frozen_list_supports_copy_and_deepcopy_without_mutation_methods():
+    request = _request(payload={"items": [1, {"x": True}]})
+    shallow = copy.copy(request.payload["items"])
+    deep = copy.deepcopy(request.payload["items"])
+    assert list(shallow) == [1, {"x": True}]
+    assert list(deep) == [1, {"x": True}]
+    with pytest.raises(TypeError):
+        deep.append(2)

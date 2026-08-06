@@ -59,6 +59,7 @@ class ActionRuntime:
         self._safety_barriers: set[str] = set()
         self._safety_epochs: dict[str, int] = {}
         self._safety_owners: dict[str, tuple[int, str]] = {}
+        self._safety_refs: dict[str, dict[str, int]] = {}
         self._lock = threading.RLock()
         # A local diagnostic trail is intentionally small and dependency-free.
         self.diagnostics: list[dict[str, Any]] = []
@@ -157,21 +158,32 @@ class ActionRuntime:
             return None
         epoch = self._safety_epochs.get(robot_id, 0) + 1
         self._safety_epochs[robot_id] = epoch
+        self._safety_refs.setdefault(robot_id, {})[owner] = epoch
         self._safety_owners[robot_id] = (epoch, owner)
         self._safety_barriers.add(robot_id)
         return epoch
 
     def _clear_safety_barrier(self, robot_id: str, owner: str, epoch: int | None) -> None:
-        if epoch is not None and self._safety_owners.get(robot_id) == (epoch, owner):
+        refs = self._safety_refs.get(robot_id)
+        if epoch is not None and refs is not None and refs.get(owner) == epoch:
+            refs.pop(owner, None)
+        if not refs:
+            self._safety_refs.pop(robot_id, None)
             self._safety_owners.pop(robot_id, None)
             self._safety_barriers.discard(robot_id)
+        elif self._safety_owners.get(robot_id) == (epoch, owner):
+            next_owner, next_epoch = max(refs.items(), key=lambda item: item[1])
+            self._safety_owners[robot_id] = (next_epoch, next_owner)
 
     def _transfer_safety_barrier(self, robot_id: str, from_owner: str, to_owner: str) -> int | None:
-        current = self._safety_owners.get(robot_id)
-        if current is None or current[1] != from_owner:
+        refs = self._safety_refs.get(robot_id)
+        if refs is None or from_owner not in refs:
             return None
-        self._safety_owners[robot_id] = (current[0], to_owner)
-        return current[0]
+        epoch = refs.pop(from_owner)
+        refs[to_owner] = epoch
+        if self._safety_owners.get(robot_id) == (epoch, from_owner):
+            self._safety_owners[robot_id] = (epoch, to_owner)
+        return epoch
 
     def _cancel_external(self, action: _InFlight | None, command_id: str) -> str | None:
         """Call adapter cancellation outside the lock and return a warning."""
@@ -346,7 +358,16 @@ class ActionRuntime:
             return current
         status = str(outcome.status).lower()
         if status in {"succeeded", "success", "ok", "completed"}:
-            receipt = self._receipt(request, CommandStatus.SUCCEEDED, result=outcome.result, completedAt=self.clock())
+            try:
+                receipt = self._receipt(request, CommandStatus.SUCCEEDED, result=outcome.result, completedAt=self.clock())
+            except (TypeError, ValueError) as exc:
+                # AdapterResult.result is untrusted input.  A malformed
+                # success payload must not escape while state remains leased.
+                self._release_lease(request.robotId, request.commandId)
+                self._inflight.pop(request.commandId, None)
+                if is_safety:
+                    self._clear_safety_barrier(request.robotId, safety_owner, safety_epoch)
+                return self._receipt(request, CommandStatus.FAILED, error=f"adapter result is not JSON-compatible: {exc}", completedAt=self.clock())
             self._release_lease(request.robotId, request.commandId)
             self._inflight.pop(request.commandId, None)
             if is_safety:
