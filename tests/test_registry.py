@@ -1,6 +1,8 @@
 import pytest
+import threading
+import time
 
-from packages.control_core.adapters import FakeAdapter, AdapterResult
+from packages.control_core.adapters import FakeAdapter, AdapterResult, RobotAgentAdapter
 from packages.control_core.models import MappingVersion
 from packages.control_core.registry import MappingRegistry
 
@@ -101,3 +103,27 @@ def test_malformed_probe_result_is_explicit_failure_and_audit_sink_is_non_blocki
     with pytest.raises(ValueError, match="probe"):
         reg.probe("m", "v1")
     assert reg.diagnostics
+
+
+def test_blocking_probe_does_not_hold_registry_lock_for_reads_or_activation():
+    class BlockingProbe(FakeAdapter):
+        def __init__(self):
+            super().__init__()
+            self.started = threading.Event(); self.release = threading.Event()
+        def probe(self, mapping):
+            self.started.set(); self.release.wait(timeout=2)
+            return AdapterResult(status="probed")
+    adapter = BlockingProbe(); reg = MappingRegistry(adapters={"fake": adapter})
+    reg.create_draft(mv()); reg.validate("m", "v1")
+    worker = threading.Thread(target=lambda: reg.probe("m", "v1")); worker.start()
+    assert adapter.started.wait(timeout=1)
+    start = time.monotonic(); record = reg.get("m", "v1"); elapsed = time.monotonic() - start
+    assert record.status == "validated" and elapsed < 0.5
+    adapter.release.set(); worker.join(timeout=2)
+
+
+def test_unavailable_adapter_operations_return_explicit_statuses():
+    adapter = RobotAgentAdapter()
+    mapping = mv()
+    for result in (adapter.discover("r1"), adapter.probe(mapping), adapter.cancel("c1"), adapter.query("c1")):
+        assert result.status in {"unavailable", "failed"}

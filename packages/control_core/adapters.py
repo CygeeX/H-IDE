@@ -67,7 +67,13 @@ class _UnavailableAdapter:
             return AdapterResult(status="unavailable", error=f"{self.name} driver does not implement {operation}")
         try:
             value = method(*args)
-            return value if isinstance(value, AdapterResult) else AdapterResult(status="succeeded", result=value)
+            if isinstance(value, AdapterResult):
+                if not isinstance(value.status, str) or not value.status.strip():
+                    return AdapterResult(status="failed", error=f"{self.name} {operation} returned result without status")
+                return value
+            if value is None:
+                return AdapterResult(status="unavailable", error=f"{self.name} {operation} returned no result")
+            return AdapterResult(status="failed", error=f"{self.name} {operation} returned invalid result")
         except Exception as exc:  # drivers own transport errors; preserve details
             return AdapterResult(status="failed", error=f"{self.name} {operation} failed: {exc}")
 

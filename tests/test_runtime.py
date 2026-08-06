@@ -229,3 +229,28 @@ def test_stop_can_interrupt_blocking_motion_dispatch():
     assert runtime.receipt("c1").status.value == "cancelled"
     assert stop_receipt.status.value == "succeeded"
     adapter.release.set(); worker.join(timeout=2)
+
+
+def test_stop_barrier_blocks_new_motion_until_stop_cancel_finishes():
+    class StopBlocking(FakeAdapter):
+        def __init__(self):
+            super().__init__(result=AdapterResult(status="succeeded"))
+            self.move_started = threading.Event(); self.cancel_started = threading.Event(); self.cancel_release = threading.Event(); self.move_release = threading.Event()
+        def dispatch(self, req, mapping):
+            if req.commandKey == "move.forward":
+                self.move_started.set(); self.move_release.wait(timeout=2)
+            return self.result
+        def cancel(self, command_id):
+            self.cancel_started.set(); self.cancel_release.wait(timeout=2)
+            return AdapterResult(status="cancelled")
+    adapter = StopBlocking(); runtime = ActionRuntime(adapters={"fake": adapter})
+    old_thread = threading.Thread(target=lambda: runtime.dispatch(request(), definition(), mapping()))
+    old_thread.start(); assert adapter.move_started.wait(timeout=1)
+    stop_result = []
+    stop_thread = threading.Thread(target=lambda: stop_result.append(runtime.dispatch(request("stop-3", "stop-3", key="stop"), definition("stop"), mapping("stop"))))
+    stop_thread.start(); assert adapter.cancel_started.wait(timeout=1)
+    blocked = runtime.dispatch(request("c3", "i3"), definition(), mapping("move.forward", "v3"))
+    assert blocked.status.value == "rejected"
+    adapter.cancel_release.set(); adapter.move_release.set()
+    stop_thread.join(timeout=2); old_thread.join(timeout=2)
+    assert stop_result and stop_result[0].status.value == "succeeded"

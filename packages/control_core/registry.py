@@ -46,6 +46,7 @@ class MappingRegistry:
         self._active: dict[str, tuple[str, str]] = {}
         self._history: dict[str, list[tuple[str, str]]] = {}
         self._lock = threading.RLock()
+        self._probing: set[tuple[str, str]] = set()
         self.diagnostics: list[dict[str, Any]] = []
 
     def _audit(self, action: str, record: MappingRecord) -> None:
@@ -126,6 +127,8 @@ class MappingRegistry:
 
     def validate(self, mapping_id: str, version: str) -> MappingRecord:
         with self._lock:
+            if (mapping_id, version) in self._probing:
+                raise ValueError("mapping is currently being probed")
             return self._validate(mapping_id, version)
 
     def _validate(self, mapping_id: str, version: str) -> MappingRecord:
@@ -139,36 +142,53 @@ class MappingRegistry:
         return rec
 
     def probe(self, mapping_id: str, version: str) -> MappingRecord:
-        with self._lock:
-            return self._probe(mapping_id, version)
+        return self._probe(mapping_id, version)
 
     def _probe(self, mapping_id: str, version: str) -> MappingRecord:
-        rec = self._require(mapping_id, version)
-        if rec.status not in {"validated", "probed"}:
-            raise ValueError("mapping must be validated before probing")
-        adapter = self.adapters.get(rec.mapping.transport.value)
-        if adapter is None:
-            result = AdapterResult(status="unavailable", error=f"no adapter for {rec.mapping.transport.value}")
-        else:
-            try:
-                result = adapter.probe(rec.mapping)
-            except Exception as exc:
-                result = AdapterResult(status="failed", error=f"adapter probe failed: {exc}")
-        if not isinstance(result, AdapterResult):
-            result = AdapterResult(status="unavailable", error="adapter probe returned invalid result")
-        probe_status = getattr(result, "status", None)
-        if not isinstance(probe_status, str) or not probe_status.strip():
-            result = AdapterResult(status="unavailable", error="adapter probe returned result without status")
-            probe_status = result.status
-        if probe_status.lower() not in {"probed", "available", "succeeded", "ok"}:
-            raise ValueError(result.error or "capability probe failed")
-        rec = MappingRecord(rec.mapping, "probed", rec.target_id, result)
-        self._records[(mapping_id, version)] = rec
-        self._audit("probed", rec)
-        return rec
+        key = (mapping_id, version)
+        with self._lock:
+            rec = self._require(mapping_id, version)
+            if rec.status not in {"validated", "probed"}:
+                raise ValueError("mapping must be validated before probing")
+            if key in self._probing:
+                raise ValueError("mapping is already being probed")
+            self._probing.add(key)
+            mapping = rec.mapping
+            target_id = rec.target_id
+            adapter = self.adapters.get(mapping.transport.value)
+        try:
+            if adapter is None:
+                result = AdapterResult(status="unavailable", error=f"no adapter for {mapping.transport.value}")
+            else:
+                try:
+                    result = adapter.probe(mapping)
+                except Exception as exc:
+                    result = AdapterResult(status="failed", error=f"adapter probe failed: {exc}")
+            if not isinstance(result, AdapterResult):
+                result = AdapterResult(status="unavailable", error="adapter probe returned invalid result")
+            probe_status = getattr(result, "status", None)
+            if not isinstance(probe_status, str) or not probe_status.strip():
+                result = AdapterResult(status="unavailable", error="adapter probe returned result without status")
+                probe_status = result.status
+            good = probe_status.lower() in {"probed", "available", "succeeded", "ok"}
+        finally:
+            with self._lock:
+                self._probing.discard(key)
+        with self._lock:
+            current = self._records.get(key)
+            if current is None or current.mapping != mapping or current.status not in {"validated", "probed"}:
+                raise ValueError("mapping changed while probing")
+            if not good:
+                raise ValueError(result.error or "capability probe failed")
+            rec = MappingRecord(mapping, "probed", target_id, result)
+            self._records[key] = rec
+            self._audit("probed", rec)
+            return rec
 
     def activate(self, mapping_id: str, version: str) -> MappingRecord:
         with self._lock:
+            if (mapping_id, version) in self._probing:
+                raise ValueError("mapping is currently being probed")
             return self._activate(mapping_id, version)
 
     def _activate(self, mapping_id: str, version: str) -> MappingRecord:
