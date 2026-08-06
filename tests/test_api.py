@@ -544,6 +544,16 @@ def test_restart_skips_corrupt_mapping_payload_rows(tmp_path):
     assert active.json()["mappingId"].startswith("seed-")
 
 
+def test_restart_resumes_validated_seed_mapping_when_probe_becomes_available(tmp_path):
+    db_path = str(tmp_path / "validated-seed.db")
+    failing = FakeAdapter(probe_result=AdapterResult(status="failed", error="temporarily unavailable"))
+    create_app(db_path=db_path, auth_token=TOKEN, adapters={"fake": failing})
+    restarted = TestClient(create_app(db_path=db_path, auth_token=TOKEN, adapters={"fake": FakeAdapter()}))
+    active = restarted.get("/api/v1/mappings/active/move.forward", headers=auth())
+    assert active.status_code == 200
+    assert active.json()["mappingId"] == "seed-move-forward"
+
+
 def test_restart_recovery_marks_confirming_plan_unknown(tmp_path):
     db_path = str(tmp_path / "confirming.db")
     first = create_app(db_path=db_path, auth_token=TOKEN)

@@ -196,14 +196,20 @@ class _ControlContext:
             mapping={"targetId": robot_id, "topic": f"/{definition.commandKey}"},
         )
         try:
-            record = self.registry.create_draft(mapping)
-            self.store.save_mapping(record)
-            record = self.registry.validate(mapping.mappingId, mapping.version)
-            self.store.save_mapping(record)
-            record = self.registry.probe(mapping.mappingId, mapping.version)
-            self.store.save_mapping(record)
-            record = self.registry.activate(mapping.mappingId, mapping.version)
-            self.store.save_mapping(record)
+            try:
+                record = self.registry.get(mapping.mappingId, mapping.version)
+            except ValueError:
+                record = self.registry.create_draft(mapping)
+                self.store.save_mapping(record)
+            if record.status == "draft":
+                record = self.registry.validate(mapping.mappingId, mapping.version)
+                self.store.save_mapping(record)
+            if record.status == "validated":
+                record = self.registry.probe(mapping.mappingId, mapping.version)
+                self.store.save_mapping(record)
+            if record.status == "probed":
+                record = self.registry.activate(mapping.mappingId, mapping.version)
+                self.store.save_mapping(record)
         except ValueError:
             # A custom adapter may intentionally be unavailable.  The mapping
             # remains absent and the API reports a controlled error.
