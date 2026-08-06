@@ -1,0 +1,21 @@
+# Multi-stage local image: build the PWA once, then serve it from the BFF.
+FROM node:24-alpine AS pwa-build
+WORKDIR /src/apps/control-pwa
+COPY apps/control-pwa/package*.json ./
+RUN npm ci
+COPY apps/control-pwa/ ./
+RUN npm run build
+
+FROM python:3.12-slim
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+WORKDIR /app
+COPY pyproject.toml ./
+COPY packages/ ./packages/
+COPY services/ ./services/
+COPY --from=pwa-build /src/apps/control-pwa/dist ./apps/control-pwa/dist
+RUN pip install --no-cache-dir .
+RUN useradd --create-home --uid 10001 control && mkdir -p /data && chown -R control:control /app /data
+USER control
+ENV CONTROL_DB_PATH=/data/control.db
+EXPOSE 8080
+CMD ["uvicorn", "services.control_api.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]

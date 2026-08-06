@@ -1,0 +1,68 @@
+name: robot-action-console
+
+services:
+  control-api:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.control-api
+    environment:
+      CONTROL_API_TOKEN: ${CONTROL_API_TOKEN:-dev-token}
+      CONTROL_DB_PATH: /data/control.db
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql://control:control@postgres:5432/control
+    ports:
+      - "${CONTROL_API_PORT:-8080}:8080"
+    volumes:
+      - control-data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    restart: unless-stopped
+    # The ROS 2 adapter remains an optional host-network deployment. Do not
+    # expose DDS discovery or rosbridge to the browser network.
+
+  # Provisioned for the PostgreSQL repository/event-fanout profile. The
+  # runnable local API currently uses SQLite through CONTROL_DB_PATH; keeping
+  # these services here makes the migration boundary explicit.
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: control
+      POSTGRES_USER: control
+      POSTGRES_PASSWORD: control
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U control -d control"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+
+  # Use this profile only when the workstation needs to see a host ROS 2
+  # graph. Run one control-api instance, not both the default and this service.
+  control-api-ros2-host:
+    profiles: ["ros2-host"]
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.control-api
+    environment:
+      CONTROL_API_TOKEN: ${CONTROL_API_TOKEN:-dev-token}
+      CONTROL_DB_PATH: /data/control.db
+    network_mode: host
+    volumes:
+      - control-data:/data
+    restart: unless-stopped
+    command: ["uvicorn", "services.control_api.main:create_app", "--factory", "--host", "127.0.0.1", "--port", "8080", "--workers", "1"]
+
+volumes:
+  control-data:
+  postgres-data:
+  redis-data:
