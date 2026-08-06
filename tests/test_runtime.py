@@ -3,6 +3,9 @@ from datetime import datetime, timedelta, timezone
 from packages.control_core.adapters import FakeAdapter, AdapterResult
 from packages.control_core.models import CommandDefinition, CommandRequest, MappingVersion
 from packages.control_core.runtime import ActionRuntime
+from concurrent.futures import ThreadPoolExecutor
+import threading
+import time
 
 
 def request(cid="c1", idem="i1", key="move.forward", transport="fake"):
@@ -56,3 +59,52 @@ def test_cancel_and_unknown_result_are_safe():
     cancelled = runtime2.cancel("c1")
     assert cancelled.status.value == "cancelled"
 
+
+def test_expired_motion_lease_cancels_adapter_and_publishes_safety_stop():
+    now = [datetime.now(timezone.utc)]
+    adapter = FakeAdapter(result=AdapterResult(status="running"))
+    events = []
+    runtime = ActionRuntime(adapters={"fake": adapter}, event_sink=events.append, clock=lambda: now[0])
+    runtime.dispatch(request(), definition(), mapping(), lease_seconds=1)
+    now[0] += timedelta(seconds=2)
+    runtime.tick()
+    assert runtime.receipt("c1").status.value == "expired"
+    assert adapter.cancellations == ["c1"]
+    assert events[-1]["safetyStop"] is True
+
+
+def test_concurrent_motion_dispatches_only_one_command_per_robot():
+    class BlockingAdapter(FakeAdapter):
+        def __init__(self):
+            super().__init__(result=AdapterResult(status="running"))
+
+        def dispatch(self, req, mapping):
+            self.dispatches.append((req, mapping))
+            time.sleep(0.1)
+            return self.result
+
+    adapter = BlockingAdapter()
+    runtime = ActionRuntime(adapters={"fake": adapter})
+    req1, req2 = request("c1", "i1"), request("c2", "i2")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        receipts = list(pool.map(lambda pair: runtime.dispatch(*pair), [(req1, definition(), mapping()), (req2, definition(), mapping("move.forward", "v2"))]))
+    assert len(adapter.dispatches) == 1
+    assert sum(r.status.value == "rejected" for r in receipts) == 1
+
+
+def test_stop_prioritizes_and_closes_old_lease_even_when_cancel_fails():
+    class CancelFailureAdapter(FakeAdapter):
+        def cancel(self, command_id):
+            self.cancellations.append(command_id)
+            return AdapterResult(status="failed", error="transport down")
+
+    adapter = CancelFailureAdapter(result=AdapterResult(status="running"))
+    events = []
+    runtime = ActionRuntime(adapters={"fake": adapter}, event_sink=events.append)
+    runtime.dispatch(request("c1", "i1"), definition(), mapping())
+    stop_req = request("stop-1", "stop-1", key="stop", transport="fake")
+    runtime.dispatch(stop_req, definition("stop"), mapping("stop", "v1"))
+    old = runtime.receipt("c1")
+    assert old.status.value == "cancelled"
+    assert "transport down" in (old.error or "")
+    assert any(e["commandId"] == "c1" and e["status"] == "cancelled" for e in events)

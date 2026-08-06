@@ -36,3 +36,22 @@ def test_probe_failure_and_transport_whitelist():
     unsafe = MappingVersion(mappingId="x", version="v1", commandKey="x", transport="http", mapping={"url": "http://evil"})
     with pytest.raises(ValueError):
         reg.create_draft(unsafe)
+
+
+def test_active_pointer_keeps_mapping_id_and_versions_are_superseded():
+    reg = MappingRegistry(adapters={"fake": FakeAdapter()})
+    for item in (mv("v1", mapping_id="m1"), mv("v1", mapping_id="m2")):
+        reg.create_draft(item); reg.validate(item.mappingId, item.version); reg.probe(item.mappingId, item.version); reg.activate(item.mappingId, item.version)
+    assert reg.active("move.forward").mappingId == "m2"
+    assert reg.get("m1", "v1").status == "superseded"
+
+
+def test_allowed_target_must_be_present_and_registered_and_dangerous_variants_rejected():
+    reg = MappingRegistry(adapters={"fake": FakeAdapter()}, allowed_targets={"r1"})
+    with pytest.raises(ValueError, match="target"):
+        reg.create_draft(mv(mapping_id="missing"))
+    with pytest.raises(ValueError, match="target"):
+        reg.create_draft(MappingVersion(mappingId="bad", version="v1", commandKey="move.forward", transport="fake", mapping={"targetId": "r2"}))
+    for key in ("scriptPath", "command_exec", "targetUrl", "shellCommand"):
+        with pytest.raises(ValueError):
+            reg.create_draft(MappingVersion(mappingId=key, version="v1", commandKey="move.forward", transport="fake", mapping={key: "x", "target_id": "r1"}))
