@@ -110,3 +110,62 @@ def test_negative_lease_and_timeout_are_rejected():
         TargetProfile(targetId="target-1", transport="http", timeoutMs=-1)
     with pytest.raises(ValidationError):
         TargetProfile(targetId="target-1", transport="http", leaseSeconds=-1)
+
+
+def test_mapping_nested_values_are_immutable_and_dump_as_json():
+    mapping = MappingVersion(
+        mappingId="mapping-1",
+        version="v1",
+        commandKey="gripper.open",
+        transport="fake",
+        mapping={"nested": {"topic": "/gripper/open"}, "items": ["a"]},
+        payloadSchema={"type": "object", "properties": {}},
+    )
+    with pytest.raises(TypeError):
+        mapping.mapping["nested"]["topic"] = "/changed"
+    with pytest.raises(TypeError):
+        mapping.mapping["items"].append("b")
+    dumped = mapping.model_dump(by_alias=True, mode="json")
+    assert dumped["mapping"]["nested"]["topic"] == "/gripper/open"
+
+
+def test_json_schema_rejects_non_json_values():
+    with pytest.raises(ValidationError):
+        CommandDefinition(commandKey="x", commandVersion="1", payloadSchema={"bad": {1, 2}})
+    with pytest.raises(ValidationError):
+        CapabilitySnapshot(agent="a", protocol="p", schema={"bad": object()})
+
+
+def test_future_issued_request_and_expired_plan_are_rejected():
+    with pytest.raises(ValidationError, match="issuedAt"):
+        _request(
+            issuedAt=datetime.now(timezone.utc) + timedelta(minutes=1),
+            expiresAt=datetime.now(timezone.utc) + timedelta(minutes=2),
+        )
+    with pytest.raises(ValidationError, match="expiresAt"):
+        PlanDraft(
+            planId="plan-1",
+            robotId="robot-1",
+            steps=[{"stepId": "a", "commandKey": "a"}],
+            createdAt=datetime.now(timezone.utc) - timedelta(minutes=2),
+            expiresAt=datetime.now(timezone.utc) - timedelta(seconds=1),
+        )
+
+
+def test_assignment_revalidates_request_fields():
+    request = _request()
+    with pytest.raises(ValidationError):
+        request.commandId = ""
+    with pytest.raises(ValidationError):
+        request.expiresAt = datetime.now(timezone.utc) - timedelta(seconds=1)
+
+
+def test_capability_schema_alias_serializes_without_shadow_warning():
+    snapshot = CapabilitySnapshot(
+        agent="robot-agent/1.2",
+        protocol="robot-agent",
+        schema={"type": "object"},
+        capabilities=[],
+        safetyMode="normal",
+    )
+    assert snapshot.model_dump(by_alias=True)["schema"] == {"type": "object"}

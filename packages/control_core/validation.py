@@ -7,8 +7,48 @@ be used by the API, runtime, and tests without dependency injection concerns.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import math
 from typing import Any, Mapping
+
+
+CLOCK_SKEW = timedelta(seconds=5)
+
+
+class FrozenDict(dict):
+    """A JSON-serializable dict that rejects all in-place mutations."""
+
+    def _immutable(self, *args, **kwargs):
+        raise TypeError("mapping version values are immutable")
+
+    __setitem__ = __delitem__ = clear = pop = popitem = setdefault = update = _immutable
+
+
+class FrozenList(tuple):
+    """Tuple-backed JSON array exposing mutation names with clear errors."""
+
+    def _immutable(self, *args, **kwargs):
+        raise TypeError("mapping version values are immutable")
+
+    append = extend = insert = pop = remove = reverse = sort = _immutable
+
+
+def _json_value(value: Any, *, freeze: bool = False) -> Any:
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("JSON values must be finite")
+        return value
+    if isinstance(value, Mapping):
+        if any(not isinstance(key, str) for key in value):
+            raise ValueError("JSON object keys must be strings")
+        converted = {key: _json_value(item, freeze=freeze) for key, item in value.items()}
+        return FrozenDict(converted) if freeze else converted
+    if isinstance(value, (list, tuple)):
+        converted = tuple(_json_value(item, freeze=freeze) for item in value)
+        return FrozenList(converted) if freeze else list(converted)
+    raise ValueError("value is not JSON-compatible")
 
 
 def non_empty_id(value: Any, field_name: str = "id") -> str:
@@ -41,6 +81,8 @@ def validate_expiry(issued_at: datetime, expires_at: datetime) -> tuple[datetime
 
     issued = as_utc(issued_at)
     expires = as_utc(expires_at)
+    if issued > utc_now() + CLOCK_SKEW:
+        raise ValueError("issuedAt cannot be in the future")
     if expires <= issued:
         raise ValueError("expiresAt must be later than issuedAt")
     if expires <= utc_now():
@@ -71,7 +113,15 @@ def require_json_schema(value: Mapping[str, Any]) -> dict[str, Any]:
 
     if not isinstance(value, Mapping):
         raise ValueError("payload schema must be a JSON object")
-    return dict(value)
+    return _json_value(value)
+
+
+def freeze_json_object(value: Mapping[str, Any]) -> FrozenDict:
+    """Validate and recursively freeze a JSON object for immutable models."""
+
+    if not isinstance(value, Mapping):
+        raise ValueError("value must be a JSON object")
+    return _json_value(value, freeze=True)
 
 
 def ensure_acyclic_steps(steps: list[Any]) -> None:

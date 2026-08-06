@@ -8,7 +8,15 @@ from typing import Any
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from .validation import as_utc, ensure_acyclic_steps, non_empty_id, require_json_schema, validate_expiry, utc_now
+from .validation import (
+    as_utc,
+    ensure_acyclic_steps,
+    freeze_json_object,
+    non_empty_id,
+    require_json_schema,
+    validate_expiry,
+    utc_now,
+)
 
 
 class _ValueEnum(str, Enum):
@@ -65,7 +73,7 @@ class SafetyMode(_ValueEnum):
 
 
 class ContractModel(BaseModel):
-    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+    model_config = ConfigDict(populate_by_name=True, extra="forbid", validate_assignment=True)
 
 
 class CommandDefinition(ContractModel):
@@ -170,6 +178,8 @@ class PlanDraft(ContractModel):
         ensure_acyclic_steps(self.steps)
         if self.expiresAt is not None and self.expiresAt <= self.createdAt:
             raise ValueError("expiresAt must be later than createdAt")
+        if self.expiresAt is not None and self.expiresAt <= utc_now():
+            raise ValueError("expiresAt is in the past")
         return self
 
 
@@ -221,7 +231,7 @@ class RobotState(ContractModel):
 class CapabilitySnapshot(ContractModel):
     agent: str
     protocol: str
-    schema: dict[str, Any] = Field(default_factory=dict)
+    schema_: dict[str, Any] = Field(default_factory=dict, alias="schema", serialization_alias="schema")
     capabilities: list[str] = Field(default_factory=list)
     safetyMode: SafetyMode = Field(default=SafetyMode.NORMAL, alias="safety_mode")
     robotId: str | None = Field(default=None, alias="robot_id")
@@ -231,7 +241,13 @@ class CapabilitySnapshot(ContractModel):
     def _names(cls, value: str, info):
         return non_empty_id(value, info.field_name)
 
-    @field_validator("schema")
+    @property
+    def schema(self) -> dict[str, Any]:
+        """Public schema API without shadowing ``BaseModel.schema`` internally."""
+
+        return self.schema_
+
+    @field_validator("schema_")
     @classmethod
     def _schema(cls, value):
         return require_json_schema(value)
@@ -290,7 +306,7 @@ class MappingVersion(ContractModel):
     @field_validator("mapping", "payloadSchema")
     @classmethod
     def _dicts(cls, value):
-        return require_json_schema(value)
+        return freeze_json_object(value)
 
     @field_validator("createdAt")
     @classmethod
