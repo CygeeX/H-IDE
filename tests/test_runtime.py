@@ -403,3 +403,21 @@ def test_cancel_running_safety_keeps_its_barrier_until_external_cancel_returns()
     assert blocked.status.value == "rejected"
     adapter.release.set(); cancel_thread.join(timeout=2); worker.join(timeout=2)
     assert not cancel_thread.is_alive() and not worker.is_alive()
+
+
+def test_safety_cancel_failure_with_running_stop_remains_recoverable():
+    class CancelFailure(FakeAdapter):
+        def __init__(self):
+            super().__init__(result=AdapterResult(status="running"))
+        def cancel(self, command_id):
+            if command_id == "c1":
+                return AdapterResult(status="failed", error="old motion did not stop")
+            return AdapterResult(status="cancelled")
+    adapter = CancelFailure(); runtime = ActionRuntime(adapters={"fake": adapter})
+    runtime.dispatch(request(), definition(), mapping())
+    safety = runtime.dispatch(request("stop-recover", "stop-recover", key="stop"), definition("stop", "safety"), mapping("stop"))
+    assert safety.status.value == "running"
+    assert runtime._safety_barriers and "stop-recover" in runtime._inflight
+    recovered = runtime.cancel("stop-recover")
+    assert recovered.status.value == "cancelled"
+    assert not runtime._safety_barriers

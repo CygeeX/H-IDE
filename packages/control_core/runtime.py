@@ -259,7 +259,13 @@ class ActionRuntime:
         with self._lock:
             receipt = self._finish_dispatch(request, mapping, outcome, motion, is_safety, safety_epoch, safety_owner)
             if cancel_warnings and is_safety:
-                receipt = self._receipt(request, CommandStatus.FAILED, error=f"previous cancellation failed: {'; '.join(cancel_warnings)}", completedAt=self.clock(), safetyStop=True, safetyWarning=cancel_warnings[0])
+                warning = f"previous cancellation failed: {'; '.join(cancel_warnings)}"
+                if receipt.status in {CommandStatus.RUNNING, CommandStatus.ACCEPTED} or (receipt.status is CommandStatus.CANCELLED and request.commandId in self._inflight):
+                    # Keep the safety operation recoverable while its adapter
+                    # remains in flight; the barrier is intentionally retained.
+                    receipt = self._receipt(request, receipt.status, error=warning, safetyStop=True, safetyWarning=cancel_warnings[0])
+                else:
+                    receipt = self._receipt(request, CommandStatus.FAILED, error=warning, completedAt=self.clock(), safetyStop=True, safetyWarning=cancel_warnings[0])
         self._flush_events()
         return receipt
 
