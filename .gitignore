@@ -1,6 +1,7 @@
 .venv/
 __pycache__/
 *.py[cod]
+*.egg-info/
 .pytest_cache/
 .coverage
 htmlcov/
@@ -12,4 +13,3 @@ dist/
 data/
 *.db
 .DS_Store
-
