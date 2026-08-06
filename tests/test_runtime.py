@@ -383,7 +383,11 @@ def test_event_worker_repairs_enqueue_while_synchronous_flush_is_busy():
     assert not first.is_alive()
 
     deadline = time.monotonic() + 1
-    while time.monotonic() < deadline and not any(event["commandId"] == "c2" for event in seen):
+    while time.monotonic() < deadline and (
+        not any(event["commandId"] == "c2" for event in seen)
+        or runtime._event_queue
+        or runtime._event_worker_pending
+    ):
         time.sleep(0.01)
     assert any(event["commandId"] == "c2" for event in seen)
     assert runtime._event_queue == []
