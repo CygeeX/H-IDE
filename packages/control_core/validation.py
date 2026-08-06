@@ -58,7 +58,9 @@ class FrozenList(list):
         return result
 
 
-def _json_value(value: Any, *, freeze: bool = False) -> Any:
+def _json_value(value: Any, *, freeze: bool = False, _active: set[int] | None = None) -> Any:
+    if _active is None:
+        _active = set()
     if value is None or isinstance(value, (str, bool, int)):
         return value
     if isinstance(value, float):
@@ -66,12 +68,26 @@ def _json_value(value: Any, *, freeze: bool = False) -> Any:
             raise ValueError("JSON values must be finite")
         return value
     if isinstance(value, Mapping):
-        if any(not isinstance(key, str) for key in value):
-            raise ValueError("JSON object keys must be strings")
-        converted = {key: _json_value(item, freeze=freeze) for key, item in value.items()}
+        marker = id(value)
+        if marker in _active:
+            raise ValueError("JSON cycle is not allowed")
+        _active.add(marker)
+        try:
+            if any(not isinstance(key, str) for key in value):
+                raise ValueError("JSON object keys must be strings")
+            converted = {key: _json_value(item, freeze=freeze, _active=_active) for key, item in value.items()}
+        finally:
+            _active.remove(marker)
         return FrozenDict(converted) if freeze else converted
     if isinstance(value, (list, tuple)):
-        converted = tuple(_json_value(item, freeze=freeze) for item in value)
+        marker = id(value)
+        if marker in _active:
+            raise ValueError("JSON cycle is not allowed")
+        _active.add(marker)
+        try:
+            converted = tuple(_json_value(item, freeze=freeze, _active=_active) for item in value)
+        finally:
+            _active.remove(marker)
         return FrozenList(converted) if freeze else list(converted)
     raise ValueError("value is not JSON-compatible")
 

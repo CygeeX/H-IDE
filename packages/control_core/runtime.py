@@ -65,6 +65,7 @@ class ActionRuntime:
         self.diagnostics: list[dict[str, Any]] = []
         self._event_queue: list[dict[str, Any]] = []
         self._event_flush_lock = threading.Lock()
+        self._event_worker_pending = False
 
     @staticmethod
     def _adapter_key(value: Any) -> str:
@@ -88,12 +89,52 @@ class ActionRuntime:
         }
         event.update(extra)
         self._event_queue.append(event)
+        # If a callback flusher is active while the prior worker is handing
+        # off, ensure a successor is available without making normal dispatch
+        # asynchronous.
+        if self.event_sink and not self._event_worker_pending and self._event_flush_lock.locked():
+            self._event_worker_pending = True
+            threading.Thread(target=self._event_worker, daemon=True).start()
+
+    def _schedule_event_worker(self) -> None:
+        with self._lock:
+            if not self.event_sink or self._event_worker_pending or not self._event_queue:
+                return
+            self._event_worker_pending = True
+        threading.Thread(target=self._event_worker, daemon=True).start()
+
+    def _deliver_events(self, events: list[dict[str, Any]]) -> None:
+        for event in events:
+            try:
+                self.event_sink(event)
+            except Exception as exc:
+                self._warn("event sink failed", exc=exc)
+
+    def _event_worker(self) -> None:
+        while True:
+            with self._event_flush_lock:
+                while True:
+                    with self._lock:
+                        events = self._event_queue
+                        self._event_queue = []
+                    if not events:
+                        break
+                    self._deliver_events(events)
+            with self._lock:
+                if self._event_queue:
+                    continue
+                self._event_worker_pending = False
+                if self._event_queue:
+                    self._event_worker_pending = True
+                    continue
+                return
 
     def _flush_events(self) -> None:
         # A callback already being flushed by another caller must not make a
         # safety operation wait; the current flusher drains events queued while
         # its callback was running.
         if not self._event_flush_lock.acquire(blocking=False):
+            self._schedule_event_worker()
             return
         try:
             while True:
@@ -104,11 +145,7 @@ class ActionRuntime:
                     break
                 if not events:
                     break
-                for event in events:
-                    try:
-                        self.event_sink(event)
-                    except Exception as exc:
-                        self._warn("event sink failed", exc=exc)
+                self._deliver_events(events)
         finally:
             self._event_flush_lock.release()
 

@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 
 from .adapters import AdapterResult, CommandAdapter
 from .models import MappingVersion, Transport
+from .validation import freeze_json_object, freeze_json_value
 
 
 def validate_mapping_safety(mapping: MappingVersion) -> None:
@@ -36,6 +37,22 @@ def validate_mapping_safety(mapping: MappingVersion) -> None:
             raise ValueError("arbitrary URL access is not allowed")
 
     walk(mapping.mapping)
+
+
+def _snapshot_probe_result(value: Any) -> AdapterResult:
+    if not isinstance(value, AdapterResult):
+        return AdapterResult(status="unavailable", error="adapter probe returned invalid result")
+    status = getattr(value, "status", None)
+    if not isinstance(status, str) or not status.strip():
+        return AdapterResult(status="failed", error="adapter probe returned result without status")
+    if value.error is not None and not isinstance(value.error, str):
+        return AdapterResult(status="failed", error="adapter probe returned invalid error")
+    try:
+        result = freeze_json_value(value.result)
+        details = freeze_json_object(value.details)
+    except ValueError as exc:
+        return AdapterResult(status="failed", error=f"adapter probe returned non-JSON data: {exc}")
+    return AdapterResult(status=status, result=result, error=value.error, details=details)
 
 
 @dataclass(frozen=True)
@@ -75,12 +92,51 @@ class MappingRegistry:
         self.diagnostics: list[dict[str, Any]] = []
         self._audit_queue: list[dict[str, Any]] = []
         self._audit_flush_lock = threading.Lock()
+        self._audit_worker_pending = False
 
     def _audit(self, action: str, record: MappingRecord) -> None:
         self._audit_queue.append({"action": action, "mappingId": record.mapping.mappingId, "version": record.version, "commandKey": record.mapping.commandKey, "status": record.status})
+        if self.audit_sink and not self._audit_worker_pending and self._audit_flush_lock.locked():
+            self._audit_worker_pending = True
+            threading.Thread(target=self._audit_worker, daemon=True).start()
+
+    def _schedule_audit_worker(self) -> None:
+        with self._lock:
+            if not self.audit_sink or self._audit_worker_pending or not self._audit_queue:
+                return
+            self._audit_worker_pending = True
+        threading.Thread(target=self._audit_worker, daemon=True).start()
+
+    def _deliver_audits(self, events: list[dict[str, Any]]) -> None:
+        for event in events:
+            try:
+                self.audit_sink(event)
+            except Exception as exc:
+                with self._lock:
+                    self.diagnostics.append({"message": "audit sink failed", "error": str(exc)})
+
+    def _audit_worker(self) -> None:
+        while True:
+            with self._audit_flush_lock:
+                while True:
+                    with self._lock:
+                        events = self._audit_queue
+                        self._audit_queue = []
+                    if not events:
+                        break
+                    self._deliver_audits(events)
+            with self._lock:
+                if self._audit_queue:
+                    continue
+                self._audit_worker_pending = False
+                if self._audit_queue:
+                    self._audit_worker_pending = True
+                    continue
+                return
 
     def _flush_audits(self) -> None:
         if not self._audit_flush_lock.acquire(blocking=False):
+            self._schedule_audit_worker()
             return
         try:
             while True:
@@ -90,12 +146,7 @@ class MappingRegistry:
                 if self.audit_sink:
                     if not events:
                         break
-                    for event in events:
-                        try:
-                            self.audit_sink(event)
-                        except Exception as exc:
-                            with self._lock:
-                                self.diagnostics.append({"message": "audit sink failed", "error": str(exc)})
+                    self._deliver_audits(events)
                 else:
                     break
         finally:
@@ -120,13 +171,18 @@ class MappingRegistry:
         if key in self._records:
             raise ValueError("mapping version already exists")
         embedded_target = self._mapping_target(mapping)
+        if target_id is not None and embedded_target is not None and target_id != embedded_target:
+            raise ValueError("target_id does not match mapping target")
         if self.allowed_targets is not None:
             if embedded_target is None:
                 raise ValueError("target is required when targets are allowlisted")
             if embedded_target not in self.allowed_targets:
                 raise ValueError("target is not allowlisted")
-            if target_id is not None and target_id != embedded_target:
-                raise ValueError("target_id does not match mapping target")
+        # Keep one canonical target binding on the record.  An embedded
+        # target is authoritative when callers omit the explicit argument;
+        # later lifecycle snapshots then retain the same binding.
+        if target_id is None:
+            target_id = embedded_target
         rec = MappingRecord(mapping=mapping, status="draft", target_id=target_id)
         self._records[self._key(mapping.mappingId, mapping.version)] = rec
         self._audit("draft", rec)
@@ -144,13 +200,18 @@ class MappingRegistry:
 
     @staticmethod
     def _mapping_target(mapping: MappingVersion) -> str | None:
+        targets: list[str] = []
         for key, value in mapping.mapping.items():
             normalized = re.sub(r"[^a-z0-9]", "", unicodedata.normalize("NFKC", str(key)).casefold())
             if normalized in {"targetid", "target"}:
                 if not isinstance(value, str) or not value.strip():
                     raise ValueError("target must be a non-empty string")
-                return value.strip()
-        return None
+                targets.append(value.strip())
+        if not targets:
+            return None
+        if len(set(targets)) != 1:
+            raise ValueError("mapping target aliases conflict")
+        return targets[0]
 
     def validate(self, mapping_id: str, version: str) -> MappingRecord:
         with self._lock:
@@ -192,12 +253,11 @@ class MappingRegistry:
                 result = adapter.probe(mapping)
             except Exception as exc:
                 result = AdapterResult(status="failed", error=f"adapter probe failed: {exc}")
-        if not isinstance(result, AdapterResult):
-            result = AdapterResult(status="unavailable", error="adapter probe returned invalid result")
-        probe_status = getattr(result, "status", None)
-        if not isinstance(probe_status, str) or not probe_status.strip():
-            result = AdapterResult(status="unavailable", error="adapter probe returned result without status")
-            probe_status = result.status
+        try:
+            result = _snapshot_probe_result(result)
+        except Exception as exc:
+            result = AdapterResult(status="failed", error=f"adapter probe result normalization failed: {exc}")
+        probe_status = result.status
         good = probe_status.lower() in {"probed", "available", "succeeded", "ok"}
         with self._lock:
             try:

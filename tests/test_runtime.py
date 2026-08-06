@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 from packages.control_core.adapters import FakeAdapter, AdapterResult
-from packages.control_core.models import CommandDefinition, CommandKind, CommandRequest, MappingVersion
+from packages.control_core.models import CommandDefinition, CommandKind, CommandRequest, CommandStatus, MappingVersion
 from packages.control_core.runtime import ActionRuntime
 from concurrent.futures import ThreadPoolExecutor
 import threading
@@ -332,8 +332,9 @@ def test_invalid_lease_seconds_reject_before_running_or_dispatch():
 
 
 def test_blocking_event_sink_does_not_hold_runtime_lock_against_cancel():
-    entered = threading.Event(); release = threading.Event()
+    entered = threading.Event(); release = threading.Event(); seen = []
     def sink(event):
+        seen.append(event)
         if event["status"] == "accepted" and not entered.is_set():
             entered.set(); release.wait(timeout=2)
     adapter = FakeAdapter(result=AdapterResult(status="running"))
@@ -344,6 +345,117 @@ def test_blocking_event_sink_does_not_hold_runtime_lock_against_cancel():
     cancel_thread.join(timeout=0.5)
     assert not cancel_thread.is_alive()
     release.set(); dispatch_thread.join(timeout=2)
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline and not any(event["commandId"] == "c1" and event["status"] == "cancelled" for event in seen):
+        time.sleep(0.01)
+    assert any(event["commandId"] == "c1" and event["status"] == "cancelled" for event in seen)
+
+
+def test_event_worker_repairs_enqueue_while_synchronous_flush_is_busy():
+    entered = threading.Event()
+    release = threading.Event()
+    seen = []
+
+    def sink(event):
+        seen.append(event)
+        if event["commandId"] == "c1" and event["status"] == "accepted":
+            entered.set()
+            assert release.wait(timeout=2)
+
+    adapter = FakeAdapter(result=AdapterResult(status="running"))
+    runtime = ActionRuntime(adapters={"fake": adapter}, event_sink=sink)
+    first = threading.Thread(target=lambda: runtime.dispatch(request(), definition(), mapping()))
+    first.start()
+    assert entered.wait(timeout=1)
+
+    second = threading.Thread(
+        target=lambda: runtime.dispatch(
+            request(cid="c2", idem="i2"),
+            definition(),
+            mapping(version="v2"),
+        )
+    )
+    second.start()
+    second.join(timeout=1)
+    assert not second.is_alive()
+    release.set()
+    first.join(timeout=2)
+    assert not first.is_alive()
+
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline and not any(event["commandId"] == "c2" for event in seen):
+        time.sleep(0.01)
+    assert any(event["commandId"] == "c2" for event in seen)
+    assert runtime._event_queue == []
+    assert runtime._event_worker_pending is False
+
+
+def test_event_worker_handoff_observes_enqueue_after_flush_lock_release():
+    # Pause a worker immediately after it releases the callback lock.  An
+    # event queued in that handoff window must still be drained by the worker.
+    class HandoffLock:
+        def __init__(self):
+            self._lock = threading.Lock()
+            self.worker_ident = None
+            self.released = threading.Event()
+            self.resume = threading.Event()
+            self._pause_once = True
+
+        def acquire(self, blocking=True):
+            return self._lock.acquire(blocking)
+
+        def release(self):
+            self._lock.release()
+            if threading.get_ident() == self.worker_ident and self._pause_once:
+                self._pause_once = False
+                self.released.set()
+                assert self.resume.wait(timeout=2)
+
+        def locked(self):
+            return self._lock.locked()
+
+        def __enter__(self):
+            self.acquire()
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            self.release()
+
+    seen = []
+    worker_started = threading.Event()
+    handoff = HandoffLock()
+    runtime = ActionRuntime(adapters={"fake": FakeAdapter()}, event_sink=seen.append)
+    runtime._event_flush_lock = handoff
+    original_worker = runtime._event_worker
+
+    def wrapped_worker():
+        handoff.worker_ident = threading.get_ident()
+        worker_started.set()
+        original_worker()
+
+    runtime._event_worker = wrapped_worker
+    req0 = request(cid="worker-seed", idem="worker-seed")
+    map0 = mapping(version="worker-seed")
+    with runtime._lock:
+        runtime._event(req0, map0, CommandStatus.ACCEPTED)
+    handoff.acquire()
+    runtime._schedule_event_worker()
+    assert worker_started.wait(timeout=1)
+    handoff.release()
+    assert handoff.released.wait(timeout=1)
+
+    req1 = request(cid="handoff", idem="handoff")
+    map1 = mapping(version="handoff")
+    with runtime._lock:
+        runtime._event(req1, map1, CommandStatus.ACCEPTED)
+    handoff.resume.set()
+
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline and not any(event["commandId"] == "handoff" for event in seen):
+        time.sleep(0.01)
+    assert any(event["commandId"] == "handoff" for event in seen)
+    assert runtime._event_queue == []
+    assert runtime._event_worker_pending is False
 
 
 def test_command_kind_not_command_key_substring_controls_safety_and_motion():

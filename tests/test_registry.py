@@ -64,6 +64,11 @@ def test_allowed_target_must_be_present_and_registered_and_dangerous_variants_re
     for key in ("scriptPath", "command_exec", "targetUrl", "shellCommand"):
         with pytest.raises(ValueError):
             reg.create_draft(MappingVersion(mappingId=key, version="v1", commandKey="move.forward", transport="fake", mapping={key: "x", "target_id": "r1"}))
+    with pytest.raises(ValueError, match="target"):
+        reg.create_draft(MappingVersion(mappingId="conflict", version="v1", commandKey="move.forward", transport="fake", mapping={"targetId": "r1", "target": "r2"}))
+    unrestricted = MappingRegistry(adapters={"fake": FakeAdapter()})
+    with pytest.raises(ValueError, match="target_id"):
+        unrestricted.create_draft(MappingVersion(mappingId="mismatch", version="v1", commandKey="move.forward", transport="fake", mapping={"targetId": "r1"}), target_id="r2")
 
 
 def test_registry_rejects_duplicate_versions_and_invalid_state_transitions():
@@ -89,6 +94,20 @@ def test_allowed_targets_are_defensively_copied_and_unicode_confusables_rejected
             reg.create_draft(bad)
 
 
+def test_embedded_target_is_snapshotted_as_record_target_id():
+    reg = MappingRegistry(adapters={"fake": FakeAdapter()})
+    item = MappingVersion(
+        mappingId="embedded-target",
+        version="v1",
+        commandKey="move.forward",
+        transport="fake",
+        mapping={"targetId": "r1"},
+    )
+    record = reg.create_draft(item)
+    assert record.target_id == "r1"
+    assert reg.get("embedded-target", "v1").target_id == "r1"
+
+
 def test_target_id_requires_non_empty_string_and_probe_cannot_validate_backwards():
     reg = MappingRegistry(adapters={"fake": FakeAdapter()})
     with pytest.raises(ValueError, match="target_id"):
@@ -110,6 +129,17 @@ def test_malformed_probe_result_is_explicit_failure_and_audit_sink_is_non_blocki
     with pytest.raises(ValueError, match="probe"):
         reg.probe("m", "v1")
     assert reg.diagnostics
+
+
+def test_probe_result_snapshot_is_deeply_immutable():
+    result = AdapterResult(status="probed", result={"caps": ["move"]}, details={"nested": {"ok": True}})
+    reg = MappingRegistry(adapters={"fake": FakeAdapter(probe_result=result)})
+    reg.create_draft(mv()); reg.validate("m", "v1")
+    record = reg.probe("m", "v1")
+    with pytest.raises(TypeError):
+        record.probe.details["nested"]["ok"] = False
+    with pytest.raises(TypeError):
+        record.probe.result["caps"].append("hack")
 
 
 def test_blocking_probe_does_not_hold_registry_lock_for_reads_or_activation():
@@ -139,8 +169,9 @@ def test_unavailable_adapter_operations_return_explicit_statuses():
 
 
 def test_blocking_audit_sink_does_not_hold_registry_lock_for_reads():
-    entered = threading.Event(); release = threading.Event()
+    entered = threading.Event(); release = threading.Event(); seen = []
     def sink(event):
+        seen.append(event)
         if event["action"] == "draft":
             entered.set(); release.wait(timeout=2)
     reg = MappingRegistry(adapters={"fake": FakeAdapter()}, audit_sink=sink)
@@ -148,7 +179,12 @@ def test_blocking_audit_sink_does_not_hold_registry_lock_for_reads():
     thread.start(); assert entered.wait(timeout=1)
     start = time.monotonic(); assert reg.get("m", "v1").status == "draft"
     assert time.monotonic() - start < 0.5
+    reg.create_draft(mv(mapping_id="m2"))
     release.set(); thread.join(timeout=2); assert not thread.is_alive()
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline and not any(event["mappingId"] == "m2" for event in seen):
+        time.sleep(0.01)
+    assert any(event["mappingId"] == "m2" for event in seen)
 
 
 def test_event_and_audit_callbacks_are_serialized():

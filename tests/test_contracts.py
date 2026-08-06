@@ -271,3 +271,10 @@ def test_frozen_list_supports_copy_and_deepcopy_without_mutation_methods():
     assert list(deep) == [1, {"x": True}]
     with pytest.raises(TypeError):
         deep.append(2)
+
+
+def test_cyclic_json_payload_is_rejected_as_validation_error():
+    payload = {}
+    payload["self"] = payload
+    with pytest.raises(ValidationError, match="cycle"):
+        _request(payload=payload)
