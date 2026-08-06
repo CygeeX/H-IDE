@@ -108,3 +108,33 @@ def test_stop_prioritizes_and_closes_old_lease_even_when_cancel_fails():
     assert old.status.value == "cancelled"
     assert "transport down" in (old.error or "")
     assert any(e["commandId"] == "c1" and e["status"] == "cancelled" for e in events)
+
+
+def test_lease_expiry_cancel_failures_never_leave_running():
+    class BrokenCancelAdapter(FakeAdapter):
+        def cancel(self, command_id):
+            raise RuntimeError("link lost")
+
+    now = [datetime.now(timezone.utc)]
+    events = []
+    adapter = BrokenCancelAdapter(result=AdapterResult(status="running"))
+    runtime = ActionRuntime(adapters={"fake": adapter}, event_sink=events.append, clock=lambda: now[0])
+    runtime.dispatch(request(), definition(), mapping(), lease_seconds=1)
+    now[0] += timedelta(seconds=2)
+    runtime.tick()
+    assert runtime.receipt("c1").status.value == "expired"
+    assert runtime.receipt("c1").status.value != "running"
+    assert events[-1]["safetyWarning"]
+
+
+def test_cancel_unknown_result_is_not_success_and_releases_lease():
+    class UnknownCancelAdapter(FakeAdapter):
+        def cancel(self, command_id):
+            return AdapterResult(status="unknown", error="no confirmation")
+
+    adapter = UnknownCancelAdapter(result=AdapterResult(status="running"))
+    runtime = ActionRuntime(adapters={"fake": adapter})
+    runtime.dispatch(request(), definition(), mapping())
+    result = runtime.cancel("c1")
+    assert result.status.value == "failed"
+    assert "no confirmation" in (result.error or "")

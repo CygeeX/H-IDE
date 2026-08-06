@@ -55,3 +55,26 @@ def test_allowed_target_must_be_present_and_registered_and_dangerous_variants_re
     for key in ("scriptPath", "command_exec", "targetUrl", "shellCommand"):
         with pytest.raises(ValueError):
             reg.create_draft(MappingVersion(mappingId=key, version="v1", commandKey="move.forward", transport="fake", mapping={key: "x", "target_id": "r1"}))
+
+
+def test_registry_rejects_duplicate_versions_and_invalid_state_transitions():
+    reg = MappingRegistry(adapters={"fake": FakeAdapter()})
+    item = mv()
+    reg.create_draft(item)
+    with pytest.raises(ValueError, match="already exists"):
+        reg.create_draft(item)
+    reg.validate("m", "v1"); reg.probe("m", "v1"); reg.activate("m", "v1")
+    with pytest.raises(ValueError, match="state"):
+        reg.validate("m", "v1")
+
+
+def test_allowed_targets_are_defensively_copied_and_unicode_confusables_rejected():
+    targets = {"r1"}
+    reg = MappingRegistry(adapters={"fake": FakeAdapter()}, allowed_targets=targets)
+    targets.clear()
+    item = MappingVersion(mappingId="m", version="v1", commandKey="move.forward", transport="fake", mapping={"targetId": "r1"})
+    reg.create_draft(item)
+    for key in ("ｓｃｒｉｐｔPath", "сcriptPath"):
+        bad = MappingVersion(mappingId=key, version="v1", commandKey="move.forward", transport="fake", mapping={key: "x", "targetId": "r1"})
+        with pytest.raises(ValueError):
+            reg.create_draft(bad)

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import re
 import threading
+import unicodedata
 from typing import Any, Callable, Mapping
 from urllib.parse import urlparse
 
@@ -40,7 +41,7 @@ class MappingRegistry:
     ):
         self.adapters = {getattr(k, "value", k): value for k, value in (adapters or {}).items()}
         self.audit_sink = audit_sink
-        self.allowed_targets = allowed_targets
+        self.allowed_targets = frozenset(allowed_targets) if allowed_targets is not None else None
         self._records: dict[tuple[str, str], MappingRecord] = {}
         self._active: dict[str, tuple[str, str]] = {}
         self._history: dict[str, list[tuple[str, str]]] = {}
@@ -63,6 +64,9 @@ class MappingRegistry:
         if target_id is not None and self.allowed_targets is not None and target_id not in self.allowed_targets:
             raise ValueError("target is not allowlisted")
         self._static_validate(mapping)
+        key = self._key(mapping.mappingId, mapping.version)
+        if key in self._records:
+            raise ValueError("mapping version already exists")
         embedded_target = self._mapping_target(mapping)
         if self.allowed_targets is not None:
             if embedded_target is None:
@@ -92,7 +96,10 @@ class MappingRegistry:
         def walk(value: Any) -> None:
             if isinstance(value, Mapping):
                 for key, item in value.items():
-                    normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+                    raw_key = unicodedata.normalize("NFKC", str(key)).casefold()
+                    if not raw_key.isascii():
+                        raise ValueError(f"mapping field {key} contains unsupported characters")
+                    normalized = re.sub(r"[^a-z0-9]", "", raw_key)
                     if any(token in normalized for token in banned_tokens) or normalized in {"command", "commandline", "run"}:
                         raise ValueError(f"mapping field {key} is not allowed")
                     walk(item)
@@ -106,7 +113,7 @@ class MappingRegistry:
     @staticmethod
     def _mapping_target(mapping: MappingVersion) -> str | None:
         for key, value in mapping.mapping.items():
-            normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+            normalized = re.sub(r"[^a-z0-9]", "", unicodedata.normalize("NFKC", str(key)).casefold())
             if normalized in {"targetid", "target"}:
                 if not isinstance(value, str) or not value.strip():
                     raise ValueError("target must be a non-empty string")
@@ -119,6 +126,8 @@ class MappingRegistry:
 
     def _validate(self, mapping_id: str, version: str) -> MappingRecord:
         rec = self._require(mapping_id, version)
+        if rec.status not in {"draft", "validated", "probed"}:
+            raise ValueError("invalid mapping state for validation")
         self._static_validate(rec.mapping)
         rec = MappingRecord(rec.mapping, "validated", rec.target_id, rec.probe)
         self._records[(mapping_id, version)] = rec

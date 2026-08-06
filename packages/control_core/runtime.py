@@ -96,9 +96,18 @@ class ActionRuntime:
             mapping = self._mappings.get(lease.command_id)
             if req and mapping:
                 adapter = self.adapters.get(self._adapter_key(req.transport))
+                warning = None
                 if adapter:
-                    adapter.cancel(req.commandId)
-                self._receipt(req, CommandStatus.EXPIRED, error="motion lease expired", completedAt=now, safetyStop=True)
+                    try:
+                        outcome = adapter.cancel(req.commandId)
+                        if str(outcome.status).lower() in {"failed", "unknown", "unavailable"}:
+                            warning = outcome.error or f"adapter returned {outcome.status} while stopping"
+                    except Exception as exc:
+                        warning = f"safety stop failed: {exc}"
+                else:
+                    warning = "safety stop unavailable: adapter unavailable"
+                error = "motion lease expired" if warning is None else f"motion lease expired; {warning}"
+                self._receipt(req, CommandStatus.EXPIRED, error=error, completedAt=now, safetyStop=True, safetyWarning=warning)
 
     def tick(self) -> None:
         """Expire stale leases and issue adapter safety cancellation."""
@@ -217,8 +226,11 @@ class ActionRuntime:
             return current
         adapter = self.adapters.get(self._adapter_key(request.transport))
         if adapter:
-            outcome = adapter.cancel(command_id)
-            if str(outcome.status).lower() in {"failed", "unavailable"}:
+            try:
+                outcome = adapter.cancel(command_id)
+            except Exception as exc:
+                outcome = AdapterResult(status="failed", error=str(exc))
+            if str(outcome.status).lower() in {"failed", "unavailable", "unknown"}:
                 self._leases.pop(request.robotId, None)
                 message = outcome.error or "cancel failed"
                 return self._receipt(request, CommandStatus.FAILED, error=message, completedAt=self.clock(), safetyStop=True, safetyWarning=message)
