@@ -277,20 +277,28 @@ class MappingRegistry:
             result = AdapterResult(status="failed", error=f"adapter probe result normalization failed: {exc}")
         probe_status = result.status
         good = probe_status.lower() in {"probed", "available", "succeeded", "ok"}
+        failure: ValueError | None = None
+        success_record: MappingRecord | None = None
         with self._lock:
             try:
                 current = self._records.get(key)
                 if current is None or current.mapping != mapping or current.status not in {"validated", "probed"}:
-                    raise ValueError("mapping changed while probing")
-                if not good:
-                    raise ValueError(result.error or "capability probe failed")
-                rec = MappingRecord(mapping, "probed", target_id, result)
-                self._records[key] = rec
-                self._audit("probed", rec)
+                    failure = ValueError("mapping changed while probing")
+                elif not good:
+                    failed_record = MappingRecord(mapping, current.status, target_id, result)
+                    self._audit("probe_failed", failed_record)
+                    failure = ValueError(result.error or "capability probe failed")
+                else:
+                    success_record = MappingRecord(mapping, "probed", target_id, result)
+                    self._records[key] = success_record
+                    self._audit("probed", success_record)
             finally:
                 self._probing.discard(key)
         self._flush_audits()
-        return rec
+        if failure is not None:
+            raise failure
+        assert success_record is not None
+        return success_record
 
     def activate(self, mapping_id: str, version: str) -> MappingRecord:
         with self._lock:
@@ -378,6 +386,24 @@ class MappingRegistry:
     def restore_history(self, command_key: str, history: list[tuple[str, str]]) -> None:
         with self._lock:
             self._history[command_key] = list(history)
+
+    def snapshot_state(self) -> tuple[dict[tuple[str, str], MappingRecord], dict[str, tuple[str, str]], dict[str, list[tuple[str, str]]], list[dict[str, Any]]]:
+        """Capture mutable registry indexes for an API transaction rollback."""
+        with self._lock:
+            return (
+                dict(self._records),
+                dict(self._active),
+                {key: list(value) for key, value in self._history.items()},
+                list(self._audit_queue),
+            )
+
+    def restore_state(self, snapshot) -> None:
+        with self._lock:
+            records, active, history, audit_queue = snapshot
+            self._records = dict(records)
+            self._active = dict(active)
+            self._history = {key: list(value) for key, value in history.items()}
+            self._audit_queue = list(audit_queue)
 
 
 __all__ = ["MappingRecord", "MappingRegistry", "mapping_target_values", "validate_mapping_safety"]

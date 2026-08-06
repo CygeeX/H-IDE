@@ -169,7 +169,10 @@ class SQLiteStore:
                     request = _decode(row["request_json"])
                 except (TypeError, ValueError, json.JSONDecodeError):
                     request = {}
-                key = request.get("idempotencyKey") or request.get("idempotency_key")
+                if isinstance(request, Mapping):
+                    key = request.get("idempotencyKey") or request.get("idempotency_key")
+                else:
+                    key = None
             if not isinstance(key, str) or not key:
                 key = f"legacy:{row['command_id']}"
             # A legacy database may contain duplicate keys because no unique
@@ -201,6 +204,8 @@ class SQLiteStore:
         for row in rows:
             try:
                 payload = _decode(row["payload_json"])
+                if not isinstance(payload, Mapping):
+                    continue
                 command_key = payload.get("commandKey") or payload.get("command_key")
             except (TypeError, ValueError, json.JSONDecodeError):
                 command_key = None
@@ -433,6 +438,40 @@ class SQLiteStore:
             ).fetchall()
         return [_decode(row["receipt_json"]) for row in rows]
 
+    def mark_unowned_commands_for_reconciliation(self) -> int:
+        """Annotate non-terminal commands after a process restart.
+
+        The status is intentionally preserved (``accepted``/``running`` are
+        useful facts for operators), but the error makes clear that this
+        process cannot claim or replay the adapter operation.
+        """
+        message = "runtime ownership unavailable after process restart; reconciliation required"
+        count = 0
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT command_id, receipt_json, status FROM commands "
+                "WHERE lower(status) IN ('accepted', 'running', 'pending')"
+            ).fetchall()
+            for row in rows:
+                try:
+                    receipt = _decode(row["receipt_json"])
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    receipt = None
+                if not isinstance(receipt, Mapping):
+                    receipt = {"commandId": row["command_id"], "status": row["status"]}
+                old_error = receipt.get("error")
+                if isinstance(old_error, str) and "reconciliation" in old_error.lower():
+                    continue
+                receipt["error"] = f"{old_error}; {message}" if old_error else message
+                self._connection.execute(
+                    "UPDATE commands SET receipt_json = ?, updated_at = ? WHERE command_id = ?",
+                    (_encode(receipt), self._now(), row["command_id"]),
+                )
+                count += 1
+            if rows:
+                self._connection.commit()
+        return count
+
     @staticmethod
     def _mapping_payload(record: MappingRecord) -> tuple[dict[str, Any], str, str | None, dict[str, Any] | None]:
         mapping_payload = dict(_jsonable(record.mapping))
@@ -514,9 +553,16 @@ class SQLiteStore:
 
     @staticmethod
     def _mapping_row(row: sqlite3.Row) -> dict[str, Any]:
-        probe = None if row["probe_json"] is None else _decode(row["probe_json"])
+        try:
+            mapping = _decode(row["payload_json"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            mapping = None
+        try:
+            probe = None if row["probe_json"] is None else _decode(row["probe_json"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            probe = None
         return {
-            "mapping": _decode(row["payload_json"]),
+            "mapping": mapping,
             "status": row["status"],
             "targetId": row["target_id"],
             "probe": probe,

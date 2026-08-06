@@ -241,6 +241,20 @@ def test_mapping_lifecycle_and_latest_version_rollback():
     assert rolled.json()["mapping"]["mappingId"] == "api-m1"
 
 
+def test_command_cannot_dispatch_against_non_active_explicit_mapping():
+    adapter = FakeAdapter()
+    client = TestClient(create_app(auth_token=TOKEN, adapters={"fake": adapter}))
+    body = mapping_body(mapping_id="draft-only")
+    assert client.post("/api/v1/mappings/drafts", headers=auth(), json=body).status_code == 200
+    response = client.post(
+        "/api/v1/commands",
+        headers=auth(),
+        json=command_body(idempotencyKey="draft-only-command", mappingId="draft-only", mappingVersion="v1"),
+    )
+    assert response.status_code in {409, 422}
+    assert adapter.dispatches == []
+
+
 def test_mapping_active_pointer_and_rollback_survive_restart(tmp_path):
     db_path = str(tmp_path / "mappings.db")
     client = TestClient(create_app(db_path=db_path, auth_token=TOKEN))
@@ -259,6 +273,52 @@ def test_mapping_active_pointer_and_rollback_survive_restart(tmp_path):
     )
     assert rollback.status_code == 200
     assert rollback.json()["mapping"]["mappingId"] == "z-old"
+
+
+def test_concurrent_mapping_activate_keeps_registry_and_sqlite_pointer_consistent(monkeypatch):
+    client = TestClient(create_app(auth_token=TOKEN))
+    for mapping_id in ("race-b", "race-c"):
+        body = mapping_body(mapping_id=mapping_id)
+        assert client.post("/api/v1/mappings/drafts", headers=auth(), json=body).status_code == 200
+        assert client.post(f"/api/v1/mappings/{mapping_id}/v1/validate", headers=auth()).status_code == 200
+        assert client.post(f"/api/v1/mappings/{mapping_id}/v1/probe", headers=auth()).status_code == 200
+
+    context = client.app.state.control
+    original_activate = context.registry.activate
+    entered_b = threading.Event()
+    release_b = threading.Event()
+
+    def activate(mapping_id, version):
+        record = original_activate(mapping_id, version)
+        if mapping_id == "race-b":
+            entered_b.set()
+            assert release_b.wait(timeout=3)
+        return record
+
+    monkeypatch.setattr(context.registry, "activate", activate)
+    responses = {}
+
+    def activate_one(mapping_id):
+        responses[mapping_id] = client.post(
+            f"/api/v1/mappings/{mapping_id}/v1/activate", headers=auth()
+        )
+
+    first = threading.Thread(target=activate_one, args=("race-b",))
+    first.start()
+    assert entered_b.wait(timeout=3)
+    second = threading.Thread(target=activate_one, args=("race-c",))
+    second.start()
+    # Let C finish its transition and pointer commit before B is allowed to
+    # persist its stale ``previous`` snapshot.
+    time.sleep(0.05)
+    release_b.set()
+    first.join(timeout=3)
+    second.join(timeout=3)
+    assert not first.is_alive() and not second.is_alive()
+    assert all(response.status_code == 200 for response in responses.values())
+    memory_active = context.registry.active("move.forward").mappingId
+    sqlite_active = context.store.get_active_pointer("move.forward")[0]
+    assert memory_active == sqlite_active
 
 
 def test_command_rejects_mapping_target_bound_to_another_robot():
@@ -434,6 +494,56 @@ def test_assistant_resolution_failure_is_terminal_not_replayable():
     assert client.post("/api/v1/assistant/drafts/unresolvable-plan/confirm", headers=auth()).status_code == 409
 
 
+def test_assistant_non_terminal_receipt_stops_plan_as_unknown():
+    adapter = _SequenceAdapter([AdapterResult(status="running"), AdapterResult(status="succeeded")])
+    client = TestClient(create_app(auth_token=TOKEN, adapters={"fake": adapter}))
+    created = client.post(
+        "/api/v1/assistant/drafts",
+        headers=auth(),
+        json={
+            "draftId": "running-plan",
+            "robotId": "robot-1",
+            "steps": [
+                {"stepId": "first", "commandKey": "move.forward", "payload": {}},
+                {"stepId": "second", "commandKey": "gripper.open", "payload": {}, "dependsOn": ["first"]},
+            ],
+        },
+    )
+    assert created.status_code == 200
+    response = client.post("/api/v1/assistant/drafts/running-plan/confirm", headers=auth())
+    assert response.status_code == 409
+    stored = client.get("/api/v1/assistant/drafts/running-plan", headers=auth()).json()
+    assert stored["status"] == "unknown"
+    assert [step["stepId"] for step in stored["execution"]["steps"]] == ["first"]
+    assert len(adapter.dispatches) == 1
+    assert client.post("/api/v1/assistant/drafts/running-plan/confirm", headers=auth()).status_code == 409
+    assert len(adapter.dispatches) == 1
+
+
+def test_restart_skips_corrupt_mapping_payload_rows(tmp_path):
+    db_path = str(tmp_path / "corrupt-mapping.db")
+    first = create_app(db_path=db_path, auth_token=TOKEN)
+    store = first.state.store
+    store._connection.execute("DELETE FROM mappings")
+    store._connection.execute(
+        "INSERT INTO mappings(mapping_id, version, payload_json, status, target_id, probe_json, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("corrupt-list", "v1", "[]", "active", None, None, store._now()),
+    )
+    store._connection.execute(
+        "INSERT INTO mappings(mapping_id, version, payload_json, status, target_id, probe_json, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("corrupt-object", "v1", '{"mappingId":"corrupt-object"}', "active", None, None, store._now()),
+    )
+    # Exercise the pointer backfill path used by an older database.
+    store._connection.execute("DELETE FROM mapping_active")
+    store._connection.commit()
+    restarted = TestClient(create_app(db_path=db_path, auth_token=TOKEN))
+    active = restarted.get("/api/v1/mappings/active/move.forward", headers=auth())
+    assert active.status_code == 200
+    assert active.json()["mappingId"].startswith("seed-")
+
+
 def test_restart_recovery_marks_confirming_plan_unknown(tmp_path):
     db_path = str(tmp_path / "confirming.db")
     first = create_app(db_path=db_path, auth_token=TOKEN)
@@ -464,7 +574,74 @@ def test_restart_running_command_cancel_is_explicitly_unavailable(tmp_path):
     restarted = TestClient(create_app(db_path=db_path, auth_token=TOKEN, adapters={"fake": FakeAdapter()}))
     cancelled = restarted.post(f"/api/v1/commands/{command_id}/cancel", headers=auth())
     assert cancelled.status_code in {409, 503}
-    assert restarted.get(f"/api/v1/commands/{command_id}", headers=auth()).json()["status"] == "running"
+    persisted = restarted.get(f"/api/v1/commands/{command_id}", headers=auth()).json()
+    assert persisted["status"] == "running"
+    assert "reconciliation" in (persisted.get("error") or "").lower()
+
+
+def test_restart_preserves_estop_robot_state_and_rejects_motion_but_allows_stop(tmp_path):
+    db_path = str(tmp_path / "robot-state.db")
+    adapter = FakeAdapter()
+    first = create_app(db_path=db_path, auth_token=TOKEN, adapters={"fake": adapter})
+    first.state.store.upsert_robot(
+        {
+            "robotId": "robot-1",
+            "status": "estop",
+            "connected": False,
+            "safetyMode": "estop",
+            "details": {"reason": "operator"},
+        }
+    )
+    restarted_adapter = FakeAdapter()
+    restarted = TestClient(create_app(db_path=db_path, auth_token=TOKEN, adapters={"fake": restarted_adapter}))
+    robot = restarted.get("/api/v1/robots", headers=auth()).json()[0]
+    assert robot["status"] == "estop"
+    assert robot["connected"] is False
+    motion = restarted.post("/api/v1/commands", headers=auth(), json=command_body(idempotencyKey="estop-motion"))
+    assert motion.status_code in {409, 422}
+    stop = restarted.post(
+        "/api/v1/commands",
+        headers=auth(),
+        json=command_body(commandKey="stop", idempotencyKey="estop-stop"),
+    )
+    assert stop.status_code == 200
+    assert [request.commandKey for request, _ in restarted_adapter.dispatches] == ["stop"]
+
+
+def test_restart_marks_claimed_accepted_command_for_reconciliation(tmp_path):
+    db_path = str(tmp_path / "accepted-command.db")
+    first = create_app(db_path=db_path, auth_token=TOKEN)
+    first.state.store.claim_command(
+        {
+            "commandId": "accepted-before-crash",
+            "robotId": "robot-1",
+            "idempotencyKey": "accepted-before-crash-key",
+        }
+    )
+    restarted = TestClient(create_app(db_path=db_path, auth_token=TOKEN))
+    receipt = restarted.get("/api/v1/commands/accepted-before-crash", headers=auth()).json()
+    assert receipt["status"] == "accepted"
+    assert "reconciliation" in (receipt.get("error") or "").lower()
+
+
+def test_runtime_watchdog_persists_expired_lease_without_new_command():
+    adapter = FakeAdapter(result=AdapterResult(status="running"))
+    app = create_app(auth_token=TOKEN, adapters={"fake": adapter})
+    app.state.control.runtime.lease_seconds = 0.03
+    client = TestClient(app)
+    submitted = client.post("/api/v1/commands", headers=auth(), json=command_body(idempotencyKey="watchdog-expiry"))
+    assert submitted.status_code == 200
+    command_id = submitted.json()["commandId"]
+    deadline = time.monotonic() + 1.0
+    persisted = None
+    while time.monotonic() < deadline:
+        persisted = client.get(f"/api/v1/commands/{command_id}", headers=auth()).json()
+        if persisted["status"] == "expired":
+            break
+        time.sleep(0.02)
+    assert persisted is not None
+    assert persisted["status"] == "expired"
+    assert adapter.cancellations == [command_id]
 
 
 def test_nested_mapping_target_alias_is_bound_and_checked():

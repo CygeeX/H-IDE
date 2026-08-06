@@ -47,6 +47,16 @@ def test_probe_failure_and_transport_whitelist():
         reg.create_draft(unsafe)
 
 
+def test_probe_failure_is_audited_before_becoming_retryable():
+    adapter = FakeAdapter(probe_result=AdapterResult(status="failed", error="capability mismatch"))
+    audits = []
+    reg = MappingRegistry(adapters={"fake": adapter}, audit_sink=audits.append)
+    reg.create_draft(mv()); reg.validate("m", "v1")
+    with pytest.raises(ValueError, match="capability mismatch"):
+        reg.probe("m", "v1")
+    assert any(event["action"] == "probe_failed" for event in audits)
+
+
 def test_active_pointer_keeps_mapping_id_and_versions_are_superseded():
     reg = MappingRegistry(adapters={"fake": FakeAdapter()})
     for item in (mv("v1", mapping_id="m1"), mv("v1", mapping_id="m2")):
