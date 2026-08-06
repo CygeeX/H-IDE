@@ -52,6 +52,7 @@ class ActionRuntime:
         self._inflight: dict[str, _InFlight] = {}
         self._stop_barriers: set[str] = set()
         self._stop_epochs: dict[str, int] = {}
+        self._stop_owners: dict[str, tuple[int, str]] = {}
         self._lock = threading.RLock()
         # A local diagnostic trail is intentionally small and dependency-free.
         self.diagnostics: list[dict[str, Any]] = []
@@ -128,6 +129,11 @@ class ActionRuntime:
         lease = self._leases.get(robot_id)
         if lease is not None and lease.command_id == command_id:
             self._leases.pop(robot_id, None)
+
+    def _clear_stop_barrier(self, robot_id: str, command_id: str, epoch: int | None) -> None:
+        if epoch is not None and self._stop_owners.get(robot_id) == (epoch, command_id):
+            self._stop_owners.pop(robot_id, None)
+            self._stop_barriers.discard(robot_id)
 
     def _cancel_external(self, action: _InFlight | None, command_id: str) -> str | None:
         """Call adapter cancellation outside the lock and return a warning."""
@@ -225,6 +231,7 @@ class ActionRuntime:
             stop_epoch = self._stop_epochs.get(robot, 0) + 1
             self._stop_epochs[robot] = stop_epoch
             self._stop_barriers.add(robot)
+            self._stop_owners[robot] = (stop_epoch, request.commandId)
             active = self._leases.pop(robot, None)
             if active:
                 prior_req = self._requests.get(active.command_id)
@@ -239,8 +246,8 @@ class ActionRuntime:
         self._receipt(request, CommandStatus.ACCEPTED)
         adapter = self.adapters.get(self._adapter_key(request.transport))
         if adapter is None:
-            if is_stop and self._stop_epochs.get(robot) == stop_epoch:
-                self._stop_barriers.discard(robot)
+            if is_stop:
+                self._clear_stop_barrier(robot, request.commandId, stop_epoch)
             return self._receipt(request, CommandStatus.FAILED, error="adapter unavailable", completedAt=self.clock())
         self._receipt(request, CommandStatus.RUNNING, startedAt=self.clock())
         motion = not self._priority(request.commandKey)
@@ -254,30 +261,30 @@ class ActionRuntime:
         current = self._receipts[request.commandId]
         if current.status not in {CommandStatus.RUNNING, CommandStatus.ACCEPTED}:
             self._inflight.pop(request.commandId, None)
-            if is_stop and self._stop_epochs.get(request.robotId) == stop_epoch:
-                self._stop_barriers.discard(request.robotId)
+            if is_stop:
+                self._clear_stop_barrier(request.robotId, request.commandId, stop_epoch)
             return current
         status = str(outcome.status).lower()
         if status in {"succeeded", "success", "ok", "completed"}:
             receipt = self._receipt(request, CommandStatus.SUCCEEDED, result=outcome.result, completedAt=self.clock())
             self._release_lease(request.robotId, request.commandId)
             self._inflight.pop(request.commandId, None)
-            if is_stop and self._stop_epochs.get(request.robotId) == stop_epoch:
-                self._stop_barriers.discard(request.robotId)
+            if is_stop:
+                self._clear_stop_barrier(request.robotId, request.commandId, stop_epoch)
             return receipt
         if status in {"cancelled", "canceled"}:
             receipt = self._receipt(request, CommandStatus.CANCELLED, error=outcome.error, completedAt=self.clock())
             self._release_lease(request.robotId, request.commandId)
             self._inflight.pop(request.commandId, None)
-            if is_stop and self._stop_epochs.get(request.robotId) == stop_epoch:
-                self._stop_barriers.discard(request.robotId)
+            if is_stop:
+                self._clear_stop_barrier(request.robotId, request.commandId, stop_epoch)
             return receipt
         if status in {"running", "accepted", "pending"}:
             return current
         self._release_lease(request.robotId, request.commandId)
         self._inflight.pop(request.commandId, None)
-        if is_stop and self._stop_epochs.get(request.robotId) == stop_epoch:
-            self._stop_barriers.discard(request.robotId)
+        if is_stop:
+            self._clear_stop_barrier(request.robotId, request.commandId, stop_epoch)
         return self._receipt(request, CommandStatus.FAILED, error=outcome.error or f"adapter returned {outcome.status}", completedAt=self.clock())
 
     submit = dispatch
@@ -291,17 +298,18 @@ class ActionRuntime:
             if current.status in {CommandStatus.SUCCEEDED, CommandStatus.FAILED, CommandStatus.CANCELLED, CommandStatus.EXPIRED, CommandStatus.REJECTED}:
                 return current
             action = self._inflight.get(command_id)
+            stop_epoch = self._stop_owners.get(request.robotId, (None, None))[0] if self._priority(request.commandKey) else None
             self._release_lease(request.robotId, command_id)
             self._receipt(request, CommandStatus.CANCELLED, completedAt=self.clock(), safetyStop=True)
         warning = self._cancel_external(action, command_id)
         if warning:
             with self._lock:
                 if self._priority(request.commandKey):
-                    self._stop_barriers.discard(request.robotId)
+                    self._clear_stop_barrier(request.robotId, request.commandId, stop_epoch)
                 return self._receipt(request, CommandStatus.FAILED, error=warning, completedAt=self.clock(), safetyStop=True, safetyWarning=warning)
         with self._lock:
             if self._priority(request.commandKey):
-                self._stop_barriers.discard(request.robotId)
+                self._clear_stop_barrier(request.robotId, request.commandId, stop_epoch)
         return self.receipt(command_id)
 
     def receipt(self, command_id: str) -> CommandReceipt:

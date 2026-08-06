@@ -254,3 +254,29 @@ def test_stop_barrier_blocks_new_motion_until_stop_cancel_finishes():
     adapter.cancel_release.set(); adapter.move_release.set()
     stop_thread.join(timeout=2); old_thread.join(timeout=2)
     assert stop_result and stop_result[0].status.value == "succeeded"
+
+
+def test_old_stop_cancel_cannot_clear_new_stop_epoch_barrier():
+    class TwoStops(FakeAdapter):
+        def __init__(self):
+            super().__init__(result=AdapterResult(status="succeeded"))
+            self.a_started = threading.Event(); self.b_started = threading.Event()
+            self.release_a = threading.Event(); self.release_b = threading.Event()
+        def dispatch(self, req, mapping):
+            if req.commandId == "stop-a":
+                self.a_started.set(); self.release_a.wait(timeout=2)
+            elif req.commandId == "stop-b":
+                self.b_started.set(); self.release_b.wait(timeout=2)
+            return self.result
+        def cancel(self, command_id):
+            return AdapterResult(status="cancelled")
+    adapter = TwoStops(); runtime = ActionRuntime(adapters={"fake": adapter})
+    a_result = []; b_result = []
+    a = threading.Thread(target=lambda: a_result.append(runtime.dispatch(request("stop-a", "stop-a", key="stop"), definition("stop"), mapping("stop", "a"))))
+    a.start(); assert adapter.a_started.wait(timeout=1)
+    b = threading.Thread(target=lambda: b_result.append(runtime.dispatch(request("stop-b", "stop-b", key="stop"), definition("stop"), mapping("stop", "b"))))
+    b.start(); assert adapter.b_started.wait(timeout=1)
+    assert runtime.cancel("stop-a").status.value == "cancelled"
+    blocked = runtime.dispatch(request("after-stop", "after-stop"), definition(), mapping())
+    assert blocked.status.value == "rejected"
+    adapter.release_a.set(); adapter.release_b.set(); a.join(timeout=2); b.join(timeout=2)
