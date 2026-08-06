@@ -99,7 +99,24 @@ class ContractModel(BaseModel):
         if deep:
             data = copy.deepcopy(data)
         if update:
-            data.update(update)
+            normalized: dict[str, Any] = {}
+            fields = type(self).model_fields
+            for key, value in update.items():
+                canonical = key
+                for name, field in fields.items():
+                    aliases = {name}
+                    if field.alias:
+                        aliases.add(field.alias)
+                    validation_alias = field.validation_alias
+                    if isinstance(validation_alias, AliasChoices):
+                        aliases.update(validation_alias.choices)
+                    elif isinstance(validation_alias, str):
+                        aliases.add(validation_alias)
+                    if key in aliases:
+                        canonical = name
+                        break
+                normalized[canonical] = value
+            data.update(normalized)
         return type(self).model_validate(data)
 
 

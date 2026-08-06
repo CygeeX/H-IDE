@@ -119,7 +119,13 @@ class ActionRuntime:
         status = getattr(value, "status", None)
         if not isinstance(status, str) or not status.strip():
             return AdapterResult(status="failed", error=f"adapter {operation} returned result without status")
+        if value.error is not None and not isinstance(value.error, str):
+            return AdapterResult(status="failed", error=f"adapter {operation} returned invalid error")
         return value
+
+    @staticmethod
+    def _error_text(value: Any, fallback: str) -> str:
+        return value if isinstance(value, str) and value else fallback
 
     def _receipt(self, request: CommandRequest, status: CommandStatus, **values: Any) -> CommandReceipt:
         current = self._receipts.get(request.commandId)
@@ -386,7 +392,7 @@ class ActionRuntime:
         self._inflight.pop(request.commandId, None)
         if is_safety:
             self._clear_safety_barrier(request.robotId, safety_owner, safety_epoch)
-        return self._receipt(request, CommandStatus.FAILED, error=outcome.error or f"adapter returned {outcome.status}", completedAt=self.clock())
+        return self._receipt(request, CommandStatus.FAILED, error=self._error_text(outcome.error, f"adapter returned {outcome.status}"), completedAt=self.clock())
 
     submit = dispatch
 

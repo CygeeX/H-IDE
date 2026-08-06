@@ -254,6 +254,15 @@ def test_model_copy_update_revalidates_and_preserves_deep_freeze():
         mapping.model_copy(update={"transport": "telnet"})
 
 
+def test_model_copy_update_accepts_public_aliases_without_duplicate_fields():
+    mapping = MappingVersion(mappingId="copy-alias", version="v1", commandKey="move", transport="fake")
+    copied = mapping.model_copy(update={"mapping_id": "copy-alias-2", "payload_schema": {"type": "object"}})
+    assert copied.mappingId == "copy-alias-2"
+    assert copied.payloadSchema["type"] == "object"
+    with pytest.raises(TypeError):
+        copied.payloadSchema["type"] = "array"
+
+
 def test_frozen_list_supports_copy_and_deepcopy_without_mutation_methods():
     request = _request(payload={"items": [1, {"x": True}]})
     shallow = copy.copy(request.payload["items"])

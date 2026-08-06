@@ -457,3 +457,25 @@ def test_failed_safety_b_does_not_clear_a_pending_cancel_barrier():
     assert blocked.status.value == "rejected"
     adapter.release.set(); a.join(timeout=2)
     assert not a.is_alive()
+
+
+def test_non_string_adapter_errors_become_failed_without_state_leaks():
+    for status in ("cancelled", "failed", "unknown"):
+        adapter = FakeAdapter(result=AdapterResult(status="running"))
+        adapter.result = AdapterResult(status=status, error={"bad": object()})
+        runtime = ActionRuntime(adapters={"fake": adapter})
+        receipt = runtime.dispatch(request(), definition(), mapping())
+        assert receipt.status.value == "failed"
+        assert not runtime._leases and not runtime._inflight
+
+
+def test_non_string_cancel_error_for_safety_cleans_barrier():
+    class BadCancel(FakeAdapter):
+        def cancel(self, command_id):
+            return AdapterResult(status="failed", error={"bad": object()})
+    adapter = BadCancel(result=AdapterResult(status="running"))
+    runtime = ActionRuntime(adapters={"fake": adapter})
+    runtime.dispatch(request("stop-bad", "stop-bad", key="stop"), definition("stop", "safety"), mapping("stop"))
+    receipt = runtime.cancel("stop-bad")
+    assert receipt.status.value == "failed"
+    assert not runtime._safety_barriers
