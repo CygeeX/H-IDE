@@ -9,6 +9,7 @@ from typing import Any
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .validation import (
+    CLOCK_SKEW,
     as_utc,
     ensure_acyclic_steps,
     freeze_json_object,
@@ -176,6 +177,8 @@ class PlanDraft(ContractModel):
     @model_validator(mode="after")
     def _dag_and_expiry(self):
         ensure_acyclic_steps(self.steps)
+        if self.createdAt > utc_now() + CLOCK_SKEW:
+            raise ValueError("createdAt cannot be in the future")
         if self.expiresAt is not None and self.expiresAt <= self.createdAt:
             raise ValueError("expiresAt must be later than createdAt")
         if self.expiresAt is not None and self.expiresAt <= utc_now():

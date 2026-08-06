@@ -21,7 +21,7 @@ class FrozenDict(dict):
     def _immutable(self, *args, **kwargs):
         raise TypeError("mapping version values are immutable")
 
-    __setitem__ = __delitem__ = clear = pop = popitem = setdefault = update = _immutable
+    __setitem__ = __delitem__ = clear = pop = popitem = setdefault = update = __ior__ = _immutable
 
 
 class FrozenList(tuple):
@@ -30,7 +30,7 @@ class FrozenList(tuple):
     def _immutable(self, *args, **kwargs):
         raise TypeError("mapping version values are immutable")
 
-    append = extend = insert = pop = remove = reverse = sort = _immutable
+    append = extend = insert = pop = remove = reverse = sort = __iadd__ = __imul__ = _immutable
 
 
 def _json_value(value: Any, *, freeze: bool = False) -> Any:

@@ -125,6 +125,9 @@ def test_mapping_nested_values_are_immutable_and_dump_as_json():
         mapping.mapping["nested"]["topic"] = "/changed"
     with pytest.raises(TypeError):
         mapping.mapping["items"].append("b")
+    with pytest.raises(TypeError):
+        mapping.mapping |= {"new": "value"}
+    assert "new" not in mapping.mapping
     dumped = mapping.model_dump(by_alias=True, mode="json")
     assert dumped["mapping"]["nested"]["topic"] == "/gripper/open"
 
@@ -149,6 +152,13 @@ def test_future_issued_request_and_expired_plan_are_rejected():
             steps=[{"stepId": "a", "commandKey": "a"}],
             createdAt=datetime.now(timezone.utc) - timedelta(minutes=2),
             expiresAt=datetime.now(timezone.utc) - timedelta(seconds=1),
+        )
+    with pytest.raises(ValidationError, match="createdAt"):
+        PlanDraft(
+            planId="plan-2",
+            robotId="robot-1",
+            steps=[{"stepId": "a", "commandKey": "a"}],
+            createdAt=datetime.now(timezone.utc) + timedelta(minutes=1),
         )
 
 
