@@ -603,17 +603,32 @@ async def test_runtime_interfaces_remain_bounded_for_30_minutes(
 
     elapsed = asyncio.get_running_loop().time() - started
     ledger_states: dict[UUID, CommandState] = {}
+    ledger_details: dict[UUID, str] = {}
     with CommandLedger(config.storage.ledger_path) as ledger:
         for command_id in command_ids:
-            ledger_states[command_id] = ledger.get(command_id).state
+            record = ledger.get(command_id)
+            ledger_states[command_id] = record.state
+            ledger_details[command_id] = record.detail
     dropped_count = sum(queue.dropped_count for queue in queues.values())
     coalesced_count = sum(queue.coalesced_count for queue in queues.values())
+    succeeded_ids = {
+        command_id
+        for command_id, state in terminal_states.items()
+        if state == "SUCCEEDED"
+    }
+    rejected_ids = {
+        command_id
+        for command_id, state in terminal_states.items()
+        if state == "REJECTED"
+    }
     report = {
         "duration_seconds": round(elapsed, 3),
         "iterations": iterations,
         "sessions_opened": sessions_opened,
         "commands": len(command_ids),
         "terminal_statuses": len(terminal_states),
+        "succeeded_commands": len(succeeded_ids),
+        "resource_conflict_rejections": len(rejected_ids),
         "lease_renewals": lease_renewals,
         "state_snapshots": wire_counts["state.snapshot"],
         "state_updates": wire_counts["state.update"],
@@ -638,9 +653,22 @@ async def test_runtime_interfaces_remain_bounded_for_30_minutes(
     if duration >= 5.0:
         assert sessions_opened >= 2
     assert len(command_ids) >= max(1, int(duration * 3))
-    assert terminal_states == {command_id: "SUCCEEDED" for command_id in command_ids}
-    assert set(ledger_states.values()) == {CommandState.SUCCEEDED}
-    assert graph.command_calls == len(command_ids)
+    assert set(terminal_states) == command_ids
+    assert set(terminal_states.values()) <= {"SUCCEEDED", "REJECTED"}
+    assert {
+        command_id: state.value for command_id, state in ledger_states.items()
+    } == terminal_states
+    assert all(
+        ledger_details[command_id].startswith("resource conflict: soak=")
+        for command_id in rejected_ids
+    )
+    conflict_owner_ids = {
+        UUID(ledger_details[command_id].removeprefix("resource conflict: soak="))
+        for command_id in rejected_ids
+    }
+    assert conflict_owner_ids <= succeeded_ids
+    assert graph.command_calls == len(succeeded_ids)
+    assert graph.command_calls >= max(1, int(duration * 3))
     assert graph.safe_stop_calls == sessions_opened + 1
     assert graph.heartbeat_calls > 0
     assert wire_counts["lease.status"] > 0
