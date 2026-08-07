@@ -148,6 +148,7 @@ class RobotAgentRuntime:
         self._event_tasks: set[asyncio.Task[None]] = set()
         self._initialized = False
         self._closed = False
+        self.ready = asyncio.Event()
 
     async def initialize(self) -> None:
         if self._initialized:
@@ -169,6 +170,7 @@ class RobotAgentRuntime:
         self._ros.start()
         await self._perform_safe_stop("agent startup")
         self._initialized = True
+        self.ready.set()
 
     async def run(self, stop: asyncio.Event) -> None:
         await self.initialize()

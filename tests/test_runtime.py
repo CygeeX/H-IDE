@@ -10,7 +10,7 @@ from uuid import UUID, uuid4
 import pytest
 from robot_agent.coordinator import ExecutionResult
 from robot_agent.protocol import WireMessage, parse_wire_message
-from robot_agent.runtime import RobotAgentRuntime
+from robot_agent.runtime import RobotAgentRuntime, RuntimeSafetyError
 
 from robot_agent.config import AgentConfig, CommandConfig, SafeStopConfig
 
@@ -83,6 +83,8 @@ class FakeRosAdapter:
         self.executions: list[tuple[UUID, str, dict[str, Any]]] = []
         self.cancelled: list[UUID] = []
         self.safe_stop_reasons = 0
+        self.safe_stop_succeeded = True
+        self.safe_stop_exception: Exception | None = None
 
     def set_callbacks(self, *, state_callback: Any, feedback_callback: Any) -> None:
         self.state_callback = state_callback
@@ -116,7 +118,13 @@ class FakeRosAdapter:
     async def safe_stop(self, config: SafeStopConfig) -> ExecutionResult:
         assert config.ros_name == "/robot/safe_stop"
         self.safe_stop_reasons += 1
-        return ExecutionResult(succeeded=True, detail="stopped", result={"success": True})
+        if self.safe_stop_exception is not None:
+            raise self.safe_stop_exception
+        return ExecutionResult(
+            succeeded=self.safe_stop_succeeded,
+            detail="stopped" if self.safe_stop_succeeded else "rejected",
+            result={"success": self.safe_stop_succeeded},
+        )
 
     async def close(self) -> None:
         self.closed = True
@@ -230,6 +238,12 @@ async def test_runtime_handshake_control_lease_command_and_disconnect(tmp_path: 
     assert completed.payload.state == "SUCCEEDED"
     assert ros.executions == [(command_id, "/robot/power_enable", {"data": True})]
 
+    changed_payload = {**command_payload, "params": {"data": False}}
+    await connection.incoming.put(inbound("command.request", session_id, changed_payload))
+    conflict = await next_message(connection)
+    assert conflict.type == "error"
+    assert conflict.payload.code == "COMMAND_ID_CONFLICT"
+
     await connection.incoming.put(
         inbound("session.goodbye", session_id, {"reason": "test complete"})
     )
@@ -309,3 +323,130 @@ async def test_runtime_rejects_peer_lease_policy_override(tmp_path: Path) -> Non
         await asyncio.wait_for(handler, timeout=2)
     assert connection.close_code == 1002
     await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first_message", ["{}", "control.acquire"])
+async def test_runtime_rejects_invalid_application_handshake(
+    tmp_path: Path, first_message: str
+) -> None:
+    config = runtime_config(tmp_path)
+    ros = FakeRosAdapter()
+    runtime = RobotAgentRuntime(config, ros_adapter=ros)
+    await runtime.initialize()
+    connection = QueueConnection()
+    handler = asyncio.create_task(runtime.handle_connection(connection))
+    await next_message(connection)
+    if first_message == "{}":
+        await connection.incoming.put(first_message)
+    else:
+        await connection.incoming.put(
+            inbound(first_message, uuid4(), {"operator_id": "operator-7"})
+        )
+    with pytest.raises(RuntimeError):
+        await asyncio.wait_for(handler, timeout=2)
+    assert connection.close_code == 1002
+    await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_runtime_routes_state_feedback_session_errors_and_cancel(tmp_path: Path) -> None:
+    config = runtime_config(tmp_path)
+    ros = FakeRosAdapter()
+    runtime = RobotAgentRuntime(config, ros_adapter=ros)
+    await runtime.initialize()
+    connection = QueueConnection()
+    handler = asyncio.create_task(runtime.handle_connection(connection))
+    await next_message(connection)
+    session_id = uuid4()
+    await connection.incoming.put(
+        inbound(
+            "session.welcome",
+            session_id,
+            {
+                "accepted_version": "1.0",
+                "lease_interval_ms": 500,
+                "lease_timeout_ms": 2000,
+                "control_state": "SAFE_HOLD",
+            },
+        )
+    )
+    await next_message(connection)
+
+    assert ros.state_callback is not None
+    ros.state_callback("robot.mode", "IDLE", datetime.now(timezone.utc))
+    snapshot = await next_message(connection)
+    assert snapshot.type == "state.snapshot"
+    ros.state_callback("robot.mode", "MOVING", datetime.now(timezone.utc))
+    update = await next_message(connection)
+    assert update.type == "state.update"
+
+    feedback_id = uuid4()
+    assert ros.feedback_callback is not None
+    ros.feedback_callback(feedback_id, {"sequence": [0, 1]})
+    feedback = await next_message(connection)
+    assert feedback.type == "command.status"
+    assert feedback.payload.command_id == feedback_id
+
+    await connection.incoming.put(
+        inbound(
+            "lease.status",
+            session_id,
+            {"sequence": 0, "expires_at": datetime.now(timezone.utc).isoformat()},
+        )
+    )
+    unexpected = await next_message(connection)
+    assert unexpected.type == "error"
+    assert unexpected.payload.code == "UNEXPECTED_MESSAGE"
+
+    await connection.incoming.put(
+        inbound("control.acquire", uuid4(), {"operator_id": "operator-7"})
+    )
+    mismatch = await next_message(connection)
+    assert mismatch.type == "error"
+    assert mismatch.payload.code == "SESSION_MISMATCH"
+
+    await connection.incoming.put(
+        inbound("control.acquire", session_id, {"operator_id": "operator-7"})
+    )
+    await next_message(connection)
+    await connection.incoming.put(inbound("lease.renew", session_id, {"sequence": 4}))
+    await next_message(connection)
+    await connection.incoming.put(inbound("lease.renew", session_id, {"sequence": 3}))
+    bad_lease = await next_message(connection)
+    assert bad_lease.type == "error"
+    assert bad_lease.payload.code == "INVALID_LEASE"
+
+    await connection.incoming.put(
+        inbound(
+            "command.cancel",
+            session_id,
+            {"command_id": str(uuid4()), "reason": "not active"},
+        )
+    )
+    not_active = await next_message(connection)
+    assert not_active.type == "error"
+    assert not_active.payload.code == "COMMAND_NOT_ACTIVE"
+
+    await connection.incoming.put(inbound("session.goodbye", session_id, {"reason": "done"}))
+    await asyncio.wait_for(handler, timeout=2)
+    await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raises", [False, True])
+async def test_runtime_fails_closed_when_mandatory_safe_stop_fails(
+    tmp_path: Path, raises: bool
+) -> None:
+    ros = FakeRosAdapter()
+    if raises:
+        ros.safe_stop_exception = RuntimeError("safe stop unavailable")
+    else:
+        ros.safe_stop_succeeded = False
+    runtime = RobotAgentRuntime(runtime_config(tmp_path), ros_adapter=ros)
+
+    with pytest.raises(RuntimeSafetyError, match="mandatory safe stop"):
+        await runtime.initialize()
+    await runtime.shutdown()
+    with pytest.raises(RuntimeError, match="closed"):
+        await runtime.initialize()

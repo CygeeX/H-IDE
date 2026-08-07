@@ -1,0 +1,21 @@
+FROM ros:humble-ros-base-jammy
+
+SHELL ["/bin/bash", "-c"]
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3-pip \
+      python3-pytest \
+      ros-humble-example-interfaces \
+      ros-humble-std-srvs \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+COPY . /workspace
+
+RUN python3 -m pip install --no-cache-dir \
+      -e /workspace/src/robot_agent \
+      "pytest>=8.4,<9" \
+      "pytest-asyncio>=1.2,<2" \
+      "pytest-cov>=7,<8"
+
+CMD ["bash", "-lc", "source /opt/ros/humble/setup.bash && pytest -q"]

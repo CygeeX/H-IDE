@@ -128,3 +128,39 @@ async def test_lease_rejects_wrong_session_and_regressing_sequence() -> None:
     deadline = controller.lease_deadline
     await controller.renew(session_id, sequence=4, at=NOW + timedelta(seconds=1))
     assert controller.lease_deadline == deadline
+
+
+@pytest.mark.asyncio
+async def test_session_edge_guards_and_force_safe_hold() -> None:
+    with pytest.raises(ValueError, match="positive"):
+        SessionController(lease_timeout=timedelta(0), safe_stop=lambda reason: None)  # type: ignore[arg-type]
+
+    reasons: list[str] = []
+
+    async def safe_stop(reason: str) -> None:
+        reasons.append(reason)
+
+    controller = SessionController(lease_timeout=timedelta(seconds=2), safe_stop=safe_stop)
+    await controller.disconnected("not connected")
+    assert controller.session_id is None
+    await controller.force_safe_hold("already safe")
+    first = uuid4()
+    await controller.connected(first)
+    with pytest.raises(SessionStateError, match="another controlling"):
+        await controller.connected(uuid4())
+    with pytest.raises(SessionStateError, match="operator_id"):
+        await controller.acquire(first, operator_id="", at=NOW)
+    with pytest.raises(SessionStateError, match="timezone"):
+        await controller.acquire(first, operator_id="operator", at=NOW.replace(tzinfo=None))
+    await controller.acquire(first, operator_id="operator", at=NOW)
+    duplicate = await controller.acquire(first, operator_id="operator", at=NOW)
+    assert duplicate.state is ControlState.ACTIVE
+    with pytest.raises(LeaseError, match="negative"):
+        await controller.renew(first, sequence=-1, at=NOW)
+    with pytest.raises(SessionStateError, match="timezone"):
+        await controller.renew(first, sequence=0, at=NOW.replace(tzinfo=None))
+    await controller.force_safe_hold("local fault")
+    assert controller.state is ControlState.SAFE_HOLD
+    assert reasons == ["local fault"]
+    with pytest.raises(LeaseError, match="not ACTIVE"):
+        await controller.renew(first, sequence=1, at=NOW)

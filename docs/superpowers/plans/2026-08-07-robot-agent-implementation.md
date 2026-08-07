@@ -41,8 +41,8 @@
 
 ### Task 6: Operations and documentation
 
-- [ ] Add `run`, `validate-config`, and read-only `doctor` commands, launch file, Mock BFF/ROS tools, systemd notify/watchdog support, hardened Unit, example configuration, and operator README.
-- [ ] Validate config/Schema examples and run `systemd-analyze verify`.
+- [x] Add `run`, `validate-config`, and read-only `doctor` commands, launch file, Mock BFF/ROS tools, systemd notify/watchdog support, hardened Unit, example configuration, and operator README.
+- [x] Validate config/Schema examples and run `systemd-analyze verify`.
 
 ### Task 7: Full acceptance
 

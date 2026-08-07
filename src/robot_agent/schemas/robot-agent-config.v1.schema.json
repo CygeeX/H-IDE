@@ -1,0 +1,514 @@
+{
+  "$defs": {
+    "ClientTransportConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "connect_timeout_ms": {
+          "default": 5000,
+          "maximum": 60000,
+          "minimum": 100,
+          "title": "Connect Timeout Ms",
+          "type": "integer"
+        },
+        "mode": {
+          "const": "client",
+          "title": "Mode",
+          "type": "string"
+        },
+        "reconnect_initial_ms": {
+          "default": 250,
+          "maximum": 30000,
+          "minimum": 50,
+          "title": "Reconnect Initial Ms",
+          "type": "integer"
+        },
+        "reconnect_max_ms": {
+          "default": 5000,
+          "maximum": 300000,
+          "minimum": 100,
+          "title": "Reconnect Max Ms",
+          "type": "integer"
+        },
+        "uri": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Uri",
+          "type": "string"
+        }
+      },
+      "required": [
+        "mode",
+        "uri"
+      ],
+      "title": "ClientTransportConfig",
+      "type": "object"
+    },
+    "CommandConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "adapter": {
+          "enum": [
+            "service",
+            "action"
+          ],
+          "title": "Adapter",
+          "type": "string"
+        },
+        "max_ttl_ms": {
+          "exclusiveMinimum": 0,
+          "maximum": 60000,
+          "title": "Max Ttl Ms",
+          "type": "integer"
+        },
+        "request_schema": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "title": "Request Schema",
+          "type": "object"
+        },
+        "resources": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 32,
+          "minItems": 1,
+          "title": "Resources",
+          "type": "array"
+        },
+        "ros_name": {
+          "pattern": "^/[A-Za-z0-9_]+(?:/[A-Za-z0-9_]+)*$",
+          "title": "Ros Name",
+          "type": "string"
+        },
+        "ros_type": {
+          "pattern": "^[A-Za-z][A-Za-z0-9_]*/(?:srv|action|msg)/[A-Za-z][A-Za-z0-9_]*$",
+          "title": "Ros Type",
+          "type": "string"
+        },
+        "timeout_ms": {
+          "exclusiveMinimum": 0,
+          "maximum": 60000,
+          "title": "Timeout Ms",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "adapter",
+        "ros_name",
+        "ros_type",
+        "request_schema",
+        "max_ttl_ms",
+        "timeout_ms",
+        "resources"
+      ],
+      "title": "CommandConfig",
+      "type": "object"
+    },
+    "JsonValue": {},
+    "QoSConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "depth": {
+          "maximum": 1000,
+          "minimum": 1,
+          "title": "Depth",
+          "type": "integer"
+        },
+        "durability": {
+          "enum": [
+            "volatile",
+            "transient_local"
+          ],
+          "title": "Durability",
+          "type": "string"
+        },
+        "reliability": {
+          "enum": [
+            "reliable",
+            "best_effort"
+          ],
+          "title": "Reliability",
+          "type": "string"
+        }
+      },
+      "required": [
+        "reliability",
+        "durability",
+        "depth"
+      ],
+      "title": "QoSConfig",
+      "type": "object"
+    },
+    "SafeStopConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "adapter": {
+          "enum": [
+            "service",
+            "action"
+          ],
+          "title": "Adapter",
+          "type": "string"
+        },
+        "request": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "title": "Request",
+          "type": "object"
+        },
+        "ros_name": {
+          "pattern": "^/[A-Za-z0-9_]+(?:/[A-Za-z0-9_]+)*$",
+          "title": "Ros Name",
+          "type": "string"
+        },
+        "ros_type": {
+          "pattern": "^[A-Za-z][A-Za-z0-9_]*/(?:srv|action|msg)/[A-Za-z][A-Za-z0-9_]*$",
+          "title": "Ros Type",
+          "type": "string"
+        },
+        "timeout_ms": {
+          "exclusiveMinimum": 0,
+          "maximum": 30000,
+          "title": "Timeout Ms",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "adapter",
+        "ros_name",
+        "ros_type",
+        "request",
+        "timeout_ms"
+      ],
+      "title": "SafeStopConfig",
+      "type": "object"
+    },
+    "SafetyConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "heartbeat_period_ms": {
+          "default": 250,
+          "maximum": 1000,
+          "minimum": 50,
+          "title": "Heartbeat Period Ms",
+          "type": "integer"
+        },
+        "heartbeat_topic": {
+          "pattern": "^/[A-Za-z0-9_]+(?:/[A-Za-z0-9_]+)*$",
+          "title": "Heartbeat Topic",
+          "type": "string"
+        },
+        "safe_stop": {
+          "$ref": "#/$defs/SafeStopConfig"
+        }
+      },
+      "required": [
+        "safe_stop",
+        "heartbeat_topic"
+      ],
+      "title": "SafetyConfig",
+      "type": "object"
+    },
+    "ServerTransportConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "handshake_timeout_ms": {
+          "default": 5000,
+          "maximum": 60000,
+          "minimum": 100,
+          "title": "Handshake Timeout Ms",
+          "type": "integer"
+        },
+        "host": {
+          "maxLength": 255,
+          "minLength": 1,
+          "title": "Host",
+          "type": "string"
+        },
+        "mode": {
+          "const": "server",
+          "title": "Mode",
+          "type": "string"
+        },
+        "port": {
+          "maximum": 65535,
+          "minimum": 1,
+          "title": "Port",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "mode",
+        "host",
+        "port"
+      ],
+      "title": "ServerTransportConfig",
+      "type": "object"
+    },
+    "SessionConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "lease_interval_ms": {
+          "default": 500,
+          "maximum": 5000,
+          "minimum": 100,
+          "title": "Lease Interval Ms",
+          "type": "integer"
+        },
+        "lease_timeout_ms": {
+          "default": 2000,
+          "maximum": 30000,
+          "minimum": 500,
+          "title": "Lease Timeout Ms",
+          "type": "integer"
+        },
+        "max_future_skew_ms": {
+          "default": 5000,
+          "maximum": 60000,
+          "minimum": 0,
+          "title": "Max Future Skew Ms",
+          "type": "integer"
+        },
+        "max_message_age_ms": {
+          "default": 30000,
+          "maximum": 300000,
+          "minimum": 1000,
+          "title": "Max Message Age Ms",
+          "type": "integer"
+        }
+      },
+      "title": "SessionConfig",
+      "type": "object"
+    },
+    "StateOutputConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "change_hz": {
+          "default": 5.0,
+          "exclusiveMinimum": 0.0,
+          "maximum": 50.0,
+          "title": "Change Hz",
+          "type": "number"
+        },
+        "outbound_queue_size": {
+          "default": 256,
+          "maximum": 65536,
+          "minimum": 8,
+          "title": "Outbound Queue Size",
+          "type": "integer"
+        },
+        "snapshot_hz": {
+          "default": 1.0,
+          "exclusiveMinimum": 0.0,
+          "maximum": 10.0,
+          "title": "Snapshot Hz",
+          "type": "number"
+        }
+      },
+      "title": "StateOutputConfig",
+      "type": "object"
+    },
+    "StateSourceConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "field": {
+          "maxLength": 256,
+          "minLength": 1,
+          "pattern": "^[A-Za-z][A-Za-z0-9_.]*$",
+          "title": "Field",
+          "type": "string"
+        },
+        "qos": {
+          "$ref": "#/$defs/QoSConfig"
+        },
+        "ros_type": {
+          "pattern": "^[A-Za-z][A-Za-z0-9_]*/(?:srv|action|msg)/[A-Za-z][A-Za-z0-9_]*$",
+          "title": "Ros Type",
+          "type": "string"
+        },
+        "topic": {
+          "pattern": "^/[A-Za-z0-9_]+(?:/[A-Za-z0-9_]+)*$",
+          "title": "Topic",
+          "type": "string"
+        }
+      },
+      "required": [
+        "topic",
+        "ros_type",
+        "field",
+        "qos"
+      ],
+      "title": "StateSourceConfig",
+      "type": "object"
+    },
+    "StorageConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "ledger_path": {
+          "minLength": 1,
+          "title": "Ledger Path",
+          "type": "string"
+        },
+        "retention_days": {
+          "default": 30,
+          "maximum": 3650,
+          "minimum": 1,
+          "title": "Retention Days",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "ledger_path"
+      ],
+      "title": "StorageConfig",
+      "type": "object"
+    },
+    "TLSConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "allow_plaintext_loopback": {
+          "default": false,
+          "title": "Allow Plaintext Loopback",
+          "type": "boolean"
+        },
+        "ca_file": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ca File"
+        },
+        "cert_file": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cert File"
+        },
+        "enabled": {
+          "default": true,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "key_file": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Key File"
+        },
+        "server_name": {
+          "anyOf": [
+            {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Server Name"
+        }
+      },
+      "title": "TLSConfig",
+      "type": "object"
+    }
+  },
+  "$id": "https://phibotics.local/schemas/robot-agent-config.v1.schema.json",
+  "additionalProperties": false,
+  "properties": {
+    "commands": {
+      "additionalProperties": {
+        "$ref": "#/$defs/CommandConfig"
+      },
+      "maxProperties": 256,
+      "minProperties": 1,
+      "title": "Commands",
+      "type": "object"
+    },
+    "robot_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "title": "Robot Id",
+      "type": "string"
+    },
+    "safety": {
+      "$ref": "#/$defs/SafetyConfig"
+    },
+    "schema_version": {
+      "const": "1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "session": {
+      "$ref": "#/$defs/SessionConfig"
+    },
+    "state": {
+      "$ref": "#/$defs/StateOutputConfig"
+    },
+    "state_sources": {
+      "additionalProperties": {
+        "$ref": "#/$defs/StateSourceConfig"
+      },
+      "title": "State Sources",
+      "type": "object"
+    },
+    "storage": {
+      "$ref": "#/$defs/StorageConfig"
+    },
+    "tls": {
+      "$ref": "#/$defs/TLSConfig"
+    },
+    "transport": {
+      "discriminator": {
+        "mapping": {
+          "client": "#/$defs/ClientTransportConfig",
+          "server": "#/$defs/ServerTransportConfig"
+        },
+        "propertyName": "mode"
+      },
+      "oneOf": [
+        {
+          "$ref": "#/$defs/ClientTransportConfig"
+        },
+        {
+          "$ref": "#/$defs/ServerTransportConfig"
+        }
+      ],
+      "title": "Transport"
+    }
+  },
+  "required": [
+    "schema_version",
+    "robot_id",
+    "transport",
+    "tls",
+    "session",
+    "storage",
+    "state",
+    "safety",
+    "commands"
+  ],
+  "title": "robot-agent-config.v1",
+  "type": "object"
+}

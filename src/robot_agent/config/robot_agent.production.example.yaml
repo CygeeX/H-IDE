@@ -1,0 +1,77 @@
+schema_version: "1"
+robot_id: g1-production
+
+transport:
+  mode: client
+  uri: wss://control.example.com:8443/robot-agent
+  reconnect_initial_ms: 250
+  reconnect_max_ms: 5000
+  connect_timeout_ms: 5000
+
+tls:
+  enabled: true
+  ca_file: /etc/robot-agent/tls/ca.pem
+  cert_file: /etc/robot-agent/tls/agent.pem
+  key_file: /etc/robot-agent/tls/agent.key
+  server_name: control.example.com
+  allow_plaintext_loopback: false
+
+session:
+  lease_interval_ms: 500
+  lease_timeout_ms: 2000
+  max_message_age_ms: 30000
+  max_future_skew_ms: 5000
+
+storage:
+  ledger_path: /var/lib/robot-agent/ledger.sqlite3
+  retention_days: 30
+
+state:
+  change_hz: 5.0
+  snapshot_hz: 1.0
+  outbound_queue_size: 256
+
+safety:
+  safe_stop:
+    adapter: service
+    ros_name: /robot/safe_stop
+    ros_type: std_srvs/srv/Trigger
+    request: {}
+    timeout_ms: 1000
+  heartbeat_topic: /robot_agent/safety_heartbeat
+  heartbeat_period_ms: 250
+
+commands:
+  power.enable:
+    adapter: service
+    ros_name: /robot/power_enable
+    ros_type: std_srvs/srv/SetBool
+    request_schema:
+      type: object
+      properties:
+        data: {type: boolean}
+      required: [data]
+      additionalProperties: false
+    max_ttl_ms: 5000
+    timeout_ms: 2000
+    resources: [power]
+  task.execute:
+    adapter: action
+    ros_name: /robot/task_execute
+    ros_type: example_interfaces/action/Fibonacci
+    request_schema:
+      type: object
+      properties:
+        order: {type: integer, minimum: 1, maximum: 100}
+      required: [order]
+      additionalProperties: false
+    max_ttl_ms: 10000
+    timeout_ms: 8000
+    resources: [motion, task_engine]
+
+state_sources:
+  robot.mode:
+    topic: /robot/mode
+    ros_type: std_msgs/msg/String
+    field: data
+    qos: {reliability: reliable, durability: volatile, depth: 1}

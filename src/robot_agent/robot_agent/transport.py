@@ -238,9 +238,7 @@ class ClientTransport:
             try:
                 connection = await self.connect_once()
                 backoff = self._config.reconnect_initial_ms / 1000.0
-                handler_task: asyncio.Future[Any] = asyncio.ensure_future(
-                    handler(connection)
-                )
+                handler_task: asyncio.Future[Any] = asyncio.ensure_future(handler(connection))
                 stop_task: asyncio.Future[Any] = asyncio.ensure_future(stop.wait())
                 done, _ = await asyncio.wait(
                     {handler_task, stop_task},

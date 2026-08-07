@@ -7,6 +7,7 @@ import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -16,6 +17,7 @@ from robot_agent.transport import (
     AgentConnection,
     ClientTransport,
     ServerTransport,
+    TransportError,
     TransportProtocolError,
     build_client_ssl_context,
     build_server_ssl_context,
@@ -197,6 +199,9 @@ async def test_server_mode_requires_mtls_and_agent_speaks_first(
     )
     await transport.start(handler)
     try:
+        assert transport.bound_port == port
+        with pytest.raises(TransportError, match="already started"):
+            await transport.start(handler)
         client_context = build_client_ssl_context(
             tls_config(certificates, server=False, server_name="localhost")
         )
@@ -226,6 +231,8 @@ async def test_server_mode_requires_mtls_and_agent_speaks_first(
                 pass
     finally:
         await transport.close()
+        await transport.close()
+        assert transport.bound_port is None
 
 
 @pytest.mark.integration
@@ -501,3 +508,102 @@ async def test_client_stop_interrupts_an_idle_connection(
         await asyncio.wait_for(connected.wait(), timeout=2)
         stop.set()
         await asyncio.wait_for(running, timeout=0.5)
+
+
+@pytest.mark.asyncio
+async def test_agent_connection_manual_bounds_plaintext_context_and_peer_certificate() -> None:
+    class FakeTransport:
+        def __init__(self, certificate: dict[str, object] | None) -> None:
+            self.certificate = certificate
+
+        def get_extra_info(self, name: str) -> object | None:
+            if name != "ssl_object" or self.certificate is None:
+                return None
+            return SimpleNamespace(getpeercert=lambda: self.certificate)
+
+    class FakeWebSocket:
+        def __init__(self) -> None:
+            self.values: asyncio.Queue[object] = asyncio.Queue()
+            self.sent: list[str] = []
+            self.close_calls: list[tuple[int, str]] = []
+            self.close_code: int | None = None
+            self.state = SimpleNamespace(name="OPEN")
+            self.transport = FakeTransport(None)
+
+        async def recv(self) -> object:
+            return await self.values.get()
+
+        async def send(self, value: str) -> None:
+            self.sent.append(value)
+
+        async def close(self, *, code: int, reason: str) -> None:
+            self.close_calls.append((code, reason))
+            self.close_code = code
+            self.state.name = "CLOSED"
+
+    websocket = FakeWebSocket()
+    connection = AgentConnection(websocket, mode="client")  # type: ignore[arg-type]
+    await websocket.values.put("x" * 65_537)
+    with pytest.raises(TransportProtocolError, match="65536"):
+        await connection.recv_text()
+    assert websocket.close_calls[-1][0] == 1009
+    with pytest.raises(TransportProtocolError, match="must be text"):
+        await connection.send_text(b"binary")  # type: ignore[arg-type]
+    with pytest.raises(TransportProtocolError, match="outbound frame"):
+        await connection.send_text("x" * 65_537)
+    assert connection.peer_certificate is None
+    websocket.transport = FakeTransport({"subject": ((("commonName", "peer"),),)})
+    assert connection.peer_certificate is not None
+    assert connection.closed is True
+
+    plaintext = TLSConfig(enabled=False, allow_plaintext_loopback=True)
+    assert build_client_ssl_context(plaintext) is None
+    assert build_server_ssl_context(plaintext) is None
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_client_rejects_peer_without_subprotocol_and_reports_connect_error(
+    certificates: Certificates,
+) -> None:
+    context = build_server_ssl_context(tls_config(certificates, server=True))
+
+    async def idle(websocket: ServerConnection) -> None:
+        await websocket.wait_closed()
+
+    async with serve(
+        idle,
+        "127.0.0.1",
+        0,
+        ssl=context,
+        compression=None,
+    ) as server:
+        port = int(server.sockets[0].getsockname()[1])
+        transport = ClientTransport(
+            ClientTransportConfig(mode="client", uri=f"wss://localhost:{port}"),
+            tls_config(certificates, server=False, server_name="localhost"),
+        )
+        with pytest.raises(TransportProtocolError, match="did not negotiate"):
+            await transport.connect_once()
+
+    errors: list[Exception] = []
+    stop = asyncio.Event()
+    failed_transport = ClientTransport(
+        ClientTransportConfig(
+            mode="client",
+            uri=f"ws://127.0.0.1:{unused_port()}",
+            reconnect_initial_ms=50,
+            reconnect_max_ms=100,
+        ),
+        TLSConfig(enabled=False, allow_plaintext_loopback=True),
+    )
+
+    async def on_error(error: Exception) -> None:
+        errors.append(error)
+        stop.set()
+
+    await asyncio.wait_for(
+        failed_transport.run(lambda connection: asyncio.sleep(0), stop, on_error=on_error),
+        timeout=2,
+    )
+    assert errors

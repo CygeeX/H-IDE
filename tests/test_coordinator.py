@@ -262,3 +262,51 @@ async def test_cancel_one_leaves_disjoint_command_running(tmp_path: Path) -> Non
 
         executor.release.set()
         assert (await camera_task).state is CommandState.SUCCEEDED
+
+
+@pytest.mark.asyncio
+async def test_coordinator_policy_rejections_and_adapter_failures(tmp_path: Path) -> None:
+    session, session_id = await active_session()
+
+    class EdgeExecutor:
+        async def execute(
+            self,
+            command_id: UUID,
+            command: CommandConfig,
+            params: dict[str, Any],
+        ) -> ExecutionResult:
+            del command_id, command
+            if params["order"] == 2:
+                return ExecutionResult(succeeded=False, detail="robot rejected")
+            raise RuntimeError("adapter exploded")
+
+        async def cancel(self, command_id: UUID) -> None:
+            del command_id
+
+    with CommandLedger(tmp_path / "ledger.sqlite3") as ledger:
+        coordinator = CommandCoordinator(
+            commands={"task.move": command_config("motion")},
+            ledger=ledger,
+            arbiter=ResourceArbiter(),
+            session=session,
+            executor=EdgeExecutor(),
+        )
+        unknown = await coordinator.submit(request("unknown.command", session_id), at=NOW)
+        too_long = await coordinator.submit(request("task.move", session_id, ttl_ms=11000), at=NOW)
+        expired = await coordinator.submit(
+            request("task.move", session_id, ttl_ms=5000),
+            at=NOW + timedelta(seconds=6),
+        )
+        invalid = await coordinator.submit(request("task.move", session_id, order=0), at=NOW)
+        rejected = await coordinator.submit(request("task.move", session_id, order=2), at=NOW)
+        failed = await coordinator.submit(request("task.move", session_id, order=3), at=NOW)
+
+        assert all(
+            record.state is CommandState.REJECTED
+            for record in (unknown, too_long, expired, invalid)
+        )
+        assert rejected.state is CommandState.FAILED
+        assert rejected.detail == "robot rejected"
+        assert failed.state is CommandState.FAILED
+        assert "adapter exploded" in failed.detail
+        assert await coordinator.cancel(uuid4(), reason="missing", at=NOW) is False

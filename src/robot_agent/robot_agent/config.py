@@ -344,3 +344,11 @@ def validate_command_params(command: CommandConfig, params: dict[str, JsonValue]
         path = "$" + "".join(f".{part}" for part in error.absolute_path)
         messages.append(f"{path}: {error.message}")
     raise CommandParametersError("; ".join(messages))
+
+
+def config_json_schema() -> dict[str, JsonValue]:
+    """Return the canonical JSON Schema for Robot Agent configuration v1."""
+    schema = AgentConfig.model_json_schema()
+    schema["$id"] = "https://phibotics.local/schemas/robot-agent-config.v1.schema.json"
+    schema["title"] = "robot-agent-config.v1"
+    return schema
