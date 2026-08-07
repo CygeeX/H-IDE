@@ -115,16 +115,12 @@ def test_parse_rejects_expired_command_and_future_envelope() -> None:
         },
     )
     with pytest.raises(FrameValidationError, match="expired"):
-        parse_wire_message(
-            json.dumps(expired), expected_robot_id="g1-dev", received_at=NOW
-        )
+        parse_wire_message(json.dumps(expired), expected_robot_id="g1-dev", received_at=NOW)
 
     future = envelope("control.acquire", {"operator_id": "operator-7"})
     future["sent_at"] = (NOW + timedelta(seconds=6)).isoformat()
     with pytest.raises(FrameValidationError, match="future"):
-        parse_wire_message(
-            json.dumps(future), expected_robot_id="g1-dev", received_at=NOW
-        )
+        parse_wire_message(json.dumps(future), expected_robot_id="g1-dev", received_at=NOW)
 
 
 def test_protocol_schema_is_versioned_and_closed() -> None:

@@ -94,9 +94,7 @@ def test_protocol_round_trip_preserves_lease_message() -> None:
     }
     parsed = parse_wire_message(json.dumps(raw), expected_robot_id="g1-dev")
 
-    reparsed = parse_wire_message(
-        serialize_wire_message(parsed), expected_robot_id="g1-dev"
-    )
+    reparsed = parse_wire_message(serialize_wire_message(parsed), expected_robot_id="g1-dev")
 
     assert reparsed == parsed
 

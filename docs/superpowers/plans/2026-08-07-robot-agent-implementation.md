@@ -23,9 +23,9 @@
 
 ### Task 3: Persistence, arbitration, and session safety
 
-- [ ] Write failing tests for durable command transitions, same-ID retry, ID mismatch, restart recovery, resource overlap, lease expiry, explicit acquire, and safe-stop latching.
-- [ ] Implement SQLite ledger, resource coordinator, session state machine, priority events, and state coalescing.
-- [ ] Run focused tests and verify the database migration path from an empty file.
+- [x] Write failing tests for durable command transitions, same-ID retry, ID mismatch, restart recovery, resource overlap, lease expiry, explicit acquire, and safe-stop latching.
+- [x] Implement SQLite ledger, resource coordinator, session state machine, priority events, and state coalescing.
+- [x] Run focused tests and verify the database migration path from an empty file.
 
 ### Task 4: WebSocket transports
 

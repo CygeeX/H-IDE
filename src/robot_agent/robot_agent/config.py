@@ -178,9 +178,7 @@ class CommandConfig(StrictConfigModel):
 
     @field_validator("request_schema")
     @classmethod
-    def validate_request_schema(
-        cls, value: dict[str, JsonValue]
-    ) -> dict[str, JsonValue]:
+    def validate_request_schema(cls, value: dict[str, JsonValue]) -> dict[str, JsonValue]:
         try:
             Draft202012Validator.check_schema(value)
         except SchemaError as exc:
@@ -239,9 +237,7 @@ class AgentConfig(StrictConfigModel):
 
     @field_validator("commands")
     @classmethod
-    def validate_command_names(
-        cls, value: dict[str, CommandConfig]
-    ) -> dict[str, CommandConfig]:
+    def validate_command_names(cls, value: dict[str, CommandConfig]) -> dict[str, CommandConfig]:
         invalid = [name for name in value if not LOGICAL_COMMAND_RE.fullmatch(name)]
         if invalid:
             raise ValueError(f"invalid logical command names: {invalid}")
@@ -280,8 +276,7 @@ class AgentConfig(StrictConfigModel):
     @property
     def capabilities_digest(self) -> str:
         payload = {
-            name: command.model_dump(mode="json")
-            for name, command in sorted(self.commands.items())
+            name: command.model_dump(mode="json") for name, command in sorted(self.commands.items())
         }
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         return f"sha256:{hashlib.sha256(encoded).hexdigest()}"

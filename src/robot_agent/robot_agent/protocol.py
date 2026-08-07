@@ -281,9 +281,7 @@ def parse_wire_message(
     if message.sent_at > now + max_future_skew:
         raise FrameValidationError("message sent_at is too far in the future")
     if isinstance(message, CommandRequest):
-        expires_at = message.payload.issued_at + timedelta(
-            milliseconds=message.payload.ttl_ms
-        )
+        expires_at = message.payload.issued_at + timedelta(milliseconds=message.payload.ttl_ms)
         if expires_at <= now:
             raise FrameValidationError("command has expired")
         if message.payload.issued_at > now + max_future_skew:
