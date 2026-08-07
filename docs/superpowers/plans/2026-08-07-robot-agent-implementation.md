@@ -29,9 +29,9 @@
 
 ### Task 4: WebSocket transports
 
-- [ ] Write failing client/server integration tests with generated CA/server/client certificates.
-- [ ] Implement shared connection handling, mTLS contexts, subprotocol enforcement, single-session server policy, client reconnect backoff, frame limits, and queue backpressure.
-- [ ] Verify rejected CA/SAN, binary/oversized frames, disconnect, and reconnect-unarmed behavior.
+- [x] Write failing client/server integration tests with generated CA/server/client certificates.
+- [x] Implement shared connection handling, mTLS contexts, subprotocol enforcement, single-session server policy, client reconnect backoff, frame limits, and queue backpressure.
+- [x] Verify rejected CA/SAN, binary/oversized frames, disconnect, and reconnect-unarmed behavior.
 
 ### Task 5: ROS adapter and runtime
 

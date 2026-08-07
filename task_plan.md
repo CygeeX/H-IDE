@@ -12,7 +12,7 @@
 - [x] 协议与严格配置模型
 - [ ] 状态归一化与输出模型
 - [x] 命令台账、资源仲裁与租约状态机
-- [ ] client/server WebSocket 与 mTLS
+- [x] client/server WebSocket 与 mTLS
 - [ ] ROS 2 Service/Action/Topic 适配与安全心跳
 - [ ] CLI、launch、systemd、Mock 工具和文档
 - [ ] Jazzy/Humble、故障、覆盖率与 soak 验证
