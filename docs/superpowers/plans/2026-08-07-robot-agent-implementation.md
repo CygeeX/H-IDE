@@ -35,9 +35,9 @@
 
 ### Task 5: ROS adapter and runtime
 
-- [ ] Write failing tests around mock Trigger/SetBool services, Fibonacci action feedback/cancel, state topics, QoS, ROS timeout, and safety heartbeat.
-- [ ] Implement the rclpy node, executor bridge, dynamic local type loading/conversion, Service/Action handlers, state sources, diagnostics, and safe shutdown.
-- [ ] Verify no synchronous ROS wait occurs in callbacks and every entity has explicit QoS/callback group configuration.
+- [x] Write failing tests around mock Trigger/SetBool services, Fibonacci action feedback/cancel, state topics, QoS, ROS timeout, and safety heartbeat.
+- [x] Implement the rclpy node, executor bridge, dynamic local type loading/conversion, Service/Action handlers, state sources, diagnostics, and safe shutdown.
+- [x] Verify no synchronous ROS wait occurs in callbacks and every entity has explicit QoS/callback group configuration.
 
 ### Task 6: Operations and documentation
 

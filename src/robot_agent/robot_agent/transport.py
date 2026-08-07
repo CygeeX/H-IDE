@@ -238,7 +238,21 @@ class ClientTransport:
             try:
                 connection = await self.connect_once()
                 backoff = self._config.reconnect_initial_ms / 1000.0
-                await handler(connection)
+                handler_task: asyncio.Future[Any] = asyncio.ensure_future(
+                    handler(connection)
+                )
+                stop_task: asyncio.Future[Any] = asyncio.ensure_future(stop.wait())
+                done, _ = await asyncio.wait(
+                    {handler_task, stop_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if stop_task in done and stop.is_set():
+                    handler_task.cancel()
+                    await asyncio.gather(handler_task, return_exceptions=True)
+                else:
+                    stop_task.cancel()
+                    await asyncio.gather(stop_task, return_exceptions=True)
+                    await handler_task
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

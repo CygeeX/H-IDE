@@ -227,3 +227,38 @@ async def test_safe_stop_preempts_and_terminalizes_active_commands(tmp_path: Pat
         assert set(executor.cancelled) == set(preempted)
         assert all(record.state is CommandState.CANCELLED for record in records)
         assert coordinator.active_commands == frozenset()
+
+
+@pytest.mark.asyncio
+async def test_cancel_one_leaves_disjoint_command_running(tmp_path: Path) -> None:
+    session, session_id = await active_session()
+    executor = ControlledExecutor()
+    with CommandLedger(tmp_path / "ledger.sqlite3") as ledger:
+        coordinator = CommandCoordinator(
+            commands={
+                "task.move": command_config("motion"),
+                "camera.capture": command_config("camera"),
+            },
+            ledger=ledger,
+            arbiter=ResourceArbiter(),
+            session=session,
+            executor=executor,
+        )
+        move = request("task.move", session_id)
+        camera = request("camera.capture", session_id)
+        move_task = asyncio.create_task(coordinator.submit(move, at=NOW))
+        camera_task = asyncio.create_task(coordinator.submit(camera, at=NOW))
+        await executor.wait_for_calls(2)
+
+        cancelled = await coordinator.cancel(
+            move.payload.command_id,
+            reason="operator request",
+            at=NOW,
+        )
+        move_record = await move_task
+        assert cancelled is True
+        assert move_record.state is CommandState.CANCELLED
+        assert coordinator.active_commands == frozenset({camera.payload.command_id})
+
+        executor.release.set()
+        assert (await camera_task).state is CommandState.SUCCEEDED

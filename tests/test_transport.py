@@ -460,3 +460,44 @@ async def test_client_reconnect_starts_unarmed_and_requires_new_acquire(
     assert bff_connections == 2
     assert states_on_connect == [ControlState.SAFE_HOLD, ControlState.SAFE_HOLD]
     assert stop_reasons == ["websocket closed", "websocket closed"]
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_client_stop_interrupts_an_idle_connection(
+    certificates: Certificates,
+) -> None:
+    server_context = build_server_ssl_context(tls_config(certificates, server=True))
+    connected = asyncio.Event()
+
+    async def bff_handler(websocket: ServerConnection) -> None:
+        await websocket.wait_closed()
+
+    async with serve(
+        bff_handler,
+        "127.0.0.1",
+        0,
+        ssl=server_context,
+        subprotocols=[SUBPROTOCOL],
+        compression=None,
+    ) as server:
+        port = int(server.sockets[0].getsockname()[1])
+        transport = ClientTransport(
+            ClientTransportConfig(
+                mode="client",
+                uri=f"wss://localhost:{port}/agent",
+                reconnect_initial_ms=50,
+                reconnect_max_ms=100,
+            ),
+            tls_config(certificates, server=False, server_name="localhost"),
+        )
+        stop = asyncio.Event()
+
+        async def handler(connection: AgentConnection) -> None:
+            connected.set()
+            await connection.recv_text()
+
+        running = asyncio.create_task(transport.run(handler, stop))
+        await asyncio.wait_for(connected.wait(), timeout=2)
+        stop.set()
+        await asyncio.wait_for(running, timeout=0.5)

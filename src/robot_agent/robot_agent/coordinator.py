@@ -166,6 +166,18 @@ class CommandCoordinator:
             at=at,
         )
 
+    async def cancel(self, command_id: UUID, *, reason: str, at: datetime) -> bool:
+        """Cancel one active command without disturbing disjoint resource groups."""
+        task = self._tasks.get(command_id)
+        if task is None or task.done():
+            return False
+        self._cancel_reasons[command_id] = reason
+        with contextlib.suppress(Exception):
+            await self._executor.cancel(command_id)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        return True
+
     async def preempt_all(self, *, reason: str, at: datetime) -> tuple[UUID, ...]:
         """Bypass locks, request adapter cancellation, and terminalize all commands."""
         command_ids = self._arbiter.preempt_all()

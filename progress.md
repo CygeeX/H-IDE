@@ -18,3 +18,8 @@
 - 完成共用文本连接契约、WebSocket client 指数退避重连和 server 单控制会话策略；两种模式均强制 `robot-agent.v1` 子协议、64 KiB、关闭码和有界接收队列。
 - 使用临时 CA/服务端/客户端证书完成真实 mTLS 集成验证，包括 Agent 首发应用握手、无客户端证书、错误 CA、错误 SAN、二进制、超大帧与重连后保持 `SAFE_HOLD`。
 - 传输阶段全量 48 项测试通过；Ruff 与严格 mypy 继续通过。
+- 完成 ROS 2 动态类型限制适配：异步 Service/Action、反馈、取消、显式 QoS/CallbackGroup、Topic 字段归一化与专用 executor 线程；未使用同步 ROS future 等待。
+- 完成 250 ms 安全心跳，QoS 为 RELIABLE/VOLATILE/KEEP_LAST(1)、Deadline 500 ms、Lifespan 1 s；Mock ROS 图验证 Service、Fibonacci Action、状态 Topic、取消和安全停机。
+- 系统化定位并修复 ROS executor/entity 退出竞态；10 轮复现和 5 轮组合回归均无销毁告警。
+- 完成应用 runtime：Agent 首发 hello、welcome 策略锁定、显式 acquire、续租、命令路由、反馈/状态优先队列、租约过期安全停机、重启台账恢复和优雅 transport 停止。
+- ROS/runtime 阶段全量 57 项测试通过；Ruff 与 Python 3.10 严格 mypy 通过。
