@@ -46,7 +46,7 @@
 
 ### Task 7: Full acceptance
 
-- [ ] Run Ruff, mypy, unit/integration tests, coverage, and colcon build/test on Jazzy.
-- [ ] Build the pinned Humble test image and run the same suite.
-- [ ] Run fault tests and a 30-minute soak; record timing, memory, queue, and replay results.
-- [ ] Re-read the design and close every requirement before completion.
+- [x] Run Ruff, mypy, unit/integration tests, coverage, and colcon build/test on Jazzy.
+- [x] Build the pinned Humble test image and run the same suite.
+- [x] Run fault tests and a 30-minute soak; record timing, memory, queue, and replay results.
+- [x] Re-read the design and close every requirement before completion.

@@ -26,3 +26,12 @@
 - 完成 `run`、`validate-config`、只读 `doctor` CLI、JSON journald 日志、原生 systemd notify/watchdog、launch 和加固 Unit；`systemd-analyze verify` 返回 0。
 - 补齐本地/生产配置、协议与配置 JSON Schema、Mock Robot、双模式 Mock BFF、Humble Docker 入口、部署/协议/验证文档。
 - 扩充错误与生命周期分支测试；当前 88 项通过，核心分支覆盖率 92.45%，高于 90% 门禁。
+- 修复 colcon 测试发现边界：新增已安装包 smoke test 与 `tests_require`；Jazzy colcon build/test 最终为 1 test、0 errors、0 failures。
+- 完成本地三进程真实联调：Mock BFF 收到 `SAFE_HOLD → ACTIVE`，`power.enable` 经 ROS 2 Service 返回 `SUCCEEDED`；BFF 断开后 Mock Robot 再次收到 safe-stop，三个进程均正常退出。
+- 修复 mandatory safe-stop 初始化失败时 runtime 未关闭 ROS/ledger 的生命周期漏洞，并让 Mock Robot 在 ROS SIGINT 后使用 `try_shutdown()` 干净退出。
+- 在 Humble/Python 3.10 容器中定位并修复 `asyncio.TimeoutError` 兼容问题；最终固定官方 Humble 镜像内 122 项通过、1 个长 soak 按标记跳过。
+- 完成最终设计审计：启用终态台账保留期清理、补齐随附 ROS 接口运行依赖、增加显式 Humble systemd 入口和可审计 Mock BFF 终态退出。
+- 完成 WebSocket server 客户端叶证书 SHA-256 固定、运行期 retention、ROS owner 线程和有界请求队列，以及命令注册/取消/抢占与安全停机取消竞态加固。
+- 最终 Jazzy 非 soak 全量为 122 项通过；Ruff、strict mypy 通过；分支覆盖率 90.09%；colcon 为 1 test/0 failures。
+- 完成第二次 1800 秒真实 Runtime soak：180,000 次循环，8,749 条命令全部有终态，8,674 次 ROS 成功调用；RSS 94,519,296 → 105,746,432 B、队列峰值 2/64、丢弃 0、最大事件循环延迟 20.510 ms。
+- 核心加固提交为 `1d796a3`，验收快照为 `d27b33e`；本轮仍未复制到真机，等待真实 SONIC/Unitree 接口清单和目标机变更窗口。

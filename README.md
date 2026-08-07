@@ -23,7 +23,8 @@ WebSocket client/server（运行时二选一）
 - 重连不会恢复控制；BFF 必须重新发送 `control.acquire`。
 - 同一 `command_id` 和同一载荷返回已有状态；同 ID 不同载荷会被拒绝。
 - 普通命令只能占用配置中的资源组；safe-stop 绕过锁并取消所有活动 Action。
-- 生产配置必须使用 mTLS。明文只允许显式开启的 loopback 开发模式。
+- 生产配置必须使用 mTLS。server 模式还会固定客户端叶证书的 SHA-256
+  指纹，不能只依赖同一 CA；明文只允许显式开启的 loopback 开发模式。
 
 ## 本地快速验证（ROS 2 Jazzy）
 
@@ -76,7 +77,7 @@ PYTHONPATH=src/robot_agent:${PYTHONPATH} .venv/bin/python -m robot_agent.cli doc
 ## 验证
 
 ```bash
-.venv/bin/python -m pytest
+PYTHONPATH=src/robot_agent:${PYTHONPATH} .venv/bin/python -m pytest -m 'not soak'
 .venv/bin/ruff check .
 .venv/bin/mypy src/robot_agent/robot_agent
 .venv/bin/python /usr/bin/colcon build --symlink-install
@@ -84,7 +85,8 @@ PYTHONPATH=src/robot_agent:${PYTHONPATH} .venv/bin/python -m robot_agent.cli doc
 .venv/bin/python /usr/bin/colcon test-result --verbose
 ```
 
-Humble 容器验证入口为 `tools/test_humble.sh`。30 分钟 soak 用例带有 `soak` marker，详见[验证说明](docs/verification.md)。
+Humble 容器验证入口为 `tools/test_humble.sh`。30 分钟 soak 使用真实
+WebSocket/ROS 2/SQLite 链路并带有 `soak` marker，详见[验证说明](docs/verification.md)。
 
 ## 配置与协议
 
@@ -95,3 +97,6 @@ Humble 容器验证入口为 `tools/test_humble.sh`。30 分钟 soak 用例带�
 - 生成的 JSON Schema：[schemas](src/robot_agent/schemas)
 
 配置中的 `commands` 是唯一 ROS 出口。修改注册表后，能力摘要会变化，BFF 可据此识别部署能力。生产上线前必须把模板里的 ROS 名称、类型、参数 Schema、资源集合和 safe-stop 端点替换为真机经过评审的接口。
+
+若生产使用 WebSocket server 模式，必须在 `tls.peer_certificate_sha256` 中填写
+BFF 客户端叶证书 DER 的小写 SHA-256 指纹；证书轮换时应同步更新配置并重新验收。

@@ -18,7 +18,8 @@
 1. 运行 `validate-config`，确认命令数量和能力摘要。
 2. 运行 `doctor`，所有 ROS 类型和 safe-stop 类型必须是 `PASS`。
 3. 在 Mock 或安全工位验证每个 Service/Action 参数和资源集合。
-4. 验证错误 CA、错误 SAN 和无客户端证书不能建立连接。
+4. 验证错误 CA、错误 SAN 和无客户端证书不能建立连接；server 模式还要验证
+   非固定客户端叶证书即使由同一 CA 签发也会被拒绝。
 5. 主动断网与停止续租，确认 2 秒内机器人进入安全态。
 6. 杀死 Agent 进程，由独立安全监视器确认 500 ms Deadline / 1 s Lifespan 心跳丢失。
 7. 重启 Agent，确认遗留非终态命令变为 `ABORTED_AGENT_RESTART`，且仍需新 `control.acquire`。
@@ -38,7 +39,19 @@ journalctl -u robot-agent -f -o cat
 
 日志是一行一个 JSON 对象，可按 `robot_id`、`session_id`、`command_id` 和 `event_code` 索引。`doctor` 是只读命令，不会创建台账或调用 ROS 接口。
 
-`storage.retention_days` 是命令幂等窗口：Agent 启动时先把遗留非终态命令标记为 `ABORTED_AGENT_RESTART`，再删除超过该窗口的终态命令及其转移历史；非终态记录永不被保留期清理。
+`storage.retention_days` 是命令幂等窗口：Agent 启动时先把遗留非终态命令标记为
+`ABORTED_AGENT_RESTART`，随后在启动阶段和运行期间周期性删除超过该窗口的终态
+命令及其转移历史；非终态记录永不被保留期清理。
+
+WebSocket server 模式必须配置 `tls.peer_certificate_sha256`，其值是获准 BFF 客户端
+叶证书 DER 的小写 SHA-256：
+
+```bash
+openssl x509 -in bff-client.crt -outform DER | sha256sum
+```
+
+证书轮换必须把新证书与新指纹作为同一变更发布；不能用“同一 CA 签发”替代叶证书
+身份固定。
 
 ## 故障处置
 
