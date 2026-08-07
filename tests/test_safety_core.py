@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
@@ -164,3 +165,71 @@ async def test_session_edge_guards_and_force_safe_hold() -> None:
     assert reasons == ["local fault"]
     with pytest.raises(LeaseError, match="not ACTIVE"):
         await controller.renew(first, sequence=1, at=NOW)
+
+
+@pytest.mark.asyncio
+async def test_safe_stop_failure_latches_fault_and_blocks_reacquire() -> None:
+    async def failing_safe_stop(reason: str) -> None:
+        raise RuntimeError(f"safe-stop unavailable: {reason}: {'x' * 300}")
+
+    controller = SessionController(
+        lease_timeout=timedelta(seconds=2),
+        safe_stop=failing_safe_stop,
+    )
+    session_id = uuid4()
+    await controller.connected(session_id)
+    await controller.acquire(session_id, operator_id="operator-7", at=NOW)
+
+    with pytest.raises(RuntimeError, match="safe-stop unavailable"):
+        await controller.force_safe_hold("lease expired")
+
+    assert controller.state is ControlState.SAFE_HOLD
+    assert len(controller.snapshot.reason) <= 256
+    with pytest.raises(SessionStateError, match="safety fault is latched"):
+        await controller.acquire(
+            session_id,
+            operator_id="operator-7",
+            at=NOW + timedelta(seconds=3),
+        )
+
+    with pytest.raises(RuntimeError, match="safe-stop unavailable"):
+        await controller.disconnected("websocket closed")
+    replacement_session = uuid4()
+    await controller.connected(replacement_session)
+    with pytest.raises(SessionStateError, match="safety fault is latched"):
+        await controller.acquire(
+            replacement_session,
+            operator_id="operator-8",
+            at=NOW + timedelta(seconds=4),
+        )
+
+
+@pytest.mark.asyncio
+async def test_cancelling_safe_hold_latches_fault_and_blocks_reacquire() -> None:
+    safe_stop_started = asyncio.Event()
+
+    async def blocking_safe_stop(reason: str) -> None:
+        del reason
+        safe_stop_started.set()
+        await asyncio.Event().wait()
+
+    controller = SessionController(
+        lease_timeout=timedelta(seconds=2),
+        safe_stop=blocking_safe_stop,
+    )
+    session_id = uuid4()
+    await controller.connected(session_id)
+    await controller.acquire(session_id, operator_id="operator-7", at=NOW)
+    safe_hold = asyncio.create_task(controller.force_safe_hold("lease expired"))
+    await asyncio.wait_for(safe_stop_started.wait(), timeout=1)
+    safe_hold.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await safe_hold
+    assert controller.state is ControlState.SAFE_HOLD
+    with pytest.raises(SessionStateError, match="safety fault is latched"):
+        await controller.acquire(
+            session_id,
+            operator_id="operator-7",
+            at=NOW + timedelta(seconds=3),
+        )

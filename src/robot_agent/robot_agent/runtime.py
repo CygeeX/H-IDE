@@ -6,7 +6,7 @@ import asyncio
 import re
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
-from typing import Any, Protocol, cast
+from typing import Any, Protocol, TypeVar, cast
 from uuid import UUID, uuid4
 
 from websockets.exceptions import ConnectionClosed
@@ -20,7 +20,11 @@ from robot_agent.config import (
     ServerTransportConfig,
     StateSourceConfig,
 )
-from robot_agent.coordinator import CommandCoordinator, ExecutionResult
+from robot_agent.coordinator import (
+    CommandCancellationError,
+    CommandCoordinator,
+    ExecutionResult,
+)
 from robot_agent.ledger import CommandIdConflict, CommandLedger, CommandRecord
 from robot_agent.outbound import (
     OutboundItem,
@@ -60,6 +64,11 @@ from robot_agent.session import LeaseError, SessionController, SessionStateError
 from robot_agent.state import StateCoalescer, StateEmission
 from robot_agent.transport import ClientTransport, ServerTransport
 
+_RETENTION_CHECK_INTERVAL_SECONDS = 3600.0
+_PREEMPTION_TIMEOUT_SECONDS = 0.5
+_MAX_IN_FLIGHT_COMMANDS = 64
+_TaskResult = TypeVar("_TaskResult")
+
 
 class RuntimeErrorBase(RuntimeError):
     """Base error for Agent runtime failures."""
@@ -98,6 +107,8 @@ class RosRuntimeAdapter(Protocol):
     ) -> None: ...
 
     def start(self) -> None: ...
+
+    def check_health(self) -> None: ...
 
     async def execute(
         self,
@@ -146,6 +157,8 @@ class RobotAgentRuntime:
         self._connection_session_id: UUID | None = None
         self._command_tasks: set[asyncio.Task[None]] = set()
         self._event_tasks: set[asyncio.Task[None]] = set()
+        self._detached_safety_tasks: set[asyncio.Task[Any]] = set()
+        self._background_failure: asyncio.Future[None] | None = None
         self._initialized = False
         self._closed = False
         self.ready = asyncio.Event()
@@ -157,10 +170,11 @@ class RobotAgentRuntime:
             raise RuntimeErrorBase("runtime is closed")
         self._event_loop = asyncio.get_running_loop()
         initialized_at = _now()
-        self._ledger.abort_incomplete_after_restart(at=initialized_at)
-        self._ledger.prune_terminal_before(
-            before=initialized_at - timedelta(days=self.config.storage.retention_days)
+        await asyncio.to_thread(
+            self._ledger.abort_incomplete_after_restart,
+            at=initialized_at,
         )
+        await self._prune_ledger(at=initialized_at)
         self._ros.set_callbacks(
             state_callback=self._on_ros_state,
             feedback_callback=self._on_ros_feedback,
@@ -177,19 +191,50 @@ class RobotAgentRuntime:
         self.ready.set()
 
     async def run(self, stop: asyncio.Event) -> None:
+        transport_task: asyncio.Task[None] | None = None
+        retention_task: asyncio.Task[None] | None = None
         try:
             await self.initialize()
             transport_config = self.config.transport
             if isinstance(transport_config, ClientTransportConfig):
                 transport = ClientTransport(transport_config, self.config.tls)
-                await transport.run(self.handle_connection, stop)
+                transport_task = asyncio.create_task(
+                    transport.run(self.handle_connection, stop)
+                )
             elif isinstance(transport_config, ServerTransportConfig):
                 server = ServerTransport(transport_config, self.config.tls)
-                await server.run(self.handle_connection, stop)
+                transport_task = asyncio.create_task(
+                    server.run(self.handle_connection, stop)
+                )
             else:  # pragma: no cover - Pydantic's discriminated union prevents this.
                 raise RuntimeErrorBase("unsupported transport configuration")
+            retention_task = asyncio.create_task(self._retention_loop())
+            done, _ = await asyncio.wait(
+                {transport_task, retention_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            completed = next(iter(done))
+            await completed
         finally:
+            for task in (transport_task, retention_task):
+                if task is not None and not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                *(task for task in (transport_task, retention_task) if task is not None),
+                return_exceptions=True,
+            )
             await self.shutdown()
+
+    async def _retention_loop(self) -> None:
+        while True:
+            await asyncio.sleep(_RETENTION_CHECK_INTERVAL_SECONDS)
+            await self._prune_ledger(at=_now())
+
+    async def _prune_ledger(self, *, at: datetime) -> None:
+        await asyncio.to_thread(
+            self._ledger.prune_terminal_before,
+            before=at - timedelta(days=self.config.storage.retention_days),
+        )
 
     async def handle_connection(self, connection: ConnectionLike) -> None:
         if not self._initialized:
@@ -234,38 +279,67 @@ class RobotAgentRuntime:
         self._connection_session_id = session_id
         queue = PriorityOutboundQueue(maxsize=self.config.state.outbound_queue_size)
         self._outbound = queue
+        background_failure = asyncio.get_running_loop().create_future()
+        self._background_failure = background_failure
         writer = asyncio.create_task(self._writer(connection, queue))
         lease_monitor = asyncio.create_task(self._lease_monitor())
         state_emitter = asyncio.create_task(self._state_emitter())
+        reader = asyncio.create_task(self._reader_loop(connection, session_id))
         disconnect_reason = "websocket disconnected"
         try:
             await self._enqueue_control_status()
-            disconnect_reason = await self._reader_loop(connection, session_id)
+            supervised: set[asyncio.Future[Any]] = {
+                reader,
+                writer,
+                lease_monitor,
+                state_emitter,
+                background_failure,
+            }
+            done, _ = await asyncio.wait(
+                supervised,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if background_failure in done:
+                await background_failure
+            elif reader in done:
+                disconnect_reason = await reader
+            else:
+                completed = next(
+                    task for task in (writer, lease_monitor, state_emitter) if task in done
+                )
+                await completed
+                raise RuntimeErrorBase("connection background task stopped unexpectedly")
         except ConnectionClosed as exc:
             disconnect_reason = f"websocket closed ({exc})"
         finally:
             try:
                 await self._session.disconnected(disconnect_reason)
             finally:
-                for task in tuple(self._command_tasks):
-                    if not task.done():
-                        task.cancel()
+                for command_task in tuple(self._command_tasks):
+                    if not command_task.done():
+                        command_task.cancel()
                 if self._command_tasks:
                     await asyncio.gather(*self._command_tasks, return_exceptions=True)
-                for task in tuple(self._event_tasks):
-                    task.cancel()
+                for event_task in tuple(self._event_tasks):
+                    event_task.cancel()
                 if self._event_tasks:
                     await asyncio.gather(*self._event_tasks, return_exceptions=True)
-                for task in (lease_monitor, state_emitter, writer):
-                    task.cancel()
+                for background_task in (reader, lease_monitor, state_emitter, writer):
+                    background_task.cancel()
                 await asyncio.gather(
+                    reader,
                     lease_monitor,
                     state_emitter,
                     writer,
                     return_exceptions=True,
                 )
+                if not background_failure.done():
+                    background_failure.cancel()
+                await asyncio.gather(background_failure, return_exceptions=True)
                 self._outbound = None
                 self._connection_session_id = None
+                if self._background_failure is background_failure:
+                    self._background_failure = None
 
     def _parse(self, raw: str | bytes) -> WireMessage:
         return parse_wire_message(
@@ -357,17 +431,33 @@ class RobotAgentRuntime:
             return None
         if isinstance(message, CommandRequest):
             self._session.assert_can_command(session_id)
+            if len(self._command_tasks) >= _MAX_IN_FLIGHT_COMMANDS:
+                await self._enqueue_error(
+                    "COMMAND_QUEUE_FULL",
+                    f"at most {_MAX_IN_FLIGHT_COMMANDS} commands may be in flight",
+                    related_message_id=message.message_id,
+                )
+                return None
             task = asyncio.create_task(self._execute_and_report(message))
             self._command_tasks.add(task)
-            task.add_done_callback(self._command_tasks.discard)
+            task.add_done_callback(
+                lambda completed: self._tracked_task_completed(completed, self._command_tasks)
+            )
+            # Give the coordinator one turn to register the submission before a
+            # back-to-back command.cancel can be routed from the same connection.
+            await asyncio.sleep(0)
             return None
         if isinstance(message, CommandCancel):
             self._session.assert_can_command(session_id)
-            cancelled = await self._coordinator.cancel(
-                message.payload.command_id,
-                reason=message.payload.reason,
-                at=_now(),
-            )
+            try:
+                cancelled = await self._coordinator.cancel(
+                    message.payload.command_id,
+                    reason=message.payload.reason,
+                    at=_now(),
+                )
+            except CommandCancellationError as exc:
+                await self._perform_safe_stop(str(exc))
+                return None
             if not cancelled:
                 await self._enqueue_error(
                     "COMMAND_NOT_ACTIVE",
@@ -393,6 +483,10 @@ class RobotAgentRuntime:
                 str(exc),
                 related_message_id=request.message_id,
             )
+            return
+        except CommandCancellationError as exc:
+            await self._enqueue_command_status(exc.record)
+            await self._perform_safe_stop(str(exc))
             return
         await self._enqueue_command_status(record)
 
@@ -523,6 +617,7 @@ class RobotAgentRuntime:
     async def _lease_monitor(self) -> None:
         while True:
             await asyncio.sleep(0.05)
+            self._ros.check_health()
             if await self._session.check_lease(_now()):
                 await self._enqueue_control_status()
 
@@ -572,21 +667,47 @@ class RobotAgentRuntime:
         await self._enqueue(priority, message.type, message, coalesce_key=key)
 
     async def _perform_safe_stop(self, reason: str) -> None:
-        await self._coordinator.preempt_all(reason=reason, at=_now())
-        try:
-            result = await asyncio.wait_for(
-                self._ros.safe_stop(self.config.safety.safe_stop),
-                timeout=self.config.safety.safe_stop.timeout_ms / 1000.0,
-            )
-        except Exception as exc:
-            await self._enqueue_safety("SAFE_STOP_FAILED", f"{reason}: {exc}")
-            raise RuntimeSafetyError(f"mandatory safe stop failed: {exc}") from exc
+        if self._detached_safety_tasks:
+            detail = "a prior safety operation ignored cancellation and is still running"
+            await self._enqueue_safety("SAFE_STOP_FAILED", f"{reason}: {detail}")
+            raise RuntimeSafetyError(detail)
+        timeout_seconds = self.config.safety.safe_stop.timeout_ms / 1000.0
+        physical_stop = asyncio.create_task(self._ros.safe_stop(self.config.safety.safe_stop))
+        preemption = asyncio.create_task(self._coordinator.preempt_all(reason=reason, at=_now()))
+        (result, physical_error), (_, preemption_error) = await asyncio.gather(
+            _capture_bounded_task(
+                physical_stop,
+                timeout=timeout_seconds,
+                description="physical safe stop",
+                detached_tasks=self._detached_safety_tasks,
+            ),
+            _capture_bounded_task(
+                preemption,
+                timeout=_PREEMPTION_TIMEOUT_SECONDS,
+                description="command preemption",
+                detached_tasks=self._detached_safety_tasks,
+            ),
+        )
+        if physical_error is not None:
+            await self._enqueue_safety("SAFE_STOP_FAILED", f"{reason}: {physical_error}")
+            raise RuntimeSafetyError(
+                f"mandatory safe stop failed: {physical_error}"
+            ) from physical_error
+        assert result is not None
         if not result.succeeded:
             await self._enqueue_safety(
                 "SAFE_STOP_FAILED",
                 f"{reason}: {result.detail}",
             )
             raise RuntimeSafetyError(f"mandatory safe stop was rejected: {result.detail}")
+        if preemption_error is not None:
+            await self._enqueue_safety(
+                "SAFE_STOP_FAILED",
+                f"{reason}: command preemption failed: {preemption_error}",
+            )
+            raise RuntimeSafetyError(
+                f"command preemption failed during mandatory safe stop: {preemption_error}"
+            ) from preemption_error
         await self._enqueue_safety(_safety_code(reason), reason)
 
     def _on_ros_state(self, path: str, value: Any, observed_at: datetime) -> None:
@@ -626,14 +747,29 @@ class RobotAgentRuntime:
             )
         )
         self._event_tasks.add(task)
-        task.add_done_callback(self._event_tasks.discard)
+        task.add_done_callback(
+            lambda completed: self._tracked_task_completed(completed, self._event_tasks)
+        )
+
+    def _tracked_task_completed(
+        self,
+        task: asyncio.Task[None],
+        collection: set[asyncio.Task[None]],
+    ) -> None:
+        collection.discard(task)
+        if task.cancelled():
+            return
+        exception = task.exception()
+        failure = self._background_failure
+        if exception is not None and failure is not None and not failure.done():
+            failure.set_exception(exception)
 
     async def shutdown(self) -> None:
         if self._closed:
             return
         self._closed = True
         await self._ros.close()
-        self._ledger.close()
+        await asyncio.to_thread(self._ledger.close)
 
 
 def _now() -> datetime:
@@ -643,3 +779,65 @@ def _now() -> datetime:
 def _safety_code(reason: str) -> str:
     code = re.sub(r"[^A-Z0-9]+", "_", reason.upper()).strip("_")
     return (code or "SAFE_STOP")[:128]
+
+
+async def _bounded_task_result(
+    task: asyncio.Task[_TaskResult],
+    *,
+    timeout: float,
+    description: str,
+    detached_tasks: set[asyncio.Task[Any]],
+) -> _TaskResult:
+    try:
+        done, _ = await asyncio.wait({task}, timeout=timeout)
+    except asyncio.CancelledError:
+        _cancel_and_track(task, detached_tasks)
+        raise
+    if task not in done:
+        _cancel_and_track(task, detached_tasks)
+        raise asyncio.TimeoutError(f"{description} exceeded {timeout:.3f}s deadline")
+    if task.cancelled():
+        raise RuntimeError(f"{description} was cancelled")
+    return task.result()
+
+
+async def _capture_bounded_task(
+    task: asyncio.Task[_TaskResult],
+    *,
+    timeout: float,
+    description: str,
+    detached_tasks: set[asyncio.Task[Any]],
+) -> tuple[_TaskResult | None, Exception | None]:
+    try:
+        return (
+            await _bounded_task_result(
+                task,
+                timeout=timeout,
+                description=description,
+                detached_tasks=detached_tasks,
+            ),
+            None,
+        )
+    except Exception as exc:
+        return None, exc
+
+
+def _cancel_and_track(
+    task: asyncio.Task[Any],
+    detached_tasks: set[asyncio.Task[Any]],
+) -> None:
+    if not task.done():
+        task.cancel()
+
+    detached_tasks.add(task)
+
+    def completed(completed_task: asyncio.Task[Any]) -> None:
+        detached_tasks.discard(completed_task)
+        _consume_task_outcome(completed_task)
+
+    task.add_done_callback(completed)
+
+
+def _consume_task_outcome(task: asyncio.Task[Any]) -> None:
+    if not task.cancelled():
+        task.exception()

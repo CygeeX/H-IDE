@@ -152,6 +152,18 @@ def test_plaintext_requires_explicit_opt_in_even_on_loopback(tmp_path: Path) -> 
         AgentConfig.model_validate(raw)
 
 
+def test_server_mtls_requires_pinned_client_certificate(tmp_path: Path) -> None:
+    raw = valid_config(tmp_path)
+    raw["transport"] = {"mode": "server", "host": "0.0.0.0", "port": 8765}
+
+    with pytest.raises(ValidationError, match="peer_certificate_sha256"):
+        AgentConfig.model_validate(raw)
+
+    raw["tls"]["peer_certificate_sha256"] = "A" * 64  # type: ignore[index]
+    config = AgentConfig.model_validate(raw)
+    assert config.tls.peer_certificate_sha256 == "a" * 64
+
+
 def test_command_params_are_validated_by_local_schema(tmp_path: Path) -> None:
     config = AgentConfig.model_validate(valid_config(tmp_path))
     command = config.commands["task.execute"]

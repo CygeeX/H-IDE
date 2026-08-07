@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+import robot_agent.runtime as runtime_module
 from robot_agent.coordinator import ExecutionResult
 from robot_agent.protocol import WireMessage, parse_wire_message
 from robot_agent.runtime import RobotAgentRuntime, RuntimeSafetyError
+from robot_agent.session import SessionStateError
 
 from robot_agent.config import AgentConfig, CommandConfig, SafeStopConfig
 
@@ -85,6 +89,7 @@ class FakeRosAdapter:
         self.safe_stop_reasons = 0
         self.safe_stop_succeeded = True
         self.safe_stop_exception: Exception | None = None
+        self.health_exception: Exception | None = None
 
     def set_callbacks(self, *, state_callback: Any, feedback_callback: Any) -> None:
         self.state_callback = state_callback
@@ -98,6 +103,10 @@ class FakeRosAdapter:
 
     def start(self) -> None:
         self.started = True
+
+    def check_health(self) -> None:
+        if self.health_exception is not None:
+            raise self.health_exception
 
     async def execute(
         self,
@@ -453,6 +462,147 @@ async def test_runtime_fails_closed_when_mandatory_safe_stop_fails(
 
 
 @pytest.mark.asyncio
+async def test_safe_stop_deadline_is_bounded_when_adapter_suppresses_cancellation(
+    tmp_path: Path,
+) -> None:
+    class UncooperativeSafeStopAdapter(FakeRosAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.release = asyncio.Event()
+            self.stopped = asyncio.Event()
+
+        async def safe_stop(self, config: SafeStopConfig) -> ExecutionResult:
+            del config
+            try:
+                while not self.release.is_set():
+                    try:
+                        await asyncio.sleep(0.01)
+                    except asyncio.CancelledError:
+                        continue
+                return ExecutionResult(succeeded=True, detail="released")
+            finally:
+                self.stopped.set()
+
+    config = runtime_config(tmp_path)
+    config = config.model_copy(
+        update={
+            "safety": config.safety.model_copy(
+                update={
+                    "safe_stop": config.safety.safe_stop.model_copy(
+                        update={"timeout_ms": 50}
+                    )
+                }
+            )
+        }
+    )
+    ros = UncooperativeSafeStopAdapter()
+    runtime = RobotAgentRuntime(config, ros_adapter=ros)
+    initialization = asyncio.create_task(runtime.initialize())
+
+    try:
+        done, _ = await asyncio.wait({initialization}, timeout=0.3)
+        assert initialization in done
+        with pytest.raises(RuntimeSafetyError, match="deadline"):
+            await initialization
+        assert len(runtime._detached_safety_tasks) == 1
+    finally:
+        ros.release.set()
+        await asyncio.wait_for(ros.stopped.wait(), timeout=1)
+        await asyncio.sleep(0)
+        if not initialization.done():
+            await asyncio.wait_for(initialization, timeout=1)
+        await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cancelling_safe_stop_cleans_both_parallel_safety_tasks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BlockingSafetyAdapter(FakeRosAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.physical_started = asyncio.Event()
+            self.physical_stopped = asyncio.Event()
+
+        async def safe_stop(self, config: SafeStopConfig) -> ExecutionResult:
+            del config
+            self.physical_started.set()
+            try:
+                await asyncio.Event().wait()
+                raise AssertionError("unreachable")
+            finally:
+                self.physical_stopped.set()
+
+    ros = BlockingSafetyAdapter()
+    runtime = RobotAgentRuntime(runtime_config(tmp_path), ros_adapter=ros)
+    preemption_started = asyncio.Event()
+    preemption_stopped = asyncio.Event()
+
+    async def blocking_preemption(*, reason: str, at: datetime) -> tuple[UUID, ...]:
+        del reason, at
+        preemption_started.set()
+        try:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+        finally:
+            preemption_stopped.set()
+
+    monkeypatch.setattr(runtime._coordinator, "preempt_all", blocking_preemption)
+    safe_stop = asyncio.create_task(runtime._perform_safe_stop("outer cancellation"))
+    await asyncio.wait_for(ros.physical_started.wait(), timeout=1)
+    await asyncio.wait_for(preemption_started.wait(), timeout=1)
+    safe_stop.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await safe_stop
+    await asyncio.wait_for(ros.physical_stopped.wait(), timeout=1)
+    await asyncio.wait_for(preemption_stopped.wait(), timeout=1)
+    await asyncio.sleep(0)
+    assert runtime._detached_safety_tasks == set()
+    await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_self_cancelled_physical_safe_stop_is_a_safety_failure(
+    tmp_path: Path,
+) -> None:
+    class SelfCancellingSafeStopAdapter(FakeRosAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        async def safe_stop(self, config: SafeStopConfig) -> ExecutionResult:
+            self.calls += 1
+            if self.calls == 1:
+                return await super().safe_stop(config)
+            raise asyncio.CancelledError("adapter cancelled its own safe-stop task")
+
+    runtime = RobotAgentRuntime(
+        runtime_config(tmp_path),
+        ros_adapter=SelfCancellingSafeStopAdapter(),
+    )
+    await runtime.initialize()
+    session_id = uuid4()
+    await runtime._session.connected(session_id)
+    await runtime._session.acquire(
+        session_id,
+        operator_id="operator-7",
+        at=datetime.now(timezone.utc),
+    )
+
+    with pytest.raises(RuntimeSafetyError, match="physical safe stop was cancelled"):
+        await runtime._session.force_safe_hold("lease expired")
+    with pytest.raises(SessionStateError, match="safety fault is latched"):
+        await runtime._session.acquire(
+            session_id,
+            operator_id="operator-7",
+            at=datetime.now(timezone.utc),
+        )
+    await runtime.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_runtime_run_cleans_ros_after_initialization_failure(tmp_path: Path) -> None:
     ros = FakeRosAdapter()
     ros.safe_stop_exception = RuntimeError("safe stop unavailable")
@@ -461,3 +611,404 @@ async def test_runtime_run_cleans_ros_after_initialization_failure(tmp_path: Pat
     with pytest.raises(RuntimeSafetyError):
         await runtime.run(asyncio.Event())
     assert ros.closed is True
+
+
+@pytest.mark.asyncio
+async def test_runtime_prunes_terminal_ledger_periodically(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ros = FakeRosAdapter()
+    runtime = RobotAgentRuntime(runtime_config(tmp_path), ros_adapter=ros)
+    await runtime.initialize()
+    pruned = threading.Event()
+    original_prune = runtime._ledger.prune_terminal_before
+
+    def observed_prune(*, before: datetime) -> int:
+        result = original_prune(before=before)
+        pruned.set()
+        return result
+
+    monkeypatch.setattr(runtime._ledger, "prune_terminal_before", observed_prune)
+    monkeypatch.setattr(runtime_module, "_RETENTION_CHECK_INTERVAL_SECONDS", 0.01)
+    retention = asyncio.create_task(runtime._retention_loop())
+    try:
+        assert await asyncio.to_thread(pruned.wait, 0.5)
+    finally:
+        retention.cancel()
+        await asyncio.gather(retention, return_exceptions=True)
+        await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_lease_monitor_safe_stop_failure_terminates_connection_promptly(
+    tmp_path: Path,
+) -> None:
+    config = runtime_config(tmp_path, lease_interval_ms=100, lease_timeout_ms=500)
+    ros = FakeRosAdapter()
+    runtime = RobotAgentRuntime(config, ros_adapter=ros)
+    await runtime.initialize()
+    connection = QueueConnection()
+    handler = asyncio.create_task(runtime.handle_connection(connection))
+    await next_message(connection)
+    session_id = uuid4()
+    await connection.incoming.put(
+        inbound(
+            "session.welcome",
+            session_id,
+            {
+                "accepted_version": "1.0",
+                "lease_interval_ms": 100,
+                "lease_timeout_ms": 500,
+                "control_state": "SAFE_HOLD",
+            },
+        )
+    )
+    await next_message(connection)
+    await connection.incoming.put(
+        inbound("control.acquire", session_id, {"operator_id": "operator-7"})
+    )
+    await next_message(connection)
+    ros.safe_stop_exception = RuntimeError("safe stop unavailable")
+
+    try:
+        await asyncio.sleep(0.7)
+        assert handler.done() is True
+        with pytest.raises(RuntimeSafetyError, match="mandatory safe stop"):
+            await handler
+    finally:
+        if not handler.done():
+            handler.cancel()
+            await asyncio.gather(handler, return_exceptions=True)
+        await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_ros_executor_failure_terminates_active_connection(tmp_path: Path) -> None:
+    ros = FakeRosAdapter()
+    runtime = RobotAgentRuntime(runtime_config(tmp_path), ros_adapter=ros)
+    await runtime.initialize()
+    connection = QueueConnection()
+    handler = asyncio.create_task(runtime.handle_connection(connection))
+    await next_message(connection)
+    session_id = uuid4()
+    await connection.incoming.put(
+        inbound(
+            "session.welcome",
+            session_id,
+            {
+                "accepted_version": "1.0",
+                "lease_interval_ms": 500,
+                "lease_timeout_ms": 2000,
+                "control_state": "SAFE_HOLD",
+            },
+        )
+    )
+    await next_message(connection)
+    await connection.incoming.put(
+        inbound("control.acquire", session_id, {"operator_id": "operator-7"})
+    )
+    await next_message(connection)
+    ros.health_exception = RuntimeError("ROS executor failed")
+
+    try:
+        with pytest.raises(RuntimeError, match="ROS executor failed"):
+            await asyncio.wait_for(handler, timeout=0.5)
+        assert ros.safe_stop_reasons == 2
+    finally:
+        if not handler.done():
+            handler.cancel()
+            await asyncio.gather(handler, return_exceptions=True)
+        await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_safe_stop_invokes_physical_stop_even_when_action_cancel_hangs(
+    tmp_path: Path,
+) -> None:
+    class HangingCancelAdapter(FakeRosAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.execute_started = asyncio.Event()
+            self.cancel_started = asyncio.Event()
+            self.safe_stop_called = asyncio.Event()
+
+        async def execute(
+            self,
+            command_id: UUID,
+            command: CommandConfig,
+            params: dict[str, Any],
+        ) -> ExecutionResult:
+            del command_id, command, params
+            self.execute_started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        async def cancel(self, command_id: UUID) -> None:
+            self.cancelled.append(command_id)
+            self.cancel_started.set()
+            await asyncio.Event().wait()
+
+        async def safe_stop(self, config: SafeStopConfig) -> ExecutionResult:
+            result = await super().safe_stop(config)
+            self.safe_stop_called.set()
+            return result
+
+    ros = HangingCancelAdapter()
+    runtime = RobotAgentRuntime(runtime_config(tmp_path), ros_adapter=ros)
+    await runtime.initialize()
+    ros.safe_stop_called.clear()
+    connection = QueueConnection()
+    handler = asyncio.create_task(runtime.handle_connection(connection))
+    await next_message(connection)
+    session_id = uuid4()
+    await connection.incoming.put(
+        inbound(
+            "session.welcome",
+            session_id,
+            {
+                "accepted_version": "1.0",
+                "lease_interval_ms": 500,
+                "lease_timeout_ms": 2000,
+                "control_state": "SAFE_HOLD",
+            },
+        )
+    )
+    await next_message(connection)
+    await connection.incoming.put(
+        inbound("control.acquire", session_id, {"operator_id": "operator-7"})
+    )
+    await next_message(connection)
+    await connection.incoming.put(
+        inbound(
+            "command.request",
+            session_id,
+            {
+                "command_id": str(uuid4()),
+                "kind": "power.enable",
+                "issued_at": datetime.now(timezone.utc).isoformat(),
+                "ttl_ms": 5000,
+                "params": {"data": True},
+            },
+        )
+    )
+    await asyncio.wait_for(ros.execute_started.wait(), timeout=1)
+    await connection.incoming.put(
+        inbound("session.goodbye", session_id, {"reason": "test safe stop"})
+    )
+
+    try:
+        await asyncio.wait_for(ros.cancel_started.wait(), timeout=1)
+        assert ros.safe_stop_called.is_set() is True
+        with pytest.raises(RuntimeSafetyError, match="preempt"):
+            await asyncio.wait_for(handler, timeout=2)
+        replacement = uuid4()
+        await runtime._session.connected(replacement)
+        with pytest.raises(SessionStateError, match="safety fault is latched"):
+            await runtime._session.acquire(
+                replacement,
+                operator_id="operator-8",
+                at=datetime.now(timezone.utc),
+            )
+    finally:
+        if not handler.done():
+            handler.cancel()
+        await asyncio.gather(handler, return_exceptions=True)
+        await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_runtime_bounds_in_flight_command_tasks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ros = FakeRosAdapter()
+    runtime = RobotAgentRuntime(runtime_config(tmp_path), ros_adapter=ros)
+    await runtime.initialize()
+    connection = QueueConnection()
+    handler = asyncio.create_task(runtime.handle_connection(connection))
+    await next_message(connection)
+    session_id = uuid4()
+    await connection.incoming.put(
+        inbound(
+            "session.welcome",
+            session_id,
+            {
+                "accepted_version": "1.0",
+                "lease_interval_ms": 500,
+                "lease_timeout_ms": 2000,
+                "control_state": "SAFE_HOLD",
+            },
+        )
+    )
+    await next_message(connection)
+    await connection.incoming.put(
+        inbound("control.acquire", session_id, {"operator_id": "operator-7"})
+    )
+    await next_message(connection)
+    release = asyncio.Event()
+
+    async def hold_command(request: object) -> None:
+        del request
+        await release.wait()
+
+    monkeypatch.setattr(runtime, "_execute_and_report", hold_command)
+    for _ in range(runtime_module._MAX_IN_FLIGHT_COMMANDS + 1):
+        await connection.incoming.put(
+            inbound(
+                "command.request",
+                session_id,
+                {
+                    "command_id": str(uuid4()),
+                    "kind": "power.enable",
+                    "issued_at": datetime.now(timezone.utc).isoformat(),
+                    "ttl_ms": 5000,
+                    "params": {"data": True},
+                },
+            )
+        )
+
+    full = await next_message(connection)
+    assert full.type == "error"
+    assert full.payload.code == "COMMAND_QUEUE_FULL"
+    assert len(runtime._command_tasks) == runtime_module._MAX_IN_FLIGHT_COMMANDS
+
+    release.set()
+    await connection.incoming.put(
+        inbound("session.goodbye", session_id, {"reason": "test complete"})
+    )
+    await asyncio.wait_for(handler, timeout=2)
+    await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_back_to_back_request_and_cancel_never_dispatches_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ros = FakeRosAdapter()
+    runtime = RobotAgentRuntime(runtime_config(tmp_path), ros_adapter=ros)
+    await runtime.initialize()
+    connection = QueueConnection()
+    handler = asyncio.create_task(runtime.handle_connection(connection))
+    await next_message(connection)
+    session_id = uuid4()
+    await connection.incoming.put(
+        inbound(
+            "session.welcome",
+            session_id,
+            {
+                "accepted_version": "1.0",
+                "lease_interval_ms": 500,
+                "lease_timeout_ms": 2000,
+                "control_state": "SAFE_HOLD",
+            },
+        )
+    )
+    await next_message(connection)
+    await connection.incoming.put(
+        inbound("control.acquire", session_id, {"operator_id": "operator-7"})
+    )
+    await next_message(connection)
+    original_register = runtime._ledger.register
+
+    def slow_register(**kwargs: Any) -> Any:
+        time.sleep(0.2)
+        return original_register(**kwargs)
+
+    monkeypatch.setattr(runtime._ledger, "register", slow_register)
+    command_id = uuid4()
+    await connection.incoming.put(
+        inbound(
+            "command.request",
+            session_id,
+            {
+                "command_id": str(command_id),
+                "kind": "power.enable",
+                "issued_at": datetime.now(timezone.utc).isoformat(),
+                "ttl_ms": 5000,
+                "params": {"data": True},
+            },
+        )
+    )
+    await connection.incoming.put(
+        inbound(
+            "command.cancel",
+            session_id,
+            {"command_id": str(command_id), "reason": "operator changed intent"},
+        )
+    )
+
+    cancelled = await next_message(connection)
+    assert cancelled.type == "command.status"
+    assert cancelled.payload.command_id == command_id
+    assert cancelled.payload.state == "CANCELLED"
+    assert ros.executions == []
+
+    await connection.incoming.put(
+        inbound("session.goodbye", session_id, {"reason": "test complete"})
+    )
+    await asyncio.wait_for(handler, timeout=2)
+    await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_command_background_failure_terminates_active_connection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ros = FakeRosAdapter()
+    runtime = RobotAgentRuntime(runtime_config(tmp_path), ros_adapter=ros)
+    await runtime.initialize()
+    connection = QueueConnection()
+    handler = asyncio.create_task(runtime.handle_connection(connection))
+    await next_message(connection)
+    session_id = uuid4()
+    await connection.incoming.put(
+        inbound(
+            "session.welcome",
+            session_id,
+            {
+                "accepted_version": "1.0",
+                "lease_interval_ms": 500,
+                "lease_timeout_ms": 2000,
+                "control_state": "SAFE_HOLD",
+            },
+        )
+    )
+    await next_message(connection)
+    await connection.incoming.put(
+        inbound("control.acquire", session_id, {"operator_id": "operator-7"})
+    )
+    await next_message(connection)
+
+    async def fail_status(record: object) -> None:
+        del record
+        raise RuntimeError("outbound command status failed")
+
+    monkeypatch.setattr(runtime, "_enqueue_command_status", fail_status)
+    await connection.incoming.put(
+        inbound(
+            "command.request",
+            session_id,
+            {
+                "command_id": str(uuid4()),
+                "kind": "power.enable",
+                "issued_at": datetime.now(timezone.utc).isoformat(),
+                "ttl_ms": 5000,
+                "params": {"data": True},
+            },
+        )
+    )
+
+    try:
+        await asyncio.sleep(0.1)
+        assert handler.done() is True
+        with pytest.raises(RuntimeError, match="outbound command status failed"):
+            await handler
+        assert ros.safe_stop_reasons == 2
+    finally:
+        if not handler.done():
+            handler.cancel()
+            await asyncio.gather(handler, return_exceptions=True)
+        await runtime.shutdown()

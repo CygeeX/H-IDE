@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import socket
 import ssl
 import subprocess
@@ -160,6 +161,9 @@ def tls_config(
     ca: Path | None = None,
     server_name: str | None = None,
 ) -> TLSConfig:
+    client_der = ssl.PEM_cert_to_DER_cert(
+        certificates.client_cert.read_text(encoding="utf-8")
+    )
     return TLSConfig.model_validate(
         {
             "enabled": True,
@@ -167,6 +171,9 @@ def tls_config(
             "cert_file": str(certificates.server_cert if server else certificates.client_cert),
             "key_file": str(certificates.server_key if server else certificates.client_key),
             "server_name": server_name,
+            "peer_certificate_sha256": (
+                hashlib.sha256(client_der).hexdigest() if server else None
+            ),
             "allow_plaintext_loopback": False,
         }
     )
@@ -233,6 +240,41 @@ async def test_server_mode_requires_mtls_and_agent_speaks_first(
         await transport.close()
         await transport.close()
         assert transport.bound_port is None
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_server_mode_rejects_ca_trusted_but_unpinned_client_identity(
+    certificates: Certificates,
+) -> None:
+    port = unused_port()
+    handled = asyncio.Event()
+    server_tls = tls_config(certificates, server=True).model_copy(
+        update={"peer_certificate_sha256": "0" * 64}
+    )
+    transport = ServerTransport(
+        ServerTransportConfig(mode="server", host="127.0.0.1", port=port),
+        server_tls,
+    )
+    await transport.start(lambda connection: handled.wait())
+    client_context = build_client_ssl_context(
+        tls_config(certificates, server=False, server_name="localhost")
+    )
+    try:
+        async with connect(
+            f"wss://localhost:{port}",
+            ssl=client_context,
+            server_hostname="localhost",
+            subprotocols=[SUBPROTOCOL],
+            proxy=None,
+        ) as websocket:
+            with pytest.raises(ConnectionClosed) as closed:
+                await websocket.recv()
+            assert closed.value.rcvd is not None
+            assert closed.value.rcvd.code == 1008
+        assert handled.is_set() is False
+    finally:
+        await transport.close()
 
 
 @pytest.mark.integration

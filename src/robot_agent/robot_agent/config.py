@@ -75,13 +75,27 @@ class TLSConfig(StrictConfigModel):
     cert_file: str | None = None
     key_file: str | None = None
     server_name: str | None = Field(default=None, min_length=1, max_length=255)
+    peer_certificate_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9A-Fa-f]{64}$",
+    )
     allow_plaintext_loopback: bool = False
+
+    @field_validator("peer_certificate_sha256")
+    @classmethod
+    def normalize_peer_fingerprint(cls, value: str | None) -> str | None:
+        return None if value is None else value.lower()
 
     @model_validator(mode="after")
     def validate_material(self) -> TLSConfig:
         if not self.enabled:
-            if self.ca_file or self.cert_file or self.key_file:
-                raise ValueError("TLS files must not be set when TLS is disabled")
+            if (
+                self.ca_file
+                or self.cert_file
+                or self.key_file
+                or self.peer_certificate_sha256
+            ):
+                raise ValueError("TLS material must not be set when TLS is disabled")
             return self
         missing = [
             name
@@ -263,7 +277,16 @@ class AgentConfig(StrictConfigModel):
                 raise ValueError("TLS client transport requires a wss:// URI")
             if not self.tls.enabled:
                 self._validate_plaintext_host(parsed.hostname)
-        elif not self.tls.enabled:
+            if self.tls.peer_certificate_sha256 is not None:
+                raise ValueError(
+                    "peer_certificate_sha256 is only valid for server transport"
+                )
+        elif self.tls.enabled:
+            if self.tls.peer_certificate_sha256 is None:
+                raise ValueError(
+                    "TLS server transport requires peer_certificate_sha256"
+                )
+        else:
             self._validate_plaintext_host(self.transport.host)
         return self
 

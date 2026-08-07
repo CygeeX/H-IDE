@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import hmac
 import ssl
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -124,6 +126,10 @@ class ServerTransport:
     """Inbound transport that permits exactly one controlling peer."""
 
     def __init__(self, config: ServerTransportConfig, tls: TLSConfig) -> None:
+        if tls.enabled and tls.peer_certificate_sha256 is None:
+            raise TransportError(
+                "TLS server transport requires peer_certificate_sha256"
+            )
         self._config = config
         self._tls = tls
         self._server: Server | None = None
@@ -157,6 +163,9 @@ class ServerTransport:
         if websocket.subprotocol != SUBPROTOCOL:
             await websocket.close(code=1002, reason=f"required subprotocol {SUBPROTOCOL}")
             return
+        if self._tls.enabled and not self._peer_identity_authorized(websocket):
+            await websocket.close(code=1008, reason="client certificate identity not authorized")
+            return
         async with self._active_lock:
             if self._active:
                 await websocket.close(code=1013, reason="controlling session already connected")
@@ -170,6 +179,19 @@ class ServerTransport:
                 await connection.close()
             async with self._active_lock:
                 self._active = False
+
+    def _peer_identity_authorized(self, websocket: ServerConnection) -> bool:
+        expected = self._tls.peer_certificate_sha256
+        if expected is None:
+            return False
+        ssl_object = websocket.transport.get_extra_info("ssl_object")
+        if ssl_object is None:
+            return False
+        certificate = ssl_object.getpeercert(binary_form=True)
+        if not isinstance(certificate, bytes):
+            return False
+        actual = hashlib.sha256(certificate).hexdigest()
+        return hmac.compare_digest(actual, expected)
 
     async def run(self, handler: ConnectionHandler, stop: asyncio.Event) -> None:
         await self.start(handler)

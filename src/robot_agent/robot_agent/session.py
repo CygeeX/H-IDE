@@ -55,6 +55,7 @@ class SessionController:
         self._operator_id: str | None = None
         self._lease_sequence: int | None = None
         self._lease_deadline: datetime | None = None
+        self._safety_fault: str | None = None
         self._reason = "agent startup requires explicit control.acquire"
 
     async def connected(self, session_id: UUID) -> SessionSnapshot:
@@ -66,7 +67,11 @@ class SessionController:
             self._lease_sequence = None
             self._lease_deadline = None
             self._state = ControlState.SAFE_HOLD
-            self._reason = "new session requires explicit control.acquire"
+            self._reason = (
+                self._latched_fault_reason()
+                if self._safety_fault is not None
+                else "new session requires explicit control.acquire"
+            )
             return self.snapshot
 
     async def acquire(
@@ -81,6 +86,8 @@ class SessionController:
             raise SessionStateError("operator_id must not be empty")
         async with self._lock:
             self._require_session(session_id)
+            if self._safety_fault is not None:
+                raise SessionStateError(f"control blocked: {self._latched_fault_reason()}")
             if self._state is ControlState.ACTIVE:
                 return self.snapshot
             self._state = ControlState.ACTIVE
@@ -132,12 +139,14 @@ class SessionController:
     async def disconnected(self, reason: str) -> SessionSnapshot:
         async with self._lock:
             had_session = self._session_id is not None
-            if had_session:
-                await self._enter_safe_hold(reason)
-            self._session_id = None
-            self._operator_id = None
-            self._lease_sequence = None
-            self._lease_deadline = None
+            try:
+                if had_session:
+                    await self._enter_safe_hold(reason)
+            finally:
+                self._session_id = None
+                self._operator_id = None
+                self._lease_sequence = None
+                self._lease_deadline = None
             if not had_session:
                 self._reason = reason
             return self.snapshot
@@ -147,14 +156,38 @@ class SessionController:
             if self._state is ControlState.ACTIVE:
                 await self._enter_safe_hold(reason)
             else:
-                self._reason = reason
+                self._reason = (
+                    self._latched_fault_reason() if self._safety_fault is not None else reason
+                )
+            return self.snapshot
+
+    async def latch_safety_fault(self, reason: str) -> SessionSnapshot:
+        """Block all command dispatch immediately when execution state is uncertain."""
+        async with self._lock:
+            self._state = ControlState.SAFE_HOLD
+            self._lease_deadline = None
+            self._safety_fault = reason[:231]
+            self._reason = self._latched_fault_reason()
             return self.snapshot
 
     async def _enter_safe_hold(self, reason: str) -> None:
         self._state = ControlState.SAFE_HOLD
         self._lease_deadline = None
         self._reason = reason
-        await self._safe_stop(reason)
+        try:
+            await self._safe_stop(reason)
+        except asyncio.CancelledError:
+            self._safety_fault = "CancelledError: mandatory safe-stop operation was cancelled"
+            self._reason = self._latched_fault_reason()
+            raise
+        except Exception as exc:
+            self._safety_fault = f"{type(exc).__name__}: {exc}"[:231]
+            self._reason = self._latched_fault_reason()
+            raise
+
+    def _latched_fault_reason(self) -> str:
+        assert self._safety_fault is not None
+        return f"safety fault is latched: {self._safety_fault}"[:256]
 
     def assert_can_command(self, session_id: UUID) -> None:
         self._require_session(session_id)

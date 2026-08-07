@@ -1,4 +1,5 @@
-FROM ros:humble-ros-base-jammy
+ARG ROS_HUMBLE_BASE=ros:humble-ros-base-jammy@sha256:09da889006b4d4f120ada9b788394d566818f9e451f59a3a9246a1f9eecf849b
+FROM ${ROS_HUMBLE_BASE}
 
 SHELL ["/bin/bash", "-c"]
 
@@ -13,9 +14,10 @@ WORKDIR /workspace
 COPY . /workspace
 
 RUN python3 -m pip install --no-cache-dir \
+      --constraint /workspace/docker/constraints-humble.txt \
       -e /workspace/src/robot_agent \
-      "pytest>=8.4,<9" \
-      "pytest-asyncio>=1.2,<2" \
-      "pytest-cov>=7,<8"
+      pytest==8.4.2 \
+      pytest-asyncio==1.4.0 \
+      pytest-cov==7.1.0
 
 CMD ["bash", "-lc", "source /opt/ros/humble/setup.bash && python3 -m pytest -q"]

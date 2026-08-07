@@ -414,6 +414,19 @@
           "default": null,
           "title": "Key File"
         },
+        "peer_certificate_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9A-Fa-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Peer Certificate Sha256"
+        },
         "server_name": {
           "anyOf": [
             {
