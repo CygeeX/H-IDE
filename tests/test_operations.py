@@ -6,6 +6,7 @@ import logging
 import os
 import socket
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pytest
@@ -108,6 +109,22 @@ def test_checked_in_schemas_are_current_and_production_template_is_structural() 
         )
     )
     Draft202012Validator(rendered_config_schema).validate(production)
+
+
+def test_systemd_service_starts_inside_the_humble_environment() -> None:
+    unit = (WORKSPACE / "deploy/systemd/robot-agent.service").read_text(encoding="utf-8")
+    entrypoint = (WORKSPACE / "deploy/robot-agent-entrypoint").read_text(encoding="utf-8")
+
+    assert "ExecStart=/usr/bin/env /opt/robot-agent/bin/robot-agent-entrypoint run" in unit
+    assert "source /opt/ros/humble/setup.bash" in entrypoint
+    assert 'exec /opt/robot-agent/venv/bin/robot-agent "$@"' in entrypoint
+
+
+def test_package_declares_interfaces_used_by_shipped_configs_as_runtime_dependencies() -> None:
+    package = ET.parse(WORKSPACE / "src/robot_agent/package.xml").getroot()
+    runtime_dependencies = {element.text for element in package.findall("exec_depend")}
+
+    assert {"example_interfaces", "std_msgs", "std_srvs"} <= runtime_dependencies
 
 
 def test_cli_invalid_config_and_doctor_failure_paths(

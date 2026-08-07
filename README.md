@@ -31,8 +31,15 @@ WebSocket client/server（运行时二选一）
 source /opt/ros/jazzy/setup.bash
 uv venv --python /usr/bin/python3.12 --system-site-packages .venv
 uv sync --python .venv/bin/python --all-groups
-colcon build --symlink-install
+.venv/bin/python /usr/bin/colcon build --symlink-install
 source install/setup.bash
+```
+
+若开发机预设了仅指向远端机器人的 `CYCLONEDDS_URI`，本地三个进程会互相发现不到。联调终端应先执行：
+
+```bash
+unset CYCLONEDDS_URI
+export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
 ```
 
 依次打开三个终端：
@@ -53,7 +60,8 @@ Mock BFF 可发送一次命令：
 
 ```bash
 PYTHONPATH=src/robot_agent:${PYTHONPATH} .venv/bin/python tools/mock_bff.py \
-  --mode server --command-kind power.enable --params '{"data":true}'
+  --mode server --command-kind power.enable --params '{"data":true}' \
+  --exit-on-command-terminal
 ```
 
 配置检查与只读诊断：
@@ -71,9 +79,9 @@ PYTHONPATH=src/robot_agent:${PYTHONPATH} .venv/bin/python -m robot_agent.cli doc
 .venv/bin/python -m pytest
 .venv/bin/ruff check .
 .venv/bin/mypy src/robot_agent/robot_agent
-colcon build --symlink-install
-colcon test --event-handlers console_direct+
-colcon test-result --verbose
+.venv/bin/python /usr/bin/colcon build --symlink-install
+.venv/bin/python /usr/bin/colcon test --event-handlers console_direct+
+.venv/bin/python /usr/bin/colcon test-result --verbose
 ```
 
 Humble 容器验证入口为 `tools/test_humble.sh`。30 分钟 soak 用例带有 `soak` marker，详见[验证说明](docs/verification.md)。

@@ -54,5 +54,5 @@ async def watchdog_loop(stop: asyncio.Event) -> None:
         notify("WATCHDOG=1")
         try:
             await asyncio.wait_for(stop.wait(), timeout=interval)
-        except TimeoutError:
+        except asyncio.TimeoutError:
             continue

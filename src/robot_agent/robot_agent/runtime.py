@@ -156,7 +156,11 @@ class RobotAgentRuntime:
         if self._closed:
             raise RuntimeErrorBase("runtime is closed")
         self._event_loop = asyncio.get_running_loop()
-        self._ledger.abort_incomplete_after_restart(at=_now())
+        initialized_at = _now()
+        self._ledger.abort_incomplete_after_restart(at=initialized_at)
+        self._ledger.prune_terminal_before(
+            before=initialized_at - timedelta(days=self.config.storage.retention_days)
+        )
         self._ros.set_callbacks(
             state_callback=self._on_ros_state,
             feedback_callback=self._on_ros_feedback,
@@ -173,8 +177,8 @@ class RobotAgentRuntime:
         self.ready.set()
 
     async def run(self, stop: asyncio.Event) -> None:
-        await self.initialize()
         try:
+            await self.initialize()
             transport_config = self.config.transport
             if isinstance(transport_config, ClientTransportConfig):
                 transport = ClientTransport(transport_config, self.config.tls)
@@ -209,7 +213,7 @@ class RobotAgentRuntime:
         try:
             raw_welcome = await asyncio.wait_for(connection.recv_text(), timeout=5.0)
             welcome = self._parse(raw_welcome)
-        except (TimeoutError, FrameValidationError) as exc:
+        except (asyncio.TimeoutError, FrameValidationError) as exc:
             await connection.close(code=1002, reason="invalid application handshake")
             raise RuntimeErrorBase(f"application handshake failed: {exc}") from exc
         if not isinstance(welcome, SessionWelcome):

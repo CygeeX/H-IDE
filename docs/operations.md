@@ -5,6 +5,7 @@
 建议在真机计算单元使用：
 
 - 程序与虚拟环境：`/opt/robot-agent`
+- ROS 环境入口：`/opt/robot-agent/bin/robot-agent-entrypoint`
 - 严格配置：`/etc/robot-agent/agent.yaml`
 - CA、Agent 证书和私钥：`/etc/robot-agent/tls/`
 - SQLite 台账：`/var/lib/robot-agent/ledger.sqlite3`
@@ -24,10 +25,11 @@
 
 ## systemd
 
-Unit 位于 `deploy/systemd/robot-agent.service`，使用 `Type=notify`、`WatchdogSec=5`、自动重启和只读系统保护。安装前按目标机修改 `User`、`ExecStart` 与设备访问策略，然后：
+Unit 位于 `deploy/systemd/robot-agent.service`，使用 `Type=notify`、`WatchdogSec=5`、自动重启和只读系统保护。入口脚本会显式加载 `/opt/ros/humble/setup.bash`，避免 systemd 非交互环境缺少 ROS 变量与动态库路径。安装前按目标机修改 `User` 与设备访问策略，然后：
 
 ```bash
 sudo systemd-analyze verify deploy/systemd/robot-agent.service
+sudo install -D -m 0755 deploy/robot-agent-entrypoint /opt/robot-agent/bin/robot-agent-entrypoint
 sudo install -m 0644 deploy/systemd/robot-agent.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now robot-agent
@@ -35,6 +37,8 @@ journalctl -u robot-agent -f -o cat
 ```
 
 日志是一行一个 JSON 对象，可按 `robot_id`、`session_id`、`command_id` 和 `event_code` 索引。`doctor` 是只读命令，不会创建台账或调用 ROS 接口。
+
+`storage.retention_days` 是命令幂等窗口：Agent 启动时先把遗留非终态命令标记为 `ABORTED_AGENT_RESTART`，再删除超过该窗口的终态命令及其转移历史；非终态记录永不被保留期清理。
 
 ## 故障处置
 

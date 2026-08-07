@@ -16,6 +16,7 @@ from uuid import UUID, uuid4
 from robot_agent.protocol import (
     CommandRequest,
     CommandRequestPayload,
+    CommandStatus,
     ControlAcquire,
     ControlAcquirePayload,
     LeaseRenew,
@@ -29,6 +30,17 @@ from robot_agent.protocol import (
 from robot_agent.transport import SUBPROTOCOL
 from websockets.asyncio.client import connect
 from websockets.asyncio.server import ServerConnection, serve
+
+TERMINAL_COMMAND_STATES = frozenset(
+    {
+        "SUCCEEDED",
+        "FAILED",
+        "CANCELLED",
+        "REJECTED",
+        "TIMED_OUT",
+        "ABORTED_AGENT_RESTART",
+    }
+)
 
 
 def now() -> datetime:
@@ -45,7 +57,15 @@ def envelope_fields(robot_id: str, session_id: UUID) -> dict[str, Any]:
     }
 
 
-async def run_session(websocket: Any, args: argparse.Namespace) -> None:
+def command_reached_terminal_state(message: Any, command_id: UUID) -> bool:
+    return (
+        isinstance(message, CommandStatus)
+        and message.payload.command_id == command_id
+        and message.payload.state in TERMINAL_COMMAND_STATES
+    )
+
+
+async def run_session(websocket: Any, args: argparse.Namespace) -> bool:
     hello = parse_wire_message(await websocket.recv(), expected_robot_id=args.robot_id)
     if not isinstance(hello, SessionHello):
         raise RuntimeError("Agent must initiate with session.hello")
@@ -68,13 +88,15 @@ async def run_session(websocket: Any, args: argparse.Namespace) -> None:
     )
     await websocket.send(serialize_wire_message(acquire))
 
+    command_id: UUID | None = None
     if args.command_kind:
         params = json.loads(args.params)
+        command_id = uuid4()
         command = CommandRequest(
             **envelope_fields(args.robot_id, session_id),
             type="command.request",
             payload=CommandRequestPayload(
-                command_id=uuid4(),
+                command_id=command_id,
                 kind=args.command_kind,
                 issued_at=now(),
                 ttl_ms=args.command_ttl_ms,
@@ -100,9 +122,16 @@ async def run_session(websocket: Any, args: argparse.Namespace) -> None:
         async for raw in websocket:
             parsed = parse_wire_message(raw, expected_robot_id=args.robot_id)
             print(serialize_wire_message(parsed), flush=True)
+            if (
+                args.exit_on_command_terminal
+                and command_id is not None
+                and command_reached_terminal_state(parsed, command_id)
+            ):
+                return True
     finally:
         renewer.cancel()
         await asyncio.gather(renewer, return_exceptions=True)
+    return False
 
 
 def client_context(args: argparse.Namespace) -> ssl.SSLContext | None:
@@ -135,8 +164,11 @@ async def run(args: argparse.Namespace) -> None:
             await run_session(websocket, args)
         return
 
+    terminal_received = asyncio.Event()
+
     async def handler(websocket: ServerConnection) -> None:
-        await run_session(websocket, args)
+        if await run_session(websocket, args):
+            terminal_received.set()
 
     async with serve(
         handler,
@@ -146,7 +178,10 @@ async def run(args: argparse.Namespace) -> None:
         subprotocols=[SUBPROTOCOL],
         compression=None,
     ):
-        await asyncio.Future()
+        if args.exit_on_command_terminal:
+            await terminal_received.wait()
+        else:
+            await asyncio.Future()
 
 
 def parser() -> argparse.ArgumentParser:
@@ -162,6 +197,11 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--command-kind")
     result.add_argument("--command-ttl-ms", type=int, default=5000)
     result.add_argument("--params", default="{}")
+    result.add_argument(
+        "--exit-on-command-terminal",
+        action="store_true",
+        help="exit after the configured command reaches a terminal status",
+    )
     result.add_argument("--ca-file", type=Path)
     result.add_argument("--cert-file", type=Path)
     result.add_argument("--key-file", type=Path)

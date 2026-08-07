@@ -128,7 +128,7 @@ class CommandCoordinator:
                 result=result.result,
                 at=at,
             )
-        except TimeoutError:
+        except asyncio.TimeoutError:
             await self._executor.cancel(payload.command_id)
             return self._ledger.transition(
                 payload.command_id,

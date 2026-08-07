@@ -9,6 +9,7 @@ import pytest
 from robot_agent.ledger import (
     CommandIdConflict,
     CommandLedger,
+    CommandNotFound,
     CommandState,
     InvalidTransition,
 )
@@ -136,3 +137,38 @@ def test_ledger_enforces_transition_graph_and_durable_pragmas(tmp_path: Path) ->
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     finally:
         connection.close()
+
+
+def test_ledger_prunes_only_terminal_commands_older_than_retention_window(
+    tmp_path: Path,
+) -> None:
+    old_terminal = uuid4()
+    old_incomplete = uuid4()
+    recent_terminal = uuid4()
+    with CommandLedger(tmp_path / "commands.sqlite3") as ledger:
+        for command_id, created_at in (
+            (old_terminal, NOW - timedelta(days=40)),
+            (old_incomplete, NOW - timedelta(days=40)),
+            (recent_terminal, NOW - timedelta(days=2)),
+        ):
+            ledger.register(
+                command_id=command_id,
+                kind="task.execute",
+                payload={"kind": "task.execute", "params": {"order": 5}},
+                session_id=uuid4(),
+                at=created_at,
+            )
+        for command_id, completed_at in (
+            (old_terminal, NOW - timedelta(days=39)),
+            (recent_terminal, NOW - timedelta(days=1)),
+        ):
+            ledger.transition(command_id, CommandState.RUNNING, detail="running", at=completed_at)
+            ledger.transition(command_id, CommandState.SUCCEEDED, detail="done", at=completed_at)
+
+        deleted = ledger.prune_terminal_before(before=NOW - timedelta(days=30))
+
+        assert deleted == 1
+        with pytest.raises(CommandNotFound):
+            ledger.get(old_terminal)
+        assert ledger.get(old_incomplete).state is CommandState.RECEIVED
+        assert ledger.get(recent_terminal).state is CommandState.SUCCEEDED

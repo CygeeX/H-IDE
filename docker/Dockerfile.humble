@@ -18,4 +18,4 @@ RUN python3 -m pip install --no-cache-dir \
       "pytest-asyncio>=1.2,<2" \
       "pytest-cov>=7,<8"
 
-CMD ["bash", "-lc", "source /opt/ros/humble/setup.bash && pytest -q"]
+CMD ["bash", "-lc", "source /opt/ros/humble/setup.bash && python3 -m pytest -q"]

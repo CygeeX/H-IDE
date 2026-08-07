@@ -340,6 +340,28 @@ class CommandLedger:
                 recovered.append(self.get(current.command_id))
         return recovered
 
+    def prune_terminal_before(self, *, before: datetime) -> int:
+        """Delete terminal commands older than the configured idempotency window."""
+        timestamp = _aware_iso(before)
+        terminal_values = tuple(state.value for state in TERMINAL_STATES)
+        placeholders = ", ".join("?" for _ in terminal_values)
+        params = (*terminal_values, timestamp)
+        old_terminal_commands = (
+            "SELECT command_id FROM commands "
+            f"WHERE state IN ({placeholders}) "
+            "AND julianday(updated_at) < julianday(?)"
+        )
+        with self._lock, self._connection:
+            self._connection.execute(
+                f"DELETE FROM command_transitions WHERE command_id IN ({old_terminal_commands})",
+                params,
+            )
+            cursor = self._connection.execute(
+                f"DELETE FROM commands WHERE command_id IN ({old_terminal_commands})",
+                params,
+            )
+        return cursor.rowcount
+
     def _insert_transition(
         self,
         *,

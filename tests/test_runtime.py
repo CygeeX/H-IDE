@@ -450,3 +450,14 @@ async def test_runtime_fails_closed_when_mandatory_safe_stop_fails(
     await runtime.shutdown()
     with pytest.raises(RuntimeError, match="closed"):
         await runtime.initialize()
+
+
+@pytest.mark.asyncio
+async def test_runtime_run_cleans_ros_after_initialization_failure(tmp_path: Path) -> None:
+    ros = FakeRosAdapter()
+    ros.safe_stop_exception = RuntimeError("safe stop unavailable")
+    runtime = RobotAgentRuntime(runtime_config(tmp_path), ros_adapter=ros)
+
+    with pytest.raises(RuntimeSafetyError):
+        await runtime.run(asyncio.Event())
+    assert ros.closed is True

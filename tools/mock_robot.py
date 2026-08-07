@@ -121,7 +121,7 @@ def main() -> int:
     finally:
         executor.shutdown()
         robot.close()
-        rclpy.shutdown()
+        rclpy.try_shutdown()
     return 0
 
 

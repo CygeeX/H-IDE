@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -66,6 +67,19 @@ async def test_state_and_queue_remain_bounded_for_30_minutes() -> None:
         next_tick += 0.01
         await asyncio.sleep(max(0.0, next_tick - loop.time()))
         max_lag = max(max_lag, loop.time() - next_tick)
+
+    elapsed = loop.time() - started
+    report = {
+        "duration_seconds": round(elapsed, 3),
+        "iterations": iterations,
+        "start_rss_bytes": start_rss,
+        "max_rss_bytes": max_rss,
+        "rss_growth_bytes": max_rss - start_rss,
+        "max_queue_depth": max_queue,
+        "dropped_count": queue.dropped_count,
+        "max_event_loop_lag_seconds": round(max_lag, 6),
+    }
+    print(f"SOAK_RESULT={json.dumps(report, sort_keys=True)}", flush=True)
 
     assert iterations >= int(duration * 50)
     assert max_queue <= 64

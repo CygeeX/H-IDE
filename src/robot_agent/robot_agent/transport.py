@@ -261,6 +261,6 @@ class ClientTransport:
                     await connection.close()
             if stop.is_set():
                 break
-            with contextlib.suppress(TimeoutError):
+            with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(stop.wait(), timeout=backoff)
             backoff = min(maximum, backoff * 2.0)
