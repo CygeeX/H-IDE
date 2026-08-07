@@ -8,8 +8,9 @@
 
 - [x] 架构资料与 rosbridge 参考实现调研
 - [x] 用户确认总体设计、协议边界与验收标准
-- [ ] 仓库与测试基础设施
-- [ ] 协议、配置与状态模型
+- [x] 仓库与测试基础设施
+- [x] 协议与严格配置模型
+- [ ] 状态归一化与输出模型
 - [ ] 命令台账、资源仲裁与租约状态机
 - [ ] client/server WebSocket 与 mTLS
 - [ ] ROS 2 Service/Action/Topic 适配与安全心跳
@@ -31,4 +32,6 @@
 | 错误 | 次数 | 处理 |
 |---|---:|---|
 | 初始工作区不是 Git 仓库，无法创建 worktree | 1 | 在当前空工作区初始化 `feature/robot-agent-v1` 分支 |
-
+| 系统 Python 缺少 Pydantic/websockets/Ruff/mypy | 1 | 建立项目虚拟环境并锁定依赖，同时继承系统 rclpy |
+| `uv venv` 首次自动选择 Python 3.11，无法继承 Jazzy 的 Python 3.12 rclpy | 1 | 用 `/usr/bin/python3.12 --system-site-packages --clear` 重建，并验证 rclpy/Pydantic/websockets 同时可导入 |
+| 静态检查发现 `datetime.UTC` 不兼容 Humble 的 Python 3.10 | 1 | 全部改用 `timezone.utc`，并把 mypy 的 Python 版本固定为 3.10 |

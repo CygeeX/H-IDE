@@ -1,0 +1,58 @@
+[project]
+name = "robot-agent-workspace"
+version = "0.1.0"
+description = "Development and verification workspace for the robot-side protocol agent"
+requires-python = ">=3.10"
+dependencies = [
+  "jsonschema>=4.25,<5",
+  "pydantic>=2.13,<3",
+  "PyYAML>=6.0,<7",
+  "websockets>=16.1,<17",
+]
+
+[dependency-groups]
+dev = [
+  "mypy>=1.17,<2",
+  "pytest>=8.4,<9",
+  "pytest-asyncio>=1.2,<2",
+  "pytest-cov>=7,<8",
+  "ruff>=0.12,<1",
+  "types-jsonschema>=4.25,<5",
+  "types-PyYAML>=6.0,<7",
+]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers"
+asyncio_mode = "auto"
+pythonpath = ["src/robot_agent"]
+testpaths = ["tests", "src/robot_agent/test"]
+markers = [
+  "integration: tests that exercise sockets or ROS graph integration",
+  "soak: long-running bounded-resource verification",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["robot_agent"]
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC", "RUF"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_unreachable = true
+packages = ["robot_agent"]
+mypy_path = "src/robot_agent"
+
+[[tool.mypy.overrides]]
+module = ["rclpy.*", "rosidl_runtime_py.*", "std_msgs.*", "std_srvs.*"]
+ignore_missing_imports = true

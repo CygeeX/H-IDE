@@ -12,14 +12,14 @@
 
 ### Task 1: Package and test foundation
 
-- [ ] Create the ament_python package, dependency locks, schemas/config directories, launch skeleton, and pytest configuration.
-- [ ] Verify pure pytest collection and colcon package discovery.
+- [x] Create the ament_python package, dependency locks, schemas/config directories, launch skeleton, and pytest configuration.
+- [x] Verify pure pytest collection and colcon package discovery.
 
 ### Task 2: Protocol and configuration
 
-- [ ] Write failing tests for strict envelope parsing, all message families, time/target/frame validation, TLS configuration, and local command registry validation.
-- [ ] Implement the minimal Pydantic models and configuration loader; export JSON Schemas.
-- [ ] Run focused tests and static checks.
+- [x] Write failing tests for strict envelope parsing, all message families, time/target/frame validation, TLS configuration, and local command registry validation.
+- [x] Implement the minimal Pydantic models and configuration loader; export JSON Schemas.
+- [x] Run focused tests and static checks.
 
 ### Task 3: Persistence, arbitration, and session safety
 
@@ -50,4 +50,3 @@
 - [ ] Build the pinned Humble test image and run the same suite.
 - [ ] Run fault tests and a 30-minute soak; record timing, memory, queue, and replay results.
 - [ ] Re-read the design and close every requirement before completion.
-
