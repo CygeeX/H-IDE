@@ -4,6 +4,22 @@ Robot Agent 是部署在机器人计算单元上的受限协议代理。它只�
 
 当前实现完成的是 Agent 内核和本地验证环境，不包含真实 SONIC/Unitree 适配，也不会自动复制到真机。
 
+## 可视化体验
+
+一条命令启动测试网页、隔离 ROS Domain 中的 Mock Robot，以及真实 Robot Agent：
+
+```bash
+source /opt/ros/jazzy/setup.bash
+PYTHONPATH=src/robot_agent:${PYTHONPATH} .venv/bin/python \
+  tools/web_demo_server.py --launch-stack --open-browser
+```
+
+也可手动打开 <http://127.0.0.1:8765/>。页面可以获取控制权、调用
+`power.enable`、执行/取消 `task.execute`，并暂停续租验证 Agent 在本地进入
+`SAFE_HOLD`。如果暂时不启动 ROS/Agent，直接运行不带 `--launch-stack` 的命令，
+再点击页面右上角“进入浏览器演示”即可查看交互效果。详细说明见
+[可视化测试台](docs/web-demo.md)。
+
 ## 安全边界
 
 ```text
@@ -94,6 +110,7 @@ WebSocket/ROS 2/SQLite 链路并带有 `soak` marker，详见[验证说明](docs
 - 生产 mTLS 模板：[robot_agent.production.example.yaml](src/robot_agent/config/robot_agent.production.example.yaml)
 - 协议说明：[protocol-v1.md](docs/protocol-v1.md)
 - 运维与部署：[operations.md](docs/operations.md)
+- 可视化测试台：[web-demo.md](docs/web-demo.md)
 - 生成的 JSON Schema：[schemas](src/robot_agent/schemas)
 
 配置中的 `commands` 是唯一 ROS 出口。修改注册表后，能力摘要会变化，BFF 可据此识别部署能力。生产上线前必须把模板里的 ROS 名称、类型、参数 Schema、资源集合和 safe-stop 端点替换为真机经过评审的接口。

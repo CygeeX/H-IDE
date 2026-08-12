@@ -64,3 +64,16 @@ ROS 2 Service/Topic/心跳/safe-stop、SQLite 台账与运行期 retention。第
 幂等专项重复提交同一 `command_id` 和相同规范载荷时返回既有记录，没有再次执行；
 同 ID 不同载荷被 `CommandIdConflict` 拒绝。重启恢复测试把所有遗留非终态记录置为
 `ABORTED_AGENT_RESTART`，不会自动重放。
+
+## 2026-08-12 可视化测试台增量验证
+
+- Jazzy/Python 3.12：127 passed、1 soak deselected，分支覆盖率 90.09%。
+- Humble/Python 3.10 固定镜像：127 passed、1 soak skipped。
+- 可视化服务专项：5 passed；覆盖 HTTP 安全头、Agent 握手、控制/续租/命令桥接、
+  Agent 离线拒绝，以及同源允许/异源拒绝。
+- JavaScript 语法、全仓 Ruff、产品包和可视化服务 strict mypy、`git diff --check`
+  全部通过。
+- 使用隔离 `ROS_DOMAIN_ID=232` 完成真实链路：`SAFE_HOLD → ACTIVE`，
+  `power.enable → SUCCEEDED → robot.mode=IDLE`；Action 进入 `RUNNING` 后取消为
+  `CANCELLED`；暂停续租后回到 `SAFE_HOLD`，再次显式获取控制才恢复 `ACTIVE`。
+- 一键启动栈退出时 Robot Agent 与 Mock Robot 均正常结束，无 ROS entity 销毁 traceback。
