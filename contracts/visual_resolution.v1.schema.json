@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://h-ide.local/contracts/visual-resolution.v1.schema.json",
+  "title": "VisualResolution",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "visualResolutionId",
+    "missionId",
+    "stageId",
+    "attempt",
+    "traceId",
+    "status",
+    "executable",
+    "source",
+    "versions",
+    "safetyGates",
+    "createdAt"
+  ],
+  "properties": {
+    "visualResolutionId": {"type": "string", "minLength": 1},
+    "missionId": {"type": "string", "minLength": 1},
+    "stageId": {"type": "string", "minLength": 1},
+    "attempt": {"type": "integer", "minimum": 1},
+    "traceId": {"type": "string", "minLength": 1},
+    "status": {"enum": ["queued", "resolving", "succeeded", "needs_input", "rejected", "cancelled", "failed"]},
+    "executable": {"type": "boolean"},
+    "source": {"type": "object"},
+    "versions": {"type": "object"},
+    "landmarkPose": {"type": ["object", "null"]},
+    "goalPose": {"type": ["object", "null"]},
+    "goalPurpose": {"enum": ["observe", "approach", "final"]},
+    "safetyGates": {"type": "array"},
+    "ambiguityCandidates": {"type": "array"},
+    "warnings": {"type": "array", "items": {"type": "string"}},
+    "rejectionReason": {"type": ["string", "null"]},
+    "evidence": {"type": "array"},
+    "createdAt": {"type": "string", "format": "date-time"}
+  }
+}
+
