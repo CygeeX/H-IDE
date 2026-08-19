@@ -981,20 +981,36 @@ class RobotAgentRuntime:
             if session_snapshot.lease_deadline is None
             else (session_snapshot.lease_deadline - observed_at).total_seconds() * 1_000.0
         )
-        control_ready = (
-            transport_ready
-            and session_snapshot.state.value == "ACTIVE"
+        control_active = session_snapshot.state.value == "ACTIVE"
+        lease_valid = (
+            control_active
             and lease_remaining_ms is not None
             and lease_remaining_ms > 0
         )
-        if session_snapshot.state.value != "ACTIVE":
-            control_reason = "control_not_active"
-        elif lease_remaining_ms is None or lease_remaining_ms <= 0:
-            control_reason = "control_lease_expired"
-        elif not transport_ready:
+        active_command_count = len(self._coordinator.active_commands)
+        standby_ready = (
+            transport_ready
+            and not control_active
+            and session_snapshot.can_acquire
+            and active_command_count == 0
+        )
+        active_control_ready = transport_ready and lease_valid
+        control_ready = standby_ready or active_control_ready
+        if not transport_ready:
             control_reason = "transport_session_unavailable"
+        elif active_command_count and not lease_valid:
+            control_reason = "active_commands_without_valid_lease"
+        elif control_active and not lease_valid:
+            control_reason = "control_lease_expired"
+        elif standby_ready:
+            control_reason = "standby_waiting_for_control_acquire"
+        elif not session_snapshot.can_acquire:
+            control_reason = "control_acquire_blocked"
         else:
             control_reason = None
+        control_mode = (
+            "ACTIVE" if active_control_ready else "STANDBY" if standby_ready else "BLOCKED"
+        )
         if ros_ready:
             try:
                 self._ros.check_health()
@@ -1097,6 +1113,11 @@ class RobotAgentRuntime:
                 "required": True,
                 "ready": control_ready,
                 "state": session_snapshot.state.value,
+                "mode": control_mode,
+                "active": control_active,
+                "canAcquire": transport_ready and session_snapshot.can_acquire,
+                "leaseValid": lease_valid,
+                "activeCommandCount": active_command_count,
                 "reason": control_reason,
                 "leaseRemainingMs": _rounded_age(lease_remaining_ms),
             },
@@ -1130,12 +1151,33 @@ class RobotAgentRuntime:
             },
         }
         ready = all(bool(check["ready"]) for check in checks.values() if bool(check["required"]))
+        command_readiness_reason = (
+            None
+            if ready
+            else control_reason
+            if not control_ready
+            else "required_dependency_unavailable"
+        )
         return {
             "schemaVersion": "robot-agent.diagnostics/1",
             "robotId": self.config.robot_id,
             "robotBootId": str(self._boot_id),
             "observedAt": observed_at.isoformat(),
             "ready": ready,
+            "commandReadiness": {
+                "ready": ready,
+                "mode": control_mode if ready else "BLOCKED",
+                "reason": command_readiness_reason,
+            },
+            "controlState": {
+                "state": session_snapshot.state.value,
+                "active": control_active,
+                "standby": standby_ready,
+                "canAcquire": transport_ready and session_snapshot.can_acquire,
+                "leaseValid": lease_valid,
+                "leaseRemainingMs": _rounded_age(lease_remaining_ms),
+                "activeCommandCount": active_command_count,
+            },
             "checks": checks,
         }
 

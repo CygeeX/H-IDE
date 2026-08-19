@@ -31,6 +31,7 @@ class SessionSnapshot:
     lease_sequence: int | None
     lease_deadline: datetime | None
     reason: str
+    can_acquire: bool
 
 
 SafeStopCallback = Callable[[str], Awaitable[None]]
@@ -216,6 +217,7 @@ class SessionController:
             ),
             lease_deadline=self._lease_deadline,
             reason=self._reason,
+            can_acquire=self._session_id is not None and self._safety_fault is None,
         )
 
     @property

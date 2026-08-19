@@ -81,11 +81,21 @@ loopback IP，不能配置为 `0.0.0.0`、LAN 地址或主机名。该端口没�
 - `/v1/capabilities`：返回经过删减的能力、执行器和传感器元数据，不返回配置文件、TLS
   路径/密钥、命令参数 Schema、原始状态或图像。
 
-`/readyz` 不把“进程启动成功”误报为可控制。它要求 runtime 完成初始化、工作站 transport
-握手存在、控制状态为 `ACTIVE`、ROS executor 可接受请求、所有配置的 Nav2 Action server
-可发现、每个配置的 `localization.*` 字段都在 `localization_max_age_ms` 内更新，以及所有
-`requires_observation` 能力具有不超过 `admission_max_age_ms` 的 `USABLE` accepted ACK。
-因此启动后尚未取得控制权或视觉尚未出首帧时返回 503 是预期行为。
+`/readyz` 不把“进程启动成功”误报为可接单，但也不要求无任务时预先持有控制租约。它要求
+runtime 完成初始化、工作站 transport 握手存在、ROS executor 可接受请求、所有配置的
+Nav2 Action server 可发现、每个配置的 `localization.*` 字段都在
+`localization_max_age_ms` 内更新，以及所有 `requires_observation` 能力具有不超过
+`admission_max_age_ms` 的 `USABLE` accepted ACK。控制状态满足以下任一条件即可：
+
+- `ACTIVE` 且租约尚未过期；
+- 无活动命令、没有锁存安全故障、当前 transport 会话可执行 `control.acquire` 的
+  `SAFE_HOLD` 安全待机。
+
+第二种状态下根字段 `commandReadiness.mode` 为 `STANDBY`，`controlState.active` 为
+`false`，首条命令仍必须先走既有 `control.acquire` 和续租协议。若本地仍有活动命令而租约
+无效、租约已过期、transport 断开，或任一 ROS/Nav2/定位/观测必需检查失败，`/readyz`
+仍返回 503。`commandReadiness` 是聚合接单结果；`controlState` 额外给出当前状态、是否待机、
+是否可获取控制、租约有效性和活动命令数量。既有 `ready` 与 `checks` 字段保持兼容。
 
 本地配置显式使用 `127.0.0.1:8795`，MuJoCo 配置使用 `127.0.0.1:8796`，避免两套 Agent
 同时开发时冲突。生产若部署同机 H-IDE 代理，可在评审后设置：

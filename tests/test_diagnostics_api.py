@@ -415,6 +415,48 @@ def diagnostic_runtime_config(tmp_path: Path) -> AgentConfig:
     )
 
 
+def publish_ready_local_dependencies(
+    runtime: RobotAgentRuntime,
+    ros: DiagnosticRosAdapter,
+    *,
+    include_observation: bool = True,
+) -> None:
+    assert ros.state_callback is not None
+    now = datetime.now(timezone.utc)
+    ros.state_callback("localization.position.x", 0.0, now)
+    ros.state_callback("localization.position.y", 0.0, now)
+    if not include_observation:
+        return
+    assert ros.observation_health_callback is not None
+    ros.observation_health_callback(
+        ObservationHealthSample(
+            robot_id="g1-diagnostic",
+            robot_boot_id=str(runtime._boot_id),
+            gateway_instance_id="gateway-test",
+            observation_session_id="observation-test",
+            sensor_id="head_rgbd",
+            scene_version="office-v2",
+            localization_epoch_id="epoch-test",
+            status=ObservationHealthStatus.USABLE,
+            reason=0,
+            has_last_accepted_sequence=True,
+            last_accepted_sequence=1,
+            last_accepted_monotonic_ns=1,
+            capture_age_ms=10.0,
+            ack_age_ms=10.0,
+            drop_count=0,
+            heartbeat_sequence=1,
+        )
+    )
+
+
+async def connect_transport(runtime: RobotAgentRuntime) -> UUID:
+    session_id = uuid4()
+    await runtime._session.connected(session_id)
+    runtime._connection_session_id = session_id
+    return session_id
+
+
 @pytest.mark.asyncio
 async def test_ros_nav2_readiness_probe_never_dispatches_a_goal(
     tmp_path: Path,
@@ -529,6 +571,112 @@ async def test_runtime_diagnostics_fail_closed_on_probe_and_executor_errors(
 
 
 @pytest.mark.asyncio
+async def test_idle_safe_hold_is_ready_standby_when_control_can_be_acquired(
+    tmp_path: Path,
+) -> None:
+    ros = DiagnosticRosAdapter()
+    runtime = RobotAgentRuntime(diagnostic_runtime_config(tmp_path), ros_adapter=ros)
+    await runtime.initialize()
+    try:
+        await connect_transport(runtime)
+        publish_ready_local_dependencies(runtime, ros)
+        await asyncio.sleep(0)
+
+        standby = await runtime.diagnostics_snapshot()
+
+        assert standby["ready"] is True
+        assert standby["commandReadiness"] == {
+            "ready": True,
+            "mode": "STANDBY",
+            "reason": None,
+        }
+        assert standby["controlState"] == {
+            "state": "SAFE_HOLD",
+            "active": False,
+            "standby": True,
+            "canAcquire": True,
+            "leaseValid": False,
+            "leaseRemainingMs": None,
+            "activeCommandCount": 0,
+        }
+        assert standby["checks"]["control"]["ready"] is True
+        assert standby["checks"]["control"]["reason"] == (
+            "standby_waiting_for_control_acquire"
+        )
+
+        await runtime._session.latch_safety_fault("test safety interlock")
+        faulted = await runtime.diagnostics_snapshot()
+        assert faulted["ready"] is False
+        assert faulted["controlState"]["canAcquire"] is False
+        assert faulted["controlState"]["standby"] is False
+        assert faulted["checks"]["control"]["reason"] == "control_acquire_blocked"
+    finally:
+        await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_safe_hold_with_claimed_command_and_no_lease_is_not_ready(
+    tmp_path: Path,
+) -> None:
+    ros = DiagnosticRosAdapter()
+    runtime = RobotAgentRuntime(diagnostic_runtime_config(tmp_path), ros_adapter=ros)
+    await runtime.initialize()
+    command_id = uuid4()
+    try:
+        await connect_transport(runtime)
+        publish_ready_local_dependencies(runtime, ros)
+        claim = runtime._coordinator._arbiter.claim(command_id, {"motion"})
+        assert claim.acquired is True
+
+        blocked = await runtime.diagnostics_snapshot()
+
+        assert blocked["ready"] is False
+        assert blocked["commandReadiness"] == {
+            "ready": False,
+            "mode": "BLOCKED",
+            "reason": "active_commands_without_valid_lease",
+        }
+        assert blocked["controlState"]["activeCommandCount"] == 1
+        assert blocked["controlState"]["standby"] is False
+        assert blocked["checks"]["control"]["reason"] == (
+            "active_commands_without_valid_lease"
+        )
+    finally:
+        runtime._coordinator._arbiter.release(command_id)
+        await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_ready_snapshot_requires_connected_transport_even_when_local_stack_is_ready(
+    tmp_path: Path,
+) -> None:
+    ros = DiagnosticRosAdapter()
+    runtime = RobotAgentRuntime(diagnostic_runtime_config(tmp_path), ros_adapter=ros)
+    await runtime.initialize()
+    try:
+        session_id = await connect_transport(runtime)
+        publish_ready_local_dependencies(runtime, ros)
+        await asyncio.sleep(0)
+        assert (await runtime.diagnostics_snapshot())["ready"] is True
+
+        runtime._connection_session_id = None
+        disconnected = await runtime.diagnostics_snapshot()
+
+        assert disconnected["ready"] is False
+        assert disconnected["checks"]["transportSession"]["reason"] == (
+            "transport_session_unavailable"
+        )
+        assert disconnected["checks"]["control"]["reason"] == (
+            "transport_session_unavailable"
+        )
+        assert disconnected["controlState"]["canAcquire"] is False
+        assert disconnected["commandReadiness"]["mode"] == "BLOCKED"
+        assert runtime._session.snapshot.session_id == session_id
+    finally:
+        await runtime.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_ready_snapshot_requires_every_control_and_sensor_dependency(
     tmp_path: Path,
 ) -> None:
@@ -546,44 +694,28 @@ async def test_ready_snapshot_requires_every_control_and_sensor_dependency(
         assert initial["checks"]["localization"]["reason"] == "localization_incomplete"
         assert initial["checks"]["observation"]["reason"] == "no_observation_health"
 
-        session_id = uuid4()
-        await runtime._session.connected(session_id)
+        session_id = await connect_transport(runtime)
         await runtime._session.acquire(
             session_id,
             operator_id="test-operator",
             at=datetime.now(timezone.utc) - timedelta(seconds=3),
         )
-        runtime._connection_session_id = session_id
-        assert ros.state_callback is not None
-        now = datetime.now(timezone.utc)
-        ros.state_callback("localization.position.x", 0.0, now)
-        ros.state_callback("localization.position.y", 0.0, now)
-        assert ros.observation_health_callback is not None
-        ros.observation_health_callback(
-            ObservationHealthSample(
-                robot_id="g1-diagnostic",
-                robot_boot_id=str(runtime._boot_id),
-                gateway_instance_id="gateway-test",
-                observation_session_id="observation-test",
-                sensor_id="head_rgbd",
-                scene_version="office-v2",
-                localization_epoch_id="epoch-test",
-                status=ObservationHealthStatus.USABLE,
-                reason=0,
-                has_last_accepted_sequence=True,
-                last_accepted_sequence=1,
-                last_accepted_monotonic_ns=1,
-                capture_age_ms=10.0,
-                ack_age_ms=10.0,
-                drop_count=0,
-                heartbeat_sequence=1,
-            )
-        )
+        publish_ready_local_dependencies(runtime, ros, include_observation=False)
         await asyncio.sleep(0)
+
+        observation_down = await runtime.diagnostics_snapshot()
+        assert observation_down["ready"] is False
+        assert observation_down["checks"]["observation"]["reason"] == (
+            "no_observation_health"
+        )
 
         expired = await runtime.diagnostics_snapshot()
         assert expired["ready"] is False
         assert expired["checks"]["control"]["reason"] == "control_lease_expired"
+        assert expired["controlState"]["state"] == "ACTIVE"
+        assert expired["controlState"]["leaseValid"] is False
+        publish_ready_local_dependencies(runtime, ros)
+        await asyncio.sleep(0)
         await runtime._session.renew(
             session_id,
             sequence=0,
@@ -591,6 +723,9 @@ async def test_ready_snapshot_requires_every_control_and_sensor_dependency(
         )
         ready = await runtime.diagnostics_snapshot()
         assert ready["ready"] is True
+        assert ready["commandReadiness"]["mode"] == "ACTIVE"
+        assert ready["controlState"]["active"] is True
+        assert ready["controlState"]["leaseValid"] is True
         assert all(check["ready"] for check in ready["checks"].values() if check["required"])
 
         ros.nav2_ready = False

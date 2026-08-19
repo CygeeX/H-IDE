@@ -116,8 +116,9 @@ PYTHONPATH=src/robot_agent:${PYTHONPATH} .venv/bin/python -m robot_agent.cli doc
 ```
 
 本地 profile 还会在 `127.0.0.1:8795` 启动只读运行诊断 API；MuJoCo profile 使用
-`127.0.0.1:8796`。`/healthz` 只表示进程仍可响应，`/readyz` 只有在控制会话、ROS
-executor、全部 Nav2 Action、定位和观测均可执行时才返回 200。详细字段及生产启用方式见
+`127.0.0.1:8796`。`/healthz` 只表示进程仍可响应；`/readyz` 表示当前运行时可安全接收
+下一条命令，因此已连接但尚未获取控制权的无任务 `SAFE_HOLD` 会作为待机状态返回 200，
+ROS executor、Nav2、定位、观测或 transport 不可用时仍返回 503。详细字段及生产启用方式见
 [运维与部署](docs/operations.md#只读运行诊断-api)。
 
 ## 验证
