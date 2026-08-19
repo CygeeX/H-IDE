@@ -19,12 +19,23 @@ import sys
 import threading
 import time
 from typing import Iterable
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
+import uuid
 
 import numpy as np
 
 from .config import SimConfig
 from .frames import BodyTwist, read_mujoco_local_body_twist
+from .render_workers import (
+    LatestStateMailbox,
+    MAX_CAPTURE_AGE_NS,
+    MujocoStateShape,
+    PassiveViewerWorker,
+    RenderedFrame,
+    RenderWorkerConfig,
+    RgbdRenderWorker,
+    ViewerWorkerConfig,
+)
 from .runtime_diagnostics import PlantRuntimeDiagnostics
 from .scene_runtime import RuntimeScene
 
@@ -316,63 +327,38 @@ def configure_tracking_viewer(mujoco, model, viewer, scene: RuntimeScene) -> Non
     )
 
 
-class PlantFrameStore:
-    def __init__(
-        self,
-        config: SimConfig,
-        model,
-        data,
-        support: PlantSupportController,
-        runtime_diagnostics: PlantRuntimeDiagnostics | None = None,
-    ):
+class PlantPhysicsMonitor:
+    """Authority-thread checks that never depend on rendering availability."""
+
+    def __init__(self, config: SimConfig, mujoco_api, model, data, support) -> None:
         self.config = config
+        self.mujoco = mujoco_api
         self.model = model
         self.data = data
         self.support = support
-        self.runtime_diagnostics = runtime_diagnostics
-        self._lock = threading.RLock()
-        self._sequence = 0
-        self._captured_at_ns = 0
-        self._pose = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
-        self._root_velocity = BodyTwist.zero()
-        self._root_body_id: int | None = None
-        self._camera_pose = [0.2, 0.0, 1.15, 1.0, 0.0, 0.0, 0.0]
-        self._intrinsics = {"fx": 312.77, "fy": 312.77, "cx": 320.0, "cy": 240.0}
-        self._rgb = b""
-        self._depth = b""
-        self._depth_renderer = None
-        self._servers: list[ThreadingHTTPServer] = []
+        self.root_body_id = int(
+            mujoco_api.mj_name2id(
+                model,
+                mujoco_api.mjtObj.mjOBJ_BODY,
+                "pelvis",
+            )
+        )
+        if self.root_body_id < 0:
+            raise RuntimeError("pinned G1 model does not define pelvis")
 
-    def capture(self, render_cache: dict[str, object]) -> None:
-        import cv2
-        import mujoco
-        import numpy as np
-
+    def observe(self) -> None:
         self.support.observe_simulation_time(float(self.data.time))
         self.support.require_healthy()
-
+        arrays = (self.data.qpos, self.data.qvel, self.data.act)
+        if not all(np.all(np.isfinite(values)) for values in arrays):
+            self.support.fail("MuJoCo physics state contains non-finite values")
         root_pose = np.asarray(self.data.qpos[:7], dtype=float)
-        if not np.all(np.isfinite(root_pose)):
-            self.support.fail("MuJoCo root pose contains non-finite values")
-        if self._root_body_id is None:
-            self._root_body_id = int(
-                mujoco.mj_name2id(
-                    self.model,
-                    mujoco.mjtObj.mjOBJ_BODY,
-                    "pelvis",
-                )
-            )
-            if self._root_body_id < 0:
-                raise RuntimeError("pinned G1 model does not define pelvis")
         try:
-            # mj_objectVelocity returns angular:linear. Request the local
-            # orientation so the resulting ROS twist is genuinely expressed
-            # in base_link rather than in the MuJoCo world frame.
-            root_velocity = read_mujoco_local_body_twist(
-                mujoco,
+            read_mujoco_local_body_twist(
+                self.mujoco,
                 self.model,
                 self.data,
-                self._root_body_id,
+                self.root_body_id,
             )
         except ValueError as exc:
             self.support.fail(f"MuJoCo root velocity is invalid: {exc}")
@@ -389,140 +375,256 @@ class PlantFrameStore:
                 f"(x={x:.3f}, y={y:.3f}, z={z:.3f})"
             )
 
-        rgb = render_cache.get("head_camera_image")
-        if rgb is None:
-            return
-        image = np.asarray(rgb, dtype=np.uint8)
-        jpeg_started = time.monotonic()
-        try:
-            ok, encoded = cv2.imencode(
-                ".jpg",
-                cv2.cvtColor(image, cv2.COLOR_RGB2BGR),
-                [cv2.IMWRITE_JPEG_QUALITY, self.config.observation_jpeg_quality],
-            )
-        finally:
-            if self.runtime_diagnostics is not None:
-                self.runtime_diagnostics.observe_stage(
-                    "jpegEncode",
-                    time.monotonic() - jpeg_started,
-                    unix_ns=time.time_ns(),
-                )
-        if not ok:
-            return
-        depth_started = time.monotonic()
-        try:
-            if self._depth_renderer is None:
-                self._depth_renderer = mujoco.Renderer(
-                    self.model,
-                    height=480,
-                    width=640,
-                )
-            self._depth_renderer.enable_depth_rendering()
-            try:
-                self._depth_renderer.update_scene(
-                    self.data,
-                    camera="head_camera",
-                )
-                depth_m = np.asarray(
-                    self._depth_renderer.render(),
-                    dtype=np.float32,
-                )
-            finally:
-                self._depth_renderer.disable_depth_rendering()
-        finally:
-            if self.runtime_diagnostics is not None:
-                self.runtime_diagnostics.observe_stage(
-                    "depthRender",
-                    time.monotonic() - depth_started,
-                    unix_ns=time.time_ns(),
-                )
-        depth = np.clip(depth_m * 1000.0, 0, 65535).astype("<u2")
-        pose = [float(value) for value in root_pose]
-        camera_id = mujoco.mj_name2id(
-            self.model,
-            mujoco.mjtObj.mjOBJ_CAMERA,
-            "head_camera",
-        )
-        if camera_id < 0:
-            raise RuntimeError("pinned G1 model does not define head_camera")
-        # MuJoCo camera local +X is image-right, +Y is image-up, and it looks
-        # along -Z. ROS optical coordinates are +X right, +Y down, +Z forward.
-        # Publish the actual articulated camera pose in optical convention so
-        # RGB-D deprojection cannot confuse forward depth with map height.
-        mujoco_camera_rotation = np.asarray(
-            self.data.cam_xmat[camera_id],
-            dtype=float,
-        ).reshape(3, 3)
-        optical_rotation = mujoco_camera_rotation @ np.diag([1.0, -1.0, -1.0])
-        optical_quaternion = np.empty(4, dtype=float)
-        mujoco.mju_mat2Quat(optical_quaternion, optical_rotation.reshape(-1))
-        if optical_quaternion[0] < 0:
-            optical_quaternion *= -1
-        camera_pose = [
-            *[float(value) for value in self.data.cam_xpos[camera_id]],
-            *[float(value) for value in optical_quaternion],
-        ]
-        focal_pixels = 240.0 / math.tan(
-            math.radians(float(self.model.cam_fovy[camera_id])) / 2.0
-        )
-        intrinsics = {
-            "fx": focal_pixels,
-            "fy": focal_pixels,
-            "cx": 320.0,
-            "cy": 240.0,
-        }
-        rgb_body = encoded.tobytes()
-        with self._lock:
-            self._sequence += 1
-            self._captured_at_ns = time.time_ns()
-            self._pose = pose
-            self._root_velocity = root_velocity
-            self._camera_pose = camera_pose
-            self._intrinsics = intrinsics
-            self._rgb = rgb_body
-            self._depth = depth.tobytes()
 
-    def state(self) -> dict[str, object]:
+class PlantFrameStore:
+    def __init__(
+        self,
+        config: SimConfig,
+        support: PlantSupportController,
+        runtime_diagnostics: PlantRuntimeDiagnostics | None = None,
+        worker_status_provider=None,
+        viewer_status_provider=None,
+    ):
+        self.config = config
+        self.support = support
+        self.runtime_diagnostics = runtime_diagnostics
+        self._lock = threading.RLock()
+        self._latest: RenderedFrame | None = None
+        self._previous: RenderedFrame | None = None
+        self._worker_status_provider = worker_status_provider
+        self._viewer_status_provider = viewer_status_provider
+        self._servers: list[ThreadingHTTPServer] = []
+
+    def set_worker_status_provider(self, provider) -> None:
+        self._worker_status_provider = provider
+
+    def set_viewer_status_provider(self, provider) -> None:
+        self._viewer_status_provider = provider
+
+    def commit(self, frame: RenderedFrame) -> None:
+        """Atomically install one complete RGB-D/state generation."""
+
+        if frame.sequence <= 0 or frame.captured_at_unix_ns <= 0:
+            raise ValueError("rendered frame identity is invalid")
+        if not (
+            frame.captured_at_unix_ns
+            <= frame.render_started_at_unix_ns
+            <= frame.rendered_at_unix_ns
+        ):
+            raise ValueError("rendered frame timestamps are not ordered")
+        uuid.UUID(frame.producer_boot_id)
+        if (
+            frame.width <= 0
+            or frame.height <= 0
+            or not isinstance(frame.rgb_jpeg, bytes)
+            or not frame.rgb_jpeg
+        ):
+            raise ValueError("rendered frame RGB payload is invalid")
+        if (
+            not isinstance(frame.depth_z16_le, bytes)
+            or len(frame.depth_z16_le) != frame.width * frame.height * 2
+        ):
+            raise ValueError("rendered frame depth payload is invalid")
+        if not isinstance(frame.pose, tuple) or len(frame.pose) != 7:
+            raise ValueError("rendered frame root pose shape is invalid")
+        if not isinstance(frame.camera_pose, tuple) or len(frame.camera_pose) != 7:
+            raise ValueError("rendered frame camera pose shape is invalid")
+        values = (*frame.pose, *frame.camera_pose, frame.simulation_time_s)
+        if not all(math.isfinite(float(value)) for value in values):
+            raise ValueError("rendered frame geometry contains non-finite values")
+        intrinsics = dict(frame.intrinsics)
+        if set(intrinsics) != {"fx", "fy", "cx", "cy"} or not all(
+            math.isfinite(float(value)) for value in intrinsics.values()
+        ):
+            raise ValueError("rendered frame intrinsics are invalid")
+        if float(intrinsics["fx"]) <= 0 or float(intrinsics["fy"]) <= 0:
+            raise ValueError("rendered frame focal lengths must be positive")
+        timings = dict(frame.render_timing)
+        if not all(
+            math.isfinite(float(value)) and float(value) >= 0
+            for value in timings.values()
+        ):
+            raise ValueError("rendered frame timing is invalid")
         with self._lock:
-            x, y, z, qw, qx, qy, qz = self._pose
-            camera_x, camera_y, camera_z, camera_qw, camera_qx, camera_qy, camera_qz = (
-                self._camera_pose
-            )
-            support_state = self.support.state()
+            latest = self._latest
+            if latest is not None:
+                if latest.producer_boot_id == frame.producer_boot_id:
+                    if frame.sequence <= latest.sequence:
+                        raise ValueError("rendered frame sequence did not increase")
+                    self._previous = latest
+                else:
+                    self._previous = None
+            self._latest = frame
+
+    def _worker_status(self) -> dict[str, object]:
+        provider = self._worker_status_provider
+        if provider is None:
             return {
-                "status": (
-                    "failed"
-                    if support_state["fault"] is not None
-                    else ("running" if self._sequence else "starting")
-                ),
-                "schemaVersion": "h-ide.mujoco-capture/1",
-                "robotId": self.config.robot_id,
-                "sourceMode": "synthetic",
-                "sourceId": f"mujoco:unitree-g1:{self.config.robot_id}",
-                "localizationEpochId": self.config.localization_epoch_id,
-                "sequence": self._sequence,
-                "capturedAtUnixNs": self._captured_at_ns,
-                "pose": {"x": x, "y": y, "z": z, "qw": qw, "qx": qx, "qy": qy, "qz": qz},
-                "rootVelocity": self._root_velocity.capture_state(),
-                "support": support_state,
-                "runtimeTiming": (
-                    self.runtime_diagnostics.snapshot()
-                    if self.runtime_diagnostics is not None
-                    else None
-                ),
-                "cameraPose": {
-                    "x": camera_x,
-                    "y": camera_y,
-                    "z": camera_z,
-                    "qw": camera_qw,
-                    "qx": camera_qx,
-                    "qy": camera_qy,
-                    "qz": camera_qz,
-                },
-                "intrinsics": dict(self._intrinsics),
-                "rgb": {"width": 640, "height": 480, "encoding": "jpeg"},
-                "depth": {"width": 640, "height": 480, "encoding": "z16_le", "scaleMetersPerUnit": 0.001},
+                "status": "starting",
+                "ready": False,
+                "alive": False,
+                "lastError": "RGB-D worker is not configured",
             }
+        try:
+            value = provider()
+        except Exception as exc:
+            return {
+                "status": "failed",
+                "ready": False,
+                "alive": False,
+                "lastError": f"worker status unavailable: {type(exc).__name__}: {exc}"[:512],
+            }
+        return dict(value)
+
+    def _viewer_status(self) -> dict[str, object]:
+        provider = self._viewer_status_provider
+        if provider is None:
+            return {
+                "status": "disabled",
+                "authorityFeedbackEnabled": False,
+                "keyCallbackRegistered": False,
+            }
+        try:
+            return dict(provider())
+        except Exception as exc:
+            return {
+                "status": "failed",
+                "authorityFeedbackEnabled": False,
+                "keyCallbackRegistered": False,
+                "lastError": f"viewer status unavailable: {type(exc).__name__}: {exc}"[:512],
+            }
+
+    def _observation_status(
+        self,
+        frame: RenderedFrame | None,
+        *,
+        now_ns: int | None = None,
+    ) -> tuple[str, float | None, dict[str, object]]:
+        worker = self._worker_status()
+        if worker.get("status") == "failed":
+            status = "failed"
+        elif worker.get("status") != "running" or frame is None:
+            status = "starting"
+        else:
+            age_ms = max(
+                0.0,
+                ((time.time_ns() if now_ns is None else int(now_ns)) - frame.captured_at_unix_ns)
+                / 1_000_000.0,
+            )
+            status = "stale" if age_ms > MAX_CAPTURE_AGE_NS / 1_000_000.0 else "running"
+            return status, age_ms, worker
+        age_ms = (
+            None
+            if frame is None
+            else max(
+                0.0,
+                ((time.time_ns() if now_ns is None else int(now_ns)) - frame.captured_at_unix_ns)
+                / 1_000_000.0,
+            )
+        )
+        return status, age_ms, worker
+
+    def state(self, frame: RenderedFrame | None = None) -> dict[str, object]:
+        if frame is None:
+            with self._lock:
+                frame = self._latest
+        support_state = self.support.state()
+        observation_status, capture_age_ms, worker_status = self._observation_status(frame)
+        physics_status = "failed" if support_state["fault"] is not None else "running"
+        status = (
+            "failed"
+            if physics_status == "failed"
+            else ("running" if observation_status == "running" else "degraded")
+        )
+        pose = frame.pose if frame is not None else (0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0)
+        camera_pose = (
+            frame.camera_pose
+            if frame is not None
+            else (0.2, 0.0, 1.15, 1.0, 0.0, 0.0, 0.0)
+        )
+        intrinsics = (
+            dict(frame.intrinsics)
+            if frame is not None
+            else {"fx": 312.77, "fy": 312.77, "cx": 320.0, "cy": 240.0}
+        )
+        width = frame.width if frame is not None else 640
+        height = frame.height if frame is not None else 480
+        x, y, z, qw, qx, qy, qz = pose
+        camera_x, camera_y, camera_z, camera_qw, camera_qx, camera_qy, camera_qz = camera_pose
+        return {
+            "status": status,
+            "physicsStatus": physics_status,
+            "observationStatus": observation_status,
+            "schemaVersion": "h-ide.mujoco-capture/2",
+            "robotId": self.config.robot_id,
+            "sourceMode": "synthetic",
+            "sourceId": f"mujoco:unitree-g1:{self.config.robot_id}",
+            "localizationEpochId": self.config.localization_epoch_id,
+            "producerBootId": frame.producer_boot_id if frame is not None else None,
+            "sequence": frame.sequence if frame is not None else 0,
+            "capturedAtUnixNs": frame.captured_at_unix_ns if frame is not None else 0,
+            "renderStartedAtUnixNs": frame.render_started_at_unix_ns if frame is not None else 0,
+            "renderedAtUnixNs": frame.rendered_at_unix_ns if frame is not None else 0,
+            "simulationTimeS": frame.simulation_time_s if frame is not None else None,
+            "captureAgeMs": capture_age_ms,
+            "renderLatencyMs": (
+                (frame.rendered_at_unix_ns - frame.captured_at_unix_ns) / 1_000_000.0
+                if frame is not None
+                else None
+            ),
+            "pose": {"x": x, "y": y, "z": z, "qw": qw, "qx": qx, "qy": qy, "qz": qz},
+            "rootVelocity": (
+                frame.root_velocity.capture_state()
+                if frame is not None
+                else BodyTwist.zero().capture_state()
+            ),
+            "support": support_state,
+            "runtimeTiming": (
+                self.runtime_diagnostics.snapshot()
+                if self.runtime_diagnostics is not None
+                else None
+            ),
+            "renderTiming": dict(frame.render_timing) if frame is not None else None,
+            "observationWorker": worker_status,
+            "viewerWorker": self._viewer_status(),
+            "cameraPose": {
+                "x": camera_x, "y": camera_y, "z": camera_z,
+                "qw": camera_qw, "qx": camera_qx, "qy": camera_qy, "qz": camera_qz,
+            },
+            "intrinsics": intrinsics,
+            "rgb": {"width": width, "height": height, "encoding": "jpeg"},
+            "depth": {
+                "width": width,
+                "height": height,
+                "encoding": "z16_le",
+                "scaleMetersPerUnit": 0.001,
+            },
+        }
+
+    def _select_frame(self, query: str) -> tuple[RenderedFrame | None, bool]:
+        if not query:
+            with self._lock:
+                return self._latest, False
+        values = parse_qs(query, keep_blank_values=True, strict_parsing=True)
+        if set(values) != {"boot", "sequence"} or any(len(items) != 1 for items in values.values()):
+            raise ValueError("boot and sequence must be supplied exactly once")
+        boot = values["boot"][0]
+        try:
+            uuid.UUID(boot)
+            sequence = int(values["sequence"][0])
+        except (ValueError, TypeError) as exc:
+            raise ValueError("capture identity is invalid") from exc
+        if sequence <= 0:
+            raise ValueError("capture sequence must be positive")
+        with self._lock:
+            for candidate in (self._latest, self._previous):
+                if (
+                    candidate is not None
+                    and candidate.producer_boot_id == boot
+                    and candidate.sequence == sequence
+                ):
+                    return candidate, True
+        return None, True
 
     def serve(
         self,
@@ -537,8 +639,23 @@ class PlantFrameStore:
             class Handler(BaseHTTPRequestHandler):
                 def do_GET(self):  # noqa: N802
                     parsed = urlparse(self.path)
+                    frame = None
+                    if parsed.path in {"/state", "/rgb.jpg", "/depth.raw"}:
+                        try:
+                            frame, exact = store._select_frame(parsed.query)
+                        except ValueError as exc:
+                            self.send_error(400, str(exc))
+                            return
+                        if exact and frame is None:
+                            self.send_error(409, "requested capture is no longer retained")
+                            return
+                    elif parsed.path == "/healthz" and parsed.query:
+                        self.send_error(400, "healthz does not accept a capture identity")
+                        return
+
+                    payload = None
                     if parsed.path in {"/healthz", "/state"}:
-                        payload = store.state()
+                        payload = store.state(frame)
                         if parsed.path == "/healthz":
                             payload = {
                                 "backend": "mujoco_sonic",
@@ -547,12 +664,22 @@ class PlantFrameStore:
                         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
                         content_type = "application/json"
                     elif parsed.path == "/rgb.jpg":
-                        with store._lock:
-                            body = store._rgb
+                        if frame is None:
+                            self.send_error(503, "capture not ready")
+                            return
+                        if store.state(frame)["status"] != "running":
+                            self.send_error(503, "capture is stale or worker failed")
+                            return
+                        body = frame.rgb_jpeg
                         content_type = "image/jpeg"
                     elif parsed.path == "/depth.raw":
-                        with store._lock:
-                            body = store._depth
+                        if frame is None:
+                            self.send_error(503, "capture not ready")
+                            return
+                        if store.state(frame)["status"] != "running":
+                            self.send_error(503, "capture is stale or worker failed")
+                            return
+                        body = frame.depth_z16_le
                         content_type = "application/octet-stream"
                     elif (
                         parsed.path == "/support"
@@ -570,15 +697,32 @@ class PlantFrameStore:
                     if not body:
                         self.send_error(503, "capture not ready")
                         return
-                    status_code = (
-                        503
-                        if parsed.path == "/healthz" and payload.get("status") == "failed"
-                        else 200
-                    )
+                    status_code = 503 if (
+                        parsed.path == "/healthz"
+                        and payload is not None
+                        and payload.get("status") != "running"
+                    ) else 200
                     self.send_response(status_code)
                     self.send_header("Content-Type", content_type)
                     self.send_header("Content-Length", str(len(body)))
                     self.send_header("Cache-Control", "no-store")
+                    if frame is not None:
+                        self.send_header(
+                            "X-Hide-Capture-Boot-Id",
+                            frame.producer_boot_id,
+                        )
+                        self.send_header(
+                            "X-Hide-Capture-Sequence",
+                            str(frame.sequence),
+                        )
+                        self.send_header(
+                            "X-Hide-Captured-At-Unix-Ns",
+                            str(frame.captured_at_unix_ns),
+                        )
+                        self.send_header(
+                            "X-Hide-Rendered-At-Unix-Ns",
+                            str(frame.rendered_at_unix_ns),
+                        )
                     self.end_headers()
                     try:
                         self.wfile.write(body)
@@ -669,11 +813,6 @@ class PlantFrameStore:
             server.shutdown()
             server.server_close()
         self._servers.clear()
-        if self._depth_renderer is not None:
-            try:
-                self._depth_renderer.close()
-            except Exception:
-                pass
 
 
 def run_plant(config: SimConfig) -> int:
@@ -704,8 +843,10 @@ def run_plant(config: SimConfig) -> int:
         "SIMULATE_DT": 0.004,
         "VIEWER_DT": 0.02,
         "IMAGE_DT": 1.0 / config.camera_hz,
-        "ENABLE_ONSCREEN": config.onscreen,
-        "ENABLE_OFFSCREEN": config.offscreen,
+        # Renderer and viewer ownership is delegated to independent spawn
+        # processes below.  The authority must never create a GL context.
+        "ENABLE_ONSCREEN": False,
+        "ENABLE_OFFSCREEN": False,
         "MP_START_METHOD": "spawn",
         "USE_SENSOR": False,
         "PRINT_SCENE_INFORMATION": False,
@@ -724,13 +865,12 @@ def run_plant(config: SimConfig) -> int:
         + [25, 25, 25, 25, 25, 5, 5] * 2,
     }
     init_channel(model_config)
-    camera_configs = {"head_camera": {"height": 480, "width": 640}} if config.offscreen else {}
     simulator = SimulatorFactory.create_simulator(
         config=model_config,
         env_name="default",
-        onscreen=config.onscreen,
-        offscreen=config.offscreen,
-        camera_configs=camera_configs,
+        onscreen=False,
+        offscreen=False,
+        camera_configs={},
     )
 
     # The upstream XML supplies the pelvis height but leaves all articulated
@@ -769,12 +909,6 @@ def run_plant(config: SimConfig) -> int:
     else:
         support_controller.finish_startup()
 
-    # MuJoCo cameras look along their local -Z axis.  The pinned upstream G1
-    # asset points that axis sharply at the floor, which makes visual mission
-    # validation useless.  Keep the camera rigidly attached to the torso but
-    # orient it level along the robot's +X (forward) axis.  Local camera X is
-    # robot -Y (image right) and local camera Y is robot +Z (image up).
-    configure_head_camera(mujoco, sim_env.mj_model)
     apply_process_start_spawn(
         sim_env.mj_data,
         sim_env.mj_model,
@@ -793,12 +927,6 @@ def run_plant(config: SimConfig) -> int:
         sim_env.mj_data.qpos[int(joint_id) + 6] = float(DEFAULT_ANGLES_MUJOCO[i])
     sim_env.mj_data.qvel[:] = 0.0
     mujoco.mj_forward(sim_env.mj_model, sim_env.mj_data)
-    configure_tracking_viewer(
-        mujoco,
-        sim_env.mj_model,
-        getattr(sim_env, "viewer", None),
-        config.runtime_scene,
-    )
     if support_band is not None:
         # Upstream defaults target world z=1 with very stiff gains, which
         # visibly hoists the pelvis and makes contacting feet propel the robot
@@ -869,10 +997,21 @@ def run_plant(config: SimConfig) -> int:
             name="mujoco-startup-support-release",
         )
         support_release.start()
-    frames = None
+    frames: PlantFrameStore | None = None
+    rgbd_worker: RgbdRenderWorker | None = None
+    viewer_worker: PassiveViewerWorker | None = None
     runtime_diagnostics = PlantRuntimeDiagnostics(
         stall_threshold_s=config.plant_lowstate_stale_s,
     )
+    physics_monitor = PlantPhysicsMonitor(
+        config,
+        mujoco,
+        sim_env.mj_model,
+        sim_env.mj_data,
+        support_controller,
+    )
+    state_shape = MujocoStateShape.from_model(mujoco, sim_env.mj_model)
+    producer_boot_id = str(uuid.uuid4())
     original_sim_step = simulator.sim_env.sim_step
 
     def timed_sim_step():
@@ -882,7 +1021,9 @@ def run_plant(config: SimConfig) -> int:
             unix_ns=time.time_ns(),
         )
         try:
-            return original_sim_step()
+            result = original_sim_step()
+            physics_monitor.observe()
+            return result
         finally:
             runtime_diagnostics.observe_stage(
                 "simStep",
@@ -891,80 +1032,108 @@ def run_plant(config: SimConfig) -> int:
             )
 
     simulator.sim_env.sim_step = timed_sim_step
-    original_update_viewer = simulator.sim_env.update_viewer
-
-    def timed_update_viewer():
-        started = time.monotonic()
-        try:
-            return original_update_viewer()
-        finally:
-            runtime_diagnostics.observe_stage(
-                "viewerSync",
-                time.monotonic() - started,
-                unix_ns=time.time_ns(),
+    try:
+        if config.offscreen:
+            frames = PlantFrameStore(
+                config,
+                support_controller,
+                runtime_diagnostics,
+            )
+            rgbd_mailbox = LatestStateMailbox(
+                state_shape,
+                producer_boot_id=producer_boot_id,
+            )
+            rgbd_worker = RgbdRenderWorker(
+                mailbox=rgbd_mailbox,
+                shape=state_shape,
+                config=RenderWorkerConfig(
+                    runtime_manifest=str(config.scene_runtime_manifest),
+                    model_scene=str(config.model_scene),
+                    reset_policy=config.reset_policy,
+                    jpeg_quality=config.observation_jpeg_quality,
+                ),
+                on_frame=frames.commit,
+            )
+            frames.set_worker_status_provider(rgbd_worker.status)
+            rgbd_worker.start()
+            frames.serve(
+                config.plant_bind_host,
+                config.plant_port,
+                docker_observation_host=config.docker_observation_bind_host,
             )
 
-    simulator.sim_env.update_viewer = timed_update_viewer
-    if config.offscreen:
-        frames = PlantFrameStore(
-            config,
-            simulator.sim_env.mj_model,
-            simulator.sim_env.mj_data,
-            support_controller,
-            runtime_diagnostics,
-        )
-        frames.serve(
-            config.plant_bind_host,
-            config.plant_port,
-            docker_observation_host=config.docker_observation_bind_host,
-        )
-        original_render = simulator.sim_env.update_render_caches
-
-        def capture_render():
-            total_started = time.monotonic()
-            try:
-                render_started = time.monotonic()
+            def publish_rgbd_snapshot():
+                started = time.monotonic()
                 try:
-                    result = original_render()
+                    rgbd_mailbox.try_publish(
+                        mujoco,
+                        sim_env.mj_model,
+                        sim_env.mj_data,
+                        captured_at_unix_ns=time.time_ns(),
+                    )
+                    return {}
                 finally:
                     runtime_diagnostics.observe_stage(
-                        "rgbRender",
-                        time.monotonic() - render_started,
+                        "snapshotPublish",
+                        time.monotonic() - started,
                         unix_ns=time.time_ns(),
                     )
-                capture_started = time.monotonic()
+
+            simulator.sim_env.update_render_caches = publish_rgbd_snapshot
+
+        if config.onscreen:
+            viewer_mailbox = LatestStateMailbox(
+                state_shape,
+                producer_boot_id=producer_boot_id,
+            )
+            viewer_worker = PassiveViewerWorker(
+                mailbox=viewer_mailbox,
+                shape=state_shape,
+                config=ViewerWorkerConfig(
+                    runtime_manifest=str(config.scene_runtime_manifest),
+                    model_scene=str(config.model_scene),
+                    reset_policy=config.reset_policy,
+                    spawn_x=config.runtime_scene.spawn_x,
+                    spawn_y=config.runtime_scene.spawn_y,
+                ),
+            )
+            viewer_worker.start()
+            if frames is not None:
+                frames.set_viewer_status_provider(viewer_worker.status)
+
+            def publish_viewer_snapshot():
+                started = time.monotonic()
                 try:
-                    frames.capture(result)
+                    viewer_mailbox.try_publish(
+                        mujoco,
+                        sim_env.mj_model,
+                        sim_env.mj_data,
+                        captured_at_unix_ns=time.time_ns(),
+                    )
                 finally:
                     runtime_diagnostics.observe_stage(
-                        "capturePostprocess",
-                        time.monotonic() - capture_started,
+                        "viewerSnapshotPublish",
+                        time.monotonic() - started,
                         unix_ns=time.time_ns(),
                     )
-                return result
-            finally:
-                runtime_diagnostics.observe_stage(
-                    "renderCaptureTotal",
-                    time.monotonic() - total_started,
-                    unix_ns=time.time_ns(),
-                )
 
-        simulator.sim_env.update_render_caches = capture_render
-    try:
+            simulator.sim_env.update_viewer = publish_viewer_snapshot
+
         simulator.start()
     finally:
-        # Release renderers while the EGL context is still alive.  MuJoCo's
-        # renderer destructor otherwise emits an EGL_NOT_INITIALIZED warning on
-        # Ctrl-C even though the simulation itself shut down cleanly.
-        for renderer in list(getattr(sim_env, "renderers", {}).values()):
+        try:
+            if frames is not None:
+                frames.close()
+        finally:
             try:
-                renderer.close()
-            except Exception:
-                pass
-        getattr(sim_env, "renderers", {}).clear()
-        simulator.close()
-        if frames is not None:
-            frames.close()
+                if rgbd_worker is not None:
+                    rgbd_worker.close()
+            finally:
+                try:
+                    if viewer_worker is not None:
+                        viewer_worker.close()
+                finally:
+                    simulator.close()
     return 0
 
 

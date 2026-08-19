@@ -3,14 +3,138 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import json
 import math
 import os
 import time
-from typing import Iterable
+from typing import Iterable, Mapping
+from urllib.parse import urlencode
+import uuid
 
 from .config import SimConfig
 from .frames import BodyTwist, PoseDifferenceDiagnostic, PoseDifferenceResult
+from .render_workers import MAX_CAPTURE_AGE_NS
+
+
+_CAPTURE_BOOT_HEADER = "X-Hide-Capture-Boot-Id"
+_CAPTURE_SEQUENCE_HEADER = "X-Hide-Capture-Sequence"
+_CAPTURE_TIME_HEADER = "X-Hide-Captured-At-Unix-Ns"
+
+
+class CaptureContractError(ValueError):
+    """A state or image response cannot belong to one atomic RGB-D capture."""
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureIdentity:
+    producer_boot_id: str
+    sequence: int
+    captured_at_unix_ns: int
+
+    @classmethod
+    def from_state(cls, state: Mapping[str, object]) -> "CaptureIdentity":
+        producer_boot_id = state.get("producerBootId")
+        if not isinstance(producer_boot_id, str) or not producer_boot_id.strip():
+            raise CaptureContractError("MuJoCo state has no producerBootId")
+        try:
+            uuid.UUID(producer_boot_id)
+        except ValueError as exc:
+            raise CaptureContractError("MuJoCo producerBootId is not a UUID") from exc
+        try:
+            raw_sequence = state["sequence"]
+            raw_captured_at = state["capturedAtUnixNs"]
+        except KeyError as exc:
+            raise CaptureContractError(
+                "MuJoCo state has an invalid capture sequence or timestamp"
+            ) from exc
+        if (
+            isinstance(raw_sequence, bool)
+            or not isinstance(raw_sequence, int)
+            or isinstance(raw_captured_at, bool)
+            or not isinstance(raw_captured_at, int)
+        ):
+            raise CaptureContractError(
+                "MuJoCo state has an invalid capture sequence or timestamp"
+            )
+        sequence = raw_sequence
+        captured_at_unix_ns = raw_captured_at
+        if sequence <= 0:
+            raise CaptureContractError("MuJoCo capture sequence is not positive")
+        if captured_at_unix_ns <= 0:
+            raise CaptureContractError("MuJoCo capture timestamp is invalid")
+        return cls(producer_boot_id, sequence, captured_at_unix_ns)
+
+    def exact_resource_url(self, base_url: str, resource: str) -> str:
+        if not resource.startswith("/"):
+            raise ValueError("capture resource must be an absolute path")
+        query = urlencode(
+            {"boot": self.producer_boot_id, "sequence": str(self.sequence)}
+        )
+        return f"{base_url}{resource}?{query}"
+
+    def validate_age(self, now_unix_ns: int) -> int:
+        age_ns = int(now_unix_ns) - self.captured_at_unix_ns
+        if age_ns < 0:
+            raise CaptureContractError("MuJoCo capture timestamp is in the future")
+        if age_ns > MAX_CAPTURE_AGE_NS:
+            raise CaptureContractError(
+                f"MuJoCo capture is stale ({age_ns / 1_000_000.0:.1f} ms)"
+            )
+        return age_ns
+
+    def validate_response_headers(
+        self,
+        headers: Mapping[str, object],
+        resource: str,
+    ) -> None:
+        # HTTP header names are case-insensitive.  Normalize explicitly so the
+        # contract remains testable without depending on requests' CaseInsensitiveDict.
+        normalized = {str(key).lower(): str(value) for key, value in headers.items()}
+
+        def required(name: str) -> str:
+            try:
+                return normalized[name.lower()]
+            except KeyError as exc:
+                raise CaptureContractError(
+                    f"{resource} response is missing {name}"
+                ) from exc
+
+        response_boot_id = required(_CAPTURE_BOOT_HEADER)
+        try:
+            response_sequence = int(required(_CAPTURE_SEQUENCE_HEADER))
+            response_captured_at_ns = int(required(_CAPTURE_TIME_HEADER))
+        except ValueError as exc:
+            raise CaptureContractError(
+                f"{resource} response has malformed capture headers"
+            ) from exc
+        if response_boot_id != self.producer_boot_id:
+            raise CaptureContractError(
+                f"{resource} response belongs to a different producer boot"
+            )
+        if response_sequence != self.sequence:
+            raise CaptureContractError(
+                f"{resource} response belongs to sequence {response_sequence}, "
+                f"expected {self.sequence}"
+            )
+        if response_captured_at_ns != self.captured_at_unix_ns:
+            raise CaptureContractError(
+                f"{resource} response has a mismatched capture timestamp"
+            )
+
+
+def is_new_capture(
+    candidate: CaptureIdentity,
+    last_producer_boot_id: str | None,
+    last_sequence: int,
+) -> bool:
+    """Apply a strict sequence order within a boot, with reset on a new boot."""
+
+    return (
+        last_producer_boot_id is None
+        or candidate.producer_boot_id != last_producer_boot_id
+        or candidate.sequence > last_sequence
+    )
 
 
 class MujocoObservationBridge:
@@ -41,6 +165,7 @@ class MujocoObservationBridge:
         self.odom_pub = self.node.create_publisher(Odometry, "/odom", qos)
         self.epoch_pub = self.node.create_publisher(String, "/localization/epoch_id", epoch_qos)
         self.tf = TransformBroadcaster(self.node)
+        self._last_producer_boot_id: str | None = None
         self._last_sequence = 0
         self._last_captured_at_ns = 0
         self._pose_difference_diagnostic = PoseDifferenceDiagnostic()
@@ -125,8 +250,6 @@ class MujocoObservationBridge:
         message.angular.z = twist.wz
 
     def poll(self):
-        import cv2
-        import numpy as np
         import requests
 
         poll_started = time.perf_counter()
@@ -136,20 +259,39 @@ class MujocoObservationBridge:
             state = state_response.json()
             if state.get("status") != "running":
                 raise RuntimeError(
-                    "MuJoCo physics is not healthy: "
-                    f"{state.get('support', {}).get('fault') or state.get('status')}"
+                    "MuJoCo capture is not healthy: "
+                    f"{state.get('support', {}).get('fault') or state.get('observationStatus') or state.get('status')}"
                 )
-            sequence = int(state["sequence"])
-            captured_at_ns = int(state["capturedAtUnixNs"])
-            # A restarted MuJoCo plant resets its frame sequence.  Wall-clock
-            # capture time remains monotonic across that restart, so use it as
-            # the freshness authority instead of permanently rejecting the new
-            # process's lower sequence numbers.
-            if captured_at_ns <= self._last_captured_at_ns:
+            capture = CaptureIdentity.from_state(state)
+            capture.validate_response_headers(state_response.headers, "/state")
+            if not is_new_capture(
+                capture,
+                self._last_producer_boot_id,
+                self._last_sequence,
+            ):
                 return
-            rgb_response = requests.get(f"{self._base_url}/rgb.jpg", timeout=0.2)
-            depth_response = requests.get(f"{self._base_url}/depth.raw", timeout=0.2)
-            rgb_response.raise_for_status(); depth_response.raise_for_status()
+            # Check the source timestamp before spending either network timeout.
+            capture.validate_age(time.time_ns())
+            rgb_response = requests.get(
+                capture.exact_resource_url(self._base_url, "/rgb.jpg"),
+                timeout=0.2,
+            )
+            rgb_response.raise_for_status()
+            capture.validate_response_headers(rgb_response.headers, "/rgb.jpg")
+            depth_response = requests.get(
+                capture.exact_resource_url(self._base_url, "/depth.raw"),
+                timeout=0.2,
+            )
+            depth_response.raise_for_status()
+            capture.validate_response_headers(depth_response.headers, "/depth.raw")
+            # Network latency is part of true capture age.  Recheck only after
+            # both exact resources have arrived; a 409 or mismatch never reaches
+            # any ROS publisher.
+            capture.validate_age(time.time_ns())
+
+            import cv2
+            import numpy as np
+
             rgb_bgr = cv2.imdecode(np.frombuffer(rgb_response.content, dtype=np.uint8), cv2.IMREAD_COLOR)
             if rgb_bgr is None or rgb_bgr.shape[:2] != (480, 640):
                 raise ValueError("MuJoCo RGB dimensions are invalid")
@@ -161,6 +303,9 @@ class MujocoObservationBridge:
         except Exception as exc:
             self.node.get_logger().warning(f"MuJoCo capture unavailable: {exc}")
             return
+
+        sequence = capture.sequence
+        captured_at_ns = capture.captured_at_unix_ns
 
         stamp = self._stamp(captured_at_ns)
         raw_pose = state["pose"]
@@ -213,6 +358,13 @@ class MujocoObservationBridge:
         ]
         if not all(math.isfinite(value) for value in (fx, fy, cx, cy)) or fx <= 0 or fy <= 0:
             self.node.get_logger().error("MuJoCo camera intrinsics are invalid")
+            return
+        try:
+            # Decode and state validation also consume the 500 ms budget.  This
+            # is the final admission gate immediately before the first publish.
+            capture.validate_age(time.time_ns())
+        except CaptureContractError as exc:
+            self.node.get_logger().warning(f"MuJoCo capture unavailable: {exc}")
             return
         pose = self.PoseWithCovarianceStamped()
         pose.header.stamp, pose.header.frame_id = stamp, "map"
@@ -298,6 +450,7 @@ class MujocoObservationBridge:
         self.color_meta_pub.publish(color_metadata)
         self.depth_meta_pub.publish(depth_metadata)
         self.rgbd_pub.publish(bundle)
+        self._last_producer_boot_id = capture.producer_boot_id
         self._last_sequence = sequence
         self._last_captured_at_ns = captured_at_ns
         self._poll_count += 1

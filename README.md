@@ -202,15 +202,23 @@ LowState-only hot update mutates scalar telemetry in place; the ordinary update
 API retains its isolated-snapshot return contract, and HTTP readers also
 receive isolated copies.
 
-MuJoCo `/state` and `/healthz` expose `runtimeTiming`: last/max duration,
-over-stale-threshold count, and the latest slow timestamp for the authoritative
-simulation-loop gap, physics step, viewer sync, RGB render, JPEG encode, depth
-render, and total capture path.  These two surfaces are intended to be read
-together.  A LowState gap with continuous health probes, no overlapping GC,
-and a matching slow Plant stage identifies an upstream publication/render
-stall; a matching GC pause or health-probe gap instead supports SONIC
-process/GIL scheduling as the cause.  These diagnostics do not widen the
-100-ms safety limits or replay stale samples.
+MuJoCo `/state` and `/healthz` expose `runtimeTiming` for the authoritative
+simulation-loop gap, physics step, and non-blocking state-snapshot publication.
+RGB, depth and JPEG work runs only in a `spawn` worker with its own verified
+OfficeV2 model, `MjData` and Renderer; its per-frame costs are reported as
+`renderTiming`.  A worker failure or a frame older than 500 ms changes only
+`observationStatus`, makes `/healthz` return 503, and never enables a synchronous
+render fallback in the physics process.  The optional operator viewer follows
+the same private-model rule and has no control/input callback into the plant.
+
+`/rgb.jpg` and `/depth.raw` remain compatible as latest-frame routes.  Atomic
+consumers first read `/state`, then request both resources with the exact
+`?boot=<producerBootId>&sequence=<sequence>` identity.  The latest and previous
+complete captures are retained; a missing generation returns 409, and all
+three responses carry matching capture identity headers.  The ROS observation
+bridge enforces those identities and rechecks the original capture timestamp
+against the same 500-ms limit before publishing.  These changes do not widen
+the 100-ms physics safety limits or replay stale samples.
 
 ### Read-only SAFE_HOLD soak evidence
 

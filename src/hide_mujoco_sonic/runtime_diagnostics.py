@@ -269,7 +269,7 @@ class _DurationProbe:
 
 
 class PlantRuntimeDiagnostics:
-    """Attribute a slow plant iteration to physics, viewer, or RGB-D work."""
+    """Attribute authority-loop stalls without executing render work there."""
 
     _STAGES = (
         "simStep",
@@ -279,6 +279,8 @@ class PlantRuntimeDiagnostics:
         "depthRender",
         "capturePostprocess",
         "renderCaptureTotal",
+        "snapshotPublish",
+        "viewerSnapshotPublish",
     )
 
     def __init__(self, *, stall_threshold_s: float) -> None:

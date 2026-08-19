@@ -6,6 +6,8 @@ from pathlib import Path
 from types import SimpleNamespace
 import socket
 import threading
+import time
+import uuid
 
 import pytest
 
@@ -15,7 +17,9 @@ from hide_mujoco_sonic.network import (
     resolve_docker_observation_bind_host,
 )
 from hide_mujoco_sonic.config import SimConfig
+from hide_mujoco_sonic.frames import BodyTwist
 from hide_mujoco_sonic.plant import PlantFrameStore, PlantSupportController
+from hide_mujoco_sonic.render_workers import RenderedFrame
 from hide_mujoco_sonic.sonic_driver import _bind_command_server
 from hide_mujoco_sonic.telemetry import TelemetryState, TelemetryStore, serve_telemetry
 from hide_mujoco_sonic.runtime_diagnostics import PlantRuntimeDiagnostics
@@ -206,17 +210,36 @@ def test_docker_plant_listener_serves_live_rgb_but_rejects_support_write() -> No
             robot_id="g1-sim",
             localization_epoch_id="test-epoch",
         ),
-        model=None,
-        data=None,
         support=support,
         runtime_diagnostics=runtime_diagnostics,
+        worker_status_provider=lambda: {
+            "status": "running",
+            "ready": True,
+            "alive": True,
+        },
     )
     jpeg = b"\xff\xd8read-only-fixture\xff\xd9"
-    with store._lock:
-        store._sequence = 1
-        store._captured_at_ns = 123
-        store._rgb = jpeg
-        store._depth = b"\x01\x00\x02\x00"
+    captured_at = time.time_ns()
+    producer_boot_id = str(uuid.uuid4())
+    store.commit(
+        RenderedFrame(
+            producer_boot_id=producer_boot_id,
+            sequence=1,
+            captured_at_unix_ns=captured_at,
+            render_started_at_unix_ns=captured_at + 1,
+            rendered_at_unix_ns=captured_at + 2,
+            simulation_time_s=1.0,
+            pose=(0.0, 0.0, 0.8, 1.0, 0.0, 0.0, 0.0),
+            root_velocity=BodyTwist.zero(),
+            camera_pose=(0.2, 0.0, 1.15, 1.0, 0.0, 0.0, 0.0),
+            intrinsics=(("fx", 1.0), ("fy", 1.0), ("cx", 1.0), ("cy", 0.5)),
+            width=2,
+            height=1,
+            rgb_jpeg=jpeg,
+            depth_z16_le=b"\x01\x00\x02\x00",
+            render_timing=(("totalMs", 0.001),),
+        )
+    )
     store.serve(
         "127.0.0.1",
         port,
@@ -239,6 +262,22 @@ def test_docker_plant_listener_serves_live_rgb_but_rejects_support_write() -> No
         status, _headers, body = _request("127.0.0.2", port, "GET", "/depth.raw")
         assert status == 200
         assert body == b"\x01\x00\x02\x00"
+        exact = f"boot={producer_boot_id}&sequence=1"
+        status, headers, body = _request(
+            "127.0.0.2", port, "GET", f"/rgb.jpg?{exact}"
+        )
+        assert status == 200
+        assert body == jpeg
+        assert headers["X-Hide-Capture-Boot-Id"] == producer_boot_id
+        assert headers["X-Hide-Capture-Sequence"] == "1"
+        assert headers["X-Hide-Captured-At-Unix-Ns"] == str(captured_at)
+        status, _headers, _body = _request(
+            "127.0.0.2",
+            port,
+            "GET",
+            f"/depth.raw?boot={producer_boot_id}&sequence=2",
+        )
+        assert status == 409
         status, _headers, _body = _request(
             "127.0.0.2",
             port,
@@ -279,5 +318,55 @@ def test_docker_plant_listener_serves_live_rgb_but_rejects_support_write() -> No
         assert headers["Allow"] == "GET"
         assert body == b""
         assert support.state()["mode"] == "idle"
+
+        store.set_worker_status_provider(
+            lambda: {
+                "status": "failed",
+                "ready": True,
+                "alive": False,
+                "lastError": "injected renderer crash",
+            }
+        )
+        status, _headers, body = _request(
+            "127.0.0.2", port, "GET", "/healthz"
+        )
+        assert status == 503
+        health = json.loads(body)
+        assert health["physicsStatus"] == "running"
+        assert health["observationStatus"] == "failed"
+        assert health["status"] == "degraded"
+        status, _headers, _body = _request(
+            "127.0.0.2", port, "GET", "/rgb.jpg"
+        )
+        assert status == 503
+
+        store.set_worker_status_provider(
+            lambda: {"status": "running", "ready": True, "alive": True}
+        )
+        stale_at = time.time_ns() - 500_000_001
+        store.commit(
+            RenderedFrame(
+                producer_boot_id=producer_boot_id,
+                sequence=2,
+                captured_at_unix_ns=stale_at,
+                render_started_at_unix_ns=stale_at + 1,
+                rendered_at_unix_ns=stale_at + 2,
+                simulation_time_s=2.0,
+                pose=(0.0, 0.0, 0.8, 1.0, 0.0, 0.0, 0.0),
+                root_velocity=BodyTwist.zero(),
+                camera_pose=(0.2, 0.0, 1.15, 1.0, 0.0, 0.0, 0.0),
+                intrinsics=(("fx", 1.0), ("fy", 1.0), ("cx", 1.0), ("cy", 0.5)),
+                width=2,
+                height=1,
+                rgb_jpeg=jpeg,
+                depth_z16_le=b"\x01\x00\x02\x00",
+                render_timing=(("totalMs", 0.001),),
+            )
+        )
+        status, _headers, body = _request(
+            "127.0.0.2", port, "GET", "/healthz"
+        )
+        assert status == 503
+        assert json.loads(body)["observationStatus"] == "stale"
     finally:
         store.close()
