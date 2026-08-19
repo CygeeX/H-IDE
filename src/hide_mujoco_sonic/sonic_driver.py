@@ -20,8 +20,13 @@ from pathlib import Path
 import threading
 import time
 from typing import Any
+from uuid import uuid4
 
 from .config import SimConfig
+from .motion_fault import (
+    SONIC_HEALTH_SCHEMA_VERSION,
+    validate_sonic_health_request,
+)
 from .network import require_loopback_bind_host
 from .planner_evidence import PlannerReferenceEvidenceGate
 from .safety import (
@@ -285,6 +290,7 @@ class SonicDriver:
     def __init__(self, config: SimConfig, telemetry: TelemetryStore):
         self.config = config
         self.telemetry = telemetry
+        self._driver_boot_id = uuid4()
         self.guard = CmdVelGuard(
             max_linear_mps=config.max_linear_mps,
             min_walk_command_mps=config.min_walk_command_mps,
@@ -318,6 +324,7 @@ class SonicDriver:
         self._wall_clock = time.monotonic
         self._control_clock_armed_at_wall_s: float | None = None
         self._last_lowstate_wall_s: float | None = None
+        self._last_control_step_wall_s: float | None = None
         self._lowstate_stall_timeout_s = max(1.0, config.command_timeout_s * 4.0)
         self._stop = threading.Event()
         self._fault_latched = threading.Event()
@@ -822,6 +829,14 @@ class SonicDriver:
             self._last_published_targets = tuple(
                 float(value) for value in selected
             )
+        self._mark_control_step_published()
+
+    def _mark_control_step_published(self) -> None:
+        """Record only a successful actuator write on the monotonic clock."""
+
+        published_at = self._wall_clock()
+        with self._control_condition:
+            self._last_control_step_wall_s = published_at
 
     def _publish_measured_hold(self, lowstate) -> None:
         self._publish_position_hold(
@@ -1359,6 +1374,7 @@ class SonicDriver:
             self._msg.crc = self._crc.Crc(self._msg)
             self._publisher.Write(self._msg)
             self._last_published_targets = published_targets
+        self._mark_control_step_published()
         nonzero = any(abs(float(self._msg.motor_cmd[i].q)) > 1e-4 for i in range(29))
         # Legs and waist are the locomotion plant.  Tracking their commanded
         # joint references separately from the arms tells an operator whether
@@ -1636,6 +1652,62 @@ class SonicDriver:
                 condition.notify_all()
 
     def accept_json(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        if payload.get("type") == "sonic_health_probe":
+            request_id, _producer_boot_id = validate_sonic_health_request(
+                payload,
+                expected_robot_id=self.config.robot_id,
+            )
+            with self._control_condition:
+                checked_at = self._wall_clock()
+                last_lowstate_at = self._last_lowstate_wall_s
+                last_control_step_at = self._last_control_step_wall_s
+                lowstate_age = (
+                    None
+                    if last_lowstate_at is None
+                    else max(0.0, checked_at - last_lowstate_at)
+                )
+                control_step_age = (
+                    None
+                    if last_control_step_at is None
+                    else max(0.0, checked_at - last_control_step_at)
+                )
+            terminal_fault = self._fault_latched.is_set()
+            motion_ready = (
+                not terminal_fault
+                and not self._stop.is_set()
+                and self._motion_ready.is_set()
+            )
+            if terminal_fault:
+                status = "fault"
+            elif self._stop.is_set():
+                status = "stopped"
+            elif motion_ready:
+                status = "ready"
+            else:
+                status = "warming"
+            terminal_reason = (
+                None
+                if not terminal_fault
+                else (
+                    (
+                        str(self._terminal_fault_reason or "").strip()
+                        or "SONIC terminal fault"
+                    )[:512]
+                )
+            )
+            # This path is deliberately observational: it does not touch the
+            # ingress gate, planner, controller, telemetry or actuator state.
+            return {
+                "schema_version": SONIC_HEALTH_SCHEMA_VERSION,
+                "robot_id": self.config.robot_id,
+                "driver_boot_id": str(self._driver_boot_id),
+                "status": status,
+                "terminal_fault": terminal_fault,
+                "reason": terminal_reason,
+                "motion_ready": motion_ready,
+                "last_lowstate_age_s": lowstate_age,
+                "last_control_step_age_s": control_step_age,
+            }
         if payload.get("type") == "plant_support_state":
             if payload.get("schema_version") != "h-ide.plant-support-state/v1":
                 raise ValueError("unsupported plant support state schema")
@@ -1822,6 +1894,50 @@ class SonicDriver:
         return None
 
 
+def _handle_command_connection(driver: SonicDriver, conn) -> None:
+    """Serve one bounded-lifetime 8793 client without changing its semantics."""
+
+    data = b""
+    while True:
+        chunk = conn.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+    messages, _ = parse_lines(data + (b"" if data.endswith(b"\n") else b"\n"))
+    for message in messages:
+        request_id = message.get("request_id")
+        try:
+            response = driver.accept_json(message)
+            if request_id is not None:
+                acknowledgement = {
+                    "request_id": request_id,
+                    "ok": True,
+                    **(response or {}),
+                }
+                conn.sendall(
+                    (
+                        json.dumps(acknowledgement, separators=(",", ":"))
+                        + "\n"
+                    ).encode("utf-8")
+                )
+        except Exception as exc:
+            if request_id is None:
+                raise
+            conn.sendall(
+                (
+                    json.dumps(
+                        {
+                            "request_id": request_id,
+                            "ok": False,
+                            "error": str(exc)[:512],
+                        },
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                ).encode("utf-8")
+            )
+
+
 def run_driver(config: SimConfig) -> None:
     telemetry = TelemetryStore(TelemetryState(robot_id=config.robot_id, ros_domain_id=config.ros_domain_id))
     serve_telemetry(
@@ -1835,57 +1951,21 @@ def run_driver(config: SimConfig) -> None:
     # A tiny localhost TCP command server.  ROS bridge is the only intended
     # client; it sends one JSON object per line and never receives actuator data.
     server = _bind_command_server(config.command_bind_host, config.command_port)
+    command_server_stop = threading.Event()
 
     def accept_loop():
-        while not driver._stop.is_set():
+        while not command_server_stop.is_set():
             try:
                 conn, _ = server.accept()
             except TimeoutError:
                 continue
+            except OSError:
+                if command_server_stop.is_set():
+                    return
+                raise
             with conn:
-                data = b""
-                while True:
-                    chunk = conn.recv(4096)
-                    if not chunk:
-                        break
-                    data += chunk
                 try:
-                    messages, _ = parse_lines(data + (b"" if data.endswith(b"\n") else b"\n"))
-                    for message in messages:
-                        request_id = message.get("request_id")
-                        try:
-                            response = driver.accept_json(message)
-                            if request_id is not None:
-                                acknowledgement = {
-                                    "request_id": request_id,
-                                    "ok": True,
-                                    **(response or {}),
-                                }
-                                conn.sendall(
-                                    (
-                                        json.dumps(
-                                            acknowledgement,
-                                            separators=(",", ":"),
-                                        )
-                                        + "\n"
-                                    ).encode("utf-8")
-                                )
-                        except Exception as exc:
-                            if request_id is None:
-                                raise
-                            conn.sendall(
-                                (
-                                    json.dumps(
-                                        {
-                                            "request_id": request_id,
-                                            "ok": False,
-                                            "error": str(exc)[:512],
-                                        },
-                                        separators=(",", ":"),
-                                    )
-                                    + "\n"
-                                ).encode("utf-8")
-                            )
+                    _handle_command_connection(driver, conn)
                 except Exception as exc:
                     logger.warning("invalid bridge command: %s", exc)
 
@@ -1893,7 +1973,19 @@ def run_driver(config: SimConfig) -> None:
     try:
         driver.run()
     finally:
+        if driver._fault_latched.is_set():
+            # Keep the existing read-only 8793 probe surface alive briefly so
+            # the 40 Hz bridge can report the terminal reason rather than only
+            # a generic disconnect.  Motion is already latched off.
+            command_server_stop.wait(
+                timeout=min(
+                    0.10,
+                    2.0 * config.sonic_health_probe_period_s
+                    + config.sonic_health_probe_timeout_s,
+                )
+            )
         driver.stop()
+        command_server_stop.set()
         server.close()
 
 

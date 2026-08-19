@@ -408,6 +408,20 @@ def test_supported_configs_all_select_the_same_verified_office_v2_bundle() -> No
         assert config.runtime_scene.spawn_x == pytest.approx(-6.45)
         assert config.runtime_scene.spawn_y == pytest.approx(0.0)
         assert config.reset_policy == "explicit_process_restart"
+        assert config.motion_fault_topic == "/h_ide/g1_sim/motion_safety_fault"
+        assert config.sonic_health_probe_period_s == pytest.approx(0.025)
+        assert config.sonic_health_probe_timeout_s == pytest.approx(0.020)
+        assert config.plant_lowstate_stale_s == pytest.approx(0.10)
+        assert config.sonic_control_step_stale_s == pytest.approx(0.10)
+        assert (
+            max(
+                config.plant_lowstate_stale_s,
+                config.sonic_control_step_stale_s,
+            )
+            + config.sonic_health_probe_period_s
+            + config.sonic_health_probe_timeout_s
+            < 0.30
+        )
     for name in ("sim.yaml", "headless.yaml", "ros-headless.yaml"):
         assert "h_ide_office_29dof.xml" not in (
             ROOT / "config" / name

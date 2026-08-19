@@ -84,6 +84,18 @@ non-semantic integrity manifest.
   so all accepted map motion still comes from SONIC.
 * A Nav2 cancel, bridge disconnect, or stale command publishes an idle SONIC
   intent and sends a zero/hold command to the MuJoCo plant.
+* GaitAdapter faults, SONIC loss/terminal faults, and stale Plant or SONIC
+  control steps publish one strict `h-ide.motion-safety-fault/v1` JSON event on
+  `/h_ide/g1_sim/motion_safety_fault` with reliable, transient-local QoS. The
+  event is published before the local Plant/SONIC stop is attempted. It carries
+  robot/epoch, bridge and driver boot IDs, source sequence, control generation,
+  event ID and health-probe request ID for isolation and de-duplication.
+  Robot Agent remains the sole Nav2 action owner and cancels only its correlated
+  goal handle; the simulator never uses a global `CancelGoal(all)` operation.
+* The existing loopback-only port 8793 also accepts a read-only SONIC health
+  probe. It exposes both LowState age and last successful control-step age; the
+  25 ms probe, 20 ms timeout, and 100 ms stale bounds stay below the 300 ms
+  Robot Agent cancellation budget without placing ROS code inside SONIC.
 
 ## One-command workstation start
 

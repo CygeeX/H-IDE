@@ -13,6 +13,7 @@ import math
 import os
 import time
 from typing import Iterable
+from uuid import UUID, uuid4
 
 from .config import SimConfig
 from .gait_adapter import (
@@ -22,6 +23,14 @@ from .gait_adapter import (
     GaitState,
     Nav2Twist,
     SonicIntent,
+)
+from .motion_fault import (
+    MotionFaultLatch,
+    MotionSafetyFault,
+    SonicHealth,
+    classify_sonic_health,
+    motion_fault_qos,
+    sonic_health_probe,
 )
 from .safety import (
     BodyStabilityGuard,
@@ -119,6 +128,7 @@ def run_ros_bridge(config: SimConfig) -> None:
         import rclpy
         from geometry_msgs.msg import PoseWithCovarianceStamped, Twist
         from nav_msgs.msg import Odometry, Path
+        from std_msgs.msg import String
         from std_srvs.srv import Trigger
     except ImportError as exc:  # pragma: no cover - depends on ROS installation
         raise RosBridgeUnavailable("rclpy and geometry_msgs are required for ros-bridge") from exc
@@ -126,6 +136,15 @@ def run_ros_bridge(config: SimConfig) -> None:
     rclpy.init()
     node = rclpy.create_node("h_ide_mujoco_sonic_bridge")
     generation = {"value": _new_bridge_generation()}
+    fault_latch = MotionFaultLatch(
+        robot_id=config.robot_id,
+        localization_epoch_id=config.localization_epoch_id,
+    )
+    fault_publisher = node.create_publisher(
+        String,
+        config.motion_fault_topic,
+        motion_fault_qos(),
+    )
     gait = GaitAdapter(
         GaitAdapterConfig(
             command_timeout_s=config.command_timeout_s,
@@ -147,6 +166,7 @@ def run_ros_bridge(config: SimConfig) -> None:
     latest_heading = {"yaw": None}
     latest_observation: dict[str, BaseObservation | None] = {"value": None}
     bridge_fault = {"reason": None}
+    sonic_boot_id: dict[str, UUID | None] = {"value": None}
     direction_guard = MotionDirectionGuard()
     goal_guard = GoalProgressGuard()
     heading_guard = TranslationHeadingGuard(
@@ -186,33 +206,132 @@ def run_ros_bridge(config: SimConfig) -> None:
             ),
         )
 
-    def latch_stop(*, source: str, reason: str) -> None:
-        """Latch a bridge safety event and revoke this lifecycle's motion."""
+    def publish_fault(event: MotionSafetyFault) -> None:
+        message = String()
+        message.data = event.to_json()
+        fault_publisher.publish(message)
 
+    def latch_stop(
+        *,
+        source: str,
+        code: str,
+        reason: str,
+        stop_intent: SonicIntent | None = None,
+        downstream_boot_id: UUID | None = None,
+        probe_request_id: UUID | None = None,
+    ) -> None:
+        """Publish one immutable fault, then enforce the stronger local stop."""
+
+        bounded_reason = str(reason).strip()[:512] or "motion safety fault"
         if bridge_fault["reason"] is None:
-            bridge_fault["reason"] = f"{source}: {reason}"
-        now = time.monotonic()
-        intent = gait.cancel(generation["value"], now, now=now)
-        send_intent(intent)
-        if reason:
-            set_plant_support(
-                "127.0.0.1",
-                config.plant_port,
-                "safety_stop",
-                timeout=0.3,
-            )
-            request_json(
-                config.command_host,
-                config.command_port,
-                {
-                    "type": "plant_support_state",
-                    "schema_version": "h-ide.plant-support-state/v1",
-                    "source": "navigation_guard",
-                    "mode": "safety_stop",
-                    "reason": f"{source}: {reason}",
-                },
-                timeout=0.5,
-            )
+            bridge_fault["reason"] = f"{source}/{code}: {bounded_reason}"
+
+        def local_stop() -> None:
+            errors: list[str] = []
+            intent = stop_intent
+            try:
+                if intent is None:
+                    now = time.monotonic()
+                    intent = gait.cancel(generation["value"], now, now=now)
+                send_intent(intent)
+            except Exception as exc:
+                errors.append(f"SONIC stop delivery: {exc}")
+            try:
+                set_plant_support(
+                    "127.0.0.1",
+                    config.plant_port,
+                    "safety_stop",
+                    timeout=0.3,
+                )
+            except Exception as exc:
+                errors.append(f"Plant safety_stop: {exc}")
+            try:
+                request_json(
+                    config.command_host,
+                    config.command_port,
+                    {
+                        "type": "plant_support_state",
+                        "schema_version": "h-ide.plant-support-state/v1",
+                        "source": "navigation_guard",
+                        "mode": "safety_stop",
+                        "reason": f"{source}/{code}: {bounded_reason}",
+                    },
+                    timeout=0.5,
+                )
+            except Exception as exc:
+                errors.append(f"SONIC support latch: {exc}")
+            if errors:
+                raise RuntimeError("; ".join(errors))
+
+        event = fault_latch.trip(
+            control_generation=generation["value"],
+            source=source,
+            code=code,
+            reason=bounded_reason,
+            publish=publish_fault,
+            local_stop=local_stop,
+            downstream_boot_id=downstream_boot_id,
+            probe_request_id=probe_request_id,
+        )
+        node.get_logger().error(
+            "motion safety fault latched "
+            f"event={event.event_id} source={event.source} code={event.code}: "
+            f"{event.reason}"
+        )
+
+    def deliver_intent(intent: SonicIntent, *, context: str) -> bool:
+        existing_fault = fault_latch.event
+        if existing_fault is not None:
+            if fault_latch.complete:
+                return False
+            try:
+                latch_stop(
+                    source=existing_fault.source,
+                    code=existing_fault.code,
+                    reason=existing_fault.reason,
+                    stop_intent=(
+                        intent
+                        if intent.state == GaitState.FAULT.value
+                        else None
+                    ),
+                    downstream_boot_id=existing_fault.downstream_boot_id,
+                    probe_request_id=existing_fault.probe_request_id,
+                )
+            except Exception as exc:
+                node.get_logger().error(
+                    f"failed to retry incomplete motion-fault handling: {exc}"
+                )
+            return False
+        if intent.state == GaitState.FAULT.value:
+            try:
+                latch_stop(
+                    source="gait_adapter",
+                    code="GAIT_ADAPTER_FAULT",
+                    reason=intent.reason or f"GaitAdapter fault during {context}",
+                    stop_intent=intent,
+                )
+            except Exception as exc:
+                node.get_logger().error(
+                    f"failed to enforce GaitAdapter fault stop: {exc}"
+                )
+            return False
+        try:
+            send_intent(intent)
+        except Exception as exc:
+            reason = f"SONIC command channel unavailable during {context}: {exc}"
+            node.get_logger().error(reason)
+            try:
+                latch_stop(
+                    source="sonic_driver",
+                    code="SONIC_UNAVAILABLE",
+                    reason=reason,
+                )
+            except Exception as delivery_exc:
+                node.get_logger().error(
+                    f"failed to enforce unavailable-SONIC stop: {delivery_exc}"
+                )
+            return False
+        return True
 
     def on_pose(message: PoseWithCovarianceStamped):
         pose = message.pose.pose
@@ -249,7 +368,11 @@ def run_ros_bridge(config: SimConfig) -> None:
             reason = interlock_reason() or "measured navigation motion mismatch"
             node.get_logger().error(f"SONIC navigation interlock latched: {reason}")
             try:
-                latch_stop(source="navigation_guard", reason=reason)
+                latch_stop(
+                    source="navigation_guard",
+                    code="NAVIGATION_GUARD_FAULT",
+                    reason=reason,
+                )
             except Exception as exc:
                 node.get_logger().error(f"failed to deliver navigation interlock stop: {exc}")
 
@@ -264,7 +387,11 @@ def run_ros_bridge(config: SimConfig) -> None:
             )
             node.get_logger().error(reason)
             try:
-                latch_stop(source="odometry_contract", reason=reason)
+                latch_stop(
+                    source="ros_bridge",
+                    code="ODOMETRY_CONTRACT_FAULT",
+                    reason=reason,
+                )
             except Exception as exc:
                 node.get_logger().error(f"failed to deliver odometry-frame stop: {exc}")
             return
@@ -279,7 +406,11 @@ def run_ros_bridge(config: SimConfig) -> None:
             reason = f"odometry time contract mismatch: {exc}"
             node.get_logger().error(reason)
             try:
-                latch_stop(source="odometry_contract", reason=reason)
+                latch_stop(
+                    source="ros_bridge",
+                    code="ODOMETRY_CONTRACT_FAULT",
+                    reason=reason,
+                )
             except Exception as delivery_exc:
                 node.get_logger().error(
                     f"failed to deliver odometry-time stop: {delivery_exc}"
@@ -304,7 +435,11 @@ def run_ros_bridge(config: SimConfig) -> None:
             reason = "base_link odometry quaternion is non-finite or not normalized"
             node.get_logger().error(reason)
             try:
-                latch_stop(source="odometry_contract", reason=reason)
+                latch_stop(
+                    source="ros_bridge",
+                    code="ODOMETRY_CONTRACT_FAULT",
+                    reason=reason,
+                )
             except Exception as exc:
                 node.get_logger().error(f"failed to deliver invalid-odometry stop: {exc}")
             return
@@ -335,16 +470,16 @@ def run_ros_bridge(config: SimConfig) -> None:
         )
         latest_observation["value"] = observation
         intent = gait.ingest_observation(observation, now=now)
+        if intent.state == GaitState.FAULT.value:
+            deliver_intent(intent, context="odometry observation")
+            return
         if bridge_fault["reason"] is None and gait.state is GaitState.DISARMED:
             # A successful result proves this exact observation was fresh and
             # stationary; rejected attempts remain fail-closed.
             armed = gait.arm(generation["value"], now=now)
             if armed.state == GaitState.IDLE.value:
                 intent = armed
-        try:
-            send_intent(intent)
-        except Exception as exc:
-            node.get_logger().error(f"failed to deliver measured gait state: {exc}")
+        deliver_intent(intent, context="measured gait state")
 
     def on_path(message: Path):
         if not message.poses:
@@ -369,17 +504,15 @@ def run_ros_bridge(config: SimConfig) -> None:
             node.get_logger().error("non-finite /cmd_vel latched as a navigation fault")
             try:
                 latch_stop(
-                    source="nav2_cmd_vel",
+                    source="ros_bridge",
+                    code="NAV2_COMMAND_FAULT",
                     reason="Nav2 emitted a non-finite velocity command",
                 )
             except Exception as exc:
                 node.get_logger().error(f"failed to deliver invalid-command stop: {exc}")
             return
         if bridge_fault["reason"] is not None:
-            try:
-                send_intent(gait.tick(now=now))
-            except Exception as exc:
-                node.get_logger().error(f"failed to maintain bridge fault stop: {exc}")
+            deliver_intent(gait.tick(now=now), context="latched bridge fault")
             return
         direction_admitted = direction_guard.accept_command(vx, vy, wz)
         goal_admitted = goal_guard.accept_command(vx, vy, wz)
@@ -396,6 +529,7 @@ def run_ros_bridge(config: SimConfig) -> None:
             try:
                 latch_stop(
                     source="navigation_guard",
+                    code="NAVIGATION_GUARD_FAULT",
                     reason=interlock_reason() or "navigation interlock awaiting sustained Nav2 idle",
                 )
             except Exception as exc:
@@ -412,10 +546,7 @@ def run_ros_bridge(config: SimConfig) -> None:
             ),
             now=now,
         )
-        try:
-            send_intent(intent)
-        except Exception as exc:
-            node.get_logger().error(f"failed to deliver Nav2 gait intent: {exc}")
+        deliver_intent(intent, context="Nav2 gait intent")
 
     def control_arm(_request, response):
         """Use one explicit Robot Agent control.acquire to rearm the plant."""
@@ -489,9 +620,16 @@ def run_ros_bridge(config: SimConfig) -> None:
                 now=failed_at,
             )
             try:
-                send_intent(stopped)
-            except Exception:
-                pass
+                latch_stop(
+                    source="sonic_driver",
+                    code="SONIC_UNAVAILABLE",
+                    reason=f"control arm failed closed: {exc}",
+                    stop_intent=stopped,
+                )
+            except Exception as delivery_exc:
+                node.get_logger().error(
+                    f"failed to enforce control-arm stop: {delivery_exc}"
+                )
             response.success = False
             response.message = f"control arm failed closed: {exc}"
             return response
@@ -513,15 +651,90 @@ def run_ros_bridge(config: SimConfig) -> None:
         # The adapter owns command/observation expiry.  Its first timeout tick
         # emits ``stop_requested`` before the driver performs any model mapping.
         intent = gait.tick(now=now)
+        deliver_intent(intent, context="gait watchdog")
+
+    def health_probe():
+        if bridge_fault["reason"] is not None:
+            return
+        request_id = uuid4()
         try:
-            send_intent(intent)
-        except Exception:
-            pass
+            response = request_json(
+                config.command_host,
+                config.command_port,
+                sonic_health_probe(
+                    robot_id=config.robot_id,
+                    producer_boot_id=fault_latch.producer_boot_id,
+                    request_id=request_id,
+                ),
+                timeout=config.sonic_health_probe_timeout_s,
+            )
+            health = SonicHealth.from_response(
+                response,
+                expected_request_id=request_id,
+                expected_robot_id=config.robot_id,
+            )
+        except Exception as exc:
+            try:
+                latch_stop(
+                    source="sonic_driver",
+                    code="SONIC_UNAVAILABLE",
+                    reason=f"SONIC health probe failed: {exc}",
+                    probe_request_id=request_id,
+                )
+            except Exception as delivery_exc:
+                node.get_logger().error(
+                    f"failed to enforce SONIC health-probe stop: {delivery_exc}"
+                )
+            return
+
+        previous_boot = sonic_boot_id["value"]
+        if previous_boot is None:
+            sonic_boot_id["value"] = health.driver_boot_id
+        elif previous_boot != health.driver_boot_id:
+            try:
+                latch_stop(
+                    source="sonic_driver",
+                    code="SONIC_BOOT_CHANGED",
+                    reason=(
+                        "SONIC driver boot identity changed while the ROS "
+                        f"bridge remained active ({previous_boot} -> "
+                        f"{health.driver_boot_id})"
+                    ),
+                    downstream_boot_id=health.driver_boot_id,
+                    probe_request_id=request_id,
+                )
+            except Exception as delivery_exc:
+                node.get_logger().error(
+                    f"failed to enforce SONIC-restart stop: {delivery_exc}"
+                )
+            return
+
+        cause = classify_sonic_health(
+            health,
+            plant_lowstate_stale_s=config.plant_lowstate_stale_s,
+            sonic_control_step_stale_s=config.sonic_control_step_stale_s,
+        )
+        if cause is None:
+            return
+        try:
+            latch_stop(
+                source=cause.source,
+                code=cause.code,
+                reason=cause.reason,
+                downstream_boot_id=health.driver_boot_id,
+                probe_request_id=request_id,
+            )
+        except Exception as delivery_exc:
+            node.get_logger().error(
+                f"failed to enforce SONIC/Plant health stop: {delivery_exc}"
+            )
 
     node.create_timer(min(config.command_timeout_s / 2, 0.1), watchdog)
+    node.create_timer(config.sonic_health_probe_period_s, health_probe)
     node.get_logger().info(
         f"H-IDE MuJoCo SONIC bridge listening to {config.cmd_vel_topic} "
-        f"and {config.nav_path_topic} on ROS domain {config.ros_domain_id}"
+        f"and {config.nav_path_topic} on ROS domain {config.ros_domain_id}; "
+        f"faults publish on {config.motion_fault_topic}"
     )
     try:
         rclpy.spin(node)

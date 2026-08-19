@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import re
 from typing import Any
 
 import yaml
@@ -23,6 +24,7 @@ class SimConfig:
     odom_topic: str
     localization_topic: str
     nav_path_topic: str
+    motion_fault_topic: str
     lowstate_topic: str
     lowcmd_topic: str
     telemetry_host: str
@@ -33,6 +35,10 @@ class SimConfig:
     command_host: str
     command_bind_host: str
     command_port: int
+    sonic_health_probe_period_s: float
+    sonic_health_probe_timeout_s: float
+    plant_lowstate_stale_s: float
+    sonic_control_step_stale_s: float
     docker_observation_bind_host: str | None
     max_linear_mps: float
     min_walk_command_mps: float
@@ -74,8 +80,12 @@ class SimConfig:
         required = {
             "schema_version", "robot_id", "robot_profile", "localization_epoch_id", "ros_domain_id",
             "interface", "cmd_vel_topic", "odom_topic", "localization_topic", "nav_path_topic",
+            "motion_fault_topic",
             "lowstate_topic", "lowcmd_topic", "telemetry_host", "telemetry_port",
-            "command_host", "command_port", "plant_port", "max_linear_mps", "min_walk_command_mps", "max_angular_rps",
+            "command_host", "command_port", "plant_port",
+            "sonic_health_probe_period_s", "sonic_health_probe_timeout_s",
+            "plant_lowstate_stale_s", "sonic_control_step_stale_s",
+            "max_linear_mps", "min_walk_command_mps", "max_angular_rps",
             "max_facing_lead_rad", "max_translation_facing_offset_rad",
             "max_translation_heading_error_rad", "translation_heading_violation_s",
             "max_spin_reverse_rad", "max_spin_translation_m",
@@ -93,6 +103,46 @@ class SimConfig:
             raise ValueError(f"simulation config is missing: {', '.join(missing)}")
         if raw["ros_domain_id"] == 231:
             raise ValueError("simulation ROS domain 232 must stay isolated from live domain 231")
+        motion_fault_topic = str(raw["motion_fault_topic"])
+        if not re.fullmatch(
+            r"/(?:[A-Za-z_][A-Za-z0-9_]*/)*[A-Za-z_][A-Za-z0-9_]*",
+            motion_fault_topic,
+        ):
+            raise ValueError("motion_fault_topic must be an absolute ROS topic")
+        health_probe_period_s = float(raw["sonic_health_probe_period_s"])
+        health_probe_timeout_s = float(raw["sonic_health_probe_timeout_s"])
+        plant_lowstate_stale_s = float(raw["plant_lowstate_stale_s"])
+        sonic_control_step_stale_s = float(raw["sonic_control_step_stale_s"])
+        if not 0 < health_probe_period_s <= 0.05:
+            raise ValueError("sonic_health_probe_period_s must be in (0, 0.05]")
+        if not 0 < health_probe_timeout_s <= min(0.05, health_probe_period_s):
+            raise ValueError(
+                "sonic_health_probe_timeout_s must be positive and no greater "
+                "than the probe period"
+            )
+        control_hz = int(raw["control_hz"])
+        if control_hz <= 0:
+            raise ValueError("control_hz must be positive")
+        if not 2.0 / control_hz <= plant_lowstate_stale_s <= 0.10:
+            raise ValueError(
+                "plant_lowstate_stale_s must cover at least two control periods "
+                "and must not exceed 0.10s"
+            )
+        if not 2.0 / control_hz <= sonic_control_step_stale_s <= 0.10:
+            raise ValueError(
+                "sonic_control_step_stale_s must cover at least two control "
+                "periods and must not exceed 0.10s"
+            )
+        if (
+            max(plant_lowstate_stale_s, sonic_control_step_stale_s)
+            + health_probe_period_s
+            + health_probe_timeout_s
+            >= 0.30
+        ):
+            raise ValueError(
+                "motion health detection must remain below the 0.30s "
+                "Robot Agent cancellation budget"
+            )
         if not 0 < float(raw["command_timeout_s"]):
             raise ValueError("command_timeout_s must be positive")
         if float(raw["motion_handoff_warmup_s"]) < 0:
@@ -173,6 +223,7 @@ class SimConfig:
             odom_topic=str(raw["odom_topic"]),
             localization_topic=str(raw["localization_topic"]),
             nav_path_topic=str(raw["nav_path_topic"]),
+            motion_fault_topic=motion_fault_topic,
             lowstate_topic=str(raw["lowstate_topic"]),
             lowcmd_topic=str(raw["lowcmd_topic"]),
             telemetry_host=str(raw["telemetry_host"]),
@@ -183,6 +234,10 @@ class SimConfig:
             command_host=str(raw["command_host"]),
             command_bind_host=command_bind_host,
             command_port=int(raw["command_port"]),
+            sonic_health_probe_period_s=health_probe_period_s,
+            sonic_health_probe_timeout_s=health_probe_timeout_s,
+            plant_lowstate_stale_s=plant_lowstate_stale_s,
+            sonic_control_step_stale_s=sonic_control_step_stale_s,
             docker_observation_bind_host=docker_observation_bind_host,
             max_linear_mps=float(raw["max_linear_mps"]),
             min_walk_command_mps=float(raw["min_walk_command_mps"]),
@@ -203,7 +258,7 @@ class SimConfig:
             command_timeout_s=float(raw["command_timeout_s"]),
             motion_handoff_warmup_s=float(raw["motion_handoff_warmup_s"]),
             motion_handoff_blend_s=float(raw["motion_handoff_blend_s"]),
-            control_hz=int(raw["control_hz"]),
+            control_hz=control_hz,
             camera_hz=int(raw["camera_hz"]),
             observation_hz=int(raw["observation_hz"]),
             observation_jpeg_quality=observation_jpeg_quality,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import threading
 from types import SimpleNamespace
+from uuid import UUID
 
 import pytest
 
@@ -16,8 +17,15 @@ from hide_mujoco_sonic.ros_bridge import (
     _intent_payload,
     _ros_stamp_in_monotonic_domain,
 )
+from hide_mujoco_sonic.motion_fault import SonicHealth, sonic_health_probe
 from hide_mujoco_sonic.safety import PlantControlClock, PlantTickGuard
-from hide_mujoco_sonic.sonic_driver import SonicDriver, SonicIntentIngress
+from hide_mujoco_sonic.sonic_driver import (
+    SonicDriver,
+    SonicIntentIngress,
+    _bind_command_server,
+    _handle_command_connection,
+)
+from hide_mujoco_sonic.transport import request_json, send_json
 
 
 class Clock:
@@ -292,7 +300,8 @@ class FakeTelemetry:
 
 def bare_driver(clock: Clock) -> SonicDriver:
     driver = SonicDriver.__new__(SonicDriver)
-    driver.config = SimpleNamespace(plant_port=8794)
+    driver.config = SimpleNamespace(plant_port=8794, robot_id="g1-sim")
+    driver._driver_boot_id = UUID("30000000-0000-4000-8000-000000000003")
     driver.guard = FakeGuard()
     driver.telemetry = FakeTelemetry()
     driver._intent_ingress = SonicIntentIngress(clock=clock, max_age_s=0.5)
@@ -317,6 +326,7 @@ def bare_driver(clock: Clock) -> SonicDriver:
     driver._wall_clock = clock
     driver._control_clock_armed_at_wall_s = None
     driver._last_lowstate_wall_s = None
+    driver._last_control_step_wall_s = None
     driver._lowstate_stall_timeout_s = 1.0
     driver._stop = threading.Event()
     driver._support_lock = threading.RLock()
@@ -332,6 +342,111 @@ def bare_driver(clock: Clock) -> SonicDriver:
     )
     driver._arm_guard = SimpleNamespace(reset=lambda: None)
     return driver
+
+
+def test_sonic_health_probe_is_strict_read_only_and_reports_terminal_fault() -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    driver._last_lowstate_wall_s = clock.value - 0.02
+    driver._last_control_step_wall_s = clock.value - 0.01
+    producer_boot = UUID("20000000-0000-4000-8000-000000000002")
+    request_id = UUID("40000000-0000-4000-8000-000000000004")
+    probe = sonic_health_probe(
+        robot_id="g1-sim",
+        producer_boot_id=producer_boot,
+        request_id=request_id,
+    )
+    telemetry_before = dict(driver.telemetry.values)
+    guard_before = (list(driver.guard.accepted), list(driver.guard.stops))
+
+    response = driver.accept_json(probe)
+    assert response is not None
+    ready = SonicHealth.from_response(
+        {"request_id": str(request_id), "ok": True, **response},
+        expected_request_id=request_id,
+        expected_robot_id="g1-sim",
+    )
+    assert ready.status == "ready"
+    assert ready.motion_ready is True
+    assert ready.last_lowstate_age_s == pytest.approx(0.02)
+    assert ready.last_control_step_age_s == pytest.approx(0.01)
+    assert driver.telemetry.values == telemetry_before
+    assert (driver.guard.accepted, driver.guard.stops) == guard_before
+
+    driver._terminal_fault_reason = "MuJoCo plant tick rolled back"
+    driver._fault_latched.set()
+    terminal_response = driver.accept_json(probe)
+    assert terminal_response is not None
+    terminal = SonicHealth.from_response(
+        {"request_id": str(request_id), "ok": True, **terminal_response},
+        expected_request_id=request_id,
+        expected_robot_id="g1-sim",
+    )
+    assert terminal.status == "fault"
+    assert terminal.terminal_fault is True
+    assert terminal.motion_ready is False
+    assert terminal.reason == "MuJoCo plant tick rolled back"
+    assert driver.telemetry.values == telemetry_before
+    assert (driver.guard.accepted, driver.guard.stops) == guard_before
+
+
+def test_adjacent_intent_and_health_probe_fit_the_20ms_loopback_budget() -> None:
+    clock = Clock()
+    adapter, _ = runtime(clock)
+    driver = bare_driver(clock)
+    driver._last_lowstate_wall_s = clock.value - 0.01
+    driver._last_control_step_wall_s = clock.value - 0.01
+    server = _bind_command_server("127.0.0.1", 0)
+    port = int(server.getsockname()[1])
+    failures: list[Exception] = []
+
+    def serve_two_connections() -> None:
+        try:
+            for _ in range(2):
+                conn, _address = server.accept()
+                with conn:
+                    _handle_command_connection(driver, conn)
+        except Exception as exc:
+            failures.append(exc)
+
+    worker = threading.Thread(target=serve_two_connections, daemon=True)
+    worker.start()
+    request_id = UUID("50000000-0000-4000-8000-000000000005")
+    try:
+        send_json(
+            "127.0.0.1",
+            port,
+            _intent_payload(
+                adapter.tick(now=clock.value),
+                measured_heading_yaw=0.0,
+            ),
+            timeout=0.020,
+        )
+        response = request_json(
+            "127.0.0.1",
+            port,
+            sonic_health_probe(
+                robot_id="g1-sim",
+                producer_boot_id=UUID(
+                    "20000000-0000-4000-8000-000000000002"
+                ),
+                request_id=request_id,
+            ),
+            timeout=0.020,
+        )
+    finally:
+        worker.join(timeout=1.0)
+        server.close()
+
+    assert worker.is_alive() is False
+    assert failures == []
+    parsed = SonicHealth.from_response(
+        response,
+        expected_request_id=request_id,
+        expected_robot_id="g1-sim",
+    )
+    assert parsed.status == "ready"
+    assert driver._intent_ingress.armed is True
 
 
 def test_driver_obeys_stop_before_model_guard_mapping() -> None:

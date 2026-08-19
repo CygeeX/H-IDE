@@ -8,6 +8,7 @@ cmd_vel_topic: /cmd_vel
 odom_topic: /odom
 localization_topic: /localization/pose
 nav_path_topic: /plan
+motion_fault_topic: /h_ide/g1_sim/motion_safety_fault
 lowstate_topic: rt/lowstate
 lowcmd_topic: rt/lowcmd
 telemetry_host: 127.0.0.1
@@ -15,6 +16,13 @@ telemetry_port: 8792
 plant_port: 8794
 command_host: 127.0.0.1
 command_port: 8793
+# Read-only checks remain on the existing loopback command boundary. These
+# bounds leave ample time for Robot Agent to cancel its exact Nav2 goal within
+# the 300 ms end-to-end safety budget.
+sonic_health_probe_period_s: 0.025
+sonic_health_probe_timeout_s: 0.020
+plant_lowstate_stale_s: 0.10
+sonic_control_step_stale_s: 0.10
 max_linear_mps: 0.25
 min_walk_command_mps: 0.10
 max_angular_rps: 0.25
