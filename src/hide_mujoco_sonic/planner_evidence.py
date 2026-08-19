@@ -22,6 +22,13 @@ from .safety import MovementIntent
 
 
 _MIN_DIRECTIONAL_PROJECTION_M = 1e-4
+# The locked planner_sonic.onnx revision 9c0ff22 nominal-context baseline
+# produced 0.004016 rad of root-yaw drift for a zero facing request, while the
+# smallest explicitly verified +/-0.05 rad requests produced
+# -0.037168/+0.047419 rad. Keep a conservative deadband between those
+# observations so planner noise cannot be mistaken for evidence that a pure
+# Nav2 rotation is turning the requested way.
+_MIN_MEANINGFUL_YAW_RAD = 0.01
 
 
 class PlannerReferenceDeadlineExceeded(RuntimeError):
@@ -57,6 +64,7 @@ class _RequestEvidence:
     gen_frame: int | None
     matches_intent: bool
     requested_direction: tuple[float, float] | None
+    requested_facing_angle_rad: float | None
 
 
 class PlannerReferenceEvidenceGate:
@@ -68,10 +76,11 @@ class PlannerReferenceEvidenceGate:
     translational intents its predicted root displacement must also have a
     strictly positive projection on the requested direction.
 
-    A pure Nav2 rotation has no requested root translation vector.  It still
-    requires a generation-matched new plan, while its predicted root direction
-    and displacement remain observable rather than being interpreted as a
-    translation contract.
+    A pure Nav2 rotation has no requested root translation vector.  It requires
+    both a generation-matched plan and meaningful root-yaw motion whose shortest
+    signed delta agrees with the requested facing change.  Translational plans
+    retain their root-projection contract; yaw remains diagnostic for them and
+    never replaces that projection gate.
     """
 
     def __init__(self, *, required_timeout_s: float = 0.75) -> None:
@@ -93,6 +102,9 @@ class PlannerReferenceEvidenceGate:
         self._predicted_direction: tuple[float, float] | None = None
         self._predicted_projection_m: float | None = None
         self._direction_consistent: bool | None = None
+        self._requested_yaw_error_rad: float | None = None
+        self._predicted_yaw_delta_rad: float | None = None
+        self._yaw_consistent: bool | None = None
         self._required_started_at_s: float | None = None
         self._reason = "no Nav2 motion intent"
 
@@ -209,6 +221,9 @@ class PlannerReferenceEvidenceGate:
             self._predicted_direction = None
             self._predicted_projection_m = None
             self._direction_consistent = None
+            self._requested_yaw_error_rad = None
+            self._predicted_yaw_delta_rad = None
+            self._yaw_consistent = None
             self._required_started_at_s = started_at
             self._reason = "awaiting a matching SONIC planner reference"
 
@@ -337,6 +352,15 @@ class PlannerReferenceEvidenceGate:
                 raise ValueError
         except (AttributeError, TypeError, ValueError):
             gen_frame = None
+        try:
+            facing = tuple(float(value) for value in ms.facing_direction)
+            if len(facing) < 2 or not all(
+                math.isfinite(value) for value in facing[:2]
+            ):
+                raise ValueError
+            requested_facing_angle_rad = math.atan2(facing[1], facing[0])
+        except (AttributeError, TypeError, ValueError):
+            requested_facing_angle_rad = None
 
         with self._lock:
             self._request_counter += 1
@@ -356,6 +380,7 @@ class PlannerReferenceEvidenceGate:
                 requested_direction=(
                     None if intent is None else intent.requested_direction
                 ),
+                requested_facing_angle_rad=requested_facing_angle_rad,
             )
             self._latest_request = request
             if gen_frame is not None:
@@ -410,6 +435,85 @@ class PlannerReferenceEvidenceGate:
             projection,
             projection > _MIN_DIRECTIONAL_PROJECTION_M,
         )
+
+    @staticmethod
+    def _wrap_angle(value: float) -> float:
+        return (float(value) + math.pi) % (2.0 * math.pi) - math.pi
+
+    @staticmethod
+    def _quaternion_yaw(value: object) -> float:
+        """Extract yaw from one finite, non-degenerate scalar-first quaternion."""
+
+        try:
+            quaternion = tuple(float(component) for component in value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "planner root quaternion is not a numeric wxyz vector"
+            ) from exc
+        if len(quaternion) != 4 or not all(
+            math.isfinite(component) for component in quaternion
+        ):
+            raise ValueError("planner root quaternion must contain four finite values")
+        norm = math.sqrt(sum(component * component for component in quaternion))
+        if norm <= 1e-12:
+            raise ValueError("planner root quaternion must be non-degenerate")
+        w, x, y, z = (component / norm for component in quaternion)
+        yaw = math.atan2(
+            2.0 * (x * y + w * z),
+            1.0 - 2.0 * (y * y + z * z),
+        )
+        if not math.isfinite(yaw):
+            raise ValueError("planner root quaternion produced a non-finite yaw")
+        return yaw
+
+    @classmethod
+    def _predicted_root_yaw(
+        cls,
+        motion: object,
+        requested_facing_angle_rad: float | None,
+    ) -> tuple[float, float, bool | None]:
+        """Return shortest requested/output yaw deltas and their direction match."""
+
+        if requested_facing_angle_rad is None or not math.isfinite(
+            requested_facing_angle_rad
+        ):
+            raise ValueError("planner request has no usable facing angle")
+        try:
+            timesteps = int(motion.timesteps)
+            quaternions = motion.body_quaternions
+            first_quaternion = quaternions[0]
+            last_quaternion = quaternions[timesteps - 1]
+        except (AttributeError, IndexError, TypeError, ValueError) as exc:
+            raise ValueError("planner motion has no usable root yaw trajectory") from exc
+        if timesteps < 2:
+            raise ValueError("planner motion has no usable root yaw trajectory")
+        first_yaw = cls._quaternion_yaw(first_quaternion)
+        last_yaw = cls._quaternion_yaw(last_quaternion)
+        requested_error = cls._wrap_angle(
+            requested_facing_angle_rad - first_yaw
+        )
+        predicted_delta = cls._wrap_angle(last_yaw - first_yaw)
+        if abs(requested_error) <= _MIN_MEANINGFUL_YAW_RAD:
+            consistent: bool | None = None
+        elif abs(predicted_delta) <= _MIN_MEANINGFUL_YAW_RAD:
+            consistent = False
+        else:
+            consistent = requested_error * predicted_delta > 0.0
+        return requested_error, predicted_delta, consistent
+
+    def _store_rejected_yaw_locked(
+        self,
+        requested_error: float | None,
+        predicted_delta: float | None,
+        consistent: bool | None,
+    ) -> None:
+        """Expose a rejected required candidate without erasing proven refresh evidence."""
+
+        if self._has_current_reference_locked():
+            return
+        self._requested_yaw_error_rad = requested_error
+        self._predicted_yaw_delta_rad = predicted_delta
+        self._yaw_consistent = consistent
 
     def _accept_result(self, result: object) -> bool:
         try:
@@ -478,12 +582,67 @@ class PlannerReferenceEvidenceGate:
                 return self._reject_result_locked(
                     "planner root projection opposes or does not realize the Nav2 direction"
                 )
+            requested_yaw_error: float | None = None
+            predicted_yaw_delta: float | None = None
+            yaw_consistent: bool | None = None
+            try:
+                (
+                    requested_yaw_error,
+                    predicted_yaw_delta,
+                    yaw_consistent,
+                ) = self._predicted_root_yaw(
+                    motion,
+                    request.requested_facing_angle_rad,
+                )
+            except ValueError as exc:
+                if request.requested_direction is None:
+                    self._store_rejected_yaw_locked(None, None, False)
+                    return self._reject_result_locked(str(exc))
+                # Translation authority remains its positive root projection;
+                # missing yaw is diagnostic only and cannot weaken that gate.
+            if request.requested_direction is None:
+                if (
+                    requested_yaw_error is None
+                    or abs(requested_yaw_error) <= _MIN_MEANINGFUL_YAW_RAD
+                ):
+                    self._store_rejected_yaw_locked(
+                        requested_yaw_error,
+                        predicted_yaw_delta,
+                        False,
+                    )
+                    return self._reject_result_locked(
+                        "pure-rotation planner request has no meaningful yaw error"
+                    )
+                if (
+                    predicted_yaw_delta is None
+                    or abs(predicted_yaw_delta) <= _MIN_MEANINGFUL_YAW_RAD
+                ):
+                    self._store_rejected_yaw_locked(
+                        requested_yaw_error,
+                        predicted_yaw_delta,
+                        False,
+                    )
+                    return self._reject_result_locked(
+                        "pure-rotation planner output has no meaningful root yaw"
+                    )
+                if yaw_consistent is not True:
+                    self._store_rejected_yaw_locked(
+                        requested_yaw_error,
+                        predicted_yaw_delta,
+                        False,
+                    )
+                    return self._reject_result_locked(
+                        "planner root yaw opposes the pure-rotation request"
+                    )
             self._predicted_direction = direction
             self._predicted_projection_m = projection
             self._direction_consistent = True
+            self._requested_yaw_error_rad = requested_yaw_error
+            self._predicted_yaw_delta_rad = predicted_yaw_delta
+            self._yaw_consistent = yaw_consistent
             self._accepted_request = request
             self._reference_ready = True
-            self._reason = "matching direction-consistent planner reference accepted"
+            self._reason = "matching planner reference evidence accepted"
             return True
 
     def telemetry_fields(self, *, ref_cursor: int | None) -> dict[str, Any]:
@@ -556,6 +715,13 @@ class PlannerReferenceEvidenceGate:
                     self._predicted_projection_m
                 ),
                 "sonic_planner_direction_consistent": self._direction_consistent,
+                "sonic_planner_requested_yaw_error_rad": (
+                    self._requested_yaw_error_rad
+                ),
+                "sonic_planner_predicted_yaw_delta_rad": (
+                    self._predicted_yaw_delta_rad
+                ),
+                "sonic_planner_yaw_consistent": self._yaw_consistent,
                 "sonic_planner_evidence_reason": self._reason,
             }
 

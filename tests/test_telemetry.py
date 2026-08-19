@@ -64,6 +64,9 @@ def test_joint_fault_trace_is_bounded_named_and_strict_json(tmp_path):
                 "planner_predicted_root_direction_x": 1.0,
                 "planner_predicted_root_direction_y": 0.0,
                 "planner_predicted_root_projection_m": 0.4,
+                "planner_requested_yaw_error_rad": 0.10,
+                "planner_predicted_yaw_delta_rad": 0.08,
+                "planner_yaw_consistent": True,
             },
             handoff_ratio=0.5,
             plant_support_mode="locomotion",
@@ -89,6 +92,13 @@ def test_joint_fault_trace_is_bounded_named_and_strict_json(tmp_path):
     assert payload["samples"][-1]["intent"][
         "planner_predicted_root_projection_m"
     ] == 0.4
+    assert payload["samples"][-1]["intent"][
+        "planner_requested_yaw_error_rad"
+    ] == 0.1
+    assert payload["samples"][-1]["intent"][
+        "planner_predicted_yaw_delta_rad"
+    ] == 0.08
+    assert payload["samples"][-1]["intent"]["planner_yaw_consistent"] is True
     assert payload["gains"] == {"kp": [10.0, 20.0], "kd": [1.0, 2.0]}
 
     path = trace.persist(tmp_path / "sonic-fault-trace.json", payload)

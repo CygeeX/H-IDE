@@ -79,6 +79,10 @@ non-semantic integrity manifest.
   still absent after `planner_reference_timeout_s` of MuJoCo time, SONIC enters
   a terminal exact-target hold. A bad periodic refresh is discarded without
   revoking the currently proven reference.
+* Pure rotations additionally require the planned root quaternion trajectory
+  to contain a meaningful shortest yaw delta with the same sign as the
+  requested facing error. Translation continues to use root projection as its
+  authority gate; its yaw evidence is recorded for diagnosis only.
 * A Nav2 angular-only `cmd_vel` selects SONIC's zero-translation facing-change
   plan.  Rotation is therefore still owned by Nav2 and never by a direct motor
   or head command.
@@ -156,8 +160,9 @@ The service exposes a small local telemetry endpoint for the H-IDE adapter at
 read-only observation surface.  H-IDE's simulation API can proxy this status
 and show whether the real MuJoCo/SONIC chain is running.  Planner-evidence
 fields expose the current intent generation/signature, request and accepted
-generations, reference cursor, and predicted root direction/projection.  The
-same fields are copied into every bounded pre-fault control-trace sample.
+generations, reference cursor, predicted root direction/projection, and the
+requested/predicted root-yaw deltas. The same fields are copied into every
+bounded pre-fault control-trace sample.
 
 ## Acceptance gate before deleting the old deterministic backend
 

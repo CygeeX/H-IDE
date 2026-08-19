@@ -50,6 +50,9 @@ class TelemetryState:
     sonic_planner_predicted_root_direction_y: float | None = None
     sonic_planner_predicted_root_projection_m: float | None = None
     sonic_planner_direction_consistent: bool | None = None
+    sonic_planner_requested_yaw_error_rad: float | None = None
+    sonic_planner_predicted_yaw_delta_rad: float | None = None
+    sonic_planner_yaw_consistent: bool | None = None
     sonic_planner_evidence_reason: str = "no Nav2 motion intent"
     last_cmd_vx: float = 0.0
     last_cmd_vy: float = 0.0
