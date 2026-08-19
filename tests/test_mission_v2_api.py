@@ -787,10 +787,40 @@ def test_mission_v2_http_flow_is_approved_and_event_driven() -> None:
         assert started.status_code == 200, started.text
         assert started.json()["snapshot"]["status"] == "ready"
 
+        # A semantic label is never sufficient authority for base motion.  The
+        # happy-path fixture must bind the reviewed label to a trusted map
+        # pose, exactly as scene teaching / RGB-D geometry would do in the
+        # product, before the runtime may issue NavigateToPose.
+        trusted_target = client.post(
+            f"/api/v2/missions/{draft_id}/world-records",
+            headers=headers(),
+            json={
+                "recordId": "record-kitchen-target-1",
+                "robotId": "robot-1",
+                "kind": "fact",
+                "subject": "厨房",
+                "predicate": "target_pose",
+                "value": {
+                    "goalPose": {
+                        "frameId": "map",
+                        "x": 1.5,
+                        "y": 0.5,
+                        "z": 0.0,
+                        "yaw": 0.0,
+                    }
+                },
+                "source": "operator",
+                "sourceRef": "operator-reviewed-kitchen-1",
+                "confidence": 1.0,
+                "observedAt": utc_now().isoformat(),
+                "frameId": "map",
+            },
+        )
+        assert trusted_target.status_code == 200, trusted_target.text
+
         issued = client.post(
             f"/api/v2/missions/{draft_id}/nodes/navigate-kitchen/skill-requests",
             headers=headers(),
-            json={"input": {"targetRef": "semantic:kitchen"}},
         )
         assert issued.status_code == 202, issued.text
         skill_request = issued.json()["request"]
@@ -811,7 +841,7 @@ def test_mission_v2_http_flow_is_approved_and_event_driven() -> None:
         assert completed.status_code == 200, completed.text
         mission = completed.json()
         assert mission["snapshot"]["status"] == "completed"
-        assert [event["sequence"] for event in mission["events"]] == [1, 2, 3, 4, 5]
+        assert [event["sequence"] for event in mission["events"]] == [1, 2, 3, 4, 5, 6]
 
 
 def test_mission_v2_rejects_duplicate_approval_and_qwen_fact() -> None:
@@ -989,13 +1019,6 @@ def test_mission_v2_visual_skill_keeps_qwen_hypothesis_separate_from_geometry_fa
         issued = client.post(
             f"/api/v2/missions/{draft_id}/nodes/observe-target/skill-requests",
             headers=headers(),
-            json={
-                "input": {
-                    "mode": "object_approach",
-                    "instruction": "找到银白色机器人并计算旁边的安全目标点",
-                    "targetDescription": "银白色机器人",
-                }
-            },
         )
         assert issued.status_code == 202, issued.text
         response = issued.json()
@@ -1074,23 +1097,56 @@ def test_mission_v2_dispatches_reviewed_pose_only_through_robot_agent_nav2(
             headers=headers(),
         ).status_code == 200
 
-        issued = client.post(
+        injected = client.post(
             f"/api/v2/missions/{draft_id}/nodes/navigate-kitchen/skill-requests",
             headers=headers(),
             json={
                 "input": {
-                    "payloadType": "visual_resolution",
                     "goalPose": {
+                        "frameId": "map",
+                        "x": 99.0,
+                        "y": 99.0,
+                        "z": 0.0,
+                        "yaw": 0.0,
+                    }
+                }
+            },
+        )
+        assert injected.status_code == 422
+        assert "server-owned" in injected.json()["detail"]
+        assert driver.dispatches == []
+
+        trusted_target = client.post(
+            f"/api/v2/missions/{draft_id}/world-records",
+            headers=headers(),
+            json={
+                "recordId": "record-live-kitchen-target-1",
+                "robotId": "robot-1",
+                "kind": "fact",
+                "subject": "厨房",
+                "predicate": "target_pose",
+                "value": {
+                    "targetPose": {
                         "frameId": "map",
                         "x": 1.5,
                         "y": 0.25,
                         "z": 0,
                         "yaw": 0.1,
-                    },
-                    "goalPurpose": "final",
-                    "visualResolutionId": "visual-resolution-1",
-                }
+                    }
+                },
+                "source": "geometry",
+                "sourceRef": "visual-resolution-1",
+                "confidence": 1.0,
+                "observedAt": utc_now().isoformat(),
+                "frameId": "map",
+                "evidenceIds": ["visual-evidence-1"],
             },
+        )
+        assert trusted_target.status_code == 200, trusted_target.text
+
+        issued = client.post(
+            f"/api/v2/missions/{draft_id}/nodes/navigate-kitchen/skill-requests",
+            headers=headers(),
         )
         assert issued.status_code == 202, issued.text
         response = issued.json()

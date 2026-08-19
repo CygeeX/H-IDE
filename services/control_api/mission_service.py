@@ -2156,6 +2156,27 @@ class MissionService:
                 )
         return completed
 
+    def issue_resolved_skill(self, mission_id: str, node_id: str) -> dict[str, Any]:
+        """Issue one node using only server-derived, reviewed skill input.
+
+        The HTTP compatibility endpoint used to accept an arbitrary ``input``
+        object after PlanDraft approval.  That allowed a caller to replace a
+        reviewed navigation target without creating a PlanRevision.  Keep the
+        one-node developer operation, but resolve its payload from the active
+        revision and trusted WorldRecords exactly like :meth:`advance`.
+        """
+
+        record = self.runtime.get(mission_id)
+        revision = PlanRevision.model_validate(record["activeRevision"])
+        node = next((item for item in revision.nodes if item.nodeId == node_id), None)
+        if node is None:
+            raise MissionServiceError("mission node not found")
+        return self.issue_skill(
+            mission_id,
+            node_id,
+            self._build_node_input(record, node),
+        )
+
     def issue_skill(self, mission_id: str, node_id: str, input: Mapping[str, Any]) -> dict[str, Any]:
         mission = self.runtime.get(mission_id)
         plan = MissionPlanDraft.model_validate(mission["plan"])

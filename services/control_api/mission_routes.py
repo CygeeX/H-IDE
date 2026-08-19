@@ -155,11 +155,15 @@ def create_mission_router(service: MissionService, token: str | None = None) -> 
         status_code=status.HTTP_202_ACCEPTED,
     )
     def issue_skill(mission_id: str, node_id: str, body: dict[str, Any] | None = None):
-        payload = body or {}
-        skill_input = payload.get("input", payload)
-        if not isinstance(skill_input, dict):
-            raise HTTPException(status_code=422, detail="input must be an object")
-        return invoke(lambda: service.issue_skill(mission_id, node_id, skill_input))
+        if body:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "skill input is server-owned; update the PlanDraft/WorldRecord "
+                    "and issue the reviewed node without an input body"
+                ),
+            )
+        return invoke(lambda: service.issue_resolved_skill(mission_id, node_id))
 
     @router.post("/missions/{mission_id}/skill-progress", dependencies=dependencies)
     def report_progress(mission_id: str, body: dict[str, Any]):
