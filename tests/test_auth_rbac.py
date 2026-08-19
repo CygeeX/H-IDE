@@ -51,17 +51,23 @@ def test_auth_migration_is_expand_only_versioned_and_idempotent(tmp_path) -> Non
 
     first = SQLiteStore(str(db_path))
     assert first.get_robot("legacy-robot")["sentinel"] == "preserved"
-    assert first.schema_migrations() == [
+    migrations = first.schema_migrations()
+    assert migrations == [
         {
             "version": 1,
             "name": "assistant_v2_auth_rbac",
-            "appliedAt": first.schema_migrations()[0]["appliedAt"],
-        }
+            "appliedAt": migrations[0]["appliedAt"],
+        },
+        {
+            "version": 2,
+            "name": "assistant_v2_conversation_gateway",
+            "appliedAt": migrations[1]["appliedAt"],
+        },
     ]
     first.close()
 
     reopened = SQLiteStore(str(db_path))
-    assert len(reopened.schema_migrations()) == 1
+    assert len(reopened.schema_migrations()) == 2
     assert reopened.get_robot("legacy-robot")["sentinel"] == "preserved"
     tables = {
         row[0]
@@ -69,7 +75,14 @@ def test_auth_migration_is_expand_only_versioned_and_idempotent(tmp_path) -> Non
             "SELECT name FROM sqlite_master WHERE type='table'"
         ).fetchall()
     }
-    assert {"schema_migrations", "users", "sessions", "login_audits", "resource_acl"} <= tables
+    assert {
+        "schema_migrations",
+        "users",
+        "sessions",
+        "login_audits",
+        "resource_acl",
+        "assistant_turn_events",
+    } <= tables
     reopened.close()
 
 

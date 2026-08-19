@@ -1,0 +1,342 @@
+from __future__ import annotations
+
+import time
+from typing import Any, Mapping
+
+import httpx
+import pytest
+from fastapi.testclient import TestClient
+from pydantic import ValidationError
+
+from packages.control_core.assistant_models import (
+    ConversationGatewayResult,
+    ConversationIntent,
+    ConversationTurnRequest,
+    ConversationTurnResponse,
+)
+from services.control_api.conversation_client import MastraConversationClient
+from services.control_api.conversation_gateway import ConversationGateway
+from services.control_api.main import create_app
+
+
+TOKEN = "conversation-v2-test-token"
+PASSWORD = "correct horse battery staple"
+
+
+def auth() -> dict[str, str]:
+    return {"Authorization": f"Bearer {TOKEN}"}
+
+
+class RoutedConversationClient:
+    configured = True
+
+    def __init__(self, selector=None):
+        self.selector = selector
+        self.requests: list[ConversationTurnRequest] = []
+
+    def route_turn(self, request: ConversationTurnRequest) -> ConversationTurnResponse:
+        self.requests.append(request)
+        if self.selector is not None:
+            intent, message = self.selector(request)
+        else:
+            intent, message = ConversationIntent.SOCIAL_CHAT, "你好，很高兴见到你。"
+        needs_robot = intent in {
+            ConversationIntent.ROBOT_OBSERVE,
+            ConversationIntent.ROBOT_ACTION,
+            ConversationIntent.SCENE_TEACH,
+        }
+        return ConversationTurnResponse(
+            schemaVersion="h-ide.conversation-result/2",
+            conversationId=request.conversationId,
+            robotId=request.robotId,
+            intent=intent,
+            assistantMessage=message,
+            needsRobot=needs_robot,
+            shouldCreateMission=intent is ConversationIntent.ROBOT_ACTION,
+        )
+
+
+class VisualFixture:
+    def __init__(self):
+        self.requests: list[dict[str, Any]] = []
+
+    def analyze(self, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        payload = dict(request)
+        self.requests.append(payload)
+        return {
+            "schemaVersion": "h-ide.visual-result/2",
+            "analysisId": "analysis-readonly-1",
+            "requestId": payload["requestId"],
+            "requestSha256": "a" * 64,
+            "missionId": payload["missionId"],
+            "revisionId": payload["revisionId"],
+            "nodeId": payload["nodeId"],
+            "attempt": 1,
+            "mode": "scene_description",
+            "status": "succeeded",
+            "source": "qwen",
+            "versions": {},
+            "hypotheses": [],
+            "geometryCandidates": [],
+            "observationSummary": "我看到一张会议桌和两把椅子。",
+            "evidence": [
+                {
+                    "evidenceId": "evidence-rgb-1",
+                    "kind": "input_rgb",
+                    "sha256": "b" * 64,
+                }
+            ],
+            "warnings": [],
+        }
+
+    def get_evidence(self, analysis_id: str, sha256: str):
+        del analysis_id, sha256
+        return b"fixture", "image/jpeg"
+
+
+def wait_turn(client: TestClient, task_id: str) -> dict[str, Any]:
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        response = client.get(f"/api/v1/assistant/turns/{task_id}", headers=auth())
+        assert response.status_code == 200, response.text
+        turn = response.json()
+        if turn["status"] not in {"queued", "running"}:
+            return turn
+        time.sleep(0.01)
+    raise AssertionError("assistant turn did not finish")
+
+
+def test_typed_http_client_uses_internal_v2_endpoint_and_validates_flags(monkeypatch):
+    calls = []
+
+    def post(url, **kwargs):
+        calls.append((url, kwargs))
+        return httpx.Response(
+            200,
+            json={
+                "schemaVersion": "h-ide.conversation-result/2",
+                "conversationId": "conversation-1",
+                "intent": "GENERAL_QA",
+                "assistantMessage": "4",
+                "needsRobot": False,
+                "shouldCreateMission": False,
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx, "post", post)
+    request = ConversationTurnRequest(
+        conversationId="conversation-1",
+        text="2+2 等于多少？",
+    )
+    response = MastraConversationClient("http://planning-agent:4111", "secret").route_turn(
+        request
+    )
+
+    assert response.intent is ConversationIntent.GENERAL_QA
+    assert calls[0][0].endswith("/internal/v2/conversation-turns")
+    assert calls[0][1]["trust_env"] is False
+    assert calls[0][1]["json"].get("robotId") is None
+
+
+def test_gateway_only_robot_action_can_create_a_mission_draft():
+    calls = []
+    client = RoutedConversationClient(
+        lambda request: (ConversationIntent.ROBOT_ACTION, "我已整理为待审核行动。")
+    )
+    gateway = ConversationGateway(
+        client,
+        mission_draft_creator=lambda brief: calls.append(dict(brief)) or {"draftId": "mission-1"},
+    )
+
+    result = gateway.handle(
+        task_id="task-1",
+        request=ConversationTurnRequest(
+            conversationId="conversation-1",
+            robotId="robot-1",
+            text="向前走一米",
+        ),
+        requested_by="user-1",
+        modality="text",
+        mission_history=[],
+    )
+
+    assert result.route.value == "mission_review"
+    assert result.routeStatus == "review"
+    assert result.missionDraftId == "mission-1"
+    assert calls == [
+        {
+            "robotId": "robot-1",
+            "requestedBy": "user-1",
+            "objective": "向前走一米",
+            "locale": "zh-CN",
+            "modality": "text",
+            "history": [],
+        }
+    ]
+
+    with pytest.raises(ValidationError):
+        ConversationGatewayResult.model_validate(
+            {
+                **result.model_dump(mode="json"),
+                "intent": "GENERAL_QA",
+            }
+        )
+
+
+def test_unbound_conversation_supports_long_natural_chat_without_plan_drafts():
+    router = RoutedConversationClient(
+        lambda request: (
+            (ConversationIntent.SOCIAL_CHAT, "你好，很高兴见到你。")
+            if "你好" in request.text
+            else (ConversationIntent.GENERAL_QA, "2 + 2 等于 4。")
+        )
+    )
+    app = create_app(auth_token=TOKEN, conversation_client=router)
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/assistant/conversations",
+            headers=auth(),
+            json={"locale": "zh-CN"},
+        )
+        assert created.status_code == 201, created.text
+        conversation_id = created.json()["conversationId"]
+        assert created.json()["robotId"] is None
+
+        first = client.post(
+            f"/api/v1/assistant/conversations/{conversation_id}/messages",
+            headers=auth(),
+            json={"text": "你好"},
+        )
+        first_turn = wait_turn(client, first.json()["taskId"])
+        assert first_turn["status"] == "completed"
+        assert first_turn["result"]["route"] == "reply"
+        assert first_turn["result"].get("missionDraftId") is None
+
+        second = client.post(
+            f"/api/v1/assistant/conversations/{conversation_id}/messages",
+            headers=auth(),
+            json={"text": "2+2 等于多少？"},
+        )
+        second_turn = wait_turn(client, second.json()["taskId"])
+        assert second_turn["result"]["intent"] == "GENERAL_QA"
+        assert [item.content for item in router.requests[-1].history] == [
+            "你好",
+            "你好，很高兴见到你。",
+        ]
+
+        conversation = client.get(
+            f"/api/v1/assistant/conversations/{conversation_id}", headers=auth()
+        ).json()
+        assert [message["content"] for message in conversation["messages"]] == [
+            "你好",
+            "你好，很高兴见到你。",
+            "2+2 等于多少？",
+            "2 + 2 等于 4。",
+        ]
+        assert conversation["drafts"] == []
+        assert app.state.store.list_mission_drafts() == []
+
+        events = client.get(
+            f"/api/v1/assistant/turns/{second.json()['taskId']}/events",
+            headers=auth(),
+        ).json()
+        assert [item["type"] for item in events["events"]] == [
+            "turn.accepted",
+            "turn.started",
+            "route.selected",
+            "turn.completed",
+        ]
+
+
+def test_observe_is_read_only_visual_task_and_scene_teach_stays_pending():
+    router = RoutedConversationClient(
+        lambda request: (
+            (ConversationIntent.ROBOT_OBSERVE, "我会只观察当前画面。")
+            if "观察" in request.text
+            else (ConversationIntent.SCENE_TEACH, "我会先保存为待确认的场景教学。")
+        )
+    )
+    visual = VisualFixture()
+    app = create_app(
+        auth_token=TOKEN,
+        conversation_client=router,
+        visual_task_client=visual,
+    )
+    with TestClient(app) as client:
+        conversation = client.post(
+            "/api/v1/assistant/conversations",
+            headers=auth(),
+            json={"robotId": "robot-1"},
+        ).json()
+        observe = client.post(
+            f"/api/v1/assistant/conversations/{conversation['conversationId']}/messages",
+            headers=auth(),
+            json={"text": "只观察当前画面，不要移动"},
+        )
+        observed = wait_turn(client, observe.json()["taskId"])
+        assert observed["result"]["route"] == "visual_observation"
+        assert observed["result"]["routeStatus"] == "completed"
+        assert observed["result"]["assistantMessage"] == "我看到一张会议桌和两把椅子。"
+        assert observed["result"]["evidence"][0]["kind"] == "input_rgb"
+        evidence_url = observed["result"]["evidence"][0]["proxyUrl"]
+        evidence_response = client.get(evidence_url, headers=auth())
+        assert evidence_response.status_code == 200
+        assert evidence_response.content == b"fixture"
+        assert evidence_response.headers["cache-control"] == "private, no-store, max-age=0"
+        assert visual.requests[0]["mode"] == "scene_description"
+        assert visual.requests[0]["authorizationId"].startswith("assistant-readonly-")
+        assert app.state.store.list_mission_drafts() == []
+        assert client.get("/api/v1/commands", headers=auth()).json() == []
+
+        teaching = client.post(
+            f"/api/v1/assistant/conversations/{conversation['conversationId']}/messages",
+            headers=auth(),
+            json={"text": "记住这里叫会议区"},
+        )
+        taught = wait_turn(client, teaching.json()["taskId"])
+        assert taught["result"]["route"] == "scene_teaching"
+        assert taught["result"]["routeStatus"] == "awaiting_confirmation"
+        assert len(visual.requests) == 1
+        assert app.state.store.list_mission_drafts() == []
+
+
+def test_action_mission_draft_inherits_conversation_owner_and_site():
+    router = RoutedConversationClient(
+        lambda request: (ConversationIntent.ROBOT_ACTION, "行动方案已生成，等待你审核。")
+    )
+    app = create_app(auth_token=TOKEN, conversation_client=router)
+    with TestClient(app) as client:
+        registered = client.post(
+            "/api/v1/auth/register",
+            json={
+                "username": "mission-owner",
+                "displayName": "Mission Owner",
+                "password": PASSWORD,
+            },
+        ).json()["user"]
+        login = client.post(
+            "/api/v1/auth/login",
+            json={"username": "mission-owner", "password": PASSWORD},
+        ).json()
+        csrf = login["csrfToken"]
+        gateway = app.state.assistant.conversation_gateway
+        gateway.mission_draft_creator = lambda brief: {"draftId": "mission-owned-1"}
+        created = client.post(
+            "/api/v1/assistant/conversations",
+            headers={"X-CSRF-Token": csrf},
+            json={"robotId": "robot-1"},
+        )
+        assert created.status_code == 201, created.text
+        submitted = client.post(
+            f"/api/v1/assistant/conversations/{created.json()['conversationId']}/messages",
+            headers={"X-CSRF-Token": csrf},
+            json={"text": "向前走一米"},
+        )
+        assert submitted.status_code == 202, submitted.text
+        turn = wait_turn(client, submitted.json()["taskId"])
+        assert turn["result"]["missionDraftId"] == "mission-owned-1"
+        binding = app.state.store.get_resource_owner("mission_draft", "mission-owned-1")
+        assert binding is not None
+        assert binding["ownerUserId"] == registered["userId"]
+        assert binding["siteId"] == "default"

@@ -57,13 +57,22 @@ configured.
   confirmed|failed|partial|expired|unknown`); a restart marks an in-flight
   confirmation `unknown` and it is never replayed. Per-step receipts remain
   persisted for reconciliation, and a second confirmation is rejected.
-- `POST /api/v1/assistant/conversations` creates a robot-scoped conversation;
+- `POST /api/v1/assistant/conversations` creates an owner/site-scoped
+  conversation. `robotId` is optional so ordinary chat and QA do not require a
+  robot binding;
   `POST /api/v1/assistant/conversations/{conversationId}/messages` accepts a
   natural-language text or reviewed voice transcript and returns `202` with a
-  planning `taskId`. `GET /api/v1/assistant/turns/{taskId}` polls the durable
-  result and `POST .../cancel` cancels locally even when Mastra is unavailable.
-  Generated proposals are validated against the frozen robot context and
-  command JSON Schemas before becoming ordinary `PlanDraft` records.
+  turn `taskId`. The Assistant V2 gateway calls Mastra's typed conversation
+  router first. Social chat, QA and admin explanations return text without a
+  draft; observation calls a fixed-head `scene_description` VisualTask and can
+  never dispatch motion; scene teaching remains pending confirmation. Only an
+  unambiguous `ROBOT_ACTION` may call Mission V2, which still produces a
+  reviewable draft and cannot bypass policy or human confirmation. `GET
+  /api/v1/assistant/turns/{taskId}` polls the durable result, `GET .../events`
+  returns ordered event-compatible output, and the per-turn visual-evidence
+  proxy keeps the Vision credential out of the browser. Full message history is
+  retained locally while Mastra receives only the bounded recent window plus
+  an optional server-owned summary.
 - Generated drafts support `POST /api/v1/assistant/drafts/{draftId}/revise`
   with feedback and `POST .../reject` with a reason. Revision creates a new
   planning turn and never mutates the original plan payload.
@@ -122,9 +131,11 @@ disconnected Robot Agent therefore fails closed.
 
 ## Assistant service configuration
 
-- `MASTRA_PLANNING_URL` and `MASTRA_INTERNAL_TOKEN` enable the internal
-  planning-only client; if either is missing, assistant turns fail closed while
+- `MASTRA_PLANNING_URL` and `MASTRA_INTERNAL_TOKEN` enable both the internal
+  Assistant V2 router and Mission V2 planner. If either is missing, legacy V1
+  embedded callers remain compatible and configured V2 routes fail closed;
   manual control remains available.
+- `MASTRA_CONVERSATION_TIMEOUT_SECONDS` defaults to 30 seconds.
 - `MASTRA_PLANNING_TIMEOUT_SECONDS` defaults to 120 seconds.
 - `WHISPER_ENDPOINT` enables local speech transcription and normally ends in
   `/inference`; `WHISPER_TIMEOUT_SECONDS` defaults to 45 seconds.

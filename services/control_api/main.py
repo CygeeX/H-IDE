@@ -77,6 +77,12 @@ from packages.simulation_core import (
 from services.robot_agent_gateway import RobotAgentGatewayHttpDriver
 
 from .assistant_service import AssistantNotFound, AssistantService
+from .conversation_client import (
+    ConversationClient,
+    UnavailableConversationClient,
+    conversation_client_from_env,
+)
+from .conversation_gateway import ConversationGateway
 from .auth import (
     AuthService,
     AuthorizationDenied,
@@ -108,7 +114,11 @@ from .speech import (
     speech_client_from_env,
     validate_wav,
 )
-from .visual_task_client import VisualTaskClient, visual_task_client_from_env
+from .visual_task_client import (
+    VisualTaskClient,
+    VisualTaskUnavailable,
+    visual_task_client_from_env,
+)
 
 from .store import (
     AssistantTurnConflict,
@@ -799,6 +809,7 @@ def create_app(
     adapters: Mapping[str | Transport, CommandAdapter] | None = None,
     watchdog_interval: float = 0.1,
     planning_client: PlanningClient | None = None,
+    conversation_client: ConversationClient | None = None,
     mission_planning_client: MissionPlanningClient | None = None,
     speech_client: SpeechClient | None = None,
     scene_context_client: SceneContextClient | None = None,
@@ -1039,13 +1050,6 @@ def create_app(
         raise ValueError("ASSISTANT_DRAFT_TTL_SECONDS must be a number") from exc
     if not math.isfinite(draft_ttl_seconds) or draft_ttl_seconds <= 0:
         raise ValueError("ASSISTANT_DRAFT_TTL_SECONDS must be finite and greater than zero")
-    assistant_service = AssistantService(
-        store,
-        context.definitions,
-        planning_client or planning_client_from_env(),
-        scene_adapter,
-        draft_ttl_seconds=draft_ttl_seconds,
-    )
     mission_runtime = MissionRuntime(store)
     mission_service = MissionService(
         store,
@@ -1057,6 +1061,23 @@ def create_app(
         ),
     )
     mission_service.scene_context_client = scene_adapter
+    conversation_adapter = conversation_client or conversation_client_from_env()
+    conversation_gateway = (
+        None
+        if isinstance(conversation_adapter, UnavailableConversationClient)
+        else ConversationGateway(
+            conversation_adapter,
+            mission_draft_creator=mission_service.create_draft,
+        )
+    )
+    assistant_service = AssistantService(
+        store,
+        context.definitions,
+        planning_client or planning_client_from_env(),
+        scene_adapter,
+        draft_ttl_seconds=draft_ttl_seconds,
+        conversation_gateway=conversation_gateway,
+    )
 
     def bridge_simulation_event(
         session: SimulationSession,
@@ -1603,6 +1624,82 @@ def create_app(
             "receipt": _receipt_json(receipt),
             "mapping": _plain(mapping),
         }
+
+    def dispatch_assistant_observation(payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Run one fixed-head scene-description task without creating motion authority."""
+
+        task_id = payload.get("taskId")
+        robot_id = payload.get("robotId")
+        instruction = payload.get("instruction")
+        if not all(
+            isinstance(value, str) and value.strip()
+            for value in (task_id, robot_id, instruction)
+        ):
+            raise ValueError("assistant observation requires taskId, robotId, and instruction")
+        robot, profile, manifest = mission_service._robot_manifest(robot_id)
+        details = robot.get("details") if isinstance(robot.get("details"), Mapping) else {}
+        configured_sensors = [
+            item.strip()
+            for item in os.getenv("HIDE_VISION_SENSOR_IDS", "head_rgbd").split(",")
+            if item.strip()
+        ]
+        sensor_id = next(
+            (
+                item.sensorId
+                for item in profile.sensors
+                if item.sensorId in configured_sensors
+                and item.depthCapable
+                and item.fixedMount
+            ),
+            None,
+        )
+        if sensor_id is None:
+            raise ValueError("no configured fixed RGB-D sensor is present in RobotProfile")
+        source_mode = details.get("sourceMode") or profile.metadata.get("sourceMode")
+        if source_mode not in {"live", "synthetic", "replay"}:
+            source_mode = "synthetic" if details.get("adapter") == "fake" else "live"
+        robot_boot_id = details.get("robotBootId")
+        localization_epoch_id = details.get("localizationEpochId")
+        if details.get("adapter") == "fake":
+            robot_boot_id = robot_boot_id or "synthetic-boot"
+            localization_epoch_id = localization_epoch_id or "synthetic-epoch"
+        if not isinstance(robot_boot_id, str) or not robot_boot_id:
+            raise ValueError("assistant observation robotBootId is unavailable")
+        if not isinstance(localization_epoch_id, str) or not localization_epoch_id:
+            raise ValueError("assistant observation localizationEpochId is unavailable")
+        visual_request = {
+            "schemaVersion": "h-ide.visual-task/2",
+            "requestId": f"assistant-observe-{task_id}",
+            "missionId": f"assistant-observe-{task_id}",
+            "revisionId": f"assistant-observe-revision-{task_id}",
+            "nodeId": "observe-current-scene",
+            "authorizationId": f"assistant-readonly-{task_id}",
+            "attempt": 1,
+            "traceId": task_id,
+            "mode": "scene_description",
+            "instruction": instruction,
+            "robotId": robot_id,
+            "robotBootId": robot_boot_id,
+            "localizationEpochId": localization_epoch_id,
+            "robotProfileDigest": profile.profileDigest,
+            "capabilityManifestDigest": manifest.manifestDigest,
+            "sensorId": sensor_id,
+            "requestedSourceMode": source_mode,
+        }
+        result = visual_task_adapter.analyze(visual_request)
+        if result.get("schemaVersion") != "h-ide.visual-result/2":
+            raise ValueError("H-IDE Vision returned an unsupported result schema")
+        for field in ("requestId", "missionId", "revisionId", "nodeId"):
+            if result.get(field) != visual_request[field]:
+                raise ValueError(f"H-IDE Vision observation changed {field}")
+        if result.get("mode") != "scene_description":
+            raise ValueError("H-IDE Vision observation changed the read-only mode")
+        if result.get("geometryCandidates"):
+            raise ValueError("scene-description observation returned unexpected motion geometry")
+        return dict(result)
+
+    if conversation_gateway is not None:
+        conversation_gateway.visual_observer = dispatch_assistant_observation
 
     def dispatch_workstation_skill(skill: SkillRequest) -> dict[str, Any]:
         if skill.expiresAt <= utc_now():
@@ -2227,6 +2324,75 @@ def create_app(
             return service.get_turn(task_id)
         except AssistantNotFound as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get(
+        "/api/v1/assistant/turns/{task_id}/events",
+        dependencies=[Depends(require_assistant)],
+    )
+    def get_assistant_turn_events(
+        task_id: str,
+        request: Request,
+        afterSequence: int = 0,
+        principal: Principal = Depends(require_assistant),
+        service: AssistantService = Depends(get_assistant_service),
+    ):
+        try:
+            require_turn_resource(request, principal, task_id)
+            if afterSequence < 0:
+                raise ValueError("afterSequence cannot be negative")
+            events = service.get_turn_events(task_id, after_sequence=afterSequence)
+            return {
+                "schemaVersion": "h-ide.assistant-events/2",
+                "taskId": task_id,
+                "events": events,
+                "lastSequence": events[-1]["sequence"] if events else afterSequence,
+            }
+        except AssistantNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get(
+        "/api/v1/assistant/turns/{task_id}/visual-evidence/{analysis_id}/{sha256}",
+        dependencies=[Depends(require_assistant)],
+    )
+    def get_assistant_turn_visual_evidence(
+        task_id: str,
+        analysis_id: str,
+        sha256: str,
+        request: Request,
+        principal: Principal = Depends(require_assistant),
+        service: AssistantService = Depends(get_assistant_service),
+    ) -> Response:
+        require_turn_resource(request, principal, task_id)
+        turn = service.get_turn(task_id)
+        result = turn.get("result")
+        visual = result.get("visualResult") if isinstance(result, Mapping) else None
+        if (
+            not isinstance(visual, Mapping)
+            or visual.get("analysisId") != analysis_id
+        ):
+            raise HTTPException(status_code=404, detail="assistant visual evidence not found")
+        evidence = visual.get("evidence")
+        if not isinstance(evidence, list) or not any(
+            isinstance(item, Mapping) and item.get("sha256") == sha256
+            for item in evidence
+        ):
+            raise HTTPException(status_code=404, detail="assistant visual evidence not found")
+        try:
+            content, media_type = visual_task_adapter.get_evidence(analysis_id, sha256)
+        except VisualTaskUnavailable as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return Response(
+            content=content,
+            media_type=media_type,
+            headers={
+                "Cache-Control": "private, no-store, max-age=0",
+                "Pragma": "no-cache",
+                "Content-Security-Policy": "default-src 'none'; sandbox",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
 
     @app.post(
         "/api/v1/assistant/turns/{task_id}/cancel",

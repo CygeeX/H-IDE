@@ -21,6 +21,8 @@ from packages.scene_core import (
     validate_navigation_payload,
 )
 from packages.control_core.assistant_models import (
+    AssistantTurnEvent,
+    ConversationTurnRequest,
     DraftReadyResult,
     LogicalCommand,
     PlanningEnvelope,
@@ -32,6 +34,7 @@ from packages.visual_mission_core import VisualMissionPlanDraft
 from packages.control_core.validation import non_empty_id
 
 from .planning_client import PlanningClient
+from .conversation_gateway import ConversationGateway
 from .scene_client import SceneContextClient, SceneContextUnavailable
 from .store import AssistantTurnConflict, SQLiteStore, _jsonable
 
@@ -56,26 +59,33 @@ class AssistantService:
         scene_context_client: SceneContextClient,
         *,
         draft_ttl_seconds: float = 900.0,
+        conversation_gateway: ConversationGateway | None = None,
     ):
         self.store = store
         self.definitions = definitions
         self.planning_client = planning_client
         self.scene_context_client = scene_context_client
         self.draft_ttl_seconds = draft_ttl_seconds
+        self.conversation_gateway = conversation_gateway
         self._threads: dict[str, threading.Thread] = {}
         self._threads_lock = threading.Lock()
         self.store.recover_active_assistant_turns()
 
     def create_conversation(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        robot_id = non_empty_id(body.get("robotId"), "robotId")
+        raw_robot_id = body.get("robotId")
+        robot_id = None if raw_robot_id is None else non_empty_id(raw_robot_id, "robotId")
         requested_by = non_empty_id(body.get("requestedBy", "operator"), "requestedBy")
         locale = non_empty_id(body.get("locale", "zh-CN"), "locale")
+        raw_summary = body.get("summary")
+        summary = None if raw_summary is None else non_empty_id(raw_summary, "summary")
         if len(locale) > 35:
             raise ValueError("locale is too long")
-        if self.store.get_robot(robot_id) is None:
+        if summary is not None and len(summary) > 12000:
+            raise ValueError("summary is too long")
+        if robot_id is not None and self.store.get_robot(robot_id) is None:
             raise AssistantNotFound("robot not found")
         return self.store.create_assistant_conversation(
-            _new_id("conversation"), robot_id, requested_by, locale
+            _new_id("conversation"), robot_id, requested_by, locale, summary
         )
 
     def list_conversations(self) -> list[dict[str, Any]]:
@@ -112,6 +122,44 @@ class AssistantService:
         text = body.get("text")
         if revision_of_draft_id is not None and isinstance(text, str) and len(text) > 2000:
             raise ValueError("revision feedback cannot exceed 2000 characters")
+        if self.conversation_gateway is not None and revision_of_draft_id is None:
+            route_request = ConversationTurnRequest.model_validate(
+                {
+                    "conversationId": conversation_id,
+                    "robotId": conversation.get("robotId"),
+                    "locale": body.get("locale", conversation["locale"]),
+                    "text": text,
+                    "history": [],
+                    "summary": conversation.get("summary"),
+                }
+            )
+            task_id = _new_id("task")
+            stored_request = {
+                **route_request.model_dump(mode="json", by_alias=False, exclude_none=True),
+                "taskId": task_id,
+                "requestedBy": conversation["requestedBy"],
+                "modality": modality,
+                "transcriptionId": transcription_id,
+            }
+            self.store.create_assistant_turn(
+                stored_request,
+                message_id=_new_id("message"),
+            )
+            thread = threading.Thread(
+                target=self._execute_conversation_turn,
+                args=(task_id,),
+                name=f"assistant-v2-{task_id[-8:]}",
+                daemon=True,
+            )
+            with self._threads_lock:
+                self._threads[task_id] = thread
+            thread.start()
+            return {
+                "taskId": task_id,
+                "conversationId": conversation_id,
+                "status": "queued",
+                "eventsUrl": f"/api/v1/assistant/turns/{task_id}/events",
+            }
         selection = body.get("sceneSelection")
         expected_ref = None
         selected_point = None
@@ -172,13 +220,111 @@ class AssistantService:
             turn["draft"] = draft
         return turn
 
+    def get_turn_events(self, task_id: str, *, after_sequence: int = 0) -> list[dict[str, Any]]:
+        if self.store.get_assistant_turn(task_id) is None:
+            raise AssistantNotFound("assistant turn not found")
+        return [
+            AssistantTurnEvent.model_validate(item).model_dump(mode="json", by_alias=False)
+            for item in self.store.list_assistant_turn_events(
+                task_id,
+                after_sequence=after_sequence,
+            )
+        ]
+
     def cancel_turn(self, task_id: str) -> dict[str, Any]:
         turn = self.store.cancel_assistant_turn(task_id)
         if turn is None:
             raise AssistantNotFound("assistant turn not found")
-        if turn["status"] == "cancelled":
+        request = turn.get("request")
+        is_v2 = (
+            isinstance(request, Mapping)
+            and request.get("schemaVersion") == "h-ide.conversation-turn/2"
+        )
+        if turn["status"] == "cancelled" and not is_v2:
             self.planning_client.cancel_turn(task_id)
         return turn
+
+    def _execute_conversation_turn(self, task_id: str) -> None:
+        """Run routing, then cross exactly one downstream authority boundary."""
+
+        try:
+            if not self.store.mark_assistant_turn_running(task_id):
+                return
+            turn = self.store.get_assistant_turn(task_id)
+            if turn is None:
+                raise AssistantNotFound("assistant turn not found")
+            raw_request = turn.get("request")
+            if not isinstance(raw_request, Mapping):
+                raise ValueError("Assistant V2 turn request is unavailable")
+            conversation_id = str(turn["conversationId"])
+            conversation = self.store.get_assistant_conversation(conversation_id)
+            if conversation is None:
+                raise AssistantNotFound("assistant conversation not found")
+            messages = self.store.list_assistant_messages(conversation_id)
+            prior_messages = [item for item in messages if item.get("taskId") != task_id]
+            recent_history = [
+                {"role": item["role"], "content": item["content"]}
+                for item in prior_messages
+                if item.get("role") in {"user", "assistant"}
+            ][-20:]
+            route_request = ConversationTurnRequest.model_validate(
+                {
+                    "conversationId": conversation_id,
+                    "robotId": conversation.get("robotId"),
+                    "locale": raw_request.get("locale", conversation["locale"]),
+                    "text": raw_request.get("text"),
+                    "history": recent_history,
+                    "summary": conversation.get("summary"),
+                }
+            )
+            gateway = self.conversation_gateway
+            if gateway is None:
+                raise RuntimeError("Assistant V2 conversation gateway is unavailable")
+            result = gateway.handle(
+                task_id=task_id,
+                request=route_request,
+                requested_by=str(conversation["requestedBy"]),
+                modality=str(raw_request.get("modality") or "text"),
+                mission_history=recent_history,
+            )
+            if self.store.is_assistant_turn_cancelled(task_id):
+                return
+            if result.missionDraftId is not None:
+                binding = self.store.get_resource_owner(
+                    "assistant_conversation", conversation_id
+                )
+                if binding is not None:
+                    self.store.bind_resource_owner(
+                        "mission_draft",
+                        result.missionDraftId,
+                        owner_user_id=str(binding["ownerUserId"]),
+                        site_id=str(binding["siteId"]),
+                    )
+            terminal_status = {
+                "review": "draft_ready",
+                "needs_input": "needs_input",
+                "needs_robot": "needs_input",
+                "unavailable": "cannot_plan",
+            }.get(result.routeStatus, "completed")
+            conversation_status = {
+                "review": "review",
+                "needs_input": "awaiting_user",
+                "needs_robot": "awaiting_user",
+                "awaiting_confirmation": "teaching",
+            }.get(result.routeStatus, "idle")
+            self.store.complete_assistant_turn(
+                task_id,
+                status=terminal_status,
+                result=result.model_dump(mode="json", by_alias=False, exclude_none=True),
+                assistant_message=result.assistantMessage,
+                message_id=_new_id("message"),
+                conversation_status=conversation_status,
+            )
+        except Exception as exc:
+            self.store.fail_assistant_turn(task_id, str(exc)[:2000] or type(exc).__name__)
+        finally:
+            with self._threads_lock:
+                self._threads.pop(task_id, None)
 
     def reject_draft(self, draft_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
         reason = non_empty_id(body.get("reason", "operator rejected the plan"), "reason")

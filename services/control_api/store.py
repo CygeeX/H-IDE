@@ -473,6 +473,35 @@ class SQLiteStore:
                     """,
                 ),
             ),
+            (
+                2,
+                "assistant_v2_conversation_gateway",
+                (
+                    "ALTER TABLE assistant_conversations ADD COLUMN robot_id_v2 TEXT",
+                    "ALTER TABLE assistant_conversations ADD COLUMN summary TEXT",
+                    "UPDATE assistant_conversations SET robot_id_v2 = robot_id "
+                    "WHERE robot_id_v2 IS NULL AND robot_id <> '__assistant_unbound__'",
+                    """
+                    CREATE TABLE assistant_turn_events (
+                        task_id TEXT NOT NULL,
+                        sequence INTEGER NOT NULL,
+                        event_id TEXT NOT NULL UNIQUE,
+                        conversation_id TEXT NOT NULL,
+                        event_type TEXT NOT NULL,
+                        data_json TEXT NOT NULL DEFAULT '{}',
+                        created_at TEXT NOT NULL,
+                        PRIMARY KEY(task_id, sequence),
+                        FOREIGN KEY(task_id) REFERENCES assistant_turns(task_id),
+                        FOREIGN KEY(conversation_id)
+                            REFERENCES assistant_conversations(conversation_id)
+                    )
+                    """,
+                    """
+                    CREATE INDEX assistant_turn_events_conversation_idx
+                        ON assistant_turn_events(conversation_id, created_at, event_id)
+                    """,
+                ),
+            ),
         )
         for version, name, statements in migrations:
             applied = self._connection.execute(
@@ -1456,17 +1485,29 @@ class SQLiteStore:
     def create_assistant_conversation(
         self,
         conversation_id: str,
-        robot_id: str,
+        robot_id: str | None,
         requested_by: str,
         locale: str,
+        summary: str | None = None,
     ) -> dict[str, Any]:
         now = self._now()
+        legacy_robot_id = robot_id or "__assistant_unbound__"
         with self._lock:
             self._connection.execute(
                 "INSERT INTO assistant_conversations("
-                "conversation_id, robot_id, requested_by, locale, status, created_at, updated_at"
-                ") VALUES (?, ?, ?, ?, 'idle', ?, ?)",
-                (conversation_id, robot_id, requested_by, locale, now, now),
+                "conversation_id, robot_id, robot_id_v2, requested_by, locale, summary, "
+                "status, created_at, updated_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, 'idle', ?, ?)",
+                (
+                    conversation_id,
+                    legacy_robot_id,
+                    robot_id,
+                    requested_by,
+                    locale,
+                    summary,
+                    now,
+                    now,
+                ),
             )
             self._connection.commit()
         return {
@@ -1474,6 +1515,7 @@ class SQLiteStore:
             "robotId": robot_id,
             "requestedBy": requested_by,
             "locale": locale,
+            "summary": summary,
             "status": "idle",
             "createdAt": now,
             "updatedAt": now,
@@ -1483,9 +1525,10 @@ class SQLiteStore:
     def _assistant_conversation_row(row: sqlite3.Row) -> dict[str, Any]:
         return {
             "conversationId": row["conversation_id"],
-            "robotId": row["robot_id"],
+            "robotId": row["robot_id_v2"],
             "requestedBy": row["requested_by"],
             "locale": row["locale"],
+            "summary": row["summary"],
             "status": row["status"],
             "createdAt": row["created_at"],
             "updatedAt": row["updated_at"],
@@ -1550,6 +1593,66 @@ class SQLiteStore:
                 (conversation_id,),
             ).fetchall()
         return [self._assistant_turn_row(row) for row in rows]
+
+    def _append_assistant_event_locked(
+        self,
+        task_id: str,
+        conversation_id: str,
+        event_type: str,
+        data: Mapping[str, Any],
+        *,
+        created_at: str | None = None,
+    ) -> None:
+        """Append one event while the caller owns ``self._lock`` and transaction."""
+
+        row = self._connection.execute(
+            "SELECT COALESCE(MAX(sequence), 0) AS last_sequence "
+            "FROM assistant_turn_events WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        sequence = int(row["last_sequence"]) + 1
+        event_id = f"assistant-event-{task_id}-{sequence}"
+        self._connection.execute(
+            "INSERT INTO assistant_turn_events("
+            "task_id, sequence, event_id, conversation_id, event_type, data_json, created_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                task_id,
+                sequence,
+                event_id,
+                conversation_id,
+                event_type,
+                _encode(data),
+                created_at or self._now(),
+            ),
+        )
+
+    def list_assistant_turn_events(
+        self,
+        task_id: str,
+        *,
+        after_sequence: int = 0,
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT sequence, event_id, conversation_id, event_type, data_json, created_at "
+                "FROM assistant_turn_events WHERE task_id = ? AND sequence > ? "
+                "ORDER BY sequence",
+                (task_id, max(0, int(after_sequence))),
+            ).fetchall()
+        return [
+            {
+                "schemaVersion": "h-ide.assistant-event/2",
+                "eventId": str(row["event_id"]),
+                "taskId": task_id,
+                "conversationId": str(row["conversation_id"]),
+                "sequence": int(row["sequence"]),
+                "type": str(row["event_type"]),
+                "data": _decode(row["data_json"]),
+                "createdAt": str(row["created_at"]),
+            }
+            for row in rows
+        ]
 
     def get_assistant_turn(self, task_id: str) -> dict[str, Any] | None:
         with self._lock:
@@ -1640,6 +1743,13 @@ class SQLiteStore:
                     "WHERE conversation_id = ?",
                     (now, conversation_id),
                 )
+                self._append_assistant_event_locked(
+                    task_id,
+                    conversation_id,
+                    "turn.accepted",
+                    {"status": "queued"},
+                    created_at=now,
+                )
                 self._connection.commit()
             except sqlite3.IntegrityError as exc:
                 self._connection.rollback()
@@ -1651,13 +1761,32 @@ class SQLiteStore:
 
     def mark_assistant_turn_running(self, task_id: str) -> bool:
         with self._lock:
-            cursor = self._connection.execute(
-                "UPDATE assistant_turns SET status = 'running', updated_at = ? "
-                "WHERE task_id = ? AND status = 'queued' AND cancellation_requested = 0",
-                (self._now(), task_id),
-            )
-            self._connection.commit()
-            return cursor.rowcount == 1
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                now = self._now()
+                cursor = self._connection.execute(
+                    "UPDATE assistant_turns SET status = 'running', updated_at = ? "
+                    "WHERE task_id = ? AND status = 'queued' AND cancellation_requested = 0",
+                    (now, task_id),
+                )
+                if cursor.rowcount == 1:
+                    row = self._connection.execute(
+                        "SELECT conversation_id FROM assistant_turns WHERE task_id = ?",
+                        (task_id,),
+                    ).fetchone()
+                    assert row is not None
+                    self._append_assistant_event_locked(
+                        task_id,
+                        str(row["conversation_id"]),
+                        "turn.started",
+                        {"status": "running"},
+                        created_at=now,
+                    )
+                self._connection.commit()
+                return cursor.rowcount == 1
+            except Exception:
+                self._connection.rollback()
+                raise
 
     def is_assistant_turn_cancelled(self, task_id: str) -> bool:
         with self._lock:
@@ -1690,6 +1819,13 @@ class SQLiteStore:
                         "UPDATE assistant_conversations SET status = 'idle', updated_at = ? "
                         "WHERE conversation_id = ?",
                         (now, row["conversation_id"]),
+                    )
+                    self._append_assistant_event_locked(
+                        task_id,
+                        str(row["conversation_id"]),
+                        "turn.cancelled",
+                        {"status": "cancelled"},
+                        created_at=now,
                     )
                 self._connection.commit()
             except Exception:
@@ -1766,6 +1902,31 @@ class SQLiteStore:
                     "UPDATE assistant_conversations SET status = ?, updated_at = ? WHERE conversation_id = ?",
                     (conversation_status, now, conversation_id),
                 )
+                if result.get("schemaVersion") == "h-ide.assistant-result/2":
+                    route_event = {
+                        key: result[key]
+                        for key in (
+                            "intent",
+                            "route",
+                            "routeStatus",
+                            "missionDraftId",
+                        )
+                        if result.get(key) is not None
+                    }
+                    self._append_assistant_event_locked(
+                        task_id,
+                        str(conversation_id),
+                        "route.selected",
+                        route_event,
+                        created_at=now,
+                    )
+                self._append_assistant_event_locked(
+                    task_id,
+                    str(conversation_id),
+                    "turn.completed",
+                    {"status": status},
+                    created_at=now,
+                )
                 self._connection.commit()
                 return True
             except Exception:
@@ -1793,6 +1954,13 @@ class SQLiteStore:
                     "UPDATE assistant_conversations SET status = 'failed', updated_at = ? WHERE conversation_id = ?",
                     (now, row["conversation_id"]),
                 )
+                self._append_assistant_event_locked(
+                    task_id,
+                    str(row["conversation_id"]),
+                    "turn.failed",
+                    {"status": "failed", "error": error[:2000]},
+                    created_at=now,
+                )
                 self._connection.commit()
                 return True
             except Exception:
@@ -1805,10 +1973,18 @@ class SQLiteStore:
         message = "planning turn interrupted by process restart; submit a new turn"
         with self._lock:
             rows = self._connection.execute(
-                "SELECT request_json FROM assistant_turns WHERE status IN ('queued', 'running')"
+                "SELECT task_id, conversation_id, request_json FROM assistant_turns "
+                "WHERE status IN ('queued', 'running')"
             ).fetchall()
             for row in rows:
                 self._restore_revision_source(row["request_json"], now)
+                self._append_assistant_event_locked(
+                    str(row["task_id"]),
+                    str(row["conversation_id"]),
+                    "turn.failed",
+                    {"status": "unknown", "error": message},
+                    created_at=now,
+                )
             self._connection.execute(
                 "UPDATE assistant_turns SET status = 'unknown', error = ?, updated_at = ? "
                 "WHERE status IN ('queued', 'running')",
