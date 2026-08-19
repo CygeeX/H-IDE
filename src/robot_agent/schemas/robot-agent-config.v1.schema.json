@@ -295,6 +295,51 @@
       "type": "object"
     },
     "JsonValue": {},
+    "MotionSafetyFaultConfig": {
+      "additionalProperties": false,
+      "description": "Robot-scoped, latched simulator/driver motion-fault ingress.",
+      "properties": {
+        "cancel_begin_deadline_ms": {
+          "const": 100,
+          "default": 100,
+          "title": "Cancel Begin Deadline Ms",
+          "type": "integer"
+        },
+        "enabled": {
+          "default": false,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "localization_epoch_id": {
+          "anyOf": [
+            {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Localization Epoch Id"
+        },
+        "nav2_terminal_deadline_ms": {
+          "const": 300,
+          "default": 300,
+          "title": "Nav2 Terminal Deadline Ms",
+          "type": "integer"
+        },
+        "topic": {
+          "default": "/robot_agent/motion_safety_fault",
+          "pattern": "^/[A-Za-z0-9_]+(?:/[A-Za-z0-9_]+)*$",
+          "title": "Topic",
+          "type": "string"
+        }
+      },
+      "title": "MotionSafetyFaultConfig",
+      "type": "object"
+    },
     "ObservationConfig": {
       "additionalProperties": false,
       "properties": {
@@ -563,6 +608,16 @@
           "pattern": "^/[A-Za-z0-9_]+(?:/[A-Za-z0-9_]+)*$",
           "title": "Heartbeat Topic",
           "type": "string"
+        },
+        "motion_safety_fault": {
+          "$ref": "#/$defs/MotionSafetyFaultConfig",
+          "default": {
+            "cancel_begin_deadline_ms": 100,
+            "enabled": false,
+            "localization_epoch_id": null,
+            "nav2_terminal_deadline_ms": 300,
+            "topic": "/robot_agent/motion_safety_fault"
+          }
         },
         "safe_stop": {
           "$ref": "#/$defs/SafeStopConfig"

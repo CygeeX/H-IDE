@@ -60,6 +60,12 @@ safety:
     ros_type: std_srvs/srv/Trigger
     request: {}
     timeout_ms: 1000
+  motion_safety_fault:
+    enabled: true
+    topic: /h_ide/g1_sim/motion_safety_fault
+    localization_epoch_id: g1-sim-map-epoch-1
+    cancel_begin_deadline_ms: 100
+    nav2_terminal_deadline_ms: 300
   heartbeat_topic: /robot_agent/safety_heartbeat
   heartbeat_period_ms: 250
 

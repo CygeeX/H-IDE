@@ -111,6 +111,32 @@ def test_load_config_accepts_client_mtls_and_restricted_registry(tmp_path: Path)
     assert config.capabilities_digest.startswith("sha256:")
 
 
+def test_motion_fault_config_is_backward_compatible_and_deadlines_are_fixed(
+    tmp_path: Path,
+) -> None:
+    raw = valid_config(tmp_path)
+    config = AgentConfig.model_validate(raw)
+    assert config.safety.motion_safety_fault.enabled is False
+
+    raw["safety"]["motion_safety_fault"] = {  # type: ignore[index]
+        "enabled": True,
+        "topic": "/h_ide/g1_sim/motion_safety_fault",
+        "localization_epoch_id": "g1-sim-map-epoch-1",
+        "cancel_begin_deadline_ms": 100,
+        "nav2_terminal_deadline_ms": 300,
+    }
+    enabled = AgentConfig.model_validate(raw)
+    assert enabled.safety.motion_safety_fault.enabled is True
+
+    raw["safety"]["motion_safety_fault"]["nav2_terminal_deadline_ms"] = 301  # type: ignore[index]
+    with pytest.raises(ValidationError, match="nav2_terminal_deadline_ms"):
+        AgentConfig.model_validate(raw)
+
+    raw["safety"]["motion_safety_fault"] = {"enabled": True}  # type: ignore[index]
+    with pytest.raises(ValidationError, match="localization_epoch_id"):
+        AgentConfig.model_validate(raw)
+
+
 def test_config_rejects_unknown_fields_and_invalid_command_schema(tmp_path: Path) -> None:
     raw = valid_config(tmp_path)
     raw["unexpected"] = True

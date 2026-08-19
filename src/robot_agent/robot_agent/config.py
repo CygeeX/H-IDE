@@ -177,12 +177,40 @@ class SafeStopConfig(StrictConfigModel):
         return self
 
 
+class MotionSafetyFaultConfig(StrictConfigModel):
+    """Robot-scoped, latched simulator/driver motion-fault ingress."""
+
+    enabled: bool = False
+    topic: str = Field(
+        default="/robot_agent/motion_safety_fault",
+        pattern=ROS_NAME_PATTERN,
+    )
+    localization_epoch_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=256,
+    )
+    # These are protocol deadlines, not tuning knobs.  Keeping them literal
+    # prevents a deployment override from silently weakening the boundary.
+    cancel_begin_deadline_ms: Literal[100] = 100
+    nav2_terminal_deadline_ms: Literal[300] = 300
+
+    @model_validator(mode="after")
+    def require_epoch_when_enabled(self) -> MotionSafetyFaultConfig:
+        if self.enabled and self.localization_epoch_id is None:
+            raise ValueError(
+                "motion_safety_fault.localization_epoch_id is required when enabled"
+            )
+        return self
+
+
 class SafetyConfig(StrictConfigModel):
     safe_stop: SafeStopConfig
     # Simulation and other latched motion profiles may require one explicit
     # local rearm after the remote operator acquires control.  Omitted for
     # platforms whose hardware safety controller owns this transition.
     control_arm: SafeStopConfig | None = None
+    motion_safety_fault: MotionSafetyFaultConfig = MotionSafetyFaultConfig()
     heartbeat_topic: str = Field(pattern=ROS_NAME_PATTERN)
     heartbeat_period_ms: int = Field(default=250, ge=50, le=1_000)
 

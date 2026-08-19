@@ -96,6 +96,8 @@ class CommandCoordinator:
         self._cancel_failures: set[UUID] = set()
         self._preempting: set[UUID] = set()
         self._defer_terminal: set[UUID] = set()
+        self._external_cancel_tasks: dict[UUID, asyncio.Task[Any]] = {}
+        self._active_nav2: set[UUID] = set()
         self._pending_cancel_confirmations: dict[
             UUID, tuple[CommandState, str]
         ] = {}
@@ -124,6 +126,7 @@ class CommandCoordinator:
                 self._arbiter.release(payload.command_id)
                 self._cancel_reasons.pop(payload.command_id, None)
                 self._defer_terminal.discard(payload.command_id)
+                self._external_cancel_tasks.pop(payload.command_id, None)
                 if self._tasks.get(payload.command_id) is current_task:
                     del self._tasks[payload.command_id]
                 if self._registration_locks.get(payload.command_id) is registration_lock:
@@ -323,6 +326,8 @@ class CommandCoordinator:
                     at=_utc_now(),
                 )
         self._executing.add(payload.command_id)
+        if command.goal_transform in {"navigate_to_pose_v1", "nav2_spin_v2"}:
+            self._active_nav2.add(payload.command_id)
         execution_task = asyncio.create_task(
             self._executor.execute(
                 payload.command_id,
@@ -411,6 +416,7 @@ class CommandCoordinator:
             execution_task.add_done_callback(_consume_task_outcome)
             self._arbiter.release(payload.command_id)
             self._executing.discard(payload.command_id)
+            self._active_nav2.discard(payload.command_id)
             if self._observation_guard is not None:
                 with contextlib.suppress(Exception):
                     await self._observation_guard.command_finished(observation_binding)
@@ -449,10 +455,17 @@ class CommandCoordinator:
         acknowledged = True
         failure_detail = _CANCEL_NOT_ACKNOWLEDGED
         try:
-            await asyncio.wait_for(
-                self._executor.cancel(command_id),
-                timeout=_ADAPTER_CANCEL_TIMEOUT_SECONDS,
-            )
+            external_cancel = self._external_cancel_tasks.get(command_id)
+            if external_cancel is None:
+                await asyncio.wait_for(
+                    self._executor.cancel(command_id),
+                    timeout=_ADAPTER_CANCEL_TIMEOUT_SECONDS,
+                )
+            else:
+                # The motion-fault path owns a stricter absolute deadline
+                # measured from ROS callback T0.  Do not replace it with the
+                # ordinary relative executor budget.
+                await asyncio.shield(external_cancel)
         except Exception as exc:
             acknowledged = False
             failure_detail = f"{_CANCEL_NOT_ACKNOWLEDGED}: {type(exc).__name__}: {exc}"
@@ -486,21 +499,50 @@ class CommandCoordinator:
         reason: str,
         at: datetime,
         defer_terminal_until_safe_stop: bool = False,
+        external_cancel_task: asyncio.Task[Any] | None = None,
     ) -> bool:
         """Cancel one active command without disturbing disjoint resource groups."""
+        task = self._tasks.get(command_id)
+        if task is None or task.done():
+            if external_cancel_task is not None:
+                self._external_cancel_tasks.pop(command_id, None)
+            return False
+        self.prepare_safe_stop_cancel(
+            command_id,
+            reason=reason,
+            at=at,
+            defer_terminal_until_safe_stop=defer_terminal_until_safe_stop,
+            external_cancel_task=external_cancel_task,
+        )
+        if command_id in self._executing:
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        self._cancel_reasons.pop(command_id, None)
+        self._external_cancel_tasks.pop(command_id, None)
+        if command_id in self._cancel_failures:
+            self._cancel_failures.discard(command_id)
+            raise CommandCancellationError(await asyncio.to_thread(self._ledger.get, command_id))
+        return True
+
+    def prepare_safe_stop_cancel(
+        self,
+        command_id: UUID,
+        *,
+        reason: str,
+        at: datetime,
+        defer_terminal_until_safe_stop: bool,
+        external_cancel_task: asyncio.Task[Any] | None,
+    ) -> bool:
+        """Synchronously establish terminal deferral before fault I/O starts."""
+
         task = self._tasks.get(command_id)
         if task is None or task.done():
             return False
         if defer_terminal_until_safe_stop:
             self._defer_terminal.add(command_id)
+        if external_cancel_task is not None:
+            self._external_cancel_tasks[command_id] = external_cancel_task
         self._cancel_reasons.setdefault(command_id, (reason, at))
-        if command_id in self._executing:
-            task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-        self._cancel_reasons.pop(command_id, None)
-        if command_id in self._cancel_failures:
-            self._cancel_failures.discard(command_id)
-            raise CommandCancellationError(await asyncio.to_thread(self._ledger.get, command_id))
         return True
 
     async def record(self, command_id: UUID) -> CommandRecord | None:
@@ -595,6 +637,12 @@ class CommandCoordinator:
     @property
     def active_commands(self) -> frozenset[UUID]:
         return self._arbiter.active_commands
+
+    @property
+    def active_nav2_commands(self) -> frozenset[UUID]:
+        """Commands for which this runtime owns a Nav2 action execution."""
+
+        return frozenset(self._active_nav2)
 
     @property
     def pending_cancel_confirmations(self) -> frozenset[UUID]:

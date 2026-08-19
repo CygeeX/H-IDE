@@ -15,6 +15,8 @@ from types import TracebackType
 from typing import Any
 from uuid import UUID
 
+from robot_agent.motion_fault import MotionSafetyFault
+
 
 class CommandState(str, Enum):
     RECEIVED = "RECEIVED"
@@ -127,10 +129,37 @@ class SafeStopAuditRecord:
     updated_at: datetime
 
 
+@dataclass(frozen=True)
+class MotionFaultAuditRecord:
+    handling_id: int
+    event_id: UUID
+    robot_id: str
+    localization_epoch_id: str
+    producer_boot_id: UUID
+    source_sequence: int
+    control_generation: int
+    source: str
+    code: str
+    reason: str
+    detected_at: str
+    downstream_boot_id: UUID | None
+    probe_request_id: UUID | None
+    received_monotonic_ns: int
+    safe_stop_epoch: int | None
+    command_id: UUID | None
+    cancel_begin_monotonic_ns: int | None
+    ros_cancel_call_monotonic_ns: int | None
+    nav2_terminal_monotonic_ns: int | None
+    outcome: str
+    detail: str
+    received_at: datetime
+    updated_at: datetime
+
+
 class CommandLedger:
     """Thread-safe durable ledger with an explicit schema migration boundary."""
 
-    SCHEMA_VERSION = 2
+    SCHEMA_VERSION = 3
 
     def __init__(self, path: str | Path) -> None:
         self._path = Path(path)
@@ -194,11 +223,18 @@ class CommandLedger:
                     "ON command_transitions(command_id, transition_id)"
                 )
                 self._create_safe_stop_events_table()
+                self._create_motion_fault_events_table()
                 self._connection.execute(f"PRAGMA user_version={self.SCHEMA_VERSION}")
             return
         if version == 1:
             with self._connection:
                 self._create_safe_stop_events_table()
+                self._create_motion_fault_events_table()
+                self._connection.execute(f"PRAGMA user_version={self.SCHEMA_VERSION}")
+            return
+        if version == 2:
+            with self._connection:
+                self._create_motion_fault_events_table()
                 self._connection.execute(f"PRAGMA user_version={self.SCHEMA_VERSION}")
             return
         if version == self.SCHEMA_VERSION:
@@ -219,6 +255,157 @@ class CommandLedger:
             )
             """
         )
+
+    def _create_motion_fault_events_table(self) -> None:
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS motion_fault_events (
+                handling_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL,
+                robot_id TEXT NOT NULL,
+                localization_epoch_id TEXT NOT NULL,
+                producer_boot_id TEXT NOT NULL,
+                source_sequence INTEGER NOT NULL CHECK (source_sequence > 0),
+                control_generation INTEGER NOT NULL CHECK (control_generation >= 0),
+                source TEXT NOT NULL,
+                code TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                detected_at TEXT NOT NULL,
+                downstream_boot_id TEXT,
+                probe_request_id TEXT,
+                received_monotonic_ns INTEGER NOT NULL CHECK (received_monotonic_ns >= 0),
+                safe_stop_epoch INTEGER REFERENCES safe_stop_events(epoch),
+                command_id TEXT,
+                cancel_begin_monotonic_ns INTEGER,
+                ros_cancel_call_monotonic_ns INTEGER,
+                nav2_terminal_monotonic_ns INTEGER,
+                outcome TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                received_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS motion_fault_event_idx "
+            "ON motion_fault_events(event_id, handling_id)"
+        )
+        self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS motion_fault_producer_idx "
+            "ON motion_fault_events(producer_boot_id, source_sequence, handling_id)"
+        )
+
+    def begin_motion_fault(
+        self,
+        *,
+        fault: MotionSafetyFault,
+        received_monotonic_ns: int,
+        at: datetime,
+    ) -> MotionFaultAuditRecord:
+        """Append receipt before associating the safe-stop/cancel outcome."""
+
+        if received_monotonic_ns < 0:
+            raise LedgerError("motion-fault monotonic receipt must be non-negative")
+        timestamp = _aware_iso(at)
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                """
+                INSERT INTO motion_fault_events (
+                    event_id, robot_id, localization_epoch_id,
+                    producer_boot_id, source_sequence, control_generation,
+                    source, code, reason, detected_at, downstream_boot_id,
+                    probe_request_id, received_monotonic_ns, safe_stop_epoch,
+                    command_id, cancel_begin_monotonic_ns,
+                    ros_cancel_call_monotonic_ns, nav2_terminal_monotonic_ns,
+                    outcome, detail, received_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL,
+                          NULL, NULL, NULL, ?, ?, ?, ?)
+                """,
+                (
+                    str(fault.event_id),
+                    fault.robot_id,
+                    fault.localization_epoch_id,
+                    str(fault.producer_boot_id),
+                    fault.source_sequence,
+                    fault.control_generation,
+                    fault.source,
+                    fault.code,
+                    fault.reason[:512],
+                    fault.detected_at,
+                    None if fault.downstream_boot_id is None else str(fault.downstream_boot_id),
+                    None if fault.probe_request_id is None else str(fault.probe_request_id),
+                    received_monotonic_ns,
+                    "received",
+                    "fault accepted; authority revocation pending",
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            handling_id = cursor.lastrowid
+            if handling_id is None:  # pragma: no cover - SQLite INSERT invariant.
+                raise LedgerError("motion-fault insert did not return a handling ID")
+            return self.motion_fault_event(handling_id)
+
+    def finish_motion_fault(
+        self,
+        handling_id: int,
+        *,
+        safe_stop_epoch: int,
+        command_id: UUID | None,
+        cancel_begin_monotonic_ns: int | None,
+        ros_cancel_call_monotonic_ns: int | None,
+        nav2_terminal_monotonic_ns: int | None,
+        outcome: str,
+        detail: str,
+        at: datetime,
+    ) -> MotionFaultAuditRecord:
+        timestamp = _aware_iso(at)
+        with self._lock, self._connection:
+            if self._connection.execute(
+                "SELECT 1 FROM motion_fault_events WHERE handling_id = ?",
+                (handling_id,),
+            ).fetchone() is None:
+                raise LedgerError(f"unknown motion-fault handling {handling_id}")
+            self._connection.execute(
+                """
+                UPDATE motion_fault_events
+                SET safe_stop_epoch = ?, command_id = ?,
+                    cancel_begin_monotonic_ns = ?,
+                    ros_cancel_call_monotonic_ns = ?,
+                    nav2_terminal_monotonic_ns = ?, outcome = ?, detail = ?,
+                    updated_at = ?
+                WHERE handling_id = ?
+                """,
+                (
+                    safe_stop_epoch,
+                    None if command_id is None else str(command_id),
+                    cancel_begin_monotonic_ns,
+                    ros_cancel_call_monotonic_ns,
+                    nav2_terminal_monotonic_ns,
+                    outcome[:128],
+                    detail[:1024],
+                    timestamp,
+                    handling_id,
+                ),
+            )
+            return self.motion_fault_event(handling_id)
+
+    def motion_fault_event(self, handling_id: int) -> MotionFaultAuditRecord:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM motion_fault_events WHERE handling_id = ?",
+                (handling_id,),
+            ).fetchone()
+            if row is None:
+                raise LedgerError(f"unknown motion-fault handling {handling_id}")
+            return _row_to_motion_fault_record(row)
+
+    def motion_fault_events(self) -> list[MotionFaultAuditRecord]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM motion_fault_events ORDER BY handling_id"
+            ).fetchall()
+        return [_row_to_motion_fault_record(row) for row in rows]
 
     def begin_safe_stop(self, *, epoch: int, reason: str, at: datetime) -> SafeStopAuditRecord:
         """Durably record authority revocation before physical stop dispatch."""
@@ -578,5 +765,55 @@ def _row_to_safe_stop_record(row: sqlite3.Row) -> SafeStopAuditRecord:
         reason=row["reason"],
         detail=row["detail"],
         requested_at=datetime.fromisoformat(row["requested_at"]),
+        updated_at=datetime.fromisoformat(row["updated_at"]),
+    )
+
+
+def _row_to_motion_fault_record(row: sqlite3.Row) -> MotionFaultAuditRecord:
+    return MotionFaultAuditRecord(
+        handling_id=int(row["handling_id"]),
+        event_id=UUID(row["event_id"]),
+        robot_id=row["robot_id"],
+        localization_epoch_id=row["localization_epoch_id"],
+        producer_boot_id=UUID(row["producer_boot_id"]),
+        source_sequence=int(row["source_sequence"]),
+        control_generation=int(row["control_generation"]),
+        source=row["source"],
+        code=row["code"],
+        reason=row["reason"],
+        detected_at=row["detected_at"],
+        downstream_boot_id=(
+            None
+            if row["downstream_boot_id"] is None
+            else UUID(row["downstream_boot_id"])
+        ),
+        probe_request_id=(
+            None
+            if row["probe_request_id"] is None
+            else UUID(row["probe_request_id"])
+        ),
+        received_monotonic_ns=int(row["received_monotonic_ns"]),
+        safe_stop_epoch=(
+            None if row["safe_stop_epoch"] is None else int(row["safe_stop_epoch"])
+        ),
+        command_id=(None if row["command_id"] is None else UUID(row["command_id"])),
+        cancel_begin_monotonic_ns=(
+            None
+            if row["cancel_begin_monotonic_ns"] is None
+            else int(row["cancel_begin_monotonic_ns"])
+        ),
+        ros_cancel_call_monotonic_ns=(
+            None
+            if row["ros_cancel_call_monotonic_ns"] is None
+            else int(row["ros_cancel_call_monotonic_ns"])
+        ),
+        nav2_terminal_monotonic_ns=(
+            None
+            if row["nav2_terminal_monotonic_ns"] is None
+            else int(row["nav2_terminal_monotonic_ns"])
+        ),
+        outcome=row["outcome"],
+        detail=row["detail"],
+        received_at=datetime.fromisoformat(row["received_at"]),
         updated_at=datetime.fromisoformat(row["updated_at"]),
     )

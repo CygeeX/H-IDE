@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import math
 import re
@@ -25,6 +26,7 @@ from robot_agent.config import (
     AgentConfig,
     ClientTransportConfig,
     CommandConfig,
+    MotionSafetyFaultConfig,
     SafeStopConfig,
     ServerTransportConfig,
     StateSourceConfig,
@@ -41,6 +43,11 @@ from robot_agent.ledger import (
     CommandLedger,
     CommandRecord,
     SafeStopAuditState,
+)
+from robot_agent.motion_fault import (
+    DeduplicationDecision,
+    MotionFaultDeduplicator,
+    MotionSafetyFault,
 )
 from robot_agent.observation import (
     ObservationGuard,
@@ -82,6 +89,9 @@ from robot_agent.protocol import (
 )
 from robot_agent.ros_adapter import (
     FeedbackCallback,
+    MotionFaultCancelEvidence,
+    MotionFaultCancellationError,
+    MotionSafetyFaultCallback,
     RosActionReadiness,
     RosAdapter,
     StateCallback,
@@ -134,6 +144,13 @@ class RosRuntimeAdapter(Protocol):
 
     def configure_observation(self, *, demand_topic: str, health_topic: str) -> None: ...
 
+    def configure_motion_safety_fault(
+        self,
+        *,
+        config: MotionSafetyFaultConfig,
+        callback: MotionSafetyFaultCallback,
+    ) -> None: ...
+
     def configure_heartbeat(
         self,
         *,
@@ -164,6 +181,15 @@ class RosRuntimeAdapter(Protocol):
     ) -> ExecutionResult: ...
 
     async def cancel(self, command_id: UUID) -> None: ...
+
+    async def cancel_nav2_for_motion_fault(
+        self,
+        command_id: UUID,
+        *,
+        received_monotonic_ns: int,
+        cancel_begin_deadline_ms: int = 100,
+        nav2_terminal_deadline_ms: int = 300,
+    ) -> MotionFaultCancelEvidence: ...
 
     async def safe_stop(self, config: SafeStopConfig) -> ExecutionResult: ...
 
@@ -233,12 +259,31 @@ class RobotAgentRuntime:
         self._connection_session_id: UUID | None = None
         self._command_tasks: set[asyncio.Task[None]] = set()
         self._event_tasks: set[asyncio.Task[None]] = set()
+        self._motion_fault_tasks: set[asyncio.Task[None]] = set()
         self._detached_safety_tasks: set[asyncio.Task[Any]] = set()
         self._detached_control_arm_tasks: set[asyncio.Task[Any]] = set()
         self._background_failure: asyncio.Future[None] | None = None
         self._diagnostics_lock = asyncio.Lock()
         self._state_freshness_lock = threading.RLock()
         self._state_received_monotonic: dict[str, float] = {}
+        self._motion_fault_lock = threading.RLock()
+        self._motion_fault_deduplicator = MotionFaultDeduplicator()
+        self._motion_fault_ingress_latched = threading.Event()
+        self._motion_fault_latest: MotionSafetyFault | None = None
+        self._motion_fault_latest_evidence: MotionFaultCancelEvidence | None = None
+        self._motion_fault_latest_outcome: str | None = None
+        self._motion_fault_latest_detail: str | None = None
+        self._motion_fault_latest_safe_stop_epoch: int | None = None
+        self._motion_fault_counters: dict[str, int] = {
+            "accepted": 0,
+            "invalid": 0,
+            "wrongRobot": 0,
+            "wrongEpoch": 0,
+            "duplicate": 0,
+            "staleSequence": 0,
+            "sequenceConflict": 0,
+        }
+        self._motion_fault_handling_lock = asyncio.Lock()
         self._initialized = False
         self._closed = False
         self.ready = asyncio.Event()
@@ -265,6 +310,11 @@ class RobotAgentRuntime:
                 health_topic=self.config.observation.health_topic,
             )
         self._ros.configure_state_sources(self.config.state_sources)
+        if self.config.safety.motion_safety_fault.enabled:
+            self._ros.configure_motion_safety_fault(
+                config=self.config.safety.motion_safety_fault,
+                callback=self._on_motion_safety_fault,
+            )
         self._ros.configure_heartbeat(
             topic=self.config.safety.heartbeat_topic,
             period_ms=self.config.safety.heartbeat_period_ms,
@@ -502,6 +552,7 @@ class RobotAgentRuntime:
         session_id: UUID,
     ) -> str | None:
         if isinstance(message, ControlAcquire):
+            self._assert_motion_fault_not_latched()
             try:
                 if self._session.state is not ControlState.ACTIVE:
                     await self._assert_downstream_ready_for_acquire()
@@ -545,6 +596,7 @@ class RobotAgentRuntime:
             )
             return None
         if isinstance(message, CommandRequest):
+            self._assert_motion_fault_not_latched()
             self._session.assert_can_command(session_id)
             existing = await self._coordinator.record(message.payload.command_id)
             if existing is not None:
@@ -574,6 +626,7 @@ class RobotAgentRuntime:
             await asyncio.sleep(0)
             return None
         if isinstance(message, CommandCancel):
+            self._assert_motion_fault_not_latched()
             self._session.assert_can_command(session_id)
             if not self._coordinator.is_command_active(message.payload.command_id):
                 record = await self._coordinator.record(message.payload.command_id)
@@ -985,8 +1038,17 @@ class RobotAgentRuntime:
             # confirmed SAFE_HOLD.  The session has already revoked authority.
             await self._enqueue_control_status()
 
-    async def _revoke_authority_for_safe_stop(self, reason: str) -> None:
-        revoked = await self._session.revoke_authority(reason)
+    async def _revoke_authority_for_safe_stop(
+        self,
+        reason: str,
+        *,
+        latch_fault: bool = False,
+    ) -> None:
+        revoked = (
+            await self._session.latch_safety_fault(reason)
+            if latch_fault
+            else await self._session.revoke_authority(reason)
+        )
         try:
             await asyncio.to_thread(
                 self._ledger.begin_safe_stop,
@@ -1055,6 +1117,223 @@ class RobotAgentRuntime:
         if loop is None or loop.is_closed() or self._observation_guard is None:
             return
         loop.call_soon_threadsafe(self._accept_observation_health, sample)
+
+    def _on_motion_safety_fault(
+        self,
+        raw: str,
+        received_monotonic_ns: int,
+    ) -> None:
+        """Strictly isolate and deduplicate a ROS-thread fault ingress."""
+
+        try:
+            fault = MotionSafetyFault.from_json(raw)
+        except ValueError as exc:
+            with self._motion_fault_lock:
+                self._motion_fault_counters["invalid"] += 1
+            LOGGER.warning("rejecting invalid motion-safety-fault event: %s", exc)
+            return
+        config = self.config.safety.motion_safety_fault
+        with self._motion_fault_lock:
+            if fault.robot_id != self.config.robot_id:
+                self._motion_fault_counters["wrongRobot"] += 1
+                return
+            if fault.localization_epoch_id != config.localization_epoch_id:
+                self._motion_fault_counters["wrongEpoch"] += 1
+                return
+            decision = self._motion_fault_deduplicator.observe(fault)
+            counter = {
+                DeduplicationDecision.DUPLICATE: "duplicate",
+                DeduplicationDecision.STALE_SEQUENCE: "staleSequence",
+                DeduplicationDecision.SEQUENCE_CONFLICT: "sequenceConflict",
+            }.get(decision)
+            if counter is not None:
+                self._motion_fault_counters[counter] += 1
+                return
+            self._motion_fault_counters["accepted"] += 1
+            self._motion_fault_latest = fault
+            # This thread-safe latch closes the small interval before the
+            # asyncio SessionController can durably revoke authority.
+            self._motion_fault_ingress_latched.set()
+        loop = self._event_loop
+        if loop is None or loop.is_closed():
+            LOGGER.critical(
+                "accepted motion-safety-fault without a live runtime event loop"
+            )
+            return
+        loop.call_soon_threadsafe(
+            self._schedule_motion_safety_fault,
+            fault,
+            received_monotonic_ns,
+        )
+
+    def _schedule_motion_safety_fault(
+        self,
+        fault: MotionSafetyFault,
+        received_monotonic_ns: int,
+    ) -> None:
+        task = asyncio.create_task(
+            self._handle_motion_safety_fault(fault, received_monotonic_ns)
+        )
+        self._motion_fault_tasks.add(task)
+        task.add_done_callback(self._motion_fault_task_completed)
+
+    def _motion_fault_task_completed(self, task: asyncio.Task[None]) -> None:
+        self._motion_fault_tasks.discard(task)
+        if task.cancelled():
+            LOGGER.critical("motion-safety-fault handling was cancelled")
+            return
+        exception = task.exception()
+        if exception is not None:
+            LOGGER.critical(
+                "motion-safety-fault handling failed closed: %s",
+                exception,
+                exc_info=exception,
+            )
+
+    async def _handle_motion_safety_fault(
+        self,
+        fault: MotionSafetyFault,
+        received_monotonic_ns: int,
+    ) -> None:
+        async with self._motion_fault_handling_lock:
+            reason = (
+                f"motion_safety_fault[{fault.event_id}] "
+                f"{fault.source}/{fault.code}: {fault.reason}"
+            )
+            received_at = _now()
+            audit_task = asyncio.create_task(
+                asyncio.to_thread(
+                    self._ledger.begin_motion_fault,
+                    fault=fault,
+                    received_monotonic_ns=received_monotonic_ns,
+                    at=received_at,
+                )
+            )
+            revoke_task = asyncio.create_task(
+                self._revoke_authority_for_safe_stop(reason, latch_fault=True)
+            )
+
+            command_ids = self._coordinator.active_nav2_commands
+            command_id = next(iter(command_ids)) if len(command_ids) == 1 else None
+            cancel_task: asyncio.Task[MotionFaultCancelEvidence] | None = None
+            coordinator_task: asyncio.Task[bool] | None = None
+            outcome = "no_active_nav2_goal"
+            detail = "fault latched with no active Nav2 command"
+            evidence: MotionFaultCancelEvidence | None = None
+            if command_id is not None:
+                fault_config = self.config.safety.motion_safety_fault
+                cancel_task = asyncio.create_task(
+                    self._ros.cancel_nav2_for_motion_fault(
+                        command_id,
+                        received_monotonic_ns=received_monotonic_ns,
+                        cancel_begin_deadline_ms=fault_config.cancel_begin_deadline_ms,
+                        nav2_terminal_deadline_ms=fault_config.nav2_terminal_deadline_ms,
+                    )
+                )
+                prepared = self._coordinator.prepare_safe_stop_cancel(
+                    command_id,
+                    reason=reason,
+                    at=received_at,
+                    defer_terminal_until_safe_stop=True,
+                    external_cancel_task=cancel_task,
+                )
+                if prepared:
+                    coordinator_task = asyncio.create_task(
+                        self._coordinator.cancel(
+                            command_id,
+                            reason=reason,
+                            at=received_at,
+                            defer_terminal_until_safe_stop=True,
+                            external_cancel_task=cancel_task,
+                        )
+                    )
+            elif len(command_ids) > 1:
+                outcome = "ambiguous_nav2_ownership"
+                detail = (
+                    "multiple locally active Nav2 commands; refused any broad ROS cancel"
+                )
+
+            try:
+                if coordinator_task is not None:
+                    await coordinator_task
+                if cancel_task is not None:
+                    evidence = await cancel_task
+                    outcome = evidence.outcome
+                    detail = "exact command-owned Nav2 goal reached terminal"
+            except MotionFaultCancellationError as exc:
+                evidence = exc.evidence
+                outcome = evidence.outcome
+                detail = str(exc)
+            except CommandCancellationError as exc:
+                if cancel_task is not None and cancel_task.done():
+                    try:
+                        evidence = cancel_task.result()
+                    except MotionFaultCancellationError as cancel_exc:
+                        evidence = cancel_exc.evidence
+                    except Exception:
+                        pass
+                outcome = (
+                    evidence.outcome
+                    if evidence is not None
+                    else "command_cancellation_unacknowledged"
+                )
+                detail = str(exc)
+            except Exception as exc:
+                if isinstance(exc, MotionFaultCancellationError):
+                    evidence = exc.evidence
+                outcome = "fault_cancel_failed"
+                detail = f"{type(exc).__name__}: {exc}"
+
+            # Authority revocation and its epoch audit run concurrently with
+            # the 300 ms cancellation boundary, never in front of it.
+            with contextlib.suppress(Exception):
+                await revoke_task
+            safe_stop_epoch = self._session.snapshot.safe_stop_epoch
+            with self._motion_fault_lock:
+                self._motion_fault_latest_evidence = evidence
+                self._motion_fault_latest_outcome = outcome
+                self._motion_fault_latest_detail = detail[:1024]
+                self._motion_fault_latest_safe_stop_epoch = safe_stop_epoch
+            try:
+                await self._enter_safe_hold_after_cancel(reason)
+            except Exception as exc:
+                outcome = f"{outcome}:safe_stop_failed"
+                detail = f"{detail}; physical safe-stop failed: {type(exc).__name__}: {exc}"
+
+            with self._motion_fault_lock:
+                self._motion_fault_latest_evidence = evidence
+                self._motion_fault_latest_outcome = outcome
+                self._motion_fault_latest_detail = detail[:1024]
+                self._motion_fault_latest_safe_stop_epoch = safe_stop_epoch
+
+            try:
+                audit = await audit_task
+                await asyncio.to_thread(
+                    self._ledger.finish_motion_fault,
+                    audit.handling_id,
+                    safe_stop_epoch=safe_stop_epoch,
+                    command_id=command_id,
+                    cancel_begin_monotonic_ns=(
+                        None if evidence is None else evidence.cancel_begin_monotonic_ns
+                    ),
+                    ros_cancel_call_monotonic_ns=(
+                        None if evidence is None else evidence.ros_cancel_call_monotonic_ns
+                    ),
+                    nav2_terminal_monotonic_ns=(
+                        None if evidence is None else evidence.nav2_terminal_monotonic_ns
+                    ),
+                    outcome=outcome,
+                    detail=detail,
+                    at=_now(),
+                )
+            except Exception as exc:
+                LOGGER.error("failed to persist motion-fault correlation: %s", exc)
+
+    def _assert_motion_fault_not_latched(self) -> None:
+        if self._motion_fault_ingress_latched.is_set():
+            raise SessionStateError(
+                "control blocked: a motion-safety fault is latched"
+            )
 
     def _accept_observation_health(self, sample: ObservationHealthSample) -> None:
         guard = self._observation_guard
@@ -1172,6 +1451,11 @@ class RobotAgentRuntime:
             return
         self._closed = True
         self.ready.clear()
+        if self._motion_fault_tasks:
+            await asyncio.gather(
+                *tuple(self._motion_fault_tasks),
+                return_exceptions=True,
+            )
         await self._ros.close()
         await asyncio.to_thread(self._ledger.close)
 
@@ -1255,6 +1539,14 @@ class RobotAgentRuntime:
         monotonic_now = time.monotonic()
         lifecycle_ready = self._initialized and not self._closed
         session_snapshot = self._session.snapshot
+        with self._motion_fault_lock:
+            motion_fault_latched = self._motion_fault_ingress_latched.is_set()
+            motion_fault = self._motion_fault_latest
+            motion_fault_evidence = self._motion_fault_latest_evidence
+            motion_fault_outcome = self._motion_fault_latest_outcome
+            motion_fault_detail = self._motion_fault_latest_detail
+            motion_fault_safe_stop_epoch = self._motion_fault_latest_safe_stop_epoch
+            motion_fault_counters = dict(self._motion_fault_counters)
         connection_session_id = self._connection_session_id
         transport_ready = (
             lifecycle_ready
@@ -1378,6 +1670,7 @@ class RobotAgentRuntime:
             lifecycle_ready
             and ros_ready
             and safety_endpoints_ready
+            and not motion_fault_latched
             and (not nav2_required or nav2_ready)
             and (not localization_required or localization_fresh)
             and (not observation_required or bool(observation["ready"]))
@@ -1386,15 +1679,20 @@ class RobotAgentRuntime:
             transport_ready
             and session_snapshot.can_acquire
             and downstream_ready_for_acquire
+            and not motion_fault_latched
         )
         standby_ready = (
             not control_active
             and effective_can_acquire
             and active_command_count == 0
         )
-        active_control_ready = transport_ready and lease_valid
+        active_control_ready = (
+            transport_ready and lease_valid and not motion_fault_latched
+        )
         control_ready = standby_ready or active_control_ready
-        if not transport_ready:
+        if motion_fault_latched:
+            control_reason = "motion_safety_fault_latched"
+        elif not transport_ready:
             control_reason = "transport_session_unavailable"
         elif active_command_count and not lease_valid:
             control_reason = "active_commands_without_valid_lease"
@@ -1489,6 +1787,47 @@ class RobotAgentRuntime:
                 "required": observation_required,
                 **observation,
             },
+            "motionSafetyFault": {
+                "required": self.config.safety.motion_safety_fault.enabled,
+                "ready": not motion_fault_latched,
+                "reason": (
+                    "motion_safety_fault_latched" if motion_fault_latched else None
+                ),
+                "latched": motion_fault_latched,
+                "eventId": None if motion_fault is None else str(motion_fault.event_id),
+                "source": None if motion_fault is None else motion_fault.source,
+                "code": None if motion_fault is None else motion_fault.code,
+                "controlGeneration": (
+                    None if motion_fault is None else motion_fault.control_generation
+                ),
+                "localizationEpochId": (
+                    None if motion_fault is None else motion_fault.localization_epoch_id
+                ),
+                "safeStopEpoch": motion_fault_safe_stop_epoch,
+                "commandId": (
+                    None
+                    if motion_fault_evidence is None
+                    else str(motion_fault_evidence.command_id)
+                ),
+                "outcome": motion_fault_outcome,
+                "detail": motion_fault_detail,
+                "cancelBeginLatencyMs": (
+                    None
+                    if motion_fault_evidence is None
+                    else _rounded_age(motion_fault_evidence.cancel_begin_latency_ms)
+                ),
+                "nav2TerminalLatencyMs": (
+                    None
+                    if motion_fault_evidence is None
+                    else _rounded_age(motion_fault_evidence.nav2_terminal_latency_ms)
+                ),
+                "rosCancelCallLatencyMs": (
+                    None
+                    if motion_fault_evidence is None
+                    else _rounded_age(motion_fault_evidence.ros_cancel_call_latency_ms)
+                ),
+                "counters": motion_fault_counters,
+            },
         }
         ready = all(bool(check["ready"]) for check in checks.values() if bool(check["required"]))
         command_readiness_reason = (
@@ -1521,6 +1860,7 @@ class RobotAgentRuntime:
                 "leaseRemainingMs": _rounded_age(lease_remaining_ms),
                 "activeCommandCount": active_command_count,
             },
+            "motionSafetyFault": checks["motionSafetyFault"],
             "checks": checks,
         }
 

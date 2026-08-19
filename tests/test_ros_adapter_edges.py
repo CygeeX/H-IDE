@@ -3,15 +3,18 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import threading
+import time
 from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
 import pytest
 from action_msgs.msg import GoalStatus
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, ReliabilityPolicy
 
 from robot_agent.config import CommandConfig, StateSourceConfig
 from robot_agent.ros_adapter import (
+    MotionFaultCancellationError,
     RosAdapter,
     RosAdapterError,
     RosTypeError,
@@ -22,6 +25,7 @@ from robot_agent.ros_adapter import (
     _set_result_if_pending,
     _wait_for_ready,
     build_message,
+    motion_safety_fault_qos,
 )
 
 
@@ -281,6 +285,226 @@ def test_action_send_is_refused_if_cancel_won_before_owner_thread_dispatch() -> 
 
     assert client.calls == 0
     assert command_id not in adapter._pending
+
+
+def test_motion_fault_subscription_qos_is_durable_robot_scoped_contract() -> None:
+    qos = motion_safety_fault_qos()
+    assert qos.history is HistoryPolicy.KEEP_LAST
+    assert qos.depth == 1
+    assert qos.reliability is ReliabilityPolicy.RELIABLE
+    assert qos.durability is DurabilityPolicy.TRANSIENT_LOCAL
+
+
+@pytest.mark.asyncio
+async def test_motion_fault_cancels_only_owned_goal_and_proves_deadlines() -> None:
+    adapter = RosAdapter()
+    adapter._started = True
+    adapter._thread = LiveThread()  # type: ignore[assignment]
+    adapter._owner_thread_id = threading.get_ident()
+    adapter._accepting_requests = True
+
+    class GoalHandle:
+        accepted = True
+        status = GoalStatus.STATUS_EXECUTING
+
+        def __init__(self) -> None:
+            self.cancel_calls = 0
+            self.result_future = ImmediateFuture(
+                SimpleNamespace(status=GoalStatus.STATUS_CANCELED, result=object())
+            )
+
+        def cancel_goal_async(self) -> ImmediateFuture:
+            self.cancel_calls += 1
+            return ImmediateFuture(SimpleNamespace(goals_canceling=[self]))
+
+        def get_result_async(self) -> ImmediateFuture:
+            return self.result_future
+
+    command_id = uuid4()
+    other_command_id = uuid4()
+    goal = GoalHandle()
+    other_goal = GoalHandle()
+    adapter._goals[command_id] = goal
+    adapter._goals[other_command_id] = other_goal
+    adapter._action_waiters.update({command_id, other_command_id})
+    received_ns = time.monotonic_ns()
+
+    proof = await adapter.cancel_nav2_for_motion_fault(
+        command_id,
+        received_monotonic_ns=received_ns,
+    )
+
+    assert proof.command_id == command_id
+    assert proof.outcome == "nav2_terminal"
+    assert 0 <= proof.cancel_begin_latency_ms <= 100
+    assert proof.nav2_terminal_latency_ms is not None
+    assert 0 <= proof.nav2_terminal_latency_ms <= 300
+    assert proof.ros_cancel_call_monotonic_ns is not None
+    assert proof.ros_cancel_call_latency_ms is not None
+    assert 0 <= proof.ros_cancel_call_latency_ms <= 100
+    assert goal.cancel_calls == 1
+    assert other_goal.cancel_calls == 0
+    assert other_command_id not in adapter._cancel_requested
+
+
+@pytest.mark.asyncio
+async def test_motion_fault_handles_pending_rejected_and_already_terminal_goal_races() -> None:
+    adapter = RosAdapter()
+    adapter._started = True
+    adapter._thread = LiveThread()  # type: ignore[assignment]
+    adapter._owner_thread_id = threading.get_ident()
+    adapter._accepting_requests = True
+
+    class PendingGoal:
+        accepted = True
+        status = GoalStatus.STATUS_ACCEPTED
+
+        def __init__(self) -> None:
+            self.cancel_calls = 0
+
+        def cancel_goal_async(self) -> ImmediateFuture:
+            self.cancel_calls += 1
+            return ImmediateFuture(SimpleNamespace(goals_canceling=[self]))
+
+        def get_result_async(self) -> ImmediateFuture:
+            return ImmediateFuture(
+                SimpleNamespace(status=GoalStatus.STATUS_CANCELED, result=object())
+            )
+
+    pending_id = uuid4()
+    pending_goal = PendingGoal()
+    adapter._pending[pending_id] = ImmediateFuture(pending_goal)
+    adapter._pending_actions.add(pending_id)
+    adapter._action_waiters.add(pending_id)
+    pending_proof = await adapter.cancel_nav2_for_motion_fault(
+        pending_id,
+        received_monotonic_ns=time.monotonic_ns(),
+    )
+    assert pending_proof.outcome == "nav2_terminal"
+    assert pending_goal.cancel_calls == 1
+
+    rejected_id = uuid4()
+    adapter._pending[rejected_id] = ImmediateFuture(SimpleNamespace(accepted=False))
+    adapter._pending_actions.add(rejected_id)
+    adapter._action_waiters.add(rejected_id)
+    rejected_proof = await adapter.cancel_nav2_for_motion_fault(
+        rejected_id,
+        received_monotonic_ns=time.monotonic_ns(),
+    )
+    assert rejected_proof.outcome == "goal_rejected_before_execution"
+
+    terminal_id = uuid4()
+    terminal_goal = PendingGoal()
+    terminal_goal.status = GoalStatus.STATUS_SUCCEEDED
+    adapter._goals[terminal_id] = terminal_goal
+    terminal_proof = await adapter.cancel_nav2_for_motion_fault(
+        terminal_id,
+        received_monotonic_ns=time.monotonic_ns(),
+    )
+    assert terminal_proof.outcome == "already_terminal"
+    assert terminal_goal.cancel_calls == 0
+
+    class RacingGoal(PendingGoal):
+        def cancel_goal_async(self) -> ImmediateFuture:
+            self.cancel_calls += 1
+            return ImmediateFuture(SimpleNamespace(goals_canceling=[]))
+
+    racing_id = uuid4()
+    racing_goal = RacingGoal()
+    adapter._goals[racing_id] = racing_goal
+    adapter._action_waiters.add(racing_id)
+    racing_proof = await adapter.cancel_nav2_for_motion_fault(
+        racing_id,
+        received_monotonic_ns=time.monotonic_ns(),
+    )
+    assert racing_proof.outcome == "terminal_raced_cancel"
+    assert racing_goal.cancel_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_motion_fault_rejects_a_missed_cancel_begin_deadline_without_broad_cancel() -> None:
+    adapter = RosAdapter()
+    adapter._started = True
+    adapter._thread = LiveThread()  # type: ignore[assignment]
+    adapter._owner_thread_id = threading.get_ident()
+    adapter._accepting_requests = True
+    command_id = uuid4()
+    received_ns = time.monotonic_ns() - 101_000_000
+
+    with pytest.raises(
+        MotionFaultCancellationError,
+        match="did not begin within 100 ms",
+    ) as caught:
+        await adapter.cancel_nav2_for_motion_fault(
+            command_id,
+            received_monotonic_ns=received_ns,
+        )
+    assert caught.value.evidence.outcome == "cancel_begin_deadline_missed"
+
+
+@pytest.mark.asyncio
+async def test_motion_fault_enforces_actual_ros_cancel_and_terminal_absolute_deadlines(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class GoalHandle:
+        accepted = True
+        status = GoalStatus.STATUS_EXECUTING
+
+        def __init__(self, result_future: Any) -> None:
+            self.result_future = result_future
+
+        def cancel_goal_async(self) -> ImmediateFuture:
+            return ImmediateFuture(SimpleNamespace(goals_canceling=[self]))
+
+        def get_result_async(self) -> Any:
+            return self.result_future
+
+    delayed = RosAdapter()
+    delayed._started = True
+    delayed._thread = LiveThread()  # type: ignore[assignment]
+    delayed._owner_thread_id = threading.get_ident()
+    delayed._accepting_requests = True
+    delayed_id = uuid4()
+    delayed._goals[delayed_id] = GoalHandle(
+        ImmediateFuture(SimpleNamespace(status=GoalStatus.STATUS_CANCELED))
+    )
+    delayed._action_waiters.add(delayed_id)
+    original_run = delayed._run_on_ros_thread
+
+    async def delayed_run(callback: Any) -> Any:
+        await asyncio.sleep(0.105)
+        return await original_run(callback)
+
+    monkeypatch.setattr(delayed, "_run_on_ros_thread", delayed_run)
+    with pytest.raises(MotionFaultCancellationError) as begin_missed:
+        await delayed.cancel_nav2_for_motion_fault(
+            delayed_id,
+            received_monotonic_ns=time.monotonic_ns(),
+        )
+    assert begin_missed.value.evidence.outcome == "ros_cancel_begin_deadline_missed"
+    assert begin_missed.value.evidence.ros_cancel_call_latency_ms is not None
+    assert begin_missed.value.evidence.ros_cancel_call_latency_ms > 100
+
+    terminal = RosAdapter()
+    terminal._started = True
+    terminal._thread = LiveThread()  # type: ignore[assignment]
+    terminal._owner_thread_id = threading.get_ident()
+    terminal._accepting_requests = True
+    terminal_id = uuid4()
+    never_terminal: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+    terminal._goals[terminal_id] = GoalHandle(never_terminal)
+    terminal._action_waiters.add(terminal_id)
+    with pytest.raises(MotionFaultCancellationError) as terminal_missed:
+        await terminal.cancel_nav2_for_motion_fault(
+            terminal_id,
+            received_monotonic_ns=time.monotonic_ns(),
+        )
+    assert (
+        terminal_missed.value.evidence.outcome
+        == "nav2_terminal_deadline_or_failure"
+    )
+    assert terminal_missed.value.evidence.nav2_terminal_monotonic_ns is None
+    assert never_terminal.cancelled() is False
 
 
 def test_ros_start_reports_closed_timeout_startup_and_stopped_thread() -> None:

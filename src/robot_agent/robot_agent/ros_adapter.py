@@ -38,6 +38,7 @@ from std_msgs.msg import String
 
 from robot_agent.config import (
     CommandConfig,
+    MotionSafetyFaultConfig,
     QoSConfig,
     SafeStopConfig,
     StateSourceConfig,
@@ -162,6 +163,17 @@ def heartbeat_qos() -> QoSProfile:
     )
 
 
+def motion_safety_fault_qos() -> QoSProfile:
+    """Durable one-sample contract for a latched motion-safety fault."""
+
+    return QoSProfile(
+        history=HistoryPolicy.KEEP_LAST,
+        depth=1,
+        reliability=ReliabilityPolicy.RELIABLE,
+        durability=DurabilityPolicy.TRANSIENT_LOCAL,
+    )
+
+
 def state_source_qos(config: QoSConfig) -> QoSProfile:
     reliability = (
         ReliabilityPolicy.RELIABLE
@@ -211,6 +223,7 @@ def action_status_qos() -> QoSProfile:
 StateCallback = Callable[[str, Any, datetime], None]
 FeedbackCallback = Callable[[UUID, dict[str, Any]], None]
 ObservationHealthCallback = Callable[[ObservationHealthSample], None]
+MotionSafetyFaultCallback = Callable[[str, int], None]
 StateSupplier = Callable[[], str]
 
 _ROS_REQUEST_QUEUE_SIZE = 256
@@ -227,6 +240,46 @@ _TERMINAL_GOAL_STATUSES = frozenset(
 class RosActionReadiness:
     ready: bool
     reason: str | None = None
+
+
+@dataclass(frozen=True)
+class MotionFaultCancelEvidence:
+    """Monotonic evidence for one exact Nav2 cancellation boundary."""
+
+    command_id: UUID
+    received_monotonic_ns: int
+    cancel_begin_monotonic_ns: int
+    ros_cancel_call_monotonic_ns: int | None
+    nav2_terminal_monotonic_ns: int | None
+    outcome: str
+
+    @property
+    def cancel_begin_latency_ms(self) -> float:
+        return (self.cancel_begin_monotonic_ns - self.received_monotonic_ns) / 1_000_000
+
+    @property
+    def nav2_terminal_latency_ms(self) -> float | None:
+        if self.nav2_terminal_monotonic_ns is None:
+            return None
+        return (
+            self.nav2_terminal_monotonic_ns - self.received_monotonic_ns
+        ) / 1_000_000
+
+    @property
+    def ros_cancel_call_latency_ms(self) -> float | None:
+        if self.ros_cancel_call_monotonic_ns is None:
+            return None
+        return (
+            self.ros_cancel_call_monotonic_ns - self.received_monotonic_ns
+        ) / 1_000_000
+
+
+class MotionFaultCancellationError(RosAdapterError):
+    """Exact fault cancellation missed or could not prove its deadline."""
+
+    def __init__(self, message: str, evidence: MotionFaultCancelEvidence) -> None:
+        self.evidence = evidence
+        super().__init__(message)
 
 
 class RosAdapter:
@@ -264,6 +317,9 @@ class RosAdapter:
         self._state_callback = state_callback
         self._feedback_callback = feedback_callback
         self._observation_health_callback: ObservationHealthCallback | None = None
+        self._motion_fault_configuration: tuple[
+            MotionSafetyFaultConfig, MotionSafetyFaultCallback
+        ] | None = None
         self._service_clients: dict[tuple[str, str], Any] = {}
         self._action_clients: dict[tuple[str, str], Any] = {}
         self._subscriptions: list[Any] = []
@@ -276,6 +332,7 @@ class RosAdapter:
         self._service_waiters: set[UUID] = set()
         self._cancel_requested: set[UUID] = set()
         self._cancel_futures: dict[UUID, Any] = {}
+        self._cancel_started_monotonic_ns: dict[UUID, int] = {}
         self._action_waiters: set[UUID] = set()
         self._goal_lock = threading.RLock()
         self._heartbeat_publisher: Any | None = None
@@ -334,6 +391,7 @@ class RosAdapter:
             self._create_state_sources()
             self._create_heartbeat()
             self._create_observation_bridge()
+            self._create_motion_safety_fault_subscription()
         except BaseException as exc:
             self._startup_error = exc
             self._running.clear()
@@ -408,6 +466,46 @@ class RosAdapter:
                     f"unable to load state source type {source.ros_type!r}: {exc}"
                 ) from exc
         self._configured_state_sources = dict(sources)
+
+    def configure_motion_safety_fault(
+        self,
+        *,
+        config: MotionSafetyFaultConfig,
+        callback: MotionSafetyFaultCallback,
+    ) -> None:
+        if self._closed:
+            raise RosAdapterError("ROS adapter is closed")
+        if self._started:
+            raise RosAdapterError(
+                "motion-safety-fault subscription must be configured before startup"
+            )
+        if self._motion_fault_configuration is not None:
+            raise RosAdapterError("motion-safety-fault subscription is already configured")
+        if config.enabled:
+            self._motion_fault_configuration = (config, callback)
+
+    def _create_motion_safety_fault_subscription(self) -> None:
+        configuration = self._motion_fault_configuration
+        if configuration is None:
+            return
+        config, callback = configuration
+        group = ReentrantCallbackGroup()
+        self._callback_groups.append(group)
+
+        def on_message(message: String) -> None:
+            # Capture T0 as the first operation in the callback.  Parsing,
+            # SQLite and the asyncio bridge are all charged against this time.
+            received_monotonic_ns = time.monotonic_ns()
+            callback(message.data, received_monotonic_ns)
+
+        subscription = self._require_node().create_subscription(
+            String,
+            config.topic,
+            on_message,
+            motion_safety_fault_qos(),
+            callback_group=group,
+        )
+        self._subscriptions.append(subscription)
 
     def _create_state_sources(self) -> None:
         for logical_path, source in self._configured_state_sources.items():
@@ -854,6 +952,165 @@ class RosAdapter:
                 if not service_waiting and not action_waiting:
                     self._cancel_requested.discard(command_id)
 
+    async def cancel_nav2_for_motion_fault(
+        self,
+        command_id: UUID,
+        *,
+        received_monotonic_ns: int,
+        cancel_begin_deadline_ms: int = 100,
+        nav2_terminal_deadline_ms: int = 300,
+    ) -> MotionFaultCancelEvidence:
+        """Cancel exactly one action goal under the fault-specific deadline.
+
+        This deliberately does not use the ROS ``CancelGoal`` service and has
+        no "cancel all" fallback.  A command without an owned goal is treated
+        as prevented-before-dispatch only while its local action coroutine is
+        still registered.
+        """
+
+        if cancel_begin_deadline_ms != 100 or nav2_terminal_deadline_ms != 300:
+            raise ValueError("motion-fault deadlines are fixed at 100 ms / 300 ms")
+        self._require_started()
+        begin_ns = time.monotonic_ns()
+        begin_limit_ns = received_monotonic_ns + cancel_begin_deadline_ms * 1_000_000
+        terminal_limit_ns = (
+            received_monotonic_ns + nav2_terminal_deadline_ms * 1_000_000
+        )
+        ros_call_ns: int | None = None
+
+        def evidence(
+            outcome: str,
+            *,
+            terminal_ns: int | None = None,
+        ) -> MotionFaultCancelEvidence:
+            return MotionFaultCancelEvidence(
+                command_id=command_id,
+                received_monotonic_ns=received_monotonic_ns,
+                cancel_begin_monotonic_ns=begin_ns,
+                ros_cancel_call_monotonic_ns=(
+                    ros_call_ns
+                    if ros_call_ns is not None
+                    else self._cancel_started_monotonic_ns.get(command_id)
+                ),
+                nav2_terminal_monotonic_ns=terminal_ns,
+                outcome=outcome,
+            )
+
+        if begin_ns > begin_limit_ns:
+            proof = evidence("cancel_begin_deadline_missed")
+            raise MotionFaultCancellationError(
+                "motion-fault cancellation did not begin within 100 ms",
+                proof,
+            )
+        with self._goal_lock:
+            self._cancel_requested.add(command_id)
+            goal_handle = self._goals.get(command_id)
+            pending = self._pending.get(command_id)
+            pending_action = command_id in self._pending_actions
+            action_waiting = command_id in self._action_waiters
+
+        if goal_handle is None and pending is not None and not pending_action:
+            # A result future can already be installed before _goals becomes
+            # visible only during teardown.  It still belongs to this command;
+            # wait for its exact terminal rather than touching another goal.
+            if not action_waiting:
+                terminal_ns = time.monotonic_ns()
+                return evidence("already_terminal", terminal_ns=terminal_ns)
+            proof = evidence("goal_ownership_ambiguous")
+            raise MotionFaultCancellationError(
+                "active command has no provable Nav2 goal ownership",
+                proof,
+            )
+
+        if goal_handle is None and pending is not None and pending_action:
+            try:
+                candidate = await _await_ros_future_before(
+                    pending,
+                    absolute_deadline_ns=terminal_limit_ns,
+                )
+            except Exception as exc:
+                proof = evidence("pending_goal_acceptance_failed")
+                raise MotionFaultCancellationError(
+                    f"pending Nav2 goal acceptance failed: {type(exc).__name__}: {exc}",
+                    proof,
+                ) from exc
+            if not getattr(candidate, "accepted", False):
+                terminal_ns = time.monotonic_ns()
+                self._cleanup_command_tracking(command_id)
+                return evidence("goal_rejected_before_execution", terminal_ns=terminal_ns)
+            goal_handle = candidate
+
+        if goal_handle is None:
+            terminal_ns = time.monotonic_ns()
+            if action_waiting:
+                # _begin_action_send observes _cancel_requested under the same
+                # lock, proving this command can no longer dispatch a goal.
+                return evidence("prevented_before_dispatch", terminal_ns=terminal_ns)
+            with self._goal_lock:
+                self._cancel_requested.discard(command_id)
+            return evidence("already_terminal", terminal_ns=terminal_ns)
+
+        status = getattr(goal_handle, "status", None)
+        if status in _TERMINAL_GOAL_STATUSES:
+            return evidence("already_terminal", terminal_ns=time.monotonic_ns())
+
+        cancel_future = await self._run_on_ros_thread(
+            lambda: self._begin_goal_cancel(command_id, goal_handle)
+        )
+        with self._goal_lock:
+            ros_call_ns = self._cancel_started_monotonic_ns.get(command_id)
+        if ros_call_ns is None or ros_call_ns > begin_limit_ns:
+            proof = evidence("ros_cancel_begin_deadline_missed")
+            raise MotionFaultCancellationError(
+                "exact Nav2 cancellation did not begin within 100 ms",
+                proof,
+            )
+        cancel_rejected = False
+        if cancel_future is not None:
+            try:
+                response = await _await_ros_future_before(
+                    cancel_future,
+                    absolute_deadline_ns=terminal_limit_ns,
+                )
+            except Exception as exc:
+                proof = evidence("cancel_ack_deadline_or_failure")
+                raise MotionFaultCancellationError(
+                    f"exact Nav2 cancel acknowledgement failed: {type(exc).__name__}: {exc}",
+                    proof,
+                ) from exc
+            if not response.goals_canceling:
+                # A goal can become terminal between our ownership snapshot
+                # and Nav2 processing the exact cancel request.  The result
+                # future below distinguishes that benign race from a live
+                # cancellation rejection without broadening the target.
+                cancel_rejected = True
+
+        result_future = await self._run_on_ros_thread(
+            lambda: self._begin_action_result(command_id, goal_handle)
+        )
+        try:
+            terminal = await _await_ros_future_before(
+                result_future,
+                absolute_deadline_ns=terminal_limit_ns,
+            )
+        except Exception as exc:
+            proof = evidence("nav2_terminal_deadline_or_failure")
+            raise MotionFaultCancellationError(
+                f"Nav2 did not reach terminal within 300 ms: {type(exc).__name__}: {exc}",
+                proof,
+            ) from exc
+        terminal_ns = time.monotonic_ns()
+        if terminal.status not in _TERMINAL_GOAL_STATUSES or terminal_ns > terminal_limit_ns:
+            proof = evidence("nav2_terminal_deadline_missed", terminal_ns=terminal_ns)
+            raise MotionFaultCancellationError(
+                "Nav2 terminal proof exceeded the 300 ms fault deadline",
+                proof,
+            )
+        return evidence(
+            "terminal_raced_cancel" if cancel_rejected else "nav2_terminal",
+            terminal_ns=terminal_ns,
+        )
+
     def _begin_action_send(
         self,
         command_id: UUID,
@@ -908,9 +1165,11 @@ class RosAdapter:
             if existing is not None:
                 return existing
             self._goals[command_id] = goal_handle
+        started_ns = time.monotonic_ns()
         cancel_future = goal_handle.cancel_goal_async()
         with self._goal_lock:
             self._cancel_futures[command_id] = cancel_future
+            self._cancel_started_monotonic_ns[command_id] = started_ns
         return cancel_future
 
     def _request_cancel_without_waiting(self, command_id: UUID) -> None:
@@ -997,6 +1256,7 @@ class RosAdapter:
             self._pending_actions.discard(command_id)
             self._cancel_requested.discard(command_id)
             self._cancel_futures.pop(command_id, None)
+            self._cancel_started_monotonic_ns.pop(command_id, None)
 
     def _service_client(self, ros_name: str, ros_type: str) -> Any:
         self._require_owner_thread()
@@ -1246,6 +1506,22 @@ async def _await_ros_future(future: Any, *, cancel_source: bool = True) -> Any:
         if cancel_source:
             future.cancel()
         raise
+
+
+async def _await_ros_future_before(
+    future: Any,
+    *,
+    absolute_deadline_ns: int,
+) -> Any:
+    """Await a ROS future without extending or cancelling its absolute deadline."""
+
+    remaining = (absolute_deadline_ns - time.monotonic_ns()) / 1_000_000_000
+    if remaining <= 0:
+        raise asyncio.TimeoutError("absolute monotonic deadline already expired")
+    return await asyncio.wait_for(
+        _await_ros_future(future, cancel_source=False),
+        timeout=remaining,
+    )
 
 
 def _set_result_if_pending(future: asyncio.Future[Any], value: Any) -> None:

@@ -12,7 +12,12 @@ from uuid import UUID, uuid4
 import pytest
 
 import robot_agent.runtime as runtime_module
-from robot_agent.config import AgentConfig, CommandConfig, SafeStopConfig
+from robot_agent.config import (
+    AgentConfig,
+    CommandConfig,
+    MotionSafetyFaultConfig,
+    SafeStopConfig,
+)
 from robot_agent.coordinator import CommandCancellationError, ExecutionResult
 from robot_agent.ledger import CommandRecord, CommandState
 from robot_agent.observation import (
@@ -21,7 +26,7 @@ from robot_agent.observation import (
     ObservationHealthStatus,
 )
 from robot_agent.protocol import CommandCancel, CommandRequest, WireMessage, parse_wire_message
-from robot_agent.ros_adapter import RosActionReadiness
+from robot_agent.ros_adapter import MotionFaultCancelEvidence, RosActionReadiness
 from robot_agent.runtime import RobotAgentRuntime, RuntimeSafetyError
 from robot_agent.session import ControlState, SessionStateError
 
@@ -1112,6 +1117,252 @@ async def test_lease_monitor_safe_stop_failure_terminates_connection_promptly(
             handler.cancel()
             await asyncio.gather(handler, return_exceptions=True)
         await runtime.shutdown()
+
+
+class FaultAwareFakeRosAdapter(FakeRosAdapter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.motion_fault_callback: Any = None
+        self.motion_fault_config: MotionSafetyFaultConfig | None = None
+        self.execution_started = asyncio.Event()
+        self.fault_stop_started = asyncio.Event()
+        self.release_fault_stop = asyncio.Event()
+        self.exact_fault_cancels: list[UUID] = []
+
+    def configure_motion_safety_fault(
+        self,
+        *,
+        config: MotionSafetyFaultConfig,
+        callback: Any,
+    ) -> None:
+        self.motion_fault_config = config
+        self.motion_fault_callback = callback
+
+    async def execute(
+        self,
+        command_id: UUID,
+        command: CommandConfig,
+        params: dict[str, Any],
+    ) -> ExecutionResult:
+        self.executions.append((command_id, command.ros_name, params))
+        self.execution_started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("blocked fault test execution unexpectedly resumed")
+
+    async def cancel_nav2_for_motion_fault(
+        self,
+        command_id: UUID,
+        *,
+        received_monotonic_ns: int,
+        cancel_begin_deadline_ms: int = 100,
+        nav2_terminal_deadline_ms: int = 300,
+    ) -> MotionFaultCancelEvidence:
+        assert cancel_begin_deadline_ms == 100
+        assert nav2_terminal_deadline_ms == 300
+        self.exact_fault_cancels.append(command_id)
+        begin = time.monotonic_ns()
+        terminal = time.monotonic_ns()
+        return MotionFaultCancelEvidence(
+            command_id=command_id,
+            received_monotonic_ns=received_monotonic_ns,
+            cancel_begin_monotonic_ns=begin,
+            ros_cancel_call_monotonic_ns=begin,
+            nav2_terminal_monotonic_ns=terminal,
+            outcome="nav2_terminal",
+        )
+
+    async def safe_stop(self, config: SafeStopConfig) -> ExecutionResult:
+        if self.safe_stop_reasons >= 1:
+            self.fault_stop_started.set()
+            await self.release_fault_stop.wait()
+        return await super().safe_stop(config)
+
+
+def fault_runtime_config(tmp_path: Path) -> AgentConfig:
+    base = runtime_config(tmp_path)
+    fault_config = MotionSafetyFaultConfig.model_validate(
+        {
+            "enabled": True,
+            "topic": "/h_ide/g1_sim/motion_safety_fault",
+            "localization_epoch_id": "g1-sim-map-epoch-1",
+            "cancel_begin_deadline_ms": 100,
+            "nav2_terminal_deadline_ms": 300,
+        }
+    )
+    safety = base.safety.model_copy(
+        update={"motion_safety_fault": fault_config}
+    )
+    nav2_command = CommandConfig.model_validate(
+        {
+            "adapter": "action",
+            "ros_name": "/navigate_to_pose",
+            "ros_type": "nav2_msgs/action/NavigateToPose",
+            "request_schema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+            "max_ttl_ms": 5000,
+            "timeout_ms": 4000,
+            "resources": ["base_motion"],
+            "capability_kind": "motion",
+            "goal_transform": "navigate_to_pose_v1",
+        }
+    )
+    return base.model_copy(
+        update={
+            "safety": safety,
+            "commands": {"navigation.navigate_to_pose": nav2_command},
+        }
+    )
+
+
+def motion_fault_json(
+    *,
+    event_id: UUID,
+    producer_boot_id: UUID,
+    robot_id: str = "g1-dev",
+    localization_epoch_id: str = "g1-sim-map-epoch-1",
+) -> str:
+    return json.dumps(
+        {
+            "schemaVersion": "h-ide.motion-safety-fault/v1",
+            "eventId": str(event_id),
+            "robotId": robot_id,
+            "localizationEpochId": localization_epoch_id,
+            "producerBootId": str(producer_boot_id),
+            "sourceSequence": 1,
+            "controlGeneration": 12,
+            "source": "mujoco_plant",
+            "code": "BASE_FALL_DETECTED",
+            "reason": "base tilt crossed the latched safety threshold",
+            "latched": True,
+            "detectedAt": datetime.now(timezone.utc).isoformat(),
+            "downstreamBootId": None,
+            "probeRequestId": None,
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_motion_fault_isolated_exact_cancel_and_terminal_after_physical_stop(
+    tmp_path: Path,
+) -> None:
+    config = fault_runtime_config(tmp_path)
+    ros = FaultAwareFakeRosAdapter()
+    runtime = RobotAgentRuntime(config, ros_adapter=ros)
+    await runtime.initialize()
+    assert ros.motion_fault_config is not None
+    assert ros.motion_fault_config.topic == "/h_ide/g1_sim/motion_safety_fault"
+    assert ros.motion_fault_callback is not None
+
+    # Wrong robot/epoch events are isolated before they can poison dedupe.
+    event_id = uuid4()
+    producer_boot_id = uuid4()
+    ros.motion_fault_callback(
+        motion_fault_json(
+            event_id=uuid4(),
+            producer_boot_id=producer_boot_id,
+            robot_id="other-robot",
+        ),
+        time.monotonic_ns(),
+    )
+    ros.motion_fault_callback(
+        motion_fault_json(
+            event_id=uuid4(),
+            producer_boot_id=producer_boot_id,
+            localization_epoch_id="old-map-epoch",
+        ),
+        time.monotonic_ns(),
+    )
+    assert runtime._motion_fault_ingress_latched.is_set() is False
+
+    session_id = uuid4()
+    await runtime._session.connected(session_id)
+    await runtime._session.acquire(
+        session_id,
+        operator_id="operator-7",
+        at=datetime.now(timezone.utc),
+    )
+    command_id = uuid4()
+    request = parse_wire_message(
+        inbound(
+            "command.request",
+            session_id,
+            {
+                "command_id": str(command_id),
+                "kind": "navigation.navigate_to_pose",
+                "issued_at": datetime.now(timezone.utc).isoformat(),
+                "ttl_ms": 5000,
+                "params": {},
+            },
+        ),
+        expected_robot_id="g1-dev",
+    )
+    assert isinstance(request, CommandRequest)
+    submission = asyncio.create_task(
+        runtime._coordinator.submit(request, at=datetime.now(timezone.utc))
+    )
+    await asyncio.wait_for(ros.execution_started.wait(), timeout=1)
+
+    retained_event = motion_fault_json(
+        event_id=event_id,
+        producer_boot_id=producer_boot_id,
+    )
+    ros.motion_fault_callback(retained_event, time.monotonic_ns())
+    ros.motion_fault_callback(retained_event, time.monotonic_ns())
+    await asyncio.wait_for(ros.fault_stop_started.wait(), timeout=1)
+
+    # The Nav2 terminal is known, but public command truth remains RUNNING
+    # until the independent physical safe-stop confirms.
+    pending = runtime._ledger.get(command_id)
+    assert pending.state is CommandState.RUNNING
+    assert command_id in runtime._coordinator.pending_cancel_confirmations
+    assert ros.exact_fault_cancels == [command_id]
+    assert runtime._session.snapshot.safe_stop_state.value == "requested"
+
+    ros.release_fault_stop.set()
+    await asyncio.wait_for(submission, timeout=1)
+    await asyncio.gather(*tuple(runtime._motion_fault_tasks))
+
+    terminal = runtime._ledger.get(command_id)
+    assert terminal.state is CommandState.CANCELLED
+    assert "physical safe-stop confirmed" in terminal.detail
+    assert runtime._session.snapshot.safe_stop_state.value == "confirmed"
+    assert runtime._session.snapshot.can_acquire is False
+    assert runtime._motion_fault_counters["wrongRobot"] == 1
+    assert runtime._motion_fault_counters["wrongEpoch"] == 1
+    assert runtime._motion_fault_counters["accepted"] == 1
+    assert runtime._motion_fault_counters["duplicate"] == 1
+    audit = runtime._ledger.motion_fault_events()[-1]
+    assert audit.event_id == event_id
+    assert audit.command_id == command_id
+    assert audit.safe_stop_epoch == runtime._session.snapshot.safe_stop_epoch
+    assert audit.source == "mujoco_plant"
+    assert audit.code == "BASE_FALL_DETECTED"
+    assert audit.control_generation == 12
+    diagnostics = await runtime.diagnostics_snapshot()
+    assert diagnostics["controlState"]["canAcquire"] is False
+    assert diagnostics["motionSafetyFault"]["latched"] is True
+    assert diagnostics["motionSafetyFault"]["eventId"] == str(event_id)
+    assert diagnostics["motionSafetyFault"]["commandId"] == str(command_id)
+    await runtime.shutdown()
+
+    # A fresh process/deduplicator must accept the transient-local replay and
+    # create a newer durable safe-stop epoch instead of clearing the latch.
+    replay_ros = FaultAwareFakeRosAdapter()
+    replay_ros.release_fault_stop.set()
+    replay_runtime = RobotAgentRuntime(config, ros_adapter=replay_ros)
+    await replay_runtime.initialize()
+    before_replay_epoch = replay_runtime._session.snapshot.safe_stop_epoch
+    assert replay_ros.motion_fault_callback is not None
+    replay_ros.motion_fault_callback(retained_event, time.monotonic_ns())
+    await asyncio.sleep(0)
+    await asyncio.gather(*tuple(replay_runtime._motion_fault_tasks))
+    assert replay_runtime._session.snapshot.safe_stop_epoch > before_replay_epoch
+    assert replay_runtime._session.snapshot.can_acquire is False
+    assert len(replay_runtime._ledger.motion_fault_events()) == 2
+    await replay_runtime.shutdown()
 
 
 @pytest.mark.asyncio
