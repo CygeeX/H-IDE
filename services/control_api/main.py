@@ -236,10 +236,12 @@ class _CommandIdentityConflict(ValueError):
 _CONTROL_PWA_DEEP_LINKS = (
     "/app",
     "/app/tasks/{conversation_id}",
+    "/app/scene-memory",
     "/developer",
     "/developer/tasks/{conversation_id}",
     "/developer/simulation",
     "/developer/interfaces",
+    "/developer/scene-memory",
     # Compatibility-only entry points.  The Assistant V2 product router no
     # longer exposes a scenes workspace, but old bookmarks still land in the
     # shell and no scene data is removed by this routing change.

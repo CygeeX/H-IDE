@@ -12,6 +12,12 @@ services:
       DATABASE_URL: postgresql://control:control@postgres:5432/control
       MASTRA_PLANNING_URL: ${MASTRA_COMPOSE_PLANNING_URL:-http://planning-agent:4111}
       MASTRA_INTERNAL_TOKEN: ${MASTRA_INTERNAL_TOKEN:-dev-internal-token}
+      # Trusted Mission callbacks must not reuse a browser or planner token.
+      # An omitted value leaves the callback routes fail-closed (503); the
+      # workstation demo supplies a generated value through its root .env.
+      MISSION_V2_INTERNAL_TOKEN: ${MISSION_V2_INTERNAL_TOKEN:-}
+      MISSION_POLICY_GRANT_TTL_SECONDS: ${MISSION_POLICY_GRANT_TTL_SECONDS:-600}
+      ROBOT_SITE_BINDINGS_JSON: ${ROBOT_SITE_BINDINGS_JSON:-}
       MASTRA_PLANNING_TIMEOUT_SECONDS: ${MASTRA_PLANNING_TIMEOUT_SECONDS:-120}
       ASSISTANT_DRAFT_TTL_SECONDS: ${ASSISTANT_DRAFT_TTL_SECONDS:-900}
       SCENE_API_INTERNAL_URL: http://scene-api:8090

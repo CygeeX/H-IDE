@@ -177,11 +177,13 @@ def test_control_pwa_production_deep_links_fall_back_to_index(tmp_path) -> None:
     with TestClient(app) as client:
         for path in (
             "/app",
+            "/app/scene-memory",
             "/app/tasks/conversation-1",
             "/developer",
             "/developer/tasks/conversation-2",
             "/developer/simulation",
             "/developer/interfaces",
+            "/developer/scene-memory",
         ):
             response = client.get(path)
             assert response.status_code == 200, (path, response.text)
