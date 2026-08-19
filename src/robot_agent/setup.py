@@ -21,7 +21,7 @@ setup(
         "PyYAML>=6.0,<7",
         "websockets>=16.1,<17",
     ],
-    tests_require=["pytest>=8.4,<9"],
+    extras_require={"test": ["pytest>=8.4,<9"]},
     zip_safe=False,
     maintainer="dzp",
     maintainer_email="dzp@phibotics.cn",

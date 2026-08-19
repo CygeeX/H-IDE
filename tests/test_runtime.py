@@ -10,13 +10,19 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+
 import robot_agent.runtime as runtime_module
-from robot_agent.coordinator import ExecutionResult
+from robot_agent.config import AgentConfig, CommandConfig, SafeStopConfig
+from robot_agent.coordinator import CommandCancellationError, ExecutionResult
+from robot_agent.ledger import CommandRecord, CommandState
+from robot_agent.observation import (
+    ObservationBinding,
+    ObservationHealthSample,
+    ObservationHealthStatus,
+)
 from robot_agent.protocol import WireMessage, parse_wire_message
 from robot_agent.runtime import RobotAgentRuntime, RuntimeSafetyError
 from robot_agent.session import SessionStateError
-
-from robot_agent.config import AgentConfig, CommandConfig, SafeStopConfig
 
 
 def runtime_config(
@@ -24,6 +30,7 @@ def runtime_config(
     *,
     lease_interval_ms: int = 500,
     lease_timeout_ms: int = 2000,
+    observation_enabled: bool = False,
 ) -> AgentConfig:
     return AgentConfig.model_validate(
         {
@@ -39,6 +46,11 @@ def runtime_config(
             "session": {
                 "lease_interval_ms": lease_interval_ms,
                 "lease_timeout_ms": lease_timeout_ms,
+            },
+            "observation": {
+                "enabled": observation_enabled,
+                "admission_max_age_ms": 500,
+                "watchdog_timeout_ms": 750,
             },
             "storage": {"ledger_path": str(tmp_path / "ledger.sqlite3")},
             "state": {
@@ -82,6 +94,9 @@ class FakeRosAdapter:
     def __init__(self) -> None:
         self.state_callback: Any = None
         self.feedback_callback: Any = None
+        self.observation_health_callback: Any = None
+        self.observation_topics: tuple[str, str] | None = None
+        self.observation_demands: list[tuple[UUID, bool, str, str, str, str]] = []
         self.started = False
         self.closed = False
         self.executions: list[tuple[UUID, str, dict[str, Any]]] = []
@@ -91,9 +106,19 @@ class FakeRosAdapter:
         self.safe_stop_exception: Exception | None = None
         self.health_exception: Exception | None = None
 
-    def set_callbacks(self, *, state_callback: Any, feedback_callback: Any) -> None:
+    def set_callbacks(
+        self,
+        *,
+        state_callback: Any,
+        feedback_callback: Any,
+        observation_health_callback: Any = None,
+    ) -> None:
         self.state_callback = state_callback
         self.feedback_callback = feedback_callback
+        self.observation_health_callback = observation_health_callback
+
+    def configure_observation(self, *, demand_topic: str, health_topic: str) -> None:
+        self.observation_topics = (demand_topic, health_topic)
 
     def configure_state_sources(self, sources: object) -> None:
         del sources
@@ -123,6 +148,27 @@ class FakeRosAdapter:
 
     async def cancel(self, command_id: UUID) -> None:
         self.cancelled.append(command_id)
+
+    async def publish_observation_demand(
+        self,
+        *,
+        command_id: UUID,
+        active: bool,
+        observation_session_id: str,
+        sensor_id: str,
+        scene_version: str,
+        localization_epoch_id: str,
+    ) -> None:
+        self.observation_demands.append(
+            (
+                command_id,
+                active,
+                observation_session_id,
+                sensor_id,
+                scene_version,
+                localization_epoch_id,
+            )
+        )
 
     async def safe_stop(self, config: SafeStopConfig) -> ExecutionResult:
         assert config.ros_name == "/robot/safe_stop"
@@ -181,6 +227,172 @@ def inbound(
 async def next_message(connection: QueueConnection) -> WireMessage:
     raw = await asyncio.wait_for(connection.outgoing.get(), timeout=2)
     return parse_wire_message(raw, expected_robot_id="g1-dev")
+
+
+def observation_health(
+    *,
+    robot_boot_id: str = "boot-1",
+    status: int = ObservationHealthStatus.USABLE,
+    heartbeat_sequence: int = 1,
+    capture_age_ms: float = 10.0,
+    ack_age_ms: float = 10.0,
+) -> ObservationHealthSample:
+    return ObservationHealthSample(
+        robot_id="g1-dev",
+        robot_boot_id=robot_boot_id,
+        gateway_instance_id="gateway-1",
+        observation_session_id="obs-1",
+        sensor_id="head_rgbd",
+        scene_version="scene-1",
+        localization_epoch_id="epoch-1",
+        status=status,
+        reason=0,
+        has_last_accepted_sequence=True,
+        last_accepted_sequence=heartbeat_sequence,
+        last_accepted_monotonic_ns=1,
+        capture_age_ms=capture_age_ms,
+        ack_age_ms=ack_age_ms,
+        drop_count=3,
+        heartbeat_sequence=heartbeat_sequence,
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        (ObservationHealthStatus.DEGRADED, "DEGRADED"),
+        (ObservationHealthStatus.STREAMING_WAITING_ACK, "NOT_USABLE"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_runtime_normalizes_non_usable_observation_health(
+    tmp_path: Path,
+    status: int,
+    expected: str,
+) -> None:
+    ros = FakeRosAdapter()
+    runtime = RobotAgentRuntime(
+        runtime_config(tmp_path, observation_enabled=True),
+        ros_adapter=ros,
+    )
+    await runtime.initialize()
+    try:
+        sample = observation_health(robot_boot_id=str(runtime._boot_id), status=status)
+        if status != ObservationHealthStatus.USABLE:
+            # Non-usable messages are still valid health, but do not refresh an ACK.
+            sample = ObservationHealthSample(
+                **{
+                    **sample.__dict__,
+                    "has_last_accepted_sequence": False,
+                    "last_accepted_sequence": 0,
+                    "last_accepted_monotonic_ns": 0,
+                    "capture_age_ms": float("inf"),
+                    "ack_age_ms": float("inf"),
+                }
+            )
+        runtime._accept_observation_health(sample)
+        snapshot = runtime._state.snapshot()
+        assert snapshot["observation"]["status"] == expected
+        assert snapshot["observation"]["capture_age_ms"] is None
+        assert snapshot["observation"]["ack_age_ms"] is None
+    finally:
+        await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_runtime_configures_and_publishes_observation_health_state(
+    tmp_path: Path,
+) -> None:
+    ros = FakeRosAdapter()
+    runtime = RobotAgentRuntime(
+        runtime_config(tmp_path, observation_enabled=True),
+        ros_adapter=ros,
+    )
+    await runtime.initialize()
+    try:
+        assert ros.observation_topics == (
+            "/robot_agent/observation_demand",
+            "/robot_observation_gateway/health",
+        )
+        assert ros.observation_health_callback is not None
+        sample = observation_health(robot_boot_id=str(runtime._boot_id))
+        ros.observation_health_callback(sample)
+        await asyncio.sleep(0)
+        snapshot = runtime._state.snapshot()
+        assert snapshot["observation"]["status"] == "USABLE"
+        assert snapshot["observation"]["session_id"] == "obs-1"
+        assert snapshot["observation"]["drop_count"] == 3
+
+        # A repeated heartbeat and malformed ages cannot replace the accepted sample.
+        ros.observation_health_callback(sample)
+        ros.observation_health_callback(
+            observation_health(
+                robot_boot_id=str(runtime._boot_id),
+                heartbeat_sequence=2,
+                capture_age_ms=float("nan"),
+            )
+        )
+        await asyncio.sleep(0)
+        assert runtime._observation_guard is not None
+        assert runtime._observation_guard.current_health() is sample
+    finally:
+        await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_observation_watchdog_cancellation_failure_forces_safe_stop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ros = FakeRosAdapter()
+    runtime = RobotAgentRuntime(
+        runtime_config(tmp_path, observation_enabled=True),
+        ros_adapter=ros,
+    )
+    await runtime.initialize()
+    command_id = uuid4()
+    now = datetime.now(timezone.utc)
+    record = CommandRecord(
+        command_id=command_id,
+        kind="navigation.vln.execute",
+        payload_hash="a" * 64,
+        payload={},
+        state=CommandState.FAILED,
+        detail="CANCEL_NOT_ACKNOWLEDGED",
+        result=None,
+        session_id=uuid4(),
+        created_at=now,
+        updated_at=now,
+    )
+    assert runtime._observation_guard is not None
+    monkeypatch.setattr(
+        runtime._observation_guard,
+        "stale_bindings",
+        lambda **_kwargs: (
+            (
+                ObservationBinding(
+                    command_id,
+                    "obs-1",
+                    "head_rgbd",
+                    "scene-1",
+                    "boot-1",
+                    "epoch-1",
+                ),
+                "ACK timeout",
+            ),
+        ),
+    )
+
+    async def fail_cancel(*_args: Any, **_kwargs: Any) -> bool:
+        raise CommandCancellationError(record)
+
+    monkeypatch.setattr(runtime._coordinator, "cancel", fail_cancel)
+    initial_safe_stops = ros.safe_stop_reasons
+    try:
+        await runtime._check_observation_watchdog()
+        assert ros.safe_stop_reasons == initial_safe_stops + 1
+    finally:
+        await runtime.shutdown()
 
 
 @pytest.mark.asyncio
@@ -242,6 +454,9 @@ async def test_runtime_handshake_control_lease_command_and_disconnect(tmp_path: 
     assert lease.payload.sequence == 0
 
     await connection.incoming.put(inbound("command.request", session_id, command_payload))
+    running = await next_message(connection)
+    assert running.type == "command.status"
+    assert running.payload.state == "RUNNING"
     completed = await next_message(connection)
     assert completed.type == "command.status"
     assert completed.payload.state == "SUCCEEDED"

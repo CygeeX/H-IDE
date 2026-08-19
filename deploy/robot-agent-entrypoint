@@ -4,5 +4,8 @@ set -euo pipefail
 # rclpy and the selected ROS interfaces depend on the Humble environment.
 # systemd doesn't run an interactive shell, so establish it explicitly here.
 source /opt/ros/humble/setup.bash
+if [[ -f /opt/robot-agent/install/setup.bash ]]; then
+  source /opt/robot-agent/install/setup.bash
+fi
 
 exec /opt/robot-agent/venv/bin/robot-agent "$@"

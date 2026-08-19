@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source /opt/ros/humble/setup.bash
+if [[ -f /opt/robot-agent/install/setup.bash ]]; then
+  source /opt/robot-agent/install/setup.bash
+fi
+
+exec /opt/robot-agent/venv/bin/robot-observation-gateway "$@"

@@ -4,13 +4,16 @@
 from __future__ import annotations
 
 import argparse
+import threading
 import time
 from typing import Any
 
 import rclpy
 from example_interfaces.action import Fibonacci
+from nav2_msgs.action import NavigateToPose
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.context import Context
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
@@ -28,10 +31,13 @@ def reliable_qos(depth: int = 1) -> QoSProfile:
 
 
 class MockRobot(Node):
-    def __init__(self) -> None:
-        super().__init__("robot_agent_mock_robot")
+    def __init__(self, *, context: Context | None = None) -> None:
+        super().__init__("robot_agent_mock_robot", context=context)
         group = ReentrantCallbackGroup()
         self._enabled = False
+        self.navigation_goal_count = 0
+        self.last_navigation_goal: NavigateToPose.Goal | None = None
+        self.navigation_goal_event = threading.Event()
         self._mode_publisher = self.create_publisher(
             String,
             "/robot/mode",
@@ -61,6 +67,18 @@ class MockRobot(Node):
             goal_callback=lambda goal: GoalResponse.ACCEPT,
             cancel_callback=lambda goal: CancelResponse.ACCEPT,
             callback_group=group,
+        )
+        self._navigation_action_server = ActionServer(
+            self,
+            NavigateToPose,
+            "/navigate_to_pose",
+            execute_callback=self._navigate_to_pose,
+            goal_callback=self._accept_navigation_goal,
+            cancel_callback=lambda goal: CancelResponse.ACCEPT,
+            callback_group=group,
+        )
+        self.get_logger().warning(
+            "Mock Nav2 enabled: goals are recorded and simulated; no motion command is published"
         )
 
     def _power_enable(
@@ -98,6 +116,41 @@ class MockRobot(Node):
         result.sequence = sequence
         return result
 
+    def _accept_navigation_goal(self, goal: NavigateToPose.Goal) -> GoalResponse:
+        pose = goal.pose
+        if pose.header.frame_id != "map" or goal.behavior_tree:
+            self.get_logger().error(
+                "rejected non-map or planner-mutating NavigateToPose goal"
+            )
+            return GoalResponse.REJECT
+        self.navigation_goal_count += 1
+        self.last_navigation_goal = goal
+        self.navigation_goal_event.set()
+        self.get_logger().info(
+            "SIMULATED NavigateToPose received: "
+            f"x={pose.pose.position.x:.3f} y={pose.pose.position.y:.3f} "
+            f"z={pose.pose.position.z:.3f}"
+        )
+        return GoalResponse.ACCEPT
+
+    def _navigate_to_pose(self, goal_handle: Any) -> NavigateToPose.Result:
+        """Exercise the real Nav2 action type without publishing robot motion."""
+        started = self.get_clock().now()
+        for step in range(5):
+            if goal_handle.is_cancel_requested:
+                goal_handle.canceled()
+                return NavigateToPose.Result()
+            feedback = NavigateToPose.Feedback()
+            feedback.current_pose = goal_handle.request.pose
+            feedback.navigation_time = (self.get_clock().now() - started).to_msg()
+            feedback.estimated_time_remaining.sec = max(0, 1 - step // 3)
+            feedback.number_of_recoveries = 0
+            feedback.distance_remaining = float(4 - step) * 0.25
+            goal_handle.publish_feedback(feedback)
+            time.sleep(0.1)
+        goal_handle.succeed()
+        return NavigateToPose.Result()
+
     def _publish_mode(self) -> None:
         message = String()
         message.data = "IDLE" if self._enabled else "SAFE_HOLD"
@@ -105,6 +158,7 @@ class MockRobot(Node):
 
     def close(self) -> None:
         self._action_server.destroy()
+        self._navigation_action_server.destroy()
         self.destroy_node()
 
 

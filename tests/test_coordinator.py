@@ -9,7 +9,9 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+
 from robot_agent.arbitration import ResourceArbiter
+from robot_agent.config import CommandConfig
 from robot_agent.coordinator import (
     CommandCancellationError,
     CommandCoordinator,
@@ -18,8 +20,6 @@ from robot_agent.coordinator import (
 from robot_agent.ledger import CommandIdConflict, CommandLedger, CommandState
 from robot_agent.protocol import CommandRequest
 from robot_agent.session import SessionController
-
-from robot_agent.config import CommandConfig
 
 NOW = datetime(2026, 8, 7, 15, 0, tzinfo=timezone.utc)
 
@@ -585,7 +585,8 @@ async def test_cancel_fails_closed_if_execution_coroutine_ignores_cancellation(
             with pytest.raises(CommandCancellationError):
                 await cancellation
             record = await submission
-            assert record.state is CommandState.CANCELLED
+            assert record.state is CommandState.FAILED
+            assert "CANCEL_NOT_ACKNOWLEDGED" in record.detail
             assert "not acknowledged" in record.detail
         finally:
             executor.release.set()

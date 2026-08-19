@@ -229,6 +229,27 @@
             </div>
           </div>
 
+          <div class="command-block command-action-block vln-command-block">
+            <div class="command-copy">
+              <span class="command-number">C</span>
+              <div>
+                <h3>H-IDE map 目标 → Mock Nav2</h3>
+                <p><code>navigation.navigate_to_pose</code> · 运动为模拟，不驱动真机</p>
+              </div>
+            </div>
+            <label class="number-field">
+              <span>MAP X / Y / YAW</span>
+              <input id="navX" type="number" step="0.1" value="1.0" inputmode="decimal">
+              <input id="navY" type="number" step="0.1" value="0.5" inputmode="decimal">
+              <input id="navYaw" type="number" min="-3.14159" max="3.14159" step="0.1" value="0" inputmode="decimal">
+            </label>
+            <div class="button-pair">
+              <button class="button button-positive command-button" id="vlnBtn" type="button">
+                SEND TO MOCK NAV2
+              </button>
+            </div>
+          </div>
+
           <div class="safety-test">
             <div class="safety-symbol" aria-hidden="true">!</div>
             <div>
@@ -299,6 +320,138 @@
         </div>
       </section>
 
+      <section class="observation-deck shell" aria-labelledby="observationTitle">
+        <div class="section-heading observation-heading">
+          <div>
+            <p class="eyebrow"><span>03</span> RGB-D OBSERVATION PLANE</p>
+            <h2 id="observationTitle">看见机器人真正发出的观测</h2>
+          </div>
+          <div class="observation-heading-status">
+            <span class="observation-status" id="observationStatus"><i></i>等待观测网关</span>
+            <small id="observationSource">SOURCE · —</small>
+          </div>
+        </div>
+
+        <div class="observation-separation">
+          <div>
+            <strong>控制面</strong>
+            <span>WebSocket · JSON · 64 KiB · 2 s 租约</span>
+          </div>
+          <i aria-hidden="true"></i>
+          <div>
+            <strong>观测面</strong>
+            <span>反向 gRPC · Protobuf · RGB + Z16 深度</span>
+          </div>
+          <p>两条链路彼此隔离：图片阻塞或断流，不会挤占安全控制消息。</p>
+        </div>
+
+        <div class="observation-grid">
+          <article class="panel camera-panel">
+            <div class="panel-heading compact-heading">
+              <div>
+                <p class="panel-kicker">ALIGNED PAIR / 同步帧</p>
+                <h2>RGB 与对齐深度</h2>
+              </div>
+              <span class="freshness" id="observationFreshness">NO FRAME</span>
+            </div>
+            <div class="camera-pair">
+              <figure class="camera-feed">
+                <div class="camera-screen">
+                  <img id="rgbImage" alt="RealSense 彩色图" hidden>
+                  <div class="camera-placeholder" id="rgbPlaceholder"><span>RGB</span>等待 JPEG 帧</div>
+                  <div class="camera-reticle" aria-hidden="true"></div>
+                </div>
+                <figcaption><strong>COLOR</strong><span>JPEG · QUALITY 85</span></figcaption>
+              </figure>
+              <figure class="camera-feed depth-feed">
+                <div class="camera-screen">
+                  <img id="depthImage" alt="RealSense 对齐深度伪彩色图" hidden>
+                  <div class="camera-placeholder" id="depthPlaceholder"><span>Z16</span>等待深度帧</div>
+                  <div class="depth-scale" aria-hidden="true"><i></i><span>NEAR</span><span>FAR</span></div>
+                </div>
+                <figcaption><strong>ALIGNED DEPTH</strong><span>ZSTD Z16 · LOSSLESS</span></figcaption>
+              </figure>
+            </div>
+            <div class="frame-identity">
+              <span>SEQ <b id="observationSequence">—</b></span>
+              <span>RGB #<b id="rgbFrameNumber">—</b></span>
+              <span>DEPTH #<b id="depthFrameNumber">—</b></span>
+              <span>SIZE <b id="frameBytes">—</b></span>
+              <span>TF <b id="frameTf">—</b></span>
+            </div>
+          </article>
+
+          <article class="panel observation-metrics-panel">
+            <div class="panel-heading compact-heading">
+              <div>
+                <p class="panel-kicker">FRESHNESS / 时延</p>
+                <h2>一帧经过了什么</h2>
+              </div>
+              <span class="panel-led" id="observationLed"><i></i>OFFLINE</span>
+            </div>
+            <div class="latency-bars">
+              <div class="latency-row">
+                <span>采集年龄</span><div><i id="captureAgeBar"></i></div><b id="captureAgeMetric">—</b>
+              </div>
+              <div class="latency-row">
+                <span>编码</span><div><i id="encodeBar"></i></div><b id="encodeMetric">—</b>
+              </div>
+              <div class="latency-row">
+                <span>排队</span><div><i id="queueBar"></i></div><b id="queueMetric">—</b>
+              </div>
+              <div class="latency-row">
+                <span>ACK 往返</span><div><i id="ackBar"></i></div><b id="ackMetric">—</b>
+              </div>
+              <div class="latency-row">
+                <span>估算网络</span><div><i id="networkBar"></i></div><b id="networkMetric">—</b>
+              </div>
+            </div>
+            <div class="observation-metric-grid">
+              <article><small>SEND RATE</small><strong id="sendFpsMetric">—</strong><span>fps</span></article>
+              <article><small>BANDWIDTH</small><strong id="bandwidthMetric">—</strong><span>Mbps</span></article>
+              <article><small>ACCEPTED</small><strong id="acceptedMetric">0</strong><span>frames</span></article>
+              <article><small>DROPPED</small><strong id="dropMetric">0</strong><span>newest-only</span></article>
+              <article><small>SEQ GAP</small><strong id="gapMetric">0</strong><span>latest ACK</span></article>
+              <article><small>REJECTED</small><strong id="rejectedMetric">0</strong><span>workstation</span></article>
+            </div>
+            <dl class="observation-binding">
+              <div><dt>SESSION</dt><dd id="observationSession">—</dd></div>
+              <div><dt>SCENE</dt><dd id="observationScene">—</dd></div>
+              <div><dt>CALIBRATION</dt><dd id="observationCalibration">—</dd></div>
+              <div><dt>HEALTH REASON</dt><dd id="observationReason">—</dd></div>
+            </dl>
+          </article>
+        </div>
+
+        <div class="observation-pipeline" aria-label="RGB-D 处理流水线">
+          <article data-observation-node="camera"><span>01</span><strong>RealSense</strong><small>SYNC RGB-D</small></article>
+          <i></i>
+          <article data-observation-node="enrich"><span>02</span><strong>采集时刻 TF</strong><small>MAP + BASE</small></article>
+          <i></i>
+          <article data-observation-node="queue"><span>03</span><strong>NEWEST ONLY</strong><small>CAPACITY = 1</small></article>
+          <i></i>
+          <article data-observation-node="encode"><span>04</span><strong>JPEG + ZSTD</strong><small>CRC32C</small></article>
+          <i></i>
+          <article data-observation-node="grpc"><span>05</span><strong>反向 gRPC</strong><small>ONE IN-FLIGHT</small></article>
+          <i></i>
+          <article data-observation-node="ack"><span>06</span><strong>ACK_ACCEPTED</strong><small>HEALTH REFRESH</small></article>
+        </div>
+
+        <div class="panel fault-panel">
+          <div>
+            <p class="panel-kicker">FAULT LAB / 故障演示</p>
+            <h3>主动破坏观测链路，观察本地健康降级</h3>
+            <p>暂停 ACK 超过 750 ms 会让观测不可用；只影响标记了 <code>requires_observation</code> 的导航目标。</p>
+          </div>
+          <div class="fault-actions">
+            <button class="button button-warning" id="ackFaultBtn" type="button">暂停 ACK</button>
+            <button class="button button-danger" id="rejectFrameBtn" type="button">拒绝下一帧</button>
+            <button class="button button-neutral" id="sessionFaultBtn" type="button">停止观测会话</button>
+            <button class="button button-neutral" id="cameraFaultBtn" type="button">暂停模拟相机</button>
+          </div>
+        </div>
+      </section>
+
       <section class="observability shell">
         <div class="panel command-history-panel">
           <div class="panel-heading">
@@ -335,7 +488,7 @@
       <section class="explain shell">
         <div class="section-heading">
           <div>
-            <p class="eyebrow"><span>03</span> WHAT THIS PROVES</p>
+            <p class="eyebrow"><span>04</span> WHAT THIS PROVES</p>
             <h2>这个页面能看到什么</h2>
           </div>
         </div>
@@ -358,7 +511,17 @@
           <article>
             <span>04</span>
             <h3>数据收敛</h3>
-            <p>只上传归一化状态与 Action feedback，不把完整 ROS graph 和高带宽数据暴露到远端。</p>
+            <p>控制面只上传归一化状态；RGB-D 通过独立 sidecar 与二进制观测面传输。</p>
+          </article>
+          <article>
+            <span>05</span>
+            <h3>新鲜度优先</h3>
+            <p>容量 1 队列让旧帧被新帧覆盖，网络变慢时不会把过期画面排队重放。</p>
+          </article>
+          <article>
+            <span>06</span>
+            <h3>观测依赖导航保护</h3>
+            <p>只有工作站接受的新观测才刷新健康；超时仅取消依赖观测的 NavigateToPose。</p>
           </article>
         </div>
       </section>

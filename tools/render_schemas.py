@@ -7,9 +7,8 @@ import argparse
 import json
 from pathlib import Path
 
-from robot_agent.protocol import protocol_json_schema
-
 from robot_agent.config import config_json_schema
+from robot_agent.protocol import protocol_json_schema
 
 
 def main() -> int:

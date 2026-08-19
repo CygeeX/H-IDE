@@ -26,6 +26,10 @@ const elements = Object.fromEntries(
     "powerOffBtn",
     "taskOrder",
     "taskBtn",
+    "navX",
+    "navY",
+    "navYaw",
+    "vlnBtn",
     "cancelBtn",
     "leaseBtn",
     "freshness",
@@ -45,6 +49,43 @@ const elements = Object.fromEntries(
     "clearEventsBtn",
     "footerClock",
     "toast",
+    "observationStatus",
+    "observationSource",
+    "observationFreshness",
+    "observationLed",
+    "rgbImage",
+    "rgbPlaceholder",
+    "depthImage",
+    "depthPlaceholder",
+    "observationSequence",
+    "rgbFrameNumber",
+    "depthFrameNumber",
+    "frameBytes",
+    "frameTf",
+    "captureAgeBar",
+    "captureAgeMetric",
+    "encodeBar",
+    "encodeMetric",
+    "queueBar",
+    "queueMetric",
+    "ackBar",
+    "ackMetric",
+    "networkBar",
+    "networkMetric",
+    "sendFpsMetric",
+    "bandwidthMetric",
+    "acceptedMetric",
+    "dropMetric",
+    "gapMetric",
+    "rejectedMetric",
+    "observationSession",
+    "observationScene",
+    "observationCalibration",
+    "observationReason",
+    "ackFaultBtn",
+    "rejectFrameBtn",
+    "sessionFaultBtn",
+    "cameraFaultBtn",
   ].map((id) => [id, document.getElementById(id)]),
 );
 
@@ -77,9 +118,12 @@ const emptySnapshot = () => ({
     last_agent_message_at: null,
     ui_clients: 0,
   },
+  observation: { enabled: false, health: { status: "OFFLINE", reason: "NOT_STARTED" } },
 });
 
 let state = emptySnapshot();
+let lastObservationSequence = null;
+let lastObservationFrameAt = 0;
 
 const demoState = {
   sequence: 11,
@@ -195,6 +239,7 @@ function render() {
   for (const button of [elements.powerOnBtn, elements.powerOffBtn, elements.taskBtn]) {
     button.disabled = !active;
   }
+  elements.vlnBtn.disabled = !active || state.observation?.health?.status !== "USABLE";
   elements.cancelBtn.disabled = !active || !latestCancelableCommand();
   elements.leaseBtn.disabled = !active;
   elements.leaseBtn.textContent = leaseEnabled ? "暂停续租" : "恢复续租";
@@ -214,6 +259,117 @@ function render() {
   renderArchitecture(connected);
   renderCommands();
   renderEvents();
+  renderObservation();
+}
+
+function metric(value, digits = 1) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number.toFixed(digits) : "—";
+}
+
+function byteSize(value) {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes <= 0) return "—";
+  return bytes >= 1024 * 1024
+    ? `${(bytes / (1024 * 1024)).toFixed(2)} MiB`
+    : `${(bytes / 1024).toFixed(0)} KiB`;
+}
+
+function setLatency(element, value, budget) {
+  const number = Number(value);
+  element.style.width = `${Number.isFinite(number) ? Math.min(100, Math.max(2, (number / budget) * 100)) : 0}%`;
+  element.classList.toggle("is-danger", Number.isFinite(number) && number > budget);
+}
+
+function renderObservation() {
+  const observation = state.observation ?? {};
+  const health = observation.health ?? {};
+  const frame = observation.frame ?? {};
+  const telemetry = observation.telemetry ?? {};
+  const enabled = Boolean(observation.enabled);
+  const usable = health.status === "USABLE";
+  const streaming = Boolean(observation.observationSessionId);
+  const sequence = observation.lastSequence;
+
+  if (sequence != null && sequence !== lastObservationSequence) {
+    lastObservationSequence = sequence;
+    lastObservationFrameAt = Date.now();
+    const cacheKey = `${sequence}-${Date.now()}`;
+    if (observation.hasRgb) {
+      elements.rgbImage.src = `/api/observation/rgb.jpg?v=${cacheKey}`;
+      elements.rgbImage.hidden = false;
+      elements.rgbPlaceholder.hidden = true;
+    }
+    if (observation.hasDepth) {
+      elements.depthImage.src = `/api/observation/depth.png?v=${cacheKey}`;
+      elements.depthImage.hidden = false;
+      elements.depthPlaceholder.hidden = true;
+    }
+  }
+
+  const statusText = enabled ? health.status ?? "OFFLINE" : "DISABLED";
+  elements.observationStatus.classList.toggle("is-usable", usable);
+  elements.observationStatus.classList.toggle("is-degraded", enabled && !usable);
+  elements.observationStatus.innerHTML = `<i></i>${escapeHtml(statusText)}`;
+  elements.observationSource.textContent = `SOURCE · ${(observation.source ?? "—").toUpperCase()}`;
+  elements.observationLed.classList.toggle("is-active", usable);
+  elements.observationLed.classList.toggle("is-danger", enabled && !usable);
+  elements.observationLed.innerHTML = `<i></i>${escapeHtml(statusText)}`;
+  elements.observationFreshness.textContent = sequence == null
+    ? "NO FRAME"
+    : `${Date.now() - lastObservationFrameAt < 1200 ? "LIVE" : "STALE"} · #${sequence}`;
+
+  elements.observationSequence.textContent = sequence ?? "—";
+  elements.rgbFrameNumber.textContent = frame.rgbFrameNumber ?? "—";
+  elements.depthFrameNumber.textContent = frame.depthFrameNumber ?? "—";
+  elements.frameBytes.textContent = byteSize(frame.serializedBytes);
+  elements.frameTf.textContent = frame.mapFrame && frame.cameraFrame
+    ? `${frame.mapFrame}→${frame.cameraFrame}`
+    : "—";
+
+  elements.captureAgeMetric.textContent = `${metric(frame.captureAgeMs)} ms`;
+  elements.encodeMetric.textContent = `${metric(frame.encodeMs)} ms`;
+  elements.queueMetric.textContent = `${metric(frame.queueMs)} ms`;
+  elements.ackMetric.textContent = `${metric(telemetry.ackRttMs)} ms`;
+  elements.networkMetric.textContent = `${metric(telemetry.networkMs)} ms`;
+  setLatency(elements.captureAgeBar, frame.captureAgeMs, 500);
+  setLatency(elements.encodeBar, frame.encodeMs, 80);
+  setLatency(elements.queueBar, frame.queueMs, 100);
+  setLatency(elements.ackBar, telemetry.ackRttMs, 750);
+  setLatency(elements.networkBar, telemetry.networkMs, 750);
+
+  elements.sendFpsMetric.textContent = metric(telemetry.actualSendFps, 2);
+  elements.bandwidthMetric.textContent = metric(telemetry.bandwidthMbps, 2);
+  elements.acceptedMetric.textContent = observation.acceptedFrames ?? 0;
+  elements.dropMetric.textContent = telemetry.dropCount ?? health.dropCount ?? 0;
+  elements.gapMetric.textContent = observation.sequenceGap ?? 0;
+  elements.rejectedMetric.textContent = observation.rejectedFrames ?? 0;
+  elements.observationSession.textContent = shortId(observation.observationSessionId, 22);
+  elements.observationScene.textContent = observation.sceneVersion || "—";
+  elements.observationCalibration.textContent = shortId(frame.calibrationSha256, 22);
+  elements.observationReason.textContent = health.reason ?? "—";
+
+  const activePipeline = enabled && observation.connected;
+  for (const node of document.querySelectorAll("[data-observation-node]")) {
+    node.classList.toggle("is-active", activePipeline);
+  }
+  document.querySelector('[data-observation-node="ack"]')?.classList.toggle("is-usable", usable);
+  document.querySelector('[data-observation-node="camera"]')?.classList.toggle(
+    "is-danger",
+    Boolean(observation.faults?.cameraPaused),
+  );
+  document.querySelector('[data-observation-node="ack"]')?.classList.toggle(
+    "is-danger",
+    Boolean(observation.faults?.acksPaused) || health.reason === "ACK_STALE",
+  );
+
+  elements.ackFaultBtn.disabled = !enabled;
+  elements.ackFaultBtn.textContent = observation.faults?.acksPaused ? "恢复 ACK" : "暂停 ACK";
+  elements.rejectFrameBtn.disabled = !enabled || !streaming;
+  elements.sessionFaultBtn.disabled = !enabled || !observation.connected;
+  elements.sessionFaultBtn.textContent = streaming ? "停止观测会话" : "启动观测会话";
+  elements.cameraFaultBtn.disabled = !enabled || observation.source !== "synthetic";
+  elements.cameraFaultBtn.textContent = observation.faults?.cameraPaused ? "恢复模拟相机" : "暂停模拟相机";
 }
 
 function renderLease() {
@@ -416,6 +572,12 @@ function handleDemoAction(action) {
     case "events.clear":
       state.events = [demoEvent("system", "事件记录已清空", "新的协议事件将继续显示")];
       break;
+    case "observation.ack_pause":
+    case "observation.reject_next":
+    case "observation.session_set":
+    case "observation.camera_pause":
+      showToast("浏览器演示不伪造 RGB-D 协议，请返回真实链路查看。", true);
+      return;
     default:
       showToast(`演示模式不支持 ${action.action}`, true);
   }
@@ -434,7 +596,7 @@ function demoCommand(kind, params) {
     params,
     state: "RUNNING",
     detail: "command dispatched to local adapter",
-    progress: kind === "task.execute" ? 0.1 : null,
+    progress: kind === "task.execute" || kind === "navigation.navigate_to_pose" ? 0.1 : null,
     result: null,
     issued_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
@@ -447,7 +609,7 @@ function demoCommand(kind, params) {
   pushDemoEvent(demoEvent("agent", "Agent → BFF · command.status", "RUNNING · local adapter", "command"));
   render();
 
-  if (kind === "task.execute") {
+  if (kind === "task.execute" || kind === "navigation.navigate_to_pose") {
     let step = 1;
     const maxSteps = 5;
     const timer = window.setInterval(() => {
@@ -457,7 +619,9 @@ function demoCommand(kind, params) {
       }
       step += 1;
       row.progress = Math.min(0.95, step / maxSteps);
-      row.detail = `action feedback · sequence ${step + 2}`;
+        row.detail = kind === "navigation.navigate_to_pose"
+          ? `Mock Nav2 feedback · ${(maxSteps - step) * 0.25} m remaining`
+          : `action feedback · sequence ${step + 2}`;
       row.updated_at = new Date().toISOString();
       state.metrics.messages_from_agent += 1;
       if (step >= maxSteps) {
@@ -465,7 +629,9 @@ function demoCommand(kind, params) {
         row.state = "SUCCEEDED";
         row.progress = 1;
         row.detail = "action completed";
-        row.result = { sequence: [0, 1, 1, 2, 3, 5, 8] };
+        row.result = kind === "navigation.navigate_to_pose"
+          ? { executionBackend: "mock_nav2", motion: "simulated" }
+          : { sequence: [0, 1, 1, 2, 3, 5, 8] };
         pushDemoEvent(demoEvent("agent", "Agent → BFF · command.status", "SUCCEEDED · action completed", "success"));
       }
       render();
@@ -543,6 +709,20 @@ elements.taskBtn.addEventListener("click", () => {
   }
   sendAction({ action: "command.send", kind: "task.execute", params: { order } });
 });
+elements.vlnBtn.addEventListener("click", () => {
+  const x = Number(elements.navX.value);
+  const y = Number(elements.navY.value);
+  const yaw = Number(elements.navYaw.value);
+  if (![x, y, yaw].every(Number.isFinite) || yaw < -Math.PI || yaw > Math.PI) {
+    showToast("请输入有效的 map 坐标，yaw 范围为 -π 到 π。", true);
+    return;
+  }
+  sendAction({
+    action: "command.send",
+    kind: "navigation.navigate_to_pose",
+    params: { goalPose: { frameId: "map", x, y, z: 0, yaw, observedAt: new Date().toISOString() } },
+  });
+});
 elements.cancelBtn.addEventListener("click", () => {
   const command = latestCancelableCommand();
   if (!command) {
@@ -557,6 +737,27 @@ elements.leaseBtn.addEventListener("click", () =>
 elements.clearEventsBtn.addEventListener("click", () => sendAction({ action: "events.clear" }));
 elements.modeToggle.addEventListener("click", () => (demoMode ? leaveDemoMode() : enterDemoMode()));
 elements.autoDemoBtn.addEventListener("click", runAutoDemo);
+elements.ackFaultBtn.addEventListener("click", () =>
+  sendAction({
+    action: "observation.ack_pause",
+    paused: !Boolean(state.observation?.faults?.acksPaused),
+  }),
+);
+elements.rejectFrameBtn.addEventListener("click", () =>
+  sendAction({ action: "observation.reject_next" }),
+);
+elements.sessionFaultBtn.addEventListener("click", () =>
+  sendAction({
+    action: "observation.session_set",
+    enabled: !Boolean(state.observation?.observationSessionId),
+  }),
+);
+elements.cameraFaultBtn.addEventListener("click", () =>
+  sendAction({
+    action: "observation.camera_pause",
+    paused: !Boolean(state.observation?.faults?.cameraPaused),
+  }),
+);
 
 window.setInterval(() => {
   elements.footerClock.textContent = new Intl.DateTimeFormat("zh-CN", {

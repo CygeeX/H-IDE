@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+import contextlib
+import logging
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Protocol
@@ -15,13 +17,26 @@ from robot_agent.config import (
     CommandParametersError,
     validate_command_params,
 )
-from robot_agent.ledger import TERMINAL_STATES, CommandLedger, CommandRecord, CommandState
+from robot_agent.ledger import (
+    TERMINAL_STATES,
+    CommandLedger,
+    CommandNotFound,
+    CommandRecord,
+    CommandState,
+)
+from robot_agent.observation import (
+    ObservationBinding,
+    ObservationGuard,
+    ObservationNotReady,
+    adapter_params,
+)
 from robot_agent.protocol import CommandRequest
 from robot_agent.session import SessionController, SessionStateError
 
 _ADAPTER_CANCEL_TIMEOUT_SECONDS = 0.25
 _EXECUTION_SETTLE_TIMEOUT_SECONDS = 0.1
-_CANCEL_NOT_ACKNOWLEDGED = "adapter cancellation was not acknowledged"
+_CANCEL_NOT_ACKNOWLEDGED = "CANCEL_NOT_ACKNOWLEDGED: adapter cancellation was not acknowledged"
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -64,12 +79,16 @@ class CommandCoordinator:
         arbiter: ResourceArbiter,
         session: SessionController,
         executor: CommandExecutor,
+        observation_guard: ObservationGuard | None = None,
+        status_callback: Callable[[CommandRecord], Awaitable[None]] | None = None,
     ) -> None:
         self._commands = dict(commands)
         self._ledger = ledger
         self._arbiter = arbiter
         self._session = session
         self._executor = executor
+        self._observation_guard = observation_guard
+        self._status_callback = status_callback
         self._tasks: dict[UUID, asyncio.Task[Any]] = {}
         self._registration_locks: dict[UUID, asyncio.Lock] = {}
         self._executing: set[UUID] = set()
@@ -135,6 +154,31 @@ class CommandCoordinator:
             )
         if not registration.is_new:
             return registration.record
+        if payload.kind == "navigation.navigate_to_pose":
+            LOGGER.info(
+                "registered H-IDE navigation audit binding %s",
+                {
+                    key: payload.params.get(key)
+                    for key in (
+                        "missionId",
+                        "stageId",
+                        "visualResolutionId",
+                        "spatialResolutionId",
+                        "relativeResolutionId",
+                        "observationSessionId",
+                        "robotBootId",
+                        "localizationEpochId",
+                        "goalPurpose",
+                        "maximumSpeedMps",
+                        "sceneRef",
+                    )
+                },
+                extra={
+                    "command_id": str(payload.command_id),
+                    "session_id": str(request.session_id),
+                    "event_code": "NAVIGATION_AUDIT_REGISTERED",
+                },
+            )
         if not observe_cancellation:
             return await asyncio.to_thread(
                 self._ledger.transition,
@@ -181,6 +225,27 @@ class CommandCoordinator:
             validate_command_params(command, payload.params)
         except CommandParametersError as exc:
             return await self._reject(payload.command_id, f"invalid command params: {exc}", at)
+        observation_binding: ObservationBinding | None = None
+        if command.requires_observation and self._observation_guard is None:
+            return await self._reject(
+                payload.command_id,
+                "observation not ready: local observation guard is unavailable",
+                _utc_now(),
+            )
+        if self._observation_guard is not None:
+            try:
+                observation_binding = self._observation_guard.admit(
+                    payload.command_id,
+                    command,
+                    payload.params,
+                    monotonic_now=loop.time(),
+                )
+            except ObservationNotReady as exc:
+                return await self._reject(
+                    payload.command_id,
+                    f"observation not ready: {exc}",
+                    _utc_now(),
+                )
 
         claim = self._arbiter.claim(payload.command_id, command.resources)
         if not claim.acquired:
@@ -197,13 +262,15 @@ class CommandCoordinator:
                 _utc_now(),
             )
 
-        await asyncio.to_thread(
+        running = await asyncio.to_thread(
             self._ledger.transition,
             payload.command_id,
             CommandState.RUNNING,
             detail="command dispatched to local adapter",
             at=_utc_now(),
         )
+        if self._status_callback is not None:
+            await self._status_callback(running)
         if observe_cancellation:
             cancelled = await self._take_pre_dispatch_cancellation(payload.command_id)
             if cancelled is not None:
@@ -238,9 +305,25 @@ class CommandCoordinator:
                 at=_utc_now(),
             )
         timeout_seconds = min(command.timeout_ms / 1000.0, remaining_before_execution)
+        if self._observation_guard is not None:
+            try:
+                await self._observation_guard.command_started(observation_binding)
+            except Exception as exc:
+                self._arbiter.release(payload.command_id)
+                return await asyncio.to_thread(
+                    self._ledger.transition,
+                    payload.command_id,
+                    CommandState.FAILED,
+                    detail=f"observation demand publication failed: {type(exc).__name__}: {exc}",
+                    at=_utc_now(),
+                )
         self._executing.add(payload.command_id)
         execution_task = asyncio.create_task(
-            self._executor.execute(payload.command_id, command, payload.params)
+            self._executor.execute(
+                payload.command_id,
+                command,
+                adapter_params(command, payload.params),
+            )
         )
         try:
             result = await asyncio.wait_for(
@@ -264,10 +347,13 @@ class CommandCoordinator:
             detail = f"local adapter exceeded {timeout_seconds:.3f}s deadline"
             if not cancel_acknowledged:
                 detail = f"{detail}; {_CANCEL_NOT_ACKNOWLEDGED}"
+            terminal_state = (
+                CommandState.TIMED_OUT if cancel_acknowledged else CommandState.FAILED
+            )
             record = await asyncio.to_thread(
                 self._ledger.transition,
                 payload.command_id,
-                CommandState.TIMED_OUT,
+                terminal_state,
                 detail=detail,
                 at=_utc_now(),
             )
@@ -289,10 +375,13 @@ class CommandCoordinator:
             if not cancel_acknowledged:
                 detail = f"{detail}; {_CANCEL_NOT_ACKNOWLEDGED}"
                 self._cancel_failures.add(payload.command_id)
+            terminal_state = (
+                CommandState.CANCELLED if cancel_acknowledged else CommandState.FAILED
+            )
             return await asyncio.to_thread(
                 self._ledger.transition,
                 payload.command_id,
-                CommandState.CANCELLED,
+                terminal_state,
                 detail=detail,
                 at=transition_at,
             )
@@ -310,6 +399,9 @@ class CommandCoordinator:
             execution_task.add_done_callback(_consume_task_outcome)
             self._arbiter.release(payload.command_id)
             self._executing.discard(payload.command_id)
+            if self._observation_guard is not None:
+                with contextlib.suppress(Exception):
+                    await self._observation_guard.command_finished(observation_binding)
 
     async def _take_pre_dispatch_cancellation(
         self,
@@ -373,7 +465,7 @@ class CommandCoordinator:
         task = self._tasks.get(command_id)
         if task is None or task.done():
             return False
-        self._cancel_reasons[command_id] = (reason, at)
+        self._cancel_reasons.setdefault(command_id, (reason, at))
         if command_id in self._executing:
             task.cancel()
         await asyncio.gather(task, return_exceptions=True)
@@ -382,6 +474,12 @@ class CommandCoordinator:
             self._cancel_failures.discard(command_id)
             raise CommandCancellationError(await asyncio.to_thread(self._ledger.get, command_id))
         return True
+
+    async def record(self, command_id: UUID) -> CommandRecord | None:
+        try:
+            return await asyncio.to_thread(self._ledger.get, command_id)
+        except CommandNotFound:
+            return None
 
     async def preempt_all(self, *, reason: str, at: datetime) -> tuple[UUID, ...]:
         """Bypass locks, request adapter cancellation, and terminalize all commands."""

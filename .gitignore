@@ -16,4 +16,36 @@ log/
 *.sqlite3-wal
 test-results/
 .planning/
+.local/
+__pycache__/
+*.py[cod]
 
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Runtime state and generated sensor/model assets
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.duckdb*
+*.pt
+*.pth
+*.onnx
+*.engine
+*.ckpt
+*.safetensors
+*.bag
+*.mcap
+*.pcd
+*.las
+*.laz
+.cache/
+runtime/
+var/

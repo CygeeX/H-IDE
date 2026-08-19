@@ -31,6 +31,31 @@ def base_config() -> dict[str, object]:
             "service",
         ),
         (("state_sources", "robot.mode", "ros_type"), "std_srvs/srv/Trigger", "message type"),
+        (
+            ("observation", "watchdog_timeout_ms"),
+            100,
+            "watchdog_timeout_ms must be >= admission_max_age_ms",
+        ),
+        (
+            ("commands", "navigation.navigate_to_pose", "ros_type"),
+            "example_interfaces/action/Fibonacci",
+            "navigate_to_pose_v1 requires",
+        ),
+        (
+            ("commands", "navigation.navigate_to_pose", "resources"),
+            ["motion", "navigation"],
+            "observation resource",
+        ),
+        (
+            ("commands", "navigation.navigate_to_pose", "observation_sensor_ids"),
+            ["head_rgbd", "head_rgbd"],
+            "observation_sensor_ids must be unique",
+        ),
+        (
+            ("commands", "navigation.navigate_to_pose", "local_only_parameters"),
+            ["missionId", "missionId"],
+            "local_only_parameters must be unique",
+        ),
     ],
 )
 def test_config_cross_field_guards(path: tuple[str, ...], value: object, match: str) -> None:
@@ -96,6 +121,45 @@ def test_tls_schema_registry_and_uri_error_branches(tmp_path: Path) -> None:
     raw = base_config()
     raw["transport"]["uri"] = "not-a-websocket-uri"  # type: ignore[index]
     with pytest.raises(ValidationError, match="absolute ws"):
+        AgentConfig.model_validate(raw)
+
+
+@pytest.mark.parametrize(
+    ("updates", "match"),
+    [
+        ({"adapter": "service"}, "requires_observation is only valid"),
+        ({"observation_sensor_ids": []}, "at least one observation_sensor_id"),
+        ({"scene_version_parameter": "missingScene"}, "scene_version_parameter is absent"),
+        (
+            {
+                "observation_session_parameter": "missingSession",
+                "robot_boot_parameter": "missingBoot",
+                "localization_epoch_parameter": "missingEpoch",
+            },
+            "must be required schema properties",
+        ),
+    ],
+)
+def test_observation_command_binding_configuration_fails_closed(
+    updates: dict[str, object],
+    match: str,
+) -> None:
+    raw = base_config()
+    command = raw["commands"]["navigation.navigate_to_pose"]  # type: ignore[index]
+    command.update(updates)  # type: ignore[union-attr]
+    if updates.get("adapter") == "service":
+        command["ros_type"] = "std_srvs/srv/Trigger"  # type: ignore[index]
+
+    with pytest.raises(ValidationError, match=match):
+        AgentConfig.model_validate(raw)
+
+
+def test_observation_sensor_ids_are_for_guarded_commands_only() -> None:
+    raw = base_config()
+    command = raw["commands"]["task.execute"]  # type: ignore[index]
+    command["observation_sensor_ids"] = ["head_rgbd"]  # type: ignore[index]
+
+    with pytest.raises(ValidationError, match="require requires_observation"):
         AgentConfig.model_validate(raw)
 
 

@@ -48,3 +48,31 @@
 - 增加回环监听、Origin 校验、CSP、64 KiB 帧限制、单 Agent、最多 8 个 UI 客户端、
   有界事件/命令历史和慢 UI 发送超时。
 - 最终 Jazzy 与 Humble 均为 127 项通过；真实 UI→BFF→Agent→ROS 2 链路验证成功。
+- 新增独立 `robot_observation_gateway`：官方 RealSense 同步/对齐 RGB-D、采集时刻 TF 与
+  定位、JPEG/Zstd/CRC32C 编码、capacity-1 newest-only 管线、机器人主动 mTLS 双向
+  gRPC、ACK/租约/遥测和强类型 ROS demand/health bridge。
+- Robot Agent 新增 500 ms 观测准入和 750 ms ACK-only VLN 看门狗；只影响
+  `requires_observation` Action，取消不确认时进入 `FAILED / CANCEL_NOT_ACKNOWLEDGED`
+  并 safe-stop，控制 WebSocket 与 2 秒租约保持不变。
+- 可视化台接入真实合成或 D435i 二进制观测，可查看 RGB、对齐深度、时延、带宽、
+  丢帧/序号缺口，并注入 ACK 暂停、单帧拒绝和会话停止。
+- Intel RealSense D435i `261222077185` 经 USB 3.2 本地验收：12 accepted、0 rejected，
+  约 5.30 fps / 4.74 Mbps，capture age 69.37 ms、ACK RTT 12.66 ms、估算网络 0.87 ms；
+  newest-only 丢旧帧 44，未发生积压重放。
+- 网页真机观看链路也完成复验：组合 launch 可用 `start_gateway:=false` 只启动相机，
+  避免与网页内 Gateway 重复；网页返回 640×480 实拍 RGB/深度，累计 324 accepted、
+  0 rejected，观测 `USABLE`，约 5.50 fps / 4.60 Mbps，估算网络 0.79 ms。
+- 最终 Jazzy/Python 3.12 与 Humble/Python 3.10 均为 185 项通过（soak 分别 deselect /
+  skip 1 项）；控制面分支覆盖率 90.18%，Ruff、strict mypy、3 包 colcon build 与
+  2 项 package smoke test 均通过。本轮仍未复制或启用真机服务。
+- 以 H-IDE Vision Observation v1 proto/lock 为唯一标准重新生成 Python/gRPC，Hello
+  对齐 1.0 和 descriptor SHA；补齐 source mode/ID、定位 epoch、时钟不确定度，并允许
+  scene 缺省。D435i 真机帧已被实际 H-IDE Vision ingress 接收。
+- 新增 `navigation.navigate_to_pose`，严格复制 H-IDE Schema；仅将 `goalPose` 转成真实
+  Nav2 `NavigateToPose` Goal，审计字段留在日志和 SQLite。Mock Nav2 使用真实 action
+  类型且从不发布运动命令。
+- 完成 boot/session/epoch/观测时效准入和运行时看门狗；PCD scene 可选。WebSocket client
+  模式、可配置 URI/TLS、`g1-dev`、RUNNING/终态状态流和 command ID 幂等保持不变。
+- 使用隔离 `ROS_DOMAIN_ID=231` 完成 D435i → H-IDE Vision → map 目标 → H-IDE Gateway →
+  Robot Agent → Mock Nav2 端到端验收；状态到 SUCCEEDED，重复下发返回同一 rosGoalId，
+  Mock 只收一次 Goal，ROS graph 无 `/cmd_vel`。H-IDE 两个仓库全程只读。

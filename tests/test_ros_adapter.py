@@ -3,14 +3,14 @@ from __future__ import annotations
 import pytest
 from rclpy.duration import Duration
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, ReliabilityPolicy
+
+from robot_agent.config import QoSConfig
 from robot_agent.ros_adapter import (
     RosTypeError,
     build_message,
     heartbeat_qos,
     state_source_qos,
 )
-
-from robot_agent.config import QoSConfig
 
 
 def test_build_message_uses_local_ros_type_and_rejects_unknown_fields() -> None:

@@ -11,6 +11,13 @@
 - SQLite 台账：`/var/lib/robot-agent/ledger.sqlite3`
 - systemd Unit：`/etc/systemd/system/robot-agent.service`
 
+观测 sidecar 独立使用：
+
+- 程序：同一只读 `/opt/robot-agent` 发布目录
+- 配置与证书：`/etc/robot-observation-gateway/`（不得与控制 Agent 共用私钥）
+- systemd Unit：`/etc/systemd/system/robot-observation-gateway.service`
+- 运行用户：`robot-observation-gateway`，需授予相机访问组，但不授予控制设备权限
+
 私钥应仅对 `robot-agent` 用户可读。不要把开发用明文配置复制到真机。
 
 ## 上线前门禁
@@ -23,6 +30,13 @@
 5. 主动断网与停止续租，确认 2 秒内机器人进入安全态。
 6. 杀死 Agent 进程，由独立安全监视器确认 500 ms Deadline / 1 s Lifespan 心跳丢失。
 7. 重启 Agent，确认遗留非终态命令变为 `ABORTED_AGENT_RESTART`，且仍需新 `control.acquire`。
+8. 验证 D435i 是 USB 3.x、同步/对齐话题稳定，采集时刻 TF 与定位严格缺失时会丢帧。
+9. 验证错误 Observation Gateway 客户端 SAN、错误工作站证书名和无客户端证书均失败。
+10. 暂停 observation ACK，确认 750 ms 后只取消 `requires_observation` 导航；取消不确认时
+    进入 `FAILED / CANCEL_NOT_ACKNOWLEDGED` 并 safe-stop。
+11. 在隔离 ROS Domain 中只连接 `tools/mock_robot.py` 的真实
+    `nav2_msgs/action/NavigateToPose` Mock，确认验收期间不存在真实 Nav2 server 或
+    `/cmd_vel` 发布者。
 
 ## systemd
 
@@ -35,6 +49,19 @@ sudo install -m 0644 deploy/systemd/robot-agent.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now robot-agent
 journalctl -u robot-agent -f -o cat
+```
+
+Observation Gateway unit 没有 `BindsTo=robot-agent.service`，任一进程重启不会连带杀死
+另一进程。控制 Agent 的 CPU 权重更高；观测进程达到内存/CPU 限额时优先牺牲图像吞吐：
+
+```bash
+sudo install -D -m 0755 deploy/robot-observation-gateway-entrypoint \
+  /opt/robot-agent/bin/robot-observation-gateway-entrypoint
+sudo install -m 0644 deploy/systemd/robot-observation-gateway.service \
+  /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now robot-observation-gateway
+journalctl -u robot-observation-gateway -f -o cat
 ```
 
 日志是一行一个 JSON 对象，可按 `robot_id`、`session_id`、`command_id` 和 `event_code` 索引。`doctor` 是只读命令，不会创建台账或调用 ROS 接口。
@@ -59,6 +86,9 @@ openssl x509 -in bff-client.crt -outform DER | sha256sum
 - `COMMAND_ID_CONFLICT`：BFF 复用了 ID 但修改了载荷；生成新 ID 或恢复原载荷。
 - `ABORTED_AGENT_RESTART`：Agent 重启时命令未到终态；人工确认机器人状态后发送新命令，绝不自动重放。
 - 反复断线：检查证书有效期/SAN、时钟、DDS/CPU 压力与 BFF 500 ms 续租节拍。
+- `ACK_STALE`：检查工作站解码/ACK、gRPC 链路和 750 ms 在途超时；不要扩大队列。
+- `CAMERA_UNAVAILABLE`：检查 USB 3.x、RealSense ROS 节点与同步 RGB-D 话题。
+- `TF_MISSING` / `LOCALIZATION_MISSING`：修复采集时刻变换或定位源，不允许降级到最新位姿。
 - 台账完整性：停服务后备份数据库，并运行 `sqlite3 ledger.sqlite3 'PRAGMA integrity_check;'`。
 
 复制到真机、创建用户、安装证书和启用服务不属于本轮本地开发动作，必须在目标机变更窗口内单独执行。

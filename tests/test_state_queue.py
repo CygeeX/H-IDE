@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 import pytest
+
 from robot_agent.outbound import (
     OutboundItem,
     OutboundPriority,

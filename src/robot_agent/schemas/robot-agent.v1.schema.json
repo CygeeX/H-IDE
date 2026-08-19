@@ -904,6 +904,36 @@
           "title": "Capabilities Digest",
           "type": "string"
         },
+        "capability_manifest": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "$ref": "#/$defs/JsonValue"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Capability Manifest"
+        },
+        "robot_profile": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "$ref": "#/$defs/JsonValue"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Robot Profile"
+        },
         "supported_versions": {
           "items": {
             "const": "1.0",

@@ -1,0 +1,243 @@
+schema_version: "2"
+agent_version: "0.2.0"
+robot_id: g1-sim
+
+robot_profile:
+  base_type: unitree_g1_29dof_mujoco
+  head_motion: fixed
+  map_frame_id: map
+  base_frame_id: base_link
+  sensors:
+    - sensor_id: head_rgbd
+      kind: rgbd
+      frame_id: camera_color_optical_frame
+      fixed_mount: true
+      horizontal_fov_rad: 1.211
+      depth_capable: true
+  metadata:
+    motionOwner: robot_agent
+    simulationBackend: mujoco_sonic
+    sourceMode: synthetic
+
+transport:
+  mode: client
+  uri: ws://127.0.0.1:8094/agent
+  reconnect_initial_ms: 250
+  reconnect_max_ms: 5000
+
+tls:
+  enabled: false
+  allow_plaintext_loopback: true
+
+session:
+  lease_interval_ms: 500
+  lease_timeout_ms: 2000
+  max_message_age_ms: 30000
+  max_future_skew_ms: 5000
+
+storage:
+  ledger_path: /tmp/robot-agent-g1-sim/ledger.sqlite3
+  retention_days: 30
+
+state:
+  change_hz: 5.0
+  snapshot_hz: 1.0
+  outbound_queue_size: 256
+
+safety:
+  safe_stop:
+    adapter: service
+    ros_name: /robot/safe_stop
+    ros_type: std_srvs/srv/Trigger
+    request: {}
+    timeout_ms: 1000
+  heartbeat_topic: /robot_agent/safety_heartbeat
+  heartbeat_period_ms: 250
+
+observation:
+  enabled: true
+  demand_topic: /robot_agent/observation_demand
+  health_topic: /robot_observation_gateway/health
+  admission_max_age_ms: 500
+  # Simulation rendering and loopback RGB-D transfer can jitter without
+  # compromising the independent 250 ms cmd_vel stale-stop.  Keep the live
+  # robot profile at 750 ms; only the synthetic G1 profile gets this margin.
+  # G1 MuJoCo + SONIC can briefly starve the observation bridge while the
+  # CPU-bound locomotion policy is replanning.  Keep the watchdog fail-closed,
+  # but allow one bounded 5 s scheduling gap in this synthetic profile only;
+  # the live D435i profile remains at its stricter timeout.
+  watchdog_timeout_ms: 5000
+
+commands:
+  navigation.navigate_to_pose:
+    adapter: action
+    ros_name: /navigate_to_pose
+    ros_type: nav2_msgs/action/NavigateToPose
+    goal_transform: navigate_to_pose_v1
+    request_schema:
+      $schema: https://json-schema.org/draft/2020-12/schema
+      $id: urn:h-ide:robot-navigation:v1:mujoco:navigate_to_pose
+      type: object
+      additionalProperties: false
+      required: [payloadType, goalPose, goalPurpose, missionId, stageId, observationSessionId, robotBootId, localizationEpochId, maximumSpeedMps]
+      properties:
+        payloadType: {enum: [visual_resolution, spatial_resolution, relative_resolution]}
+        goalPose:
+          type: object
+          additionalProperties: false
+          required: [frameId, x, y, z, yaw]
+          properties:
+            frameId: {const: map}
+            x: {type: number}
+            y: {type: number}
+            z: {type: number}
+            yaw: {type: number, minimum: -3.141592653589793, maximum: 3.141592653589793}
+            observedAt: {type: [string, "null"], format: date-time}
+        goalPurpose: {enum: [observe, approach, final]}
+        missionId: {type: string, minLength: 1, maxLength: 256}
+        stageId: {type: string, minLength: 1, maxLength: 256}
+        visualResolutionId: {type: string, minLength: 1, maxLength: 256}
+        spatialResolutionId: {type: string, minLength: 1, maxLength: 256}
+        relativeResolutionId: {type: string, minLength: 1, maxLength: 256}
+        observationSessionId: {type: string, minLength: 1, maxLength: 256}
+        robotBootId: {type: string, minLength: 1, maxLength: 256}
+        localizationEpochId: {type: string, minLength: 1, maxLength: 256}
+        maximumSpeedMps: {type: number, exclusiveMinimum: 0, maximum: 0.5}
+        sceneRef:
+          type: [object, "null"]
+          additionalProperties: false
+          required: [sceneId, revision]
+          properties:
+            sceneId: {type: string, minLength: 1}
+            revision: {type: integer, minimum: 1}
+      allOf:
+        - if: {properties: {payloadType: {const: visual_resolution}}}
+          then:
+            required: [visualResolutionId]
+            not:
+              anyOf:
+                - {required: [spatialResolutionId]}
+                - {required: [relativeResolutionId]}
+        - if: {properties: {payloadType: {const: spatial_resolution}}}
+          then:
+            required: [spatialResolutionId, sceneRef]
+            properties: {goalPurpose: {const: final}, sceneRef: {type: object}}
+            not:
+              anyOf:
+                - {required: [visualResolutionId]}
+                - {required: [relativeResolutionId]}
+        - if: {properties: {payloadType: {const: relative_resolution}}}
+          then:
+            required: [relativeResolutionId]
+            properties: {goalPurpose: {const: final}}
+            not:
+              anyOf:
+                - {required: [visualResolutionId]}
+                - {required: [spatialResolutionId]}
+                - {required: [sceneRef]}
+    # A reviewed 5 m G1 walk needs up to 50 s at the 0.10 m/s gait floor,
+    # plus Nav2 startup/settling time. Use the protocol's bounded 60 s ceiling
+    # for this synthetic profile; real-robot limits remain unchanged.
+    max_ttl_ms: 60000
+    timeout_ms: 60000
+    resources: [motion, navigation, observation]
+    skill_version: 2.0.0
+    description: Navigate with Nav2 to an H-IDE-reviewed MuJoCo map pose
+    capability_kind: motion
+    risk_level: medium
+    cancellable: true
+    interruptible: true
+    executor_profile: nav2.navigate_to_pose.default_bt
+    requires_observation: true
+    observation_sensor_ids: [head_rgbd]
+    observation_session_parameter: observationSessionId
+    robot_boot_parameter: robotBootId
+    localization_epoch_parameter: localizationEpochId
+    scene_version_parameter: null
+    local_only_parameters: [payloadType, goalPurpose, missionId, stageId, visualResolutionId, spatialResolutionId, relativeResolutionId, observationSessionId, robotBootId, localizationEpochId, maximumSpeedMps, sceneRef]
+
+  navigation.rotate:
+    adapter: action
+    ros_name: /spin
+    ros_type: nav2_msgs/action/Spin
+    goal_transform: nav2_spin_v2
+    request_schema:
+      $schema: https://json-schema.org/draft/2020-12/schema
+      $id: urn:h-ide:robot-navigation:v2:mujoco:rotate
+      type: object
+      additionalProperties: false
+      required: [targetYawRad, timeAllowanceMs, missionId, revisionId, nodeId, authorizationId, skillRequestId, idempotencyKey, robotBootId, localizationEpochId]
+      properties:
+        targetYawRad: {type: number, minimum: -6.283185307179586, maximum: 6.283185307179586, not: {const: 0}}
+        timeAllowanceMs: {type: integer, minimum: 100, maximum: 60000}
+        missionId: {type: string, minLength: 1, maxLength: 256}
+        revisionId: {type: string, minLength: 1, maxLength: 256}
+        nodeId: {type: string, minLength: 1, maxLength: 256}
+        authorizationId: {type: string, minLength: 1, maxLength: 256}
+        skillRequestId: {type: string, minLength: 1, maxLength: 256}
+        idempotencyKey: {type: string, minLength: 1, maxLength: 256}
+        robotBootId: {type: string, minLength: 1, maxLength: 256}
+        localizationEpochId: {type: string, minLength: 1, maxLength: 256}
+    max_ttl_ms: 60000
+    timeout_ms: 60000
+    resources: [motion, navigation]
+    skill_version: 2.0.0
+    description: Rotate the MuJoCo mobile base through Nav2 Spin
+    capability_kind: motion
+    risk_level: medium
+    cancellable: true
+    interruptible: true
+    executor_profile: nav2.behaviors.spin
+    local_only_parameters: [missionId, revisionId, nodeId, authorizationId, skillRequestId, idempotencyKey, robotBootId, localizationEpochId]
+
+state_sources:
+  localization.frame_id:
+    topic: /localization/pose
+    ros_type: geometry_msgs/msg/PoseWithCovarianceStamped
+    field: header.frame_id
+    qos: {reliability: reliable, durability: volatile, depth: 5}
+  localization.stamp.sec:
+    topic: /localization/pose
+    ros_type: geometry_msgs/msg/PoseWithCovarianceStamped
+    field: header.stamp.sec
+    qos: {reliability: reliable, durability: volatile, depth: 5}
+  localization.stamp.nanosec:
+    topic: /localization/pose
+    ros_type: geometry_msgs/msg/PoseWithCovarianceStamped
+    field: header.stamp.nanosec
+    qos: {reliability: reliable, durability: volatile, depth: 5}
+  localization.position.x:
+    topic: /localization/pose
+    ros_type: geometry_msgs/msg/PoseWithCovarianceStamped
+    field: pose.pose.position.x
+    qos: {reliability: reliable, durability: volatile, depth: 5}
+  localization.position.y:
+    topic: /localization/pose
+    ros_type: geometry_msgs/msg/PoseWithCovarianceStamped
+    field: pose.pose.position.y
+    qos: {reliability: reliable, durability: volatile, depth: 5}
+  localization.position.z:
+    topic: /localization/pose
+    ros_type: geometry_msgs/msg/PoseWithCovarianceStamped
+    field: pose.pose.position.z
+    qos: {reliability: reliable, durability: volatile, depth: 5}
+  localization.orientation.x:
+    topic: /localization/pose
+    ros_type: geometry_msgs/msg/PoseWithCovarianceStamped
+    field: pose.pose.orientation.x
+    qos: {reliability: reliable, durability: volatile, depth: 5}
+  localization.orientation.y:
+    topic: /localization/pose
+    ros_type: geometry_msgs/msg/PoseWithCovarianceStamped
+    field: pose.pose.orientation.y
+    qos: {reliability: reliable, durability: volatile, depth: 5}
+  localization.orientation.z:
+    topic: /localization/pose
+    ros_type: geometry_msgs/msg/PoseWithCovarianceStamped
+    field: pose.pose.orientation.z
+    qos: {reliability: reliable, durability: volatile, depth: 5}
+  localization.orientation.w:
+    topic: /localization/pose
+    ros_type: geometry_msgs/msg/PoseWithCovarianceStamped
+    field: pose.pose.orientation.w
+    qos: {reliability: reliable, durability: volatile, depth: 5}

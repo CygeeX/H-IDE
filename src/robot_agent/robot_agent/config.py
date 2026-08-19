@@ -5,13 +5,15 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import math
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal
 from urllib.parse import urlparse
 
 import yaml
-from jsonschema import Draft202012Validator, SchemaError
+from jsonschema import Draft202012Validator, FormatChecker, SchemaError
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -27,7 +29,31 @@ from robot_agent.protocol import LOGICAL_COMMAND_PATTERN
 ROS_NAME_PATTERN = r"^/[A-Za-z0-9_]+(?:/[A-Za-z0-9_]+)*$"
 ROS_TYPE_PATTERN = r"^[A-Za-z][A-Za-z0-9_]*/(?:srv|action|msg)/[A-Za-z][A-Za-z0-9_]*$"
 RESOURCE_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+SENSOR_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+PARAMETER_NAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
 LOGICAL_COMMAND_RE = re.compile(LOGICAL_COMMAND_PATTERN)
+RFC3339_DATETIME_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
+)
+
+COMMAND_FORMAT_CHECKER = FormatChecker()
+
+
+@COMMAND_FORMAT_CHECKER.checks("date-time")
+def _is_rfc3339_datetime(value: object) -> bool:
+    """Validate RFC 3339 even when jsonschema's optional helper is absent."""
+    if not isinstance(value, str):
+        return True
+    if RFC3339_DATETIME_RE.fullmatch(value) is None:
+        return False
+    try:
+        normalized = value.removesuffix("Z") + (
+            "+00:00" if value.endswith("Z") else ""
+        )
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None
 
 
 class ConfigLoadError(ValueError):
@@ -164,6 +190,26 @@ class SafetyConfig(StrictConfigModel):
     heartbeat_period_ms: int = Field(default=250, ge=50, le=1_000)
 
 
+class ObservationConfig(StrictConfigModel):
+    enabled: bool = False
+    demand_topic: str = Field(
+        default="/robot_agent/observation_demand",
+        pattern=ROS_NAME_PATTERN,
+    )
+    health_topic: str = Field(
+        default="/robot_observation_gateway/health",
+        pattern=ROS_NAME_PATTERN,
+    )
+    admission_max_age_ms: int = Field(default=500, ge=50, le=5_000)
+    watchdog_timeout_ms: int = Field(default=750, ge=100, le=10_000)
+
+    @model_validator(mode="after")
+    def validate_timeouts(self) -> ObservationConfig:
+        if self.watchdog_timeout_ms < self.admission_max_age_ms:
+            raise ValueError("watchdog_timeout_ms must be >= admission_max_age_ms")
+        return self
+
+
 class CommandConfig(StrictConfigModel):
     adapter: Literal["service", "action"]
     ros_name: str = Field(pattern=ROS_NAME_PATTERN)
@@ -172,8 +218,49 @@ class CommandConfig(StrictConfigModel):
     max_ttl_ms: int = Field(gt=0, le=60_000)
     timeout_ms: int = Field(gt=0, le=60_000)
     resources: tuple[str, ...] = Field(min_length=1, max_length=32)
+    skill_version: str = Field(
+        default="1.0.0",
+        pattern=r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?$",
+    )
+    description: str | None = Field(default=None, min_length=1, max_length=512)
+    capability_kind: Literal[
+        "motion", "observation", "manipulation", "safety", "non_motion"
+    ] = "non_motion"
+    risk_level: Literal["low", "medium", "high", "critical"] = "medium"
+    cancellable: bool | None = None
+    interruptible: bool | None = None
+    executor_profile: str | None = Field(default=None, min_length=1, max_length=256)
+    requires_observation: bool = False
+    goal_transform: Literal[
+        "direct",
+        "navigate_to_pose_v1",
+        "nav2_spin_v2",
+    ] = "direct"
+    observation_sensor_ids: tuple[str, ...] = ()
+    observation_session_parameter: str = Field(
+        default="observation_session_id",
+        pattern=r"^[A-Za-z][A-Za-z0-9_]{0,63}$",
+    )
+    robot_boot_parameter: str = Field(
+        default="robot_boot_id",
+        pattern=r"^[A-Za-z][A-Za-z0-9_]{0,63}$",
+    )
+    localization_epoch_parameter: str = Field(
+        default="localization_epoch_id",
+        pattern=r"^[A-Za-z][A-Za-z0-9_]{0,63}$",
+    )
+    scene_version_parameter: str | None = Field(
+        default="scene_version",
+        pattern=r"^[A-Za-z][A-Za-z0-9_]{0,63}$",
+    )
+    local_only_parameters: tuple[str, ...] = ()
 
-    @field_validator("resources", mode="before")
+    @field_validator(
+        "resources",
+        "observation_sensor_ids",
+        "local_only_parameters",
+        mode="before",
+    )
     @classmethod
     def normalize_resources(cls, value: object) -> object:
         if isinstance(value, list):
@@ -188,6 +275,26 @@ class CommandConfig(StrictConfigModel):
         invalid = [resource for resource in value if not RESOURCE_PATTERN.fullmatch(resource)]
         if invalid:
             raise ValueError(f"invalid resource names: {invalid}")
+        return value
+
+    @field_validator("observation_sensor_ids")
+    @classmethod
+    def validate_sensor_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(set(value)) != len(value):
+            raise ValueError("observation_sensor_ids must be unique")
+        invalid = [sensor_id for sensor_id in value if not SENSOR_ID_PATTERN.fullmatch(sensor_id)]
+        if invalid:
+            raise ValueError(f"invalid observation sensor IDs: {invalid}")
+        return value
+
+    @field_validator("local_only_parameters")
+    @classmethod
+    def validate_local_only_parameters(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(set(value)) != len(value):
+            raise ValueError("local_only_parameters must be unique")
+        invalid = [name for name in value if not PARAMETER_NAME_PATTERN.fullmatch(name)]
+        if invalid:
+            raise ValueError(f"invalid local-only parameter names: {invalid}")
         return value
 
     @field_validator("request_schema")
@@ -210,6 +317,52 @@ class CommandConfig(StrictConfigModel):
             raise ValueError(f"{self.adapter} adapter requires a {expected_segment[1:-1]} type")
         if self.timeout_ms > self.max_ttl_ms:
             raise ValueError("timeout_ms must not exceed max_ttl_ms")
+        properties = self.request_schema.get("properties")
+        property_names = set(properties) if isinstance(properties, dict) else set()
+        missing_local = set(self.local_only_parameters).difference(property_names)
+        if missing_local:
+            raise ValueError(
+                f"local_only_parameters are absent from request_schema: {sorted(missing_local)}"
+            )
+        if self.requires_observation:
+            if self.adapter != "action":
+                raise ValueError("requires_observation is only valid for action commands")
+            if not self.observation_sensor_ids:
+                raise ValueError("requires_observation needs at least one observation_sensor_id")
+            if "observation" not in self.resources:
+                raise ValueError(
+                    "requires_observation commands must claim the observation resource"
+                )
+            required = self.request_schema.get("required")
+            required_names = set(required) if isinstance(required, list) else set()
+            binding_names = {
+                self.observation_session_parameter,
+                self.robot_boot_parameter,
+                self.localization_epoch_parameter,
+            }
+            if not binding_names.issubset(property_names & required_names):
+                raise ValueError(
+                    "observation session, robot boot, and localization epoch parameters "
+                    "must be required schema properties"
+                )
+            if (
+                self.scene_version_parameter is not None
+                and self.scene_version_parameter not in property_names
+            ):
+                raise ValueError("scene_version_parameter is absent from request_schema")
+        elif self.observation_sensor_ids:
+            raise ValueError("observation_sensor_ids require requires_observation: true")
+        if self.goal_transform == "navigate_to_pose_v1" and (
+            self.adapter != "action"
+            or self.ros_type != "nav2_msgs/action/NavigateToPose"
+        ):
+            raise ValueError(
+                "navigate_to_pose_v1 requires nav2_msgs/action/NavigateToPose"
+            )
+        if self.goal_transform == "nav2_spin_v2" and (
+            self.adapter != "action" or self.ros_type != "nav2_msgs/action/Spin"
+        ):
+            raise ValueError("nav2_spin_v2 requires nav2_msgs/action/Spin")
         return self
 
 
@@ -233,8 +386,51 @@ class StateSourceConfig(StrictConfigModel):
         return value
 
 
+class RobotSensorConfig(StrictConfigModel):
+    sensor_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+    kind: Literal["rgb", "depth", "rgbd", "lidar", "imu", "other"]
+    frame_id: str = Field(min_length=1, max_length=256)
+    fixed_mount: Literal[True]
+    horizontal_fov_rad: float | None = Field(
+        default=None,
+        gt=0,
+        le=math.tau,
+        allow_inf_nan=False,
+    )
+    depth_capable: bool = False
+    calibration_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+
+
+class RobotProfileConfig(StrictConfigModel):
+    base_type: str = Field(min_length=1, max_length=128)
+    head_motion: Literal["fixed"]
+    map_frame_id: str = Field(default="map", min_length=1, max_length=256)
+    base_frame_id: str = Field(default="base_link", min_length=1, max_length=256)
+    sensors: tuple[RobotSensorConfig, ...] = Field(min_length=1, max_length=32)
+    metadata: dict[str, JsonValue] = Field(default_factory=dict)
+
+    @field_validator("sensors", mode="before")
+    @classmethod
+    def normalize_sensors(cls, value: object) -> object:
+        return tuple(value) if isinstance(value, list) else value
+
+    @field_validator("sensors")
+    @classmethod
+    def unique_sensors(
+        cls, value: tuple[RobotSensorConfig, ...]
+    ) -> tuple[RobotSensorConfig, ...]:
+        identifiers = [sensor.sensor_id for sensor in value]
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError("robot_profile sensor IDs must be unique")
+        return value
+
+
 class AgentConfig(StrictConfigModel):
-    schema_version: Literal["1"]
+    schema_version: Literal["1", "2"]
+    agent_version: str = Field(default="0.1.0", min_length=1, max_length=64)
     robot_id: str = Field(
         min_length=1,
         max_length=128,
@@ -246,6 +442,8 @@ class AgentConfig(StrictConfigModel):
     storage: StorageConfig
     state: StateOutputConfig
     safety: SafetyConfig
+    observation: ObservationConfig = ObservationConfig()
+    robot_profile: RobotProfileConfig | None = None
     commands: dict[str, CommandConfig] = Field(min_length=1, max_length=256)
     state_sources: dict[str, StateSourceConfig] = Field(default_factory=dict)
 
@@ -269,6 +467,28 @@ class AgentConfig(StrictConfigModel):
 
     @model_validator(mode="after")
     def validate_transport_security(self) -> AgentConfig:
+        if self.schema_version == "2" and self.robot_profile is None:
+            raise ValueError("schema_version 2 requires robot_profile")
+        if (
+            any(command.requires_observation for command in self.commands.values())
+            and not self.observation.enabled
+        ):
+            raise ValueError(
+                "commands requiring observation need observation.enabled: true"
+            )
+        if self.robot_profile is not None:
+            sensor_ids = {sensor.sensor_id for sensor in self.robot_profile.sensors}
+            required_sensor_ids = {
+                sensor_id
+                for command in self.commands.values()
+                for sensor_id in command.observation_sensor_ids
+            }
+            missing_sensors = required_sensor_ids - sensor_ids
+            if missing_sensors:
+                raise ValueError(
+                    "command references sensor absent from robot_profile: "
+                    f"{sorted(missing_sensors)[0]}"
+                )
         if isinstance(self.transport, ClientTransportConfig):
             parsed = urlparse(self.transport.uri)
             if parsed.scheme not in {"ws", "wss"} or not parsed.hostname:
@@ -357,7 +577,10 @@ def load_config(path: str | Path) -> AgentConfig:
 def validate_command_params(command: CommandConfig, params: dict[str, JsonValue]) -> None:
     """Validate remote params against the selected local registry schema."""
     errors = sorted(
-        Draft202012Validator(command.request_schema).iter_errors(params),
+        Draft202012Validator(
+            command.request_schema,
+            format_checker=COMMAND_FORMAT_CHECKER,
+        ).iter_errors(params),
         key=lambda error: list(error.absolute_path),
     )
     if not errors:

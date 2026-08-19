@@ -4,14 +4,19 @@ version = "0.1.0"
 description = "Development and verification workspace for the robot-side protocol agent"
 requires-python = ">=3.10"
 dependencies = [
+  "google-crc32c>=1.7,<2",
+  "grpcio>=1.81.1,<2",
+  "protobuf>=6.33.5,<7",
   "jsonschema>=4.25,<5",
   "pydantic>=2.13,<3",
   "PyYAML>=6.0,<7",
   "websockets>=16.1,<17",
+  "zstandard>=0.23,<1",
 ]
 
 [dependency-groups]
 dev = [
+  "grpcio-tools>=1.81.1,<2",
   "mypy>=1.17,<2",
   "pytest>=8.4,<9",
   "pytest-asyncio>=1.2,<2",
@@ -24,7 +29,7 @@ dev = [
 [tool.pytest.ini_options]
 addopts = "-ra --strict-markers"
 asyncio_mode = "auto"
-pythonpath = ["src/robot_agent"]
+pythonpath = ["src/robot_agent", "src/robot_observation_gateway"]
 testpaths = ["tests", "src/robot_agent/test"]
 markers = [
   "integration: tests that exercise sockets or ROS graph integration",
@@ -46,17 +51,51 @@ target-version = "py310"
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC", "RUF"]
 
+[tool.ruff.lint.isort]
+known-first-party = ["robot_agent", "robot_observation", "robot_observation_gateway"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/robot_observation_gateway/robot_observation/v1/observation_pb2*" = ["ALL"]
+
 [tool.mypy]
 python_version = "3.10"
 strict = true
 warn_unreachable = true
-packages = ["robot_agent"]
-mypy_path = "src/robot_agent"
+packages = ["robot_agent", "robot_observation_gateway"]
+mypy_path = "src/robot_agent:src/robot_observation_gateway"
 
 [[tool.mypy.overrides]]
-module = ["rclpy.*", "rosidl_runtime_py.*", "std_msgs.*", "std_srvs.*"]
+module = [
+  "action_msgs.*",
+  "builtin_interfaces.*",
+  "cv2.*",
+  "geometry_msgs.*",
+  "nav_msgs.*",
+  "nav2_msgs.*",
+  "rclpy.*",
+  "realsense2_camera_msgs.*",
+  "robot_observation_interfaces.*",
+  "rosidl_runtime_py.*",
+  "sensor_msgs.*",
+  "std_msgs.*",
+  "std_srvs.*",
+  "tf2_ros.*",
+  "zstandard.*",
+]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = ["robot_agent.ros_adapter"]
 disable_error_code = ["import-untyped", "no-untyped-call"]
+
+[[tool.mypy.overrides]]
+module = ["robot_observation.v1.*"]
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = ["robot_observation_gateway.localization_fixture"]
+disable_error_code = ["attr-defined", "misc", "no-untyped-call", "unused-ignore"]
+
+[[tool.mypy.overrides]]
+module = ["robot_observation_gateway.ros_ingress"]
+disable_error_code = ["unused-ignore"]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 import logging
 import os
@@ -10,17 +11,17 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pytest
-import robot_agent.cli as cli_module
-import robot_agent.systemd_notify as notify_module
 import yaml
 from jsonschema import Draft202012Validator
+
+import robot_agent.cli as cli_module
+import robot_agent.systemd_notify as notify_module
 from robot_agent.cli import main
+from robot_agent.config import AgentConfig, config_json_schema, load_config
 from robot_agent.doctor import collect_diagnostics
 from robot_agent.logging_utils import JsonFormatter, configure_logging
 from robot_agent.protocol import protocol_json_schema
 from robot_agent.systemd_notify import notify, watchdog_interval
-
-from robot_agent.config import AgentConfig, config_json_schema, load_config
 
 WORKSPACE = Path(__file__).resolve().parents[1]
 LOCAL_CONFIG = WORKSPACE / "src/robot_agent/config/robot_agent.local.yaml"
@@ -43,11 +44,18 @@ def test_doctor_is_read_only_and_reports_ros_types(capsys: pytest.CaptureFixture
     ledger = Path(config.storage.ledger_path)
     existed_before = ledger.exists()
 
-    assert main(["doctor", "--config", str(LOCAL_CONFIG)]) == 0
+    nav2_available = importlib.util.find_spec("nav2_msgs") is not None
+    assert main(["doctor", "--config", str(LOCAL_CONFIG)]) == (0 if nav2_available else 1)
     report = json.loads(capsys.readouterr().out)
 
-    assert report["healthy"] is True
+    assert report["healthy"] is nav2_available
     assert any(check["name"] == "command:power.enable" for check in report["checks"])
+    if not nav2_available:
+        assert any(
+            check["name"] == "command:navigation.navigate_to_pose"
+            and check["status"] == "FAIL"
+            for check in report["checks"]
+        )
     assert ledger.exists() is existed_before
 
 
@@ -124,7 +132,13 @@ def test_package_declares_interfaces_used_by_shipped_configs_as_runtime_dependen
     package = ET.parse(WORKSPACE / "src/robot_agent/package.xml").getroot()
     runtime_dependencies = {element.text for element in package.findall("exec_depend")}
 
-    assert {"example_interfaces", "std_msgs", "std_srvs"} <= runtime_dependencies
+    assert {
+        "example_interfaces",
+        "geometry_msgs",
+        "nav2_msgs",
+        "std_msgs",
+        "std_srvs",
+    } <= runtime_dependencies
 
 
 def test_cli_invalid_config_and_doctor_failure_paths(
@@ -143,7 +157,10 @@ def test_cli_invalid_config_and_doctor_failure_paths(
     config = AgentConfig.model_validate(raw)
     report = collect_diagnostics(config)
     assert report["healthy"] is False
-    assert sum(check["status"] == "FAIL" for check in report["checks"]) == 3
+    # The local profile has two Nav2 action commands (NavigateToPose and Spin),
+    # so an environment without nav2_msgs contributes two diagnostics.
+    expected_failures = 3 + (2 if importlib.util.find_spec("nav2_msgs") is None else 0)
+    assert sum(check["status"] == "FAIL" for check in report["checks"]) == expected_failures
     assert any(
         check["name"] == "ledger-directory" and check["status"] == "PASS"
         for check in report["checks"]

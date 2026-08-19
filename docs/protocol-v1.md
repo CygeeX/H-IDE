@@ -9,7 +9,7 @@
   "version": "1.0",
   "type": "command.request",
   "message_id": "UUID",
-  "robot_id": "g1-production",
+  "robot_id": "g1-dev",
   "session_id": "UUID",
   "sent_at": "2026-08-07T12:00:00Z",
   "payload": {}
@@ -47,3 +47,28 @@
 命令终态包括 `SUCCEEDED`、`FAILED`、`CANCELLED`、`REJECTED`、`TIMED_OUT` 和 `ABORTED_AGENT_RESTART`。断线后不会重放旧命令；BFF 可以用相同命令 ID 和完全相同的载荷查询已记录状态。
 
 完整机器可读定义见 `src/robot_agent/schemas/robot-agent.v1.schema.json`。
+
+## 与 RGB-D 数据面的关系
+
+本协议仍然禁止图片和任意二进制 ROS 数据进入 WebSocket。RGB-D 使用独立的
+`robot.observation.v1` Protobuf/gRPC 数据面，定义见
+`proto/robot_observation/v1/observation.proto`。两者唯一的本地协作点是强类型 ROS
+`ObservationDemand` / `ObservationHealth`：WebSocket 命令可以声明
+`requires_observation` 并绑定 observation session、robot boot 和 localization epoch；
+scene/PCD 仅为可选辅助信息，不能作为执行前置条件。命令不能借此选择 ROS 话题、
+编码器或 TF frame。工作站发现观测超时时仍通过本协议的 `command.cancel` 取消导航；
+机器人本地观测看门狗是独立后备，不依赖工作站取消能够到达。
+
+## H-IDE 导航命令
+
+`navigation.navigate_to_pose` 的参数严格服从随包保存的
+`src/robot_agent/schemas/navigation.navigate_to_pose.schema.json`。Robot Agent 验证
+boot/session/epoch 和观测新鲜度后，只把 `goalPose` 转成
+`nav2_msgs/action/NavigateToPose` 的 `PoseStamped`，frame 固定为 `map`，
+`behavior_tree` 留空。它不规划路径，也不把 `missionId`、`stageId`、
+`visualResolutionId`、限速或其他审计字段写入 ROS Goal；这些字段只进入日志和 SQLite
+命令账本。
+
+命令登记后持续返回 `RUNNING`（包括 Nav2 feedback），随后返回
+`SUCCEEDED`、`FAILED` 或 `CANCELLED` 等终态。相同 `command_id` 与相同规范载荷重发时，
+返回账本中的当前或最终状态；相同 ID 携带不同载荷会被拒绝，不会执行第二次。

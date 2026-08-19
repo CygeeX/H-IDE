@@ -9,7 +9,7 @@
 
 ```bash
 source /opt/ros/jazzy/setup.bash
-PYTHONPATH=src/robot_agent:${PYTHONPATH} .venv/bin/python \
+PYTHONPATH=src/robot_agent:src/robot_observation_gateway:${PYTHONPATH} .venv/bin/python \
   tools/web_demo_server.py --launch-stack --open-browser
 ```
 
@@ -36,6 +36,66 @@ Mock Robot 与 Agent 默认使用独立的 `ROS_DOMAIN_ID=232`，并把 DDS disc
 WebSocket 还校验 Origin。该入口仍只应在开发机或隔离安全工位使用，不应替代生产
 mTLS BFF。
 
+同一个页面还会默认启动合成 RGB-D 源、真实 Observation Gateway 和本地 gRPC 工作站
+接收端。页面里的彩色图和深度图来自接收端解码结果，不是前端动画；指标也来自协议帧
+与遥测消息。这个本地数据面使用 loopback 明文，仅用于演示。生产配置仍强制 mTLS。
+
+## 查看已连接的 D435i
+
+使用三个终端，并让它们采用同一个 ROS Domain。第一终端只启动官方 RealSense 节点，
+不启动 Gateway：
+
+```bash
+unset CYCLONEDDS_URI
+unset ROS_DISCOVERY_SERVER
+export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
+export ROS_DOMAIN_ID=42
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+# 仅当前开发机、且系统尚未安装 realsense2_camera 时：
+source tools/activate-local-realsense-jazzy.bash
+
+ros2 launch robot_observation_gateway realsense_observation.launch.py \
+  serial_no:=_261222077185 start_gateway:=false
+```
+
+第二终端发布严格采集时刻查询所需的台架 TF 和定位。这个 fixture 只用于本地测试，真机
+部署时必须替换为机器人自身的 TF 与定位：
+
+```bash
+unset CYCLONEDDS_URI
+unset ROS_DISCOVERY_SERVER
+export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
+export ROS_DOMAIN_ID=42
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+
+ros2 run robot_observation_gateway observation-localization-fixture
+```
+
+第三终端启动网页、本地 gRPC 接收端和唯一的 Gateway；若还想同时操作 Mock Robot，
+可追加 `--launch-stack --ros-domain-id 42`：
+
+```bash
+unset CYCLONEDDS_URI
+unset ROS_DISCOVERY_SERVER
+export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
+export ROS_DOMAIN_ID=42
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+# 仅当前开发机、且系统尚未安装 realsense2_camera 时：
+source tools/activate-local-realsense-jazzy.bash
+PYTHONPATH=src/robot_agent:src/robot_observation_gateway:${PYTHONPATH} .venv/bin/python \
+  tools/web_demo_server.py --observation-source realsense --open-browser
+```
+
+如果第一条命令找不到 `realsense2_camera`，先安装与当前 ROS 发行版匹配的官方
+RealSense ROS 包。上面的本地激活脚本只暴露这台开发机已经临时解包的依赖；不要把
+脚本依赖的 `.local/` 内容复制到机器人。
+
+网页不会提供“拔掉真相机”的按钮，避免测试台意外干预 USB 设备；模拟相机模式才允许
+暂停输入。ACK 暂停、拒绝下一帧和停止/恢复观测会话在两种模式都可用。
+
 ## 推荐操作顺序
 
 1. 确认页面顶部显示“Agent 在线”，初始状态是 `SAFE_HOLD`。
@@ -45,6 +105,8 @@ mTLS BFF。
 5. 点击“暂停续租”，观察租约倒计时归零，Mock Robot 收到 safe-stop，Agent 回到
    `SAFE_HOLD`。
 6. 再次点击“获取控制权”，验证失联恢复后不会自动恢复旧控制会话。
+7. 在 RGB-D 区域确认 `USABLE`，观察同步彩色/深度、帧号、延迟和带宽。
+8. 执行“观测依赖导航”，然后暂停 ACK；750 ms 后观测降级，Agent 只取消该导航。
 
 页面中的命令列表显示命令 ID、状态、结果和更新时间；协议时间线显示
 Browser/BFF/Agent 之间的重要消息。续租消息本身不会逐条写入时间线，以免 500 ms
@@ -55,8 +117,8 @@ Browser/BFF/Agent 之间的重要消息。续租消息本身不会逐条写入�
 不启动 ROS 2 时运行：
 
 ```bash
-PYTHONPATH=src/robot_agent:${PYTHONPATH} .venv/bin/python \
-  tools/web_demo_server.py --open-browser
+PYTHONPATH=src/robot_agent:src/robot_observation_gateway:${PYTHONPATH} .venv/bin/python \
+  tools/web_demo_server.py --observation-source off --open-browser
 ```
 
 然后点击右上角“进入浏览器演示”。此模式会模拟握手、命令反馈和租约超时，并明确
@@ -69,6 +131,9 @@ PYTHONPATH=src/robot_agent:${PYTHONPATH} .venv/bin/python \
 --port 8765              HTTP、/ui 与 /agent 共用端口
 --ros-domain-id 232      一键测试栈使用的隔离 ROS Domain
 --agent-config PATH      Robot Agent 本地配置
+--observation-source     synthetic（默认）、realsense 或 off
+--observation-config     Observation Gateway 本地配置
+--observation-port       本地测试工作站 gRPC 端口，默认 50051
 --open-browser           启动后尝试打开默认浏览器
 ```
 

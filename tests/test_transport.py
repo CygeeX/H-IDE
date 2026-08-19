@@ -12,6 +12,15 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from websockets.asyncio.client import connect
+from websockets.asyncio.server import ServerConnection, serve
+from websockets.exceptions import ConnectionClosed, InvalidMessage, InvalidStatus
+
+from robot_agent.config import (
+    ClientTransportConfig,
+    ServerTransportConfig,
+    TLSConfig,
+)
 from robot_agent.session import ControlState, SessionController
 from robot_agent.transport import (
     SUBPROTOCOL,
@@ -22,15 +31,6 @@ from robot_agent.transport import (
     TransportProtocolError,
     build_client_ssl_context,
     build_server_ssl_context,
-)
-from websockets.asyncio.client import connect
-from websockets.asyncio.server import ServerConnection, serve
-from websockets.exceptions import ConnectionClosed, InvalidMessage, InvalidStatus
-
-from robot_agent.config import (
-    ClientTransportConfig,
-    ServerTransportConfig,
-    TLSConfig,
 )
 
 

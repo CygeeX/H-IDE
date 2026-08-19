@@ -9,6 +9,9 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+from websockets.asyncio.client import ClientConnection, connect
+from websockets.exceptions import InvalidStatus
+
 from robot_agent.protocol import (
     CommandRequest,
     CommandStatus,
@@ -25,13 +28,12 @@ from robot_agent.protocol import (
     serialize_wire_message,
 )
 from robot_agent.transport import SUBPROTOCOL
-from websockets.asyncio.client import ClientConnection, connect
-from websockets.exceptions import InvalidStatus
-
+from robot_observation_gateway.config import load_config as load_observation_config
 from tools.web_demo_server import (
     UI_SUBPROTOCOL,
     DashboardBridge,
     DemoServerConfig,
+    ObservationDemoStack,
     create_server,
     load_assets,
     parser,
@@ -142,7 +144,11 @@ async def test_web_demo_serves_assets_with_security_headers() -> None:
         status, content_type, _, health = await asyncio.to_thread(fetch, "/healthz")
         assert status == 200
         assert content_type.startswith("application/json")
-        assert json.loads(health) == {"agent_connected": False, "status": "ok"}
+        assert json.loads(health) == {
+            "agent_connected": False,
+            "observation_enabled": False,
+            "status": "ok",
+        }
 
 
 @pytest.mark.asyncio
@@ -315,3 +321,121 @@ def test_web_demo_cli_defaults_to_safe_loopback() -> None:
     assert args.port == 8765
     assert args.ros_domain_id == 232
     assert args.launch_stack is False
+    assert args.observation_source == "synthetic"
+
+
+@pytest.mark.asyncio
+async def test_web_demo_streams_rgbd_and_exposes_bounded_fault_actions() -> None:
+    port = unused_port()
+    observation_port = unused_port()
+    config = DemoServerConfig(port=port)
+    observation = ObservationDemoStack(
+        load_observation_config(
+            "src/robot_observation_gateway/config/robot_observation_gateway.local.yaml"
+        ),
+        source_mode="synthetic",
+        port=observation_port,
+    )
+    await observation.start()
+    bridge = DashboardBridge(config, observation=observation)
+    try:
+        async with create_server(bridge, config, load_assets()), connect(
+            f"ws://127.0.0.1:{port}/ui",
+            origin=f"http://127.0.0.1:{port}",
+            subprotocols=[UI_SUBPROTOCOL],
+            compression=None,
+            proxy=None,
+        ) as ui:
+            snapshot = await receive_ui(
+                ui,
+                lambda item: item.get("observation", {}).get("acceptedFrames", 0) >= 2,
+                timeout=5.0,
+            )
+            assert snapshot["observation"]["health"]["status"] == "USABLE"
+            assert snapshot["observation"]["frame"]["width"] == 640
+            assert snapshot["observation"]["frame"]["height"] == 480
+            telemetry_deadline = asyncio.get_running_loop().time() + 2.0
+            while (
+                "networkMs" not in snapshot["observation"]["telemetry"]
+                and asyncio.get_running_loop().time() < telemetry_deadline
+            ):
+                snapshot = await receive_ui(
+                    ui,
+                    lambda item: item.get("type") == "snapshot",
+                    timeout=1.0,
+                )
+            assert snapshot["observation"]["telemetry"]["networkMs"] >= 0.0
+
+            bridge._agent = object()  # type: ignore[assignment]
+            bridge._session_id = uuid4()
+            bridge._control_state = "ACTIVE"
+            sent: list[WireMessage] = []
+
+            async def capture_command(message: WireMessage, *, record_event: bool = True) -> None:
+                del record_event
+                sent.append(message)
+
+            bridge._send_agent_message = capture_command  # type: ignore[method-assign]
+            await bridge._handle_ui_action(
+                {
+                    "action": "command.send",
+                    "kind": "navigation.navigate_to_pose",
+                    "params": {
+                        "goalPose": {
+                            "frameId": "map",
+                            "x": 1.0,
+                            "y": 0.5,
+                            "z": 0.0,
+                            "yaw": 0.0,
+                            "observedAt": datetime.now(timezone.utc).isoformat(),
+                        }
+                    },
+                }
+            )
+            assert isinstance(sent[-1], CommandRequest)
+            assert sent[-1].payload.params["observationSessionId"] == snapshot[
+                "observation"
+            ]["observationSessionId"]
+            assert sent[-1].payload.params["robotBootId"] == snapshot["observation"][
+                "robotBootId"
+            ]
+            assert sent[-1].payload.params["localizationEpochId"] == snapshot[
+                "observation"
+            ]["localizationEpochId"]
+            assert sent[-1].payload.params["sceneRef"] is None
+            assert sent[-1].payload.params["maximumSpeedMps"] == 0.3
+            bridge._agent = None
+            bridge._session_id = None
+
+            def fetch_image(path: str) -> tuple[str, bytes]:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}") as response:
+                    return response.headers["Content-Type"], response.read()
+
+            rgb_type, rgb = await asyncio.to_thread(
+                fetch_image,
+                "/api/observation/rgb.jpg",
+            )
+            depth_type, depth = await asyncio.to_thread(
+                fetch_image,
+                "/api/observation/depth.png",
+            )
+            assert rgb_type == "image/jpeg" and rgb.startswith(b"\xff\xd8")
+            assert depth_type == "image/png" and depth.startswith(b"\x89PNG")
+
+            await ui.send(json.dumps({"action": "observation.ack_pause", "paused": True}))
+            paused = await receive_ui(
+                ui,
+                lambda item: item.get("observation", {}).get("faults", {}).get("acksPaused"),
+            )
+            assert paused["observation"]["faults"]["acksPaused"] is True
+
+            await ui.send(json.dumps({"action": "observation.camera_pause", "paused": True}))
+            camera_paused = await receive_ui(
+                ui,
+                lambda item: item.get("observation", {}).get("faults", {}).get("cameraPaused"),
+            )
+            assert camera_paused["observation"]["source"] == "synthetic"
+    finally:
+        bridge._agent = None
+        await bridge.close()
+        await observation.stop()

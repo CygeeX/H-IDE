@@ -6,6 +6,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+
 from robot_agent.ledger import (
     CommandIdConflict,
     CommandLedger,

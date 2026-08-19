@@ -54,11 +54,113 @@
           "title": "Adapter",
           "type": "string"
         },
+        "cancellable": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cancellable"
+        },
+        "capability_kind": {
+          "default": "non_motion",
+          "enum": [
+            "motion",
+            "observation",
+            "manipulation",
+            "safety",
+            "non_motion"
+          ],
+          "title": "Capability Kind",
+          "type": "string"
+        },
+        "description": {
+          "anyOf": [
+            {
+              "maxLength": 512,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Description"
+        },
+        "executor_profile": {
+          "anyOf": [
+            {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Executor Profile"
+        },
+        "goal_transform": {
+          "default": "direct",
+          "enum": [
+            "direct",
+            "navigate_to_pose_v1",
+            "nav2_spin_v2"
+          ],
+          "title": "Goal Transform",
+          "type": "string"
+        },
+        "interruptible": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Interruptible"
+        },
+        "local_only_parameters": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Local Only Parameters",
+          "type": "array"
+        },
+        "localization_epoch_parameter": {
+          "default": "localization_epoch_id",
+          "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$",
+          "title": "Localization Epoch Parameter",
+          "type": "string"
+        },
         "max_ttl_ms": {
           "exclusiveMinimum": 0,
           "maximum": 60000,
           "title": "Max Ttl Ms",
           "type": "integer"
+        },
+        "observation_sensor_ids": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Observation Sensor Ids",
+          "type": "array"
+        },
+        "observation_session_parameter": {
+          "default": "observation_session_id",
+          "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$",
+          "title": "Observation Session Parameter",
+          "type": "string"
         },
         "request_schema": {
           "additionalProperties": {
@@ -66,6 +168,11 @@
           },
           "title": "Request Schema",
           "type": "object"
+        },
+        "requires_observation": {
+          "default": false,
+          "title": "Requires Observation",
+          "type": "boolean"
         },
         "resources": {
           "items": {
@@ -76,6 +183,23 @@
           "title": "Resources",
           "type": "array"
         },
+        "risk_level": {
+          "default": "medium",
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "critical"
+          ],
+          "title": "Risk Level",
+          "type": "string"
+        },
+        "robot_boot_parameter": {
+          "default": "robot_boot_id",
+          "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$",
+          "title": "Robot Boot Parameter",
+          "type": "string"
+        },
         "ros_name": {
           "pattern": "^/[A-Za-z0-9_]+(?:/[A-Za-z0-9_]+)*$",
           "title": "Ros Name",
@@ -84,6 +208,25 @@
         "ros_type": {
           "pattern": "^[A-Za-z][A-Za-z0-9_]*/(?:srv|action|msg)/[A-Za-z][A-Za-z0-9_]*$",
           "title": "Ros Type",
+          "type": "string"
+        },
+        "scene_version_parameter": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": "scene_version",
+          "title": "Scene Version Parameter"
+        },
+        "skill_version": {
+          "default": "1.0.0",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?$",
+          "title": "Skill Version",
           "type": "string"
         },
         "timeout_ms": {
@@ -106,6 +249,44 @@
       "type": "object"
     },
     "JsonValue": {},
+    "ObservationConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "admission_max_age_ms": {
+          "default": 500,
+          "maximum": 5000,
+          "minimum": 50,
+          "title": "Admission Max Age Ms",
+          "type": "integer"
+        },
+        "demand_topic": {
+          "default": "/robot_agent/observation_demand",
+          "pattern": "^/[A-Za-z0-9_]+(?:/[A-Za-z0-9_]+)*$",
+          "title": "Demand Topic",
+          "type": "string"
+        },
+        "enabled": {
+          "default": false,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "health_topic": {
+          "default": "/robot_observation_gateway/health",
+          "pattern": "^/[A-Za-z0-9_]+(?:/[A-Za-z0-9_]+)*$",
+          "title": "Health Topic",
+          "type": "string"
+        },
+        "watchdog_timeout_ms": {
+          "default": 750,
+          "maximum": 10000,
+          "minimum": 100,
+          "title": "Watchdog Timeout Ms",
+          "type": "integer"
+        }
+      },
+      "title": "ObservationConfig",
+      "type": "object"
+    },
     "QoSConfig": {
       "additionalProperties": false,
       "properties": {
@@ -138,6 +319,132 @@
         "depth"
       ],
       "title": "QoSConfig",
+      "type": "object"
+    },
+    "RobotProfileConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "base_frame_id": {
+          "default": "base_link",
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Base Frame Id",
+          "type": "string"
+        },
+        "base_type": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Base Type",
+          "type": "string"
+        },
+        "head_motion": {
+          "const": "fixed",
+          "title": "Head Motion",
+          "type": "string"
+        },
+        "map_frame_id": {
+          "default": "map",
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Map Frame Id",
+          "type": "string"
+        },
+        "metadata": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "title": "Metadata",
+          "type": "object"
+        },
+        "sensors": {
+          "items": {
+            "$ref": "#/$defs/RobotSensorConfig"
+          },
+          "maxItems": 32,
+          "minItems": 1,
+          "title": "Sensors",
+          "type": "array"
+        }
+      },
+      "required": [
+        "base_type",
+        "head_motion",
+        "sensors"
+      ],
+      "title": "RobotProfileConfig",
+      "type": "object"
+    },
+    "RobotSensorConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "calibration_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Calibration Sha256"
+        },
+        "depth_capable": {
+          "default": false,
+          "title": "Depth Capable",
+          "type": "boolean"
+        },
+        "fixed_mount": {
+          "const": true,
+          "title": "Fixed Mount",
+          "type": "boolean"
+        },
+        "frame_id": {
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Frame Id",
+          "type": "string"
+        },
+        "horizontal_fov_rad": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "maximum": 6.283185307179586,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Horizontal Fov Rad"
+        },
+        "kind": {
+          "enum": [
+            "rgb",
+            "depth",
+            "rgbd",
+            "lidar",
+            "imu",
+            "other"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "sensor_id": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+          "title": "Sensor Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sensor_id",
+        "kind",
+        "frame_id",
+        "fixed_mount"
+      ],
+      "title": "RobotSensorConfig",
       "type": "object"
     },
     "SafeStopConfig": {
@@ -449,6 +756,13 @@
   "$id": "https://phibotics.local/schemas/robot-agent-config.v1.schema.json",
   "additionalProperties": false,
   "properties": {
+    "agent_version": {
+      "default": "0.1.0",
+      "maxLength": 64,
+      "minLength": 1,
+      "title": "Agent Version",
+      "type": "string"
+    },
     "commands": {
       "additionalProperties": {
         "$ref": "#/$defs/CommandConfig"
@@ -458,6 +772,16 @@
       "title": "Commands",
       "type": "object"
     },
+    "observation": {
+      "$ref": "#/$defs/ObservationConfig",
+      "default": {
+        "admission_max_age_ms": 500,
+        "demand_topic": "/robot_agent/observation_demand",
+        "enabled": false,
+        "health_topic": "/robot_observation_gateway/health",
+        "watchdog_timeout_ms": 750
+      }
+    },
     "robot_id": {
       "maxLength": 128,
       "minLength": 1,
@@ -465,11 +789,25 @@
       "title": "Robot Id",
       "type": "string"
     },
+    "robot_profile": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RobotProfileConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
     "safety": {
       "$ref": "#/$defs/SafetyConfig"
     },
     "schema_version": {
-      "const": "1",
+      "enum": [
+        "1",
+        "2"
+      ],
       "title": "Schema Version",
       "type": "string"
     },

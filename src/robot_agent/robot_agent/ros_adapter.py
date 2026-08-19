@@ -6,6 +6,7 @@ import asyncio
 import concurrent.futures
 import contextlib
 import json
+import math
 import queue
 import threading
 import time
@@ -40,6 +41,7 @@ from robot_agent.config import (
     StateSourceConfig,
 )
 from robot_agent.coordinator import ExecutionResult
+from robot_agent.observation import ObservationHealthSample
 
 
 class RosAdapterError(RuntimeError):
@@ -68,6 +70,82 @@ def build_message(
     except (AttributeError, KeyError, TypeError, ValueError) as exc:
         raise RosTypeError(f"invalid fields for {ros_type!r}: {exc}") from exc
     return message
+
+
+def navigate_to_pose_goal_values(
+    goal_pose: Mapping[str, Any],
+    *,
+    stamp_sec: int,
+    stamp_nanosec: int,
+) -> dict[str, Any]:
+    """Create the only ROS fields allowed by the H-IDE navigation boundary."""
+    if goal_pose.get("frameId") != "map":
+        raise RosTypeError("navigation goalPose.frameId must be map")
+    yaw = goal_pose.get("yaw")
+    if isinstance(yaw, bool) or not isinstance(yaw, (int, float)):
+        raise RosTypeError("navigation goalPose.yaw must be numeric")
+    try:
+        x = float(goal_pose["x"])
+        y = float(goal_pose["y"])
+        z = float(goal_pose["z"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RosTypeError("navigation goalPose x/y/z must be numeric") from exc
+    yaw_value = float(yaw)
+    if not all(math.isfinite(value) for value in (x, y, z, yaw_value)):
+        raise RosTypeError("navigation goalPose values must be finite")
+    if not -math.pi <= yaw_value <= math.pi:
+        raise RosTypeError("navigation goalPose.yaw must be within [-pi, pi]")
+    if stamp_sec < 0 or not 0 <= stamp_nanosec < 1_000_000_000:
+        raise RosTypeError("navigation PoseStamped time is invalid")
+    return {
+        "pose": {
+            "header": {
+                "stamp": {"sec": stamp_sec, "nanosec": stamp_nanosec},
+                "frame_id": "map",
+            },
+            "pose": {
+                "position": {"x": x, "y": y, "z": z},
+                "orientation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": math.sin(yaw_value / 2.0),
+                    "w": math.cos(yaw_value / 2.0),
+                },
+            },
+        },
+        "behavior_tree": "",
+    }
+
+
+def nav2_spin_goal_values(params: Mapping[str, Any]) -> dict[str, Any]:
+    """Translate an authorized relative yaw into the Nav2 Spin action only.
+
+    Angular velocity remains a Robot Agent/Nav2 configuration concern.  H-IDE
+    may request a bounded relative orientation change, but it cannot publish a
+    velocity or inject a behavior tree.
+    """
+
+    target_yaw = params.get("targetYawRad")
+    if isinstance(target_yaw, bool) or not isinstance(target_yaw, (int, float)):
+        raise RosTypeError("navigation targetYawRad must be numeric")
+    target_yaw_value = float(target_yaw)
+    if not math.isfinite(target_yaw_value):
+        raise RosTypeError("navigation targetYawRad must be finite")
+    if target_yaw_value == 0.0 or abs(target_yaw_value) > math.tau:
+        raise RosTypeError("navigation targetYawRad must be within [-2pi, 2pi] and non-zero")
+
+    allowance_ms = params.get("timeAllowanceMs")
+    if isinstance(allowance_ms, bool) or not isinstance(allowance_ms, int):
+        raise RosTypeError("navigation timeAllowanceMs must be an integer")
+    if not 100 <= allowance_ms <= 60_000:
+        raise RosTypeError("navigation timeAllowanceMs must be within [100, 60000]")
+    return {
+        "target_yaw": target_yaw_value,
+        "time_allowance": {
+            "sec": allowance_ms // 1_000,
+            "nanosec": (allowance_ms % 1_000) * 1_000_000,
+        },
+    }
 
 
 def heartbeat_qos() -> QoSProfile:
@@ -130,6 +208,7 @@ def action_status_qos() -> QoSProfile:
 
 StateCallback = Callable[[str, Any, datetime], None]
 FeedbackCallback = Callable[[UUID, dict[str, Any]], None]
+ObservationHealthCallback = Callable[[ObservationHealthSample], None]
 StateSupplier = Callable[[], str]
 
 _ROS_REQUEST_QUEUE_SIZE = 256
@@ -151,6 +230,7 @@ class RosAdapter:
         state_callback: StateCallback | None = None,
         feedback_callback: FeedbackCallback | None = None,
         node_name: str | None = None,
+        robot_boot_id: UUID | None = None,
     ) -> None:
         self._node_name = node_name or f"robot_agent_{uuid4().hex[:8]}"
         self._context: Context | None = None
@@ -175,6 +255,7 @@ class RosAdapter:
         self._closed = False
         self._state_callback = state_callback
         self._feedback_callback = feedback_callback
+        self._observation_health_callback: ObservationHealthCallback | None = None
         self._service_clients: dict[tuple[str, str], Any] = {}
         self._action_clients: dict[tuple[str, str], Any] = {}
         self._subscriptions: list[Any] = []
@@ -192,7 +273,10 @@ class RosAdapter:
         self._heartbeat_publisher: Any | None = None
         self._heartbeat_timer: Any | None = None
         self._heartbeat_sequence = 0
-        self._boot_id = uuid4()
+        self._observation_configuration: tuple[str, str, Any, Any] | None = None
+        self._observation_demand_publisher: Any | None = None
+        self._observation_demand_sequence = 0
+        self._boot_id = robot_boot_id or uuid4()
 
     def start(self) -> None:
         if self._closed:
@@ -220,11 +304,13 @@ class RosAdapter:
         *,
         state_callback: StateCallback,
         feedback_callback: FeedbackCallback,
+        observation_health_callback: ObservationHealthCallback | None = None,
     ) -> None:
         if self._started:
             raise RosAdapterError("callbacks must be configured before the ROS adapter starts")
         self._state_callback = state_callback
         self._feedback_callback = feedback_callback
+        self._observation_health_callback = observation_health_callback
 
     def _spin(self) -> None:
         self._owner_thread_id = threading.get_ident()
@@ -239,6 +325,7 @@ class RosAdapter:
             self._executor = executor
             self._create_state_sources()
             self._create_heartbeat()
+            self._create_observation_bridge()
         except BaseException as exc:
             self._startup_error = exc
             self._running.clear()
@@ -360,6 +447,91 @@ class RosAdapter:
             raise RosAdapterError("safety heartbeat is already configured")
         self._heartbeat_configuration = (topic, period_ms, state_supplier)
 
+    def configure_observation(self, *, demand_topic: str, health_topic: str) -> None:
+        if self._started:
+            raise RosAdapterError(
+                "observation bridge must be configured before the ROS adapter starts"
+            )
+        if self._observation_configuration is not None:
+            raise RosAdapterError("observation bridge is already configured")
+        try:
+            from robot_observation_interfaces.msg import ObservationDemand, ObservationHealth
+        except ImportError as exc:
+            raise RosTypeError(
+                "robot_observation_interfaces is unavailable; build and source the ROS workspace"
+            ) from exc
+        self._observation_configuration = (
+            demand_topic,
+            health_topic,
+            ObservationDemand,
+            ObservationHealth,
+        )
+
+    def _create_observation_bridge(self) -> None:
+        if self._observation_configuration is None:
+            return
+        demand_topic, health_topic, demand_type, health_type = (
+            self._observation_configuration
+        )
+        demand_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        health_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        callback_group = ReentrantCallbackGroup()
+        self._callback_groups.append(callback_group)
+        self._observation_demand_publisher = self._require_node().create_publisher(
+            demand_type,
+            demand_topic,
+            demand_qos,
+            callback_group=callback_group,
+        )
+
+        def on_health(message: Any) -> None:
+            callback = self._observation_health_callback
+            if callback is None:
+                return
+            callback(
+                ObservationHealthSample(
+                    robot_id=str(message.robot_id),
+                    robot_boot_id=str(message.robot_boot_id),
+                    gateway_instance_id=str(message.gateway_instance_id),
+                    observation_session_id=str(message.observation_session_id),
+                    sensor_id=str(message.sensor_id),
+                    scene_version=str(message.scene_version),
+                    localization_epoch_id=str(message.localization_epoch_id),
+                    status=int(message.status),
+                    reason=int(message.reason),
+                    has_last_accepted_sequence=bool(
+                        message.has_last_accepted_sequence
+                    ),
+                    last_accepted_sequence=int(message.last_accepted_sequence),
+                    last_accepted_monotonic_ns=int(
+                        message.last_accepted_monotonic_ns
+                    ),
+                    capture_age_ms=float(message.capture_age_ms),
+                    ack_age_ms=float(message.ack_age_ms),
+                    drop_count=int(message.drop_count),
+                    heartbeat_sequence=int(message.heartbeat_sequence),
+                )
+            )
+
+        subscription = self._require_node().create_subscription(
+            health_type,
+            health_topic,
+            on_health,
+            health_qos,
+            callback_group=callback_group,
+        )
+        self._subscriptions.append(subscription)
+
     def _create_heartbeat(self) -> None:
         if self._heartbeat_configuration is None:
             return
@@ -409,11 +581,31 @@ class RosAdapter:
                 ros_type=command.ros_type,
                 values=params,
             )
+        values = params
+        if command.goal_transform == "navigate_to_pose_v1":
+            values = await self._run_on_ros_thread(
+                lambda: self._navigate_to_pose_values(params)
+            )
+        elif command.goal_transform == "nav2_spin_v2":
+            values = nav2_spin_goal_values(params)
         return await self._execute_action(
             command_id,
             ros_name=command.ros_name,
             ros_type=command.ros_type,
-            values=params,
+            values=values,
+        )
+
+    def _navigate_to_pose_values(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Translate the reviewed H-IDE map target into only a Nav2 PoseStamped."""
+        self._require_owner_thread()
+        goal_pose = params.get("goalPose")
+        if not isinstance(goal_pose, dict):
+            raise RosTypeError("navigation goalPose must be an object")
+        stamp = self._require_node().get_clock().now().to_msg()
+        return navigate_to_pose_goal_values(
+            goal_pose,
+            stamp_sec=int(stamp.sec),
+            stamp_nanosec=int(stamp.nanosec),
         )
 
     async def safe_stop(self, config: SafeStopConfig) -> ExecutionResult:
@@ -432,6 +624,40 @@ class RosAdapter:
             ros_type=config.ros_type,
             values=config.request,
         )
+
+    async def publish_observation_demand(
+        self,
+        *,
+        command_id: UUID,
+        active: bool,
+        observation_session_id: str,
+        sensor_id: str,
+        scene_version: str,
+        localization_epoch_id: str,
+    ) -> None:
+        self._require_started()
+
+        def publish() -> None:
+            self._require_owner_thread()
+            if self._observation_configuration is None:
+                raise RosAdapterError("observation bridge is not configured")
+            publisher = self._observation_demand_publisher
+            if publisher is None:
+                raise RosAdapterError("observation demand publisher is unavailable")
+            demand_type = self._observation_configuration[2]
+            message = demand_type()
+            message.emitted_at = self._require_node().get_clock().now().to_msg()
+            self._observation_demand_sequence += 1
+            message.demand_sequence = self._observation_demand_sequence
+            message.command_id = str(command_id)
+            message.active = active
+            message.observation_session_id = observation_session_id
+            message.sensor_id = sensor_id
+            message.scene_version = scene_version
+            message.localization_epoch_id = localization_epoch_id
+            publisher.publish(message)
+
+        await self._run_on_ros_thread(publish)
 
     async def _execute_service(
         self,
@@ -533,6 +759,7 @@ class RosAdapter:
                 )
             with self._goal_lock:
                 self._goals[command_id] = goal_handle
+            ros_goal_id = _goal_id_string(goal_handle)
             result_future = await self._run_on_ros_thread(
                 lambda: self._begin_action_result(command_id, goal_handle)
             )
@@ -541,7 +768,10 @@ class RosAdapter:
             return ExecutionResult(
                 succeeded=response.status == GoalStatus.STATUS_SUCCEEDED,
                 detail=f"action finished with status {status_name}",
-                result=_message_dict(response.result),
+                result={
+                    "rosGoalId": ros_goal_id,
+                    "actionResult": _message_dict(response.result),
+                },
             )
         except asyncio.CancelledError:
             self._request_cancel_without_waiting(command_id)
@@ -943,6 +1173,17 @@ def _set_exception_if_pending(future: asyncio.Future[Any], exception: Exception)
 def _message_dict(message: Any) -> dict[str, Any]:
     converted = message_to_ordereddict(message)
     return cast(dict[str, Any], json.loads(json.dumps(converted, allow_nan=False)))
+
+
+def _goal_id_string(goal_handle: Any) -> str | None:
+    goal_id = getattr(goal_handle, "goal_id", None)
+    raw = getattr(goal_id, "uuid", None)
+    if raw is None:
+        return None
+    try:
+        return str(UUID(bytes=bytes(raw)))
+    except (TypeError, ValueError):
+        return None
 
 
 def _extract_field(message: Any, field: str) -> Any:

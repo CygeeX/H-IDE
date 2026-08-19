@@ -4,7 +4,6 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from robot_agent.protocol import CommandStatus, CommandStatusPayload
-
 from tools.mock_bff import command_reached_terminal_state, parser
 
 

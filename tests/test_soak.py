@@ -15,11 +15,16 @@ from uuid import UUID, uuid4
 
 import pytest
 import rclpy
-import robot_agent.runtime as runtime_module
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.context import Context
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
+from std_msgs.msg import String
+from std_srvs.srv import Trigger
+from websockets.exceptions import ConnectionClosed
+
+import robot_agent.runtime as runtime_module
+from robot_agent.config import AgentConfig, ClientTransportConfig, TLSConfig
 from robot_agent.ledger import CommandLedger, CommandNotFound, CommandState
 from robot_agent.outbound import PriorityOutboundQueue
 from robot_agent.protocol import (
@@ -34,11 +39,6 @@ from robot_agent.ros_adapter import RosAdapter, heartbeat_qos
 from robot_agent.runtime import RobotAgentRuntime
 from robot_agent.session import ControlState
 from robot_agent.transport import AgentConnection, ClientTransport
-from std_msgs.msg import String
-from std_srvs.srv import Trigger
-from websockets.exceptions import ConnectionClosed
-
-from robot_agent.config import AgentConfig, ClientTransportConfig, TLSConfig
 
 
 class SoakRosGraph:

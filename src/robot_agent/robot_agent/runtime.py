@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import math
 import re
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
@@ -12,6 +14,11 @@ from uuid import UUID, uuid4
 from websockets.exceptions import ConnectionClosed
 
 from robot_agent.arbitration import ResourceArbiter
+from robot_agent.capabilities import (
+    CapabilityManifestWire,
+    RobotProfileWire,
+    build_capability_manifest,
+)
 from robot_agent.config import (
     AgentConfig,
     ClientTransportConfig,
@@ -25,7 +32,13 @@ from robot_agent.coordinator import (
     CommandCoordinator,
     ExecutionResult,
 )
-from robot_agent.ledger import CommandIdConflict, CommandLedger, CommandRecord
+from robot_agent.identity import read_robot_boot_id
+from robot_agent.ledger import TERMINAL_STATES, CommandIdConflict, CommandLedger, CommandRecord
+from robot_agent.observation import (
+    ObservationGuard,
+    ObservationHealthSample,
+    ObservationHealthStatus,
+)
 from robot_agent.outbound import (
     OutboundItem,
     OutboundPriority,
@@ -68,6 +81,7 @@ _RETENTION_CHECK_INTERVAL_SECONDS = 3600.0
 _PREEMPTION_TIMEOUT_SECONDS = 0.5
 _MAX_IN_FLIGHT_COMMANDS = 64
 _TaskResult = TypeVar("_TaskResult")
+LOGGER = logging.getLogger(__name__)
 
 
 class RuntimeErrorBase(RuntimeError):
@@ -94,9 +108,12 @@ class RosRuntimeAdapter(Protocol):
         *,
         state_callback: StateCallback,
         feedback_callback: FeedbackCallback,
+        observation_health_callback: Any | None = None,
     ) -> None: ...
 
     def configure_state_sources(self, sources: Mapping[str, StateSourceConfig]) -> None: ...
+
+    def configure_observation(self, *, demand_topic: str, health_topic: str) -> None: ...
 
     def configure_heartbeat(
         self,
@@ -121,6 +138,17 @@ class RosRuntimeAdapter(Protocol):
 
     async def safe_stop(self, config: SafeStopConfig) -> ExecutionResult: ...
 
+    async def publish_observation_demand(
+        self,
+        *,
+        command_id: UUID,
+        active: bool,
+        observation_session_id: str,
+        sensor_id: str,
+        scene_version: str,
+        localization_epoch_id: str,
+    ) -> None: ...
+
     async def close(self) -> None: ...
 
 
@@ -134,8 +162,16 @@ class RobotAgentRuntime:
         ros_adapter: RosRuntimeAdapter | None = None,
     ) -> None:
         self.config = config
-        self._boot_id = uuid4()
-        self._ros: RosRuntimeAdapter = ros_adapter or RosAdapter()
+        self._boot_id = read_robot_boot_id()
+        self._robot_profile: RobotProfileWire | None = None
+        self._capability_manifest: CapabilityManifestWire | None = None
+        if config.schema_version == "2":
+            self._robot_profile, self._capability_manifest = (
+                build_capability_manifest(config)
+            )
+        self._ros: RosRuntimeAdapter = ros_adapter or RosAdapter(
+            robot_boot_id=self._boot_id
+        )
         self._ledger = CommandLedger(config.storage.ledger_path)
         self._state = StateCoalescer(
             change_hz=config.state.change_hz,
@@ -145,12 +181,24 @@ class RobotAgentRuntime:
             lease_timeout=timedelta(milliseconds=config.session.lease_timeout_ms),
             safe_stop=self._perform_safe_stop,
         )
+        self._observation_guard = (
+            ObservationGuard(
+                config.observation,
+                robot_id=config.robot_id,
+                robot_boot_id=str(self._boot_id),
+                publisher=self._ros,
+            )
+            if config.observation.enabled
+            else None
+        )
         self._coordinator = CommandCoordinator(
             commands=config.commands,
             ledger=self._ledger,
             arbiter=ResourceArbiter(),
             session=self._session,
             executor=self._ros,
+            observation_guard=self._observation_guard,
+            status_callback=self._enqueue_command_status,
         )
         self._outbound: PriorityOutboundQueue | None = None
         self._event_loop: asyncio.AbstractEventLoop | None = None
@@ -175,10 +223,21 @@ class RobotAgentRuntime:
             at=initialized_at,
         )
         await self._prune_ledger(at=initialized_at)
-        self._ros.set_callbacks(
-            state_callback=self._on_ros_state,
-            feedback_callback=self._on_ros_feedback,
-        )
+        if self._observation_guard is None:
+            self._ros.set_callbacks(
+                state_callback=self._on_ros_state,
+                feedback_callback=self._on_ros_feedback,
+            )
+        else:
+            self._ros.set_callbacks(
+                state_callback=self._on_ros_state,
+                feedback_callback=self._on_ros_feedback,
+                observation_health_callback=self._on_observation_health,
+            )
+            self._ros.configure_observation(
+                demand_topic=self.config.observation.demand_topic,
+                health_topic=self.config.observation.health_topic,
+            )
         self._ros.configure_state_sources(self.config.state_sources)
         self._ros.configure_heartbeat(
             topic=self.config.safety.heartbeat_topic,
@@ -247,11 +306,25 @@ class RobotAgentRuntime:
             session_id=None,
             sent_at=_now(),
             payload=SessionHelloPayload(
-                agent_version="0.1.0",
+                agent_version=self.config.agent_version,
                 boot_id=self._boot_id,
                 supported_versions=["1.0"],
                 transport_mode=cast(Any, connection.mode),
-                capabilities_digest=self.config.capabilities_digest,
+                capabilities_digest=(
+                    self._capability_manifest.manifestDigest
+                    if self._capability_manifest is not None
+                    else self.config.capabilities_digest
+                ),
+                robot_profile=(
+                    self._robot_profile.model_dump(mode="json")
+                    if self._robot_profile is not None
+                    else None
+                ),
+                capability_manifest=(
+                    self._capability_manifest.model_dump(mode="json")
+                    if self._capability_manifest is not None
+                    else None
+                ),
             ),
         )
         await connection.send_text(serialize_wire_message(hello))
@@ -360,6 +433,7 @@ class RobotAgentRuntime:
             try:
                 message = self._parse(raw)
             except FrameValidationError as exc:
+                LOGGER.warning("rejecting invalid Robot Agent protocol message: %s", exc)
                 await self._enqueue_error(
                     "INVALID_MESSAGE",
                     str(exc),
@@ -431,6 +505,19 @@ class RobotAgentRuntime:
             return None
         if isinstance(message, CommandRequest):
             self._session.assert_can_command(session_id)
+            existing = await self._coordinator.record(message.payload.command_id)
+            if existing is not None:
+                # Route through register so a changed payload still raises the
+                # required command-id conflict. Exact duplicates return quickly.
+                task = asyncio.create_task(self._execute_and_report(message))
+                self._command_tasks.add(task)
+                task.add_done_callback(
+                    lambda completed: self._tracked_task_completed(
+                        completed, self._command_tasks
+                    )
+                )
+                await asyncio.sleep(0)
+                return None
             if len(self._command_tasks) >= _MAX_IN_FLIGHT_COMMANDS:
                 await self._enqueue_error(
                     "COMMAND_QUEUE_FULL",
@@ -452,18 +539,22 @@ class RobotAgentRuntime:
             try:
                 cancelled = await self._coordinator.cancel(
                     message.payload.command_id,
-                    reason=message.payload.reason,
+                    reason=f"remote_operator: {message.payload.reason}",
                     at=_now(),
                 )
             except CommandCancellationError as exc:
                 await self._perform_safe_stop(str(exc))
                 return None
             if not cancelled:
-                await self._enqueue_error(
-                    "COMMAND_NOT_ACTIVE",
-                    f"command {message.payload.command_id} is not active",
-                    related_message_id=message.message_id,
-                )
+                record = await self._coordinator.record(message.payload.command_id)
+                if record is not None and record.state in TERMINAL_STATES:
+                    await self._enqueue_command_status(record)
+                else:
+                    await self._enqueue_error(
+                        "COMMAND_NOT_ACTIVE",
+                        f"command {message.payload.command_id} is not active",
+                        related_message_id=message.message_id,
+                    )
             return None
         if isinstance(message, SessionGoodbye):
             return message.payload.reason
@@ -618,6 +709,7 @@ class RobotAgentRuntime:
         while True:
             await asyncio.sleep(0.05)
             self._ros.check_health()
+            await self._check_observation_watchdog()
             if await self._session.check_lease(_now()):
                 await self._enqueue_control_status()
 
@@ -718,6 +810,64 @@ class RobotAgentRuntime:
         if loop is None or loop.is_closed() or self._connection_session_id is None:
             return
         loop.call_soon_threadsafe(self._schedule_feedback, command_id, feedback)
+
+    def _on_observation_health(self, sample: ObservationHealthSample) -> None:
+        loop = self._event_loop
+        if loop is None or loop.is_closed() or self._observation_guard is None:
+            return
+        loop.call_soon_threadsafe(self._accept_observation_health, sample)
+
+    def _accept_observation_health(self, sample: ObservationHealthSample) -> None:
+        guard = self._observation_guard
+        loop = self._event_loop
+        if guard is None or loop is None:
+            return
+        previous = guard.current_health()
+        guard.update_health(sample, monotonic_now=loop.time())
+        current = guard.current_health()
+        if current is not sample or current is previous:
+            return
+        status_name = (
+            "USABLE"
+            if sample.status == ObservationHealthStatus.USABLE
+            else "DEGRADED"
+            if sample.status == ObservationHealthStatus.DEGRADED
+            else "NOT_USABLE"
+        )
+        observed_at = _now()
+        for path, value in (
+            ("observation.status", status_name),
+            ("observation.sensor_id", sample.sensor_id),
+            ("observation.session_id", sample.observation_session_id),
+            ("observation.scene_version", sample.scene_version),
+            ("observation.localization_epoch_id", sample.localization_epoch_id),
+            (
+                "observation.ack_age_ms",
+                sample.ack_age_ms if math.isfinite(sample.ack_age_ms) else None,
+            ),
+            (
+                "observation.capture_age_ms",
+                sample.capture_age_ms if math.isfinite(sample.capture_age_ms) else None,
+            ),
+            ("observation.drop_count", sample.drop_count),
+        ):
+            self._state.update(path, value, observed_at=observed_at)
+
+    async def _check_observation_watchdog(self) -> None:
+        guard = self._observation_guard
+        loop = self._event_loop
+        if guard is None or loop is None:
+            return
+        for binding, detail in guard.stale_bindings(monotonic_now=loop.time()):
+            reason = f"observation_watchdog: {detail}"
+            try:
+                await self._coordinator.cancel(
+                    binding.command_id,
+                    reason=reason,
+                    at=_now(),
+                )
+            except CommandCancellationError as exc:
+                await self._perform_safe_stop(str(exc))
 
     def _schedule_feedback(self, command_id: UUID, feedback: dict[str, Any]) -> None:
         session_id = self._connection_session_id

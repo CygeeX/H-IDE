@@ -49,6 +49,8 @@ class SessionHelloPayload(StrictModel):
     supported_versions: list[Literal["1.0"]] = Field(min_length=1)
     transport_mode: Literal["client", "server"]
     capabilities_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    robot_profile: dict[str, JsonValue] | None = None
+    capability_manifest: dict[str, JsonValue] | None = None
 
 
 class SessionHello(Envelope):

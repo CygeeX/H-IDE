@@ -17,16 +17,16 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.context import Context
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from std_msgs.msg import String
+from std_srvs.srv import SetBool, Trigger
+
 from robot_agent.arbitration import ResourceArbiter
+from robot_agent.config import CommandConfig, SafeStopConfig, StateSourceConfig
 from robot_agent.coordinator import CommandCancellationError, CommandCoordinator
 from robot_agent.ledger import CommandLedger, CommandState
 from robot_agent.protocol import CommandRequest
 from robot_agent.ros_adapter import RosAdapter, heartbeat_qos
 from robot_agent.session import ControlState, SessionController, SessionStateError
-from std_msgs.msg import String
-from std_srvs.srv import SetBool, Trigger
-
-from robot_agent.config import CommandConfig, SafeStopConfig, StateSourceConfig
 
 
 def command_config(
@@ -279,7 +279,11 @@ async def test_ros_adapter_service_action_topic_heartbeat_and_cancel(
             adapter.execute(action_id, action, {"order": 7}), timeout=4
         )
         assert action_result.succeeded is True
-        assert action_result.result == {"sequence": [0, 1, 1, 2, 3, 5, 8]}
+        assert action_result.result is not None
+        assert action_result.result["actionResult"] == {
+            "sequence": [0, 1, 1, 2, 3, 5, 8]
+        }
+        assert action_result.result["rosGoalId"] is not None
         assert any(item[0] == action_id for item in feedback)
 
         feedback_event.clear()
@@ -458,7 +462,8 @@ async def test_service_timeout_latches_safe_hold_while_ros_side_effect_continues
             with pytest.raises(CommandCancellationError) as failed:
                 await coordinator.submit(request, at=issued_at)
 
-            assert failed.value.record.state is CommandState.TIMED_OUT
+            assert failed.value.record.state is CommandState.FAILED
+            assert "CANCEL_NOT_ACKNOWLEDGED" in failed.value.record.detail
             assert graph.slow_service_started.is_set()
             assert graph.slow_service_completed.is_set() is False
             assert session.state is ControlState.SAFE_HOLD

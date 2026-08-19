@@ -9,6 +9,8 @@ from uuid import uuid4
 
 import pytest
 from action_msgs.msg import GoalStatus
+
+from robot_agent.config import CommandConfig, StateSourceConfig
 from robot_agent.ros_adapter import (
     RosAdapter,
     RosAdapterError,
@@ -21,8 +23,6 @@ from robot_agent.ros_adapter import (
     _wait_for_ready,
     build_message,
 )
-
-from robot_agent.config import CommandConfig, StateSourceConfig
 
 
 class ImmediateFuture:

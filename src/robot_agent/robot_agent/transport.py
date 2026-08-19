@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import hashlib
 import hmac
+import logging
 import ssl
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -19,6 +20,7 @@ from robot_agent.config import ClientTransportConfig, ServerTransportConfig, TLS
 from robot_agent.protocol import MAX_TEXT_FRAME_BYTES
 
 SUBPROTOCOL: Subprotocol = Subprotocol("robot-agent.v1")
+LOGGER = logging.getLogger(__name__)
 
 
 class TransportError(RuntimeError):
@@ -278,6 +280,16 @@ class ClientTransport:
             except Exception as exc:
                 if on_error is not None:
                     await on_error(exc)
+                else:
+                    # A client handler failure otherwise looks exactly like a
+                    # normal reconnect from the workstation side and makes
+                    # protocol/ROS integration faults impossible to diagnose.
+                    LOGGER.warning(
+                        "Robot Agent client connection ended with %s: %s",
+                        type(exc).__name__,
+                        exc,
+                        exc_info=LOGGER.isEnabledFor(logging.DEBUG),
+                    )
             finally:
                 if connection is not None and not connection.closed:
                     await connection.close()

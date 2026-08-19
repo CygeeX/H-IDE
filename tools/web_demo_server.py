@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import math
 import os
 import signal
 import sys
@@ -21,7 +22,16 @@ from typing import Any
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
+import yaml
 from pydantic import JsonValue
+from websockets.asyncio.server import ServerConnection, serve
+from websockets.datastructures import Headers
+from websockets.exceptions import ConnectionClosed
+from websockets.http11 import Request, Response
+from websockets.typing import Origin, Subprotocol
+
+from robot_agent.config import AgentConfig, ClientTransportConfig
+from robot_agent.config import load_config as load_agent_config
 from robot_agent.protocol import (
     CommandCancel,
     CommandCancelPayload,
@@ -47,12 +57,20 @@ from robot_agent.protocol import (
     serialize_wire_message,
 )
 from robot_agent.transport import SUBPROTOCOL
-from websockets.asyncio.server import ServerConnection, serve
-from websockets.exceptions import ConnectionClosed
-from websockets.http11 import Request, Response
-from websockets.typing import Origin, Subprotocol
-
-from robot_agent.config import AgentConfig, ClientTransportConfig, load_config
+from robot_observation.v1 import observation_pb2 as observation_pb
+from robot_observation_gateway.config import (
+    GatewayConfig as ObservationGatewayConfig,
+)
+from robot_observation_gateway.config import (
+    load_config as load_observation_config,
+)
+from robot_observation_gateway.mock_workstation import (
+    MockObservationServicer,
+    MockWorkstationServer,
+    WorkstationBehavior,
+)
+from robot_observation_gateway.runtime import GatewayRuntime
+from robot_observation_gateway.synthetic_source import SyntheticObservationSource
 
 UI_SUBPROTOCOL: Subprotocol = Subprotocol("robot-agent-demo.v1")
 MAX_UI_CLIENTS = 8
@@ -114,11 +132,197 @@ class DemoActionError(RuntimeError):
         self.code = code
 
 
+class ObservationDemoStack:
+    """Local workstation peer plus a real or synthetic observation gateway."""
+
+    def __init__(
+        self,
+        config: ObservationGatewayConfig,
+        *,
+        source_mode: str,
+        port: int,
+    ) -> None:
+        self._config = config
+        self.source_mode = source_mode
+        self._port = port
+        self.behavior = WorkstationBehavior()
+        self.workstation = MockWorkstationServer(
+            bind=f"127.0.0.1:{port}",
+            behavior=self.behavior,
+        )
+        self.runtime: GatewayRuntime | None = None
+        self._runtime_task: asyncio.Task[None] | None = None
+        self.synthetic_source: SyntheticObservationSource | None = None
+
+    async def start(self) -> None:
+        if self._config.tls.enabled:
+            raise DemoActionError(
+                "INVALID_OBSERVATION_CONFIG",
+                "the local visual workstation requires the plaintext-loopback config",
+            )
+        await self.workstation.start()
+        try:
+            transport = self._config.transport.model_copy(
+                update={"target": f"127.0.0.1:{self.workstation.port}"}
+            )
+            config = self._config.model_copy(update={"transport": transport})
+            if self.source_mode == "synthetic":
+                source = SyntheticObservationSource(config, width=640, height=480, fps=30.0)
+                self.synthetic_source = source
+                runtime = GatewayRuntime(
+                    config,
+                    source_factory=lambda _drops, _health: source,
+                )
+            elif self.source_mode == "realsense":
+                runtime = GatewayRuntime(config)
+            else:
+                raise DemoActionError(
+                    "INVALID_OBSERVATION_SOURCE",
+                    f"unsupported observation source {self.source_mode!r}",
+                )
+            self.runtime = runtime
+            self._runtime_task = asyncio.create_task(
+                runtime.run(),
+                name="visual-observation-gateway",
+            )
+        except BaseException:
+            await self.workstation.stop()
+            raise
+
+    async def stop(self) -> None:
+        runtime = self.runtime
+        task = self._runtime_task
+        if runtime is not None:
+            await runtime.stop()
+        if task is not None:
+            try:
+                await asyncio.wait_for(task, timeout=5.0)
+            except asyncio.TimeoutError:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            except Exception:
+                pass
+        await self.workstation.stop()
+
+    def snapshot(self) -> dict[str, Any]:
+        received = self.workstation.servicer.state.snapshot()
+        gateway_health = self.runtime.health() if self.runtime is not None else None
+        runtime_error = ""
+        if self._runtime_task is not None and self._runtime_task.done():
+            with contextlib.suppress(asyncio.CancelledError):
+                error = self._runtime_task.exception()
+                if error is not None:
+                    runtime_error = str(error)
+        health = {
+            "status": gateway_health.status.name if gateway_health is not None else "OFFLINE",
+            "reason": gateway_health.reason.name if gateway_health is not None else "NOT_STARTED",
+            "ackAgeMs": _finite(gateway_health.ack_age_ms) if gateway_health is not None else None,
+            "captureAgeMs": (
+                _finite(gateway_health.capture_age_ms) if gateway_health is not None else None
+            ),
+            "dropCount": gateway_health.drop_count if gateway_health is not None else 0,
+            "lastAcceptedSequence": (
+                gateway_health.last_accepted_sequence if gateway_health is not None else None
+            ),
+        }
+        return {
+            "enabled": True,
+            "source": self.source_mode,
+            "connected": received.connected,
+            "robotId": received.robot_id,
+            "gatewayInstanceId": received.gateway_instance_id,
+            "observationSessionId": received.observation_session_id,
+            "sceneVersion": received.scene_version,
+            "robotBootId": received.robot_boot_id,
+            "localizationEpochId": received.localization_epoch_id,
+            "acceptedFrames": received.accepted_frames,
+            "rejectedFrames": received.rejected_frames,
+            "lastSequence": received.last_sequence,
+            "sequenceGap": received.last_sequence_gap,
+            "ingestAgeMs": _finite(received.last_capture_age_ms),
+            "serverProcessingMs": _finite(received.last_server_processing_ms),
+            "frame": {key: _finite(value) for key, value in received.last_frame.items()},
+            "telemetry": {
+                key: _finite(value) for key, value in received.latest_telemetry.items()
+            },
+            "health": health,
+            "hasRgb": received.last_rgb_jpeg is not None,
+            "hasDepth": received.last_depth_png is not None,
+            "faults": {
+                "acksPaused": self.behavior.pause_acks,
+                "cameraPaused": bool(
+                    self.synthetic_source is not None and self.synthetic_source.paused
+                ),
+            },
+            "lastError": runtime_error or received.last_error,
+        }
+
+    def image(self, kind: str) -> tuple[str, bytes] | None:
+        snapshot = self.workstation.servicer.state.snapshot()
+        if kind == "rgb" and snapshot.last_rgb_jpeg is not None:
+            return "image/jpeg", snapshot.last_rgb_jpeg
+        if kind == "depth" and snapshot.last_depth_png is not None:
+            return "image/png", snapshot.last_depth_png
+        return None
+
+    async def action(self, request: dict[str, Any]) -> None:
+        action = request.get("action")
+        servicer: MockObservationServicer = self.workstation.servicer
+        if action == "observation.ack_pause":
+            paused = request.get("paused")
+            if not isinstance(paused, bool):
+                raise DemoActionError("INVALID_UI_ACTION", "paused must be boolean")
+            self.behavior.pause_acks = paused
+            return
+        if action == "observation.reject_next":
+            self.behavior.reject_next_reason = observation_pb.ACK_REJECT_REASON_BAD_CHECKSUM
+            return
+        if action == "observation.session_set":
+            enabled = request.get("enabled")
+            if not isinstance(enabled, bool):
+                raise DemoActionError("INVALID_UI_ACTION", "enabled must be boolean")
+            changed = (
+                await servicer.start_observation()
+                if enabled
+                else await servicer.stop_observation(reason="visual dashboard request")
+            )
+            if not changed:
+                raise DemoActionError(
+                    "OBSERVATION_STATE_CONFLICT",
+                    "observation session is already in the requested state or disconnected",
+                )
+            return
+        if action == "observation.camera_pause":
+            paused = request.get("paused")
+            if not isinstance(paused, bool):
+                raise DemoActionError("INVALID_UI_ACTION", "paused must be boolean")
+            if self.synthetic_source is None:
+                raise DemoActionError(
+                    "REAL_CAMERA_FAULT_DISABLED",
+                    "the dashboard will not disconnect a real USB camera; use synthetic mode",
+                )
+            self.synthetic_source.set_paused(paused)
+            return
+        raise DemoActionError("INVALID_UI_ACTION", f"unsupported observation action {action!r}")
+
+
+def _finite(value: Any) -> Any:
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
 class DashboardBridge:
     """Translate bounded dashboard actions into the strict Robot Agent protocol."""
 
-    def __init__(self, config: DemoServerConfig) -> None:
+    def __init__(
+        self,
+        config: DemoServerConfig,
+        *,
+        observation: ObservationDemoStack | None = None,
+    ) -> None:
         self.config = config
+        self.observation = observation
         self._agent: ServerConnection | None = None
         self._agent_send_lock = asyncio.Lock()
         self._ui_clients: dict[ServerConnection, asyncio.Lock] = {}
@@ -137,6 +341,7 @@ class DashboardBridge:
         self._messages_to_agent = 0
         self._last_agent_message_at: str | None = None
         self._started_at = iso_now()
+        self._snapshot_task: asyncio.Task[None] | None = None
         self._record_event(
             direction="system",
             kind="demo.ready",
@@ -179,6 +384,11 @@ class DashboardBridge:
                 "ui_clients": len(self._ui_clients),
                 "started_at": self._started_at,
             },
+            "observation": (
+                self.observation.snapshot()
+                if self.observation is not None
+                else {"enabled": False, "health": {"status": "OFFLINE"}}
+            ),
         }
 
     def _record_event(
@@ -250,6 +460,11 @@ class DashboardBridge:
             await peer.close(code=1013, reason="dashboard client limit reached")
             return
         self._ui_clients[peer] = asyncio.Lock()
+        if self._snapshot_task is None or self._snapshot_task.done():
+            self._snapshot_task = asyncio.create_task(
+                self._periodic_snapshots(),
+                name="visual-dashboard-snapshots",
+            )
         self._record_event(
             direction="system",
             kind="ui.connected",
@@ -289,7 +504,19 @@ class DashboardBridge:
                     await self._send_ui_error(peer, code=exc.code, message=str(exc))
         finally:
             self._ui_clients.pop(peer, None)
+            if not self._ui_clients and self._snapshot_task is not None:
+                self._snapshot_task.cancel()
+                await asyncio.gather(self._snapshot_task, return_exceptions=True)
+                self._snapshot_task = None
             await self.broadcast_snapshot()
+
+    async def _periodic_snapshots(self) -> None:
+        try:
+            while self._ui_clients:
+                await asyncio.sleep(0.2)
+                await self.broadcast_snapshot()
+        except asyncio.CancelledError:
+            raise
 
     async def _handle_ui_action(self, request: dict[str, Any]) -> None:
         action = request.get("action")
@@ -330,6 +557,20 @@ class DashboardBridge:
                 title="事件记录已清空",
                 detail="新的协议事件将继续显示",
                 level="info",
+            )
+        elif action.startswith("observation."):
+            if self.observation is None:
+                raise DemoActionError(
+                    "OBSERVATION_DISABLED",
+                    "start the visual server with --observation-source",
+                )
+            await self.observation.action(request)
+            self._record_event(
+                direction="observation",
+                kind=action,
+                title=f"观测故障注入 · {action.removeprefix('observation.')}",
+                detail=json.dumps(request, ensure_ascii=False, separators=(",", ":")),
+                level="warning",
             )
         else:
             raise DemoActionError("INVALID_UI_ACTION", f"unsupported dashboard action {action!r}")
@@ -453,10 +694,60 @@ class DashboardBridge:
                 raise DemoActionError("INVALID_COMMAND", "task.execute accepts params.order only")
             command_params = {"order": order}
             ttl_ms = 10_000
+        elif kind == "navigation.navigate_to_pose":
+            if not isinstance(params, dict):
+                raise DemoActionError(
+                    "INVALID_COMMAND",
+                    "navigation.navigate_to_pose requires an object in params",
+                )
+            goal_pose = params.get("goalPose")
+            if not isinstance(goal_pose, dict):
+                raise DemoActionError(
+                    "INVALID_COMMAND",
+                    "navigation.navigate_to_pose requires params.goalPose",
+                )
+            observation = self.observation.snapshot() if self.observation is not None else {}
+            health = observation.get("health", {})
+            observation_session_id = observation.get("observationSessionId")
+            robot_boot_id = observation.get("robotBootId")
+            localization_epoch_id = observation.get("localizationEpochId")
+            if (
+                health.get("status") != "USABLE"
+                or not isinstance(observation_session_id, str)
+                or not observation_session_id
+                or not isinstance(robot_boot_id, str)
+                or not robot_boot_id
+                or not isinstance(localization_epoch_id, str)
+                or not localization_epoch_id
+            ):
+                raise DemoActionError(
+                    "OBSERVATION_NOT_READY",
+                    "navigation requires a USABLE observation/boot/epoch binding",
+                )
+            if set(params) != {"goalPose"}:
+                raise DemoActionError(
+                    "INVALID_COMMAND",
+                    "navigation.navigate_to_pose accepts params.goalPose only in this dashboard",
+                )
+            command_params = {
+                "payloadType": "visual_resolution",
+                "goalPose": goal_pose,
+                "goalPurpose": "approach",
+                "missionId": f"demo-mission-{uuid4().hex}",
+                "stageId": "demo-stage-1",
+                "visualResolutionId": f"demo-resolution-{uuid4().hex}",
+                "observationSessionId": observation_session_id,
+                "robotBootId": robot_boot_id,
+                "localizationEpochId": localization_epoch_id,
+                "maximumSpeedMps": 0.3,
+                "sceneRef": None,
+            }
+            ttl_ms = 30_000
         else:
             raise DemoActionError(
                 "INVALID_COMMAND",
-                "the visual demo permits power.enable and task.execute only",
+                "the visual demo permits power.enable, task.execute, and "
+                "navigation.navigate_to_pose",
             )
 
         command_id = uuid4()
@@ -685,6 +976,11 @@ class DashboardBridge:
 
     async def close(self) -> None:
         await self._set_lease_enabled(False)
+        snapshot_task = self._snapshot_task
+        self._snapshot_task = None
+        if snapshot_task is not None:
+            snapshot_task.cancel()
+            await asyncio.gather(snapshot_task, return_exceptions=True)
         agent = self._agent
         if agent is not None:
             await agent.close(code=1001, reason="visual demo server stopping")
@@ -761,6 +1057,22 @@ def _secure_response(
     return response
 
 
+def _secure_binary_response(
+    status: HTTPStatus,
+    body: bytes,
+    *,
+    content_type: str,
+) -> Response:
+    headers = Headers()
+    headers["Content-Type"] = content_type
+    headers["Content-Length"] = str(len(body))
+    headers["Cache-Control"] = "no-store"
+    headers["X-Content-Type-Options"] = "nosniff"
+    headers["X-Frame-Options"] = "DENY"
+    headers["Referrer-Policy"] = "no-referrer"
+    return Response(int(status), status.phrase, headers, body)
+
+
 def create_server(
     bridge: DashboardBridge,
     config: DemoServerConfig,
@@ -775,7 +1087,11 @@ def create_server(
         path = urlsplit(request.path).path
         if path == "/healthz":
             body = json.dumps(
-                {"agent_connected": bridge.agent_connected, "status": "ok"},
+                {
+                    "agent_connected": bridge.agent_connected,
+                    "observation_enabled": bridge.observation is not None,
+                    "status": "ok",
+                },
                 separators=(",", ":"),
             ).encode("utf-8")
             return _secure_response(
@@ -783,6 +1099,22 @@ def create_server(
                 HTTPStatus.OK,
                 body,
                 content_type="application/json; charset=utf-8",
+            )
+        if path in {"/api/observation/rgb.jpg", "/api/observation/depth.png"}:
+            kind = "rgb" if path.endswith("rgb.jpg") else "depth"
+            image = bridge.observation.image(kind) if bridge.observation is not None else None
+            if image is None:
+                return _secure_response(
+                    connection,
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    b"observation image unavailable\n",
+                    content_type="text/plain; charset=utf-8",
+                )
+            content_type, body = image
+            return _secure_binary_response(
+                HTTPStatus.OK,
+                body,
+                content_type=content_type,
             )
         asset = assets.get(path)
         if asset is None:
@@ -841,7 +1173,7 @@ def _allowed_origins(config: DemoServerConfig) -> list[Origin | None]:
 
 def _load_agent_config(path: Path) -> tuple[str, AgentConfig]:
     resolved = str(path.resolve())
-    return resolved, load_config(resolved)
+    return resolved, load_agent_config(resolved)
 
 
 async def _launch_local_stack(args: argparse.Namespace) -> list[asyncio.subprocess.Process]:
@@ -870,13 +1202,26 @@ async def _launch_local_stack(args: argparse.Namespace) -> list[asyncio.subproce
         )
     endpoint = urlsplit(agent_config.transport.uri)
     endpoint_port = endpoint.port or (443 if endpoint.scheme == "wss" else 80)
-    if endpoint.hostname not in {"127.0.0.1", "localhost", "::1"} or (
-        endpoint_port != args.port or endpoint.path != "/agent"
-    ):
+    if endpoint.hostname not in {"127.0.0.1", "localhost", "::1"} or endpoint.path != "/agent":
         raise DemoActionError(
             "INVALID_DEMO_CONFIG",
-            "Agent config must target the demo server loopback port and /agent path",
+            "Agent config must target a loopback /agent endpoint",
         )
+    if endpoint_port != args.port:
+        environment_config = agent_config.model_copy(
+            update={
+                "transport": agent_config.transport.model_copy(
+                    update={"uri": f"ws://127.0.0.1:{args.port}/agent"}
+                )
+            }
+        )
+        generated_config = workspace / ".local" / "web-demo" / "robot_agent.yaml"
+        generated_config.parent.mkdir(parents=True, exist_ok=True)
+        generated_config.write_text(
+            yaml.safe_dump(environment_config.model_dump(mode="json"), sort_keys=False),
+            encoding="utf-8",
+        )
+        agent_config_path = str(generated_config)
 
     environment = os.environ.copy()
     environment.pop("CYCLONEDDS_URI", None)
@@ -948,22 +1293,44 @@ async def run(args: argparse.Namespace) -> None:
         lease_interval_ms=args.lease_interval_ms,
         lease_timeout_ms=args.lease_timeout_ms,
     )
-    bridge = DashboardBridge(config)
+    observation: ObservationDemoStack | None = None
+    bridge: DashboardBridge | None = None
     processes: list[asyncio.subprocess.Process] = []
-    async with create_server(bridge, config, load_assets()):
-        display_host = f"[{args.host}]" if ":" in args.host else args.host
-        url = f"http://{display_host}:{args.port}/"
-        print(f"Robot Agent visual demo: {url}", flush=True)
-        try:
+    try:
+        if args.observation_source != "off":
+            observation_config = await asyncio.to_thread(
+                load_observation_config,
+                args.observation_config,
+            )
+            observation = ObservationDemoStack(
+                observation_config,
+                source_mode=args.observation_source,
+                port=args.observation_port,
+            )
+            await observation.start()
+        bridge = DashboardBridge(config, observation=observation)
+        async with create_server(bridge, config, load_assets()):
+            display_host = f"[{args.host}]" if ":" in args.host else args.host
+            url = f"http://{display_host}:{args.port}/"
+            print(f"Robot Agent visual demo: {url}", flush=True)
+            if observation is not None:
+                print(
+                    f"RGB-D observation demo: {args.observation_source} source on "
+                    f"127.0.0.1:{observation.workstation.port}",
+                    flush=True,
+                )
             if args.launch_stack:
                 processes = await _launch_local_stack(args)
                 print("Mock ROS graph and Robot Agent started", flush=True)
             if args.open_browser:
                 await asyncio.to_thread(webbrowser.open, url)
             await asyncio.Future()
-        finally:
+    finally:
+        if bridge is not None:
             await bridge.close()
-            await _stop_local_stack(processes)
+        await _stop_local_stack(processes)
+        if observation is not None:
+            await observation.stop()
 
 
 def parser() -> argparse.ArgumentParser:
@@ -989,6 +1356,25 @@ def parser() -> argparse.ArgumentParser:
         "--agent-config",
         type=Path,
         default=Path("src/robot_agent/config/robot_agent.local.yaml"),
+    )
+    result.add_argument(
+        "--observation-source",
+        choices=("off", "synthetic", "realsense"),
+        default="synthetic",
+        help="RGB-D source shown in the dashboard (default: synthetic)",
+    )
+    result.add_argument(
+        "--observation-config",
+        type=Path,
+        default=Path(
+            "src/robot_observation_gateway/config/robot_observation_gateway.local.yaml"
+        ),
+    )
+    result.add_argument(
+        "--observation-port",
+        type=int,
+        default=50051,
+        help="loopback mock workstation gRPC port (default: 50051)",
     )
     result.add_argument("--open-browser", action="store_true")
     return result

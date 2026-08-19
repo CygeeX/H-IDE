@@ -13,6 +13,9 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
+from websockets.asyncio.client import connect
+from websockets.asyncio.server import ServerConnection, serve
+
 from robot_agent.protocol import (
     CommandRequest,
     CommandRequestPayload,
@@ -28,8 +31,6 @@ from robot_agent.protocol import (
     serialize_wire_message,
 )
 from robot_agent.transport import SUBPROTOCOL
-from websockets.asyncio.client import connect
-from websockets.asyncio.server import ServerConnection, serve
 
 TERMINAL_COMMAND_STATES = frozenset(
     {
