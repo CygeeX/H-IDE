@@ -174,6 +174,67 @@ def test_new_transaction_requires_new_generation_sequence_and_unique_uuid() -> N
     assert state.snapshot.stop_epoch == 2
 
 
+def test_explicit_bridge_restart_allows_only_source_sequence_reset() -> None:
+    state = NormalStopState(stop_id_factory=factory(STOP_ID_1, STOP_ID_2))
+    first = state.begin(control_generation=10, gait_source_sequence=100)
+    old_identity = first.identity
+    assert old_identity is not None
+    state.acknowledge_stationary(old_identity)
+    state.confirm_plant(old_identity)
+    state.confirm_driver(old_identity)
+
+    second = state.begin(
+        control_generation=11,
+        gait_source_sequence=2,
+        allow_source_sequence_reset=True,
+    )
+    assert second.identity == NormalStopIdentity(STOP_ID_2, 11, 2, 2)
+
+    with pytest.raises(NormalStopIdentityError, match="does not match"):
+        state.acknowledge_stationary(old_identity)
+    assert state.snapshot is second
+
+
+def test_source_sequence_reset_flag_has_a_strict_completed_generation_boundary() -> None:
+    state = NormalStopState(stop_id_factory=factory(STOP_ID_1, STOP_ID_2))
+    with pytest.raises(NormalStopTransitionError, match="confirmed normal stop"):
+        state.begin(
+            control_generation=10,
+            gait_source_sequence=100,
+            allow_source_sequence_reset=True,
+        )
+    with pytest.raises(ValueError, match="must be a boolean"):
+        state.begin(
+            control_generation=10,
+            gait_source_sequence=100,
+            allow_source_sequence_reset=1,  # type: ignore[arg-type]
+        )
+
+    braking = state.begin(control_generation=10, gait_source_sequence=100)
+    identity = braking.identity
+    assert identity is not None
+    with pytest.raises(NormalStopTransitionError, match="confirmed normal stop"):
+        state.begin(
+            control_generation=11,
+            gait_source_sequence=1,
+            allow_source_sequence_reset=True,
+        )
+    state.acknowledge_stationary(identity)
+    state.confirm_plant(identity)
+    confirmed = state.confirm_driver(identity)
+    with pytest.raises(NormalStopTransitionError, match="newer control generation"):
+        state.begin(
+            control_generation=10,
+            gait_source_sequence=100,
+            allow_source_sequence_reset=True,
+        )
+    assert state.snapshot is confirmed
+
+    with pytest.raises(NormalStopTransitionError, match="newer gait source sequence"):
+        state.begin(control_generation=11, gait_source_sequence=2)
+    assert state.snapshot is confirmed
+
+
 def test_failure_is_terminal_and_first_failure_snapshot_is_idempotent() -> None:
     state = NormalStopState(stop_id_factory=factory(STOP_ID_1, STOP_ID_2))
     braking = state.begin(control_generation=10, gait_source_sequence=20)

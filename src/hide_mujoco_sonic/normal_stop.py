@@ -159,8 +159,18 @@ class NormalStopState:
         *,
         control_generation: int,
         gait_source_sequence: int,
+        allow_source_sequence_reset: bool = False,
     ) -> NormalStopSnapshot:
-        """Start braking, or return the exact already-active transaction."""
+        """Start braking, or return the exact already-active transaction.
+
+        A bridge process restart may reset its source sequence while advancing
+        the persisted control generation.  The caller must prove that restart
+        separately, then opt in here.  The exception never relaxes generation,
+        UUID, epoch, active-transaction, or failure monotonicity.
+        """
+
+        if not isinstance(allow_source_sequence_reset, bool):
+            raise ValueError("allow_source_sequence_reset must be a boolean")
 
         generation = _integer(
             control_generation,
@@ -178,6 +188,16 @@ class NormalStopState:
                 current.control_generation == generation
                 and current.gait_source_sequence == source_sequence
             )
+            if allow_source_sequence_reset:
+                if current.phase != "DRIVER_CONFIRMED":
+                    raise NormalStopTransitionError(
+                        "source sequence reset requires a confirmed normal stop"
+                    )
+                assert current.control_generation is not None
+                if generation <= current.control_generation:
+                    raise NormalStopTransitionError(
+                        "source sequence reset requires a newer control generation"
+                    )
             if current.phase == "FAILED":
                 raise NormalStopTransitionError(
                     "normal-stop coordinator is terminal after failure"
@@ -197,7 +217,10 @@ class NormalStopState:
                     raise NormalStopTransitionError(
                         "a new normal stop requires a newer control generation"
                     )
-                if source_sequence <= current.gait_source_sequence:
+                if (
+                    source_sequence <= current.gait_source_sequence
+                    and not allow_source_sequence_reset
+                ):
                     raise NormalStopTransitionError(
                         "a new normal stop requires a newer gait source sequence"
                     )
