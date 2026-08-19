@@ -222,7 +222,7 @@ class SimulationRuntime:
             self._event_sink = sink
 
     @staticmethod
-    def _office_obstacles():
+    def _deterministic_office_obstacles():
         from .models import SimulationObstacle
 
         return [
@@ -241,7 +241,7 @@ class SimulationRuntime:
         ]
 
     @staticmethod
-    def _office_landmarks():
+    def _deterministic_office_landmarks():
         return [
             SimulationLandmark(
                 landmarkId="kitchen",
@@ -278,6 +278,19 @@ class SimulationRuntime:
 
     @staticmethod
     def _result(session: SimulationSession, snapshot: SimulationSnapshot) -> dict[str, Any]:
+        # Historical deterministic fixtures may keep their authored semantic
+        # map. A product MuJoCo session must not project those coordinates into
+        # the UI: doing so would let a label such as "厨房" bypass VLM grounding.
+        # Nav2/Robot Agent command truth and the observed robot trajectory stay
+        # visible, while semantic landmarks/obstacles and manufactured
+        # waypoints remain absent.
+        if (
+            session.mode.value == "qwen"
+            and session.backend is SimulationBackend.MUJOCO_SONIC
+        ):
+            snapshot = snapshot.model_copy(
+                update={"obstacles": [], "landmarks": [], "plannedWaypoints": []}
+            )
         result = {
             "session": session.model_dump(mode="json"),
             "snapshot": snapshot.model_dump(mode="json"),
@@ -426,13 +439,14 @@ class SimulationRuntime:
             createdAt=now,
             updatedAt=now,
         )
+        live_backend = request.backend is SimulationBackend.MUJOCO_SONIC
         snapshot = SimulationSnapshot(
             sessionId=session_id,
             status=SimulationStatus.CREATED,
             pose=start_pose,
             trajectory=[start_pose],
-            obstacles=self._office_obstacles(),
-            landmarks=self._office_landmarks(),
+            obstacles=([] if live_backend else self._deterministic_office_obstacles()),
+            landmarks=([] if live_backend else self._deterministic_office_landmarks()),
             activeMissionId=request.missionId,
             updatedAt=now,
         )

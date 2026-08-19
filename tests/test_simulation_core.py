@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
+from pydantic import ValidationError
 
 from packages.simulation_core import SimulationConflict, SimulationRuntime
 
@@ -213,6 +214,45 @@ def test_mujoco_session_uses_robot_agent_current_pose_as_start_authority() -> No
     assert created["snapshot"]["pose"]["x"] == pytest.approx(1.25)
     assert created["snapshot"]["pose"]["y"] == pytest.approx(-0.4)
     assert created["session"]["metadata"]["startPose"]["x"] == pytest.approx(1.25)
+    runtime.close()
+
+
+def test_mujoco_product_snapshot_has_no_semantic_map_or_label_navigation_shortcut() -> None:
+    runtime = SimulationRuntime(mujoco_client=_MujocoClientStub())
+    dispatched: list[object] = []
+    runtime.set_identity_provider(
+        lambda _robot_id: {
+            "robotBootId": "sim-boot-vlm",
+            "localizationEpochId": "sim-map-vlm",
+            "currentPose": {
+                "frameId": "map",
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.77,
+                "yaw": 0.0,
+                "observedAt": "2026-08-19T00:00:00Z",
+            },
+        }
+    )
+    runtime.set_navigation_dispatcher(
+        lambda session, request: dispatched.append((session, request)) or {}
+    )
+    created = runtime.create({"backend": "mujoco_sonic", "robotId": "g1-sim"})
+    session_id = created["session"]["sessionId"]
+    snapshot = created["snapshot"]
+    assert snapshot["landmarks"] == []
+    assert snapshot["obstacles"] == []
+    assert snapshot["plannedWaypoints"] == []
+
+    runtime.start(session_id)
+    with pytest.raises(ValidationError):
+        runtime.set_goal(session_id, {"semanticTarget": "厨房"})
+    assert dispatched == []
+
+    live = runtime.live(session_id)
+    assert live["snapshot"]["landmarks"] == []
+    assert live["snapshot"]["obstacles"] == []
+    assert live["snapshot"]["plannedWaypoints"] == []
     runtime.close()
 
 
