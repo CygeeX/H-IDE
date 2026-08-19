@@ -2237,6 +2237,69 @@ class SQLiteStore:
             ).fetchall()
         return [self._assistant_turn_row(row) for row in rows]
 
+    def latest_visual_diagnostic(self, *, site_id: str | None) -> dict[str, Any] | None:
+        """Return bounded visual evidence metadata for developer diagnostics.
+
+        This intentionally projects no prompt, image, pose, model response, or
+        raw evidence reference.  A site-scoped developer can only learn that a
+        visual analysis exists, how long its persisted turn took, and which
+        immutable evidence kinds were recorded.
+        """
+
+        parameters: tuple[Any, ...]
+        site_predicate = ""
+        if site_id is None:
+            parameters = ()
+        else:
+            site_predicate = "AND acl.site_id = ? "
+            parameters = (site_id,)
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT turn.task_id, turn.created_at, turn.updated_at, turn.result_json "
+                "FROM assistant_turns AS turn "
+                "JOIN resource_acl AS acl ON acl.resource_type = 'assistant_conversation' "
+                "AND acl.resource_id = turn.conversation_id "
+                "WHERE turn.result_json IS NOT NULL "
+                f"{site_predicate}"
+                "ORDER BY turn.updated_at DESC, turn.task_id DESC LIMIT 100",
+                parameters,
+            ).fetchall()
+        for row in rows:
+            result = _decode(row["result_json"])
+            if not isinstance(result, Mapping):
+                continue
+            visual = result.get("visualResult")
+            evidence = result.get("evidence")
+            if not isinstance(visual, Mapping) and not isinstance(evidence, list):
+                continue
+            visual_mapping = visual if isinstance(visual, Mapping) else {}
+            raw_evidence = (
+                evidence
+                if isinstance(evidence, list)
+                else visual_mapping.get("evidence", [])
+            )
+            kinds = sorted(
+                {
+                    str(item.get("kind"))[:80]
+                    for item in raw_evidence
+                    if isinstance(item, Mapping) and isinstance(item.get("kind"), str)
+                }
+            )[:20]
+            try:
+                created = datetime.fromisoformat(str(row["created_at"]).replace("Z", "+00:00"))
+                updated = datetime.fromisoformat(str(row["updated_at"]).replace("Z", "+00:00"))
+                latency_ms = max(0.0, round((updated - created).total_seconds() * 1_000, 3))
+            except (TypeError, ValueError, OverflowError):
+                latency_ms = None
+            return {
+                "recordedAt": str(row["updated_at"]),
+                "latencyMs": latency_ms,
+                "status": str(visual_mapping.get("status") or result.get("routeStatus") or "recorded")[:80],
+                "evidenceCount": len(raw_evidence) if isinstance(raw_evidence, list) else 0,
+                "evidenceKinds": kinds,
+            }
+        return None
+
     def _append_assistant_event_locked(
         self,
         task_id: str,

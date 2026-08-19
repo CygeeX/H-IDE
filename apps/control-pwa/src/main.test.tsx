@@ -472,6 +472,7 @@ describe("control console", () => {
     expect(screen.getByRole("button", { name: "停止机器人" })).toBeInTheDocument();
     expect(screen.getByText("工具")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "打开工具" }));
+    expect(screen.getByRole("button", { name: /系统诊断/ })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /手动控制/ }));
     expect(screen.getByRole("button", { name: /立即停止/ })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /按住向前移动/ })).toBeInTheDocument();
@@ -916,9 +917,11 @@ describe("control console", () => {
 
   it("keeps a normal user out of the developer shell and hides technical product entry points", async () => {
     const fallback = vi.mocked(fetch).getMockImplementation();
-    window.history.replaceState({}, "", "/developer");
+    window.history.replaceState({}, "", "/developer/diagnostics");
+    const requestedUrls: string[] = [];
     vi.mocked(fetch).mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
+      requestedUrls.push(url);
       if (url.endsWith("/api/v1/auth/me")) {
         return Promise.resolve(response({ principal: {
           userId: "user-ui", username: "user-ui", displayName: "普通用户",
@@ -933,6 +936,8 @@ describe("control console", () => {
     expect(await screen.findByText("今天想和机器人做什么？")).toBeInTheDocument();
     await waitFor(() => expect(window.location.pathname).toBe("/app"));
     expect(screen.queryByRole("button", { name: "打开工具" })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("开发者系统诊断")).not.toBeInTheDocument();
+    expect(requestedUrls.some((url) => url.includes("/api/v2/developer/diagnostics"))).toBe(false);
     expect(screen.queryByRole("button", { name: /导入 PCD|添加场景/ })).not.toBeInTheDocument();
     expect(screen.queryByText("robot-1")).not.toBeInTheDocument();
     expect(screen.getByRole("combobox", { name: "对话机器人" })).toHaveTextContent("机器人 1");

@@ -31,6 +31,7 @@ import {
 import type { ActiveSceneContext } from "./scene-workspace";
 import { VisualMissionCard } from "./visual-mission-card";
 import { SimulationWorkspace } from "./simulation-workspace";
+import { DeveloperDiagnostics } from "./developer-diagnostics";
 import {
   latestMissionVisualResult,
   MissionVisualEvidenceDrawer,
@@ -49,6 +50,7 @@ interface VoiceUiState {
 type AppRoute =
   | { kind: "chat"; shell: "user" | "developer"; conversationId?: string }
   | { kind: "simulation"; shell: "developer" }
+  | { kind: "diagnostics"; shell: "developer" }
   | { kind: "interfaces"; shell: "developer" };
 
 const API_BASE = (import.meta.env.VITE_CONTROL_API_URL as string | undefined)?.replace(/\/$/, "") ?? "";
@@ -283,6 +285,7 @@ function EmptyState({ children }: { children: React.ReactNode }) {
 }
 
 function parseAppRoute(pathname: string): AppRoute {
+  if (pathname === "/developer/diagnostics" || pathname.startsWith("/developer/diagnostics/")) return { kind: "diagnostics", shell: "developer" };
   if (pathname === "/developer/simulation" || pathname.startsWith("/developer/simulation/")) return { kind: "simulation", shell: "developer" };
   if (pathname === "/developer/interfaces" || pathname.startsWith("/developer/interfaces/")) return { kind: "interfaces", shell: "developer" };
   const developerTask = pathname.match(/^\/developer\/tasks\/([^/]+)$/);
@@ -2015,6 +2018,14 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
         />
       </WorkspacePage> : null}
 
+      {developerMode && route.kind === "diagnostics" ? <WorkspacePage
+        title="系统诊断"
+        subtitle="只读检查 H-IDE、Agent、Vision、Robot Agent、Nav2 与仿真执行链"
+        onBack={() => navigate(conversationPath)}
+      >
+        <DeveloperDiagnostics apiFetch={apiFetch} robotId={selectedRobotId || undefined} />
+      </WorkspacePage> : null}
+
       {developerMode && toolMenuOpen ? <ToolMenu
         advancedMode={advancedMode}
         offlineVoiceFallback={voiceCaptureMode === "offline_wav"}
@@ -2023,6 +2034,7 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
         onClose={() => setToolMenuOpen(false)}
         onControl={() => { setToolMenuOpen(false); setControlPanelOpen(true); }}
         onSimulation={() => { setToolMenuOpen(false); navigate("/developer/simulation"); }}
+        onDiagnostics={() => { setToolMenuOpen(false); navigate("/developer/diagnostics"); }}
         onHistory={() => { setToolMenuOpen(false); setHistoryOpen(true); }}
         onInterfaces={() => { setToolMenuOpen(false); navigate("/developer/interfaces"); }}
         onRefresh={() => { setToolMenuOpen(false); refresh(); }}
@@ -2219,6 +2231,7 @@ function ToolMenu({
   onClose,
   onControl,
   onSimulation,
+  onDiagnostics,
   onHistory,
   onInterfaces,
   onRefresh,
@@ -2230,6 +2243,7 @@ function ToolMenu({
   onClose: () => void;
   onControl: () => void;
   onSimulation: () => void;
+  onDiagnostics: () => void;
   onHistory: () => void;
   onInterfaces: () => void;
   onRefresh: () => void;
@@ -2238,6 +2252,7 @@ function ToolMenu({
     <div className="tool-menu-header"><span>工具</span><button className="icon-button" type="button" onClick={onClose} aria-label="关闭"><Icon name="close" /></button></div>
     <button type="button" onClick={onControl}><span className="tool-icon"><Icon name="control" /></span><span><strong>手动控制</strong><small>测试高层动作与停止</small></span><Icon name="chevron" /></button>
     <button type="button" onClick={onSimulation}><span className="tool-icon"><Icon name="activity" /></span><span><strong>仿真观测台</strong><small>连续任务、障碍与回放</small></span><Icon name="chevron" /></button>
+    <button type="button" onClick={onDiagnostics}><span className="tool-icon"><Icon name="activity" /></span><span><strong>系统诊断</strong><small>执行链存活、就绪度与具体故障</small></span><Icon name="chevron" /></button>
     <button type="button" onClick={onHistory}><span className="tool-icon"><Icon name="history" /></span><span><strong>任务历史</strong><small>恢复规划、审核和执行记录</small></span><Icon name="chevron" /></button>
     <button type="button" onClick={onRefresh}><span className="tool-icon"><Icon name="refresh" /></span><span><strong>刷新状态</strong><small>重新读取机器人与接口快照</small></span><Icon name="chevron" /></button>
     <div className="tool-separator" />

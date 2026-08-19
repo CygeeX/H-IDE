@@ -97,6 +97,10 @@ from .conversation_client import (
     conversation_client_from_env,
 )
 from .conversation_gateway import ConversationGateway
+from .developer_diagnostics import (
+    DeveloperDiagnosticsService,
+    create_developer_diagnostics_router,
+)
 from .auth import (
     AuthService,
     AuthorizationDenied,
@@ -885,6 +889,7 @@ def create_app(
     visual_task_client: VisualTaskClient | None = None,
     simulation_runtime: SimulationRuntime | None = None,
     simulation_db_path: str | None = None,
+    developer_diagnostics_service: DeveloperDiagnosticsService | None = None,
 ) -> FastAPI:
     """Create an isolated API instance suitable for tests or deployment."""
 
@@ -1290,6 +1295,11 @@ def create_app(
     )
     app.include_router(create_auth_router(auth_service))
     app.include_router(create_scene_memory_router(store))
+    app.include_router(
+        create_developer_diagnostics_router(
+            developer_diagnostics_service or DeveloperDiagnosticsService(store)
+        )
+    )
 
     robot_agent_refresh_lock = threading.RLock()
 
