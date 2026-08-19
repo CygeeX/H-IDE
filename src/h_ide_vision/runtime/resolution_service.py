@@ -22,14 +22,14 @@ from h_ide_vision.contracts import (
     SafetyGate,
     VisualResolution,
     VisualResolutionRequest,
+    VisualTaskRequest,
 )
 from h_ide_vision.evidence import EvidenceStorage
 from h_ide_vision.geometry import derive_approach_pose, estimate_landmark, transform_point
-from h_ide_vision.ingress import AcceptedObservation, LatestFrameStore
+from h_ide_vision.ingress import AcceptedObservation, LatestFrameStore, ObservationBundle
 from h_ide_vision.persistence import ResolutionRepository
 from h_ide_vision.providers.segmentation import SegmentationProvider
-from h_ide_vision.providers.vlm.base import SemanticGroundingProvider
-
+from h_ide_vision.providers.vlm.base import GroundingCandidate, SemanticGroundingProvider
 
 LOGGER = logging.getLogger(__name__)
 
@@ -50,6 +50,10 @@ class ResolutionService:
             0 <= stable_frame_wait_seconds <= 5
         ):
             raise ValueError("stable frame wait must be between 0 and 5 seconds")
+        if vlm.provider_name != "qwen":
+            raise ValueError("semantic provider boundary requires Qwen")
+        if segmentation.name != "sam2":
+            raise ValueError("mask refinement boundary requires SAM 2")
         self.repository = repository
         self.frames = frames
         self.evidence = evidence
@@ -106,8 +110,17 @@ class ResolutionService:
         if latest.identity.source_mode != request.requestedSourceMode:
             return self._reject(queued, "source_mode_mismatch")
         candidates = self.vlm.ground(image_jpeg=latest.rgb_jpeg, target=request.targetDescription)
+        semantic_evidence = self._semantic_evidence(
+            latest,
+            target_text=request.targetDescription,
+            candidates=candidates,
+        )
         if not candidates:
-            return self._reject(queued, "target_not_visible")
+            return self._reject(
+                queued,
+                "target_not_visible",
+                evidence=semantic_evidence,
+            )
         selected = None
         if request.candidateId:
             try:
@@ -163,13 +176,7 @@ class ResolutionService:
                     "status": ResolutionStatus.NEEDS_INPUT,
                     "ambiguityCandidates": ambiguity,
                     "rejectionReason": "ambiguous_target",
-                    "evidence": (
-                        self.evidence.put(
-                            kind="rgb_keyframe",
-                            media_type="image/jpeg",
-                            data=latest.rgb_jpeg,
-                        ),
-                    ),
+                    "evidence": semantic_evidence,
                 }
             )
             return self.repository.replace_terminal(needs_input)
@@ -226,25 +233,36 @@ class ResolutionService:
         try:
             goal_pose = derive_approach_pose(landmark, np.asarray(latest.t_map_camera[:3, 3]), self.policy)
         except ValueError as exc:
+            rejected_gates = (
+                *gates,
+                SafetyGate(name="approach_pose", passed=False, detail=str(exc)),
+            )
             return self._reject(
                 queued,
                 f"approach_rejected:{exc}",
-                gates=(*gates, SafetyGate(name="approach_pose", passed=False, detail=str(exc))),
+                gates=rejected_gates,
                 landmark=landmark_pose,
                 evidence=(
-                    self.evidence.put(
-                        kind="rgb_keyframe",
-                        media_type="image/jpeg",
-                        data=latest.rgb_jpeg,
+                    *semantic_evidence,
+                    self.evidence.put_mask(
+                        masks[-1], model=self.segmentation.model_name
+                    ),
+                    self._geometry_evidence(
+                        selected_frames,
+                        gates=rejected_gates,
+                        landmark=landmark_pose,
+                        target=None,
                     ),
                 ),
             )
         evidence = (
-            self.evidence.put(kind="rgb_keyframe", media_type="image/jpeg", data=latest.rgb_jpeg),
-            self.evidence.put(
-                kind="mask",
-                media_type="application/octet-stream",
-                data=masks[-1].astype(np.uint8).tobytes(),
+            *semantic_evidence,
+            self.evidence.put_mask(masks[-1], model=self.segmentation.model_name),
+            self._geometry_evidence(
+                selected_frames,
+                gates=gates,
+                landmark=landmark_pose,
+                target=goal_pose,
             ),
         )
         executable = all(gate.passed for gate in gates)
@@ -266,7 +284,7 @@ class ResolutionService:
         return self.repository.replace_terminal(terminal)
 
     def _wait_for_fresh_frames(
-        self, request: VisualResolutionRequest
+        self, request: VisualResolutionRequest | VisualTaskRequest
     ) -> tuple[AcceptedObservation, ...]:
         deadline = time.monotonic() + self.stable_frame_wait_seconds
         while True:
@@ -335,7 +353,9 @@ class ResolutionService:
         return 0.0 if union <= 0 else intersection / union
 
     def _source(
-        self, request: VisualResolutionRequest, accepted: AcceptedObservation | None
+        self,
+        request: VisualResolutionRequest | VisualTaskRequest,
+        accepted: AcceptedObservation | None,
     ) -> ResolutionSource:
         if accepted is None:
             return ResolutionSource(
@@ -372,13 +392,98 @@ class ResolutionService:
 
     def _versions(self) -> ResolutionVersions:
         return ResolutionVersions(
-            vlmProvider=type(self.vlm).__name__,
+            vlmProvider=self.vlm.provider_name,
             vlmModel=self.vlm.model_name,
             promptVersion="visual-grounding-v1",
             visualAlgorithmVersion="rgbd-median-v1",
             approachPolicyVersion=self.policy.version,
             approachPolicySha256=self.policy_hash,
-            segmentationModel=self.segmentation.name,
+            segmentationProvider="sam2",
+            segmentationModel=self.segmentation.model_name,
+        )
+
+    def _semantic_evidence(
+        self,
+        bundle: ObservationBundle,
+        *,
+        target_text: str,
+        candidates: tuple[GroundingCandidate, ...],
+    ) -> tuple[EvidenceRef, ...]:
+        rgb_jpeg = bundle.rgb_jpeg
+        rgb_refs = self.evidence.put_rgb_input(rgb_jpeg)
+        payload = {
+            "schemaVersion": "h-ide.visual-semantic-evidence/1",
+            "inputRgbSha256": rgb_refs[0].sha256,
+            "provider": "qwen",
+            "model": self.vlm.model_name,
+            "promptVersion": "visual-grounding-v1",
+            "targetText": target_text,
+            "candidates": [
+                {
+                    "candidateId": item.candidate_id,
+                    "label": item.label,
+                    "pixelBox": list(item.box),
+                    "score": item.score,
+                    "source": "qwen",
+                }
+                for item in candidates
+            ],
+        }
+        semantic = self.evidence.put(
+            kind="qwen_grounding",
+            media_type="application/json",
+            data=json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode(),
+            producer="qwen",
+            model=self.vlm.model_name,
+        )
+        return (*rgb_refs, semantic)
+
+    def _geometry_evidence(
+        self,
+        frames: tuple[AcceptedObservation, ...],
+        *,
+        gates: tuple[SafetyGate, ...],
+        landmark: Pose3D | None,
+        target: Pose3D | None,
+    ) -> EvidenceRef:
+        payload = {
+            "schemaVersion": "h-ide.rgbd-tf-gate-evidence/1",
+            "producer": "deterministic_rgbd",
+            "frames": [
+                {
+                    "bundleId": accepted.bundle_id,
+                    "depthZ16Sha256": hashlib.sha256(
+                        accepted.bundle.depth_z16.astype("<u2", copy=False).tobytes()
+                    ).hexdigest(),
+                    "depthScale": accepted.bundle.depth_scale,
+                    "calibrationSha256": accepted.bundle.calibration_sha256,
+                    "tMapCamera": np.asarray(
+                        accepted.bundle.t_map_camera, dtype=np.float64
+                    ).tolist(),
+                    "tBaseCamera": np.asarray(
+                        accepted.bundle.t_base_camera, dtype=np.float64
+                    ).tolist(),
+                    "localizationAgeMs": accepted.bundle.localization_age_ms,
+                }
+                for accepted in frames
+            ],
+            "safetyGates": [gate.model_dump(mode="json") for gate in gates],
+            "landmarkPose": (
+                None if landmark is None else landmark.model_dump(mode="json")
+            ),
+            "targetPose": None if target is None else target.model_dump(mode="json"),
+        }
+        return self.evidence.put(
+            kind="rgbd_tf_gate",
+            media_type="application/json",
+            data=json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(),
+            producer="deterministic_rgbd",
+            model="rgbd-calibration-tf-gates-v1",
         )
 
     def _reject(

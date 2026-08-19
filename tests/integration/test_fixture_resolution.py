@@ -7,13 +7,11 @@ from pathlib import Path
 
 from h_ide_vision.contracts import ApproachPolicy, ResolutionStatus, VisualResolutionRequest
 from h_ide_vision.evidence import EvidenceStorage
-from h_ide_vision.fixtures import fixture_bundle
 from h_ide_vision.ingress import LatestFrameStore
 from h_ide_vision.persistence import ResolutionRepository
-from h_ide_vision.providers.segmentation import BoxSegmentationProvider
-from h_ide_vision.providers.vlm import FakeVlmProvider
 from h_ide_vision.providers.vlm.base import GroundingCandidate
 from h_ide_vision.runtime import ResolutionService
+from tests.fixtures import StubQwenProvider, StubSam2Provider, fixture_bundle
 
 
 def request(request_id: str = "request-1") -> VisualResolutionRequest:
@@ -68,8 +66,8 @@ def test_resolution_rechecks_frame_freshness(tmp_path: Path) -> None:
         repository=ResolutionRepository(),
         frames=frames,
         evidence=EvidenceStorage(tmp_path / "evidence"),
-        vlm=FakeVlmProvider(),
-        segmentation=BoxSegmentationProvider(),
+        vlm=StubQwenProvider(),
+        segmentation=StubSam2Provider(),
         stable_frame_wait_seconds=0,
     )
 
@@ -88,8 +86,8 @@ def test_resolution_waits_bounded_time_for_a_stable_live_frame_set(
         repository=ResolutionRepository(),
         frames=frames,
         evidence=EvidenceStorage(tmp_path / "evidence"),
-        vlm=FakeVlmProvider(),
-        segmentation=BoxSegmentationProvider(),
+        vlm=StubQwenProvider(),
+        segmentation=StubSam2Provider(),
         stable_frame_wait_seconds=0.5,
     )
 
@@ -115,8 +113,8 @@ def test_unsafe_approach_is_rejected_with_auditable_keyframe(
         repository=ResolutionRepository(),
         frames=frames,
         evidence=EvidenceStorage(tmp_path / "evidence"),
-        vlm=FakeVlmProvider(),
-        segmentation=BoxSegmentationProvider(),
+        vlm=StubQwenProvider(),
+        segmentation=StubSam2Provider(),
         policy=ApproachPolicy(targetStandOffM=3.0),
     )
 
@@ -130,7 +128,19 @@ def test_unsafe_approach_is_rejected_with_auditable_keyframe(
     assert resolved.goalPose is None
     assert resolved.safetyGates[-1].name == "approach_pose"
     assert resolved.safetyGates[-1].passed is False
-    assert [item.kind for item in resolved.evidence] == ["rgb_keyframe"]
+    assert [item.kind for item in resolved.evidence] == [
+        "input_rgb",
+        "input_rgb_thumbnail",
+        "qwen_grounding",
+        "sam2_mask",
+        "rgbd_tf_gate",
+    ]
+    assert {item.producer for item in resolved.evidence} == {
+        "observation_gateway",
+        "qwen",
+        "sam2",
+        "deterministic_rgbd",
+    }
 
 
 def test_candidate_selection_uses_a_new_attempt_bound_to_immutable_ambiguity(
@@ -144,13 +154,17 @@ def test_candidate_selection_uses_a_new_attempt_bound_to_immutable_ambiguity(
         repository=ResolutionRepository(),
         frames=frames,
         evidence=EvidenceStorage(tmp_path / "evidence"),
-        vlm=FakeVlmProvider(candidates),
-        segmentation=BoxSegmentationProvider(),
+        vlm=StubQwenProvider(candidates),
+        segmentation=StubSam2Provider(),
     )
     ambiguous = ambiguous_service.resolve(request("ambiguous-request"))
     assert ambiguous.status is ResolutionStatus.NEEDS_INPUT
     assert ambiguous.executable is False
-    assert len(ambiguous.evidence) == 1
+    assert [item.kind for item in ambiguous.evidence] == [
+        "input_rgb",
+        "input_rgb_thumbnail",
+        "qwen_grounding",
+    ]
 
     selected_request = VisualResolutionRequest.model_validate(
         {

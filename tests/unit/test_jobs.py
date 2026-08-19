@@ -4,21 +4,28 @@ from pathlib import Path
 
 from h_ide_vision.contracts import ResolutionStatus
 from h_ide_vision.evidence import EvidenceStorage
-from h_ide_vision.fixtures import fixture_bundle
 from h_ide_vision.ingress import LatestFrameStore
 from h_ide_vision.jobs import ResolutionJobRunner
 from h_ide_vision.persistence import ResolutionRepository
-from h_ide_vision.providers.segmentation import BoxSegmentationProvider
 from h_ide_vision.runtime import ResolutionService
+from tests.fixtures import StubSam2Provider, fixture_bundle
 from tests.integration.test_fixture_resolution import request
 
 
 class FailingVlm:
+    provider_name = "qwen"
     available = True
     model_name = "failing-test-provider"
 
+    def ensure_ready(self) -> None:
+        return None
+
     def ground(self, *, image_jpeg: bytes, target: str):
         del image_jpeg, target
+        raise RuntimeError("provider secret must not leak into terminal status")
+
+    def observe(self, *, image_jpeg: bytes):
+        del image_jpeg
         raise RuntimeError("provider secret must not leak into terminal status")
 
 
@@ -31,7 +38,7 @@ def service(tmp_path: Path) -> ResolutionService:
         frames=frames,
         evidence=EvidenceStorage(tmp_path / "evidence"),
         vlm=FailingVlm(),
-        segmentation=BoxSegmentationProvider(),
+        segmentation=StubSam2Provider(),
     )
 
 

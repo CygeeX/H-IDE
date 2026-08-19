@@ -22,15 +22,12 @@ def settings(tmp_path: Path) -> Settings:
         grpc_port=50061,
         database_path=tmp_path / "db.sqlite3",
         evidence_dir=tmp_path / "evidence",
-        vlm_provider="fake",
-        segmentation_provider="box",
         sam2_checkpoint=None,
         sam2_model_config="configs/sam2.1/sam2.1_hiera_t.yaml",
         sam2_device="cuda",
         qwen_base_url="https://example.invalid/v1",
         qwen_model="qwen-test",
         qwen_api_key=None,
-        mujoco_oracle_url="http://127.0.0.1:8794",
         stable_frame_wait_seconds=1.0,
         agent_token="agent-secret",
         control_token="control-secret",
@@ -43,6 +40,14 @@ def settings(tmp_path: Path) -> Settings:
 
 def test_scoped_create_and_read(service: ResolutionService, tmp_path: Path) -> None:
     client = TestClient(create_app(settings=settings(tmp_path), service=service))
+    health = client.get("/healthz")
+    assert health.status_code == 200
+    assert health.json()["releaseState"] == "pure_vlm_product_profile"
+    capabilities = health.json()["capabilities"]
+    assert capabilities["vlm"]["provider"] == "qwen"
+    assert capabilities["segmentation"]["provider"] == "sam2"
+    assert "foundationpose" not in capabilities
+    assert capabilities["visualTaskV2"]["semanticProviderBoundary"] == "qwen_only"
     payload = request().model_dump(mode="json")
     assert client.post("/internal/v1/visual-resolutions", json=payload).status_code == 401
     created = client.post(
@@ -84,6 +89,21 @@ def test_scoped_create_and_read(service: ResolutionService, tmp_path: Path) -> N
     assert denied.status_code == 401
 
 
-def test_qwen_cannot_fall_back_to_fixture_box_segmentation(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="MuJoCo Oracle"):
-        build_service(replace(settings(tmp_path), vlm_provider="qwen"))
+def test_product_startup_fails_when_qwen_is_not_configured(tmp_path: Path) -> None:
+    with pytest.raises(RuntimeError, match="DASHSCOPE_API_KEY"):
+        build_service(settings(tmp_path))
+
+
+def test_product_startup_fails_when_sam2_is_not_configured(tmp_path: Path) -> None:
+    configured = replace(settings(tmp_path), qwen_api_key="configured-test-key")
+
+    with pytest.raises(RuntimeError, match="SAM 2 is unavailable"):
+        build_service(configured)
+
+
+def test_settings_expose_no_runtime_provider_selector(tmp_path: Path) -> None:
+    configured = settings(tmp_path)
+
+    assert not hasattr(configured, "vlm_provider")
+    assert not hasattr(configured, "segmentation_provider")
+    assert not hasattr(configured, "mujoco_oracle_url")

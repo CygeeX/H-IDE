@@ -11,6 +11,11 @@ class SegmentationProvider(Protocol):
     @property
     def available(self) -> bool: ...
 
+    @property
+    def model_name(self) -> str: ...
+
+    def ensure_ready(self) -> None: ...
+
     def segment(
         self,
         *,

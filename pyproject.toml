@@ -29,6 +29,9 @@ dev = [
   "pytest-asyncio>=0.25,<1",
   "ruff>=0.9,<1",
 ]
+# Marker only: the retained FoundationPose spike lives under ``experiments``
+# and is excluded from the installed product package and runtime registry.
+experimental-foundationpose = []
 
 [project.scripts]
 h-ide-vision = "h_ide_vision.cli:main"

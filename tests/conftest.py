@@ -6,12 +6,10 @@ import pytest
 
 from h_ide_vision.contracts import ApproachPolicy
 from h_ide_vision.evidence import EvidenceStorage
-from h_ide_vision.fixtures import fixture_bundle
 from h_ide_vision.ingress import LatestFrameStore
 from h_ide_vision.persistence import ResolutionRepository
-from h_ide_vision.providers.segmentation import BoxSegmentationProvider
-from h_ide_vision.providers.vlm import FakeVlmProvider
 from h_ide_vision.runtime import ResolutionService
+from tests.fixtures import StubQwenProvider, StubSam2Provider, fixture_bundle
 
 
 @pytest.fixture
@@ -28,7 +26,6 @@ def service(tmp_path: Path, frames: LatestFrameStore) -> ResolutionService:
         repository=ResolutionRepository(),
         frames=frames,
         evidence=EvidenceStorage(tmp_path / "evidence"),
-        vlm=FakeVlmProvider(),
-        segmentation=BoxSegmentationProvider(),
+        vlm=StubQwenProvider(),
+        segmentation=StubSam2Provider(),
     )
-

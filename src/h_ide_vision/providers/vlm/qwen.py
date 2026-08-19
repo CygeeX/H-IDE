@@ -6,7 +6,7 @@ import json
 import math
 import time
 from io import BytesIO
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from PIL import Image
@@ -15,8 +15,10 @@ from .base import GroundingCandidate
 
 
 class QwenVlmProvider:
+    provider_name: Literal["qwen"] = "qwen"
+
     def __init__(self, *, api_key: str | None, base_url: str, model: str, timeout_s: float = 20.0) -> None:
-        self._api_key = api_key
+        self._api_key = (api_key or "").strip() or None
         self._base_url = base_url.rstrip("/")
         self._model = model
         self._timeout_s = timeout_s
@@ -29,9 +31,16 @@ class QwenVlmProvider:
     def model_name(self) -> str:
         return self._model
 
-    def ground(self, *, image_jpeg: bytes, target: str) -> tuple[GroundingCandidate, ...]:
+    def ensure_ready(self) -> None:
+        """Validate the product profile without making a billable network call."""
+
         if not self._api_key:
             raise RuntimeError("Qwen VLM is unavailable: DASHSCOPE_API_KEY is missing")
+        if not self._base_url or not self._model.strip():
+            raise RuntimeError("Qwen VLM endpoint and model must be configured")
+
+    def ground(self, *, image_jpeg: bytes, target: str) -> tuple[GroundingCandidate, ...]:
+        self.ensure_ready()
         try:
             with Image.open(BytesIO(image_jpeg)) as image:
                 width, height = image.size

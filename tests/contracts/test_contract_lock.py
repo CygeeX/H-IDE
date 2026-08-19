@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 
 from google.protobuf.descriptor_pb2 import FileDescriptorSet
@@ -32,3 +33,14 @@ def test_schema_contains_source_epoch_and_hash_negotiation() -> None:
     assert "SourceMode source_mode" in text
     assert "optional string scene_version" in text
 
+
+def test_visual_evidence_contract_has_only_product_provenance() -> None:
+    schema = json.loads(
+        (ROOT / "contracts/visual_evidence.v1.schema.json").read_text()
+    )
+    text = json.dumps(schema, sort_keys=True)
+
+    assert '"provider": {"const": "qwen"}' in text
+    assert '"source": {"const": "qwen"}' in text
+    assert "mujoco_oracle" not in text
+    assert "fixture" not in text

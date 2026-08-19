@@ -34,8 +34,27 @@
     "ambiguityCandidates": {"type": "array"},
     "warnings": {"type": "array", "items": {"type": "string"}},
     "rejectionReason": {"type": ["string", "null"]},
-    "evidence": {"type": "array"},
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "sha256", "mediaType", "producer"],
+        "properties": {
+          "kind": {"type": "string", "minLength": 1},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "mediaType": {"type": "string", "minLength": 1},
+          "producer": {
+            "enum": [
+              "observation_gateway", "qwen", "sam2",
+              "deterministic_rgbd", "legacy_unverified"
+            ]
+          },
+          "model": {"type": ["string", "null"]},
+          "expiresAt": {"type": ["string", "null"], "format": "date-time"}
+        }
+      }
+    },
     "createdAt": {"type": "string", "format": "date-time"}
   }
 }
-

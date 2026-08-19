@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+import json
+from io import BytesIO
+
 import pytest
+from PIL import Image
 from pydantic import ValidationError
 
 from h_ide_vision.contracts import (
@@ -12,6 +17,7 @@ from h_ide_vision.contracts import (
 )
 from h_ide_vision.persistence import ResolutionConflict
 from h_ide_vision.runtime import ResolutionService, VisualTaskService
+from tests.fixtures import fixture_rgb
 
 
 def request(
@@ -67,7 +73,7 @@ def test_object_approach_returns_verified_geometry_but_no_execution_authority(
     result = tasks.analyze(visual_request)
 
     assert result.status is ResolutionStatus.SUCCEEDED
-    assert result.hypotheses[0].source == "fixture"
+    assert result.hypotheses[0].source == "qwen"
     assert not hasattr(result.hypotheses[0], "targetPose")
     geometry = result.geometryCandidates[0]
     assert geometry.source == "deterministic_rgbd"
@@ -78,6 +84,36 @@ def test_object_approach_returns_verified_geometry_but_no_execution_authority(
     assert geometry.targetPose.x == pytest.approx(1.25, abs=0.05)
     assert "executable" not in result.model_dump(mode="json")
     assert tasks.analyze(visual_request).analysisId == result.analysisId
+
+    evidence = {item.kind: item for item in result.evidence}
+    assert set(evidence) == {
+        "input_rgb",
+        "input_rgb_thumbnail",
+        "qwen_grounding",
+        "sam2_mask",
+        "rgbd_tf_gate",
+    }
+    assert evidence["input_rgb"].sha256 == hashlib.sha256(fixture_rgb()).hexdigest()
+    assert evidence["qwen_grounding"].producer == "qwen"
+    assert evidence["qwen_grounding"].model == "qwen-test-double"
+    semantic = json.loads(
+        service.evidence.get(evidence["qwen_grounding"].sha256)
+    )
+    assert semantic["inputRgbSha256"] == evidence["input_rgb"].sha256
+    assert semantic["provider"] == "qwen"
+    assert semantic["targetText"] == "fixture target"
+    assert semantic["candidates"][0]["source"] == "qwen"
+    assert semantic["candidates"][0]["pixelBox"] == [24, 16, 40, 32]
+    with Image.open(BytesIO(service.evidence.get(evidence["sam2_mask"].sha256))) as mask:
+        assert mask.format == "PNG"
+        assert mask.getbbox() == (24, 16, 40, 32)
+    geometry_evidence = json.loads(
+        service.evidence.get(evidence["rgbd_tf_gate"].sha256)
+    )
+    assert geometry_evidence["producer"] == "deterministic_rgbd"
+    assert len(geometry_evidence["frames"]) == 3
+    assert geometry_evidence["frames"][0]["calibrationSha256"]
+    assert all(gate["passed"] for gate in geometry_evidence["safetyGates"])
 
 
 def test_same_visual_request_id_with_different_payload_is_rejected(
@@ -130,7 +166,11 @@ def test_scene_description_reports_visible_objects_without_map_geometry(
     assert "fixture target" in result.observationSummary
     assert result.hypotheses[0].label == "fixture target"
     assert result.geometryCandidates == ()
-    assert {item.kind for item in result.evidence} == {"rgb_keyframe"}
+    assert {item.kind for item in result.evidence} == {
+        "input_rgb",
+        "input_rgb_thumbnail",
+        "qwen_grounding",
+    }
 
 
 def test_directional_free_space_uses_depth_and_tf_without_qwen(
@@ -153,8 +193,10 @@ def test_directional_free_space_uses_depth_and_tf_without_qwen(
     assert geometry.targetPose is not None
     assert geometry.targetPose.x == pytest.approx(1.0, abs=0.05)
     assert {item.kind for item in result.evidence} == {
-        "rgb_keyframe",
+        "input_rgb",
+        "input_rgb_thumbnail",
         "depth_sector_summary",
+        "rgbd_tf_gate",
     }
 
 
@@ -223,8 +265,10 @@ def test_arrival_verification_with_executed_goal_uses_pose_and_keeps_rgb_evidenc
     assert geometry.safetyGates[-2].name == "arrival_pose_distance_m"
     assert geometry.safetyGates[-1].name == "arrival_pose_yaw_rad"
     assert {item.kind for item in result.evidence} == {
-        "rgb_keyframe",
+        "input_rgb",
+        "input_rgb_thumbnail",
         "arrival_pose_summary",
+        "rgbd_tf_gate",
     }
 
 

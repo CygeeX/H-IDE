@@ -5,8 +5,8 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from h_ide_vision.fixtures import fixture_bundle
 from h_ide_vision.ingress import LatestFrameStore, ObservationRejected
+from tests.fixtures import fixture_bundle
 
 
 def test_store_is_bounded_and_rejects_out_of_order() -> None:

@@ -18,15 +18,12 @@ class Settings:
     grpc_port: int
     database_path: Path
     evidence_dir: Path
-    vlm_provider: str
-    segmentation_provider: str
     sam2_checkpoint: Path | None
     sam2_model_config: str
     sam2_device: str
     qwen_base_url: str
     qwen_model: str
     qwen_api_key: str | None
-    mujoco_oracle_url: str
     stable_frame_wait_seconds: float
     agent_token: str
     control_token: str
@@ -44,8 +41,6 @@ def load_settings() -> Settings:
         grpc_port=int(os.getenv("HIDE_VISION_GRPC_PORT", "50061")),
         database_path=Path(os.getenv("HIDE_VISION_DATABASE_PATH", "var/h-ide-vision.sqlite3")),
         evidence_dir=Path(os.getenv("HIDE_VISION_EVIDENCE_DIR", "var/evidence")),
-        vlm_provider=os.getenv("HIDE_VISION_VLM_PROVIDER", "fake").strip().lower(),
-        segmentation_provider=os.getenv("HIDE_VISION_SEGMENTATION_PROVIDER", "box").strip().lower(),
         sam2_checkpoint=(
             Path(value) if (value := os.getenv("HIDE_VISION_SAM2_CHECKPOINT", "").strip()) else None
         ),
@@ -56,11 +51,8 @@ def load_settings() -> Settings:
         qwen_base_url=os.getenv(
             "HIDE_VISION_QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"
         ).rstrip("/"),
-        qwen_model=os.getenv("HIDE_VISION_QWEN_MODEL", "qwen3-vl-flash"),
+        qwen_model=os.getenv("HIDE_VISION_QWEN_MODEL", "qwen3-vl-plus"),
         qwen_api_key=os.getenv("DASHSCOPE_API_KEY") or None,
-        mujoco_oracle_url=os.getenv(
-            "HIDE_VISION_MUJOCO_ORACLE_URL", "http://127.0.0.1:8794"
-        ).rstrip("/"),
         stable_frame_wait_seconds=float(
             os.getenv("HIDE_VISION_STABLE_FRAME_WAIT_SECONDS", "1")
         ),

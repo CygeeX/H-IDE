@@ -97,12 +97,13 @@ class ResolutionSource(FrozenModel):
 
 
 class ResolutionVersions(FrozenModel):
-    vlmProvider: NonEmpty
+    vlmProvider: Literal["qwen"] = "qwen"
     vlmModel: NonEmpty
     promptVersion: NonEmpty
     visualAlgorithmVersion: NonEmpty
     approachPolicyVersion: NonEmpty
     approachPolicySha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    segmentationProvider: Literal["sam2"] | None = None
     segmentationModel: str | None = None
     poseModel: str | None = None
 
@@ -119,6 +120,14 @@ class EvidenceRef(FrozenModel):
     kind: NonEmpty
     sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
     mediaType: NonEmpty
+    producer: Literal[
+        "observation_gateway",
+        "qwen",
+        "sam2",
+        "deterministic_rgbd",
+        "legacy_unverified",
+    ] = "legacy_unverified"
+    model: str | None = None
     expiresAt: datetime | None = None
 
 
@@ -228,7 +237,7 @@ class VisualHypothesis(FrozenModel):
     """A semantic interpretation that is never itself a map-coordinate fact."""
 
     hypothesisId: NonEmpty
-    source: Literal["qwen", "mujoco_oracle", "fixture"] = "qwen"
+    source: Literal["qwen"] = "qwen"
     label: NonEmpty
     pixelBox: tuple[int, int, int, int]
     score: float | None = Field(default=None, ge=0, le=1)

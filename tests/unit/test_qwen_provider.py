@@ -5,8 +5,8 @@ import json
 import httpx
 import pytest
 
-from h_ide_vision.fixtures import fixture_rgb
 from h_ide_vision.providers.vlm.qwen import QwenVlmProvider
+from tests.fixtures import fixture_rgb
 
 
 class _Response:

@@ -34,9 +34,15 @@ def fixture_bundle(
     depth = np.zeros((height, width), dtype="<u2")
     depth[16:32, 24:40] = 2000
     depth_bytes = depth.tobytes()
-    intrinsics = CameraIntrinsics(width=width, height=height, fx=60, fy=60, cx=31.5, cy=23.5)
-    # Fixture camera optical +Z points along map +X. Keeping this explicit
-    # catches accidental treatment of optical depth as map height.
+    intrinsics = CameraIntrinsics(
+        width=width,
+        height=height,
+        fx=60,
+        fy=60,
+        cx=31.5,
+        cy=23.5,
+    )
+    # Camera optical +Z points along map +X.
     transform = np.asarray(
         [
             [0.0, 0.0, 1.0, 0.0],
@@ -75,5 +81,7 @@ def fixture_bundle(
         t_map_camera=transform,
         t_base_camera=transform,
         localization_age_ms=5,
-        localization_covariance=tuple(0.001 if index % 7 == 0 else 0.0 for index in range(36)),
+        localization_covariance=tuple(
+            0.001 if index % 7 == 0 else 0.0 for index in range(36)
+        ),
     )

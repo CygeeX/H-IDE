@@ -10,10 +10,12 @@ class GroundingCandidate:
     label: str
     box: tuple[int, int, int, int]
     score: float | None = None
-    source: Literal["qwen", "mujoco_oracle", "fixture"] = "qwen"
+    source: Literal["qwen"] = "qwen"
 
 
 class SemanticGroundingProvider(Protocol):
+    provider_name: Literal["qwen"]
+
     @property
     def available(self) -> bool: ...
 
@@ -23,3 +25,5 @@ class SemanticGroundingProvider(Protocol):
     def ground(self, *, image_jpeg: bytes, target: str) -> tuple[GroundingCandidate, ...]: ...
 
     def observe(self, *, image_jpeg: bytes) -> tuple[GroundingCandidate, ...]: ...
+
+    def ensure_ready(self) -> None: ...

@@ -11,9 +11,9 @@ import grpc
 import zstandard
 from google.protobuf.timestamp_pb2 import Timestamp
 
-from h_ide_vision.fixtures import fixture_bundle
 from h_ide_vision.generated.robot_observation.v1 import observation_pb2 as pb
 from h_ide_vision.generated.robot_observation.v1 import observation_pb2_grpc as pb_grpc
+from tools.observation_fixture import fixture_bundle
 
 
 def _timestamp(value: datetime) -> Timestamp:

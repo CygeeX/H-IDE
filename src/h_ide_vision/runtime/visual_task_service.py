@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from typing import Any
+from typing import Any, Literal, TypedDict
 from uuid import uuid4
 
 import numpy as np
@@ -19,7 +19,9 @@ from h_ide_vision.contracts import (
     AmbiguityCandidate,
     EvidenceRef,
     Pose3D,
+    ResolutionSource,
     ResolutionStatus,
+    ResolutionVersions,
     SafetyGate,
     VerificationOutcome,
     VisualGeometryCandidate,
@@ -39,6 +41,21 @@ from h_ide_vision.persistence import ResolutionConflict
 from h_ide_vision.providers.vlm.base import GroundingCandidate
 
 from .resolution_service import ResolutionService
+
+
+class _VisualTaskCommon(TypedDict):
+    analysisId: str
+    requestId: str
+    requestSha256: str
+    missionId: str
+    revisionId: str
+    nodeId: str
+    attempt: int
+    mode: VisualTaskMode
+    source: ResolutionSource
+    versions: ResolutionVersions
+    selectedCandidateId: str | None
+    selectionSourceAnalysisId: str | None
 
 
 class VisualTaskService:
@@ -66,7 +83,7 @@ class VisualTaskService:
                 "visualAlgorithmVersion": "rgbd-target-v2",
             }
         )
-        common = {
+        common: _VisualTaskCommon = {
             "analysisId": f"analysis-{uuid4().hex}",
             "requestId": request.requestId,
             "requestSha256": request_sha256,
@@ -137,7 +154,7 @@ class VisualTaskService:
         self,
         request: VisualTaskRequest,
         frames: tuple[AcceptedObservation, ...],
-        common: dict[str, Any],
+        common: _VisualTaskCommon,
     ) -> VisualTaskResult:
         """Describe the current frame without requiring or inventing a map pose."""
 
@@ -163,7 +180,14 @@ class VisualTaskService:
             status=ResolutionStatus.SUCCEEDED,
             hypotheses=hypotheses,
             observationSummary=summary,
-            evidence=self._keyframe_evidence(latest.rgb_jpeg),
+            evidence=self.resolution._semantic_evidence(  # noqa: SLF001
+                latest,
+                target_text=(
+                    "all clearly visible salient objects, room fixtures, landmarks, "
+                    "doorways and obstacles in the current robot camera view"
+                ),
+                candidates=candidates,
+            ),
         )
 
     @staticmethod
@@ -196,7 +220,7 @@ class VisualTaskService:
         self,
         request: VisualTaskRequest,
         frames: tuple[AcceptedObservation, ...],
-        common: dict[str, Any],
+        common: _VisualTaskCommon,
     ) -> VisualTaskResult:
         latest = frames[-1].bundle
         candidates = self.resolution.vlm.ground(
@@ -213,14 +237,18 @@ class VisualTaskService:
             )
             for item in candidates
         )
+        semantic_evidence = self.resolution._semantic_evidence(  # noqa: SLF001
+            latest,
+            target_text=request.targetDescription or "",
+            candidates=candidates,
+        )
         if not candidates:
-            evidence = self._keyframe_evidence(latest.rgb_jpeg)
             return VisualTaskResult(
                 **common,
                 status=ResolutionStatus.REJECTED,
                 hypotheses=hypotheses,
                 rejectionReason="target_not_visible",
-                evidence=evidence,
+                evidence=semantic_evidence,
                 verification=(
                     VerificationOutcome.UNKNOWN
                     if request.mode is VisualTaskMode.ARRIVAL_VERIFICATION
@@ -245,7 +273,7 @@ class VisualTaskService:
                 hypotheses=hypotheses,
                 ambiguityCandidates=ambiguity,
                 rejectionReason="ambiguous_target",
-                evidence=self._keyframe_evidence(latest.rgb_jpeg),
+                evidence=semantic_evidence,
             )
 
         selected_frames = frames[-self.resolution.policy.requiredStableFrames :]
@@ -305,7 +333,7 @@ class VisualTaskService:
             yaw=0,
         )
         target_pose: Pose3D | None = None
-        role = "landmark"
+        role: Literal["landmark", "approach", "verification"] = "landmark"
         verification: VerificationOutcome | None = None
         if request.mode is VisualTaskMode.OBJECT_APPROACH:
             try:
@@ -345,11 +373,15 @@ class VisualTaskService:
             role = "verification"
 
         evidence = (
-            *self._keyframe_evidence(latest.rgb_jpeg),
-            self.resolution.evidence.put(
-                kind="mask",
-                media_type="application/octet-stream",
-                data=masks[-1].astype(np.uint8).tobytes(),
+            *semantic_evidence,
+            self.resolution.evidence.put_mask(
+                masks[-1], model=self.resolution.segmentation.model_name
+            ),
+            self.resolution._geometry_evidence(  # noqa: SLF001
+                selected_frames,
+                gates=tuple(gates),
+                landmark=landmark_pose,
+                target=target_pose,
             ),
         )
         gates_tuple = tuple(gates)
@@ -416,7 +448,7 @@ class VisualTaskService:
         self,
         request: VisualTaskRequest,
         frames: tuple[AcceptedObservation, ...],
-        common: dict[str, Any],
+        common: _VisualTaskCommon,
     ) -> VisualTaskResult:
         assert request.direction is not None
         assert request.requestedDistanceM is not None
@@ -516,6 +548,14 @@ class VisualTaskService:
                     sort_keys=True,
                     separators=(",", ":"),
                 ).encode(),
+                producer="deterministic_rgbd",
+                model="directional-depth-sector-v1",
+            ),
+            self.resolution._geometry_evidence(  # noqa: SLF001
+                selected_frames,
+                gates=gates,
+                landmark=None,
+                target=target_pose,
             ),
         )
         verified = all(gate.passed for gate in gates)
@@ -540,7 +580,7 @@ class VisualTaskService:
         self,
         request: VisualTaskRequest,
         frames: tuple[AcceptedObservation, ...],
-        common: dict[str, Any],
+        common: _VisualTaskCommon,
     ) -> VisualTaskResult:
         """Verify an executed Nav2 goal from fresh localization plus RGB evidence.
 
@@ -603,6 +643,14 @@ class VisualTaskService:
                 kind="arrival_pose_summary",
                 media_type="application/json",
                 data=json.dumps(summary, sort_keys=True, separators=(",", ":")).encode(),
+                producer="deterministic_rgbd",
+                model="arrival-pose-gates-v1",
+            ),
+            self.resolution._geometry_evidence(  # noqa: SLF001
+                frames[-self.resolution.policy.requiredStableFrames :],
+                gates=gates,
+                landmark=actual,
+                target=expected,
             ),
         )
         verified = all(gate.passed for gate in gates)
@@ -654,17 +702,11 @@ class VisualTaskService:
         )
 
     def _keyframe_evidence(self, rgb_jpeg: bytes) -> tuple[EvidenceRef, ...]:
-        return (
-            self.resolution.evidence.put(
-                kind="rgb_keyframe",
-                media_type="image/jpeg",
-                data=rgb_jpeg,
-            ),
-        )
+        return self.resolution.evidence.put_rgb_input(rgb_jpeg)
 
     def _store_rejection(
         self,
-        common: dict[str, Any],
+        common: _VisualTaskCommon,
         reason: str,
     ) -> VisualTaskResult:
         verification = (

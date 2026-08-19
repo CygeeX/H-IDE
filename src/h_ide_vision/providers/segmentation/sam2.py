@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import threading
 from importlib.util import find_spec
 from io import BytesIO
@@ -28,6 +29,7 @@ class Sam2SegmentationProvider:
         self._model_config = model_config
         self._device = device
         self._lock = threading.RLock()
+        self._checkpoint_sha256: str | None = None
 
     @property
     def available(self) -> bool:
@@ -45,6 +47,31 @@ class Sam2SegmentationProvider:
         import torch
 
         return bool(torch.cuda.is_available())
+
+    @property
+    def model_name(self) -> str:
+        name = self._model_config.rsplit("/", 1)[-1].removesuffix(".yaml")
+        if self._checkpoint_sha256 is None:
+            return name
+        return f"{name}@sha256:{self._checkpoint_sha256}"
+
+    def ensure_ready(self) -> None:
+        """Eagerly load the product mask refiner so startup fails closed."""
+
+        if self._predictor is None:
+            if self._checkpoint is None or not self._checkpoint.is_file():
+                raise RuntimeError(
+                    "SAM 2 is unavailable: GPU environment/model is not configured"
+                )
+            digest = hashlib.sha256()
+            with self._checkpoint.open("rb") as checkpoint:
+                for block in iter(lambda: checkpoint.read(1024 * 1024), b""):
+                    digest.update(block)
+            self._checkpoint_sha256 = digest.hexdigest()
+        if self._predictor is None:
+            self._load_predictor()
+        if not self.available:
+            raise RuntimeError("SAM 2 is unavailable: GPU environment/model is not configured")
 
     def segment(
         self,

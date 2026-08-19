@@ -16,16 +16,9 @@ from h_ide_vision.evidence import EvidenceStorage
 from h_ide_vision.ingress import LatestFrameStore
 from h_ide_vision.jobs import ResolutionJobRunner
 from h_ide_vision.persistence import ResolutionNotFound, ResolutionRepository
-from h_ide_vision.providers.segmentation import (
-    BoxSegmentationProvider,
-    Sam2SegmentationProvider,
-    SegmentationProvider,
-)
+from h_ide_vision.providers.segmentation import Sam2SegmentationProvider
 from h_ide_vision.providers.vlm import (
-    FakeVlmProvider,
-    MujocoOracleVlmProvider,
     QwenVlmProvider,
-    SemanticGroundingProvider,
 )
 from h_ide_vision.runtime import ResolutionService, VisualTaskService
 
@@ -38,37 +31,21 @@ def _bearer(authorization: str | None) -> str | None:
 
 
 def build_service(settings: Settings, frames: LatestFrameStore | None = None) -> ResolutionService:
-    vlm: SemanticGroundingProvider
-    if settings.vlm_provider == "qwen":
-        vlm = QwenVlmProvider(
-            api_key=settings.qwen_api_key,
-            base_url=settings.qwen_base_url,
-            model=settings.qwen_model,
-        )
-    elif settings.vlm_provider == "fake":
-        vlm = FakeVlmProvider()
-    elif settings.vlm_provider == "mujoco_oracle":
-        vlm = MujocoOracleVlmProvider(base_url=settings.mujoco_oracle_url)
-    else:
-        raise ValueError(f"unsupported H-IDE Vision VLM provider: {settings.vlm_provider}")
-    segmentation: SegmentationProvider
-    if settings.segmentation_provider == "sam2":
-        segmentation = Sam2SegmentationProvider(
-            checkpoint=settings.sam2_checkpoint,
-            model_config=settings.sam2_model_config,
-            device=settings.sam2_device,
-        )
-    elif settings.segmentation_provider == "box":
-        if settings.vlm_provider not in {"fake", "mujoco_oracle"}:
-            raise ValueError(
-                "box segmentation is limited to fixtures and the MuJoCo Oracle; "
-                "Qwen requires SAM 2"
-            )
-        segmentation = BoxSegmentationProvider()
-    else:
-        raise ValueError(
-            f"unsupported H-IDE Vision segmentation provider: {settings.segmentation_provider}"
-        )
+    # The product registry is deliberately closed: Qwen owns semantics and
+    # SAM 2 may only refine a Qwen pixel box. Tests inject protocol stubs into
+    # ``ResolutionService`` directly and cannot select a runtime provider.
+    vlm = QwenVlmProvider(
+        api_key=settings.qwen_api_key,
+        base_url=settings.qwen_base_url,
+        model=settings.qwen_model,
+    )
+    segmentation = Sam2SegmentationProvider(
+        checkpoint=settings.sam2_checkpoint,
+        model_config=settings.sam2_model_config,
+        device=settings.sam2_device,
+    )
+    vlm.ensure_ready()
+    segmentation.ensure_ready()
     return ResolutionService(
         repository=ResolutionRepository(settings.database_path),
         frames=frames or LatestFrameStore(),
@@ -116,10 +93,10 @@ def create_app(
         provider = service.vlm
         return {
             "status": "ok",
-            "releaseState": "code_complete_robot_agent_pending",
+            "releaseState": "pure_vlm_product_profile",
             "capabilities": {
                 "vlm": {
-                    "provider": type(provider).__name__,
+                    "provider": provider.provider_name,
                     "model": provider.model_name,
                     "available": provider.available,
                 },
@@ -127,7 +104,6 @@ def create_app(
                     "provider": service.segmentation.name,
                     "available": service.segmentation.available,
                 },
-                "foundationpose": False,
                 # The service may be fed by a live Robot Agent gateway or by a
                 # deterministic fixture. Health only promises that the ingress
                 # is ready; it must not mislabel a live camera as fixture data.
@@ -142,6 +118,8 @@ def create_app(
                         "arrival_verification",
                         "scene_description",
                     ],
+                    "semanticProviderBoundary": "qwen_only",
+                    "maskRefinementBoundary": "sam2_from_qwen_box_only",
                     "semanticGroundingOutputAuthority": "hypothesis_only",
                     "geometryAuthority": "rgbd_calibration_tf",
                 },
@@ -262,6 +240,3 @@ def create_app(
         )
 
     return app
-
-
-app = create_app()

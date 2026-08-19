@@ -342,7 +342,7 @@ async def create_grpc_server(
         # Docker bridge targets the container interface.  0.0.0.0 is therefore
         # allowed only under the same explicit insecure-development switch; the
         # compose port remains bound to 127.0.0.1 on the workstation.
-        allowed_plaintext_hosts = {"127.0.0.1", "::1", "localhost", "0.0.0.0", "::"}
+        allowed_plaintext_hosts = {"127.0.0.1", "::1", "localhost"}
         if not allow_insecure_loopback or normalized not in allowed_plaintext_hosts:
             raise ValueError("plaintext observation ingress is restricted to explicit local development")
         if server.add_insecure_port(f"{host}:{port}") == 0:

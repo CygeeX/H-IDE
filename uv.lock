@@ -184,7 +184,7 @@ requires-dist = [
     { name = "websockets", specifier = ">=14,<16" },
     { name = "zstandard", specifier = ">=0.23,<1" },
 ]
-provides-extras = ["dev"]
+provides-extras = ["dev", "experimental-foundationpose"]
 
 [[package]]
 name = "h11"
