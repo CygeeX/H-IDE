@@ -96,6 +96,7 @@ describe("Mastra agent system", () => {
       "visionWorker",
       "structuringAgent",
       "missionExecutiveAgent",
+      "conversationRouterAgent",
     ]);
     expect(Object.keys(await system.agents.motionWorker.listTools())).toContain(
       "resolveSpatialTarget",
@@ -104,6 +105,7 @@ describe("Mastra agent system", () => {
       "resolveSpatialTarget",
     );
     expect(Object.keys(await system.agents.visionWorker.listTools())).toEqual([]);
+    expect(Object.keys(await system.agents.conversationRouterAgent.listTools())).toEqual([]);
   });
 
   it("describes each available worker in the supervisor classification prompt", async () => {

@@ -11,6 +11,7 @@ import { createAgentSystem } from "./agents.js";
 import { HttpVisionResolutionClient } from "../vision/client.js";
 import { VisionWorker } from "../vision/worker.js";
 import { createMissionRoutes } from "../mission/routes.js";
+import { createConversationRoutes } from "../conversation/routes.js";
 
 function ensureLocalDatabaseDirectory(url: string) {
   if (!url.startsWith("file:") || url.startsWith("file::memory:")) return;
@@ -66,6 +67,7 @@ export const mastra = new Mastra({
       ...createHealthRoutes(readiness),
       ...createPlanningRoutes(planningService, config.internalToken, visualStageResolver),
       ...createMissionRoutes(agentSystem.missionPlanner, config.internalToken),
+      ...createConversationRoutes(agentSystem.conversationRouter, config.internalToken),
     ],
   },
 });

@@ -5,6 +5,12 @@ Supervisor–Worker 编排，但没有任何机器人执行工具：输入是 H-
 机器人状态、能力快照和逻辑命令目录，输出只可能是追问、无法规划，或一个待人
 工审核的 `PlanProposal`。
 
+Assistant V2 另有一个前置对话路由边界。它先区分普通聊天、通用问答、纯视觉
+观察、机器人行动、场景教学和开发者管理请求。普通聊天/问答会直接自然回复，
+绝不创建计划；涉及机器人时只返回口语化过渡和是否应进入 Mission/PlanDraft，
+本服务仍没有执行权限。明显问候和有界四则运算走本地快速路径，其余请求交给
+同一个 Mastra/Qwen provider，并以低温、关闭 thinking 的结构化输出分类。
+
 ```text
 H-IDE TaskRequest + frozen context
                 │ internal bearer HTTP
@@ -84,10 +90,17 @@ Studio/API 路由都需要 `Authorization: Bearer $MASTRA_INTERNAL_TOKEN`：
 | 查询状态/增量事件 | `GET /internal/v1/planning-turns/{taskId}?afterEvent=0` |
 | 取消轮次 | `POST /internal/v1/planning-turns/{taskId}/cancel` |
 | 解析已审核视觉阶段 | `POST /internal/v1/visual-stages/resolve` |
+| Assistant V2 对话路由 | `POST /internal/v2/conversation-turns` |
 
 同一 `taskId` 和完全相同的 envelope 会返回原任务；同一 ID 携带不同内容会
 返回 `409`。输入输出契约位于 `src/contracts.ts`，路由位于
 `src/http/routes.ts`。
+
+对话路由的完整请求/响应契约、意图边界和调用示例见
+[`docs/conversation-v2.md`](docs/conversation-v2.md)。它复用
+`SUPERVISOR_MODEL` 及相应供应商凭据；不需要额外模型环境变量。调用方必须只在
+`shouldCreateMission=true` 时进入既有 Mission V2/PlanDraft 流程，不能把本接口的
+文字回复当作执行授权。
 
 ## 接入外部专属 Agent
 

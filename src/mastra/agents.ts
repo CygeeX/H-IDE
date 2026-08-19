@@ -8,6 +8,7 @@ import { MastraPlanningRuntime } from "../planning/mastra-runtime.js";
 import { MissionEngine } from "../mission/engine.js";
 import { MastraMissionRuntime } from "../mission/mastra-runtime.js";
 import { spatialResolverTool } from "./tools/spatial.js";
+import { ConversationRouter } from "../conversation/router.js";
 
 export function createAgentSystem(config: AppConfig) {
   const memoryStore = new LibSQLStore({
@@ -88,6 +89,15 @@ export function createAgentSystem(config: AppConfig) {
     memory,
     defaultOptions: { maxSteps: 6 },
   });
+  const conversationRouterAgent = new Agent({
+    id: "h-ide-conversation-router",
+    name: "H-IDE Conversation Router",
+    description: "Separates ordinary conversation from observation and reviewable robot work.",
+    instructions:
+      "Classify and answer one bounded Assistant V2 conversation turn. You have no tools or execution authority. Ordinary chat and general questions receive a direct answer; robot work only receives a short transition into the separately reviewed Mission/PlanDraft path.",
+    model: config.supervisorModel,
+    defaultOptions: { maxSteps: 1 },
+  });
   const localWorkers = new Map<string, Agent>([
     ["motion-worker", motionWorker],
     ["manipulation-worker", manipulationWorker],
@@ -118,9 +128,11 @@ export function createAgentSystem(config: AppConfig) {
       visionWorker,
       structuringAgent,
       missionExecutiveAgent,
+      conversationRouterAgent,
     },
     memoryStore,
     planner: new PlanningEngine(runtime),
     missionPlanner: new MissionEngine(new MastraMissionRuntime(missionExecutiveAgent)),
+    conversationRouter: new ConversationRouter(conversationRouterAgent),
   };
 }
