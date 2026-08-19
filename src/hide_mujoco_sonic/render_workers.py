@@ -1068,7 +1068,6 @@ class PassiveViewerWorker:
         self._process.start()
 
     def status(self) -> dict[str, object]:
-        now_monotonic_ns = time.monotonic_ns()
         alive = self._process.is_alive()
         process_failed = bool(self._stats.fatal.value) or (
             self._process.pid is not None and not alive and not self._closed
@@ -1090,6 +1089,10 @@ class PassiveViewerWorker:
                 last_success_sequence,
                 dropped_at_success,
             ) = self._last_viewer_progress
+        # Sample after the complete progress generation.  The viewer child may
+        # commit while this status call is running; sampling first could make a
+        # legitimate fresh commit appear to come from the future.
+        now_monotonic_ns = time.monotonic_ns()
         mailbox_published = self.mailbox.published_count
         mailbox_dropped = self.mailbox.dropped_count
         progress_anchor_ns = (

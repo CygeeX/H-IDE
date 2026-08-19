@@ -782,6 +782,34 @@ def test_enabled_viewer_progress_ignores_wall_clock_rollback() -> None:
     assert result["movementReleaseAllowed"] is True
 
 
+def test_enabled_viewer_fresh_concurrent_progress_commit_is_healthy() -> None:
+    evaluator = idle_soak.IdleSoakEvaluator()
+    first = _batch(0)
+    second = _batch(1)
+    for batch in (first, second):
+        batch.payloads["plant"]["viewerWorker"] = _healthy_worker(
+            pid=202,
+            boot_id=VIEWER_WORKER_BOOT_ID,
+            viewer=True,
+        )
+    second.payloads["plant"]["viewerWorker"].update(
+        {
+            "lastSuccessSequence": 101,
+            "lastSuccessAtUnixNs": 1_800_000_011_000_000_000,
+            "mailboxPublishedCount": 101,
+            "progressAgeMs": 0.0,
+        }
+    )
+
+    _observe(evaluator, first, 0)
+    derived = _observe(evaluator, second, 1)
+    result = evaluator.finalize()
+
+    assert derived["plantWorkers"]["viewerProgressErrors"] == []
+    assert result["safeHoldSafetyPass"] is True
+    assert result["movementReleaseAllowed"] is True
+
+
 def test_enabled_viewer_mailbox_growth_within_stale_window_is_not_stale() -> None:
     evaluator = idle_soak.IdleSoakEvaluator()
     first = _batch(0)

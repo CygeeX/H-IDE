@@ -965,6 +965,53 @@ def test_viewer_progress_cache_reads_and_publishes_under_one_lock(
         worker.close()
 
 
+def test_viewer_status_samples_clock_after_concurrent_progress_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mujoco, model, _data = _model_data()
+    context = multiprocessing.get_context("spawn")
+    shape = MujocoStateShape.from_model(mujoco, model)
+    worker = PassiveViewerWorker(
+        mailbox=LatestStateMailbox(shape, context=context),
+        shape=shape,
+        config=ViewerWorkerConfig(
+            "missing",
+            "missing",
+            "explicit_process_restart",
+            0.0,
+            0.0,
+        ),
+        context=context,
+    )
+    commit_monotonic_ns = 2_000_000_000
+    progress_committed = threading.Event()
+
+    def read_progress(_stats):
+        progress_committed.set()
+        return (
+            1_800_000_001_000_000_000,
+            commit_monotonic_ns,
+            1,
+            0,
+        )
+
+    def sample_now() -> int:
+        assert progress_committed.is_set()
+        return commit_monotonic_ns + 1
+
+    monkeypatch.setattr(render_workers, "_read_viewer_progress", read_progress)
+    monkeypatch.setattr(time, "monotonic_ns", sample_now)
+    worker._stats.ready.value = 1
+    try:
+        status = worker.status()
+        assert status["status"] == "running"
+        assert status["ready"] is True
+        assert status["progressAgeMs"] == pytest.approx(0.000001)
+        assert status["lastError"] is None
+    finally:
+        worker.close()
+
+
 def test_successful_worker_recovery_clears_shared_last_error() -> None:
     context = multiprocessing.get_context("spawn")
     stats = _SharedWorkerStats(context)
