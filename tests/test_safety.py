@@ -13,6 +13,8 @@ from hide_mujoco_sonic.safety import (
     MovementIntent,
     MotionDirectionGuard,
     NavigationArmGuard,
+    PlantControlClock,
+    PlantControlClockFault,
     PlantTickGuard,
     ReplanIntentGate,
     RotationDirectionGuard,
@@ -57,6 +59,56 @@ def test_plant_tick_guard_distinguishes_delayed_sample_from_restart():
     assert guard.last_tick == 100
     assert guard.restart_count == 1
     assert guard.observe(110) is False
+
+
+def test_plant_control_clock_admits_one_step_per_20ms_of_simulation_time():
+    clock = PlantControlClock(control_hz=50)
+
+    first = clock.observe(1_000)
+    assert first is not None
+    assert first.tick_ms == 1_000
+    assert first.dt_s == pytest.approx(0.02)
+
+    for tick in (1_004, 1_008, 1_012, 1_016):
+        assert clock.observe(tick) is None
+    second = clock.observe(1_020)
+    assert second is not None
+    assert second.tick_ms == 1_020
+    assert second.dt_s == pytest.approx(0.02)
+
+
+def test_plant_control_clock_accepts_long_running_4ms_mujoco_tick_stream():
+    clock = PlantControlClock(control_hz=50)
+    simulation_time_s = 0.0
+    admitted = []
+
+    # The bridge uses int(simulation_time * 1000).  Repeated binary floating
+    # point addition occasionally produces a 3 ms or 5 ms tick increment even
+    # though MuJoCo's configured physics step is exactly 4 ms.
+    for _ in range(25_000):
+        step = clock.observe(int(simulation_time_s * 1_000))
+        if step is not None:
+            admitted.append(step)
+        simulation_time_s += 0.004
+
+    assert len(admitted) == 5_000
+    assert {step.dt_s for step in admitted} <= {0.02, 0.021, 0.022, 0.023, 0.024}
+
+
+@pytest.mark.parametrize(
+    ("ticks", "message"),
+    [
+        ((1_000, 1_000), "duplicate"),
+        ((1_000, 996), "backwards"),
+        ((1_000, 1_024), "source jumped"),
+        ((1_000, 1_004, 1_008, 1_012, 1_016, 1_025), "interval jumped"),
+    ],
+)
+def test_plant_control_clock_fails_closed_on_discontinuous_ticks(ticks, message):
+    clock = PlantControlClock(control_hz=50)
+    with pytest.raises(PlantControlClockFault, match=message):
+        for tick in ticks:
+            clock.observe(tick)
 
 
 def test_motion_direction_guard_latches_opposite_map_displacement_and_requires_idle():
@@ -468,6 +520,28 @@ def test_non_finite_command_is_rejected():
     guard = CmdVelGuard()
     with pytest.raises(ValueError):
         guard.accept(float("nan"), 0.0, 0.0)
+
+
+def test_cmd_vel_guard_uses_wall_age_but_simulation_dt_for_facing_integration():
+    wall_now = [10.0]
+    guard = CmdVelGuard(
+        timeout_s=0.25,
+        smoothing_alpha=1.0,
+        clock=lambda: wall_now[0],
+    )
+    guard.accept(0.2, 0.0, 0.2)
+
+    fresh = guard.intent(dt=0.02)
+    assert fresh.stale is False
+    assert fresh.facing_angle_rad == pytest.approx(0.004)
+
+    # A slow simulator must not extend a stale Nav2 command in wall time.  The
+    # timeout stops it, while no unearned wall-time integration is performed.
+    wall_now[0] += 0.26
+    stale = guard.intent(dt=0.02)
+    assert stale.stale is True
+    assert stale.mode == "IDLE"
+    assert stale.facing_angle_rad == pytest.approx(0.004)
 
 
 def test_navigation_arm_guard_clamps_policy_excursion_and_slew():

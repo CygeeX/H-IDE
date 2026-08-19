@@ -11,6 +11,8 @@ import argparse
 import gc
 import logging
 import math
+import os
+from pathlib import Path
 import threading
 import time
 from typing import Any
@@ -20,11 +22,19 @@ from .config import SimConfig
 from .safety import (
     CmdVelGuard,
     NavigationArmGuard,
+    PlantControlClock,
+    PlantControlClockFault,
+    PlantControlStep,
     PlantTickGuard,
     ReplanIntentGate,
     StaticJointHandoff,
 )
-from .telemetry import TelemetryState, TelemetryStore, serve_telemetry
+from .telemetry import (
+    JointFaultTraceBuffer,
+    TelemetryState,
+    TelemetryStore,
+    serve_telemetry,
+)
 from .transport import parse_lines
 
 logger = logging.getLogger(__name__)
@@ -46,8 +56,17 @@ class SonicDriver:
         )
         self._lowstate = None
         self._lowstate_lock = threading.RLock()
+        self._control_condition = threading.Condition(self._lowstate_lock)
+        self._control_clock = PlantControlClock(control_hz=config.control_hz)
+        self._control_clock_armed = False
+        self._pending_control_sample: tuple[Any, PlantControlStep] | None = None
+        self._wall_clock = time.monotonic
+        self._control_clock_armed_at_wall_s: float | None = None
+        self._last_lowstate_wall_s: float | None = None
+        self._lowstate_stall_timeout_s = max(1.0, config.command_timeout_s * 4.0)
         self._stop = threading.Event()
-        self._resync_requested = threading.Event()
+        self._fault_latched = threading.Event()
+        self._terminal_fault_reason: str | None = None
         self._tick_guard = PlantTickGuard()
         self._motion_armed = True
         self._navigation_task_active = False
@@ -84,6 +103,26 @@ class SonicDriver:
         self._kp = self._controller.kp
         self._kd = self._controller.kd
         self._arm_guard = self._new_arm_guard()
+        self._joint_names = tuple(self._joint_name(index) for index in range(29))
+        self._fault_trace = JointFaultTraceBuffer(
+            self._joint_names,
+            max_samples=max(1, config.control_hz * 5),
+        )
+        self._fault_trace_path = self._default_fault_trace_path()
+
+    @staticmethod
+    def _default_fault_trace_path() -> Path:
+        override = os.environ.get("HIDE_SONIC_FAULT_TRACE_PATH")
+        if override:
+            return Path(override)
+        runtime_root = Path(f"/run/user/{os.getuid()}")
+        if not runtime_root.is_dir():
+            runtime_root = Path("/tmp")
+        return (
+            runtime_root
+            / f"h-ide-mujoco-demo-{os.getuid()}"
+            / "sonic-fault-trace.json"
+        )
 
     def _new_arm_guard(self) -> NavigationArmGuard:
         from lerobot.robots.unitree_g1.controllers.sonic_pipeline import DEFAULT_ANGLES
@@ -107,28 +146,99 @@ class SonicDriver:
             tick = int(message.tick)
             restarted = self._tick_guard.observe(tick)
         except (AttributeError, TypeError, ValueError) as exc:
-            self.telemetry.update(last_error=f"invalid lowstate tick: {exc}")
+            self._latch_terminal_fault(f"invalid lowstate tick: {exc}")
             return
-        with self._lowstate_lock:
+        clock_fault: str | None = None
+        received_at_wall_s = self._wall_clock()
+        with self._control_condition:
             self._lowstate = message
+            self._last_lowstate_wall_s = received_at_wall_s
+            if restarted:
+                clock_fault = (
+                    "MuJoCo plant tick rolled back; explicit process restart required"
+                )
+            elif self._control_clock_armed:
+                try:
+                    control_step = self._control_clock.observe(tick)
+                except PlantControlClockFault as exc:
+                    clock_fault = str(exc)
+                else:
+                    if control_step is not None:
+                        if self._pending_control_sample is not None:
+                            pending_tick = self._pending_control_sample[1].tick_ms
+                            clock_fault = (
+                                "MuJoCo control sample overrun: "
+                                f"{pending_tick}ms was not consumed before "
+                                f"{control_step.tick_ms}ms; catch-up is forbidden"
+                            )
+                        else:
+                            self._pending_control_sample = (message, control_step)
+                            self._control_condition.notify_all()
         self.telemetry.update(plant_tick=tick)
-        if restarted:
-            # A new physics generation invalidates the policy's motion buffer,
-            # proprioception history and heading anchor.  Fail closed before
-            # rebuilding them; Nav2 must publish idle/stop before another
-            # non-zero command can be accepted.
-            self._motion_armed = False
-            self._navigation_task_active = False
-            self.guard.stop(source="plant_restart")
-            self._resync_requested.set()
-            self.telemetry.update(
-                status="resynchronizing",
-                nav2_state="restart_hold",
-                navigation_task_active=False,
-                sonic_mode="IDLE",
-                sonic_speed_mps=0.0,
-                last_error="MuJoCo plant tick rolled back; rebuilding SONIC state",
-            )
+        if clock_fault is not None:
+            # Any clock discontinuity invalidates policy history and actuator
+            # continuity.  Never rebuild history or replay missed policy ticks.
+            self._latch_terminal_fault(clock_fault)
+
+    def _arm_simulation_clock(self) -> None:
+        """Start policy advancement from the freshest completed plant sample."""
+
+        with self._control_condition:
+            self._control_clock.reset()
+            self._pending_control_sample = None
+            self._control_clock_armed = True
+            self._control_clock_armed_at_wall_s = self._wall_clock()
+            lowstate = self._lowstate
+            if lowstate is not None:
+                step = self._control_clock.observe(int(lowstate.tick))
+                assert step is not None
+                self._pending_control_sample = (lowstate, step)
+            self._control_condition.notify_all()
+        self.telemetry.update(control_clock_status="simulation_time_50hz")
+
+    def _next_control_sample(
+        self,
+        *,
+        wait_timeout_s: float = 0.10,
+    ) -> tuple[Any, PlantControlStep] | None:
+        """Consume at most one admitted sample; wall time is only a wake timeout."""
+
+        clock_fault: str | None = None
+        with self._control_condition:
+            if (
+                self._pending_control_sample is None
+                and not self._fault_latched.is_set()
+                and not self._stop.is_set()
+            ):
+                self._control_condition.wait(timeout=wait_timeout_s)
+            sample = self._pending_control_sample
+            self._pending_control_sample = None
+            if (
+                sample is None
+                and self._control_clock_armed
+                and not self._fault_latched.is_set()
+                and not self._stop.is_set()
+            ):
+                source_at = (
+                    self._last_lowstate_wall_s
+                    if self._last_lowstate_wall_s is not None
+                    else self._control_clock_armed_at_wall_s
+                )
+                if (
+                    source_at is not None
+                    and self._wall_clock() - source_at
+                    > self._lowstate_stall_timeout_s
+                ):
+                    clock_fault = (
+                        "MuJoCo LowState stream stalled for more than "
+                        f"{self._lowstate_stall_timeout_s:.3f}s wall time; "
+                        "wall time is not used to catch up policy steps"
+                    )
+        if clock_fault is not None:
+            # Wall time is used only as a liveness interlock.  It never emits a
+            # control step or advances any controller/handoff state.
+            self._latch_terminal_fault(clock_fault)
+        return sample
 
     def _publish_measured_hold(self, lowstate) -> None:
         for index in range(29):
@@ -142,52 +252,59 @@ class SonicDriver:
         self._msg.crc = self._crc.Crc(self._msg)
         self._publisher.Write(self._msg)
 
-    def _resynchronize_controller(self, lowstate) -> None:
-        """Hold measured joints while rebuilding every stateful SONIC object."""
+    def _latch_terminal_fault(self, reason: str) -> None:
+        """Latch a non-recoverable process fault without rebuilding state."""
 
-        self._publish_measured_hold(lowstate)
-        old_controller = self._controller
-        old_controller.shutdown()
-        gc.collect()
-        try:
-            controller = self._controller_type(force_cpu=self.config.force_cpu)
-        except Exception as exc:
-            # Never retain a cached locomotion acknowledgement after the plant
-            # has rejected a support transition.  A latched physics fault must
-            # make every later motion attempt fail closed as well.
-            self._plant_support_mode = None
-            self.telemetry.update(
-                status="failed",
-                sonic_mode="IDLE",
-                sonic_speed_mps=0.0,
-                last_error=f"SONIC resynchronization failed: {exc}",
-            )
-            self._stop.set()
-            raise
-        self._controller = controller
-        self._kp = controller.kp
-        self._kd = controller.kd
-        self._intent_gate = ReplanIntentGate()
-        self._decoder_facing_rad = None
-        self._pending_decoder_heading_delta_rad = 0.0
-        self._last_intent_signature = None
-        self._arm_guard = self._new_arm_guard()
-        self._joint_handoff.reset()
-        self._static_hold_active = True
+        if self._fault_latched.is_set():
+            return
+        self._terminal_fault_reason = str(reason)
+        self.guard.stop(source="terminal_fault")
         self._navigation_task_active = False
-        self.guard.stop(source="plant_restart_hold")
-        self.telemetry.update(
-            status="running",
-            nav2_state="restart_hold",
+        self._fault_latched.set()
+        trace_path: str | None = None
+        trace_samples = 0
+        trace = getattr(self, "_fault_trace", None)
+        if trace is not None:
+            try:
+                payload = trace.snapshot(
+                    reason=self._terminal_fault_reason,
+                    kp=tuple(float(value) for value in self._kp),
+                    kd=tuple(float(value) for value in self._kd),
+                )
+                trace_samples = int(payload["sample_count"])
+                path = trace.persist(self._fault_trace_path, payload)
+                trace_path = str(path)
+                logger.error(
+                    "terminal SONIC fault; wrote %d pre-fault samples to %s: %s",
+                    trace_samples,
+                    trace_path,
+                    self._terminal_fault_reason,
+                )
+            except Exception:
+                logger.exception("failed to persist terminal SONIC fault trace")
+        changes: dict[str, Any] = dict(
+            status="failed",
+            nav2_state="fault_latched",
             sonic_mode="IDLE",
             sonic_speed_mps=0.0,
-            controller_resync_count=self._tick_guard.restart_count,
             static_hold_active=True,
             motion_handoff_active=False,
             motion_handoff_ratio=0.0,
             navigation_task_active=False,
-            last_error="SONIC state rebuilt; waiting for Nav2 idle before re-arming",
+            control_clock_status="fault",
+            last_error=self._terminal_fault_reason,
         )
+        if trace is not None:
+            changes.update(
+                fault_trace_path=trace_path,
+                fault_trace_sample_count=trace_samples,
+                fault_joint_names=list(trace.joint_names),
+            )
+        self.telemetry.update(**changes)
+        condition = getattr(self, "_control_condition", None)
+        if condition is not None:
+            with condition:
+                condition.notify_all()
 
     def _set_plant_support_mode(self, mode: str) -> bool:
         """Switch only MuJoCo's fall-arrest profile over loopback.
@@ -223,7 +340,7 @@ class SonicDriver:
         self.telemetry.update(plant_support_mode=mode)
         return True
 
-    def _apply_intent(self, dt: float):
+    def _apply_intent(self, dt: float, *, simulation_now_s: float):
         intent = self.guard.intent(dt=dt)
         controller = self._controller
         decoder = controller.controller
@@ -237,7 +354,11 @@ class SonicDriver:
         # Switch to SLOW_WALK only for an actual Nav2 command and request a new
         # reference whenever the hold/move boundary changes.
         previous = self._intent_gate.last
-        admitted = self._intent_gate.admit(intent)
+        # Replanning is part of the learned controller's state evolution.  Its
+        # debounce window must therefore use the same authoritative MuJoCo
+        # clock as the policy cursor, handoff blend, and arm slew guard.  Wall
+        # time remains valid only for ingress freshness/watchdog decisions.
+        admitted = self._intent_gate.admit(intent, now=simulation_now_s)
         starting_motion = intent.mode != "IDLE" and (previous is None or previous.mode == "IDLE")
         if intent.mode == "IDLE":
             if previous is None or previous.mode != "IDLE":
@@ -302,7 +423,14 @@ class SonicDriver:
             for index in range(29)
         )
 
-    def _publish(self, action: dict[str, Any], lowstate, *, constrain_arms: bool = True):
+    def _publish(
+        self,
+        action: dict[str, Any],
+        lowstate,
+        *,
+        control_dt_s: float,
+        constrain_arms: bool = True,
+    ) -> tuple[float, ...]:
         # Populate the official Unitree lowcmd message.  The simulator consumes
         # this exact DDS message, just as a G1 hardware bridge would.
         self._msg.mode_machine = getattr(lowstate, "mode_machine", 0)
@@ -343,7 +471,7 @@ class SonicDriver:
             self._arm_guard.apply(
                 raw_arm,
                 measured=measured_arm,
-                dt=1.0 / self.config.control_hz,
+                dt=control_dt_s,
             )
             if constrain_arms
             else None
@@ -362,16 +490,20 @@ class SonicDriver:
             )
             for index in range(29)
         ]
+        published_targets = tuple(
+            float(
+                guarded_by_index[index]
+                if index in guarded_by_index
+                else raw_targets[index]
+            )
+            for index in range(29)
+        )
         for index in range(29):
             motor = self._msg.motor_cmd[index]
             motor.mode = 1
             motor.kp = float(self._kp[index])
             motor.kd = float(self._kd[index])
-            motor.q = float(
-                guarded_by_index[index]
-                if index in guarded_by_index
-                else raw_targets[index]
-            )
+            motor.q = published_targets[index]
             motor.dq = 0.0
             motor.tau = 0.0
         self._msg.crc = self._crc.Crc(self._msg)
@@ -427,32 +559,77 @@ class SonicDriver:
             lower_body_max_velocity_rps=max(lower_body_velocities),
             lower_body_max_estimated_torque_nm=max(lower_body_torques),
         )
+        return published_targets
 
     @staticmethod
     def _joint_name(index: int) -> str:
         from lerobot.robots.unitree_g1.g1_utils import G1_29_JointIndex
         return G1_29_JointIndex(index).name
 
+    def _record_control_trace(
+        self,
+        *,
+        lowstate,
+        control_step: PlantControlStep,
+        intent,
+        policy_targets: tuple[float, ...],
+        handoff_targets: tuple[float, ...],
+        published_targets: tuple[float, ...],
+        handoff_ratio: float,
+    ) -> None:
+        states = lowstate.motor_state
+        self._fault_trace.record(
+            plant_tick_ms=control_step.tick_ms,
+            control_dt_s=control_step.dt_s,
+            intent={
+                "mode": intent.mode,
+                "speed_mps": intent.speed_mps,
+                "movement_angle_rad": intent.movement_angle_rad,
+                "facing_angle_rad": intent.facing_angle_rad,
+                "has_movement": intent.has_movement,
+                "stale": intent.stale,
+            },
+            handoff_ratio=handoff_ratio,
+            plant_support_mode=self._plant_support_mode or "unknown",
+            measured_q_rad=tuple(float(states[index].q) for index in range(29)),
+            measured_dq_rps=tuple(float(states[index].dq) for index in range(29)),
+            measured_ddq_rps2=tuple(
+                float(getattr(states[index], "ddq", 0.0)) for index in range(29)
+            ),
+            measured_tau_nm=tuple(
+                float(states[index].tau_est) for index in range(29)
+            ),
+            policy_target_q_rad=policy_targets,
+            handoff_target_q_rad=handoff_targets,
+            published_target_q_rad=published_targets,
+        )
+
     def run(self):
         self.telemetry.update(status="running")
-        period = 1.0 / self.config.control_hz
-        last = time.monotonic()
+        self._arm_simulation_clock()
         while not self._stop.is_set():
-            tick = time.monotonic()
-            with self._lowstate_lock:
-                lowstate = self._lowstate
-            if lowstate is not None:
-                if self._resync_requested.is_set():
-                    self._resync_requested.clear()
-                    self._resynchronize_controller(lowstate)
-                    last = time.monotonic()
-                    continue
-                intent = self._apply_intent(max(0.0, tick - last))
+            sample = self._next_control_sample()
+            if self._fault_latched.is_set():
+                with self._lowstate_lock:
+                    lowstate = self._lowstate
+                try:
+                    if lowstate is not None:
+                        self._publish_measured_hold(lowstate)
+                finally:
+                    self._stop.set()
+                break
+            if sample is None:
+                continue
+            lowstate, control_step = sample
+            try:
+                intent = self._apply_intent(
+                    control_step.dt_s,
+                    simulation_now_s=control_step.tick_ms / 1_000.0,
+                )
                 # Feed empty external action: the controller reads the mapped
                 # MovementState above and executes the official SONIC pipeline.
-                # Even while Nav2 is idle this keeps proprioception/history and
-                # async planning warm. The learned IDLE output is never sent to
-                # the plant: Nav2 zero/cancel latches measured joints at once.
+                # This call, its history, and its reference cursor advance only
+                # after 20 ms of authoritative MuJoCo time.
                 policy_action = self._controller.run_step({}, lowstate)
                 self.telemetry.update(
                     sonic_policy_speed_mps=(
@@ -467,13 +644,15 @@ class SonicDriver:
                     # look-ahead after that reset, before the next policy tick.
                     self._controller.controller.delta_heading += self._pending_decoder_heading_delta_rad
                     self._pending_decoder_heading_delta_rad = 0.0
-                measured = tuple(float(lowstate.motor_state[index].q) for index in range(29))
+                measured = tuple(
+                    float(lowstate.motor_state[index].q) for index in range(29)
+                )
                 policy_targets = self._action_targets(policy_action, lowstate)
                 decision = self._joint_handoff.decide(
                     motion_active=intent.mode != "IDLE",
                     measured=measured,
                     policy=policy_targets,
-                    now=tick,
+                    now=control_step.tick_ms / 1_000.0,
                 )
                 if decision.static_hold_active:
                     desired_support_mode = "idle"
@@ -485,14 +664,8 @@ class SonicDriver:
                     desired_support_mode
                 )
                 if not support_ready and desired_support_mode == "locomotion":
-                    # Fail closed before publishing learned motion into an
-                    # unknown simulation support state.
-                    self.guard.stop(source="plant_support_unavailable")
-                    decision = self._joint_handoff.decide(
-                        motion_active=False,
-                        measured=measured,
-                        policy=policy_targets,
-                        now=tick,
+                    raise RuntimeError(
+                        "MuJoCo support transition failed during locomotion"
                     )
                 if decision.static_hold_active and not self._static_hold_active:
                     self._arm_guard.reset()
@@ -501,26 +674,53 @@ class SonicDriver:
                     f"{self._joint_name(index)}.q": target
                     for index, target in enumerate(decision.targets)
                 }
-                self._publish(
+                published_targets = self._publish(
                     output_action,
                     lowstate,
+                    control_dt_s=control_step.dt_s,
                     constrain_arms=not decision.static_hold_active,
                 )
+                self._record_control_trace(
+                    lowstate=lowstate,
+                    control_step=control_step,
+                    intent=intent,
+                    policy_targets=policy_targets,
+                    handoff_targets=decision.targets,
+                    published_targets=published_targets,
+                    handoff_ratio=decision.handoff_ratio,
+                )
                 self.telemetry.update(
+                    control_tick_ms=control_step.tick_ms,
+                    control_dt_s=control_step.dt_s,
                     static_hold_active=decision.static_hold_active,
                     motion_handoff_active=decision.motion_handoff_active,
                     motion_handoff_ratio=decision.handoff_ratio,
                 )
-            last = tick
-            time.sleep(max(0.0, period - (time.monotonic() - tick)))
-        self._controller.shutdown()
-        self.telemetry.update(status="stopped")
+            except Exception as exc:
+                self._latch_terminal_fault(f"SONIC runtime fault: {exc}")
+                try:
+                    self._publish_measured_hold(lowstate)
+                finally:
+                    self._stop.set()
+                break
+        try:
+            self._controller.shutdown()
+        finally:
+            if not self._fault_latched.is_set():
+                self.telemetry.update(status="stopped")
 
     def stop(self):
         self._stop.set()
         self.guard.stop()
+        condition = getattr(self, "_control_condition", None)
+        if condition is not None:
+            with condition:
+                condition.notify_all()
 
     def accept_json(self, payload: dict[str, Any]) -> None:
+        if self._fault_latched.is_set():
+            self.guard.stop(source="terminal_fault")
+            return
         if payload.get("type") == "stop":
             self.guard.stop(source="bridge_stop")
             self._motion_armed = True

@@ -58,6 +58,104 @@ class PlantTickGuard:
         return False
 
 
+class PlantControlClockFault(RuntimeError):
+    """The MuJoCo time source cannot safely advance the learned controller."""
+
+
+@dataclass(frozen=True)
+class PlantControlStep:
+    """One SONIC step admitted by the authoritative MuJoCo clock."""
+
+    tick_ms: int
+    dt_s: float
+
+
+class PlantControlClock:
+    """Down-sample strict ``LowState.tick`` time to one SONIC step at 50 Hz.
+
+    ``LowState.tick`` is elapsed MuJoCo time in milliseconds.  The simulation
+    can run slower than wall time when RGB-D rendering is enabled, so a wall
+    timer must never advance SONIC's reference cursor, history, handoff, or
+    joint slew guards.  This gate admits exactly one control step after one
+    simulation-time period and never emits catch-up steps.
+
+    Duplicate/backwards observations, a missing source interval, or a control
+    interval larger than the configured tolerance are terminal faults.  A
+    caller must likewise fault if an admitted step is still pending when the
+    next one arrives; buffering/catching up learned-policy steps would replay
+    stale observations into the plant.
+    """
+
+    def __init__(
+        self,
+        *,
+        control_hz: int = 50,
+        max_source_gap_ms: int | None = None,
+        control_tolerance_ms: int = 4,
+    ) -> None:
+        if isinstance(control_hz, bool) or int(control_hz) <= 0:
+            raise ValueError("control_hz must be a positive integer")
+        if 1_000 % int(control_hz) != 0:
+            raise ValueError("control_hz must divide 1000 into an integer millisecond period")
+        if isinstance(control_tolerance_ms, bool) or int(control_tolerance_ms) < 0:
+            raise ValueError("control_tolerance_ms must be a non-negative integer")
+        self.control_hz = int(control_hz)
+        self.period_ms = 1_000 // self.control_hz
+        source_gap = self.period_ms if max_source_gap_ms is None else max_source_gap_ms
+        if isinstance(source_gap, bool) or int(source_gap) <= 0:
+            raise ValueError("max_source_gap_ms must be a positive integer")
+        self.max_source_gap_ms = int(source_gap)
+        self.control_tolerance_ms = int(control_tolerance_ms)
+        self.last_observed_tick_ms: int | None = None
+        self.last_control_tick_ms: int | None = None
+
+    @staticmethod
+    def _tick(value: int) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 0xFFFFFFFF:
+            raise PlantControlClockFault("LowState.tick must be an unsigned 32-bit integer")
+        return value
+
+    def reset(self) -> None:
+        """Forget the startup stream before arming policy advancement."""
+
+        self.last_observed_tick_ms = None
+        self.last_control_tick_ms = None
+
+    def observe(self, tick_ms: int) -> PlantControlStep | None:
+        current = self._tick(tick_ms)
+        previous_observed = self.last_observed_tick_ms
+        if previous_observed is not None:
+            source_gap = current - previous_observed
+            if source_gap <= 0:
+                kind = "duplicate" if source_gap == 0 else "backwards"
+                raise PlantControlClockFault(
+                    f"MuJoCo control clock {kind}: {previous_observed}ms -> {current}ms"
+                )
+            if source_gap > self.max_source_gap_ms:
+                raise PlantControlClockFault(
+                    "MuJoCo control clock source jumped "
+                    f"{source_gap}ms (limit {self.max_source_gap_ms}ms)"
+                )
+        self.last_observed_tick_ms = current
+
+        previous_control = self.last_control_tick_ms
+        if previous_control is None:
+            self.last_control_tick_ms = current
+            return PlantControlStep(current, self.period_ms / 1_000.0)
+
+        elapsed_ms = current - previous_control
+        if elapsed_ms < self.period_ms:
+            return None
+        if elapsed_ms > self.period_ms + self.control_tolerance_ms:
+            raise PlantControlClockFault(
+                "MuJoCo control interval jumped "
+                f"{elapsed_ms}ms (expected {self.period_ms}ms, "
+                f"tolerance {self.control_tolerance_ms}ms)"
+            )
+        self.last_control_tick_ms = current
+        return PlantControlStep(current, elapsed_ms / 1_000.0)
+
+
 class MotionDirectionGuard:
     """Latch a stop when measured travel contradicts Nav2's linear command.
 
