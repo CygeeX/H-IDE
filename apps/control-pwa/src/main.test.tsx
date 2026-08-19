@@ -243,10 +243,23 @@ describe("control console", () => {
   beforeEach(() => {
     draftExpiresAt = "2099-01-01T00:00:00Z";
     confirmConflict = false;
-    window.history.replaceState({}, "", "/");
+    window.history.replaceState({}, "", "/developer");
     window.localStorage.clear();
     vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
+      if (url.endsWith("/api/v1/auth/me")) {
+        return Promise.resolve(response({
+          principal: {
+            userId: "developer-ui",
+            username: "developer-ui",
+            displayName: "Developer UI",
+            role: "DEVELOPER",
+            siteId: "default",
+            authenticationMethod: "session",
+            scopes: ["api:access", "robots:read", "assistant:use", "speech:use", "missions:use", "events:read", "commands:manage", "mappings:manage", "simulations:manage", "diagnostics:read"],
+          },
+        }));
+      }
       if (url.includes("/robots/robot-1/capabilities")) {
         return Promise.resolve(response({ robotId: "robot-1", agent: "fake-agent", protocol: "fake", capabilities: ["move.forward", "stop", "gripper.open"], safetyMode: "normal" }));
       }
@@ -265,6 +278,9 @@ describe("control console", () => {
       }
       if (url.endsWith("/api/v2/missions/drafts/mission-ui/approve")) {
         return Promise.resolve(response(missionRecordFixture("approved")));
+      }
+      if (url.endsWith("/api/v2/missions/drafts/mission-ui") && !init?.method) {
+        return Promise.resolve(response(missionDraftFixture()));
       }
       if (url.endsWith("/api/v2/missions/drafts/mission-ui/reject")) {
         return Promise.resolve(response({
@@ -352,35 +368,14 @@ describe("control console", () => {
         return Promise.resolve(response({
           taskId: "task-ui",
           conversationId: "conversation-ui",
-          status: "draft_ready",
-          result: { status: "draft_ready", assistantMessage: "草案已生成", draftId: "ui-draft" },
-          draft: {
-            draftId: "ui-draft",
-            status: "draft",
-            plan: {
-              planId: "ui-draft",
-              robotId: "robot-1",
-              expiresAt: draftExpiresAt,
-              steps: [
-                { stepId: "move", commandKey: "move.forward", payload: {}, dependsOn: [] },
-                { stepId: "open", commandKey: "gripper.open", payload: {}, dependsOn: ["move"] },
-              ],
-            },
-            review: {
-              summary: "先移动，再打开夹爪",
-              assumptions: [],
-              warnings: ["执行前确认周围无人"],
-              contributions: [
-                { agentId: "motion-worker", contribution: "motion", summary: "移动规划", steps: [], assumptions: [], warnings: [] },
-                { agentId: "manipulation-worker", contribution: "manipulation", summary: "夹爪规划", steps: [], assumptions: [], warnings: [] },
-              ],
-              steps: [
-                { stepId: "move", commandKey: "move.forward", payload: {}, dependsOn: [], rationale: "接近目标", contributedBy: "motion-worker" },
-                { stepId: "open", commandKey: "gripper.open", payload: {}, dependsOn: ["move"], rationale: "完成操作", contributedBy: "manipulation-worker" },
-              ],
-              contextVersion: "ctx-ui",
-              robotId: "robot-1",
-            },
+          status: "completed",
+          result: {
+            schemaVersion: "h-ide.assistant-result/2",
+            intent: "ROBOT_ACTION",
+            route: "mission_review",
+            routeStatus: "review",
+            assistantMessage: "行动方案已生成，等待你确认。",
+            missionDraftId: "mission-ui",
           },
         }));
       }
@@ -446,6 +441,13 @@ describe("control console", () => {
     vi.mocked(fetch).mockImplementation((input: RequestInfo | URL) => {
       const url = String(input);
       requestedUrls.push(url);
+      if (url.endsWith("/api/v1/auth/me")) {
+        return Promise.resolve(response({ principal: {
+          userId: "developer-ui", username: "developer-ui", displayName: "Developer UI",
+          role: "DEVELOPER", siteId: "default", authenticationMethod: "session",
+          scopes: ["api:access", "robots:read", "assistant:use", "speech:use", "missions:use", "events:read", "commands:manage", "mappings:manage", "simulations:manage", "diagnostics:read"],
+        } }));
+      }
       if (url.endsWith("/robots")) {
         return Promise.resolve(response([{
           robotId: "g1-dev",
@@ -485,20 +487,17 @@ describe("control console", () => {
   it("turns natural language into a reviewable continuous Mission before explicit confirmation", async () => {
     render(<App />);
     await screen.findAllByText("robot-1");
-    fireEvent.click(screen.getByRole("button", { name: "添加场景" }));
-    expect(await screen.findByRole("region", { name: "PCD 场景工作区" })).toBeInTheDocument();
-    expect(screen.getByText("场景地图与语义标注")).toBeInTheDocument();
-    fireEvent.click(screen.getAllByRole("button", { name: "返回会话" })[0]);
+    expect(screen.queryByRole("button", { name: /导入 PCD|添加场景/ })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: /开始语音输入/ })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "按住确认并执行" })).not.toBeInTheDocument();
     fireEvent.change(screen.getByLabelText("任务描述"), {
       target: { value: "向前移动后打开夹爪" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "发送给调度 Agent" }));
+    fireEvent.click(screen.getByRole("button", { name: "发送给 H-IDE" }));
     expect((await screen.findAllByText("向前移动后打开夹爪")).length).toBeGreaterThan(0);
     expect(screen.getByText("vision.observe@2.0.0")).toBeInTheDocument();
     expect(screen.getByText("navigation.navigate_to_pose@2.0.0")).toBeInTheDocument();
-    expect(screen.getByText(/所有底盘位移和转向统一交给 Nav2/)).toBeInTheDocument();
+    expect(screen.getByText(/请确认周围环境安全/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "按住确认并执行" })).not.toBeDisabled();
     const requestsBeforeConfirmation = vi.mocked(fetch).mock.calls.map(([input]) => String(input));
     expect(requestsBeforeConfirmation.some((url) => url.endsWith("/api/v1/commands"))).toBe(false);
@@ -513,7 +512,7 @@ describe("control console", () => {
     render(<App />);
     await screen.findAllByText("robot-1");
     fireEvent.change(screen.getByLabelText("任务描述"), { target: { value: "向前移动" } });
-    fireEvent.click(screen.getByRole("button", { name: "发送给调度 Agent" }));
+    fireEvent.click(screen.getByRole("button", { name: "发送给 H-IDE" }));
     await screen.findByRole("region", { name: "Mission V2 计划审核" });
 
     fireEvent.change(screen.getByLabelText(/审核备注/), { target: { value: "目标描述不清楚" } });
@@ -523,17 +522,19 @@ describe("control console", () => {
     expect(vi.mocked(fetch).mock.calls.some(([input]) => String(input).endsWith("/api/v1/commands"))).toBe(false);
   });
 
-  it("uses Mission V2 rather than the retired one-turn assistant endpoint", async () => {
+  it("routes through ConversationGateway before loading a Mission V2 draft", async () => {
     render(<App />);
     await screen.findAllByText("robot-1");
     fireEvent.change(screen.getByLabelText("任务描述"), { target: { value: "去厨房" } });
-    fireEvent.click(screen.getByRole("button", { name: "发送给调度 Agent" }));
+    fireEvent.click(screen.getByRole("button", { name: "发送给 H-IDE" }));
     await screen.findByRole("region", { name: "Mission V2 计划审核" });
     fireEvent.click(screen.getByRole("button", { name: "按住确认并执行" }));
     await screen.findByRole("region", { name: "连续 Mission 执行状态" });
     const urls = vi.mocked(fetch).mock.calls.map(([input]) => String(input));
-    expect(urls.some((url) => url.endsWith("/api/v2/missions/drafts"))).toBe(true);
-    expect(urls.some((url) => url.includes("/assistant/conversations/conversation-ui/messages"))).toBe(false);
+    expect(urls.some((url) => url.endsWith("/api/v2/missions/drafts/mission-ui"))).toBe(true);
+    expect(urls.some((url) => url.includes("/assistant/conversations/conversation-ui/messages"))).toBe(true);
+    expect(vi.mocked(fetch).mock.calls.some(([input, init]) =>
+      String(input).endsWith("/api/v2/missions/drafts") && init?.method === "POST")).toBe(false);
     expect(urls.some((url) => url.endsWith("/api/v1/commands"))).toBe(false);
   });
 
@@ -572,7 +573,7 @@ describe("control console", () => {
     render(<App />);
     await screen.findAllByText("robot-1");
     fireEvent.change(screen.getByLabelText("任务描述"), { target: { value: "去会议桌前站着" } });
-    fireEvent.click(screen.getByRole("button", { name: "发送给调度 Agent" }));
+    fireEvent.click(screen.getByRole("button", { name: "发送给 H-IDE" }));
     await screen.findByRole("region", { name: "Mission V2 计划审核" });
     fireEvent.click(screen.getByRole("button", { name: "按住确认并执行" }));
 
@@ -611,7 +612,7 @@ describe("control console", () => {
     render(<App />);
     await screen.findAllByText("robot-1");
     fireEvent.change(screen.getByLabelText("任务描述"), { target: { value: "去厨房" } });
-    fireEvent.click(screen.getByRole("button", { name: "发送给调度 Agent" }));
+    fireEvent.click(screen.getByRole("button", { name: "发送给 H-IDE" }));
     await screen.findByRole("region", { name: "Mission V2 计划审核" });
     fireEvent.click(screen.getByRole("button", { name: "按住确认并执行" }));
 
@@ -698,5 +699,184 @@ describe("control console", () => {
     fireEvent.click(screen.getByRole("button", { name: /接口中心/ }));
     expect(await screen.findByText("接口版本中心")).toBeInTheDocument();
     expect(screen.getByText("先校验并探测，再启用版本")).toBeInTheDocument();
+  });
+
+  it("answers social chat through ConversationGateway without creating a plan", async () => {
+    const fallback = vi.mocked(fetch).getMockImplementation();
+    vi.mocked(fetch).mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/assistant/turns/task-ui")) {
+        return Promise.resolve(response({
+          taskId: "task-ui",
+          conversationId: "conversation-ui",
+          status: "completed",
+          result: {
+            schemaVersion: "h-ide.assistant-result/2",
+            intent: "SOCIAL_CHAT",
+            route: "reply",
+            routeStatus: "completed",
+            assistantMessage: "你好！今天想聊点什么？",
+          },
+        }));
+      }
+      if (url.endsWith("/assistant/conversations/conversation-ui")) {
+        return Promise.resolve(response({
+          conversationId: "conversation-ui",
+          robotId: "robot-1",
+          requestedBy: "developer-ui",
+          locale: "zh-CN",
+          status: "idle",
+          messages: [{
+            messageId: "assistant-social-ui",
+            taskId: "task-ui",
+            role: "assistant",
+            content: "你好！今天想聊点什么？",
+            modality: "text",
+            createdAt: new Date().toISOString(),
+          }],
+          turns: [],
+          drafts: [],
+        }));
+      }
+      return fallback!(input, init) as Promise<Response>;
+    });
+
+    render(<App />);
+    await screen.findAllByText("robot-1");
+    fireEvent.change(screen.getByLabelText("任务描述"), { target: { value: "你好" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送给 H-IDE" }));
+
+    expect(await screen.findByText("你好！今天想聊点什么？")).toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Mission V2 计划审核" })).not.toBeInTheDocument();
+    expect(vi.mocked(fetch).mock.calls.some(([input, init]) =>
+      String(input).endsWith("/api/v2/missions/drafts") && init?.method === "POST")).toBe(false);
+  });
+
+  it("shows proxied visual evidence for a read-only observation without a plan", async () => {
+    const fallback = vi.mocked(fetch).getMockImplementation();
+    const visualResult = {
+      analysisId: "analysis-observe-ui",
+      hypotheses: [{ label: "会议桌", score: 0.94 }],
+      evidence: [{ kind: "rgb_keyframe", mediaType: "image/jpeg", sha256: "e".repeat(64) }],
+    };
+    const result = {
+      schemaVersion: "h-ide.assistant-result/2",
+      intent: "ROBOT_OBSERVE",
+      route: "visual_observation",
+      routeStatus: "completed",
+      assistantMessage: "我看到了会议桌。",
+      visualResult,
+      evidence: [{
+        kind: "rgb_keyframe",
+        mediaType: "image/jpeg",
+        sha256: "e".repeat(64),
+        proxyUrl: `/api/v1/assistant/turns/task-ui/visual-evidence/analysis-observe-ui/${"e".repeat(64)}`,
+      }],
+    };
+    vi.mocked(fetch).mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/assistant/turns/task-ui/visual-evidence/")) {
+        return Promise.resolve(new Response(new Blob(["jpeg"], { type: "image/jpeg" }), {
+          status: 200,
+          headers: { "content-type": "image/jpeg" },
+        }));
+      }
+      if (url.includes("/assistant/turns/task-ui")) {
+        return Promise.resolve(response({ taskId: "task-ui", conversationId: "conversation-ui", status: "completed", result }));
+      }
+      if (url.endsWith("/assistant/conversations/conversation-ui")) {
+        return Promise.resolve(response({
+          conversationId: "conversation-ui", robotId: "robot-1", requestedBy: "developer-ui",
+          locale: "zh-CN", status: "idle", messages: [],
+          turns: [{ taskId: "task-ui", conversationId: "conversation-ui", status: "completed", result }], drafts: [],
+        }));
+      }
+      return fallback!(input, init) as Promise<Response>;
+    });
+
+    render(<App />);
+    await screen.findAllByText("robot-1");
+    fireEvent.click(screen.getByRole("button", { name: "用户" }));
+    fireEvent.change(screen.getByLabelText("任务描述"), { target: { value: "只观察当前画面" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送给 H-IDE" }));
+
+    expect(await screen.findByRole("region", { name: "视觉证据" })).toBeInTheDocument();
+    expect(screen.getByText("识别到：会议桌")).toBeInTheDocument();
+    expect(screen.queryByText("视觉处理详情")).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Mission V2 计划审核" })).not.toBeInTheDocument();
+    await waitFor(() => expect(vi.mocked(fetch).mock.calls.some(([input]) =>
+      String(input).includes("/assistant/turns/task-ui/visual-evidence/"))).toBe(true));
+  });
+
+  it("keeps a normal user out of the developer shell and hides technical product entry points", async () => {
+    const fallback = vi.mocked(fetch).getMockImplementation();
+    window.history.replaceState({}, "", "/developer");
+    vi.mocked(fetch).mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/api/v1/auth/me")) {
+        return Promise.resolve(response({ principal: {
+          userId: "user-ui", username: "user-ui", displayName: "普通用户",
+          role: "USER", siteId: "default", authenticationMethod: "session",
+          scopes: ["api:access", "robots:read", "assistant:use", "speech:use", "missions:use", "events:read"],
+        } }));
+      }
+      return fallback!(input, init) as Promise<Response>;
+    });
+
+    render(<App />);
+    expect(await screen.findByText("今天想和机器人做什么？")).toBeInTheDocument();
+    await waitFor(() => expect(window.location.pathname).toBe("/app"));
+    expect(screen.queryByRole("button", { name: "打开工具" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /导入 PCD|添加场景/ })).not.toBeInTheDocument();
+    expect(screen.queryByText("robot-1")).not.toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: "对话机器人" })).toHaveTextContent("机器人 1");
+  });
+
+  it("logs in with Cookie credentials and applies the CSRF token to the first write", async () => {
+    const fallback = vi.mocked(fetch).getMockImplementation();
+    window.history.replaceState({}, "", "/app");
+    vi.mocked(fetch).mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/api/v1/auth/me")) {
+        return Promise.resolve(response({ detail: "not authenticated" }, { status: 401 }));
+      }
+      if (url.endsWith("/api/v1/auth/login")) {
+        return Promise.resolve(response({
+          principal: {
+            userId: "user-login-ui", username: "login-user", displayName: "登录用户",
+            role: "USER", siteId: "default", authenticationMethod: "session",
+            scopes: ["api:access", "robots:read", "assistant:use", "speech:use", "missions:use", "events:read"],
+          },
+          csrfToken: "csrf-ui-token",
+        }));
+      }
+      if (url.includes("/assistant/turns/task-ui")) {
+        return Promise.resolve(response({
+          taskId: "task-ui", conversationId: "conversation-ui", status: "completed",
+          result: { intent: "SOCIAL_CHAT", route: "reply", routeStatus: "completed", assistantMessage: "你好！" },
+        }));
+      }
+      return fallback!(input, init) as Promise<Response>;
+    });
+
+    render(<App />);
+    expect(await screen.findByRole("region", { name: "登录 H-IDE" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "注册" })).toBeInTheDocument();
+    fireEvent.change(screen.getByRole("textbox", { name: "用户名" }), { target: { value: "login-user" } });
+    fireEvent.change(screen.getByLabelText("密码"), { target: { value: "Strong-password-1" } });
+    fireEvent.click(screen.getAllByRole("button", { name: "登录" }).at(-1)!);
+    await screen.findByText("今天想和机器人做什么？");
+    fireEvent.change(screen.getByLabelText("任务描述"), { target: { value: "你好" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送给 H-IDE" }));
+    await waitFor(() => expect(vi.mocked(fetch).mock.calls.some(([input]) =>
+      String(input).includes("/assistant/conversations/conversation-ui/messages"))).toBe(true));
+
+    const loginCall = vi.mocked(fetch).mock.calls.find(([input]) => String(input).endsWith("/api/v1/auth/login"));
+    expect(loginCall?.[1]?.credentials).toBe("include");
+    const messageCall = vi.mocked(fetch).mock.calls.find(([input]) =>
+      String(input).includes("/assistant/conversations/conversation-ui/messages"));
+    const headers = new Headers(messageCall?.[1]?.headers);
+    expect(headers.get("x-csrf-token")).toBe("csrf-ui-token");
+    expect(headers.has("authorization")).toBe(false);
   });
 });

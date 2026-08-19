@@ -5,6 +5,8 @@ import type {
   AssistantConversation,
   AssistantDraft,
   AssistantMessage,
+  AuthPrincipal,
+  AuthSessionResponse,
   AssistantTurn,
   CapabilitySnapshot,
   CommandReceipt,
@@ -14,13 +16,12 @@ import type {
   MissionDraftRecordV2,
   MissionRecordV2,
   RobotState,
-  SceneSummary,
   SpeechTranscription,
   VisualMissionRecord,
 } from "./contracts";
 import { isAssistantTurnTerminal, isTerminal, isVisualMissionPlan, statusLabel } from "./contracts";
 import { BrowserWavRecorder } from "./audio";
-import { SceneWorkspace, type ActiveSceneContext } from "./scene-workspace";
+import type { ActiveSceneContext } from "./scene-workspace";
 import { VisualMissionCard } from "./visual-mission-card";
 import { SimulationWorkspace } from "./simulation-workspace";
 import {
@@ -33,13 +34,15 @@ import "./chat-shell.css";
 
 type ConnectionState = "connecting" | "live" | "offline";
 type AppRoute =
-  | { kind: "chat"; conversationId?: string }
-  | { kind: "scene" }
-  | { kind: "simulation" }
-  | { kind: "interfaces" };
+  | { kind: "chat"; shell: "user" | "developer"; conversationId?: string }
+  | { kind: "simulation"; shell: "developer" }
+  | { kind: "interfaces"; shell: "developer" };
 
 const API_BASE = (import.meta.env.VITE_CONTROL_API_URL as string | undefined)?.replace(/\/$/, "") ?? "";
-const API_TOKEN = (import.meta.env.VITE_CONTROL_API_TOKEN as string | undefined) ?? "dev-token";
+// Browser sessions are the product path. A bearer token remains an explicit,
+// opt-in compatibility path for developer diagnostics and automated fixtures.
+const API_TOKEN = (import.meta.env.VITE_CONTROL_API_TOKEN as string | undefined)?.trim() ?? "";
+let inMemoryCsrfToken = "";
 
 class ApiFailure extends Error {
   status: number;
@@ -53,6 +56,22 @@ class ApiFailure extends Error {
 
 function apiUrl(path: string): string {
   return `${API_BASE}${path}`;
+}
+
+function cookieValue(name: string): string {
+  if (typeof document === "undefined") return "";
+  const prefix = `${encodeURIComponent(name)}=`;
+  const entry = document.cookie.split(";").map((item) => item.trim()).find((item) => item.startsWith(prefix));
+  if (!entry) return "";
+  try {
+    return decodeURIComponent(entry.slice(prefix.length));
+  } catch {
+    return "";
+  }
+}
+
+function setCsrfToken(value: string | undefined): void {
+  inMemoryCsrfToken = value?.trim() ?? "";
 }
 
 export function apiErrorDetail(body: unknown, fallback: string): string {
@@ -81,7 +100,12 @@ async function apiFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
     headers.set("content-type", "application/json");
   }
   if (API_TOKEN) headers.set("authorization", `Bearer ${API_TOKEN}`);
-  const response = await fetch(apiUrl(path), { ...init, headers });
+  const method = (init.method ?? "GET").toUpperCase();
+  if (["POST", "PUT", "PATCH", "DELETE"].includes(method) && !API_TOKEN) {
+    const csrf = inMemoryCsrfToken || cookieValue("hide_csrf");
+    if (csrf) headers.set("x-csrf-token", csrf);
+  }
+  const response = await fetch(apiUrl(path), { ...init, headers, credentials: "include" });
   const text = await response.text();
   let body: unknown = null;
   if (text) {
@@ -103,7 +127,7 @@ async function apiFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
 async function apiFetchBlob(path: string): Promise<Blob> {
   const headers = new Headers({ accept: "image/jpeg,image/png,application/octet-stream" });
   if (API_TOKEN) headers.set("authorization", `Bearer ${API_TOKEN}`);
-  const response = await fetch(apiUrl(path), { headers, cache: "no-store" });
+  const response = await fetch(apiUrl(path), { headers, cache: "no-store", credentials: "include" });
   if (!response.ok) {
     let detail = response.statusText;
     try {
@@ -130,11 +154,14 @@ function wsUrl(after: number): string {
     const parsed = new URL(API_BASE, window.location.href);
     parsed.protocol = parsed.protocol === "https:" ? "wss:" : "ws:";
     parsed.pathname = `${parsed.pathname.replace(/\/$/, "")}/api/v1/events`;
-    parsed.search = new URLSearchParams({ after: String(after), token: API_TOKEN }).toString();
+    const params = new URLSearchParams({ after: String(after) });
+    if (API_TOKEN) params.set("token", API_TOKEN);
+    parsed.search = params.toString();
     return parsed.toString();
   }
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  return `${protocol}//${window.location.host}/api/v1/events?after=${after}&token=${encodeURIComponent(API_TOKEN)}`;
+  const token = API_TOKEN ? `&token=${encodeURIComponent(API_TOKEN)}` : "";
+  return `${protocol}//${window.location.host}/api/v1/events?after=${after}${token}`;
 }
 
 function friendlyError(error: unknown): string {
@@ -210,12 +237,21 @@ function EmptyState({ children }: { children: React.ReactNode }) {
 }
 
 function parseAppRoute(pathname: string): AppRoute {
-  if (pathname === "/scenes" || pathname.startsWith("/scenes/")) return { kind: "scene" };
-  if (pathname === "/simulation" || pathname.startsWith("/simulation/")) return { kind: "simulation" };
-  if (pathname === "/interfaces" || pathname.startsWith("/interfaces/")) return { kind: "interfaces" };
-  const task = pathname.match(/^\/tasks\/([^/]+)$/);
-  if (task) return { kind: "chat", conversationId: decodeURIComponent(task[1]) };
-  return { kind: "chat" };
+  if (pathname === "/developer/simulation" || pathname.startsWith("/developer/simulation/")) return { kind: "simulation", shell: "developer" };
+  if (pathname === "/developer/interfaces" || pathname.startsWith("/developer/interfaces/")) return { kind: "interfaces", shell: "developer" };
+  const developerTask = pathname.match(/^\/developer\/tasks\/([^/]+)$/);
+  if (developerTask) return { kind: "chat", shell: "developer", conversationId: decodeURIComponent(developerTask[1]) };
+  if (pathname === "/developer" || pathname === "/developer/") return { kind: "chat", shell: "developer" };
+  const task = pathname.match(/^\/(?:app\/)?tasks\/([^/]+)$/);
+  if (task) return { kind: "chat", shell: "user", conversationId: decodeURIComponent(task[1]) };
+  // PCD/scenes is intentionally absent from the product router. Legacy URLs
+  // land in the assistant instead of exposing the archived workspace.
+  return { kind: "chat", shell: "user" };
+}
+
+function chatPath(shell: "user" | "developer", conversationId?: string): string {
+  const root = shell === "developer" ? "/developer" : "/app";
+  return conversationId ? `${root}/tasks/${encodeURIComponent(conversationId)}` : root;
 }
 
 function useAppRoute(): [AppRoute, (path: string, options?: { replace?: boolean }) => void] {
@@ -233,8 +269,103 @@ function useAppRoute(): [AppRoute, (path: string, options?: { replace?: boolean 
   return [route, navigate];
 }
 
+function AuthScreen({ onAuthenticated }: { onAuthenticated: (session: AuthSessionResponse) => void }) {
+  const [mode, setMode] = useState<"login" | "register">("login");
+  const [username, setUsername] = useState("");
+  const [displayName, setDisplayName] = useState("");
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    void (async () => {
+      setBusy(true);
+      setError("");
+      try {
+        if (mode === "register") {
+          await apiFetch<{ user: AuthPrincipal }>("/api/v1/auth/register", {
+            method: "POST",
+            body: JSON.stringify({ username, displayName: displayName.trim() || username, password }),
+          });
+        }
+        const session = await apiFetch<AuthSessionResponse>("/api/v1/auth/login", {
+          method: "POST",
+          body: JSON.stringify({ username, password }),
+        });
+        if (!session?.principal?.userId) throw new Error("登录响应缺少用户身份");
+        setCsrfToken(session.csrfToken);
+        onAuthenticated(session);
+      } catch (reason) {
+        setError(friendlyError(reason));
+      } finally {
+        setBusy(false);
+      }
+    })();
+  };
+
+  return <main className="auth-shell">
+    <section className="auth-intro"><span className="auth-logo"><Icon name="logo" /></span><p className="eyebrow">H-IDE ASSISTANT</p><h1>让人与机器人自然协作</h1><p>聊天、视觉观察与机器人任务都在同一个连续会话里；真正的行动始终受权限与安全边界约束。</p></section>
+    <section className="auth-card" aria-label={mode === "login" ? "登录 H-IDE" : "注册 H-IDE"}>
+      <div className="auth-tabs"><button className={mode === "login" ? "active" : ""} type="button" onClick={() => setMode("login")}>登录</button><button className={mode === "register" ? "active" : ""} type="button" onClick={() => setMode("register")}>注册</button></div>
+      <form onSubmit={submit}>
+        <div><h2>{mode === "login" ? "欢迎回来" : "创建账户"}</h2><p>{mode === "login" ? "使用工作站账户继续" : "注册后会以普通用户身份登录"}</p></div>
+        <label>用户名<input name="username" autoComplete="username" required minLength={2} maxLength={64} value={username} onChange={(event) => setUsername(event.target.value)} /></label>
+        {mode === "register" ? <label>显示名称<input name="displayName" autoComplete="name" maxLength={80} value={displayName} onChange={(event) => setDisplayName(event.target.value)} /></label> : null}
+        <label>密码<input name="password" type="password" autoComplete={mode === "login" ? "current-password" : "new-password"} required minLength={12} maxLength={256} value={password} onChange={(event) => setPassword(event.target.value)} /></label>
+        {error ? <p className="auth-error" role="alert"><Icon name="warning" />{error}</p> : null}
+        <button className="auth-submit" type="submit" disabled={busy}>{busy ? "请稍候…" : mode === "login" ? "登录" : "注册并登录"}</button>
+      </form>
+      <p className="auth-security">使用 HttpOnly 会话 Cookie 与 CSRF 双重提交保护；浏览器不会保存 API Bearer Token。</p>
+    </section>
+  </main>;
+}
+
 function App() {
+  const [principal, setPrincipal] = useState<AuthPrincipal | null>(null);
+  const [checking, setChecking] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    void apiFetch<AuthSessionResponse>("/api/v1/auth/me")
+      .then((session) => {
+        if (!cancelled && session?.principal?.userId) {
+          setCsrfToken(session.csrfToken);
+          setPrincipal(session.principal);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setPrincipal(null);
+      })
+      .finally(() => {
+        if (!cancelled) setChecking(false);
+      });
+    return () => { cancelled = true; };
+  }, []);
+
+  const logout = useCallback(() => {
+    void apiFetch<void>("/api/v1/auth/logout", { method: "POST" })
+      .catch(() => undefined)
+      .finally(() => {
+        setCsrfToken("");
+        setPrincipal(null);
+        window.history.replaceState({}, "", "/app");
+      });
+  }, []);
+
+  if (checking) return <div className="auth-loading" role="status"><span className="planning-pulse" />正在连接 H-IDE…</div>;
+  if (!principal) return <AuthScreen onAuthenticated={(session) => {
+    setPrincipal(session.principal);
+    window.history.replaceState({}, "", "/app");
+  }} />;
+  return <WorkspaceApp principal={principal} onLogout={logout} />;
+}
+
+function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLogout: () => void }) {
   const [route, navigate] = useAppRoute();
+  const canDevelop = (principal.role === "DEVELOPER" || principal.role === "ADMIN")
+    && principal.scopes.includes("diagnostics:read");
+  const developerMode = canDevelop && route.shell === "developer";
   const [robots, setRobots] = useState<RobotState[]>([]);
   const [selectedRobotId, setSelectedRobotId] = useState("");
   const [capabilities, setCapabilities] = useState<CapabilitySnapshot | null>(null);
@@ -263,8 +394,7 @@ function App() {
   const [missionDraftHistory, setMissionDraftHistory] = useState<MissionDraftRecordV2[]>([]);
   const [missionHistoryLoaded, setMissionHistoryLoaded] = useState(false);
   const [visualMission, setVisualMission] = useState<VisualMissionRecord | null>(null);
-  const [activeSceneContext, setActiveSceneContext] = useState<ActiveSceneContext | null>(null);
-  const [pendingSceneFile, setPendingSceneFile] = useState<File | null>(null);
+  const activeSceneContext: ActiveSceneContext | null = null;
   const [toolMenuOpen, setToolMenuOpen] = useState(false);
   const [controlPanelOpen, setControlPanelOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -296,6 +426,10 @@ function App() {
   assistantConversationRef.current = assistantConversation;
   const selectedRobotRef = useRef(selectedRobotId);
   selectedRobotRef.current = selectedRobotId;
+
+  useEffect(() => {
+    if (route.shell === "developer" && !canDevelop) navigate("/app", { replace: true });
+  }, [canDevelop, navigate, route.shell]);
 
   const selectedRobot = useMemo(
     () => robots.find((robot) => robot.robotId === selectedRobotId) ?? null,
@@ -375,13 +509,15 @@ function App() {
 
   useEffect(() => {
     let cancelled = false;
+    const developerRequests = developerMode
+      ? Promise.all([loadMappings(), apiFetch<ControlEvent[]>("/api/v1/events")])
+      : Promise.resolve<[void, ControlEvent[]]>([undefined, []]);
     void Promise.all([
       loadRobots(),
-      loadMappings(),
-      apiFetch<ControlEvent[]>("/api/v1/events"),
       loadMissionHistory(),
+      developerRequests,
     ])
-      .then(([, , initialEvents]) => {
+      .then(([, , [, initialEvents]]) => {
         if (cancelled) return;
         setEvents(initialEvents);
         const last = initialEvents.reduce((max, event) => Math.max(max, Number(event.eventId ?? 0)), 0);
@@ -392,41 +528,15 @@ function App() {
         if (!cancelled) setError(friendlyError(reason));
       });
     return () => { cancelled = true; };
-  }, [loadMappings, loadMissionHistory, loadRobots]);
+  }, [developerMode, loadMappings, loadMissionHistory, loadRobots]);
 
   useEffect(() => {
-    if (!selectedRobot) {
+    if (!selectedRobot || !developerMode) {
       setCapabilities(null);
       return;
     }
     void loadCapabilities(selectedRobot.robotId);
-  }, [loadCapabilities, selectedRobot?.robotId]);
-
-  useEffect(() => {
-    let cancelled = false;
-    setActiveSceneContext(null);
-    if (!selectedRobot) return undefined;
-    void Promise.all([
-      apiFetch<{ sceneId: string; revision: number }>(`/api/v1/robots/${encodeURIComponent(selectedRobot.robotId)}/scene-binding`),
-      apiFetch<SceneSummary[]>("/api/v1/scenes"),
-    ]).then(([binding, scenes]) => {
-      if (cancelled) return;
-      const scene = scenes.find((item) => item.sceneId === binding.sceneId);
-      const revision = scene?.revisions.find((item) => item.revision === binding.revision);
-      if (!revision?.boundsMap || revision.status !== "published") return;
-      setActiveSceneContext({
-        sceneId: binding.sceneId,
-        revision: binding.revision,
-        bounds: revision.boundsMap,
-        annotations: revision.annotations,
-        currentPose: selectedRobot.pose,
-      });
-    }).catch(() => {
-      // Scene context is optional for non-spatial tasks. The scene workspace
-      // exposes any actionable catalog or binding error when the user opens it.
-    });
-    return () => { cancelled = true; };
-  }, [selectedRobot?.robotId, selectedRobot?.pose]);
+  }, [developerMode, loadCapabilities, selectedRobot?.robotId]);
 
   useEffect(() => {
     if (!missionHistoryLoaded) return undefined;
@@ -444,7 +554,7 @@ function App() {
           || missionDraftHistory.some((item) => item.status === "draft")
         ) return;
         const active = conversations.find((item) => ["planning", "review", "running"].includes(item.status));
-        if (active) navigate(`/tasks/${encodeURIComponent(active.conversationId)}`, { replace: true });
+        if (active) navigate(chatPath(initialRoute.shell, active.conversationId), { replace: true });
       })
       .catch((reason) => {
         if (!cancelled) setError(friendlyError(reason));
@@ -468,7 +578,7 @@ function App() {
     );
     const activeDraft = missionDraftHistory.find((item) => item.status === "draft");
     const identifier = activeMission?.missionId ?? activeDraft?.draftId;
-    if (identifier) navigate(`/tasks/${encodeURIComponent(identifier)}`, { replace: true });
+    if (identifier) navigate(chatPath(initialRoute.shell, identifier), { replace: true });
   }, [missionDraftHistory, missionHistory, missionHistoryLoaded, navigate]);
 
   useEffect(() => {
@@ -645,10 +755,10 @@ function App() {
       assistantConversationRef.current = conversation;
       setAssistantConversation(conversation);
       setAssistantConversations((current) => [conversation, ...current.filter((item) => item.conversationId !== conversation.conversationId)]);
-      navigate(`/tasks/${encodeURIComponent(conversation.conversationId)}`);
+      navigate(chatPath(route.shell, conversation.conversationId));
     }
     return conversation;
-  }, [assistantConversation, navigate]);
+  }, [assistantConversation, navigate, route.shell]);
 
   const refreshConversation = useCallback(async (conversationId: string, robotId: string) => {
     const detail = await apiFetch<AssistantConversation>(
@@ -684,9 +794,22 @@ function App() {
       if (selectedRobotRef.current !== robotId) return turn;
       setAssistantTurn(turn);
       if (isAssistantTurnTerminal(turn.status)) {
-        if (turn.draft) {
+        if (turn.result?.missionDraftId) {
+          const mission = await apiFetch<MissionDraftRecordV2>(
+            `/api/v2/missions/drafts/${encodeURIComponent(turn.result.missionDraftId)}`,
+          );
+          setMissionDraft(mission);
+          setMissionDraftHistory((current) => [
+            mission,
+            ...current.filter((item) => item.draftId !== mission.draftId),
+          ]);
+          setDraft(null);
+          setNotice("行动方案已准备好，请确认后再执行");
+        } else if (turn.draft) {
           setDraft(turn.draft);
           setNotice("多 Agent 计划已生成，等待人工审核");
+        } else if (turn.status === "completed") {
+          setNotice("");
         } else if (turn.status === "needs_input") {
           setNotice(turn.result?.assistantMessage ?? "调度 Agent 需要补充信息");
         } else if (turn.status === "cannot_plan") {
@@ -734,13 +857,6 @@ function App() {
             text,
             modality,
             transcriptionId: sourceTranscriptionId,
-            sceneSelection: activeSceneContext ? {
-              sceneRef: {
-                sceneId: activeSceneContext.sceneId,
-                revision: activeSceneContext.revision,
-              },
-              selectedPoint: activeSceneContext.selectedPoint,
-            } : undefined,
           }),
         },
       );
@@ -778,7 +894,7 @@ function App() {
     } finally {
       setAssistantBusy(false);
     }
-  }, [activeSceneContext, assistantBusy, connection, ensureAssistantConversation, monitorAssistantTurn, selectedRobotId]);
+  }, [assistantBusy, connection, ensureAssistantConversation, monitorAssistantTurn, selectedRobotId]);
 
   const advanceMission = useCallback(async (missionId: string) => {
     const advanced = await apiFetch<MissionAdvanceResultV2>(
@@ -818,6 +934,17 @@ function App() {
   ) => {
     const text = rawText.trim();
     if (!text || assistantBusy) return;
+    const activeMission = missionRecord
+      && !["completed", "failed", "cancelled"].includes(missionRecord.snapshot.status)
+      ? missionRecord
+      : null;
+    // Only an already-running Mission may bypass the conversation router for
+    // an answer/revision. Every new message must return to ConversationGateway
+    // so chat and QA can never accidentally become a robot plan.
+    if (!activeMission) {
+      await sendAssistantMessage(text, modality, sourceTranscriptionId);
+      return;
+    }
     if (connection !== "live") {
       setError("工作站当前离线。任务不会排队发送，请恢复连接后重新提交。");
       return;
@@ -836,95 +963,49 @@ function App() {
     };
     setMissionMessages((current) => [...current, userMessage]);
     try {
-      const activeMission = missionRecord
-        && !["completed", "failed", "cancelled"].includes(missionRecord.snapshot.status)
-        ? missionRecord
-        : null;
-      if (activeMission) {
-        const response = await apiFetch<{
-          decision: { kind?: string; reason?: string };
-          mission: MissionRecordV2;
-        }>(`/api/v2/missions/${encodeURIComponent(activeMission.missionId)}/messages`, {
-          method: "POST",
-          body: JSON.stringify({
-            text,
-            requestedBy: "operator",
-            kind: activeMission.snapshot.status === "needs_input" ? "answer" : "modify_goal",
-          }),
-        });
-        setMissionRecord(response.mission);
-        setMissionHistory((current) => [
-          response.mission,
-          ...current.filter((item) => item.missionId !== response.mission.missionId),
-        ]);
-        setMissionMessages((current) => [
-          ...current,
-          {
-            messageId: makeId("mission-message"),
-            role: "assistant",
-            content: response.decision?.kind === "replan"
-              ? "已结合你的补充生成持续任务修订；请审核变化后继续。"
-              : response.decision?.reason ?? "已记录补充信息，等待人工处理。",
-            modality: "text",
-            createdAt: new Date().toISOString(),
-          },
-        ]);
-        return;
-      }
-      const created = await apiFetch<MissionDraftRecordV2>("/api/v2/missions/drafts", {
+      const response = await apiFetch<{
+        decision: { kind?: string; reason?: string };
+        mission: MissionRecordV2;
+      }>(`/api/v2/missions/${encodeURIComponent(activeMission.missionId)}/messages`, {
         method: "POST",
         body: JSON.stringify({
-          requestId: makeId("mission-request"),
-          robotId: selectedRobotId,
-          objective: text,
           requestedBy: "operator",
-          locale: "zh-CN",
-          modality,
-          sceneRefs: activeSceneContext ? [{
-            sceneId: activeSceneContext.sceneId,
-            revision: activeSceneContext.revision,
-          }] : [],
+          text,
+          kind: activeMission.snapshot.status === "needs_input" ? "answer" : "modify_goal",
         }),
       });
-      if (
-        !created
-        || typeof created !== "object"
-        || !created.plan
-        || !Array.isArray(created.plan.nodes)
-      ) {
-        throw new Error("Mission Supervisor 返回了无效计划草案");
-      }
-      const nodeCount = created.plan.nodes.length;
-      setMissionDraft(created);
-      setMissionDraftHistory((current) => [
-        created,
-        ...current.filter((item) => item.draftId !== created.draftId),
+      setMissionRecord(response.mission);
+      setMissionHistory((current) => [
+        response.mission,
+        ...current.filter((item) => item.missionId !== response.mission.missionId),
       ]);
-      setMissionRecord(null);
-      setReviewFeedback("");
       setMissionMessages((current) => [
         ...current,
         {
           messageId: makeId("mission-message"),
           role: "assistant",
-          content: `已生成连续 Mission 计划，共 ${nodeCount} 个语义节点。执行前请审核任务边界与每个技能。`,
+          content: response.decision?.kind === "replan"
+            ? "已结合你的补充生成持续任务修订；请审核变化后继续。"
+            : response.decision?.reason ?? "已记录补充信息，等待人工处理。",
           modality: "text",
           createdAt: new Date().toISOString(),
         },
       ]);
-      setNotice("Mission 计划已生成，等待人工审核");
-      navigate(`/tasks/${encodeURIComponent(created.draftId)}`);
     } catch (reason) {
       setError(friendlyError(reason));
     } finally {
       setAssistantBusy(false);
     }
-  }, [activeSceneContext, assistantBusy, connection, missionRecord, navigate, selectedRobotId]);
+  }, [assistantBusy, connection, missionRecord, sendAssistantMessage]);
 
   const submitAssistantMessage = useCallback((event: FormEvent) => {
     event.preventDefault();
-    void sendMissionMessage(assistantText, "text", null);
-  }, [assistantText, sendMissionMessage]);
+    if (missionRecord?.snapshot.status === "needs_input") {
+      void sendMissionMessage(assistantText, "text", null);
+      return;
+    }
+    void sendAssistantMessage(assistantText, "text", null);
+  }, [assistantText, missionRecord?.snapshot.status, sendAssistantMessage, sendMissionMessage]);
 
   const confirmMissionDraft = useCallback(() => {
     if (!missionDraft || missionDraft.status !== "draft") return;
@@ -1367,7 +1448,11 @@ function App() {
           body: form,
         });
         setNotice("语音已转写并发送；任何真机动作仍需审核 PlanDraft");
-        await sendMissionMessage(transcript.text, "voice", transcript.transcriptionId);
+        if (missionRecord?.snapshot.status === "needs_input") {
+          await sendMissionMessage(transcript.text, "voice", transcript.transcriptionId);
+        } else {
+          await sendAssistantMessage(transcript.text, "voice", transcript.transcriptionId);
+        }
       } catch (reason) {
         await recorderRef.current?.cancel();
         recorderRef.current = null;
@@ -1376,7 +1461,7 @@ function App() {
         setVoiceBusy(false);
       }
     })();
-  }, [connection, recording, sendMissionMessage]);
+  }, [connection, missionRecord?.snapshot.status, recording, sendAssistantMessage, sendMissionMessage]);
 
   const createMapping = useCallback((event: FormEvent) => {
     event.preventDefault();
@@ -1439,8 +1524,8 @@ function App() {
     setTranscriptionId(null);
     setReviewFeedback("");
     setError("");
-    navigate("/");
-  }, [navigate, selectedRobotId]);
+    navigate(chatPath(route.shell));
+  }, [navigate, route.shell, selectedRobotId]);
 
   const selectRobotForNewTask = useCallback((robotId: string) => {
     if (robotId === selectedRobotId) return;
@@ -1450,8 +1535,8 @@ function App() {
 
   const openConversation = useCallback((conversationId: string) => {
     setHistoryOpen(false);
-    navigate(`/tasks/${encodeURIComponent(conversationId)}`);
-  }, [navigate]);
+    navigate(chatPath(route.shell, conversationId));
+  }, [navigate, route.shell]);
 
   const missionConversationEntries = useMemo<AssistantConversation[]>(() => {
     const records = missionHistory.map((item) => ({
@@ -1500,13 +1585,10 @@ function App() {
   const currentConversationEntry = missionConversationEntries.find(
     (item) => item.conversationId === (missionRecord?.missionId ?? missionDraft?.draftId),
   ) ?? assistantConversation;
-  const conversationPath = missionRecord
-    ? `/tasks/${encodeURIComponent(missionRecord.missionId)}`
-    : missionDraft
-      ? `/tasks/${encodeURIComponent(missionDraft.draftId)}`
-      : assistantConversation
-        ? `/tasks/${encodeURIComponent(assistantConversation.conversationId)}`
-        : "/";
+  const conversationPath = chatPath(
+    route.shell,
+    missionRecord?.missionId ?? missionDraft?.draftId ?? assistantConversation?.conversationId,
+  );
 
   const latestEvents = [...events].reverse().slice(0, 12);
   const visualMissionInFlight = Boolean(
@@ -1531,7 +1613,7 @@ function App() {
         : draft?.status ?? assistantTurn?.status ?? assistantConversation?.status ?? "idle");
 
   return (
-    <div className="hide-app-shell">
+    <div className={`hide-app-shell shell-${developerMode ? "developer" : "user"}`}>
       <AppTitlebar
         conversations={allConversationEntries}
         current={currentConversationEntry}
@@ -1540,19 +1622,22 @@ function App() {
         onOpenConversation={openConversation}
         onOpenHistory={() => setHistoryOpen(true)}
         onOpenTools={() => setToolMenuOpen((value) => !value)}
+        principal={principal}
+        developerMode={developerMode}
+        canDevelop={canDevelop}
+        onModeChange={(mode) => navigate(chatPath(mode, currentConversationEntry?.conversationId))}
+        onLogout={onLogout}
       />
-      <StatusBar
+      {developerMode ? <StatusBar
         robots={robots}
         robot={selectedRobot}
         selectedRobotId={selectedRobotId}
         connection={connection}
-        activeSceneContext={activeSceneContext}
         taskStatus={activeTaskStatus}
         onRobotChange={selectRobotForNewTask}
-        onOpenScene={() => navigate("/scenes")}
         onStop={() => submitCommand("stop", {})}
         stopDisabled={!selectedRobot || connection !== "live" || busy || !capabilities?.capabilities.includes("stop")}
-      />
+      /> : null}
 
       {connection === "offline" ? <div className="global-connection-banner" role="alert">工作站连接已中断。离线期间不会排队发送规划、审核或控制命令。</div> : null}
       {error ? <div className="global-error-banner" role="alert"><Icon name="warning" /><span><strong>操作未完成</strong>{error}</span><button type="button" onClick={() => setError("")} aria-label="关闭错误"><Icon name="close" /></button></div> : null}
@@ -1560,6 +1645,7 @@ function App() {
       {route.kind === "chat" ? <ChatWorkspace
         conversation={assistantConversation}
         missionMessages={missionMessages}
+        robots={robots}
         robot={selectedRobot}
         turn={assistantTurn}
         draft={draft}
@@ -1592,26 +1678,10 @@ function App() {
         onSelectVisualCandidate={selectVisualMissionCandidate}
         onCancelVisualMission={cancelVisualMission}
         onLoadVisualEvidence={loadVisualEvidence}
-        onOpenScene={() => navigate("/scenes")}
-        onPcdFile={(file) => { setPendingSceneFile(file); navigate("/scenes"); }}
         onPrompt={setAssistantText}
+        developerMode={developerMode}
+        onRobotChange={selectRobotForNewTask}
       /> : null}
-
-      {route.kind === "scene" ? <WorkspacePage
-        title="场景地图"
-        subtitle="PCD 可视化、坐标标定与语义位置"
-        onBack={() => navigate(conversationPath)}
-      >
-        <SceneWorkspace
-          apiFetch={apiFetch}
-          selectedRobotId={selectedRobotId}
-          currentPose={selectedRobot?.pose}
-          onContextChange={setActiveSceneContext}
-          onClose={() => navigate(conversationPath)}
-          initialFile={pendingSceneFile}
-          onInitialFileConsumed={() => setPendingSceneFile(null)}
-        />
-      </WorkspacePage> : null}
 
       {route.kind === "simulation" ? <WorkspacePage
         title="仿真观测台"
@@ -1648,15 +1718,14 @@ function App() {
         />
       </WorkspacePage> : null}
 
-      {toolMenuOpen ? <ToolMenu
+      {developerMode && toolMenuOpen ? <ToolMenu
         advancedMode={advancedMode}
         onAdvancedModeChange={setAdvancedMode}
         onClose={() => setToolMenuOpen(false)}
         onControl={() => { setToolMenuOpen(false); setControlPanelOpen(true); }}
-        onScene={() => { setToolMenuOpen(false); navigate("/scenes"); }}
-        onSimulation={() => { setToolMenuOpen(false); navigate("/simulation"); }}
+        onSimulation={() => { setToolMenuOpen(false); navigate("/developer/simulation"); }}
         onHistory={() => { setToolMenuOpen(false); setHistoryOpen(true); }}
-        onInterfaces={() => { setToolMenuOpen(false); navigate("/interfaces"); }}
+        onInterfaces={() => { setToolMenuOpen(false); navigate("/developer/interfaces"); }}
         onRefresh={() => { setToolMenuOpen(false); refresh(); }}
       /> : null}
 
@@ -1680,6 +1749,8 @@ function App() {
           currentId={currentConversationEntry?.conversationId}
           onOpen={openConversation}
           onNew={() => { setHistoryOpen(false); startNewTask(); }}
+          canManage={false}
+          developerMode={developerMode}
         />
       </SidePanel> : null}
 
@@ -1735,6 +1806,11 @@ function AppTitlebar({
   onOpenConversation,
   onOpenHistory,
   onOpenTools,
+  principal,
+  developerMode,
+  canDevelop,
+  onModeChange,
+  onLogout,
 }: {
   conversations: AssistantConversation[];
   current: AssistantConversation | null;
@@ -1743,6 +1819,11 @@ function AppTitlebar({
   onOpenConversation: (conversationId: string) => void;
   onOpenHistory: () => void;
   onOpenTools: () => void;
+  principal: AuthPrincipal;
+  developerMode: boolean;
+  canDevelop: boolean;
+  onModeChange: (mode: "user" | "developer") => void;
+  onLogout: () => void;
 }) {
   const tabs = [current, ...conversations]
     .filter((item): item is AssistantConversation => Boolean(item))
@@ -1760,10 +1841,16 @@ function AppTitlebar({
       <button className={`new-mission-tab ${route.kind === "chat" && !current ? "active" : ""}`} type="button" onClick={onNew}><Icon name="plus" />新任务</button>
     </nav>
     <div className="titlebar-actions">
+      {canDevelop ? <div className="shell-switch" aria-label="界面模式">
+        <button className={!developerMode ? "active" : ""} type="button" onClick={() => onModeChange("user")}>用户</button>
+        <button className={developerMode ? "active" : ""} type="button" onClick={() => onModeChange("developer")}>开发者</button>
+      </div> : null}
       <button className="icon-button" type="button" onClick={onOpenHistory} aria-label="任务历史"><Icon name="history" /></button>
-      <button className="icon-button titlebar-tools-button" type="button" onClick={onOpenTools} aria-label="打开工具" title="工具">
+      {developerMode ? <button className="icon-button titlebar-tools-button" type="button" onClick={onOpenTools} aria-label="打开工具" title="工具">
         <Icon name="tools" /><span>工具</span>
-      </button>
+      </button> : null}
+      <span className="account-chip" title={`${principal.username} · ${principal.role}`}><span>{principal.displayName.slice(0, 1).toUpperCase()}</span><b>{principal.displayName}</b></span>
+      <button className="logout-button" type="button" onClick={onLogout}>退出</button>
     </div>
   </header>;
 }
@@ -1784,10 +1871,8 @@ function StatusBar({
   robot,
   selectedRobotId,
   connection,
-  activeSceneContext,
   taskStatus,
   onRobotChange,
-  onOpenScene,
   onStop,
   stopDisabled,
 }: {
@@ -1795,10 +1880,8 @@ function StatusBar({
   robot: RobotState | null;
   selectedRobotId: string;
   connection: ConnectionState;
-  activeSceneContext: ActiveSceneContext | null;
   taskStatus: string;
   onRobotChange: (robotId: string) => void;
-  onOpenScene: () => void;
   onStop: () => void;
   stopDisabled: boolean;
 }) {
@@ -1808,7 +1891,6 @@ function StatusBar({
       {robots.length ? robots.map((item) => <option key={item.robotId} value={item.robotId}>{item.name ?? item.robotId}</option>) : <option value={selectedRobotId}>{selectedRobotId}</option>}
     </select><span className={`context-dot ${robot?.connected ? "live" : "offline"}`} /></label>
     <span className={`status-context connection-${connection}`}><span className="context-dot" />{connection === "live" ? "工作站在线" : connection === "connecting" ? "正在连接" : "工作站离线"}</span>
-    <button className={`status-context context-button ${activeSceneContext ? "ready" : ""}`} type="button" onClick={onOpenScene}><Icon name="map" />{activeSceneContext ? `场景 r${activeSceneContext.revision}` : "未绑定场景"}</button>
     <span className={`status-context ${pose.stale ? "stale" : "ready"}`}><Icon name="activity" />{pose.label}</span>
     <span className="status-context task-context">任务 <StatusPill value={taskStatus} /></span>
     <button className="global-stop-button" type="button" onClick={onStop} disabled={stopDisabled}><Icon name="stop" />停止机器人</button>
@@ -1827,7 +1909,6 @@ function ToolMenu({
   onAdvancedModeChange,
   onClose,
   onControl,
-  onScene,
   onSimulation,
   onHistory,
   onInterfaces,
@@ -1837,7 +1918,6 @@ function ToolMenu({
   onAdvancedModeChange: (value: boolean) => void;
   onClose: () => void;
   onControl: () => void;
-  onScene: () => void;
   onSimulation: () => void;
   onHistory: () => void;
   onInterfaces: () => void;
@@ -1846,7 +1926,6 @@ function ToolMenu({
   return <><button className="popover-scrim" type="button" onClick={onClose} aria-label="关闭工具" /><aside className="tool-menu" aria-label="H-IDE 工具">
     <div className="tool-menu-header"><span>工具</span><button className="icon-button" type="button" onClick={onClose} aria-label="关闭"><Icon name="close" /></button></div>
     <button type="button" onClick={onControl}><span className="tool-icon"><Icon name="control" /></span><span><strong>手动控制</strong><small>测试高层动作与停止</small></span><Icon name="chevron" /></button>
-    <button type="button" onClick={onScene}><span className="tool-icon"><Icon name="map" /></span><span><strong>场景地图</strong><small>PCD、标定与语义位置</small></span><Icon name="chevron" /></button>
     <button type="button" onClick={onSimulation}><span className="tool-icon"><Icon name="activity" /></span><span><strong>仿真观测台</strong><small>连续任务、障碍与回放</small></span><Icon name="chevron" /></button>
     <button type="button" onClick={onHistory}><span className="tool-icon"><Icon name="history" /></span><span><strong>任务历史</strong><small>恢复规划、审核和执行记录</small></span><Icon name="chevron" /></button>
     <button type="button" onClick={onRefresh}><span className="tool-icon"><Icon name="refresh" /></span><span><strong>刷新状态</strong><small>重新读取机器人与接口快照</small></span><Icon name="chevron" /></button>
@@ -1863,12 +1942,16 @@ function SidePanel({ title, subtitle, onClose, side = "right", children }: { tit
   </aside></div>;
 }
 
-function HistoryPanel({ conversations, currentId, onOpen, onNew }: { conversations: AssistantConversation[]; currentId?: string; onOpen: (conversationId: string) => void; onNew: () => void }) {
+function HistoryPanel({ conversations, currentId, onOpen, onNew, developerMode, canManage }: { conversations: AssistantConversation[]; currentId?: string; onOpen: (conversationId: string) => void; onNew: () => void; developerMode: boolean; canManage: boolean }) {
   return <div className="history-panel"><button className="new-history-task" type="button" onClick={onNew}><Icon name="plus" />开始新任务</button>
+    <p className="history-contract-note">重命名、归档和删除需要新的后端会话生命周期契约；当前版本明确禁用，避免在本地伪造成功。</p>
     <div className="history-list">
-      {conversations.length ? conversations.map((conversation) => <button className={conversation.conversationId === currentId ? "active" : ""} key={conversation.conversationId} type="button" onClick={() => onOpen(conversation.conversationId)}>
-        <span className={`history-state tab-${conversation.status}`}><Icon name="spark" /></span><span><strong>{conversationLabel(conversation, conversation.conversationId === currentId ? conversation : null)}</strong><small>{conversation.robotId} · {formatDateTime(conversation.updatedAt ?? conversation.createdAt)}</small></span><StatusPill value={conversation.status} />
-      </button>) : <EmptyState>还没有任务会话。发送第一条消息后，会话会保存在这里。</EmptyState>}
+      {conversations.length ? conversations.map((conversation) => <div className={`history-row ${conversation.conversationId === currentId ? "active" : ""}`} key={conversation.conversationId}>
+        <button className="history-open" type="button" onClick={() => onOpen(conversation.conversationId)}>
+          <span className={`history-state tab-${conversation.status}`}><Icon name="spark" /></span><span><strong>{conversationLabel(conversation, conversation.conversationId === currentId ? conversation : null)}</strong><small>{developerMode ? `${conversation.robotId} · ` : ""}{formatDateTime(conversation.updatedAt ?? conversation.createdAt)}</small></span><StatusPill value={conversation.status} />
+        </button>
+        <div className="history-lifecycle" aria-label="会话管理"><button type="button" disabled={!canManage} title="等待后端 PATCH 会话契约">重命名</button><button type="button" disabled={!canManage} title="等待后端归档契约">归档</button><button type="button" disabled={!canManage} title="等待后端 DELETE 会话契约">删除</button></div>
+      </div>) : <EmptyState>还没有任务会话。发送第一条消息后，会话会保存在这里。</EmptyState>}
     </div>
   </div>;
 }
@@ -1924,9 +2007,54 @@ function ManualControlPanel({ robot, capabilities, lastReceipt, lastCommandId, l
   </div>;
 }
 
+function ConversationVisualEvidence({ turn, developerMode }: { turn: AssistantTurn; developerMode: boolean }) {
+  const [imageUrl, setImageUrl] = useState("");
+  const [loadError, setLoadError] = useState("");
+  const evidence = turn.result?.evidence ?? [];
+  const image = evidence.find((item) => {
+    const mediaType = typeof item.mediaType === "string" ? item.mediaType : "";
+    return mediaType.startsWith("image/") && typeof item.proxyUrl === "string";
+  });
+  const proxyUrl = typeof image?.proxyUrl === "string" ? image.proxyUrl : "";
+  const expectedPrefix = `/api/v1/assistant/turns/${encodeURIComponent(turn.taskId)}/visual-evidence/`;
+
+  useEffect(() => {
+    if (!proxyUrl || !proxyUrl.startsWith(expectedPrefix)) return undefined;
+    let disposed = false;
+    let objectUrl = "";
+    setLoadError("");
+    void apiFetchBlob(proxyUrl)
+      .then((blob) => {
+        if (disposed) return;
+        objectUrl = URL.createObjectURL(blob);
+        setImageUrl(objectUrl);
+      })
+      .catch((reason) => {
+        if (!disposed) setLoadError(friendlyError(reason));
+      });
+    return () => {
+      disposed = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [expectedPrefix, proxyUrl]);
+
+  if (!evidence.length && !turn.result?.visualResult) return null;
+  const visual = turn.result?.visualResult;
+  const hypotheses = visual && Array.isArray(visual.hypotheses)
+    ? visual.hypotheses.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
+    : [];
+  const labels = hypotheses.flatMap((item) => typeof item.label === "string" ? [item.label] : []).slice(0, 8);
+  return <section className="conversation-evidence-card" aria-label="视觉证据">
+    <header><span><Icon name="activity" /></span><div><strong>我看到的画面</strong><small>{labels.length ? `识别到：${labels.join("、")}` : "视觉观察凭证"}</small></div></header>
+    {imageUrl ? <img src={imageUrl} alt="机器人本次视觉观察画面" /> : <div className="evidence-loading">{loadError || "正在载入视觉凭证…"}</div>}
+    {developerMode ? <details><summary>视觉处理详情</summary><pre>{JSON.stringify({ taskId: turn.taskId, evidence, visualResult: visual }, null, 2)}</pre></details> : null}
+  </section>;
+}
+
 function ChatWorkspace({
   conversation,
   missionMessages,
+  robots,
   robot,
   turn,
   draft,
@@ -1959,12 +2087,13 @@ function ChatWorkspace({
   onSelectVisualCandidate,
   onCancelVisualMission,
   onLoadVisualEvidence,
-  onOpenScene,
-  onPcdFile,
   onPrompt,
+  developerMode,
+  onRobotChange,
 }: {
   conversation: AssistantConversation | null;
   missionMessages: AssistantMessage[];
+  robots: RobotState[];
   robot: RobotState | null;
   turn: AssistantTurn | null;
   draft: AssistantDraft | null;
@@ -1997,15 +2126,16 @@ function ChatWorkspace({
   onSelectVisualCandidate: (candidateId: string) => void;
   onCancelVisualMission: () => void;
   onLoadVisualEvidence: (missionId: string, sha256: string) => Promise<string>;
-  onOpenScene: () => void;
-  onPcdFile: (file: File) => void;
   onPrompt: (prompt: string) => void;
+  developerMode: boolean;
+  onRobotChange: (robotId: string) => void;
 }) {
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const timelineRef = useRef<HTMLDivElement | null>(null);
-  const [dragging, setDragging] = useState(false);
   const messages = missionMessages.length ? missionMessages : conversation?.messages ?? [];
   const activeTurn = Boolean(turn && ["queued", "running"].includes(turn.status));
+  const evidenceTurns = [...(conversation?.turns ?? []), ...(turn ? [turn] : [])]
+    .filter((item, index, items) => items.findIndex((candidate) => candidate.taskId === item.taskId) === index)
+    .filter((item) => Boolean(item.result?.evidence?.length || item.result?.visualResult));
   const empty = !messages.length && !turn && !draft && !missionDraft && !mission;
   useEffect(() => {
     const element = timelineRef.current;
@@ -2013,26 +2143,19 @@ function ChatWorkspace({
     if (typeof element.scrollTo === "function") element.scrollTo({ top: element.scrollHeight, behavior: "smooth" });
     else element.scrollTop = element.scrollHeight;
   }, [busy, draft?.draftId, messages.length, mission?.snapshot.lastSequence, missionDraft?.draftId, turn?.status]);
-  const choosePcd = (file: File | undefined) => {
-    if (!file) return;
-    setDragging(false);
-    onPcdFile(file);
-  };
-  const suggestions = activeSceneContext
-    ? ["前进 5 米", "去厨房", "查看当前场景中的目标位置", "测试夹爪"]
-    : ["向前移动 5 米", "测试夹爪", "查看机器人当前状态", "导入场景地图"];
-  return <main className={`chat-workspace ${dragging ? "dragging" : ""}`} onDragEnter={(event) => { if (event.dataTransfer.types.includes("Files")) { event.preventDefault(); setDragging(true); } }} onDragOver={(event) => { if (dragging) event.preventDefault(); }} onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDragging(false); }} onDrop={(event) => { event.preventDefault(); choosePcd(event.dataTransfer.files?.[0]); }}>
-    {dragging ? <div className="chat-drop-overlay"><Icon name="map" /><strong>导入 PCD 场景</strong><span>释放后进入场景工作区并开始转换</span></div> : null}
+  const suggestions = ["你好，介绍一下你自己", "机器人现在状态怎么样？", "只观察当前画面，告诉我看到了什么", "去会议桌旁边"];
+  return <main className="chat-workspace">
     <div className="chat-timeline" ref={timelineRef} aria-live="polite">
       <div className="chat-thread">
-        {empty ? <section className="chat-empty-state"><span className="empty-logo"><Icon name="logo" /></span><h1>现在，要让机器人做什么？</h1><p>描述目标即可。Supervisor 会选择专属 Agent 形成计划，任何真机动作都要由你审核后执行。</p><div className="suggestion-grid">{suggestions.map((prompt) => <button key={prompt} type="button" onClick={() => prompt === "导入场景地图" ? onOpenScene() : onPrompt(prompt)}>{prompt}<Icon name="chevron" /></button>)}</div></section> : null}
+        {empty ? <section className="chat-empty-state"><span className="empty-logo"><Icon name="logo" /></span><h1>今天想和机器人做什么？</h1><p>可以聊天、提问、观察环境，也可以下达行动任务。只有机器人行动会形成需要审核的计划。</p><div className="suggestion-grid">{suggestions.map((prompt) => <button key={prompt} type="button" onClick={() => onPrompt(prompt)}>{prompt}<Icon name="chevron" /></button>)}</div></section> : null}
         {messages.map((message) => <article className={`chat-message message-${message.role}`} key={message.messageId}>
           <div className="message-author">{message.role === "user" ? "你" : message.role === "assistant" ? <><span className="agent-avatar"><Icon name="spark" /></span>H-IDE</> : "系统"}<time>{formatTime(message.createdAt)}</time></div>
           <div className="message-body">{message.content}</div>
           {message.modality === "voice" ? <span className="message-modality"><Icon name="mic" />语音转写</span> : null}
         </article>)}
-        {turn && !missionDraft && !mission ? <PlanningActivityCard turn={turn} draft={draft} /> : null}
+        {turn && !missionDraft && !mission && (["queued", "running"].includes(turn.status) || turn.result?.intent === "ROBOT_ACTION") ? <PlanningActivityCard turn={turn} draft={draft} developerMode={developerMode} /> : null}
         {turn?.result?.assistantMessage && !messages.some((message) => message.taskId === turn.taskId && message.role === "assistant") ? <article className="chat-message message-assistant"><div className="message-author"><span className="agent-avatar"><Icon name="spark" /></span>H-IDE</div><div className="message-body">{turn.result.assistantMessage}</div></article> : null}
+        {evidenceTurns.map((item) => <ConversationVisualEvidence key={item.taskId} turn={item} developerMode={developerMode} />)}
         {missionDraft && !mission ? <MissionPlanCard
           draft={missionDraft}
           robot={robot}
@@ -2041,6 +2164,7 @@ function ChatWorkspace({
           setFeedback={setFeedback}
           onConfirm={onConfirmMission}
           onReject={onRejectMission}
+          developerMode={developerMode}
         /> : null}
         {mission ? <MissionExecutionCard
           mission={mission}
@@ -2048,6 +2172,7 @@ function ChatWorkspace({
           onContinue={onContinueMission}
           onCancel={onCancelMission}
           onApproveRevision={onApproveMissionRevision}
+          developerMode={developerMode}
         /> : null}
         {!missionDraft && !mission && draft && isVisualMissionPlan(draft.plan) ? <VisualMissionCard
           draft={draft}
@@ -2078,23 +2203,24 @@ function ChatWorkspace({
           onReject={onReject}
           onRevise={onRevise}
           onReplan={onReplan}
+          developerMode={developerMode}
         /> : null}
         {!mission && draft?.status === "confirmed" && lastReceipt && !isVisualMissionPlan(draft.plan) ? <ExecutionCard receipt={lastReceipt} /> : null}
       </div>
     </div>
     <div className="composer-region">
-      {activeTurn ? <div className="active-task-dock"><span className="planning-pulse" /><span>Supervisor 正在编排任务</span><button type="button" onClick={onCancelPlanning}>取消规划</button></div> : busy ? <div className="active-task-dock"><span className="planning-pulse" /><span>Mission Supervisor 正在规划或推进任务</span></div> : null}
+      {activeTurn ? <div className="active-task-dock"><span className="planning-pulse" /><span>H-IDE 正在理解并回复</span><button type="button" onClick={onCancelPlanning}>取消</button></div> : busy ? <div className="active-task-dock"><span className="planning-pulse" /><span>正在准备或推进机器人任务</span></div> : null}
       <form className="chat-composer" onSubmit={onSubmit}>
-        <div className="composer-contexts"><span><Icon name="robot" />{robot?.name ?? robot?.robotId ?? "未选择机器人"}</span><button type="button" className={activeSceneContext ? "attached" : ""} onClick={onOpenScene}><Icon name="map" />{activeSceneContext ? `场景 r${activeSceneContext.revision}${activeSceneContext.selectedPoint ? " · 已选目标" : ""}` : "添加场景"}</button></div>
+        <div className="composer-contexts">{developerMode ? <span><Icon name="robot" />{robot?.name ?? robot?.robotId ?? "未选择机器人"}</span> : <label className="user-robot-picker"><Icon name="robot" /><select aria-label="对话机器人" value={robot?.robotId ?? ""} onChange={(event) => onRobotChange(event.target.value)}>{robots.map((item, index) => <option key={item.robotId} value={item.robotId}>{item.name ?? `机器人 ${index + 1}`}</option>)}</select></label>}{developerMode ? <span className={`composer-health ${robot?.connected ? "connected" : "offline"}`}>{robot?.connected ? "代理在线" : "代理离线"}</span> : null}</div>
         <textarea id="assistant-task" aria-label="任务描述" value={text} onChange={(event) => setText(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} rows={1} maxLength={4000} placeholder={connection === "live" ? "描述任务，或按住麦克风说话…" : "工作站离线，任务草稿不会发送"} disabled={connection !== "live"} />
-        <div className="composer-actions"><div><input ref={fileInputRef} type="file" hidden accept=".pcd,application/octet-stream" onChange={(event) => { choosePcd(event.target.files?.[0]); event.target.value = ""; }} /><button className="composer-icon-button" type="button" onClick={() => fileInputRef.current?.click()} aria-label="导入 PCD"><Icon name="attach" /></button><button className={`composer-icon-button voice-button ${recording ? "recording" : ""}`} type="button" onClick={onVoice} disabled={voiceBusy || busy || connection !== "live"} aria-label={recording ? "停止录音并发送" : "开始语音输入"}><Icon name="mic" /></button><span className="composer-hint">{recording ? "正在录音，再次点击直接发送" : voiceBusy ? "正在转写并发送…" : "Enter 发送 · Shift+Enter 换行"}</span></div><button className="send-button" type="submit" disabled={busy || !text.trim() || connection !== "live"} aria-label="发送给调度 Agent"><Icon name="send" /></button></div>
+        <div className="composer-actions"><div><button className={`composer-icon-button voice-button ${recording ? "recording" : ""}`} type="button" onClick={onVoice} disabled={voiceBusy || busy || connection !== "live"} aria-label={recording ? "停止录音并发送" : "开始语音输入"}><Icon name="mic" /></button><span className="composer-hint">{recording ? "正在聆听，再次点击发送" : voiceBusy ? "正在识别并发送…" : "Enter 发送 · Shift+Enter 换行"}</span></div><button className="send-button" type="submit" disabled={busy || !text.trim() || connection !== "live"} aria-label="发送给 H-IDE"><Icon name="send" /></button></div>
       </form>
-      <p className="composer-disclaimer">H-IDE 可能生成错误计划。执行前请核对机器人、场景、目标坐标和安全条件。</p>
+      <p className="composer-disclaimer">聊天和问答不会控制机器人；行动计划会在获得相应授权后执行。</p>
     </div>
   </main>;
 }
 
-function MissionPlanCard({ draft, robot, busy, feedback, setFeedback, onConfirm, onReject }: {
+function MissionPlanCard({ draft, robot, busy, feedback, setFeedback, onConfirm, onReject, developerMode }: {
   draft: MissionDraftRecordV2;
   robot: RobotState | null;
   busy: boolean;
@@ -2102,6 +2228,7 @@ function MissionPlanCard({ draft, robot, busy, feedback, setFeedback, onConfirm,
   setFeedback: (value: string) => void;
   onConfirm: () => void;
   onReject: () => void;
+  developerMode: boolean;
 }) {
   const plan = draft.plan;
   const reviewable = draft.status === "draft" && !busy && plan.robotId === robot?.robotId;
@@ -2110,29 +2237,29 @@ function MissionPlanCard({ draft, robot, busy, feedback, setFeedback, onConfirm,
       <div><span className="card-kicker"><Icon name="spark" />MISSION V2 · SUPERVISOR–WORKER</span><h2>{plan.objective}</h2></div>
       <StatusPill value={draft.status} />
     </header>
-    <div className="plan-context-grid">
+    {developerMode ? <div className="plan-context-grid">
       <span><small>目标机器人</small><strong>{plan.robotId}</strong></span>
       <span><small>风险上限</small><strong>{plan.envelope.maximumRiskLevel}</strong></span>
       <span><small>单段 / 累计距离</small><strong>{plan.envelope.maximumGoalDistanceM}m / {plan.envelope.maximumCumulativeDistanceM}m</strong></span>
       <span><small>审核有效期</small><strong>{formatDraftExpiry(plan.expiresAt, Date.now())}</strong></span>
-    </div>
-    <p className="card-warning"><Icon name="warning" />视觉模型只提出语义假设；目标坐标必须由 RGB-D、场景几何或人工事实确认。所有底盘位移和转向统一交给 Nav2。</p>
+    </div> : <p className="user-plan-summary">我会按下面的顺序完成任务。执行中如果环境发生变化，我会停下并告诉你。</p>}
+    <p className="card-warning"><Icon name="warning" />请确认周围环境安全，并留意机器人移动。</p>
     <ol className="plan-step-list">
       {plan.nodes.map((node, index) => <li key={node.nodeId}>
         <span>{index + 1}</span>
-        <div><strong>{node.skillId}@{node.skillVersion}</strong><p>{node.purpose}</p><small>{node.dependsOn.length ? `依赖：${node.dependsOn.join("、")}` : "起始节点"}</small></div>
+        <div><strong>{developerMode ? `${node.skillId}@${node.skillVersion}` : node.purpose}</strong>{developerMode ? <><p>{node.purpose}</p><small>{node.dependsOn.length ? `依赖：${node.dependsOn.join("、")}` : "起始节点"}</small></> : <small>{index === 0 ? "开始后先完成这一步" : "完成上一步后继续"}</small>}</div>
         <StatusPill value={node.riskLevel} />
       </li>)}
     </ol>
-    <details className="plan-technical-details">
+    {developerMode ? <details className="plan-technical-details">
       <summary><span>本次授权边界</span><Icon name="chevron" /></summary>
       <div>
         <section><strong>能力快照</strong><p>{plan.envelope.allowedSkillIds.join("、")}</p></section>
         <section><strong>固定身份</strong><p>boot: {plan.envelope.robotBootId}<br />epoch: {plan.envelope.localizationEpochId}</p></section>
         <section><strong>自动修订</strong><p>最多 {plan.envelope.maximumAutoRevisions} 次；超出授权边界必须重新审核。</p></section>
-        <section><strong>场景先验</strong><p>{plan.envelope.sceneRefs.length ? plan.envelope.sceneRefs.map((item) => `${item.sceneId}@${item.revision}`).join("、") : "未绑定 PCD 场景"}</p></section>
+        <section><strong>场景先验</strong><p>{plan.envelope.sceneRefs.length ? plan.envelope.sceneRefs.map((item) => `${item.sceneId}@${item.revision}`).join("、") : "未附加场景先验"}</p></section>
       </div>
-    </details>
+    </details> : null}
     {draft.status === "draft" ? <div className="plan-review-controls">
       <label htmlFor="mission-review-feedback">审核备注（拒绝时会保存原因）</label>
       <textarea id="mission-review-feedback" value={feedback} onChange={(event) => setFeedback(event.target.value)} placeholder="例如：目标描述不清楚，先补充视觉参照物" />
@@ -2141,12 +2268,13 @@ function MissionPlanCard({ draft, robot, busy, feedback, setFeedback, onConfirm,
   </section>;
 }
 
-function MissionExecutionCard({ mission, busy, onContinue, onCancel, onApproveRevision }: {
+function MissionExecutionCard({ mission, busy, onContinue, onCancel, onApproveRevision, developerMode }: {
   mission: MissionRecordV2;
   busy: boolean;
   onContinue: () => void;
   onCancel: () => void;
   onApproveRevision: () => void;
+  developerMode: boolean;
 }) {
   const [visualEvidenceOpen, setVisualEvidenceOpen] = useState(false);
   const status = mission.snapshot.status;
@@ -2180,12 +2308,12 @@ function MissionExecutionCard({ mission, busy, onContinue, onCancel, onApproveRe
       <div><span className="card-kicker"><Icon name="activity" />CONTINUOUS MISSION</span><h2>{mission.activeRevision.objective}</h2></div>
       <StatusPill value={status} />
     </header>
-    <div className="mission-runtime-summary">
+    {developerMode ? <div className="mission-runtime-summary">
       <span><small>当前节点</small><strong>{mission.snapshot.activeNodeId ?? "—"}</strong></span>
       <span><small>活动修订</small><strong>r{mission.activeRevision.sequence}</strong></span>
       <span><small>视觉假设</small><strong>{hypotheses}</strong></span>
       <span><small>可信空间事实</small><strong>{facts}</strong></span>
-    </div>
+    </div> : <p className="user-mission-status">{status === "completed" ? "任务已经完成。" : status === "failed" ? "任务没有完成，我已停止执行。" : status === "needs_input" ? "我需要你再补充一点信息。" : "机器人正在按计划执行，我会持续汇报进展。"}</p>}
     {visualResult ? <MissionVisualSummary
       result={visualResult}
       observationOnly={observationOnly}
@@ -2198,12 +2326,12 @@ function MissionExecutionCard({ mission, busy, onContinue, onCancel, onApproveRe
         const nodeStatus = state?.status ?? "pending";
         return <li key={node.nodeId} className={`node-${nodeStatus}`}>
           <span>{nodeStatus === "succeeded" ? "✓" : nodeStatus === "skipped" ? "–" : index + 1}</span>
-          <div><strong>{node.skillId}</strong><p>{node.purpose}</p><small>尝试 {state?.attempt ?? 0} 次 · {statusLabel(nodeStatus)}</small></div>
+          <div><strong>{developerMode ? node.skillId : node.purpose}</strong>{developerMode ? <p>{node.purpose}</p> : null}<small>{developerMode ? `尝试 ${state?.attempt ?? 0} 次 · ` : ""}{statusLabel(nodeStatus)}</small></div>
           <StatusPill value={nodeStatus} />
         </li>;
       })}
     </ol>
-    {latestEvents.length ? <details className="plan-technical-details mission-event-details">
+    {developerMode && latestEvents.length ? <details className="plan-technical-details mission-event-details">
       <summary><span>事件时间线（{mission.events.length}）</span><Icon name="chevron" /></summary>
       <div>{latestEvents.map((event) => <section key={event.eventId}><strong>#{event.sequence} · {event.eventType}</strong><p>{event.nodeId ?? "Mission"} · {formatTime(event.occurredAt)}</p></section>)}</div>
     </details> : null}
@@ -2225,15 +2353,15 @@ function MissionExecutionCard({ mission, busy, onContinue, onCancel, onApproveRe
   </>;
 }
 
-function PlanningActivityCard({ turn, draft }: { turn: AssistantTurn; draft: AssistantDraft | null }) {
+function PlanningActivityCard({ turn, draft, developerMode }: { turn: AssistantTurn; draft: AssistantDraft | null; developerMode: boolean }) {
   const active = ["queued", "running"].includes(turn.status);
   const contributions = draft?.review?.contributions ?? [];
   return <details className={`planning-activity planning-${turn.status}`} open={active || undefined}>
-    <summary><span className="agent-avatar"><Icon name="spark" /></span><span><strong>{active ? "正在规划任务" : turn.status === "draft_ready" ? "规划已完成" : "规划轮次"}</strong><small>{active ? "Supervisor 正在选择并协调专属 Agent" : statusLabel(turn.status)}</small></span><StatusPill value={turn.status} /><Icon name="chevron" /></summary>
-    <div className="planning-details"><div className="planning-stage-list"><span className="done"><i />理解任务</span><span className={turn.status === "queued" ? "active" : "done"}><i />选择 Agent</span><span className={active ? "active" : draft ? "done" : ""}><i />合并计划</span></div>
-      {contributions.length ? <div className="worker-list">{contributions.map((worker) => <div key={worker.agentId}><span><Icon name="spark" /></span><p><strong>{worker.agentId}</strong><small>{worker.summary}</small></p></div>)}</div> : <p className="planning-placeholder">专属 Agent 的贡献会在规划完成后显示。原始请求与响应仅在工程模式中提供。</p>}
+    <summary><span className="agent-avatar"><Icon name="spark" /></span><span><strong>{active ? "正在理解你的消息" : turn.status === "draft_ready" ? "行动方案已准备好" : "处理完成"}</strong><small>{active ? "H-IDE 正在判断是直接回答，还是准备机器人任务" : statusLabel(turn.status)}</small></span><StatusPill value={turn.status} /><Icon name="chevron" /></summary>
+    {developerMode ? <div className="planning-details"><div className="planning-stage-list"><span className="done"><i />理解任务</span><span className={turn.status === "queued" ? "active" : "done"}><i />路由意图</span><span className={active ? "active" : draft ? "done" : ""}><i />准备响应</span></div>
+      {contributions.length ? <div className="worker-list">{contributions.map((worker) => <div key={worker.agentId}><span><Icon name="spark" /></span><p><strong>{worker.agentId}</strong><small>{worker.summary}</small></p></div>)}</div> : <p className="planning-placeholder">行动任务的专属 Agent 贡献会在计划完成后显示。</p>}
       {turn.error ? <p className="planning-error">{turn.error}</p> : null}
-    </div>
+    </div> : null}
   </details>;
 }
 
@@ -2272,7 +2400,7 @@ function HoldConfirmButton({ disabled, onConfirm }: { disabled: boolean; onConfi
   ><span className="hold-progress" /><Icon name="check" /><span>{holding ? "继续按住…" : "按住确认并执行"}</span></button>;
 }
 
-function PlanDraftCard({ draft, robot, activeSceneContext, busy, feedback, setFeedback, onConfirm, onReject, onRevise, onReplan }: {
+function PlanDraftCard({ draft, robot, activeSceneContext, busy, feedback, setFeedback, onConfirm, onReject, onRevise, onReplan, developerMode }: {
   draft: AssistantDraft;
   robot: RobotState | null;
   activeSceneContext: ActiveSceneContext | null;
@@ -2283,6 +2411,7 @@ function PlanDraftCard({ draft, robot, activeSceneContext, busy, feedback, setFe
   onReject: () => void;
   onRevise: () => void;
   onReplan: () => void;
+  developerMode: boolean;
 }) {
   if (isVisualMissionPlan(draft.plan)) return null;
   const [now, setNow] = useState(() => Date.now());
@@ -2298,15 +2427,15 @@ function PlanDraftCard({ draft, robot, activeSceneContext, busy, feedback, setFe
   const expiry = formatDraftExpiry(draft.plan.expiresAt, now);
   return <article className={`plan-draft-card draft-${expired ? "expired" : draft.status}`}>
     <header><div><span className={`card-kicker ${expired ? "expired" : ""}`}><Icon name={expired ? "warning" : "check"} />{expired ? "计划已过期" : "等待人工审核"}</span><h2>{review?.summary ?? `${draft.plan.steps.length} 步机器人计划`}</h2></div><StatusPill value={expired ? "expired" : draft.status} /></header>
-    <div className="plan-context-grid"><span><small>目标机器人</small><strong>{draft.plan.robotId}</strong></span><span><small>场景版本</small><strong>{activeSceneContext ? `r${activeSceneContext.revision}` : "未绑定"}</strong></span><span><small>起点位姿</small><strong>{robot?.pose ? `${robot.pose.x.toFixed(2)}, ${robot.pose.y.toFixed(2)}` : "未知"}</strong></span><span><small>审核有效期</small><strong className={expired ? "expired" : ""}>{expiry}</strong></span></div>
+    {developerMode ? <div className="plan-context-grid"><span><small>目标机器人</small><strong>{draft.plan.robotId}</strong></span><span><small>场景版本</small><strong>{activeSceneContext ? `r${activeSceneContext.revision}` : "未绑定"}</strong></span><span><small>起点位姿</small><strong>{robot?.pose ? `${robot.pose.x.toFixed(2)}, ${robot.pose.y.toFixed(2)}` : "未知"}</strong></span><span><small>审核有效期</small><strong className={expired ? "expired" : ""}>{expiry}</strong></span></div> : <p className="user-plan-summary">请确认这项机器人行动是否符合你的意思。</p>}
     {draft.plan.robotId !== robot?.robotId ? <p className="card-warning"><Icon name="warning" />当前机器人与草案不一致，不能执行。</p> : null}
     {review?.warnings?.length ? <div className="plan-warnings"><strong><Icon name="warning" />执行前确认</strong>{review.warnings.map((warning) => <p key={warning}>{warning}</p>)}</div> : null}
     <ol className="plan-step-list">{draft.plan.steps.map((step, index) => {
       const detail = review?.steps.find((item) => item.stepId === step.stepId);
       const goal = navigationGoal(step.payload);
-      return <li key={step.stepId}><span>{index + 1}</span><div><strong>{step.commandKey}</strong>{detail ? <p>{detail.rationale}</p> : null}{goal ? <small>目标坐标 · {goal.x.toFixed(2)}, {goal.y.toFixed(2)}, {goal.z.toFixed(2)} · yaw {goal.yaw.toFixed(2)}</small> : null}{step.dependsOn?.length ? <small>等待步骤：{step.dependsOn.join("、")}</small> : null}</div><StatusPill value="pending" /></li>;
+      return <li key={step.stepId}><span>{index + 1}</span><div><strong>{developerMode ? step.commandKey : (detail?.rationale ?? `完成第 ${index + 1} 步`)}</strong>{developerMode && detail ? <p>{detail.rationale}</p> : null}{developerMode && goal ? <small>目标坐标 · {goal.x.toFixed(2)}, {goal.y.toFixed(2)}, {goal.z.toFixed(2)} · yaw {goal.yaw.toFixed(2)}</small> : null}{developerMode && step.dependsOn?.length ? <small>等待步骤：{step.dependsOn.join("、")}</small> : null}</div><StatusPill value="pending" /></li>;
     })}</ol>
-    {(review?.contributions?.length || review?.spatialChecks?.length) ? <details className="plan-technical-details"><summary>查看 Agent 贡献与空间依据 <Icon name="chevron" /></summary><div>{review?.contributions?.map((worker) => <section key={worker.agentId}><strong>{worker.agentId}</strong><p>{worker.summary}</p></section>)}{review?.spatialChecks?.map((check) => <section key={check.stepId}><strong>{check.stepId} · {({ observed_free: "未发现障碍", occupied: "障碍警告", unknown: "观测不足", outside: "地图外" } as const)[check.check.classification]}</strong><p>map {check.goalPose.x.toFixed(2)}, {check.goalPose.y.toFixed(2)} · 净空 {check.check.clearanceMeters.toFixed(2)} m</p></section>)}</div></details> : null}
+    {developerMode && (review?.contributions?.length || review?.spatialChecks?.length) ? <details className="plan-technical-details"><summary>查看 Agent 贡献与空间依据 <Icon name="chevron" /></summary><div>{review?.contributions?.map((worker) => <section key={worker.agentId}><strong>{worker.agentId}</strong><p>{worker.summary}</p></section>)}{review?.spatialChecks?.map((check) => <section key={check.stepId}><strong>{check.stepId} · {({ observed_free: "未发现障碍", occupied: "障碍警告", unknown: "观测不足", outside: "地图外" } as const)[check.check.classification]}</strong><p>map {check.goalPose.x.toFixed(2)}, {check.goalPose.y.toFixed(2)} · 净空 {check.check.clearanceMeters.toFixed(2)} m</p></section>)}</div></details> : null}
     {expired ? <div className="expired-plan-actions"><p><Icon name="warning" />有效期结束后，机器人状态和场景可能已经变化，因此不能执行这份旧计划。</p><button type="button" onClick={onReplan} disabled={busy}>根据原任务重新规划</button></div> : draft.status === "draft" ? <div className="plan-review-controls"><label htmlFor="review-feedback">修改意见</label><textarea id="review-feedback" aria-label="审核意见" value={feedback} onChange={(event) => setFeedback(event.target.value)} rows={2} maxLength={2000} placeholder="需要修改时，说明新的约束、目标或顺序" /><div className="plan-review-actions"><HoldConfirmButton disabled={!reviewable} onConfirm={onConfirm} /><button type="button" onClick={onRevise} disabled={!reviewable || !feedback.trim()}>要求修改</button><button className="reject-plan" type="button" onClick={onReject} disabled={!reviewable}>拒绝</button></div></div> : <p className="frozen-plan-note"><Icon name="check" />该草案已冻结为不可变审核记录：{statusLabel(draft.status)}</p>}
   </article>;
 }
@@ -2439,9 +2568,9 @@ function AssistantView({
               className={`input-mode-card ${scenePanelOpen ? "active" : ""}`}
               type="button"
               onClick={onScene}
-              aria-label={scenePanelOpen ? "收起 PCD 场景" : "打开 PCD 场景"}
+              aria-label={scenePanelOpen ? "收起归档场景" : "打开归档场景"}
             >
-              <span className="input-mode-icon">◫</span><strong>导入 PCD</strong><small>可视化 · 标定 · 标注</small>
+              <span className="input-mode-icon">◫</span><strong>归档场景</strong><small>产品界面暂不提供</small>
             </button>
             <button
               className="input-mode-card"

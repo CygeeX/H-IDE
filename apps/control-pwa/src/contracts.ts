@@ -654,7 +654,19 @@ export interface AssistantTurn {
   taskId: string;
   conversationId: string;
   status: string;
-  result?: { status?: string; assistantMessage?: string; draftId?: string } | null;
+  result?: {
+    schemaVersion?: "h-ide.assistant-result/2";
+    status?: string;
+    intent?: "SOCIAL_CHAT" | "GENERAL_QA" | "ROBOT_OBSERVE" | "ROBOT_ACTION" | "SCENE_TEACH" | "ADMIN_DEV";
+    route?: "reply" | "visual_observation" | "scene_teaching" | "mission_review";
+    routeStatus?: "completed" | "needs_input" | "needs_robot" | "unavailable" | "awaiting_confirmation" | "review";
+    assistantMessage?: string;
+    clarification?: string | null;
+    draftId?: string;
+    missionDraftId?: string | null;
+    visualResult?: Record<string, unknown> | null;
+    evidence?: Array<Record<string, unknown>>;
+  } | null;
   error?: string | null;
   cancellationRequested?: boolean;
   draft?: AssistantDraft;
@@ -679,6 +691,23 @@ export interface SpeechTranscription {
   language?: string | null;
   locale: string;
   createdAt: string;
+}
+
+export type AssistantRole = "USER" | "DEVELOPER" | "ADMIN";
+
+export interface AuthPrincipal {
+  userId: string;
+  username: string;
+  displayName: string;
+  role: AssistantRole;
+  siteId: string;
+  authenticationMethod: "session" | "legacy_bearer" | string;
+  scopes: string[];
+}
+
+export interface AuthSessionResponse {
+  principal: AuthPrincipal;
+  csrfToken?: string;
 }
 
 export interface ControlEvent {
@@ -750,7 +779,7 @@ export function statusLabel(status: string | undefined): string {
 }
 
 export function isAssistantTurnTerminal(status: string | undefined): boolean {
-  return ["needs_input", "draft_ready", "cannot_plan", "failed", "cancelled", "unknown"].includes(status ?? "");
+  return ["completed", "needs_input", "draft_ready", "cannot_plan", "failed", "cancelled", "unknown"].includes(status ?? "");
 }
 
 export function isTerminal(status: string | undefined): boolean {

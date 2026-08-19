@@ -1,4 +1,4 @@
-const CACHE_NAME = "h-ide-shell-v5-mission-reconcile";
+const CACHE_NAME = "h-ide-shell-v6-assistant-v2";
 const APP_SHELL = ["/", "/manifest.webmanifest", "/icons/h-ide.svg"];
 
 self.addEventListener("install", (event) => {
