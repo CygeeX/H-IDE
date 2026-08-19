@@ -52,6 +52,12 @@ _LOCALIZATION_POSE_STATE_KEYS = {
 
 _PROJECTED_STATE_KEYS = _OBSERVATION_STATE_KEYS | _LOCALIZATION_POSE_STATE_KEYS
 
+# A cancellation is not acknowledged by an arbitrary status revision.  The
+# Robot Agent must publish a command terminal state and, for CANCELLED, a new
+# SAFE_HOLD control status after the request.  Keep the bound private so tests
+# can shorten it without widening the service configuration surface.
+_CANCEL_CONFIRMATION_TIMEOUT_SECONDS = 5.0
+
 
 @dataclass
 class _PendingTerminalPose:
@@ -559,19 +565,60 @@ class RobotAgentInboundPeer:
                 return ProtocolCommandStatus(command_id, "REJECTED", "command not found")
             if current.state in TERMINAL:
                 return current
-            revision = self._status_revisions.get(command_id, 0)
-        self._send(
-            "command.cancel",
-            {"command_id": str(UUID(command_id)), "reason": "H-IDE mission or operator cancellation"},
-        )
-        deadline = time.monotonic() + 5.0
+            control_revision = self._control_revision
+        try:
+            self._send(
+                "command.cancel",
+                {
+                    "command_id": str(UUID(command_id)),
+                    "reason": "H-IDE mission or operator cancellation",
+                },
+            )
+        except (ValueError, RuntimeError, TimeoutError, FutureTimeoutError) as exc:
+            return ProtocolCommandStatus(
+                command_id,
+                "ABORTED_AGENT_RESTART",
+                f"cancellation outcome is unknown: command.cancel was not confirmed: {exc}",
+            )
+        deadline = time.monotonic() + _CANCEL_CONFIRMATION_TIMEOUT_SECONDS
         with self._condition:
-            while self._connected and self._status_revisions.get(command_id, 0) <= revision:
+            while True:
+                status = self._statuses.get(command_id, current)
+                if not self._connected:
+                    if status.state == "ABORTED_AGENT_RESTART":
+                        return status
+                    return ProtocolCommandStatus(
+                        command_id,
+                        "ABORTED_AGENT_RESTART",
+                        "cancellation outcome is unknown: Robot Agent disconnected "
+                        "before SAFE_HOLD confirmation",
+                    )
+                if status.state in TERMINAL:
+                    if status.state != "CANCELLED":
+                        return status
+                    if (
+                        self._control_revision > control_revision
+                        and self._control_state == "SAFE_HOLD"
+                    ):
+                        return status
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    break
+                    if status.state == "CANCELLED":
+                        detail = (
+                            "cancellation outcome is unknown: CANCELLED was received "
+                            "without a new SAFE_HOLD confirmation"
+                        )
+                    else:
+                        detail = (
+                            "cancellation outcome is unknown: timed out waiting for "
+                            "a terminal command status"
+                        )
+                    return ProtocolCommandStatus(
+                        command_id,
+                        "ABORTED_AGENT_RESTART",
+                        detail,
+                    )
                 self._condition.wait(remaining)
-            return self._statuses.get(command_id, current)
 
     def connection_snapshot(self) -> dict[str, Any]:
         with self._condition:

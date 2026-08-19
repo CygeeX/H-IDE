@@ -19,8 +19,9 @@ from packages.control_core.capabilities import (
     SensorKind,
     SensorProfile,
 )
+from services.robot_agent_gateway import ws_inbound
 from services.robot_agent_gateway.main import create_app
-from services.robot_agent_gateway.protocol import ProtocolCommand
+from services.robot_agent_gateway.protocol import ProtocolCommand, ProtocolCommandStatus
 from services.robot_agent_gateway.wire import SUBPROTOCOL, build_message, parse_message
 from services.robot_agent_gateway.ws_inbound import RobotAgentInboundPeer
 
@@ -204,6 +205,117 @@ def run_fake_agent(
             ))
         elif incoming["type"] == "session.goodbye":
             return
+
+
+def _cancel_test_peer(
+    monkeypatch,
+    *,
+    timeout_seconds: float,
+) -> tuple[RobotAgentInboundPeer, str, threading.Event]:
+    monkeypatch.setattr(
+        ws_inbound,
+        "_CANCEL_CONFIRMATION_TIMEOUT_SECONDS",
+        timeout_seconds,
+    )
+    peer = RobotAgentInboundPeer(
+        robot_id="g1-dev",
+        expected_capabilities_digest=CAPABILITY_DIGEST,
+        capabilities=CAPABILITIES,
+        allow_plaintext_loopback=True,
+        heartbeat=False,
+    )
+    command_id = str(uuid4())
+    sent = threading.Event()
+    with peer._condition:
+        peer._connected = True
+        peer._control_state = "ACTIVE"
+        peer._control_revision = 3
+        peer._statuses[command_id] = ProtocolCommandStatus(
+            command_id,
+            "RUNNING",
+            "mock Nav2 is moving",
+        )
+        peer._status_revisions[command_id] = 1
+
+    def capture_send(message_type: str, payload: dict[str, object]) -> None:
+        assert message_type == "command.cancel"
+        assert payload["command_id"] == command_id
+        sent.set()
+
+    monkeypatch.setattr(peer, "_send", capture_send)
+    return peer, command_id, sent
+
+
+def _record_command_status(
+    peer: RobotAgentInboundPeer,
+    command_id: str,
+    state: str,
+) -> None:
+    peer._record_message(
+        {
+            "type": "command.status",
+            "payload": {
+                "command_id": command_id,
+                "state": state,
+                "detail": f"test {state.lower()}",
+                "progress": None,
+                "result": None,
+            },
+        }
+    )
+
+
+def test_cancel_ignores_running_revisions_and_waits_for_new_safe_hold(
+    monkeypatch,
+) -> None:
+    peer, command_id, sent = _cancel_test_peer(
+        monkeypatch,
+        timeout_seconds=0.5,
+    )
+    results: list[ProtocolCommandStatus] = []
+    worker = threading.Thread(target=lambda: results.append(peer.cancel(command_id)))
+    worker.start()
+    assert sent.wait(timeout=0.5)
+
+    _record_command_status(peer, command_id, "RUNNING")
+    _record_command_status(peer, command_id, "RUNNING")
+    worker.join(timeout=0.02)
+    assert worker.is_alive()
+
+    _record_command_status(peer, command_id, "CANCELLED")
+    worker.join(timeout=0.02)
+    assert worker.is_alive()
+
+    peer._record_message(
+        {
+            "type": "control.status",
+            "payload": {
+                "state": "SAFE_HOLD",
+                "reason": "safe stop completed",
+                "lease_sequence": None,
+            },
+        }
+    )
+    worker.join(timeout=0.5)
+    assert not worker.is_alive()
+    assert results[0].state == "CANCELLED"
+
+
+def test_cancel_without_new_safe_hold_times_out_as_unknown(monkeypatch) -> None:
+    peer, command_id, sent = _cancel_test_peer(
+        monkeypatch,
+        timeout_seconds=0.05,
+    )
+    results: list[ProtocolCommandStatus] = []
+    worker = threading.Thread(target=lambda: results.append(peer.cancel(command_id)))
+    worker.start()
+    assert sent.wait(timeout=0.5)
+    _record_command_status(peer, command_id, "CANCELLED")
+
+    worker.join(timeout=0.5)
+    assert not worker.is_alive()
+    assert results[0].state == "ABORTED_AGENT_RESTART"
+    assert "without a new SAFE_HOLD" in results[0].detail
 
 
 def test_inbound_gateway_accepts_agent_client_and_tracks_terminal_status() -> None:

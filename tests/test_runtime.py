@@ -202,17 +202,28 @@ def test_lease_expiry_cancel_failures_never_leave_running():
     assert events[-1]["safetyWarning"]
 
 
-def test_cancel_unknown_result_is_not_success_and_releases_lease():
+def test_cancel_unknown_result_keeps_safety_barrier():
     class UnknownCancelAdapter(FakeAdapter):
         def cancel(self, command_id):
             return AdapterResult(status="unknown", error="no confirmation")
 
     adapter = UnknownCancelAdapter(result=AdapterResult(status="running"))
-    runtime = ActionRuntime(adapters={"fake": adapter})
+    events = []
+    runtime = ActionRuntime(adapters={"fake": adapter}, event_sink=events.append)
     runtime.dispatch(request(), definition(), mapping())
     result = runtime.cancel("c1")
-    assert result.status.value == "failed"
+    assert result.status.value == "unknown"
     assert "no confirmation" in (result.error or "")
+    assert not any(event["status"] == "cancelled" for event in events)
+    assert not runtime._leases
+    assert not runtime._inflight
+    blocked = runtime.dispatch(
+        request("after-cancel-unknown", "after-cancel-unknown"),
+        definition(),
+        mapping("move.forward", "v2"),
+    )
+    assert blocked.status.value == "rejected"
+    assert "safety barrier" in (blocked.error or "")
 
 
 def test_cancel_missing_or_unstructured_adapter_never_claims_cancelled():

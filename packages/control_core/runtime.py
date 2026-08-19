@@ -233,14 +233,31 @@ class ActionRuntime:
             self._safety_owners[robot_id] = (epoch, to_owner)
         return epoch
 
+    def _cancel_external_result(
+        self,
+        action: _InFlight | None,
+        command_id: str,
+    ) -> AdapterResult:
+        """Call adapter cancellation outside the lock and preserve uncertainty."""
+        if action is None:
+            return AdapterResult(
+                status="failed",
+                error="adapter unavailable during safety stop",
+            )
+        try:
+            return self._normalize_result(action.adapter.cancel(command_id), "cancel")
+        except Exception as exc:
+            # A transport exception does not prove that the remote command
+            # stopped.  Preserve it as unknown so callers can retain their
+            # safety barrier instead of recording an ordinary failure.
+            return AdapterResult(
+                status="unknown",
+                error=f"safety stop outcome is unknown: {exc}",
+            )
+
     def _cancel_external(self, action: _InFlight | None, command_id: str) -> str | None:
         """Call adapter cancellation outside the lock and return a warning."""
-        if action is None:
-            return "adapter unavailable during safety stop"
-        try:
-            outcome = self._normalize_result(action.adapter.cancel(command_id), "cancel")
-        except Exception as exc:
-            return f"safety stop failed: {exc}"
+        outcome = self._cancel_external_result(action, command_id)
         status = str(outcome.status).lower()
         if status not in {"cancelled", "canceled"}:
             return outcome.error or f"adapter returned {outcome.status} while cancelling"
@@ -569,15 +586,62 @@ class ActionRuntime:
             else:
                 safety_epoch = self._claim_safety_barrier(request.robotId, owner)
             self._release_lease(request.robotId, command_id)
-            self._receipt(request, CommandStatus.CANCELLED, completedAt=self.clock(), safetyStop=True)
+            # Persist fail-closed while the adapter call is outside the lock.
+            # A crash or observer during this window must never see CANCELLED
+            # before the remote command and SAFE_HOLD are confirmed.
+            self._receipt(
+                request,
+                CommandStatus.UNKNOWN,
+                error="cancellation confirmation pending",
+                completedAt=self.clock(),
+                safetyStop=True,
+                safetyWarning="physical execution state is unknown",
+            )
         self._flush_events()
-        warning = self._cancel_external(action, command_id)
+        outcome = self._cancel_external_result(action, command_id)
+        cancel_status = str(outcome.status).lower()
         with self._lock:
-            if warning:
-                receipt = self._receipt(request, CommandStatus.FAILED, error=warning, completedAt=self.clock(), safetyStop=True, safetyWarning=warning)
+            self._inflight.pop(command_id, None)
+            if cancel_status in {"cancelled", "canceled"}:
+                receipt = self._receipt(
+                    request,
+                    CommandStatus.CANCELLED,
+                    error=None,
+                    completedAt=self.clock(),
+                    safetyStop=True,
+                )
+                self._clear_safety_barrier(request.robotId, owner, safety_epoch)
+            elif cancel_status in {
+                "unknown",
+                "unavailable",
+                "running",
+                "accepted",
+                "pending",
+            }:
+                warning = self._error_text(
+                    outcome.error,
+                    f"adapter cancellation state is {outcome.status}",
+                )
+                self._transfer_safety_barrier(
+                    request.robotId,
+                    owner,
+                    f"unknown:{command_id}",
+                )
+                receipt = self._receipt(
+                    request,
+                    CommandStatus.UNKNOWN,
+                    error=warning,
+                    completedAt=self.clock(),
+                    safetyStop=True,
+                    safetyWarning="physical execution state is unknown",
+                )
             else:
-                receipt = self._receipts[command_id]
-            self._clear_safety_barrier(request.robotId, owner, safety_epoch)
+                warning = self._error_text(
+                    outcome.error,
+                    f"adapter returned {outcome.status} while cancelling",
+                )
+                receipt = self._receipt(request, CommandStatus.FAILED, error=warning, completedAt=self.clock(), safetyStop=True, safetyWarning=warning)
+                self._clear_safety_barrier(request.robotId, owner, safety_epoch)
         self._flush_events()
         return receipt
 
