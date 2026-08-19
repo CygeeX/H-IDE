@@ -364,6 +364,40 @@ def test_driver_requires_startup_qualification_before_accepting_motion() -> None
     assert driver.guard.accepted == [(0.20, 0.0, 0.0, "nav2")]
 
 
+def test_idle_observation_reconnect_emits_clean_driver_idle_without_replay() -> None:
+    clock = Clock()
+    adapter, _ = runtime(clock)
+    driver = bare_driver(clock)
+
+    initial_idle = adapter.tick(now=clock.value)
+    driver.accept_json(_intent_payload(initial_idle, measured_heading_yaw=0.0))
+    assert driver.telemetry.values["nav2_state"] == "idle"
+
+    clock.value += 0.31
+    stale = adapter.tick(now=clock.value)
+    driver.accept_json(_intent_payload(stale, measured_heading_yaw=0.0))
+    assert stale.state == "DISARMED"
+    assert driver.telemetry.values["nav2_state"] == "safety_stop"
+    assert "stale while idle" in str(driver.telemetry.values["last_error"])
+    assert driver.guard.accepted == []
+
+    clock.value += 0.01
+    fresh_observation = adapter.ingest_observation(
+        observation(clock), now=clock.value
+    )
+    driver.accept_json(
+        _intent_payload(fresh_observation, measured_heading_yaw=0.0)
+    )
+    clean_idle = adapter.arm(1, now=clock.value)
+    driver.accept_json(_intent_payload(clean_idle, measured_heading_yaw=0.0))
+
+    assert clean_idle.state == "IDLE"
+    assert clean_idle.reason is None
+    assert driver.telemetry.values["nav2_state"] == "idle"
+    assert driver.telemetry.values["last_error"] is None
+    assert driver.guard.accepted == []
+
+
 def test_driver_rejects_raw_cmd_vel_and_fails_closed() -> None:
     clock = Clock()
     driver = bare_driver(clock)

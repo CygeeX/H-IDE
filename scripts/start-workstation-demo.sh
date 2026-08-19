@@ -339,6 +339,18 @@ start_process \
   "${HIDE_DEMO_SIM_ROOT}" \
   'exec "$HIDE_DEMO_SIM_ROOT/.venv/bin/python" -u -m hide_mujoco_sonic sonic --config "$HIDE_DEMO_CONFIG"'
 
+wait_for_http 'MuJoCo plant + RGB-D' 'http://127.0.0.1:8794/healthz' 60
+# A listening telemetry port only proves that the Python process exists.  Keep
+# Nav2 and Robot Agent offline until the full controller path has warmed, the
+# IDLE consumer has sustained the authoritative 50 Hz simulation cadence, and
+# the driver explicitly opens its motion gate.
+wait_for_sonic_motion_ready 120
+
+# Start ROS ingress only after the actuator-side controller is ready. This
+# avoids creating an already-armed IDLE lifecycle whose observation stream can
+# expire while the cold SONIC process is still loading its models. Runtime
+# same-generation recovery remains implemented in GaitAdapter for real bridge
+# reconnects; launch ordering is only race reduction, not the safety mechanism.
 start_process \
   ros-cmd-vel-bridge \
   '-m hide_mujoco_sonic ros-bridge --config' \
@@ -357,12 +369,6 @@ start_process \
   "${HIDE_DEMO_SIM_ROOT}" \
   'source /opt/ros/jazzy/setup.bash; export ROS_DOMAIN_ID=232 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp CYCLONEDDS_URI="$HIDE_DEMO_CYCLONE"; export PYTHONPATH="$HIDE_DEMO_SIM_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"; exec /usr/bin/python3 -u -m hide_mujoco_sonic safe-stop-service --config "$HIDE_DEMO_CONFIG"'
 
-wait_for_http 'MuJoCo plant + RGB-D' 'http://127.0.0.1:8794/healthz' 60
-# A listening telemetry port only proves that the Python process exists.  Keep
-# Nav2 and Robot Agent offline until the full controller path has warmed, the
-# IDLE consumer has sustained the authoritative 50 Hz simulation cadence, and
-# the driver explicitly opens its motion gate.
-wait_for_sonic_motion_ready 120
 wait_for_simulation_tf 60
 
 if [[ "${nav2_needs_start}" == "true" ]]; then

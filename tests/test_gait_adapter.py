@@ -160,16 +160,92 @@ def test_stale_nav2_command_fails_closed_and_disarms_after_stop_ack() -> None:
     acknowledge_stop(adapter, first=10.41, terminal="DISARMED")
 
 
-def test_stale_observation_during_motion_latches_fault() -> None:
+def test_idle_startup_stale_observation_can_rearm_same_generation_without_replay() -> None:
+    config = GaitAdapterConfig(
+        command_timeout_s=1.0,
+        observation_timeout_s=0.20,
+    )
+    adapter = armed_adapter(config=config)
+
+    # A below-deadband command remains IDLE but proves there is buffered input
+    # to discard. It must never be replayed after observation recovery.
+    buffered = adapter.ingest_twist(twist(10.02, vx=0.01), now=10.02)
+    assert buffered.state == "IDLE"
+    assert adapter._command is not None
+
+    stale = adapter.tick(now=10.21)
+    assert stale.state == "DISARMED"
+    assert stale.stop_requested is True
+    assert "explicit arm" in (stale.reason or "")
+    assert adapter._requires_new_generation is False
+    assert adapter._command is None
+
+    # A fresh observation alone cannot arm or move. The explicit arm is a
+    # distinct transition and emits a clean, zero-motion IDLE envelope.
+    observed = adapter.ingest_observation(observation(10.22), now=10.22)
+    assert observed.state == "DISARMED"
+    assert observed.motion_enabled is False
+    recovered = adapter.arm(1, now=10.22)
+    assert recovered.state == "IDLE"
+    assert recovered.reason is None
+    assert recovered.motion_enabled is False
+    assert recovered.stop_requested is False
+    assert recovered.stop_acknowledged is True
+    assert recovered.velocity_x_mps == recovered.velocity_y_mps == 0.0
+    assert recovered.yaw_rate_rps == 0.0
+
+    later = adapter.tick(now=10.23)
+    assert later.state == "IDLE"
+    assert later.motion_enabled is False
+
+
+@pytest.mark.parametrize("active_state", ["STARTING", "WALKING", "TURNING"])
+def test_stale_observation_during_motion_latches_fault(active_state: str) -> None:
     config = GaitAdapterConfig(command_timeout_s=1.0, observation_timeout_s=0.20)
     adapter = armed_adapter(config=config)
-    adapter.ingest_twist(twist(10.02, vx=0.2), now=10.02)
-    adapter.ingest_observation(observation(10.03, vx=0.06), now=10.03)
-    fault = adapter.tick(now=10.24)
+    if active_state == "TURNING":
+        adapter.ingest_twist(twist(10.02, wz=0.2), now=10.02)
+        adapter.ingest_observation(observation(10.03, wz=0.06), now=10.03)
+        stale_at = 10.24
+    else:
+        adapter.ingest_twist(twist(10.02, vx=0.2), now=10.02)
+        if active_state == "WALKING":
+            adapter.ingest_observation(observation(10.03, vx=0.06), now=10.03)
+            stale_at = 10.24
+        else:
+            stale_at = 10.21
+    assert adapter.state.value == active_state
+
+    fault = adapter.tick(now=stale_at)
     assert fault.state == "FAULT"
     assert fault.motion_enabled is False
     assert fault.stop_requested is True
     assert "observation" in (fault.reason or "")
+    assert adapter._requires_new_generation is True
+
+    # Neither fresh stationary data nor explicit arm relaxes a motion fault.
+    fresh_at = stale_at + 0.01
+    adapter.ingest_observation(observation(fresh_at), now=fresh_at)
+    assert adapter.arm(1, now=fresh_at).state == "FAULT"
+
+
+def test_idle_stale_after_prior_motion_still_requires_new_generation() -> None:
+    config = GaitAdapterConfig(command_timeout_s=1.0, observation_timeout_s=0.20)
+    adapter = armed_adapter(config=config)
+    adapter.ingest_twist(twist(10.02, vx=0.2), now=10.02)
+    adapter.ingest_observation(observation(10.03, vx=0.06), now=10.03)
+    assert adapter.ingest_twist(twist(10.04), now=10.04).state == "STOPPING"
+    acknowledge_stop(adapter, first=10.05, terminal="IDLE")
+
+    stale = adapter.tick(now=10.42)
+    assert stale.state == "DISARMED"
+    assert "newer generation" in (stale.reason or "")
+    assert adapter._requires_new_generation is True
+
+    adapter.ingest_observation(observation(10.43), now=10.43)
+    rejected = adapter.arm(1, now=10.43)
+    assert rejected.state == "DISARMED"
+    assert "newer generation" in (rejected.reason or "")
 
 
 def test_sustained_measured_reverse_translation_latches_fault() -> None:
@@ -271,4 +347,3 @@ def test_fault_does_not_rearm_in_same_generation_even_after_stop_ack() -> None:
     assert acknowledged.state == "FAULT"
     assert acknowledged.stop_acknowledged is True
     assert adapter.arm(1, now=10.21).state == "FAULT"
-

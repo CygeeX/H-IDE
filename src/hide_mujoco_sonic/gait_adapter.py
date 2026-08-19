@@ -191,9 +191,11 @@ class GaitAdapter:
 
     The adapter is intentionally single-threaded.  A ROS integration should
     serialize events before calling it, then publish the returned
-    :class:`SonicIntent`.  Fault recovery always requires a strictly newer
-    plant generation, a fresh stationary observation, and an explicit
-    :meth:`arm` call.
+    :class:`SonicIntent`.  Fault or post-motion recovery always requires a
+    strictly newer plant generation.  The sole same-generation exception is a
+    stale observation while still IDLE in a generation that has never granted
+    motion: a fresh stationary observation plus an explicit :meth:`arm` may
+    restore that startup/reconnect synchronization loss.
     """
 
     def __init__(
@@ -215,6 +217,7 @@ class GaitAdapter:
         self._last_observation_timestamp: float | None = None
         self._last_command_timestamp: float | None = None
         self._requires_new_generation = False
+        self._motion_started_in_generation = False
 
         self._start_at: float | None = None
         self._active_kind: GaitState | None = None
@@ -406,8 +409,24 @@ class GaitAdapter:
         if not self._observation_is_fresh(now):
             if self.state is GaitState.IDLE:
                 self.state = GaitState.DISARMED
-                self._requires_new_generation = True
-                self.reason = "base observation became stale while idle"
+                # Losing an observation before this generation has ever
+                # granted motion is a startup/reconnect synchronization loss,
+                # not evidence that a moving robot is in an unknown state.
+                # Drop every command and require a new fresh stationary sample
+                # plus an explicit arm.  Once STARTING was entered, even a
+                # later IDLE observation loss retains the stronger new-
+                # generation interlock.
+                self._requires_new_generation = self._motion_started_in_generation
+                self._command = None
+                self._last_command_timestamp = None
+                self.reason = (
+                    "base observation became stale while idle; "
+                    + (
+                        "newer generation required after prior motion"
+                        if self._requires_new_generation
+                        else "fresh stationary observation and explicit arm required"
+                    )
+                )
             else:
                 self._trip_fault("base observation became stale during motion", now)
             return
@@ -447,6 +466,10 @@ class GaitAdapter:
                 self._trip_fault("measured base did not acknowledge gait start before timeout", now)
 
     def _begin_start(self, desired: GaitState, command: Nav2Twist, now: float) -> None:
+        # Record authority grant, not only measured movement.  If observation
+        # later disappears, a STARTING lifecycle must never be downgraded to
+        # the startup-only same-generation recovery path.
+        self._motion_started_in_generation = True
         self.state = GaitState.STARTING
         self.reason = "waiting for measured gait start"
         self._start_at = now
@@ -587,6 +610,7 @@ class GaitAdapter:
         self._last_observation_timestamp = None
         self._last_command_timestamp = None
         self._requires_new_generation = False
+        self._motion_started_in_generation = False
         self._start_at = None
         self._active_kind = None
         self._active_direction = None

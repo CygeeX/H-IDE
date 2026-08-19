@@ -137,9 +137,10 @@ def run_ros_bridge(config: SimConfig) -> None:
             max_facing_delta_rad=config.max_facing_lead_rad,
         )
     )
-    # ``arm`` is attempted only from a fresh measured odometry callback.  It
-    # cannot arm while the base is moving, and the adapter refuses same-
-    # generation recovery after stale/cancel/fault transitions.
+    # ``arm`` is attempted only from a fresh measured odometry callback. It
+    # cannot arm while the base is moving. Cancel, motion/post-motion stale,
+    # and fault transitions require a newer generation; only a never-moved
+    # IDLE observation reconnect may explicitly re-arm the same generation.
     gait.advance_generation(generation)
     latest_heading = {"yaw": None}
     bridge_fault = {"reason": None}
