@@ -217,6 +217,22 @@ def test_docker_plant_listener_serves_live_rgb_but_rejects_support_write() -> No
             "ready": True,
             "alive": True,
         },
+        dynamics_evidence_provider=lambda: {
+            "schemaVersion": "h-ide.mujoco-dynamics-evidence/1",
+            "status": "running",
+            "diagnosticOnly": True,
+            "authorityFeedbackEnabled": False,
+            "supportBandEnabled": True,
+            "attachedBody": "torso_link",
+            "lastAppliedWrench": {
+                "frameId": "world",
+                "order": [
+                    "force_x", "force_y", "force_z",
+                    "torque_x", "torque_y", "torque_z",
+                ],
+                "values": [0.0, 0.0, 42.0, 1.0, 2.0, 0.0],
+            },
+        },
     )
     jpeg = b"\xff\xd8read-only-fixture\xff\xd9"
     captured_at = time.time_ns()
@@ -254,6 +270,12 @@ def test_docker_plant_listener_serves_live_rgb_but_rejects_support_write() -> No
         assert state["runtimeTiming"]["stages"]["rgbRender"][
             "overThresholdCount"
         ] == 1
+        evidence = state["dynamicsEvidence"]
+        assert evidence["diagnosticOnly"] is True
+        assert evidence["authorityFeedbackEnabled"] is False
+        assert evidence["supportBandEnabled"] is True
+        assert evidence["attachedBody"] == "torso_link"
+        assert evidence["lastAppliedWrench"]["values"][-1] == 0.0
         assert "oracle" not in json.dumps(state).lower()
         assert "segmentation" not in json.dumps(state).lower()
         # Image routes must use their selected immutable frame directly.  A

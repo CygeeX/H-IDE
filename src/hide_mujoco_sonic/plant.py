@@ -69,6 +69,33 @@ class _FrameWindow:
     previous: RenderedFrame | None
 
 
+@dataclass(frozen=True, slots=True)
+class _PlantDynamicsSnapshot:
+    """One immutable authority-thread sample for read-only fault evidence."""
+
+    sequence: int
+    captured_at_unix_ns: int
+    simulation_time_s: float | None
+    support_band_enabled: bool
+    attached_body: str | None
+    last_applied_wrench: tuple[float | None, ...]
+    root_qpos: tuple[float | None, ...]
+    root_qvel: tuple[float | None, ...]
+    root_qacc: tuple[float | None, ...]
+    root_qacc_warmstart: tuple[float | None, ...]
+    potential_energy_j: float | None
+    kinetic_energy_j: float | None
+    warning_counts: tuple[tuple[str, int], ...]
+
+
+_PHYSICS_WARNING_NAMES = (
+    "mjWARN_BADQPOS",
+    "mjWARN_BADQVEL",
+    "mjWARN_BADQACC",
+    "mjWARN_BADCTRL",
+)
+
+
 class PlantSupportController:
     """Simulation-only fall-arrest state, never a navigation actuator.
 
@@ -426,15 +453,211 @@ def configure_tracking_viewer(mujoco, model, viewer, scene: RuntimeScene) -> Non
     )
 
 
+class PlantDynamicsEvidence:
+    """Publish complete, diagnostic-only dynamics without blocking physics.
+
+    The authoritative MuJoCo thread is the sole writer.  HTTP readers project
+    one immutable reference under the CPython GIL, exactly like the Plant
+    support state.  These fields are never consumed by a controller or
+    republished by the ROS observation bridge; they exist to make a numerical
+    stop fault reconstructable after the process has exited.
+    """
+
+    _WRENCH_ORDER = (
+        "force_x",
+        "force_y",
+        "force_z",
+        "torque_x",
+        "torque_y",
+        "torque_z",
+    )
+    _ROOT_QPOS_ORDER = ("x", "y", "z", "qw", "qx", "qy", "qz")
+    _ROOT_QVEL_ORDER = tuple(f"qvel[{index}]" for index in range(6))
+    _ROOT_QACC_ORDER = tuple(f"qacc[{index}]" for index in range(6))
+
+    def __init__(
+        self,
+        mujoco_api,
+        model,
+        data,
+        *,
+        support_band=None,
+        attached_body_id: int | None = None,
+    ) -> None:
+        self.mujoco = mujoco_api
+        self.model = model
+        self.data = data
+        self.support_band = support_band
+        self.root_body_id = int(
+            mujoco_api.mj_name2id(
+                model,
+                mujoco_api.mjtObj.mjOBJ_BODY,
+                "pelvis",
+            )
+        )
+        if self.root_body_id < 0:
+            raise RuntimeError("pinned G1 model does not define pelvis")
+        if attached_body_id is None:
+            self.attached_body_id = None
+            self.attached_body_name = None
+        else:
+            body_id = int(attached_body_id)
+            if not (0 <= body_id < int(model.nbody)):
+                raise ValueError("support attached body ID is invalid")
+            body_name = mujoco_api.mj_id2name(
+                model,
+                mujoco_api.mjtObj.mjOBJ_BODY,
+                body_id,
+            )
+            if not body_name:
+                raise ValueError("support attached body must have a stable name")
+            self.attached_body_id = body_id
+            self.attached_body_name = str(body_name)
+        self._sequence = 0
+        self._snapshot: _PlantDynamicsSnapshot | None = None
+
+    @staticmethod
+    def _finite(value: object) -> float | None:
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return None
+        return result if math.isfinite(result) else None
+
+    @classmethod
+    def _finite_tuple(cls, values) -> tuple[float | None, ...]:
+        return tuple(cls._finite(value) for value in values)
+
+    def _warning_counts(self) -> tuple[tuple[str, int], ...]:
+        return tuple(
+            (
+                name.removeprefix("mjWARN_"),
+                int(
+                    self.data.warning[
+                        int(getattr(self.mujoco.mjtWarning, name))
+                    ].number
+                ),
+            )
+            for name in _PHYSICS_WARNING_NAMES
+        )
+
+    def observe(self, *, captured_at_unix_ns: int | None = None) -> None:
+        """Capture the state after one authoritative step without any lock."""
+
+        energy = (None, None)
+        try:
+            self.mujoco.mj_energyPos(self.model, self.data)
+            self.mujoco.mj_energyVel(self.model, self.data)
+            energy = tuple(self._finite(value) for value in self.data.energy[:2])
+        except Exception:
+            # Evidence must never become a new failure source.  The physics
+            # monitor independently treats non-finite authoritative state as a
+            # terminal fault; an unavailable energy projection remains explicit.
+            energy = (None, None)
+        if self.attached_body_id is None:
+            wrench = (0.0,) * 6
+        else:
+            wrench = self._finite_tuple(
+                self.data.xfrc_applied[self.attached_body_id]
+            )
+        self._sequence += 1
+        self._snapshot = _PlantDynamicsSnapshot(
+            sequence=self._sequence,
+            captured_at_unix_ns=(
+                time.time_ns()
+                if captured_at_unix_ns is None
+                else int(captured_at_unix_ns)
+            ),
+            simulation_time_s=self._finite(self.data.time),
+            support_band_enabled=(
+                self.support_band is not None
+                and bool(getattr(self.support_band, "enable", False))
+            ),
+            attached_body=self.attached_body_name,
+            last_applied_wrench=wrench,
+            root_qpos=self._finite_tuple(self.data.qpos[:7]),
+            root_qvel=self._finite_tuple(self.data.qvel[:6]),
+            root_qacc=self._finite_tuple(self.data.qacc[:6]),
+            root_qacc_warmstart=self._finite_tuple(
+                self.data.qacc_warmstart[:6]
+            ),
+            potential_energy_j=energy[0],
+            kinetic_energy_j=energy[1],
+            warning_counts=self._warning_counts(),
+        )
+
+    def capture_state(self) -> dict[str, object]:
+        """Return one JSON-safe projection without reading live ``MjData``."""
+
+        snapshot = self._snapshot
+        if snapshot is None:
+            return {
+                "schemaVersion": "h-ide.mujoco-dynamics-evidence/1",
+                "status": "starting",
+                "diagnosticOnly": True,
+                "authorityFeedbackEnabled": False,
+            }
+        finite_values = (
+            *snapshot.last_applied_wrench,
+            *snapshot.root_qpos,
+            *snapshot.root_qvel,
+            *snapshot.root_qacc,
+            *snapshot.root_qacc_warmstart,
+            snapshot.simulation_time_s,
+            snapshot.potential_energy_j,
+            snapshot.kinetic_energy_j,
+        )
+        state_finite = all(value is not None for value in finite_values)
+        total_energy = None
+        if (
+            snapshot.potential_energy_j is not None
+            and snapshot.kinetic_energy_j is not None
+        ):
+            total_energy = (
+                snapshot.potential_energy_j + snapshot.kinetic_energy_j
+            )
+        return {
+            "schemaVersion": "h-ide.mujoco-dynamics-evidence/1",
+            "status": "running" if state_finite else "invalid",
+            "diagnosticOnly": True,
+            "authorityFeedbackEnabled": False,
+            "sampleSequence": snapshot.sequence,
+            "capturedAtUnixNs": snapshot.captured_at_unix_ns,
+            "simulationTimeS": snapshot.simulation_time_s,
+            "supportBandEnabled": snapshot.support_band_enabled,
+            "attachedBody": snapshot.attached_body,
+            "lastAppliedWrench": {
+                "frameId": "world",
+                "order": list(self._WRENCH_ORDER),
+                "values": list(snapshot.last_applied_wrench),
+            },
+            "rootState": {
+                "body": "pelvis",
+                "qposOrder": list(self._ROOT_QPOS_ORDER),
+                "qpos": list(snapshot.root_qpos),
+                "generalizedVelocityRepresentation": (
+                    "raw MuJoCo free-joint qvel; preserve order for replay"
+                ),
+                "qvelOrder": list(self._ROOT_QVEL_ORDER),
+                "qvel": list(snapshot.root_qvel),
+                "qaccOrder": list(self._ROOT_QACC_ORDER),
+                "qacc": list(snapshot.root_qacc),
+                "qaccWarmstart": list(snapshot.root_qacc_warmstart),
+            },
+            "energy": {
+                "potentialJ": snapshot.potential_energy_j,
+                "kineticJ": snapshot.kinetic_energy_j,
+                "totalJ": total_energy,
+            },
+            "warningCounts": dict(snapshot.warning_counts),
+            "finite": state_finite,
+        }
+
+
 class PlantPhysicsMonitor:
     """Authority-thread checks that never depend on rendering availability."""
 
-    _WARNING_NAMES = (
-        "mjWARN_BADQPOS",
-        "mjWARN_BADQVEL",
-        "mjWARN_BADQACC",
-        "mjWARN_BADCTRL",
-    )
+    _WARNING_NAMES = _PHYSICS_WARNING_NAMES
 
     def __init__(self, config: SimConfig, mujoco_api, model, data, support) -> None:
         self.config = config
@@ -530,6 +753,7 @@ class PlantFrameStore:
         runtime_diagnostics: PlantRuntimeDiagnostics | None = None,
         worker_status_provider=None,
         viewer_status_provider=None,
+        dynamics_evidence_provider=None,
     ):
         self.config = config
         self.support = support
@@ -542,6 +766,7 @@ class PlantFrameStore:
         self._window = _FrameWindow(latest=None, previous=None)
         self._worker_status_provider = worker_status_provider
         self._viewer_status_provider = viewer_status_provider
+        self._dynamics_evidence_provider = dynamics_evidence_provider
         self._servers: list[ThreadingHTTPServer] = []
 
     def set_worker_status_provider(self, provider) -> None:
@@ -549,6 +774,9 @@ class PlantFrameStore:
 
     def set_viewer_status_provider(self, provider) -> None:
         self._viewer_status_provider = provider
+
+    def set_dynamics_evidence_provider(self, provider) -> None:
+        self._dynamics_evidence_provider = provider
 
     def commit(self, frame: RenderedFrame) -> None:
         """Atomically install one complete RGB-D/state generation."""
@@ -645,6 +873,29 @@ class PlantFrameStore:
                 "lastError": f"viewer status unavailable: {type(exc).__name__}: {exc}"[:512],
             }
 
+    def _dynamics_evidence(self) -> dict[str, object]:
+        provider = self._dynamics_evidence_provider
+        if provider is None:
+            return {
+                "schemaVersion": "h-ide.mujoco-dynamics-evidence/1",
+                "status": "starting",
+                "diagnosticOnly": True,
+                "authorityFeedbackEnabled": False,
+            }
+        try:
+            return dict(provider())
+        except Exception as exc:
+            return {
+                "schemaVersion": "h-ide.mujoco-dynamics-evidence/1",
+                "status": "failed",
+                "diagnosticOnly": True,
+                "authorityFeedbackEnabled": False,
+                "lastError": (
+                    "dynamics evidence unavailable: "
+                    f"{type(exc).__name__}: {exc}"
+                )[:512],
+            }
+
     def _observation_status(
         self,
         frame: RenderedFrame | None,
@@ -726,6 +977,7 @@ class PlantFrameStore:
                 else BodyTwist.zero().capture_state()
             ),
             "support": support_state,
+            "dynamicsEvidence": self._dynamics_evidence(),
             "runtimeTiming": (
                 self.runtime_diagnostics.snapshot()
                 if self.runtime_diagnostics is not None
@@ -1177,6 +1429,18 @@ def run_plant(config: SimConfig) -> int:
     runtime_diagnostics = PlantRuntimeDiagnostics(
         stall_threshold_s=config.plant_lowstate_stale_s,
     )
+    dynamics_evidence = PlantDynamicsEvidence(
+        mujoco,
+        sim_env.mj_model,
+        sim_env.mj_data,
+        support_band=support_band,
+        attached_body_id=(
+            int(sim_env.band_attached_link)
+            if support_band is not None
+            else None
+        ),
+    )
+    dynamics_evidence.observe()
     physics_monitor = PlantPhysicsMonitor(
         config,
         mujoco,
@@ -1202,6 +1466,10 @@ def run_plant(config: SimConfig) -> int:
             # the check at the last safe point before mj_step.
             support_controller.require_healthy()
             result = original_sim_step()
+            # Capture the exact post-step evidence before the terminal monitor
+            # can raise and close the process.  HTTP reads only the resulting
+            # immutable projection; this data is never fed back into control.
+            dynamics_evidence.observe()
             physics_monitor.observe()
             return result
         finally:
@@ -1218,6 +1486,7 @@ def run_plant(config: SimConfig) -> int:
                 config,
                 support_controller,
                 runtime_diagnostics,
+                dynamics_evidence_provider=dynamics_evidence.capture_state,
             )
             rgbd_mailbox = LatestStateMailbox(
                 state_shape,

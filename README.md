@@ -204,6 +204,14 @@ receive isolated copies.
 
 MuJoCo `/state` and `/healthz` expose `runtimeTiming` for the authoritative
 simulation-loop gap, physics step, and non-blocking state-snapshot publication.
+They also expose a separately identified `dynamicsEvidence` sample captured by
+the MuJoCo authority thread after each step.  It records
+`supportBandEnabled`, the `attachedBody`, the world-frame
+`lastAppliedWrench`, the complete floating-root qpos/qvel/qacc and solver
+warm-start acceleration, MuJoCo potential/kinetic energy, and numerical-warning
+counts.  The sample is an immutable, read-only diagnostic projection:
+`diagnosticOnly=true` and `authorityFeedbackEnabled=false`; it is neither
+consumed by a controller nor forwarded through the ROS observation bridge.
 RGB, depth and JPEG work runs only in a `spawn` worker with its own verified
 OfficeV2 model, `MjData` and Renderer; its per-frame costs are reported as
 `renderTiming`.  A worker failure or a frame older than 500 ms changes only
@@ -219,6 +227,18 @@ three responses carry matching capture identity headers.  The ROS observation
 bridge enforces those identities and rechecks the original capture timestamp
 against the same 500-ms limit before publishing.  These changes do not widen
 the 100-ms physics safety limits or replay stale samples.
+
+`tests/test_stop_dynamics_regression.py` loads the real OfficeV2 runtime XML
+and runs a deterministic terminal-stop A/B at the configured 4 ms timestep.
+Its small fixture reconstructs the last retained finite root/29-DoF state,
+frozen SONIC target, and deployed gains; it is explicitly not bit-exact because
+the retained Plant and SONIC samples were about one tick apart and no contact
+solver warm start was recorded.  The regression requires the production
+zero-yaw `safety_stop` wrench to remain finite, warning-free, and inside the
+validated office envelope for two seconds, while the historical tethered-torso
+`-80 * wz` counterfactual must exceed acceleration/speed limits and leave the
+envelope within 80 ms.  The multi-megabyte raw trace is intentionally not part
+of the repository.
 
 ### Read-only SAFE_HOLD soak evidence
 

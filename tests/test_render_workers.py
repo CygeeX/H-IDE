@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import inspect
+import math
 import multiprocessing
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +16,7 @@ import pytest
 import hide_mujoco_sonic.render_workers as render_workers
 from hide_mujoco_sonic.frames import BodyTwist
 from hide_mujoco_sonic.plant import (
+    PlantDynamicsEvidence,
     PlantFrameStore,
     PlantPhysicsFault,
     PlantPhysicsMonitor,
@@ -81,6 +83,65 @@ def _model_data():
     data.time = 1.25
     mujoco.mj_forward(model, data)
     return mujoco, model, data
+
+
+def test_dynamics_evidence_is_complete_immutable_and_diagnostic_only() -> None:
+    mujoco, model, data = _model_data()
+    pelvis_id = mujoco.mj_name2id(
+        model,
+        mujoco.mjtObj.mjOBJ_BODY,
+        "pelvis",
+    )
+    data.xfrc_applied[pelvis_id] = (1.0, -2.0, 3.0, -4.0, 5.0, -6.0)
+    evidence = PlantDynamicsEvidence(
+        mujoco,
+        model,
+        data,
+        support_band=SimpleNamespace(enable=True),
+        attached_body_id=pelvis_id,
+    )
+
+    evidence.observe(captured_at_unix_ns=123)
+    state = evidence.capture_state()
+    assert state["schemaVersion"] == "h-ide.mujoco-dynamics-evidence/1"
+    assert state["status"] == "running"
+    assert state["diagnosticOnly"] is True
+    assert state["authorityFeedbackEnabled"] is False
+    assert state["capturedAtUnixNs"] == 123
+    assert state["simulationTimeS"] == 1.25
+    assert state["supportBandEnabled"] is True
+    assert state["attachedBody"] == "pelvis"
+    assert state["lastAppliedWrench"]["frameId"] == "world"
+    assert state["lastAppliedWrench"]["values"] == [
+        1.0, -2.0, 3.0, -4.0, 5.0, -6.0,
+    ]
+    assert state["rootState"]["qpos"] == pytest.approx(
+        [0.25, -0.1, 0.9, 1.0, 0.0, 0.0, 0.0]
+    )
+    assert state["rootState"]["qvel"] == pytest.approx(
+        [0.1, 0.2, -0.1, 0.01, 0.02, 0.03]
+    )
+    assert len(state["rootState"]["qacc"]) == 6
+    assert len(state["rootState"]["qaccWarmstart"]) == 6
+    assert math.isfinite(state["energy"]["potentialJ"])
+    assert math.isfinite(state["energy"]["kineticJ"])
+    assert state["energy"]["totalJ"] == pytest.approx(
+        state["energy"]["potentialJ"] + state["energy"]["kineticJ"]
+    )
+    assert state["warningCounts"] == {
+        "BADQPOS": 0,
+        "BADQVEL": 0,
+        "BADQACC": 0,
+        "BADCTRL": 0,
+    }
+    assert "oracle" not in str(state).lower()
+
+    # HTTP may read only the published immutable sample, never live MjData.
+    data.qpos[0] = 99.0
+    data.xfrc_applied[pelvis_id, 0] = 99.0
+    unchanged = evidence.capture_state()
+    assert unchanged["rootState"]["qpos"][0] == 0.25
+    assert unchanged["lastAppliedWrench"]["values"][0] == 1.0
 
 
 def _slow_reader(mailbox, ready, release, output) -> None:
