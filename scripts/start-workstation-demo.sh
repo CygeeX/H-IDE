@@ -169,7 +169,8 @@ wait_for_qwen_vision() {
   local health=""
   while (( SECONDS < deadline )); do
     health="$(curl -fsS --max-time 3 http://127.0.0.1:8092/healthz 2>/dev/null || true)"
-    if [[ "${health}" == *'"provider":"QwenVlmProvider"'* \
+    if [[ "${health}" == *'"releaseState":"pure_vlm_product_profile"'* \
+      && "${health}" == *'"provider":"qwen","model":"qwen3-vl-plus","available":true'* \
       && "${health}" == *'"provider":"sam2","available":true'* ]]; then
       printf '%-28s ready\n' 'H-IDE Vision Qwen + SAM2'
       return 0

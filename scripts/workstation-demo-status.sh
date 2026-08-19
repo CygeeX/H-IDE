@@ -33,8 +33,8 @@ http_status() {
 
 http_status 'H-IDE web/control API' 'http://127.0.0.1:8080/api/v1/robots' -H "Authorization: Bearer ${control_token}"
 vision_health="$(curl -fsS --max-time 3 http://127.0.0.1:8092/healthz 2>/dev/null || true)"
-if [[ "${vision_health}" == *'"provider":"QwenVlmProvider"'* \
-  && "${vision_health}" == *'"model":"qwen3-vl-plus"'* \
+if [[ "${vision_health}" == *'"releaseState":"pure_vlm_product_profile"'* \
+  && "${vision_health}" == *'"provider":"qwen","model":"qwen3-vl-plus","available":true'* \
   && "${vision_health}" == *'"provider":"sam2","available":true'* ]]; then
   printf '%-28s ok (qwen3-vl-plus + sam2)\n' 'H-IDE Vision'
 else
