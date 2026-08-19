@@ -72,8 +72,13 @@ class AssistantTurnConflict(ValueError):
     """A conversation already owns an active planning turn."""
 
 
+class AssistantConversationConflict(ValueError):
+    """A lifecycle mutation conflicts with the conversation's current state."""
+
+
 _MAPPING_POINTER_UNSET = object()
 _MAPPING_PROBE_UNSET = object()
+_ASSISTANT_TITLE_UNSET = object()
 
 
 def _jsonable(value: Any) -> Any:
@@ -499,6 +504,19 @@ class SQLiteStore:
                     """
                     CREATE INDEX assistant_turn_events_conversation_idx
                         ON assistant_turn_events(conversation_id, created_at, event_id)
+                    """,
+                ),
+            ),
+            (
+                3,
+                "assistant_v2_conversation_lifecycle",
+                (
+                    "ALTER TABLE assistant_conversations ADD COLUMN title TEXT",
+                    "ALTER TABLE assistant_conversations ADD COLUMN archived_at TEXT",
+                    "ALTER TABLE assistant_conversations ADD COLUMN deleted_at TEXT",
+                    """
+                    CREATE INDEX assistant_conversations_lifecycle_updated_idx
+                        ON assistant_conversations(deleted_at, archived_at, updated_at DESC)
                     """,
                 ),
             ),
@@ -1489,15 +1507,16 @@ class SQLiteStore:
         requested_by: str,
         locale: str,
         summary: str | None = None,
+        title: str | None = None,
     ) -> dict[str, Any]:
         now = self._now()
         legacy_robot_id = robot_id or "__assistant_unbound__"
         with self._lock:
             self._connection.execute(
                 "INSERT INTO assistant_conversations("
-                "conversation_id, robot_id, robot_id_v2, requested_by, locale, summary, "
+                "conversation_id, robot_id, robot_id_v2, requested_by, locale, summary, title, "
                 "status, created_at, updated_at"
-                ") VALUES (?, ?, ?, ?, ?, ?, 'idle', ?, ?)",
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?)",
                 (
                     conversation_id,
                     legacy_robot_id,
@@ -1505,6 +1524,7 @@ class SQLiteStore:
                     requested_by,
                     locale,
                     summary,
+                    title,
                     now,
                     now,
                 ),
@@ -1516,7 +1536,12 @@ class SQLiteStore:
             "requestedBy": requested_by,
             "locale": locale,
             "summary": summary,
+            "title": title,
             "status": "idle",
+            "archived": False,
+            "archivedAt": None,
+            "deleted": False,
+            "deletedAt": None,
             "createdAt": now,
             "updatedAt": now,
         }
@@ -1529,15 +1554,32 @@ class SQLiteStore:
             "requestedBy": row["requested_by"],
             "locale": row["locale"],
             "summary": row["summary"],
+            "title": row["title"],
             "status": row["status"],
+            "archived": row["archived_at"] is not None,
+            "archivedAt": row["archived_at"],
+            "deleted": row["deleted_at"] is not None,
+            "deletedAt": row["deleted_at"],
             "createdAt": row["created_at"],
             "updatedAt": row["updated_at"],
         }
 
-    def list_assistant_conversations(self) -> list[dict[str, Any]]:
+    def list_assistant_conversations(
+        self,
+        *,
+        include_archived: bool = False,
+        include_deleted: bool = False,
+    ) -> list[dict[str, Any]]:
+        predicates: list[str] = []
+        if not include_archived:
+            predicates.append("archived_at IS NULL")
+        if not include_deleted:
+            predicates.append("deleted_at IS NULL")
+        where = f" WHERE {' AND '.join(predicates)}" if predicates else ""
         with self._lock:
             rows = self._connection.execute(
-                "SELECT * FROM assistant_conversations ORDER BY updated_at DESC, conversation_id"
+                "SELECT * FROM assistant_conversations"
+                f"{where} ORDER BY updated_at DESC, conversation_id"
             ).fetchall()
         return [self._assistant_conversation_row(row) for row in rows]
 
@@ -1548,6 +1590,98 @@ class SQLiteStore:
                 (conversation_id,),
             ).fetchone()
         return None if row is None else self._assistant_conversation_row(row)
+
+    def update_assistant_conversation(
+        self,
+        conversation_id: str,
+        *,
+        title: str | None | object = _ASSISTANT_TITLE_UNSET,
+        archived: bool | None = None,
+        deleted: bool | None = None,
+    ) -> dict[str, Any] | None:
+        """Atomically update display metadata and the recoverable lifecycle.
+
+        Messages, turns, drafts, Missions, and evidence are deliberately not
+        cascaded.  ``deleted_at`` is a tombstone that can be cleared through
+        the same authenticated PATCH boundary.
+        """
+
+        now = self._now()
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                row = self._connection.execute(
+                    "SELECT * FROM assistant_conversations WHERE conversation_id = ?",
+                    (conversation_id,),
+                ).fetchone()
+                if row is None:
+                    self._connection.rollback()
+                    return None
+
+                current_deleted = row["deleted_at"] is not None
+                restoring = deleted is False and current_deleted
+                lifecycle_requested = archived is not None or deleted is not None
+                title_requested = title is not _ASSISTANT_TITLE_UNSET
+                if current_deleted and not restoring and (title_requested or archived is not None):
+                    raise AssistantConversationConflict(
+                        "deleted conversation must be restored before it can be changed"
+                    )
+
+                active = None
+                if lifecycle_requested:
+                    active = self._connection.execute(
+                        "SELECT task_id FROM assistant_turns WHERE conversation_id = ? "
+                        "AND status IN ('queued', 'running') LIMIT 1",
+                        (conversation_id,),
+                    ).fetchone()
+                desired_archived_at = row["archived_at"]
+                desired_deleted_at = row["deleted_at"]
+                if archived is True and desired_archived_at is None:
+                    desired_archived_at = now
+                elif archived is False:
+                    desired_archived_at = None
+                if deleted is True and desired_deleted_at is None:
+                    desired_deleted_at = now
+                elif deleted is False:
+                    desired_deleted_at = None
+
+                lifecycle_changed = (
+                    desired_archived_at != row["archived_at"]
+                    or desired_deleted_at != row["deleted_at"]
+                )
+                if lifecycle_changed and active is not None:
+                    raise AssistantConversationConflict(
+                        "conversation lifecycle cannot change while a turn is active"
+                    )
+
+                desired_title = row["title"] if title is _ASSISTANT_TITLE_UNSET else title
+                if (
+                    desired_title == row["title"]
+                    and not lifecycle_changed
+                ):
+                    self._connection.commit()
+                    return self._assistant_conversation_row(row)
+
+                self._connection.execute(
+                    "UPDATE assistant_conversations SET title = ?, archived_at = ?, "
+                    "deleted_at = ?, updated_at = ? WHERE conversation_id = ?",
+                    (
+                        desired_title,
+                        desired_archived_at,
+                        desired_deleted_at,
+                        now,
+                        conversation_id,
+                    ),
+                )
+                updated = self._connection.execute(
+                    "SELECT * FROM assistant_conversations WHERE conversation_id = ?",
+                    (conversation_id,),
+                ).fetchone()
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+        return None if updated is None else self._assistant_conversation_row(updated)
 
     def list_assistant_messages(self, conversation_id: str) -> list[dict[str, Any]]:
         with self._lock:
@@ -1695,11 +1829,20 @@ class SQLiteStore:
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
                 conversation = self._connection.execute(
-                    "SELECT robot_id FROM assistant_conversations WHERE conversation_id = ?",
+                    "SELECT robot_id, archived_at, deleted_at "
+                    "FROM assistant_conversations WHERE conversation_id = ?",
                     (conversation_id,),
                 ).fetchone()
                 if conversation is None:
                     raise ValueError("assistant conversation not found")
+                if conversation["deleted_at"] is not None:
+                    raise AssistantConversationConflict(
+                        "deleted conversation must be restored before accepting messages"
+                    )
+                if conversation["archived_at"] is not None:
+                    raise AssistantConversationConflict(
+                        "archived conversation must be restored before accepting messages"
+                    )
                 active = self._connection.execute(
                     "SELECT task_id FROM assistant_turns WHERE conversation_id = ? "
                     "AND status IN ('queued', 'running') LIMIT 1",

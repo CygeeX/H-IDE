@@ -1538,6 +1538,62 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
     navigate(chatPath(route.shell, conversationId));
   }, [navigate, route.shell]);
 
+  const renameConversation = useCallback((conversation: AssistantConversation) => {
+    const requested = window.prompt(
+      "重命名会话",
+      conversation.title ?? conversationLabel(conversation, conversation),
+    );
+    if (requested === null) return;
+    const title = requested.trim();
+    if (!title) {
+      setError("会话名称不能为空");
+      return;
+    }
+    void runRequest(async () => {
+      const updated = await apiFetch<AssistantConversation>(
+        `/api/v1/assistant/conversations/${encodeURIComponent(conversation.conversationId)}`,
+        { method: "PATCH", body: JSON.stringify({ title }) },
+      );
+      setAssistantConversations((current) => current.map((item) => (
+        item.conversationId === updated.conversationId ? { ...item, ...updated } : item
+      )));
+      setAssistantConversation((current) => current?.conversationId === updated.conversationId
+        ? { ...current, ...updated }
+        : current);
+      setNotice(`会话已重命名为“${updated.title ?? title}”`);
+    });
+  }, [runRequest]);
+
+  const hideConversationAfterLifecycleChange = useCallback((conversationId: string) => {
+    setAssistantConversations((current) => current.filter(
+      (item) => item.conversationId !== conversationId,
+    ));
+    if (route.kind === "chat" && route.conversationId === conversationId) startNewTask();
+  }, [route, startNewTask]);
+
+  const archiveConversation = useCallback((conversation: AssistantConversation) => {
+    void runRequest(async () => {
+      await apiFetch<AssistantConversation>(
+        `/api/v1/assistant/conversations/${encodeURIComponent(conversation.conversationId)}`,
+        { method: "PATCH", body: JSON.stringify({ archived: true }) },
+      );
+      hideConversationAfterLifecycleChange(conversation.conversationId);
+      setNotice("会话已归档；数据仍保留，可通过归档查询恢复");
+    });
+  }, [hideConversationAfterLifecycleChange, runRequest]);
+
+  const deleteConversation = useCallback((conversation: AssistantConversation) => {
+    if (!window.confirm("将这个会话移入可恢复的删除状态？消息、任务和视觉凭证都会保留。")) return;
+    void runRequest(async () => {
+      await apiFetch<AssistantConversation>(
+        `/api/v1/assistant/conversations/${encodeURIComponent(conversation.conversationId)}`,
+        { method: "DELETE" },
+      );
+      hideConversationAfterLifecycleChange(conversation.conversationId);
+      setNotice("会话已移除；这是可恢复的软删除，关联记录未被清除");
+    });
+  }, [hideConversationAfterLifecycleChange, runRequest]);
+
   const missionConversationEntries = useMemo<AssistantConversation[]>(() => {
     const records = missionHistory.map((item) => ({
       conversationId: item.missionId,
@@ -1749,7 +1805,12 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
           currentId={currentConversationEntry?.conversationId}
           onOpen={openConversation}
           onNew={() => { setHistoryOpen(false); startNewTask(); }}
-          canManage={false}
+          canManage={(conversation) => assistantConversations.some(
+            (item) => item.conversationId === conversation.conversationId,
+          )}
+          onRename={renameConversation}
+          onArchive={archiveConversation}
+          onDelete={deleteConversation}
           developerMode={developerMode}
         />
       </SidePanel> : null}
@@ -1793,6 +1854,8 @@ function Icon({ name }: { name: IconName }) {
 
 function conversationLabel(conversation: AssistantConversation, current: AssistantConversation | null): string {
   const detail = current?.conversationId === conversation.conversationId ? current : conversation;
+  const title = detail.title?.trim();
+  if (title) return title;
   const firstUserMessage = detail.messages?.find((message) => message.role === "user")?.content.trim();
   if (firstUserMessage) return firstUserMessage.length > 22 ? `${firstUserMessage.slice(0, 22)}…` : firstUserMessage;
   return `${conversation.robotId} 的新任务`;
@@ -1942,15 +2005,15 @@ function SidePanel({ title, subtitle, onClose, side = "right", children }: { tit
   </aside></div>;
 }
 
-function HistoryPanel({ conversations, currentId, onOpen, onNew, developerMode, canManage }: { conversations: AssistantConversation[]; currentId?: string; onOpen: (conversationId: string) => void; onNew: () => void; developerMode: boolean; canManage: boolean }) {
+function HistoryPanel({ conversations, currentId, onOpen, onNew, onRename, onArchive, onDelete, developerMode, canManage }: { conversations: AssistantConversation[]; currentId?: string; onOpen: (conversationId: string) => void; onNew: () => void; onRename: (conversation: AssistantConversation) => void; onArchive: (conversation: AssistantConversation) => void; onDelete: (conversation: AssistantConversation) => void; developerMode: boolean; canManage: (conversation: AssistantConversation) => boolean }) {
   return <div className="history-panel"><button className="new-history-task" type="button" onClick={onNew}><Icon name="plus" />开始新任务</button>
-    <p className="history-contract-note">重命名、归档和删除需要新的后端会话生命周期契约；当前版本明确禁用，避免在本地伪造成功。</p>
+    <p className="history-contract-note">归档和删除不会清除消息、任务或视觉凭证；当前列表默认只显示活跃会话。</p>
     <div className="history-list">
       {conversations.length ? conversations.map((conversation) => <div className={`history-row ${conversation.conversationId === currentId ? "active" : ""}`} key={conversation.conversationId}>
         <button className="history-open" type="button" onClick={() => onOpen(conversation.conversationId)}>
           <span className={`history-state tab-${conversation.status}`}><Icon name="spark" /></span><span><strong>{conversationLabel(conversation, conversation.conversationId === currentId ? conversation : null)}</strong><small>{developerMode ? `${conversation.robotId} · ` : ""}{formatDateTime(conversation.updatedAt ?? conversation.createdAt)}</small></span><StatusPill value={conversation.status} />
         </button>
-        <div className="history-lifecycle" aria-label="会话管理"><button type="button" disabled={!canManage} title="等待后端 PATCH 会话契约">重命名</button><button type="button" disabled={!canManage} title="等待后端归档契约">归档</button><button type="button" disabled={!canManage} title="等待后端 DELETE 会话契约">删除</button></div>
+        <div className="history-lifecycle" aria-label="会话管理"><button type="button" disabled={!canManage(conversation)} onClick={() => onRename(conversation)}>重命名</button><button type="button" disabled={!canManage(conversation)} onClick={() => onArchive(conversation)}>归档</button><button type="button" disabled={!canManage(conversation)} onClick={() => onDelete(conversation)}>删除</button></div>
       </div>) : <EmptyState>还没有任务会话。发送第一条消息后，会话会保存在这里。</EmptyState>}
     </div>
   </div>;

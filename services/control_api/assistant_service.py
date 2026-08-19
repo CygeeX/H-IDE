@@ -36,7 +36,12 @@ from packages.control_core.validation import non_empty_id
 from .planning_client import PlanningClient
 from .conversation_gateway import ConversationGateway
 from .scene_client import SceneContextClient, SceneContextUnavailable
-from .store import AssistantTurnConflict, SQLiteStore, _jsonable
+from .store import (
+    AssistantConversationConflict,
+    AssistantTurnConflict,
+    SQLiteStore,
+    _jsonable,
+)
 
 
 _TURN_RESULT_ADAPTER = TypeAdapter(PlanningTurnResult)
@@ -48,6 +53,19 @@ def _new_id(prefix: str) -> str:
 
 class AssistantNotFound(ValueError):
     pass
+
+
+def _conversation_title(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("title must be a string or null")
+    title = value.strip()
+    if not title:
+        raise ValueError("title cannot be blank")
+    if len(title) > 120:
+        raise ValueError("title is too long")
+    return title
 
 
 class AssistantService:
@@ -78,6 +96,7 @@ class AssistantService:
         locale = non_empty_id(body.get("locale", "zh-CN"), "locale")
         raw_summary = body.get("summary")
         summary = None if raw_summary is None else non_empty_id(raw_summary, "summary")
+        title = _conversation_title(body.get("title"))
         if len(locale) > 35:
             raise ValueError("locale is too long")
         if summary is not None and len(summary) > 12000:
@@ -85,11 +104,57 @@ class AssistantService:
         if robot_id is not None and self.store.get_robot(robot_id) is None:
             raise AssistantNotFound("robot not found")
         return self.store.create_assistant_conversation(
-            _new_id("conversation"), robot_id, requested_by, locale, summary
+            _new_id("conversation"), robot_id, requested_by, locale, summary, title
         )
 
-    def list_conversations(self) -> list[dict[str, Any]]:
-        return self.store.list_assistant_conversations()
+    def list_conversations(
+        self,
+        *,
+        include_archived: bool = False,
+        include_deleted: bool = False,
+    ) -> list[dict[str, Any]]:
+        return self.store.list_assistant_conversations(
+            include_archived=include_archived,
+            include_deleted=include_deleted,
+        )
+
+    def update_conversation(
+        self,
+        conversation_id: str,
+        body: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        supported = {"title", "archived", "deleted"}
+        unknown = set(body) - supported
+        if unknown:
+            raise ValueError(
+                "conversation patch contains unsupported fields: "
+                + ", ".join(sorted(str(item) for item in unknown))
+            )
+        if not body:
+            raise ValueError("conversation patch must change at least one field")
+        kwargs: dict[str, Any] = {}
+        if "title" in body:
+            kwargs["title"] = _conversation_title(body.get("title"))
+        for field in ("archived", "deleted"):
+            if field not in body:
+                continue
+            value = body[field]
+            if not isinstance(value, bool):
+                raise ValueError(f"{field} must be a boolean")
+            kwargs[field] = value
+        updated = self.store.update_assistant_conversation(conversation_id, **kwargs)
+        if updated is None:
+            raise AssistantNotFound("assistant conversation not found")
+        return updated
+
+    def delete_conversation(self, conversation_id: str) -> dict[str, Any]:
+        updated = self.store.update_assistant_conversation(
+            conversation_id,
+            deleted=True,
+        )
+        if updated is None:
+            raise AssistantNotFound("assistant conversation not found")
+        return updated
 
     def get_conversation(self, conversation_id: str) -> dict[str, Any]:
         conversation = self.store.get_assistant_conversation(conversation_id)
@@ -110,6 +175,14 @@ class AssistantService:
         conversation = self.store.get_assistant_conversation(conversation_id)
         if conversation is None:
             raise AssistantNotFound("assistant conversation not found")
+        if conversation.get("deleted"):
+            raise AssistantConversationConflict(
+                "deleted conversation must be restored before accepting messages"
+            )
+        if conversation.get("archived"):
+            raise AssistantConversationConflict(
+                "archived conversation must be restored before accepting messages"
+            )
         modality = body.get("modality", "text")
         transcription_id = body.get("transcriptionId")
         if modality == "voice":

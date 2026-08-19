@@ -677,7 +677,13 @@ export interface AssistantConversation {
   robotId: string;
   requestedBy: string;
   locale: string;
+  title?: string | null;
+  summary?: string | null;
   status: string;
+  archived?: boolean;
+  archivedAt?: string | null;
+  deleted?: boolean;
+  deletedAt?: string | null;
   createdAt?: string;
   updatedAt?: string;
   messages?: AssistantMessage[];

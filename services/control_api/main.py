@@ -137,6 +137,7 @@ from .visual_task_client import (
 )
 
 from .store import (
+    AssistantConversationConflict,
     AssistantTurnConflict,
     MappingPointerConflict,
     MappingStateConflict,
@@ -223,6 +224,52 @@ def _new_id(prefix: str) -> str:
 
 class _CommandIdentityConflict(ValueError):
     """A command id is already owned by another idempotency key."""
+
+
+_CONTROL_PWA_DEEP_LINKS = (
+    "/app",
+    "/app/tasks/{conversation_id}",
+    "/developer",
+    "/developer/tasks/{conversation_id}",
+    "/developer/simulation",
+    "/developer/interfaces",
+    # Compatibility-only entry points.  The Assistant V2 product router no
+    # longer exposes a scenes workspace, but old bookmarks still land in the
+    # shell and no scene data is removed by this routing change.
+    "/tasks/{conversation_id}",
+    "/scenes",
+    "/simulation",
+    "/interfaces",
+)
+
+
+def _mount_control_pwa(app: FastAPI, dist: Path) -> bool:
+    """Mount built PWA assets and explicit production history fallbacks."""
+
+    index_file = dist / "index.html"
+    if not dist.is_dir() or not index_file.is_file():
+        return False
+
+    async def serve_control_pwa_route(
+        conversation_id: str | None = None,
+    ) -> FileResponse:
+        del conversation_id
+        return FileResponse(
+            index_file,
+            media_type="text/html",
+            headers={"cache-control": "no-cache"},
+        )
+
+    for position, path in enumerate(_CONTROL_PWA_DEEP_LINKS):
+        app.add_api_route(
+            path,
+            serve_control_pwa_route,
+            methods=["GET"],
+            include_in_schema=False,
+            name=f"control_pwa_deep_link_{position}",
+        )
+    app.mount("/", StaticFiles(directory=dist, html=True), name="pwa")
+    return True
 
 
 def _embedded_mapping_target(mapping: MappingVersion) -> str | None:
@@ -2365,12 +2412,17 @@ def create_app(
 
     @app.get("/api/v1/assistant/conversations", dependencies=[Depends(require_assistant)])
     def list_assistant_conversations(
+        includeArchived: bool = False,
+        includeDeleted: bool = False,
         principal: Principal = Depends(require_assistant),
         service: AssistantService = Depends(get_assistant_service),
     ):
         return [
             conversation
-            for conversation in service.list_conversations()
+            for conversation in service.list_conversations(
+                include_archived=includeArchived,
+                include_deleted=includeDeleted,
+            )
             if assistant_resource_visible(
                 principal,
                 "assistant_conversation",
@@ -2423,6 +2475,45 @@ def create_app(
         except AssistantNotFound as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+    @app.patch(
+        "/api/v1/assistant/conversations/{conversation_id}",
+        dependencies=[Depends(require_assistant)],
+    )
+    def update_assistant_conversation(
+        conversation_id: str,
+        body: dict[str, Any],
+        request: Request,
+        principal: Principal = Depends(require_assistant),
+        service: AssistantService = Depends(get_assistant_service),
+    ):
+        try:
+            require_conversation_resource(request, principal, conversation_id)
+            return service.update_conversation(conversation_id, body)
+        except AssistantNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except AssistantConversationConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.delete(
+        "/api/v1/assistant/conversations/{conversation_id}",
+        dependencies=[Depends(require_assistant)],
+    )
+    def delete_assistant_conversation(
+        conversation_id: str,
+        request: Request,
+        principal: Principal = Depends(require_assistant),
+        service: AssistantService = Depends(get_assistant_service),
+    ):
+        try:
+            require_conversation_resource(request, principal, conversation_id)
+            return service.delete_conversation(conversation_id)
+        except AssistantNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except AssistantConversationConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     @app.post(
         "/api/v1/assistant/conversations/{conversation_id}/messages",
         dependencies=[Depends(require_assistant)],
@@ -2448,6 +2539,8 @@ def create_app(
         except AssistantNotFound as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except AssistantTurnConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except AssistantConversationConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except SceneContextConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -3408,18 +3501,7 @@ def create_app(
             return
 
     dist = Path(__file__).resolve().parents[2] / "apps" / "control-pwa" / "dist"
-    if dist.is_dir():
-        index_file = dist / "index.html"
-
-        @app.get("/tasks/{conversation_id}", include_in_schema=False)
-        @app.get("/scenes", include_in_schema=False)
-        @app.get("/simulation", include_in_schema=False)
-        @app.get("/interfaces", include_in_schema=False)
-        async def serve_pwa_route(conversation_id: str | None = None):
-            del conversation_id
-            return FileResponse(index_file, media_type="text/html", headers={"cache-control": "no-cache"})
-
-        app.mount("/", StaticFiles(directory=dist, html=True), name="pwa")
+    _mount_control_pwa(app, dist)
     return app
 
 

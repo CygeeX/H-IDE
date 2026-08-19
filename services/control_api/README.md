@@ -72,7 +72,15 @@ configured.
   returns ordered event-compatible output, and the per-turn visual-evidence
   proxy keeps the Vision credential out of the browser. Full message history is
   retained locally while Mastra receives only the bounded recent window plus
-  an optional server-owned summary.
+  an optional server-owned summary. Conversation display names and recoverable
+  lifecycle state are managed with `PATCH
+  /api/v1/assistant/conversations/{conversationId}` (`title`, `archived`, and
+  `deleted`). `DELETE` writes the same deletion tombstone and never physically
+  deletes messages, turns, Mission records, or evidence. Lists omit archived
+  and deleted records by default; authenticated recovery tools may opt in with
+  `includeArchived=true` and `includeDeleted=true`, then clear the flags through
+  `PATCH`. Every read and mutation remains owner/site scoped and Cookie writes
+  require CSRF validation.
 - Generated drafts support `POST /api/v1/assistant/drafts/{draftId}/revise`
   with feedback and `POST .../reject` with a reason. Revision creates a new
   planning turn and never mutates the original plan payload.

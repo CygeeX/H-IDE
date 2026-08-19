@@ -436,6 +436,49 @@ describe("control console", () => {
     expect(screen.queryByText("cmd_vel")).not.toBeInTheDocument();
   });
 
+  it("uses the durable conversation lifecycle API for history management", async () => {
+    const fallback = vi.mocked(fetch).getMockImplementation();
+    const conversation = {
+      conversationId: "conversation-managed",
+      robotId: "robot-1",
+      requestedBy: "developer-ui",
+      locale: "zh-CN",
+      title: "巡检会话",
+      status: "idle",
+      archived: false,
+      deleted: false,
+      createdAt: "2026-08-19T00:00:00Z",
+      updatedAt: "2026-08-19T00:00:00Z",
+    };
+    vi.mocked(fetch).mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/assistant/conversations") && !init?.method) {
+        return Promise.resolve(response([conversation]));
+      }
+      if (url.endsWith("/assistant/conversations/conversation-managed") && init?.method === "PATCH") {
+        const body = typeof init.body === "string" ? JSON.parse(init.body) : {};
+        return Promise.resolve(response({ ...conversation, ...body, updatedAt: "2026-08-19T00:01:00Z" }));
+      }
+      return fallback!(input, init) as Promise<Response>;
+    });
+    vi.spyOn(window, "prompt").mockReturnValue("会议区巡检");
+
+    render(<App />);
+    await screen.findAllByText("robot-1");
+    fireEvent.click(screen.getByRole("button", { name: "任务历史" }));
+    expect((await screen.findAllByText("巡检会话")).length).toBeGreaterThan(0);
+    fireEvent.click(screen.getByRole("button", { name: "重命名" }));
+
+    await waitFor(() => expect(vi.mocked(fetch).mock.calls.some(([input, init]) => (
+      String(input).endsWith("/assistant/conversations/conversation-managed")
+      && init?.method === "PATCH"
+      && init.body === JSON.stringify({ title: "会议区巡检" })
+    ))).toBe(true));
+    expect((await screen.findAllByText("会议区巡检")).length).toBeGreaterThan(0);
+    expect(screen.getByRole("button", { name: "归档" })).not.toBeDisabled();
+    expect(screen.getByRole("button", { name: "删除" })).not.toBeDisabled();
+  });
+
   it("waits for robot discovery before requesting robot-scoped endpoints", async () => {
     const requestedUrls: string[] = [];
     vi.mocked(fetch).mockImplementation((input: RequestInfo | URL) => {

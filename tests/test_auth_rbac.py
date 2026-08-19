@@ -46,11 +46,36 @@ def test_auth_migration_is_expand_only_versioned_and_idempotent(tmp_path) -> Non
         "INSERT INTO robots(robot_id, payload_json, updated_at) VALUES (?, ?, ?)",
         ("legacy-robot", '{"robotId":"legacy-robot","sentinel":"preserved"}', "2026-01-01T00:00:00+00:00"),
     )
+    connection.execute(
+        "CREATE TABLE assistant_conversations("
+        "conversation_id TEXT PRIMARY KEY, robot_id TEXT NOT NULL, requested_by TEXT NOT NULL, "
+        "locale TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"
+    )
+    connection.execute(
+        "INSERT INTO assistant_conversations("
+        "conversation_id, robot_id, requested_by, locale, status, created_at, updated_at"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            "legacy-conversation",
+            "legacy-robot",
+            "legacy-operator",
+            "zh-CN",
+            "idle",
+            "2026-01-01T00:00:00+00:00",
+            "2026-01-01T00:00:00+00:00",
+        ),
+    )
     connection.commit()
     connection.close()
 
     first = SQLiteStore(str(db_path))
     assert first.get_robot("legacy-robot")["sentinel"] == "preserved"
+    legacy_conversation = first.get_assistant_conversation("legacy-conversation")
+    assert legacy_conversation is not None
+    assert legacy_conversation["robotId"] == "legacy-robot"
+    assert legacy_conversation["title"] is None
+    assert legacy_conversation["archived"] is False
+    assert legacy_conversation["deleted"] is False
     migrations = first.schema_migrations()
     assert migrations == [
         {
@@ -63,11 +88,16 @@ def test_auth_migration_is_expand_only_versioned_and_idempotent(tmp_path) -> Non
             "name": "assistant_v2_conversation_gateway",
             "appliedAt": migrations[1]["appliedAt"],
         },
+        {
+            "version": 3,
+            "name": "assistant_v2_conversation_lifecycle",
+            "appliedAt": migrations[2]["appliedAt"],
+        },
     ]
     first.close()
 
     reopened = SQLiteStore(str(db_path))
-    assert len(reopened.schema_migrations()) == 2
+    assert len(reopened.schema_migrations()) == 3
     assert reopened.get_robot("legacy-robot")["sentinel"] == "preserved"
     tables = {
         row[0]
