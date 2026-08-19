@@ -38,6 +38,8 @@ ROBOT_AGENT_INTERVAL_S = 5.0
 RAW_CHECKPOINT_INTERVAL_S = 10.0
 DEFAULT_DURATION_S = 605.0
 EXPECTED_STALL_THRESHOLD_S = 0.1
+EXPECTED_WORKER_STALL_THRESHOLD_MS = 100.0
+VIEWER_PROGRESS_TIMEOUT_NS = 2_000_000_000
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 
 _PLANT_STAGES = (
@@ -52,6 +54,15 @@ _PLANT_STAGES = (
     "renderCaptureTotal",
 )
 _PLANT_WORKERS = ("observationWorker", "viewerWorker")
+_OBSERVATION_RENDER_TIMING_STAGES = (
+    "totalMs",
+    "rgbRenderMs",
+    "jpegEncodeMs",
+    "depthRenderMs",
+    "stateApplyMs",
+    "mjForwardMs",
+    "queueAgeAtStartMs",
+)
 _SONIC_GAP_PREFIXES = (
     "lowstate_callback",
     "control_publish",
@@ -565,6 +576,179 @@ class RuntimeCounterTracker:
         }
 
 
+class WorkerRenderTimingTracker:
+    """Track every published observation-worker slow-stage counter."""
+
+    def __init__(self) -> None:
+        self.baseline: dict[str, int] | None = None
+        self.previous: dict[str, int] | None = None
+        self.latest: dict[str, int] = {}
+        self.stall_deltas: dict[str, int] = {}
+
+    @staticmethod
+    def _extract(
+        worker: Mapping[str, Any],
+    ) -> tuple[dict[str, int], dict[str, dict[str, Any]], float]:
+        timing = _mapping(
+            worker.get("renderTiming"),
+            "plant.observationWorker.renderTiming",
+        )
+        threshold_ms = _finite_number(
+            timing.get("thresholdMs"),
+            "plant.observationWorker.renderTiming.thresholdMs",
+        )
+        if not math.isclose(
+            threshold_ms,
+            EXPECTED_WORKER_STALL_THRESHOLD_MS,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise ValueError(
+                "observation-worker render stall threshold is not the reviewed 100ms"
+            )
+        stages = _mapping(
+            timing.get("stages"),
+            "plant.observationWorker.renderTiming.stages",
+        )
+        missing = [
+            name for name in _OBSERVATION_RENDER_TIMING_STAGES if name not in stages
+        ]
+        if missing:
+            raise ValueError(
+                "plant.observationWorker.renderTiming.stages is missing: "
+                + ", ".join(missing)
+            )
+
+        counters: dict[str, int] = {}
+        normalized: dict[str, dict[str, Any]] = {}
+        for name, raw_stage in stages.items():
+            if not isinstance(name, str) or not name:
+                raise ValueError(
+                    "plant.observationWorker.renderTiming stage name is invalid"
+                )
+            field = f"plant.observationWorker.renderTiming.stages.{name}"
+            stage = _mapping(raw_stage, field)
+            last_ms = _finite_number(stage.get("lastMs"), f"{field}.lastMs")
+            max_ms = _finite_number(stage.get("maxMs"), f"{field}.maxMs")
+            if last_ms < 0 or max_ms < 0 or max_ms < last_ms:
+                raise ValueError(f"{field} has inconsistent timing values")
+            path = f"{field}.overThresholdCount"
+            count = _counter(stage.get("overThresholdCount"), path)
+            last_over_ms_raw = stage.get("lastOverThresholdMs")
+            last_over_ms: float | None
+            if last_over_ms_raw is None:
+                last_over_ms = None
+            else:
+                last_over_ms = _finite_number(
+                    last_over_ms_raw,
+                    f"{field}.lastOverThresholdMs",
+                )
+            last_over_at = stage.get("lastOverThresholdAtUnixNs")
+            if last_over_at is not None and (
+                isinstance(last_over_at, bool)
+                or not isinstance(last_over_at, int)
+                or last_over_at <= 0
+            ):
+                raise ValueError(
+                    f"{field}.lastOverThresholdAtUnixNs must be null or a "
+                    "positive integer"
+                )
+            if count == 0 and (last_over_ms is not None or last_over_at is not None):
+                raise ValueError(
+                    f"{field} has last-over-threshold evidence with a zero counter"
+                )
+            if count > 0 and (last_over_ms is None or last_over_at is None):
+                raise ValueError(
+                    f"{field} is missing persistent last-over-threshold evidence"
+                )
+            if last_over_ms is not None and (
+                last_over_ms <= threshold_ms or last_over_ms > max_ms
+            ):
+                raise ValueError(
+                    f"{field}.lastOverThresholdMs is inconsistent"
+                )
+            counters[path] = count
+            normalized[name] = {
+                "lastMs": last_ms,
+                "maxMs": max_ms,
+                "overThresholdCount": count,
+                "lastOverThresholdMs": last_over_ms,
+                "lastOverThresholdAtUnixNs": last_over_at,
+            }
+        return counters, normalized, threshold_ms
+
+    def observe(self, worker: Mapping[str, Any]) -> dict[str, Any]:
+        counters, stages, threshold_ms = self._extract(worker)
+        if self.baseline is None:
+            self.baseline = dict(counters)
+            self.previous = dict(counters)
+            self.latest = dict(counters)
+            self.stall_deltas = {path: 0 for path in sorted(counters)}
+            return {
+                "baseline": True,
+                "thresholdMs": threshold_ms,
+                "stages": stages,
+                "baselineCounters": dict(self.baseline),
+                "previousCounters": dict(self.previous),
+                "currentCounters": dict(counters),
+                "counterChanges": {},
+                "counterRollbacks": {},
+                "stallEvent": False,
+                "deltasFromBaseline": dict(self.stall_deltas),
+                "eventEvidence": {},
+            }
+
+        assert self.previous is not None
+        assert self.baseline is not None
+        if set(counters) != set(self.baseline):
+            raise ValueError(
+                "plant.observationWorker.renderTiming stage set changed during soak"
+            )
+        prior_counters = dict(self.previous)
+        changes: dict[str, dict[str, int]] = {}
+        rollbacks: dict[str, dict[str, int]] = {}
+        for path, current in counters.items():
+            prior = prior_counters[path]
+            if current < prior:
+                rollbacks[path] = {"previous": prior, "current": current}
+            elif current > prior:
+                changes[path] = {"previous": prior, "current": current}
+        self.previous = dict(counters)
+        self.latest = dict(counters)
+        self.stall_deltas = {
+            path: counters[path] - self.baseline[path] for path in sorted(counters)
+        }
+        changed_stages = {
+            path.split(".stages.", 1)[1].split(".", 1)[0]
+            for path in (*changes, *rollbacks)
+        }
+        event_evidence = (
+            {
+                "baselineCounters": dict(self.baseline),
+                "previousCounters": prior_counters,
+                "currentCounters": dict(counters),
+                "stages": {
+                    name: stages[name] for name in sorted(changed_stages)
+                },
+            }
+            if changed_stages
+            else {}
+        )
+        return {
+            "baseline": False,
+            "thresholdMs": threshold_ms,
+            "stages": stages,
+            "baselineCounters": dict(self.baseline),
+            "previousCounters": prior_counters,
+            "currentCounters": dict(counters),
+            "counterChanges": changes,
+            "counterRollbacks": rollbacks,
+            "stallEvent": bool(changes),
+            "deltasFromBaseline": dict(self.stall_deltas),
+            "eventEvidence": event_evidence,
+        }
+
+
 class PlantWorkerIdentityTracker:
     """Keep render-worker health, process identity and failure evidence stable."""
 
@@ -620,6 +804,145 @@ class PlantWorkerIdentityTracker:
             "lastFailureAtUnixNs": failure_at,
             "lastError": last_error,
         }
+
+    @staticmethod
+    def _viewer_progress_snapshot(
+        value: Mapping[str, Any],
+        *,
+        previous: Mapping[str, Any] | None,
+    ) -> tuple[dict[str, Any], list[str], dict[str, Any]]:
+        errors: list[str] = []
+
+        def read_counter(field: str) -> Any:
+            try:
+                return _counter(value.get(field), f"plant.viewerWorker.{field}")
+            except ValueError as exc:
+                errors.append(str(exc))
+                return value.get(field)
+
+        mailbox_published = read_counter("mailboxPublishedCount")
+        mailbox_dropped = read_counter("mailboxDroppedCount")
+        last_success_sequence = read_counter("lastSuccessSequence")
+        dropped_at_success = read_counter("lastSuccessMailboxDroppedCount")
+        last_success_at = value.get("lastSuccessAtUnixNs")
+        if (
+            isinstance(last_success_at, bool)
+            or not isinstance(last_success_at, int)
+            or last_success_at <= 0
+        ):
+            errors.append(
+                "plant.viewerWorker.lastSuccessAtUnixNs is not a positive integer"
+            )
+        try:
+            progress_age_ms: Any = _finite_number(
+                value.get("progressAgeMs"),
+                "plant.viewerWorker.progressAgeMs",
+            )
+        except ValueError as exc:
+            errors.append(str(exc))
+            progress_age_ms = value.get("progressAgeMs")
+        try:
+            stale_after_ms: Any = _finite_number(
+                value.get("staleAfterMs"),
+                "plant.viewerWorker.staleAfterMs",
+            )
+        except ValueError as exc:
+            errors.append(str(exc))
+            stale_after_ms = value.get("staleAfterMs")
+        if isinstance(progress_age_ms, (int, float)) and not isinstance(
+            progress_age_ms, bool
+        ) and progress_age_ms < 0:
+            errors.append("plant.viewerWorker.progressAgeMs is negative")
+        expected_stale_after_ms = VIEWER_PROGRESS_TIMEOUT_NS / 1_000_000.0
+        if not (
+            isinstance(stale_after_ms, (int, float))
+            and not isinstance(stale_after_ms, bool)
+            and math.isclose(
+                float(stale_after_ms),
+                expected_stale_after_ms,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            )
+        ):
+            errors.append(
+                "plant.viewerWorker.staleAfterMs is not the reviewed 2000ms"
+            )
+
+        parent_has_advanced = bool(
+            isinstance(mailbox_published, int)
+            and not isinstance(mailbox_published, bool)
+            and isinstance(last_success_sequence, int)
+            and not isinstance(last_success_sequence, bool)
+            and mailbox_published > last_success_sequence
+        ) or bool(
+            isinstance(mailbox_dropped, int)
+            and not isinstance(mailbox_dropped, bool)
+            and isinstance(dropped_at_success, int)
+            and not isinstance(dropped_at_success, bool)
+            and mailbox_dropped > dropped_at_success
+        )
+        if (
+            parent_has_advanced
+            and isinstance(progress_age_ms, (int, float))
+            and not isinstance(progress_age_ms, bool)
+            and isinstance(stale_after_ms, (int, float))
+            and not isinstance(stale_after_ms, bool)
+            and progress_age_ms > stale_after_ms
+        ):
+            errors.append(
+                "plant.viewerWorker has unpublished progress and its last "
+                f"success is {float(progress_age_ms):.3f}ms old "
+                f"(limit {float(stale_after_ms):.0f}ms)"
+            )
+
+        current = {
+            "status": value.get("status"),
+            "ready": value.get("ready"),
+            "mailboxPublishedCount": mailbox_published,
+            "mailboxDroppedCount": mailbox_dropped,
+            "lastSuccessMailboxDroppedCount": dropped_at_success,
+            "lastSuccessSequence": last_success_sequence,
+            "lastSuccessAtUnixNs": last_success_at,
+            "progressAgeMs": progress_age_ms,
+            "staleAfterMs": stale_after_ms,
+            "parentHasAdvanced": parent_has_advanced,
+        }
+        prior_progress = (
+            previous.get("progress")
+            if isinstance(previous, Mapping)
+            and isinstance(previous.get("progress"), Mapping)
+            else None
+        )
+        if prior_progress is not None:
+            for field in (
+                "mailboxPublishedCount",
+                "mailboxDroppedCount",
+                "lastSuccessMailboxDroppedCount",
+                "lastSuccessSequence",
+            ):
+                prior = prior_progress.get(field)
+                now = current.get(field)
+                if (
+                    isinstance(prior, int)
+                    and not isinstance(prior, bool)
+                    and isinstance(now, int)
+                    and not isinstance(now, bool)
+                    and now < prior
+                ):
+                    errors.append(
+                        f"plant.viewerWorker.{field} rolled back from {prior} to {now}"
+                    )
+        evidence = (
+            {
+                "errors": list(errors),
+                "previous": None if prior_progress is None else dict(prior_progress),
+                "current": dict(current),
+                "timeoutMs": VIEWER_PROGRESS_TIMEOUT_NS / 1_000_000.0,
+            }
+            if errors
+            else {}
+        )
+        return current, errors, evidence
 
     @classmethod
     def _enabled_snapshot(
@@ -750,14 +1073,18 @@ class PlantWorkerIdentityTracker:
         workers: dict[str, dict[str, Any]] = {}
         health_errors: list[str] = []
         identity_errors: list[str] = []
+        viewer_progress_errors: list[str] = []
+        viewer_progress_evidence: dict[str, Any] = {}
         identity_changes: dict[str, dict[str, Any]] = {}
         failure_changes: dict[str, dict[str, Any]] = {}
         first_snapshot = not self.baseline
 
         for name in _PLANT_WORKERS:
             raw = plant.get(name)
+            previous_worker = self.latest.get(name)
             worker_health: list[str] = []
             worker_identity: list[str] = []
+            worker_progress_errors: list[str] = []
             if not isinstance(raw, Mapping):
                 health_errors.append(f"plant.{name} is not an object")
                 snapshot = {
@@ -782,6 +1109,21 @@ class PlantWorkerIdentityTracker:
                 )
                 health_errors.extend(worker_health)
                 identity_errors.extend(worker_identity)
+
+            if name == "viewerWorker" and snapshot["mode"] == "enabled":
+                progress, progress_errors, progress_evidence = (
+                    self._viewer_progress_snapshot(
+                        raw,
+                        previous=previous_worker,
+                    )
+                )
+                snapshot["progress"] = progress
+                worker_progress_errors.extend(progress_errors)
+                viewer_progress_errors.extend(progress_errors)
+                if progress_evidence:
+                    viewer_progress_evidence = progress_evidence
+            else:
+                snapshot["progress"] = None
 
             baseline = self.baseline.get(name)
             if baseline is None:
@@ -810,6 +1152,7 @@ class PlantWorkerIdentityTracker:
                 **snapshot,
                 "healthErrors": worker_health,
                 "identityErrors": worker_identity,
+                "progressErrors": worker_progress_errors,
             }
 
         observation_identity = workers["observationWorker"]["identity"]
@@ -842,6 +1185,8 @@ class PlantWorkerIdentityTracker:
             "identityErrors": identity_errors,
             "identityChanges": identity_changes,
             "failureChanges": failure_changes,
+            "viewerProgressErrors": viewer_progress_errors,
+            "viewerProgressEvidence": viewer_progress_evidence,
         }
 
 
@@ -854,6 +1199,7 @@ class IdleSoakEvaluator:
             self.limits.acceptance_limits()
         )
         self.runtime = RuntimeCounterTracker()
+        self.worker_render_timing = WorkerRenderTimingTracker()
         self.workers = PlantWorkerIdentityTracker()
         self.failures: dict[str, Failure] = {}
         self.first_observed_s: float | None = None
@@ -1099,6 +1445,17 @@ class IdleSoakEvaluator:
             "identityErrors": [],
             "identityChanges": {},
             "failureChanges": {},
+            "viewerProgressErrors": [],
+            "viewerProgressEvidence": {},
+            "renderTiming": {
+                "baseline": False,
+                "counterChanges": {},
+                "counterRollbacks": {},
+                "stallEvent": False,
+                "deltasFromBaseline": dict(
+                    self.worker_render_timing.stall_deltas
+                ),
+            },
         }
         if plant is not None:
             authority_pid: int | None = None
@@ -1115,6 +1472,15 @@ class IdleSoakEvaluator:
                 plant,
                 authority_pid=authority_pid,
             )
+            worker_derived["renderTiming"] = {
+                "baseline": False,
+                "counterChanges": {},
+                "counterRollbacks": {},
+                "stallEvent": False,
+                "deltasFromBaseline": dict(
+                    self.worker_render_timing.stall_deltas
+                ),
+            }
             if worker_derived["healthErrors"]:
                 self._fail(
                     "PLANT_WORKER_HEALTH_INVALID",
@@ -1147,6 +1513,44 @@ class IdleSoakEvaluator:
                     ),
                     observed_s,
                 )
+            if worker_derived["viewerProgressErrors"]:
+                self._fail(
+                    "PLANT_VIEWER_PROGRESS_STALLED",
+                    json.dumps(
+                        worker_derived["viewerProgressEvidence"],
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                    observed_s,
+                )
+            observation_worker = plant.get("observationWorker")
+            try:
+                render_timing_derived = self.worker_render_timing.observe(
+                    _mapping(
+                        observation_worker,
+                        "plant.observationWorker",
+                    )
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                self._fail(
+                    "PLANT_WORKER_RENDER_TIMING_INVALID",
+                    str(exc),
+                    observed_s,
+                )
+            else:
+                worker_derived["renderTiming"] = render_timing_derived
+                if render_timing_derived["counterRollbacks"]:
+                    self._fail(
+                        "PLANT_WORKER_RENDER_TIMING_COUNTER_ROLLBACK",
+                        json.dumps(
+                            render_timing_derived["counterRollbacks"],
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        ),
+                        observed_s,
+                    )
+                if render_timing_derived["stallEvent"]:
+                    self.runtime_stall_seen = True
         if plant is None or sonic is None:
             self.motion.observe_error(
                 "Plant or SONIC sample unavailable", observed_s=observed_s
@@ -1247,6 +1651,10 @@ class IdleSoakEvaluator:
             and not self.runtime_stall_seen
             and not self.temporal_stale_log_seen
             and all(delta == 0 for delta in self.runtime.stall_deltas.values())
+            and all(
+                delta == 0
+                for delta in self.worker_render_timing.stall_deltas.values()
+            )
         )
         elapsed = (
             0.0
@@ -1263,6 +1671,15 @@ class IdleSoakEvaluator:
             "robotAgentSampleCount": self.robot_agent_samples,
             "observedDurationS": elapsed,
             "runtimeCounterDeltas": dict(self.runtime.stall_deltas),
+            "workerRenderTimingCounterDeltas": dict(
+                self.worker_render_timing.stall_deltas
+            ),
+            "workerRenderTimingBaseline": (
+                None
+                if self.worker_render_timing.baseline is None
+                else dict(self.worker_render_timing.baseline)
+            ),
+            "workerRenderTimingFinal": dict(self.worker_render_timing.latest),
             "processBaseline": self._process_baseline,
             "processFinal": self._process_latest,
             "plantWorkerBaseline": dict(self.workers.baseline),
@@ -1448,11 +1865,18 @@ def run_soak(
         )
         process_event = bool(derived.get("processIdentityChanged"))
         worker_evidence = derived.get("plantWorkers", {})
+        worker_timing_evidence = worker_evidence.get("renderTiming", {})
+        worker_timing_event = bool(
+            worker_timing_evidence.get("stallEvent")
+            or worker_timing_evidence.get("counterRollbacks")
+        )
         worker_event = bool(
             worker_evidence.get("healthErrors")
             or worker_evidence.get("identityErrors")
             or worker_evidence.get("identityChanges")
             or worker_evidence.get("failureChanges")
+            or worker_evidence.get("viewerProgressErrors")
+            or worker_timing_event
         )
         failure_event = bool(
             batch.errors
@@ -1470,7 +1894,9 @@ def run_soak(
             or observed >= next_raw
         ):
             event_kind = (
-                "runtime_event"
+                "worker_event"
+                if worker_timing_event
+                else "runtime_event"
                 if runtime_event
                 else "process_event"
                 if process_event

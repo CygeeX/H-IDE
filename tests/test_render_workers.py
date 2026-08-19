@@ -12,6 +12,7 @@ import uuid
 import numpy as np
 import pytest
 
+import hide_mujoco_sonic.render_workers as render_workers
 from hide_mujoco_sonic.frames import BodyTwist
 from hide_mujoco_sonic.plant import (
     PlantFrameStore,
@@ -23,15 +24,20 @@ from hide_mujoco_sonic.render_workers import (
     LatestStateMailbox,
     MAX_CAPTURE_AGE_NS,
     MujocoStateShape,
+    PassiveViewerWorker,
+    RENDER_TIMING_STALL_THRESHOLD_MS,
     RenderedFrame,
     RenderWorkerConfig,
     RgbdRenderWorker,
-    PassiveViewerWorker,
+    VIEWER_PROGRESS_STALE_NS,
     ViewerWorkerConfig,
     _SharedWorkerStats,
     _clear_shared_error,
     _encode_rgb_jpeg,
     _initialize_worker_identity,
+    _read_render_timing,
+    _record_render_timing,
+    _record_viewer_progress,
     _set_shared_error,
     _viewer_worker_main,
 )
@@ -134,13 +140,80 @@ def _healthy_viewer_identity_worker(
     stats,
 ) -> None:
     _initialize_worker_identity(stats)
+    first = None
+    while first is None and not stop_event.is_set():
+        first = _mailbox.copy_latest(after_sequence=0)
+        if first is None:
+            stop_event.wait(0.001)
+    if first is None:
+        return
+    _record_viewer_progress(stats, _mailbox, first)
     stats.ready.value = 1
-    stats.last_success_at_ns.value = time.time_ns()
-    stats.last_success_sequence.value = 1
     stop_event.wait(10.0)
 
 
-def _frame(sequence: int, *, captured_at_ns: int, boot: str) -> RenderedFrame:
+def _slow_then_normal_timing_worker(
+    mailbox,
+    _shape,
+    _config,
+    _result_queue,
+    stop_event,
+    stats,
+) -> None:
+    _initialize_worker_identity(stats)
+    captured_at_ns = time.time_ns()
+    _record_render_timing(
+        stats,
+        _frame(
+            1,
+            captured_at_ns=captured_at_ns,
+            boot=mailbox.producer_boot_id,
+            render_timing=_render_timing(total_ms=250.0, rgb_ms=125.0),
+        ),
+    )
+    _record_render_timing(
+        stats,
+        _frame(
+            2,
+            captured_at_ns=captured_at_ns + 100,
+            boot=mailbox.producer_boot_id,
+            render_timing=_render_timing(total_ms=10.0, rgb_ms=5.0),
+        ),
+    )
+    stats.last_success_at_ns.value = time.time_ns()
+    stats.last_success_sequence.value = 2
+    stats.ready.value = 1
+    stop_event.wait(10.0)
+
+
+def _render_timing(
+    *,
+    total_ms: float = 0.001,
+    rgb_ms: float = 0.001,
+    jpeg_ms: float = 0.001,
+    depth_ms: float = 0.001,
+    state_apply_ms: float = 0.001,
+    mj_forward_ms: float = 0.001,
+    queue_age_ms: float = 0.001,
+) -> tuple[tuple[str, float], ...]:
+    return (
+        ("stateApplyMs", state_apply_ms),
+        ("rgbRenderMs", rgb_ms),
+        ("depthRenderMs", depth_ms),
+        ("jpegEncodeMs", jpeg_ms),
+        ("totalMs", total_ms),
+        ("mjForwardMs", mj_forward_ms),
+        ("queueAgeAtStartMs", queue_age_ms),
+    )
+
+
+def _frame(
+    sequence: int,
+    *,
+    captured_at_ns: int,
+    boot: str,
+    render_timing: tuple[tuple[str, float], ...] | None = None,
+) -> RenderedFrame:
     return RenderedFrame(
         producer_boot_id=boot,
         sequence=sequence,
@@ -156,7 +229,7 @@ def _frame(sequence: int, *, captured_at_ns: int, boot: str) -> RenderedFrame:
         height=1,
         rgb_jpeg=f"jpeg-{sequence}".encode(),
         depth_z16_le=bytes((sequence, 0, sequence + 1, 0)),
-        render_timing=(("totalMs", 0.001),),
+        render_timing=render_timing or _render_timing(),
     )
 
 
@@ -170,9 +243,11 @@ def test_fullphysics_roundtrip_uses_an_independent_mjdata() -> None:
         model,
         authority,
         captured_at_unix_ns=time.time_ns(),
+        captured_at_monotonic_ns=123_456_789,
     ) == 1
     snapshot = mailbox.copy_latest()
     assert snapshot is not None
+    assert snapshot.captured_at_monotonic_ns == 123_456_789
 
     replica = mujoco.MjData(model)
     mujoco.mj_setState(
@@ -332,12 +407,42 @@ def test_parent_physics_monitor_catches_warning_after_mj_step_self_heals() -> No
     "warning_name",
     ["mjWARN_BADQPOS", "mjWARN_BADQVEL", "mjWARN_BADQACC", "mjWARN_BADCTRL"],
 )
-def test_parent_physics_monitor_baselines_and_detects_every_bad_warning(
+def test_parent_physics_monitor_rejects_every_nonzero_initial_bad_warning(
     warning_name: str,
 ) -> None:
     mujoco, model, data = _model_data()
     warning_index = int(getattr(mujoco.mjtWarning, warning_name))
     data.warning[warning_index].number = 7
+    support = PlantSupportController()
+    support.finish_startup()
+
+    warning_label = warning_name.removeprefix("mjWARN_")
+    with pytest.raises(
+        PlantPhysicsFault,
+        match=rf"non-zero before the first Plant step: .*{warning_label}=7",
+    ):
+        PlantPhysicsMonitor(
+            SimpleNamespace(
+                runtime_scene=SimpleNamespace(
+                    bounds_min=(-1.0, -1.0, 0.0),
+                    bounds_max=(1.0, 1.0, 2.0),
+                )
+            ),
+            mujoco,
+            model,
+            data,
+            support,
+        )
+
+
+@pytest.mark.parametrize(
+    "warning_name",
+    ["mjWARN_BADQPOS", "mjWARN_BADQVEL", "mjWARN_BADQACC", "mjWARN_BADCTRL"],
+)
+def test_parent_physics_monitor_detects_every_post_start_bad_warning(
+    warning_name: str,
+) -> None:
+    mujoco, model, data = _model_data()
     support = PlantSupportController()
     support.finish_startup()
     monitor = PlantPhysicsMonitor(
@@ -354,12 +459,13 @@ def test_parent_physics_monitor_baselines_and_detects_every_bad_warning(
     )
     monitor.observe()
     data.time += 0.004
-    data.warning[warning_index].number = 8
+    warning_index = int(getattr(mujoco.mjtWarning, warning_name))
+    data.warning[warning_index].number = 1
 
     warning_label = warning_name.removeprefix("mjWARN_")
     with pytest.raises(
         PlantPhysicsFault,
-        match=rf"{warning_label} warning count increased \(7 -> 8\)",
+        match=rf"{warning_label} warning count increased \(0 -> 1\)",
     ):
         monitor.observe()
 
@@ -510,22 +616,218 @@ def test_office_v2_worker_reloads_verified_scene_and_emits_one_atomic_rgbd() -> 
             "depthRenderMs",
             "jpegEncodeMs",
             "totalMs",
+            "mjForwardMs",
             "queueAgeAtStartMs",
         }
         status = worker.status()
         assert status["status"] == "running"
         assert status["workerPid"] == worker._process.pid
         uuid.UUID(str(status["workerBootId"]))
+        timing_status = status["renderTiming"]
+        assert timing_status["thresholdMs"] == 100.0
+        assert set(timing_status["stages"]) == set(dict(frame.render_timing))
+        assert timing_status["stages"]["totalMs"]["lastMs"] == pytest.approx(
+            dict(frame.render_timing)["totalMs"]
+        )
     finally:
         worker.close(timeout_s=5.0)
 
 
-def test_viewer_status_exposes_child_identity_and_failure_counters() -> None:
+def test_worker_timing_persists_slow_evidence_across_normal_frames() -> None:
+    context = multiprocessing.get_context("spawn")
+    stats = _SharedWorkerStats(context)
+    boot = str(uuid.uuid4())
+    captured_at_ns = time.time_ns()
+    slow = _frame(
+        1,
+        captured_at_ns=captured_at_ns,
+        boot=boot,
+        render_timing=_render_timing(total_ms=250.0, rgb_ms=125.0),
+    )
+    normal = _frame(
+        2,
+        captured_at_ns=captured_at_ns + 100,
+        boot=boot,
+        render_timing=_render_timing(total_ms=10.0, rgb_ms=5.0),
+    )
+
+    _record_render_timing(stats, slow)
+    slow_status = _read_render_timing(stats)
+    assert slow_status is not None
+    assert slow_status["stages"]["totalMs"] == {
+        "lastMs": 250.0,
+        "maxMs": 250.0,
+        "overThresholdCount": 1,
+        "lastOverThresholdMs": 250.0,
+        "lastOverThresholdAtUnixNs": slow.rendered_at_unix_ns,
+    }
+
+    _record_render_timing(stats, normal)
+    recovered_status = _read_render_timing(stats)
+    assert recovered_status is not None
+    assert recovered_status["stages"]["totalMs"] == {
+        "lastMs": 10.0,
+        "maxMs": 250.0,
+        "overThresholdCount": 1,
+        "lastOverThresholdMs": 250.0,
+        "lastOverThresholdAtUnixNs": slow.rendered_at_unix_ns,
+    }
+    assert recovered_status["stages"]["rgbRenderMs"] == {
+        "lastMs": 5.0,
+        "maxMs": 125.0,
+        "overThresholdCount": 1,
+        "lastOverThresholdMs": 125.0,
+        "lastOverThresholdAtUnixNs": slow.rendered_at_unix_ns,
+    }
+
+
+def test_worker_timing_exact_threshold_is_normal_and_new_worker_starts_clean() -> None:
+    context = multiprocessing.get_context("spawn")
+    first_worker_stats = _SharedWorkerStats(context)
+    frame = _frame(
+        1,
+        captured_at_ns=time.time_ns(),
+        boot=str(uuid.uuid4()),
+        render_timing=_render_timing(total_ms=RENDER_TIMING_STALL_THRESHOLD_MS),
+    )
+    _record_render_timing(first_worker_stats, frame)
+    first_status = _read_render_timing(first_worker_stats)
+    assert first_status is not None
+    assert first_status["stages"]["totalMs"] == {
+        "lastMs": RENDER_TIMING_STALL_THRESHOLD_MS,
+        "maxMs": RENDER_TIMING_STALL_THRESHOLD_MS,
+        "overThresholdCount": 0,
+        "lastOverThresholdMs": None,
+        "lastOverThresholdAtUnixNs": None,
+    }
+
+    restarted_worker_stats = _SharedWorkerStats(context)
+    restarted_status = _read_render_timing(restarted_worker_stats)
+    assert restarted_status is not None
+    assert restarted_status["stages"]["totalMs"] == {
+        "lastMs": None,
+        "maxMs": 0.0,
+        "overThresholdCount": 0,
+        "lastOverThresholdMs": None,
+        "lastOverThresholdAtUnixNs": None,
+    }
+
+
+def test_worker_status_exposes_defensive_persistent_timing_snapshot() -> None:
     mujoco, model, _data = _model_data()
     context = multiprocessing.get_context("spawn")
     shape = MujocoStateShape.from_model(mujoco, model)
-    worker = PassiveViewerWorker(
+    worker = RgbdRenderWorker(
         mailbox=LatestStateMailbox(shape, context=context),
+        shape=shape,
+        config=RenderWorkerConfig(
+            "missing", "missing", "explicit_process_restart", 85
+        ),
+        on_frame=lambda _frame: None,
+        context=context,
+    )
+    try:
+        frame = _frame(
+            1,
+            captured_at_ns=time.time_ns(),
+            boot=str(uuid.uuid4()),
+            render_timing=_render_timing(total_ms=250.0),
+        )
+        _record_render_timing(worker._stats, frame)
+        first = worker.status()["renderTiming"]
+        assert first["thresholdMs"] == RENDER_TIMING_STALL_THRESHOLD_MS
+        assert first["stages"]["totalMs"]["overThresholdCount"] == 1
+        first["stages"]["totalMs"]["overThresholdCount"] = 999
+        assert worker.status()["renderTiming"]["stages"]["totalMs"][
+            "overThresholdCount"
+        ] == 1
+    finally:
+        worker.close()
+
+
+def test_parent_timing_cache_reads_and_publishes_under_one_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mujoco, model, _data = _model_data()
+    context = multiprocessing.get_context("spawn")
+    shape = MujocoStateShape.from_model(mujoco, model)
+    worker = RgbdRenderWorker(
+        mailbox=LatestStateMailbox(shape, context=context),
+        shape=shape,
+        config=RenderWorkerConfig(
+            "missing", "missing", "explicit_process_restart", 85
+        ),
+        on_frame=lambda _frame: None,
+        context=context,
+    )
+    first = render_workers._empty_render_timing_snapshot()
+    second = render_workers._empty_render_timing_snapshot()
+    first["stages"]["totalMs"]["overThresholdCount"] = 1
+    second["stages"]["totalMs"]["overThresholdCount"] = 2
+    snapshots = iter((first, second))
+    lock_observations: list[bool] = []
+
+    def read_timing(_stats):
+        lock_observations.append(worker._status_lock.locked())
+        return next(snapshots)
+
+    monkeypatch.setattr(render_workers, "_read_render_timing", read_timing)
+    try:
+        worker._collect_frame(
+            _frame(1, captured_at_ns=time.time_ns(), boot=str(uuid.uuid4()))
+        )
+        status = worker.status()
+        assert lock_observations == [True, True]
+        assert status["renderTiming"]["stages"]["totalMs"][
+            "overThresholdCount"
+        ] == 2
+    finally:
+        worker.close()
+
+
+def test_spawn_worker_preserves_slow_timing_after_normal_recovery() -> None:
+    mujoco, model, _data = _model_data()
+    context = multiprocessing.get_context("spawn")
+    shape = MujocoStateShape.from_model(mujoco, model)
+    worker = RgbdRenderWorker(
+        mailbox=LatestStateMailbox(shape, context=context),
+        shape=shape,
+        config=RenderWorkerConfig(
+            "missing", "missing", "explicit_process_restart", 85
+        ),
+        on_frame=lambda _frame: None,
+        context=context,
+        target=_slow_then_normal_timing_worker,
+    )
+    worker.start()
+    try:
+        deadline = time.monotonic() + 5.0
+        status = worker.status()
+        while not status["ready"] and time.monotonic() < deadline:
+            time.sleep(0.01)
+            status = worker.status()
+        total = status["renderTiming"]["stages"]["totalMs"]
+        assert status["status"] == "running"
+        assert total["lastMs"] == 10.0
+        assert total["maxMs"] == 250.0
+        assert total["overThresholdCount"] == 1
+        assert total["lastOverThresholdMs"] == 250.0
+        assert isinstance(total["lastOverThresholdAtUnixNs"], int)
+        assert total["lastOverThresholdAtUnixNs"] > 0
+    finally:
+        worker.close(timeout_s=1.0)
+
+
+def test_viewer_status_exposes_child_identity_and_failure_counters() -> None:
+    mujoco, model, data = _model_data()
+    context = multiprocessing.get_context("spawn")
+    shape = MujocoStateShape.from_model(mujoco, model)
+    mailbox = LatestStateMailbox(shape, context=context)
+    assert mailbox.try_publish(
+        mujoco, model, data, captured_at_unix_ns=time.time_ns()
+    ) == 1
+    worker = PassiveViewerWorker(
+        mailbox=mailbox,
         shape=shape,
         config=ViewerWorkerConfig(
             "missing",
@@ -548,8 +850,119 @@ def test_viewer_status_exposes_child_identity_and_failure_counters() -> None:
         uuid.UUID(str(status["workerBootId"]))
         assert status["failureCount"] == 0
         assert status["lastFailureAtUnixNs"] is None
+        assert status["lastSuccessSequence"] == status["mailboxPublishedCount"]
+        assert status["progressAgeMs"] < status["staleAfterMs"]
     finally:
         worker.close(timeout_s=1.0)
+
+
+def test_viewer_alive_without_progress_becomes_stale_and_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mujoco, model, data = _model_data()
+    context = multiprocessing.get_context("spawn")
+    shape = MujocoStateShape.from_model(mujoco, model)
+    mailbox = LatestStateMailbox(shape, context=context)
+    mailbox.try_publish(mujoco, model, data, captured_at_unix_ns=time.time_ns())
+    worker = PassiveViewerWorker(
+        mailbox=mailbox,
+        shape=shape,
+        config=ViewerWorkerConfig(
+            "missing",
+            "missing",
+            "explicit_process_restart",
+            0.0,
+            0.0,
+        ),
+        context=context,
+        target=_healthy_viewer_identity_worker,
+    )
+    worker.start()
+    try:
+        deadline = time.monotonic() + 5.0
+        while not worker.status()["ready"] and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert worker.status()["status"] == "running"
+        data.time += 0.004
+        assert mailbox.try_publish(
+            mujoco, model, data, captured_at_unix_ns=time.time_ns()
+        ) == 2
+        progress_anchor_ns = 10_000_000_000
+        worker._stats.last_success_monotonic_ns.value = progress_anchor_ns
+        monkeypatch.setattr(
+            time,
+            "monotonic_ns",
+            lambda: progress_anchor_ns + VIEWER_PROGRESS_STALE_NS,
+        )
+        boundary = worker.status()
+        assert boundary["status"] == "running"
+        assert boundary["ready"] is True
+        monkeypatch.setattr(
+            time,
+            "monotonic_ns",
+            lambda: progress_anchor_ns + VIEWER_PROGRESS_STALE_NS + 1,
+        )
+
+        stale = worker.status()
+
+        assert stale["alive"] is True
+        assert stale["status"] == "stale"
+        assert stale["ready"] is False
+        assert stale["lastSuccessSequence"] == 1
+        assert stale["mailboxPublishedCount"] == 2
+        assert stale["progressAgeMs"] > stale["staleAfterMs"]
+
+        latest = mailbox.copy_latest(after_sequence=1)
+        assert latest is not None
+        _record_viewer_progress(worker._stats, mailbox, latest)
+        recovered = worker.status()
+        assert recovered["status"] == "running"
+        assert recovered["ready"] is True
+        assert recovered["lastSuccessSequence"] == 2
+    finally:
+        worker.close(timeout_s=1.0)
+
+
+def test_viewer_progress_cache_reads_and_publishes_under_one_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mujoco, model, _data = _model_data()
+    context = multiprocessing.get_context("spawn")
+    shape = MujocoStateShape.from_model(mujoco, model)
+    worker = PassiveViewerWorker(
+        mailbox=LatestStateMailbox(shape, context=context),
+        shape=shape,
+        config=ViewerWorkerConfig(
+            "missing",
+            "missing",
+            "explicit_process_restart",
+            0.0,
+            0.0,
+        ),
+        context=context,
+    )
+    progress = iter(
+        (
+            (1_800_000_001_000_000_000, 1_000_000_000, 1, 0),
+            (1_800_000_002_000_000_000, 2_000_000_000, 2, 0),
+        )
+    )
+    lock_observations: list[bool] = []
+
+    def read_progress(_stats):
+        lock_observations.append(worker._progress_cache_lock.locked())
+        return next(progress)
+
+    monkeypatch.setattr(render_workers, "_read_viewer_progress", read_progress)
+    monkeypatch.setattr(time, "monotonic_ns", lambda: 2_000_000_000)
+    try:
+        worker.status()
+        status = worker.status()
+        assert lock_observations == [True, True]
+        assert status["lastSuccessSequence"] == 2
+        assert worker._last_viewer_progress[2] == 2
+    finally:
+        worker.close()
 
 
 def test_successful_worker_recovery_clears_shared_last_error() -> None:
@@ -561,6 +974,57 @@ def test_successful_worker_recovery_clears_shared_last_error() -> None:
     _clear_shared_error(stats)
 
     assert stats.last_error.value == b""
+
+
+def test_collector_failure_is_durable_after_recovery_and_ignores_wall_order() -> None:
+    mujoco, model, _data = _model_data()
+    context = multiprocessing.get_context("spawn")
+    shape = MujocoStateShape.from_model(mujoco, model)
+    commit_calls = 0
+
+    def commit(_rendered: RenderedFrame) -> None:
+        nonlocal commit_calls
+        commit_calls += 1
+        if commit_calls == 1:
+            raise RuntimeError("injected frame-store failure")
+
+    worker = RgbdRenderWorker(
+        mailbox=LatestStateMailbox(shape, context=context),
+        shape=shape,
+        config=RenderWorkerConfig(
+            "missing", "missing", "explicit_process_restart", 85
+        ),
+        on_frame=commit,
+        context=context,
+    )
+    try:
+        boot = str(uuid.uuid4())
+        frame = _frame(1, captured_at_ns=time.time_ns(), boot=boot)
+        # Simulate a wall-clock rollback: active errors must determine health,
+        # not ordering two Unix timestamps from different clock generations.
+        worker._stats.last_success_at_ns.value = 9_000_000_000_000_000_000
+        worker._collect_frame(frame)
+
+        failed = worker.status()
+        assert failed["status"] == "failed"
+        assert failed["failureCount"] == 1
+        assert failed["collectorFailureCount"] == 1
+        assert "injected frame-store failure" in failed["lastError"]
+        assert failed["currentCollectorError"] == failed["lastError"]
+
+        worker._collect_frame(
+            _frame(2, captured_at_ns=time.time_ns(), boot=boot)
+        )
+        recovered = worker.status()
+        assert recovered["status"] == "running"
+        assert recovered["lastError"] is None
+        assert recovered["currentCollectorError"] is None
+        assert recovered["failureCount"] == 1
+        assert recovered["collectorFailureCount"] == 1
+        assert "injected frame-store failure" in recovered["lastCollectorError"]
+        assert recovered["lastCollectorFailureAtUnixNs"] is not None
+    finally:
+        worker.close()
 
 
 def test_worker_shutdown_is_bounded_and_idempotent() -> None:

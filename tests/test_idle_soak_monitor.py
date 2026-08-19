@@ -29,6 +29,42 @@ OBSERVATION_WORKER_BOOT_ID = "22222222-2222-4222-8222-222222222222"
 VIEWER_WORKER_BOOT_ID = "33333333-3333-4333-8333-333333333333"
 
 
+def _worker_render_timing(
+    *,
+    stage: str | None = None,
+    count: int = 0,
+    last_ms: float = 5.0,
+    max_ms: float | None = None,
+    last_over_ms: float | None = None,
+    last_over_at_unix_ns: int = 1_800_000_001_000_000_000,
+) -> dict:
+    stages = {}
+    for name in idle_soak._OBSERVATION_RENDER_TIMING_STAGES:
+        changed = name == stage
+        value = last_ms if changed else 5.0
+        stages[name] = {
+            "lastMs": value,
+            "maxMs": (
+                max(8.0, value)
+                if not changed or max_ms is None
+                else max_ms
+            ),
+            "overThresholdCount": count if changed else 0,
+            "lastOverThresholdMs": (
+                (value if last_over_ms is None else last_over_ms)
+                if changed and count
+                else None
+            ),
+            "lastOverThresholdAtUnixNs": (
+                last_over_at_unix_ns if changed and count else None
+            ),
+        }
+    return {
+        "thresholdMs": idle_soak.EXPECTED_WORKER_STALL_THRESHOLD_MS,
+        "stages": stages,
+    }
+
+
 def _healthy_worker(*, pid: int, boot_id: str, viewer: bool = False) -> dict:
     value = {
         "status": "running",
@@ -46,8 +82,17 @@ def _healthy_worker(*, pid: int, boot_id: str, viewer: bool = False) -> dict:
             {
                 "authorityFeedbackEnabled": False,
                 "keyCallbackRegistered": False,
+                "lastSuccessSequence": 100,
+                "lastSuccessAtUnixNs": 1_800_000_000_000_000_000,
+                "mailboxPublishedCount": 100,
+                "mailboxDroppedCount": 0,
+                "lastSuccessMailboxDroppedCount": 0,
+                "progressAgeMs": 10.0,
+                "staleAfterMs": 2_000.0,
             }
         )
+    else:
+        value["renderTiming"] = _worker_render_timing()
     return value
 
 
@@ -368,8 +413,20 @@ def _observe(
 
 def test_baseline_nonzero_counters_do_not_block_a_clean_soak() -> None:
     evaluator = idle_soak.IdleSoakEvaluator()
-    _observe(evaluator, _batch(0), 0)
-    _observe(evaluator, _batch(1), 1)
+    first = _batch(0)
+    second = _batch(1)
+    for batch in (first, second):
+        batch.payloads["plant"]["observationWorker"]["renderTiming"] = (
+            _worker_render_timing(
+                stage="totalMs",
+                count=4,
+                last_ms=5.0,
+                max_ms=150.0,
+                last_over_ms=150.0,
+            )
+        )
+    _observe(evaluator, first, 0)
+    _observe(evaluator, second, 1)
 
     result = evaluator.finalize()
 
@@ -377,6 +434,7 @@ def test_baseline_nonzero_counters_do_not_block_a_clean_soak() -> None:
     assert result["movementReleaseAllowed"] is True
     assert result["quarantineExercised"] is False
     assert set(result["runtimeCounterDeltas"].values()) == {0}
+    assert set(result["workerRenderTimingCounterDeltas"].values()) == {0}
     assert result["plantWorkerBaseline"]["observationWorker"]["identity"] == {
         "workerPid": 201,
         "workerBootId": OBSERVATION_WORKER_BOOT_ID,
@@ -564,6 +622,238 @@ def test_new_snapshot_publish_stages_are_tracked(stage: str) -> None:
     assert result["runtimeCounterDeltas"][
         f"plant.stages.{stage}.overThresholdCount"
     ] == 1
+    assert result["movementReleaseAllowed"] is False
+
+
+def test_continuous_250ms_observation_worker_total_samples_force_hold() -> None:
+    evaluator = idle_soak.IdleSoakEvaluator()
+    _observe(evaluator, _batch(0), 0)
+    last_derived = None
+    for index in (1, 2):
+        batch = _batch(index)
+        batch.payloads["plant"]["observationWorker"]["renderTiming"] = (
+            _worker_render_timing(
+                stage="totalMs",
+                count=index,
+                last_ms=250.0,
+            )
+        )
+        last_derived = _observe(evaluator, batch, index)
+
+    assert last_derived is not None
+    result = evaluator.finalize()
+    timing = last_derived["plantWorkers"]["renderTiming"]
+    path = (
+        "plant.observationWorker.renderTiming.stages.totalMs."
+        "overThresholdCount"
+    )
+
+    assert timing["stallEvent"] is True
+    assert timing["counterChanges"][path] == {"previous": 1, "current": 2}
+    assert timing["eventEvidence"]["stages"]["totalMs"]["lastMs"] == 250.0
+    assert result["workerRenderTimingCounterDeltas"][path] == 2
+    assert len(result["workerRenderTimingCounterDeltas"]) == len(
+        idle_soak._OBSERVATION_RENDER_TIMING_STAGES
+    )
+    assert set(result["runtimeCounterDeltas"].values()) == {0}
+    assert result["runtimeStallSeen"] is True
+    assert result["safeHoldSafetyPass"] is True
+    assert result["movementReleaseAllowed"] is False
+    assert result["quarantineExercised"] is True
+
+
+def test_worker_last_slow_duration_survives_a_normal_render_sample() -> None:
+    evaluator = idle_soak.IdleSoakEvaluator()
+    _observe(evaluator, _batch(0), 0)
+    samples = (
+        _worker_render_timing(
+            stage="totalMs",
+            count=1,
+            last_ms=150.0,
+            max_ms=150.0,
+            last_over_at_unix_ns=1_800_000_001_000_000_000,
+        ),
+        _worker_render_timing(
+            stage="totalMs",
+            count=2,
+            last_ms=120.0,
+            max_ms=150.0,
+            last_over_at_unix_ns=1_800_000_002_000_000_000,
+        ),
+        _worker_render_timing(
+            stage="totalMs",
+            count=2,
+            last_ms=5.0,
+            max_ms=150.0,
+            last_over_ms=120.0,
+            last_over_at_unix_ns=1_800_000_002_000_000_000,
+        ),
+    )
+    for index, timing in enumerate(samples, start=1):
+        batch = _batch(index)
+        batch.payloads["plant"]["observationWorker"]["renderTiming"] = timing
+        derived = _observe(evaluator, batch, index)
+
+    stage = derived["plantWorkers"]["renderTiming"]["stages"]["totalMs"]
+    result = evaluator.finalize()
+
+    assert derived["plantWorkers"]["renderTiming"]["stallEvent"] is False
+    assert stage == {
+        "lastMs": 5.0,
+        "maxMs": 150.0,
+        "overThresholdCount": 2,
+        "lastOverThresholdMs": 120.0,
+        "lastOverThresholdAtUnixNs": 1_800_000_002_000_000_000,
+    }
+    assert result["runtimeStallSeen"] is True
+    assert result["movementReleaseAllowed"] is False
+
+
+def test_every_published_observation_worker_stage_counter_is_tracked() -> None:
+    evaluator = idle_soak.IdleSoakEvaluator()
+    first = _batch(0)
+    second = _batch(1)
+    extra_stage = {
+        "lastMs": 1.0,
+        "maxMs": 1.0,
+        "overThresholdCount": 0,
+        "lastOverThresholdMs": None,
+        "lastOverThresholdAtUnixNs": None,
+    }
+    first.payloads["plant"]["observationWorker"]["renderTiming"]["stages"][
+        "gpuFenceMs"
+    ] = dict(extra_stage)
+    second.payloads["plant"]["observationWorker"]["renderTiming"]["stages"][
+        "gpuFenceMs"
+    ] = {
+        **extra_stage,
+        "lastMs": 150.0,
+        "maxMs": 150.0,
+        "overThresholdCount": 1,
+        "lastOverThresholdMs": 150.0,
+        "lastOverThresholdAtUnixNs": 1_800_000_001_000_000_000,
+    }
+
+    _observe(evaluator, first, 0)
+    derived = _observe(evaluator, second, 1)
+    result = evaluator.finalize()
+    path = (
+        "plant.observationWorker.renderTiming.stages.gpuFenceMs."
+        "overThresholdCount"
+    )
+
+    assert derived["plantWorkers"]["renderTiming"]["counterChanges"][path]
+    assert result["workerRenderTimingCounterDeltas"][path] == 1
+    assert result["movementReleaseAllowed"] is False
+
+
+def test_enabled_viewer_progress_ignores_wall_clock_rollback() -> None:
+    evaluator = idle_soak.IdleSoakEvaluator()
+    first = _batch(0)
+    second = _batch(1)
+    first.payloads["plant"]["viewerWorker"] = _healthy_worker(
+        pid=202,
+        boot_id=VIEWER_WORKER_BOOT_ID,
+        viewer=True,
+    )
+    first.payloads["plant"]["viewerWorker"]["lastSuccessAtUnixNs"] = (
+        1_800_000_010_000_000_000
+    )
+    second.payloads["plant"]["viewerWorker"] = _healthy_worker(
+        pid=202,
+        boot_id=VIEWER_WORKER_BOOT_ID,
+        viewer=True,
+    )
+    second.payloads["plant"]["viewerWorker"].update(
+        {
+            "lastSuccessSequence": 101,
+            "lastSuccessAtUnixNs": 1_800_000_009_000_000_000,
+            "mailboxPublishedCount": 101,
+        }
+    )
+
+    _observe(evaluator, first, 0)
+    derived = _observe(evaluator, second, 1)
+    result = evaluator.finalize()
+
+    assert derived["plantWorkers"]["viewerProgressErrors"] == []
+    assert derived["plantWorkers"]["identityChanges"] == {}
+    assert result["safeHoldSafetyPass"] is True
+    assert result["movementReleaseAllowed"] is True
+
+
+def test_enabled_viewer_mailbox_growth_within_stale_window_is_not_stale() -> None:
+    evaluator = idle_soak.IdleSoakEvaluator()
+    first = _batch(0)
+    second = _batch(1)
+    for batch in (first, second):
+        batch.payloads["plant"]["viewerWorker"] = _healthy_worker(
+            pid=202,
+            boot_id=VIEWER_WORKER_BOOT_ID,
+            viewer=True,
+        )
+    second.payloads["plant"]["viewerWorker"]["mailboxPublishedCount"] = 101
+
+    _observe(evaluator, first, 0)
+    derived = _observe(evaluator, second, 1)
+    result = evaluator.finalize()
+
+    assert derived["plantWorkers"]["viewerProgressErrors"] == []
+    assert derived["plantWorkers"]["viewerProgressEvidence"] == {}
+    assert result["safeHoldSafetyPass"] is True
+    assert result["movementReleaseAllowed"] is True
+
+
+def test_enabled_viewer_exact_stale_boundary_is_not_stale() -> None:
+    evaluator = idle_soak.IdleSoakEvaluator()
+    for index in (0, 1):
+        batch = _batch(index)
+        batch.payloads["plant"]["viewerWorker"] = _healthy_worker(
+            pid=202,
+            boot_id=VIEWER_WORKER_BOOT_ID,
+            viewer=True,
+        )
+        batch.payloads["plant"]["viewerWorker"].update(
+            {
+                "mailboxPublishedCount": 101,
+                "progressAgeMs": 2_000.0,
+            }
+        )
+        derived = _observe(evaluator, batch, index)
+
+    result = evaluator.finalize()
+
+    assert derived["plantWorkers"]["viewerProgressErrors"] == []
+    assert result["safeHoldSafetyPass"] is True
+    assert result["movementReleaseAllowed"] is True
+
+
+def test_enabled_viewer_with_published_mailbox_and_two_second_stale_success_holds() -> None:
+    evaluator = idle_soak.IdleSoakEvaluator()
+    for index in (0, 1):
+        batch = _batch(index)
+        batch.payloads["plant"]["viewerWorker"] = _healthy_worker(
+            pid=202,
+            boot_id=VIEWER_WORKER_BOOT_ID,
+            viewer=True,
+        )
+        batch.payloads["plant"]["viewerWorker"].update(
+            {
+                "status": "stale",
+                "ready": False,
+                "mailboxPublishedCount": 101,
+                "progressAgeMs": 2_000.001,
+            }
+        )
+        derived = _observe(evaluator, batch, index)
+
+    result = evaluator.finalize()
+
+    assert any(
+        "last success" in error
+        for error in derived["plantWorkers"]["viewerProgressErrors"]
+    )
+    assert result["safeHoldSafetyPass"] is False
     assert result["movementReleaseAllowed"] is False
 
 
@@ -861,6 +1151,28 @@ class _WorkerDriftSampler:
         return batch
 
 
+class _WorkerRenderStallSampler:
+    def __init__(self) -> None:
+        self.calls: list[bool] = []
+
+    def sample(self, *, include_robot_agent: bool) -> idle_soak.EndpointBatch:
+        index = len(self.calls)
+        self.calls.append(include_robot_agent)
+        batch = _batch(index)
+        if index >= 1:
+            batch.payloads["plant"]["observationWorker"]["renderTiming"] = (
+                _worker_render_timing(
+                    stage="totalMs",
+                    count=1,
+                    last_ms=250.0,
+                )
+            )
+        if not include_robot_agent:
+            batch.payloads.pop("robotAgent")
+            batch.latency_ms.pop("robotAgent")
+        return batch
+
+
 class _FakeProcessProbe:
     def snapshot(self):
         return PROCESSES, ()
@@ -945,6 +1257,38 @@ def test_short_run_writes_full_worker_drift_evidence() -> None:
     assert result["safeHoldSafetyPass"] is False
 
 
+def test_short_run_writes_full_worker_render_stall_evidence() -> None:
+    clock = _FakeClock()
+    writer = _MemoryWriter()
+
+    result = idle_soak.run_soak(
+        sampler=_WorkerRenderStallSampler(),
+        evaluator=idle_soak.IdleSoakEvaluator(),
+        writer=writer,
+        process_probe=_FakeProcessProbe(),
+        log_scanner=_FakeLogScanner(),
+        duration_s=0.6,
+        session_id="session-worker-render-stall",
+        clock=clock,
+        sleeper=clock.sleep,
+    )
+
+    event = next(value for value in writer.values if value["kind"] == "worker_event")
+    timing = event["derived"]["plantWorkers"]["renderTiming"]
+    path = (
+        "plant.observationWorker.renderTiming.stages.totalMs."
+        "overThresholdCount"
+    )
+    assert timing["counterChanges"][path] == {"previous": 0, "current": 1}
+    assert timing["eventEvidence"]["stages"]["totalMs"]["lastMs"] == 250.0
+    assert event["payloads"]["plant"]["observationWorker"]["renderTiming"][
+        "stages"
+    ]["totalMs"]["overThresholdCount"] == 1
+    assert set(result["runtimeCounterDeltas"].values()) == {0}
+    assert result["runtimeStallSeen"] is True
+    assert result["movementReleaseAllowed"] is False
+
+
 def test_documented_defaults_are_2hz_5s_10s_and_605s() -> None:
     assert idle_soak.SAMPLE_INTERVAL_S == 0.5
     assert idle_soak.ROBOT_AGENT_INTERVAL_S == 5.0
@@ -952,3 +1296,14 @@ def test_documented_defaults_are_2hz_5s_10s_and_605s() -> None:
     assert idle_soak.DEFAULT_DURATION_S == 605.0
     assert "snapshotPublish" in idle_soak._PLANT_STAGES
     assert "viewerSnapshotPublish" in idle_soak._PLANT_STAGES
+    assert idle_soak.EXPECTED_WORKER_STALL_THRESHOLD_MS == 100.0
+    assert idle_soak.VIEWER_PROGRESS_TIMEOUT_NS == 2_000_000_000
+    assert set(idle_soak._OBSERVATION_RENDER_TIMING_STAGES) == {
+        "totalMs",
+        "rgbRenderMs",
+        "jpegEncodeMs",
+        "depthRenderMs",
+        "stateApplyMs",
+        "mjForwardMs",
+        "queueAgeAtStartMs",
+    }

@@ -28,6 +28,17 @@ CAPTURE_STATE_NAME = "mjSTATE_FULLPHYSICS"
 MAX_CAPTURE_AGE_NS = 500_000_000
 RGB_WIDTH = 640
 RGB_HEIGHT = 480
+RENDER_TIMING_STALL_THRESHOLD_MS = 100.0
+VIEWER_PROGRESS_STALE_NS = 2_000_000_000
+_RENDER_TIMING_STAGE_NAMES = (
+    "totalMs",
+    "rgbRenderMs",
+    "jpegEncodeMs",
+    "depthRenderMs",
+    "stateApplyMs",
+    "mjForwardMs",
+    "queueAgeAtStartMs",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +103,7 @@ class AuthoritativeSnapshot:
     producer_boot_id: str
     sequence: int
     captured_at_unix_ns: int
+    captured_at_monotonic_ns: int
     state: np.ndarray
 
 
@@ -114,6 +126,7 @@ class LatestStateMailbox:
         self._state = ctx.RawArray("d", shape.fullphysics_size)
         self._sequence = ctx.Value("Q", 0, lock=False)
         self._captured_at_ns = ctx.Value("Q", 0, lock=False)
+        self._captured_at_monotonic_ns = ctx.Value("Q", 0, lock=False)
         self._published = ctx.Value("Q", 0, lock=False)
         self._dropped = ctx.Value("Q", 0, lock=False)
 
@@ -132,12 +145,20 @@ class LatestStateMailbox:
         data,
         *,
         captured_at_unix_ns: int,
+        captured_at_monotonic_ns: int | None = None,
     ) -> int | None:
         """Copy one state or drop it immediately when the worker is reading."""
 
         captured_at = int(captured_at_unix_ns)
         if captured_at <= 0:
             raise ValueError("captured_at_unix_ns must be positive")
+        captured_monotonic = int(
+            time.monotonic_ns()
+            if captured_at_monotonic_ns is None
+            else captured_at_monotonic_ns
+        )
+        if captured_monotonic <= 0:
+            raise ValueError("captured_at_monotonic_ns must be positive")
         if not self._lock.acquire(False):
             self._dropped.value = int(self._dropped.value) + 1
             return None
@@ -151,6 +172,7 @@ class LatestStateMailbox:
             )
             sequence = int(self._sequence.value) + 1
             self._captured_at_ns.value = captured_at
+            self._captured_at_monotonic_ns.value = captured_monotonic
             # Sequence is written last while holding the lock, making it the
             # commit marker for the state and timestamp copied above.
             self._sequence.value = sequence
@@ -169,6 +191,9 @@ class LatestStateMailbox:
             if sequence <= int(after_sequence):
                 return None
             captured_at = int(self._captured_at_ns.value)
+            captured_at_monotonic = int(
+                self._captured_at_monotonic_ns.value
+            )
             state = np.frombuffer(self._state, dtype=np.float64).copy()
         finally:
             self._lock.release()
@@ -176,6 +201,7 @@ class LatestStateMailbox:
             producer_boot_id=self.producer_boot_id,
             sequence=sequence,
             captured_at_unix_ns=captured_at,
+            captured_at_monotonic_ns=captured_at_monotonic,
             state=state,
         )
 
@@ -227,6 +253,127 @@ class WorkerFailure:
     at_unix_ns: int
     message: str
     fatal: bool
+
+
+def _empty_render_timing_snapshot() -> dict[str, object]:
+    return {
+        "thresholdMs": RENDER_TIMING_STALL_THRESHOLD_MS,
+        "stages": {
+            name: {
+                "lastMs": None,
+                "maxMs": 0.0,
+                "overThresholdCount": 0,
+                "lastOverThresholdMs": None,
+                "lastOverThresholdAtUnixNs": None,
+            }
+            for name in _RENDER_TIMING_STAGE_NAMES
+        },
+    }
+
+
+def _copy_render_timing_snapshot(value: dict[str, object]) -> dict[str, object]:
+    stages = value["stages"]
+    assert isinstance(stages, dict)
+    return {
+        "thresholdMs": value["thresholdMs"],
+        "stages": {
+            name: dict(stage)
+            for name, stage in stages.items()
+        },
+    }
+
+
+def _record_render_timing(stats, frame: RenderedFrame) -> None:
+    """Publish every completed worker timing without losing slow evidence."""
+
+    timings = dict(frame.render_timing)
+    if set(timings) != set(_RENDER_TIMING_STAGE_NAMES):
+        raise RuntimeError("render worker timing stages do not match the contract")
+    values = tuple(float(timings[name]) for name in _RENDER_TIMING_STAGE_NAMES)
+    if not all(math.isfinite(value) and value >= 0.0 for value in values):
+        raise RuntimeError("render worker timing contains an invalid duration")
+    observed_at_ns = int(frame.rendered_at_unix_ns)
+    if observed_at_ns <= 0:
+        raise RuntimeError("render worker timing timestamp is invalid")
+
+    # Only the render child writes.  HTTP uses a non-blocking read below, so a
+    # dead child holding this lock can never hang Plant state/health requests.
+    with stats.render_timing_lock:
+        for index, duration_ms in enumerate(values):
+            stats.render_timing_last_ms[index] = duration_ms
+            stats.render_timing_max_ms[index] = max(
+                float(stats.render_timing_max_ms[index]),
+                duration_ms,
+            )
+            if duration_ms > RENDER_TIMING_STALL_THRESHOLD_MS:
+                stats.render_timing_over_threshold_count[index] = (
+                    int(stats.render_timing_over_threshold_count[index]) + 1
+                )
+                stats.render_timing_last_over_ms[index] = duration_ms
+                stats.render_timing_last_over_at_ns[index] = observed_at_ns
+        stats.render_timing_observed.value = 1
+
+
+def _read_render_timing(stats) -> dict[str, object] | None:
+    """Return one complete child generation or fail open to a parent cache."""
+
+    if not stats.render_timing_lock.acquire(False):
+        return None
+    try:
+        last_ms = tuple(float(value) for value in stats.render_timing_last_ms)
+        max_ms = tuple(float(value) for value in stats.render_timing_max_ms)
+        counts = tuple(
+            int(value) for value in stats.render_timing_over_threshold_count
+        )
+        last_over_ms = tuple(
+            float(value) for value in stats.render_timing_last_over_ms
+        )
+        last_over_at = tuple(
+            int(value) for value in stats.render_timing_last_over_at_ns
+        )
+        observed = bool(stats.render_timing_observed.value)
+    finally:
+        stats.render_timing_lock.release()
+    return {
+        "thresholdMs": RENDER_TIMING_STALL_THRESHOLD_MS,
+        "stages": {
+            name: {
+                "lastMs": last_ms[index] if observed else None,
+                "maxMs": max_ms[index],
+                "overThresholdCount": counts[index],
+                "lastOverThresholdMs": (
+                    last_over_ms[index] if last_over_at[index] else None
+                ),
+                "lastOverThresholdAtUnixNs": last_over_at[index] or None,
+            }
+            for index, name in enumerate(_RENDER_TIMING_STAGE_NAMES)
+        },
+    }
+
+
+def _record_viewer_progress(stats, mailbox, snapshot) -> None:
+    """Commit one internally consistent viewer progress generation."""
+
+    with stats.viewer_progress_lock:
+        stats.last_success_at_ns.value = time.time_ns()
+        stats.last_success_sequence.value = snapshot.sequence
+        stats.last_success_mailbox_dropped_count.value = mailbox.dropped_count
+        # Monotonic is the commit marker and is written last.
+        stats.last_success_monotonic_ns.value = time.monotonic_ns()
+
+
+def _read_viewer_progress(stats) -> tuple[int, int, int, int] | None:
+    if not stats.viewer_progress_lock.acquire(False):
+        return None
+    try:
+        return (
+            int(stats.last_success_at_ns.value),
+            int(stats.last_success_monotonic_ns.value),
+            int(stats.last_success_sequence.value),
+            int(stats.last_success_mailbox_dropped_count.value),
+        )
+    finally:
+        stats.viewer_progress_lock.release()
 
 
 def _set_shared_error(stats, message: str) -> str:
@@ -364,6 +511,13 @@ def _render_snapshot(
     if snapshot.state.shape != (shape.fullphysics_size,):
         raise RuntimeError("render worker received an invalid state vector size")
     render_started_ns = time.time_ns()
+    render_started_monotonic_ns = time.monotonic_ns()
+    queue_age_ns = (
+        render_started_monotonic_ns - snapshot.captured_at_monotonic_ns
+    )
+    if queue_age_ns < 0:
+        raise RuntimeError("render worker monotonic capture age is negative")
+    render_total_started = time.perf_counter()
     apply_started = time.perf_counter()
     mujoco_api.mj_setState(
         model,
@@ -371,8 +525,10 @@ def _render_snapshot(
         snapshot.state,
         mujoco_api.mjtState.mjSTATE_FULLPHYSICS,
     )
-    mujoco_api.mj_forward(model, data)
     state_apply_ms = (time.perf_counter() - apply_started) * 1000.0
+    forward_started = time.perf_counter()
+    mujoco_api.mj_forward(model, data)
+    mj_forward_ms = (time.perf_counter() - forward_started) * 1000.0
 
     rgb_started = time.perf_counter()
     renderer.update_scene(data, camera=config.camera_name)
@@ -425,6 +581,7 @@ def _render_snapshot(
         math.radians(float(model.cam_fovy[camera_id])) / 2.0
     )
     rendered_at_ns = time.time_ns()
+    total_ms = (time.perf_counter() - render_total_started) * 1000.0
     return RenderedFrame(
         producer_boot_id=snapshot.producer_boot_id,
         sequence=snapshot.sequence,
@@ -450,13 +607,11 @@ def _render_snapshot(
             ("rgbRenderMs", rgb_render_ms),
             ("depthRenderMs", depth_render_ms),
             ("jpegEncodeMs", jpeg_encode_ms),
-            ("totalMs", (rendered_at_ns - render_started_ns) / 1_000_000.0),
+            ("totalMs", total_ms),
+            ("mjForwardMs", mj_forward_ms),
             (
                 "queueAgeAtStartMs",
-                max(
-                    0.0,
-                    (render_started_ns - snapshot.captured_at_unix_ns) / 1_000_000.0,
-                ),
+                queue_age_ns / 1_000_000.0,
             ),
         ),
     )
@@ -520,6 +675,7 @@ def _rgbd_worker_main(
                     shape=expected_shape,
                     config=config,
                 )
+                _record_render_timing(stats, frame)
                 consecutive_failures = 0
                 _clear_shared_error(stats)
                 stats.last_success_at_ns.value = frame.rendered_at_unix_ns
@@ -617,8 +773,7 @@ def _viewer_worker_main(
             mujoco_api.mjtState.mjSTATE_FULLPHYSICS,
         )
         mujoco_api.mj_forward(model, data)
-        stats.last_success_at_ns.value = time.time_ns()
-        stats.last_success_sequence.value = first.sequence
+        _record_viewer_progress(stats, mailbox, first)
         from mujoco import viewer as mujoco_viewer
 
         # No key_callback is registered.  Mouse perturbations, pause state and
@@ -638,8 +793,7 @@ def _viewer_worker_main(
                 )
                 mujoco_api.mj_forward(model, data)
                 last_sequence = snapshot.sequence
-                stats.last_success_at_ns.value = time.time_ns()
-                stats.last_success_sequence.value = snapshot.sequence
+                _record_viewer_progress(stats, mailbox, snapshot)
             viewer.sync(state_only=True)
             stop_event.wait(config.viewer_period_s)
         if not stop_event.is_set():
@@ -669,10 +823,25 @@ class _SharedWorkerStats:
         self.failure_count = context.Value("Q", 0, lock=False)
         self.last_failure_at_ns = context.Value("Q", 0, lock=False)
         self.last_success_at_ns = context.Value("Q", 0, lock=False)
+        self.last_success_monotonic_ns = context.Value("Q", 0, lock=False)
         self.last_success_sequence = context.Value("Q", 0, lock=False)
+        self.last_success_mailbox_dropped_count = context.Value(
+            "Q", 0, lock=False
+        )
         self.last_error = context.Array("c", 513, lock=True)
         self.worker_pid = context.Value("q", 0, lock=False)
         self.worker_boot_id = context.Array("c", 37, lock=True)
+        stage_count = len(_RENDER_TIMING_STAGE_NAMES)
+        self.render_timing_lock = context.Lock()
+        self.render_timing_observed = context.Value("b", 0, lock=False)
+        self.render_timing_last_ms = context.RawArray("d", stage_count)
+        self.render_timing_max_ms = context.RawArray("d", stage_count)
+        self.render_timing_over_threshold_count = context.RawArray(
+            "Q", stage_count
+        )
+        self.render_timing_last_over_ms = context.RawArray("d", stage_count)
+        self.render_timing_last_over_at_ns = context.RawArray("Q", stage_count)
+        self.viewer_progress_lock = context.Lock()
 
 
 class RgbdRenderWorker:
@@ -713,6 +882,11 @@ class RgbdRenderWorker:
         self._status_lock = threading.Lock()
         self._last_error: str | None = None
         self._last_error_at_ns = 0
+        self._collector_failure_count = 0
+        self._collector_current_error: str | None = None
+        self._last_collector_failure_at_ns = 0
+        self._last_collector_error: str | None = None
+        self._last_render_timing = _empty_render_timing_snapshot()
         self._closed = False
 
     def start(self) -> None:
@@ -730,34 +904,76 @@ class RgbdRenderWorker:
                 result = self._result_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
-            except (EOFError, OSError, ValueError):
+            except (EOFError, OSError, ValueError) as exc:
+                if not self._collector_stop.is_set() and not self._closed:
+                    self._record_collector_failure(
+                        f"collector queue failed: {type(exc).__name__}: {exc}"
+                    )
                 break
             if isinstance(result, RenderedFrame):
-                try:
-                    self._on_frame(result)
-                    with self._status_lock:
-                        self._last_error = None
-                except Exception as exc:
-                    with self._status_lock:
-                        self._last_error = (
-                            f"frame commit failed: {type(exc).__name__}: {exc}"[:512]
-                        )
-                        self._last_error_at_ns = time.time_ns()
+                self._collect_frame(result)
             elif isinstance(result, WorkerFailure):
                 with self._status_lock:
                     self._last_error = result.message
                     self._last_error_at_ns = result.at_unix_ns
+            else:
+                self._record_collector_failure(
+                    "collector received an unknown worker result"
+                )
+                break
+
+    def _record_collector_failure(self, message: str) -> None:
+        error = str(message)[:512]
+        failure_at_ns = time.time_ns()
+        with self._status_lock:
+            self._last_error = error
+            self._last_error_at_ns = failure_at_ns
+            self._collector_failure_count += 1
+            self._collector_current_error = error
+            self._last_collector_failure_at_ns = failure_at_ns
+            self._last_collector_error = error
+
+    def _collect_frame(self, frame: RenderedFrame) -> None:
+        try:
+            self._on_frame(frame)
+        except Exception as exc:
+            self._record_collector_failure(
+                f"frame commit failed: {type(exc).__name__}: {exc}"
+            )
+            return
+        with self._status_lock:
+            render_timing = _read_render_timing(self._stats)
+            self._last_error = None
+            self._collector_current_error = None
+            if render_timing is not None:
+                self._last_render_timing = render_timing
 
     def status(self) -> dict[str, object]:
         alive = self._process.is_alive()
         exitcode = self._process.exitcode
+        collector_started = self._collector is not None
+        collector_alive = bool(
+            self._collector is not None and self._collector.is_alive()
+        )
         fatal = bool(self._stats.fatal.value) or (
             exitcode is not None and exitcode != 0
-        ) or (self._process.pid is not None and not alive and not self._closed)
+        ) or (self._process.pid is not None and not alive and not self._closed) or (
+            collector_started and not collector_alive and not self._closed
+        )
         last_success_at = int(self._stats.last_success_at_ns.value)
         with self._status_lock:
+            render_timing = _read_render_timing(self._stats)
             local_error = self._last_error
             local_error_at_ns = self._last_error_at_ns
+            collector_failure_count = self._collector_failure_count
+            collector_current_error = self._collector_current_error
+            last_collector_failure_at_ns = self._last_collector_failure_at_ns
+            last_collector_error = self._last_collector_error
+            if render_timing is not None:
+                self._last_render_timing = render_timing
+            render_timing_status = _copy_render_timing_snapshot(
+                self._last_render_timing
+            )
         last_failure_at = max(
             int(self._stats.last_failure_at_ns.value),
             local_error_at_ns,
@@ -769,7 +985,8 @@ class RgbdRenderWorker:
             )
         with self._stats.worker_boot_id.get_lock():
             worker_boot_id = self._stats.worker_boot_id.value.decode("ascii")
-        if fatal or (last_failure_at > last_success_at):
+        active_error = local_error or shared_error or None
+        if fatal or active_error is not None:
             status = "failed"
         elif last_success_at:
             status = "running"
@@ -779,16 +996,26 @@ class RgbdRenderWorker:
             "status": status,
             "ready": bool(self._stats.ready.value),
             "alive": alive,
+            "collectorAlive": collector_alive,
             "exitCode": exitcode,
             "workerPid": int(self._stats.worker_pid.value) or None,
             "workerBootId": worker_boot_id or None,
             "lastSuccessSequence": int(self._stats.last_success_sequence.value),
             "lastSuccessAtUnixNs": last_success_at,
-            "failureCount": int(self._stats.failure_count.value),
+            "failureCount": (
+                int(self._stats.failure_count.value) + collector_failure_count
+            ),
             "lastFailureAtUnixNs": last_failure_at or None,
-            "lastError": local_error or shared_error or None,
+            "lastError": active_error,
+            "collectorFailureCount": collector_failure_count,
+            "currentCollectorError": collector_current_error,
+            "lastCollectorFailureAtUnixNs": (
+                last_collector_failure_at_ns or None
+            ),
+            "lastCollectorError": last_collector_error,
             "mailboxPublishedCount": self.mailbox.published_count,
             "mailboxDroppedCount": self.mailbox.dropped_count,
+            "renderTiming": render_timing_status,
         }
 
     def close(self, *, timeout_s: float = 3.0) -> None:
@@ -831,14 +1058,19 @@ class PassiveViewerWorker:
             args=(mailbox, shape, config, self._stop_event, self._stats),
             name="mujoco-passive-viewer-worker",
         )
+        self._started_at_monotonic_ns = 0
+        self._progress_cache_lock = threading.Lock()
+        self._last_viewer_progress = (0, 0, 0, 0)
         self._closed = False
 
     def start(self) -> None:
+        self._started_at_monotonic_ns = time.monotonic_ns()
         self._process.start()
 
     def status(self) -> dict[str, object]:
+        now_monotonic_ns = time.monotonic_ns()
         alive = self._process.is_alive()
-        failed = bool(self._stats.fatal.value) or (
+        process_failed = bool(self._stats.fatal.value) or (
             self._process.pid is not None and not alive and not self._closed
         )
         with self._stats.last_error.get_lock():
@@ -848,32 +1080,83 @@ class PassiveViewerWorker:
             )
         with self._stats.worker_boot_id.get_lock():
             worker_boot_id = self._stats.worker_boot_id.value.decode("ascii")
+        with self._progress_cache_lock:
+            progress = _read_viewer_progress(self._stats)
+            if progress is not None:
+                self._last_viewer_progress = progress
+            (
+                last_success_at,
+                last_success_monotonic_ns,
+                last_success_sequence,
+                dropped_at_success,
+            ) = self._last_viewer_progress
+        mailbox_published = self.mailbox.published_count
+        mailbox_dropped = self.mailbox.dropped_count
+        progress_anchor_ns = (
+            last_success_monotonic_ns or self._started_at_monotonic_ns
+        )
+        progress_age_ns = (
+            None
+            if progress_anchor_ns <= 0
+            else now_monotonic_ns - progress_anchor_ns
+        )
+        progress_invalid = bool(
+            progress_age_ns is not None and progress_age_ns < 0
+        )
+        failed = process_failed or progress_invalid
+        parent_has_advanced = (
+            mailbox_published > last_success_sequence
+            or mailbox_dropped > dropped_at_success
+        )
+        stale = bool(
+            not failed
+            and alive
+            and parent_has_advanced
+            and progress_age_ns is not None
+            and progress_age_ns > VIEWER_PROGRESS_STALE_NS
+        )
+        initialized = bool(self._stats.ready.value)
+        status = (
+            "failed"
+            if failed
+            else "stale"
+            if stale
+            else "running"
+            if initialized and last_success_at
+            else "starting"
+        )
         return {
-            "status": (
-                "failed"
-                if failed
-                else (
-                    "running"
-                    if int(self._stats.last_success_at_ns.value)
-                    else "starting"
-                )
-            ),
-            "ready": bool(self._stats.ready.value),
+            "status": status,
+            "ready": initialized and not failed and not stale,
             "alive": alive,
             "exitCode": self._process.exitcode,
             "workerPid": int(self._stats.worker_pid.value) or None,
             "workerBootId": worker_boot_id or None,
-            "lastSuccessSequence": int(self._stats.last_success_sequence.value),
-            "lastSuccessAtUnixNs": int(self._stats.last_success_at_ns.value),
+            "lastSuccessSequence": last_success_sequence,
+            "lastSuccessAtUnixNs": last_success_at,
+            "progressAgeMs": (
+                None
+                if progress_age_ns is None
+                else progress_age_ns / 1_000_000.0
+            ),
+            "staleAfterMs": VIEWER_PROGRESS_STALE_NS / 1_000_000.0,
             "failureCount": int(self._stats.failure_count.value),
             "lastFailureAtUnixNs": (
                 int(self._stats.last_failure_at_ns.value) or None
             ),
-            "mailboxPublishedCount": self.mailbox.published_count,
-            "mailboxDroppedCount": self.mailbox.dropped_count,
+            "mailboxPublishedCount": mailbox_published,
+            "mailboxDroppedCount": mailbox_dropped,
+            "lastSuccessMailboxDroppedCount": dropped_at_success,
             "authorityFeedbackEnabled": False,
             "keyCallbackRegistered": False,
-            "lastError": shared_error or None,
+            "lastError": (
+                shared_error
+                or (
+                    "viewer monotonic progress age is negative"
+                    if progress_invalid
+                    else None
+                )
+            ),
         }
 
     def close(self, *, timeout_s: float = 3.0) -> None:
@@ -895,9 +1178,11 @@ __all__ = [
     "MAX_CAPTURE_AGE_NS",
     "MujocoStateShape",
     "PassiveViewerWorker",
+    "RENDER_TIMING_STALL_THRESHOLD_MS",
     "RenderedFrame",
     "RenderWorkerConfig",
     "RgbdRenderWorker",
+    "VIEWER_PROGRESS_STALE_NS",
     "ViewerWorkerConfig",
     "WorkerFailure",
     "configure_head_camera",

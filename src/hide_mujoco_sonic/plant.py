@@ -443,6 +443,19 @@ class PlantPhysicsMonitor:
         if self.root_body_id < 0:
             raise RuntimeError("pinned G1 model does not define pelvis")
         self._warning_counts = self._read_warning_counts()
+        active_warnings = {
+            name: count
+            for name, count in self._warning_counts.items()
+            if count != 0
+        }
+        if active_warnings:
+            self.support.fail(
+                "MuJoCo warning counters are non-zero before the first Plant step: "
+                + ", ".join(
+                    f"{name}={count}"
+                    for name, count in active_warnings.items()
+                )
+            )
 
     def _read_warning_counts(self) -> dict[str, int]:
         return {
