@@ -146,7 +146,23 @@ def _runtime(*, auto_reference_authority: bool = False):
     runtime._reference_install_epoch = 0
     runtime._minimum_acquirable_epoch = None
     runtime._policy_step_pending = False
+    runtime._pending_reference_install_epoch = None
+    runtime._pending_ref_cursor = None
     return runtime, planner, controller, encoder, decoder, raw_action
+
+
+def _initialize_and_acquire(runtime, planner, obs):
+    runtime.initialize_from_observation(obs)
+    boundary = np.array([obs[f"{motor.name}.q"] for motor in G1_29_JointIndex], np.float32)
+    runtime.request_reference(obs)
+    planner.results.append((_motion_from_measured(boundary), planner.gen_frame))
+    assert runtime.poll_reference()
+    runtime.acquire_reference(
+        obs,
+        executed_target=boundary,
+        expected_install_epoch=runtime.reference_install_epoch,
+    )
+    return boundary
 
 
 def test_action_mapping_is_a_29_axis_bijection():
@@ -300,11 +316,72 @@ def test_publish_feedback_is_required_and_is_the_only_cursor_commit():
     # A stop racing this pending candidate keeps the feedback transaction open.
     runtime.revoke_reference_authority()
     assert runtime.execution_feedback_pending
+    with pytest.raises(RuntimeError, match="not acknowledged"):
+        runtime.tick(obs, debug=False, use_joystick=False)
     runtime.record_executed_target(published)
     assert controller.ref_cursor == 1
     assert not runtime.execution_feedback_pending
     with pytest.raises(RuntimeError, match="no policy step"):
         runtime.record_executed_target(published)
+
+
+def test_periodic_refresh_installs_before_decode_and_binds_candidate_to_new_epoch():
+    runtime, planner, controller, _encoder, _decoder, _raw_action = _runtime()
+    obs = _complete_obs()
+    _initialize_and_acquire(runtime, planner, obs)
+
+    first = runtime.tick(obs, debug=False, use_joystick=False)
+    runtime.record_executed_target(_target_vector(first))
+    old_epoch = runtime.reference_install_epoch
+    assert controller.ref_cursor == 1
+
+    refreshed_q = np.array(
+        [obs[f"{motor.name}.q"] + 0.05 for motor in G1_29_JointIndex],
+        np.float32,
+    )
+    planner.results.append((_motion_from_measured(refreshed_q), planner.gen_frame))
+    runtime.tick(obs, debug=False, use_joystick=False)
+
+    assert runtime.reference_install_epoch == old_epoch + 1
+    assert runtime._pending_reference_install_epoch == runtime.reference_install_epoch
+    assert runtime._pending_ref_cursor == controller.ref_cursor == 0
+
+
+@pytest.mark.parametrize("identity_change", ["epoch", "cursor"])
+def test_stale_candidate_cannot_commit_across_reference_identity(identity_change):
+    runtime, planner, controller, _encoder, _decoder, _raw_action = _runtime()
+    obs = _complete_obs()
+    _initialize_and_acquire(runtime, planner, obs)
+    candidate = runtime.tick(obs, debug=False, use_joystick=False)
+    published = _target_vector(candidate)
+    executed_before = controller.last_executed_action_il.copy()
+    cursor_before = controller.ref_cursor
+
+    if identity_change == "epoch":
+        runtime._reference_install_epoch += 1
+    else:
+        controller.ref_cursor += 1
+
+    with pytest.raises(RuntimeError, match="no longer matches"):
+        runtime.record_executed_target(published)
+    np.testing.assert_array_equal(controller.last_executed_action_il, executed_before)
+    assert controller.execution_feedback_pending
+    assert runtime.execution_feedback_pending
+    assert controller.ref_cursor == cursor_before + (identity_change == "cursor")
+
+
+def test_poll_reference_rejects_install_while_candidate_feedback_is_pending():
+    runtime, planner, _controller, _encoder, _decoder, _raw_action = _runtime()
+    obs = _complete_obs()
+    boundary = _initialize_and_acquire(runtime, planner, obs)
+    runtime.tick(obs, debug=False, use_joystick=False)
+    epoch_before = runtime.reference_install_epoch
+    planner.results.append((_motion_from_measured(boundary), planner.gen_frame))
+
+    with pytest.raises(RuntimeError, match="feedback is pending"):
+        runtime.poll_reference()
+    assert runtime.reference_install_epoch == epoch_before
+    assert len(planner.results) == 1
 
 
 def test_planning_only_request_and_poll_do_not_advance_policy_state():

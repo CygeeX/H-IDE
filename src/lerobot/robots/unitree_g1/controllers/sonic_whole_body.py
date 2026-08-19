@@ -233,6 +233,8 @@ class SonicRuntime:
         self._reference_install_epoch = 0
         self._minimum_acquirable_epoch: int | None = None
         self._policy_step_pending = False
+        self._pending_reference_install_epoch: int | None = None
+        self._pending_ref_cursor: int | None = None
 
     @property
     def pipeline(self):
@@ -310,9 +312,12 @@ class SonicRuntime:
         should set ``discard_pending_execution=True``.
         """
 
-        if discard_pending_execution and self.controller.execution_feedback_pending:
-            self.controller.discard_pending_execution()
+        if discard_pending_execution:
+            if self.controller.execution_feedback_pending:
+                self.controller.discard_pending_execution()
             self._policy_step_pending = False
+            self._pending_reference_install_epoch = None
+            self._pending_ref_cursor = None
         self.controller.set_reference_authority(
             actuator_authority=False,
             matching_reference_ready=False,
@@ -347,6 +352,8 @@ class SonicRuntime:
     def poll_reference(self) -> bool:
         """Poll and blend one accepted async plan without policy-state progress."""
 
+        if self._policy_step_pending or self.controller.execution_feedback_pending:
+            raise RuntimeError("cannot install a SONIC reference while policy feedback is pending")
         result = self.planner.try_get_new_motion()
         if result is None:
             return False
@@ -400,9 +407,21 @@ class SonicRuntime:
 
         if not self._policy_step_pending:
             raise RuntimeError("SONIC runtime has no policy step awaiting publish feedback")
+        pending_epoch = self._pending_reference_install_epoch
+        pending_cursor = self._pending_ref_cursor
+        current_cursor = int(self.controller.ref_cursor)
+        if (
+            pending_epoch is None
+            or pending_cursor is None
+            or pending_epoch != self._reference_install_epoch
+            or pending_cursor != current_cursor
+        ):
+            raise RuntimeError("pending SONIC candidate no longer matches its reference epoch/cursor")
         executed = self.controller.record_executed_target(target)
         self.controller.advance_cursor()
         self._policy_step_pending = False
+        self._pending_reference_install_epoch = None
+        self._pending_ref_cursor = None
         return executed
 
     def tick(self, obs: dict, *, debug: bool | None = None, use_joystick: bool = True) -> dict:
@@ -411,6 +430,8 @@ class SonicRuntime:
 
         if not self._initialized:
             self.initialize_from_observation(obs)
+        if self._policy_step_pending or self.controller.execution_feedback_pending:
+            raise RuntimeError("previous SONIC policy target was not acknowledged by the actuator publisher")
         if not self.reference_authority:
             if not self.auto_reference_authority:
                 return {}
@@ -431,6 +452,14 @@ class SonicRuntime:
             self.ms.needs_replan = False
             self.last_ms = snapshot_ms(self.ms)
 
+        # Install an accepted refresh before choosing the reference identity for
+        # this decoder invocation. Never blend a new epoch behind an in-flight
+        # candidate: its executed-action commit must remain bound to exactly the
+        # reference/cursor that produced it.
+        self.poll_reference()
+        candidate_epoch = self._reference_install_epoch
+        candidate_cursor = int(self.controller.ref_cursor)
+
         # Official deploy parity: the encoder token is fresh on every 50 Hz
         # policy tick; cadence must not depend on a mutable/debug counter.
         do_enc = True
@@ -438,8 +467,8 @@ class SonicRuntime:
             debug = self.step % DEBUG_PRINT_EVERY == 0
         action = self.controller.step(obs, update_encoder=do_enc, debug=debug)
         self._policy_step_pending = True
-
-        self.poll_reference()
+        self._pending_reference_install_epoch = candidate_epoch
+        self._pending_ref_cursor = candidate_cursor
 
         self.step += 1
         return action
