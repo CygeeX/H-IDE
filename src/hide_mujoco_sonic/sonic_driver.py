@@ -423,7 +423,12 @@ class SonicDriver:
         self._crc = CRC()
         self._msg = unitree_hg_msg_dds__LowCmd_()
         self._controller_type = SonicWholeBodyController
-        self._controller = self._controller_type(force_cpu=config.force_cpu)
+        self._controller = self._controller_type(
+            force_cpu=config.force_cpu,
+            auto_reference_authority=False,
+            enable_startup_blend=False,
+            allow_operator_intent=False,
+        )
         self._planner_evidence = PlannerReferenceEvidenceGate(
             required_timeout_s=config.planner_reference_timeout_s
         )
@@ -617,6 +622,10 @@ class SonicDriver:
         warm_runtime.controller = warm_pipeline
         warm_runtime.planner = warm_planner
         warm_runtime.ms = warm_ms
+        # The live controller remains manual-authority.  This isolated clone is
+        # deliberately auto-authorized so one full encoder/decoder pass can be
+        # warmed without manufacturing an outer reference transaction.
+        warm_runtime.auto_reference_authority = True
 
         warm_controller = cls._clone_state_owner(
             controller,
@@ -732,6 +741,8 @@ class SonicDriver:
         if not self._set_plant_support_mode("idle"):
             raise RuntimeError("MuJoCo idle support is unavailable during SONIC warm-up")
         self._publish_measured_hold(lowstate)
+        if not self._controller.initialize_from_lowstate(lowstate):
+            raise RuntimeError("SONIC live runtime was initialized before startup preparation")
         self._warm_controller_inference(lowstate)
         runtime_diagnostics = getattr(self, "_runtime_diagnostics", None)
         if runtime_diagnostics is not None:

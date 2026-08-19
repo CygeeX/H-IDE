@@ -226,6 +226,7 @@ def test_controller_warmup_runs_full_path_on_isolated_state() -> None:
 
     assert len(calls) == 1
     assert calls[0] is not driver._controller
+    assert calls[0]._runtime.auto_reference_authority is True
     assert driver._controller._runtime.step == 0
     assert driver._controller._init_step == 0
     assert driver._controller.controller.ref_cursor == 0
@@ -318,6 +319,11 @@ def test_startup_holds_plant_before_warmup_and_leaves_clock_disarmed() -> None:
 
     driver._set_plant_support_mode = support
     driver._publish_measured_hold = lambda state: events.append(("hold", state))
+    driver._controller = SimpleNamespace(
+        initialize_from_lowstate=lambda state: (
+            events.append(("initialize", state)) or True
+        )
+    )
     driver._warm_controller_inference = lambda state: events.append(("warm", state))
     driver._runtime_diagnostics = SimpleNamespace(
         freeze_warm_runtime=lambda: events.append(("gc_freeze", None)),
@@ -333,6 +339,7 @@ def test_startup_holds_plant_before_warmup_and_leaves_clock_disarmed() -> None:
     assert events == [
         ("support", "idle"),
         ("hold", lowstate),
+        ("initialize", lowstate),
         ("warm", lowstate),
         ("gc_freeze", None),
     ]
