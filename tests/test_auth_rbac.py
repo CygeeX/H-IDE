@@ -98,11 +98,21 @@ def test_auth_migration_is_expand_only_versioned_and_idempotent(tmp_path) -> Non
             "name": "assistant_v2_server_owned_conversation_memory",
             "appliedAt": migrations[3]["appliedAt"],
         },
+        {
+            "version": 5,
+            "name": "assistant_v2_owned_speech_transcriptions",
+            "appliedAt": migrations[4]["appliedAt"],
+        },
+        {
+            "version": 6,
+            "name": "assistant_v2_typed_scene_memory",
+            "appliedAt": migrations[5]["appliedAt"],
+        },
     ]
     first.close()
 
     reopened = SQLiteStore(str(db_path))
-    assert len(reopened.schema_migrations()) == 4
+    assert len(reopened.schema_migrations()) == 6
     assert reopened.get_robot("legacy-robot")["sentinel"] == "preserved"
     tables = {
         row[0]
@@ -119,6 +129,11 @@ def test_auth_migration_is_expand_only_versioned_and_idempotent(tmp_path) -> Non
         "assistant_turn_events",
         "assistant_conversation_summaries",
         "assistant_conversation_memory_audits",
+        "scene_inspection_sessions",
+        "scene_inspection_checkpoints",
+        "scene_landmarks",
+        "scene_landmark_observations",
+        "scene_landmark_aliases",
     } <= tables
     reopened.close()
 

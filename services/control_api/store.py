@@ -647,6 +647,210 @@ class SQLiteStore:
                     """,
                 ),
             ),
+            (
+                6,
+                "assistant_v2_typed_scene_memory",
+                (
+                    """
+                    CREATE TABLE scene_inspection_sessions (
+                        inspection_id TEXT PRIMARY KEY,
+                        owner_user_id TEXT NOT NULL,
+                        site_id TEXT NOT NULL,
+                        robot_id TEXT NOT NULL,
+                        purpose TEXT,
+                        map_frame_id TEXT NOT NULL CHECK(map_frame_id = 'map'),
+                        localization_epoch_id TEXT NOT NULL,
+                        status TEXT NOT NULL
+                            CHECK(status IN ('open', 'completed', 'cancelled')),
+                        record_version INTEGER NOT NULL DEFAULT 1
+                            CHECK(record_version >= 1),
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        completed_at TEXT,
+                        cancelled_at TEXT,
+                        FOREIGN KEY(owner_user_id) REFERENCES users(user_id)
+                    )
+                    """,
+                    """
+                    CREATE TABLE scene_inspection_checkpoints (
+                        checkpoint_id TEXT PRIMARY KEY,
+                        inspection_id TEXT NOT NULL,
+                        owner_user_id TEXT NOT NULL,
+                        site_id TEXT NOT NULL,
+                        sequence INTEGER NOT NULL CHECK(sequence >= 1),
+                        status TEXT NOT NULL CHECK(status IN (
+                            'stopped', 'captured', 'named', 'confirmed',
+                            'superseded', 'cancelled'
+                        )),
+                        motion_state TEXT NOT NULL CHECK(motion_state = 'STOPPED'),
+                        head_state TEXT NOT NULL CHECK(head_state = 'FIXED'),
+                        stationary_duration_ms INTEGER NOT NULL
+                            CHECK(stationary_duration_ms >= 500),
+                        linear_speed_mps REAL NOT NULL CHECK(linear_speed_mps >= 0),
+                        angular_speed_radps REAL NOT NULL CHECK(angular_speed_radps >= 0),
+                        robot_pose_json TEXT NOT NULL,
+                        localization_epoch_id TEXT NOT NULL,
+                        observed_at TEXT NOT NULL,
+                        frame_id TEXT,
+                        frame_sha256 TEXT,
+                        evidence_sha256 TEXT,
+                        evidence_ref TEXT,
+                        vlm_provider TEXT CHECK(vlm_provider IS NULL OR vlm_provider = 'qwen'),
+                        vlm_model TEXT,
+                        bbox_json TEXT,
+                        depth_json TEXT,
+                        tf_provenance_json TEXT,
+                        confidence REAL CHECK(confidence IS NULL OR (confidence >= 0 AND confidence <= 1)),
+                        support_count INTEGER CHECK(support_count IS NULL OR support_count >= 1),
+                        captured_at TEXT,
+                        named_at TEXT,
+                        confirmed_at TEXT,
+                        record_version INTEGER NOT NULL DEFAULT 1
+                            CHECK(record_version >= 1),
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        UNIQUE(inspection_id, sequence),
+                        FOREIGN KEY(inspection_id)
+                            REFERENCES scene_inspection_sessions(inspection_id),
+                        FOREIGN KEY(owner_user_id) REFERENCES users(user_id)
+                    )
+                    """,
+                    """
+                    CREATE TABLE scene_landmarks (
+                        landmark_id TEXT PRIMARY KEY,
+                        root_landmark_id TEXT NOT NULL,
+                        revision INTEGER NOT NULL CHECK(revision >= 1),
+                        owner_user_id TEXT NOT NULL,
+                        site_id TEXT NOT NULL,
+                        inspection_id TEXT NOT NULL,
+                        checkpoint_id TEXT NOT NULL,
+                        canonical_name TEXT NOT NULL,
+                        normalized_name TEXT NOT NULL,
+                        description TEXT,
+                        status TEXT NOT NULL
+                            CHECK(status IN ('candidate', 'confirmed', 'superseded')),
+                        source_kind TEXT NOT NULL DEFAULT 'SCENE_TEACH'
+                            CHECK(source_kind = 'SCENE_TEACH'),
+                        execution_eligible INTEGER NOT NULL DEFAULT 0
+                            CHECK(execution_eligible = 0),
+                        current_observation_id TEXT NOT NULL,
+                        supersedes_landmark_id TEXT,
+                        superseded_by_landmark_id TEXT,
+                        superseded_reason TEXT,
+                        confirmed_by_user_id TEXT,
+                        confirmed_at TEXT,
+                        invalidated_by_user_id TEXT,
+                        invalidated_at TEXT,
+                        record_version INTEGER NOT NULL DEFAULT 1
+                            CHECK(record_version >= 1),
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        UNIQUE(root_landmark_id, revision),
+                        FOREIGN KEY(owner_user_id) REFERENCES users(user_id),
+                        FOREIGN KEY(inspection_id)
+                            REFERENCES scene_inspection_sessions(inspection_id),
+                        FOREIGN KEY(checkpoint_id)
+                            REFERENCES scene_inspection_checkpoints(checkpoint_id),
+                        FOREIGN KEY(supersedes_landmark_id)
+                            REFERENCES scene_landmarks(landmark_id),
+                        FOREIGN KEY(superseded_by_landmark_id)
+                            REFERENCES scene_landmarks(landmark_id),
+                        FOREIGN KEY(confirmed_by_user_id) REFERENCES users(user_id),
+                        FOREIGN KEY(invalidated_by_user_id) REFERENCES users(user_id)
+                    )
+                    """,
+                    """
+                    CREATE TABLE scene_landmark_observations (
+                        observation_id TEXT PRIMARY KEY,
+                        landmark_id TEXT NOT NULL,
+                        owner_user_id TEXT NOT NULL,
+                        site_id TEXT NOT NULL,
+                        inspection_id TEXT NOT NULL,
+                        checkpoint_id TEXT NOT NULL,
+                        status TEXT NOT NULL
+                            CHECK(status IN ('candidate', 'confirmed', 'superseded')),
+                        map_pose_json TEXT NOT NULL,
+                        covariance_json TEXT NOT NULL,
+                        localization_epoch_id TEXT NOT NULL,
+                        robot_pose_json TEXT NOT NULL,
+                        frame_id TEXT NOT NULL,
+                        frame_sha256 TEXT NOT NULL,
+                        evidence_sha256 TEXT NOT NULL,
+                        evidence_ref TEXT NOT NULL,
+                        vlm_provider TEXT NOT NULL CHECK(vlm_provider = 'qwen'),
+                        vlm_model TEXT NOT NULL,
+                        bbox_json TEXT NOT NULL,
+                        depth_json TEXT NOT NULL,
+                        tf_provenance_json TEXT NOT NULL,
+                        confidence REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),
+                        support_count INTEGER NOT NULL CHECK(support_count >= 1),
+                        authority TEXT NOT NULL DEFAULT 'observation_only'
+                            CHECK(authority = 'observation_only'),
+                        execution_eligible INTEGER NOT NULL DEFAULT 0
+                            CHECK(execution_eligible = 0),
+                        confirmed_by_user_id TEXT,
+                        confirmed_at TEXT,
+                        superseded_by_observation_id TEXT,
+                        superseded_reason TEXT,
+                        record_version INTEGER NOT NULL DEFAULT 1
+                            CHECK(record_version >= 1),
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        FOREIGN KEY(landmark_id) REFERENCES scene_landmarks(landmark_id),
+                        FOREIGN KEY(owner_user_id) REFERENCES users(user_id),
+                        FOREIGN KEY(inspection_id)
+                            REFERENCES scene_inspection_sessions(inspection_id),
+                        FOREIGN KEY(checkpoint_id)
+                            REFERENCES scene_inspection_checkpoints(checkpoint_id),
+                        FOREIGN KEY(confirmed_by_user_id) REFERENCES users(user_id),
+                        FOREIGN KEY(superseded_by_observation_id)
+                            REFERENCES scene_landmark_observations(observation_id)
+                    )
+                    """,
+                    """
+                    CREATE TABLE scene_landmark_aliases (
+                        alias_id TEXT PRIMARY KEY,
+                        landmark_id TEXT NOT NULL,
+                        owner_user_id TEXT NOT NULL,
+                        site_id TEXT NOT NULL,
+                        alias TEXT NOT NULL,
+                        normalized_alias TEXT NOT NULL,
+                        status TEXT NOT NULL CHECK(status IN ('active', 'superseded')),
+                        superseded_by_alias_id TEXT,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        FOREIGN KEY(landmark_id) REFERENCES scene_landmarks(landmark_id),
+                        FOREIGN KEY(owner_user_id) REFERENCES users(user_id),
+                        FOREIGN KEY(superseded_by_alias_id)
+                            REFERENCES scene_landmark_aliases(alias_id)
+                    )
+                    """,
+                    """
+                    CREATE INDEX scene_inspections_site_owner_time_idx
+                        ON scene_inspection_sessions(site_id, owner_user_id, updated_at DESC)
+                    """,
+                    """
+                    CREATE INDEX scene_checkpoints_inspection_sequence_idx
+                        ON scene_inspection_checkpoints(inspection_id, sequence)
+                    """,
+                    """
+                    CREATE INDEX scene_landmarks_site_status_name_idx
+                        ON scene_landmarks(site_id, status, normalized_name, updated_at DESC)
+                    """,
+                    """
+                    CREATE INDEX scene_landmark_root_revision_idx
+                        ON scene_landmarks(root_landmark_id, revision DESC)
+                    """,
+                    """
+                    CREATE INDEX scene_observations_landmark_time_idx
+                        ON scene_landmark_observations(landmark_id, created_at DESC)
+                    """,
+                    """
+                    CREATE INDEX scene_aliases_site_lookup_idx
+                        ON scene_landmark_aliases(site_id, normalized_alias, status)
+                    """,
+                ),
+            ),
         )
         for version, name, statements in migrations:
             applied = self._connection.execute(

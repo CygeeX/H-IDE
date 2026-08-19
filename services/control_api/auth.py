@@ -49,6 +49,7 @@ class Scope(StrEnum):
     API_ACCESS = "api:access"
     ROBOTS_READ = "robots:read"
     ASSISTANT_USE = "assistant:use"
+    SCENE_MEMORY_USE = "scene-memory:use"
     SPEECH_USE = "speech:use"
     MISSIONS_USE = "missions:use"
     EVENTS_READ = "events:read"
@@ -64,6 +65,7 @@ _USER_SCOPES = frozenset(
         Scope.API_ACCESS,
         Scope.ROBOTS_READ,
         Scope.ASSISTANT_USE,
+        Scope.SCENE_MEMORY_USE,
         Scope.SPEECH_USE,
         Scope.MISSIONS_USE,
         Scope.EVENTS_READ,

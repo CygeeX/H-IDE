@@ -116,6 +116,7 @@ from .mission_client import (
 )
 from .mission_service import MissionService, MissionServiceError
 from .mission_routes import create_mission_router
+from .scene_memory import create_scene_memory_router
 from .simulation_routes import create_simulation_router
 from .scene_client import (
     SceneContextClient,
@@ -1288,6 +1289,7 @@ def create_app(
         ),
     )
     app.include_router(create_auth_router(auth_service))
+    app.include_router(create_scene_memory_router(store))
 
     robot_agent_refresh_lock = threading.RLock()
 
