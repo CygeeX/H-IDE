@@ -183,6 +183,27 @@ generations, reference cursor, predicted root direction/projection, and the
 requested/predicted root-yaw deltas. The same fields are copied into every
 bounded pre-fault control-trace sample.
 
+The telemetry JSON also includes a read-only `runtime_diagnostics` snapshot.
+It records LowState-callback, successful-control-publish, and health-probe
+gaps, together with CPython cyclic-GC count, last/max/total pause, and how much
+completed GC time overlapped each last gap.  SONIC performs one full collection
+and freezes the warmed long-lived Python object graph before arming its strict
+control clock; automatic GC remains enabled for runtime request and control
+objects, and the applied/error state is explicit in telemetry.  The hot
+LowState-only hot update mutates scalar telemetry in place; the ordinary
+update API retains its isolated-snapshot return contract, and HTTP readers
+also receive isolated copies.
+
+MuJoCo `/state` and `/healthz` expose `runtimeTiming`: last/max duration,
+over-stale-threshold count, and the latest slow timestamp for the authoritative
+simulation-loop gap, physics step, viewer sync, RGB render, JPEG encode, depth
+render, and total capture path.  These two surfaces are intended to be read
+together.  A LowState gap with continuous health probes, no overlapping GC,
+and a matching slow Plant stage identifies an upstream publication/render
+stall; a matching GC pause or health-probe gap instead supports SONIC
+process/GIL scheduling as the cause.  These diagnostics do not widen the
+100-ms safety limits or replay stale samples.
+
 ## Acceptance gate before deleting the old deterministic backend
 
 The deterministic/FakeAdapter code is retained only as a migration fixture.

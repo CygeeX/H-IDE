@@ -25,6 +25,9 @@ class _Telemetry:
     def update(self, **values: object) -> None:
         self.values.update(values)
 
+    def update_hot(self, **values: object) -> None:
+        self.values.update(values)
+
 
 def _bare_driver(
     *,
@@ -91,6 +94,23 @@ def test_driver_consumes_exactly_one_admitted_simulation_step() -> None:
     assert second is not None
     assert second[1].tick_ms == 1_020
     assert second[1].dt_s == 0.02
+
+
+def test_driver_observes_lowstate_and_successful_publish_gaps() -> None:
+    driver = _bare_driver()
+    lowstates = []
+    publishes = []
+    driver._runtime_diagnostics = SimpleNamespace(
+        observe_lowstate=lowstates.append,
+        observe_control_publish=publishes.append,
+    )
+
+    driver._on_lowstate(SimpleNamespace(tick=1_000))
+    driver._mark_control_step_published()
+
+    assert lowstates == [10.0]
+    assert publishes == [10.0]
+    assert driver._last_control_step_wall_s == 10.0
 
 
 def test_driver_fails_closed_instead_of_catching_up_pending_policy_steps() -> None:
@@ -299,6 +319,14 @@ def test_startup_holds_plant_before_warmup_and_leaves_clock_disarmed() -> None:
     driver._set_plant_support_mode = support
     driver._publish_measured_hold = lambda state: events.append(("hold", state))
     driver._warm_controller_inference = lambda state: events.append(("warm", state))
+    driver._runtime_diagnostics = SimpleNamespace(
+        freeze_warm_runtime=lambda: events.append(("gc_freeze", None)),
+        snapshot=lambda: {
+            "python_gc_freeze_applied": True,
+            "python_gc_warmup_collected_objects": 11,
+            "python_gc_freeze_error": None,
+        },
+    )
 
     driver._prepare_idle_startup()
 
@@ -306,6 +334,7 @@ def test_startup_holds_plant_before_warmup_and_leaves_clock_disarmed() -> None:
         ("support", "idle"),
         ("hold", lowstate),
         ("warm", lowstate),
+        ("gc_freeze", None),
     ]
     assert driver._control_clock_armed is False
     assert driver._control_consumer_ready.is_set() is False

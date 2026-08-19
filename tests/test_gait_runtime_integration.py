@@ -311,6 +311,9 @@ class FakeTelemetry:
     def update(self, **values):
         self.values.update(values)
 
+    def update_hot(self, **values):
+        self.values.update(values)
+
     def reset_navigation_task_peaks(self):
         pass
 
@@ -379,6 +382,10 @@ def test_sonic_health_probe_is_strict_read_only_and_reports_terminal_fault() -> 
     )
     telemetry_before = dict(driver.telemetry.values)
     guard_before = (list(driver.guard.accepted), list(driver.guard.stops))
+    observed_health_probes = []
+    driver._runtime_diagnostics = SimpleNamespace(
+        observe_health_probe=observed_health_probes.append,
+    )
 
     response = driver.accept_json(probe)
     assert response is not None
@@ -399,6 +406,7 @@ def test_sonic_health_probe_is_strict_read_only_and_reports_terminal_fault() -> 
     assert ready.motion_authorized is False
     assert ready.nav2_command_zero is True
     assert ready.confirmed_safe_hold is False
+    assert observed_health_probes == [clock.value]
     assert driver.telemetry.values == telemetry_before
     assert (driver.guard.accepted, driver.guard.stops) == guard_before
 
@@ -415,6 +423,7 @@ def test_sonic_health_probe_is_strict_read_only_and_reports_terminal_fault() -> 
     assert terminal.terminal_fault is True
     assert terminal.motion_ready is False
     assert terminal.reason == "MuJoCo plant tick rolled back"
+    assert observed_health_probes == [clock.value, clock.value]
     assert driver.telemetry.values == telemetry_before
     assert (driver.guard.accepted, driver.guard.stops) == guard_before
 

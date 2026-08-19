@@ -25,6 +25,7 @@ import numpy as np
 
 from .config import SimConfig
 from .frames import BodyTwist, read_mujoco_local_body_twist
+from .runtime_diagnostics import PlantRuntimeDiagnostics
 from .scene_runtime import RuntimeScene
 
 
@@ -322,11 +323,13 @@ class PlantFrameStore:
         model,
         data,
         support: PlantSupportController,
+        runtime_diagnostics: PlantRuntimeDiagnostics | None = None,
     ):
         self.config = config
         self.model = model
         self.data = data
         self.support = support
+        self.runtime_diagnostics = runtime_diagnostics
         self._lock = threading.RLock()
         self._sequence = 0
         self._captured_at_ns = 0
@@ -390,19 +393,49 @@ class PlantFrameStore:
         if rgb is None:
             return
         image = np.asarray(rgb, dtype=np.uint8)
-        ok, encoded = cv2.imencode(
-            ".jpg",
-            cv2.cvtColor(image, cv2.COLOR_RGB2BGR),
-            [cv2.IMWRITE_JPEG_QUALITY, self.config.observation_jpeg_quality],
-        )
+        jpeg_started = time.monotonic()
+        try:
+            ok, encoded = cv2.imencode(
+                ".jpg",
+                cv2.cvtColor(image, cv2.COLOR_RGB2BGR),
+                [cv2.IMWRITE_JPEG_QUALITY, self.config.observation_jpeg_quality],
+            )
+        finally:
+            if self.runtime_diagnostics is not None:
+                self.runtime_diagnostics.observe_stage(
+                    "jpegEncode",
+                    time.monotonic() - jpeg_started,
+                    unix_ns=time.time_ns(),
+                )
         if not ok:
             return
-        if self._depth_renderer is None:
-            self._depth_renderer = mujoco.Renderer(self.model, height=480, width=640)
-        self._depth_renderer.enable_depth_rendering()
-        self._depth_renderer.update_scene(self.data, camera="head_camera")
-        depth_m = np.asarray(self._depth_renderer.render(), dtype=np.float32)
-        self._depth_renderer.disable_depth_rendering()
+        depth_started = time.monotonic()
+        try:
+            if self._depth_renderer is None:
+                self._depth_renderer = mujoco.Renderer(
+                    self.model,
+                    height=480,
+                    width=640,
+                )
+            self._depth_renderer.enable_depth_rendering()
+            try:
+                self._depth_renderer.update_scene(
+                    self.data,
+                    camera="head_camera",
+                )
+                depth_m = np.asarray(
+                    self._depth_renderer.render(),
+                    dtype=np.float32,
+                )
+            finally:
+                self._depth_renderer.disable_depth_rendering()
+        finally:
+            if self.runtime_diagnostics is not None:
+                self.runtime_diagnostics.observe_stage(
+                    "depthRender",
+                    time.monotonic() - depth_started,
+                    unix_ns=time.time_ns(),
+                )
         depth = np.clip(depth_m * 1000.0, 0, 65535).astype("<u2")
         pose = [float(value) for value in root_pose]
         camera_id = mujoco.mj_name2id(
@@ -472,6 +505,11 @@ class PlantFrameStore:
                 "pose": {"x": x, "y": y, "z": z, "qw": qw, "qx": qx, "qy": qy, "qz": qz},
                 "rootVelocity": self._root_velocity.capture_state(),
                 "support": support_state,
+                "runtimeTiming": (
+                    self.runtime_diagnostics.snapshot()
+                    if self.runtime_diagnostics is not None
+                    else None
+                ),
                 "cameraPose": {
                     "x": camera_x,
                     "y": camera_y,
@@ -832,12 +870,48 @@ def run_plant(config: SimConfig) -> int:
         )
         support_release.start()
     frames = None
+    runtime_diagnostics = PlantRuntimeDiagnostics(
+        stall_threshold_s=config.plant_lowstate_stale_s,
+    )
+    original_sim_step = simulator.sim_env.sim_step
+
+    def timed_sim_step():
+        started = time.monotonic()
+        runtime_diagnostics.observe_loop_start(
+            started,
+            unix_ns=time.time_ns(),
+        )
+        try:
+            return original_sim_step()
+        finally:
+            runtime_diagnostics.observe_stage(
+                "simStep",
+                time.monotonic() - started,
+                unix_ns=time.time_ns(),
+            )
+
+    simulator.sim_env.sim_step = timed_sim_step
+    original_update_viewer = simulator.sim_env.update_viewer
+
+    def timed_update_viewer():
+        started = time.monotonic()
+        try:
+            return original_update_viewer()
+        finally:
+            runtime_diagnostics.observe_stage(
+                "viewerSync",
+                time.monotonic() - started,
+                unix_ns=time.time_ns(),
+            )
+
+    simulator.sim_env.update_viewer = timed_update_viewer
     if config.offscreen:
         frames = PlantFrameStore(
             config,
             simulator.sim_env.mj_model,
             simulator.sim_env.mj_data,
             support_controller,
+            runtime_diagnostics,
         )
         frames.serve(
             config.plant_bind_host,
@@ -847,9 +921,33 @@ def run_plant(config: SimConfig) -> int:
         original_render = simulator.sim_env.update_render_caches
 
         def capture_render():
-            result = original_render()
-            frames.capture(result)
-            return result
+            total_started = time.monotonic()
+            try:
+                render_started = time.monotonic()
+                try:
+                    result = original_render()
+                finally:
+                    runtime_diagnostics.observe_stage(
+                        "rgbRender",
+                        time.monotonic() - render_started,
+                        unix_ns=time.time_ns(),
+                    )
+                capture_started = time.monotonic()
+                try:
+                    frames.capture(result)
+                finally:
+                    runtime_diagnostics.observe_stage(
+                        "capturePostprocess",
+                        time.monotonic() - capture_started,
+                        unix_ns=time.time_ns(),
+                    )
+                return result
+            finally:
+                runtime_diagnostics.observe_stage(
+                    "renderCaptureTotal",
+                    time.monotonic() - total_started,
+                    unix_ns=time.time_ns(),
+                )
 
         simulator.sim_env.update_render_caches = capture_render
     try:

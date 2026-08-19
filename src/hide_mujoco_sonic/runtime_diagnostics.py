@@ -1,0 +1,320 @@
+"""Low-overhead runtime timing evidence for the simulator processes.
+
+The safety bridge must distinguish an upstream LowState publication gap from a
+whole-process Python pause.  These observers retain scalar timing evidence only;
+they never drive control, publish DDS, or perform I/O from a real-time callback.
+"""
+
+from __future__ import annotations
+
+import gc
+import math
+import threading
+import time
+from typing import Any, Callable
+
+
+class _GapProbe:
+    def __init__(self, *, threshold_s: float) -> None:
+        self.threshold_s = threshold_s
+        self.previous_at_s: float | None = None
+        self.previous_gc_total_s = 0.0
+        self.last_gap_s: float | None = None
+        self.max_gap_s = 0.0
+        self.over_threshold_count = 0
+        self.last_over_threshold_at_unix_s: float | None = None
+        self.last_gap_gc_pause_s = 0.0
+
+    def observe(
+        self,
+        at_s: float,
+        *,
+        unix_s: float,
+        gc_total_pause_s: float,
+    ) -> None:
+        previous = self.previous_at_s
+        previous_gc_total = self.previous_gc_total_s
+        self.previous_at_s = at_s
+        self.previous_gc_total_s = gc_total_pause_s
+        if previous is None:
+            return
+        gap = max(0.0, at_s - previous)
+        self.last_gap_s = gap
+        self.max_gap_s = max(self.max_gap_s, gap)
+        self.last_gap_gc_pause_s = max(
+            0.0,
+            gc_total_pause_s - previous_gc_total,
+        )
+        if gap > self.threshold_s:
+            self.over_threshold_count += 1
+            self.last_over_threshold_at_unix_s = unix_s
+
+    def snapshot(self, prefix: str) -> dict[str, Any]:
+        return {
+            f"{prefix}_last_gap_s": self.last_gap_s,
+            f"{prefix}_max_gap_s": self.max_gap_s,
+            f"{prefix}_over_threshold_count": self.over_threshold_count,
+            f"{prefix}_last_over_threshold_at_unix_s": (
+                self.last_over_threshold_at_unix_s
+            ),
+            f"{prefix}_last_gap_gc_pause_s": self.last_gap_gc_pause_s,
+        }
+
+
+class SonicRuntimeDiagnostics:
+    """Correlate callback/control/probe gaps with CPython cyclic-GC pauses.
+
+    GC callbacks deliberately update scalar attributes without taking a lock.
+    Taking a contended Python lock from a stop-the-world callback can deadlock:
+    the lock owner cannot run while the callback owns the GIL.  CPython executes
+    the assignments below while holding the GIL, and a telemetry snapshot may
+    tolerate observing two adjacent scalar generations during an update.
+    """
+
+    def __init__(
+        self,
+        *,
+        stall_threshold_s: float,
+        monotonic_clock: Callable[[], float] = time.monotonic,
+        unix_clock: Callable[[], float] = time.time,
+        gc_module=gc,
+    ) -> None:
+        threshold = float(stall_threshold_s)
+        if not math.isfinite(threshold) or threshold <= 0:
+            raise ValueError("stall_threshold_s must be finite and positive")
+        self.stall_threshold_s = threshold
+        self._clock = monotonic_clock
+        self._unix_clock = unix_clock
+        self._gc = gc_module
+        self._lowstate = _GapProbe(threshold_s=threshold)
+        self._control = _GapProbe(threshold_s=threshold)
+        self._health = _GapProbe(threshold_s=threshold)
+        self._gc_started_at_s: float | None = None
+        self._gc_pause_active = False
+        self._gc_collection_count = 0
+        self._gc_last_generation: int | None = None
+        self._gc_last_pause_s: float | None = None
+        self._gc_max_pause_s = 0.0
+        self._gc_total_pause_s = 0.0
+        self._gc_last_completed_at_unix_s: float | None = None
+        self._gc_warmup_collected_objects = 0
+        self._gc_freeze_applied = False
+        self._gc_freeze_error: str | None = None
+        self._gc_callback = self._observe_gc
+        self._registered = False
+        callbacks = getattr(self._gc, "callbacks", None)
+        if callbacks is None:
+            raise ValueError("gc module must expose callbacks")
+        callbacks.append(self._gc_callback)
+        self._registered = True
+
+    def _observe_gc(self, phase: str, info: dict[str, Any]) -> None:
+        now = self._clock()
+        if phase == "start":
+            self._gc_started_at_s = now
+            self._gc_pause_active = True
+            generation = info.get("generation")
+            self._gc_last_generation = (
+                int(generation) if isinstance(generation, int) else None
+            )
+            return
+        if phase != "stop":
+            return
+        started = self._gc_started_at_s
+        pause = 0.0 if started is None else max(0.0, now - started)
+        self._gc_started_at_s = None
+        self._gc_pause_active = False
+        self._gc_collection_count += 1
+        self._gc_last_pause_s = pause
+        self._gc_max_pause_s = max(self._gc_max_pause_s, pause)
+        self._gc_total_pause_s += pause
+        self._gc_last_completed_at_unix_s = self._unix_clock()
+
+    def observe_lowstate(self, at_s: float | None = None) -> None:
+        now = self._clock() if at_s is None else float(at_s)
+        self._lowstate.observe(
+            now,
+            unix_s=self._unix_clock(),
+            gc_total_pause_s=self._gc_total_pause_s,
+        )
+
+    def observe_control_publish(self, at_s: float | None = None) -> None:
+        now = self._clock() if at_s is None else float(at_s)
+        self._control.observe(
+            now,
+            unix_s=self._unix_clock(),
+            gc_total_pause_s=self._gc_total_pause_s,
+        )
+
+    def observe_health_probe(self, at_s: float | None = None) -> None:
+        now = self._clock() if at_s is None else float(at_s)
+        self._health.observe(
+            now,
+            unix_s=self._unix_clock(),
+            gc_total_pause_s=self._gc_total_pause_s,
+        )
+
+    def freeze_warm_runtime(self) -> None:
+        """Collect then freeze the warmed object graph without disabling GC.
+
+        Refcounting and automatic cyclic GC remain active for all objects
+        created after warm-up, including HTTP request threads.  Freezing only
+        removes the existing long-lived process graph from later full scans.
+        """
+
+        try:
+            if not self._gc.isenabled():
+                self._gc.enable()
+            self._gc_warmup_collected_objects = int(self._gc.collect())
+            self._gc.freeze()
+            self._gc_freeze_applied = True
+            self._gc_freeze_error = None
+        except Exception as exc:  # diagnostics must not block safe stationary start
+            self._gc_freeze_applied = False
+            self._gc_freeze_error = f"{type(exc).__name__}: {exc}"[:256]
+
+    def snapshot(self) -> dict[str, Any]:
+        try:
+            gc_enabled = bool(self._gc.isenabled())
+        except Exception:
+            gc_enabled = False
+        try:
+            frozen_objects = int(self._gc.get_freeze_count())
+        except Exception:
+            frozen_objects = 0
+        result: dict[str, Any] = {
+            "runtime_stall_threshold_s": self.stall_threshold_s,
+            "python_gc_enabled": gc_enabled,
+            "python_gc_pause_active": self._gc_pause_active,
+            "python_gc_collection_count": self._gc_collection_count,
+            "python_gc_last_generation": self._gc_last_generation,
+            "python_gc_last_pause_s": self._gc_last_pause_s,
+            "python_gc_max_pause_s": self._gc_max_pause_s,
+            "python_gc_total_pause_s": self._gc_total_pause_s,
+            "python_gc_last_completed_at_unix_s": (
+                self._gc_last_completed_at_unix_s
+            ),
+            "python_gc_warmup_collected_objects": (
+                self._gc_warmup_collected_objects
+            ),
+            "python_gc_freeze_applied": self._gc_freeze_applied,
+            "python_gc_frozen_objects": frozen_objects,
+            "python_gc_freeze_error": self._gc_freeze_error,
+        }
+        result.update(self._lowstate.snapshot("lowstate_callback"))
+        result.update(self._control.snapshot("control_publish"))
+        result.update(self._health.snapshot("health_probe"))
+        return result
+
+    def close(self) -> None:
+        if not self._registered:
+            return
+        callbacks = self._gc.callbacks
+        try:
+            callbacks.remove(self._gc_callback)
+        except ValueError:
+            pass
+        self._registered = False
+
+
+class _DurationProbe:
+    def __init__(self, *, threshold_s: float) -> None:
+        self.threshold_s = threshold_s
+        self.last_s: float | None = None
+        self.max_s = 0.0
+        self.over_threshold_count = 0
+        self.last_over_threshold_at_unix_ns: int | None = None
+
+    def observe(self, duration_s: float, *, unix_ns: int) -> bool:
+        duration = max(0.0, float(duration_s))
+        self.last_s = duration
+        self.max_s = max(self.max_s, duration)
+        if duration <= self.threshold_s:
+            return False
+        self.over_threshold_count += 1
+        self.last_over_threshold_at_unix_ns = int(unix_ns)
+        return True
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "lastS": self.last_s,
+            "maxS": self.max_s,
+            "overThresholdCount": self.over_threshold_count,
+            "lastOverThresholdAtUnixNs": self.last_over_threshold_at_unix_ns,
+        }
+
+
+class PlantRuntimeDiagnostics:
+    """Attribute a slow plant iteration to physics, viewer, or RGB-D work."""
+
+    _STAGES = (
+        "simStep",
+        "viewerSync",
+        "rgbRender",
+        "jpegEncode",
+        "depthRender",
+        "capturePostprocess",
+        "renderCaptureTotal",
+    )
+
+    def __init__(self, *, stall_threshold_s: float) -> None:
+        threshold = float(stall_threshold_s)
+        if not math.isfinite(threshold) or threshold <= 0:
+            raise ValueError("stall_threshold_s must be finite and positive")
+        self.stall_threshold_s = threshold
+        self._lock = threading.RLock()
+        self._last_loop_start_s: float | None = None
+        self._loop_gap = _DurationProbe(threshold_s=threshold)
+        self._stages = {
+            name: _DurationProbe(threshold_s=threshold) for name in self._STAGES
+        }
+        self._last_slow_stage: str | None = None
+        self._last_slow_duration_s: float | None = None
+        self._last_slow_at_unix_ns: int | None = None
+
+    def observe_loop_start(self, at_s: float, *, unix_ns: int) -> None:
+        current = float(at_s)
+        with self._lock:
+            previous = self._last_loop_start_s
+            self._last_loop_start_s = current
+            if previous is None:
+                return
+            slow = self._loop_gap.observe(current - previous, unix_ns=unix_ns)
+            if slow:
+                self._remember_slow(
+                    "simLoopGap",
+                    current - previous,
+                    unix_ns,
+                )
+
+    def observe_stage(
+        self,
+        stage: str,
+        duration_s: float,
+        *,
+        unix_ns: int,
+    ) -> None:
+        if stage not in self._stages:
+            raise ValueError(f"unknown plant timing stage: {stage}")
+        with self._lock:
+            if self._stages[stage].observe(duration_s, unix_ns=unix_ns):
+                self._remember_slow(stage, duration_s, unix_ns)
+
+    def _remember_slow(self, stage: str, duration_s: float, unix_ns: int) -> None:
+        self._last_slow_stage = stage
+        self._last_slow_duration_s = max(0.0, float(duration_s))
+        self._last_slow_at_unix_ns = int(unix_ns)
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "stallThresholdS": self.stall_threshold_s,
+                "simLoopGap": self._loop_gap.snapshot(),
+                "stages": {
+                    name: probe.snapshot()
+                    for name, probe in self._stages.items()
+                },
+                "lastSlowStage": self._last_slow_stage,
+                "lastSlowDurationS": self._last_slow_duration_s,
+                "lastSlowAtUnixNs": self._last_slow_at_unix_ns,
+            }

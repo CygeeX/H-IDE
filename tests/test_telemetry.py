@@ -45,6 +45,55 @@ def test_navigation_task_peaks_keep_the_maximum_and_reset_for_the_next_goal():
     assert stopped.navigation_task_peak_arm_tracking_error_rad == 0.0
 
 
+def test_hot_path_update_does_not_clone_full_telemetry(monkeypatch):
+    store = TelemetryStore(TelemetryState(robot_id="g1-sim"))
+
+    def fail_if_copied(_self):
+        raise AssertionError("hot update cloned the complete telemetry state")
+
+    monkeypatch.setattr(TelemetryState, "json", fail_if_copied)
+    assert store.update_hot(plant_tick=17, sonic_speed_mps=0.1) is None
+
+
+def test_regular_update_keeps_its_isolated_snapshot_return_value():
+    store = TelemetryStore(TelemetryState(robot_id="g1-sim"))
+
+    updated = store.update(plant_tick=17)
+    store.update(plant_tick=18)
+
+    assert updated.plant_tick == 17
+    assert store.get().plant_tick == 18
+
+
+def test_snapshot_json_adds_runtime_diagnostics_without_mutating_state():
+    store = TelemetryStore(TelemetryState(robot_id="g1-sim"))
+    store.set_runtime_diagnostics_provider(
+        lambda: {"lowstate_callback_max_gap_s": 0.149}
+    )
+
+    payload = store.snapshot_json()
+
+    assert payload["runtime_diagnostics"] == {
+        "lowstate_callback_max_gap_s": 0.149
+    }
+    assert not hasattr(store.get(), "runtime_diagnostics")
+
+
+def test_runtime_diagnostics_failure_does_not_break_telemetry_snapshot():
+    store = TelemetryStore(TelemetryState(robot_id="g1-sim"))
+
+    def fail():
+        raise RuntimeError("probe failed")
+
+    store.set_runtime_diagnostics_provider(fail)
+
+    payload = store.snapshot_json()
+    assert payload["robot_id"] == "g1-sim"
+    assert payload["runtime_diagnostics"] == {
+        "snapshot_error": "RuntimeError: probe failed"
+    }
+
+
 def test_joint_fault_trace_is_bounded_named_and_strict_json(tmp_path):
     trace = JointFaultTraceBuffer(("hip", "left_shoulder_roll"), max_samples=2)
 

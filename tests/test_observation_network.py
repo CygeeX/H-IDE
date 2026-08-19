@@ -18,6 +18,7 @@ from hide_mujoco_sonic.config import SimConfig
 from hide_mujoco_sonic.plant import PlantFrameStore, PlantSupportController
 from hide_mujoco_sonic.sonic_driver import _bind_command_server
 from hide_mujoco_sonic.telemetry import TelemetryState, TelemetryStore, serve_telemetry
+from hide_mujoco_sonic.runtime_diagnostics import PlantRuntimeDiagnostics
 from hide_mujoco_sonic.transport import request_json
 
 
@@ -194,6 +195,12 @@ def test_docker_plant_listener_serves_live_rgb_but_rejects_support_write() -> No
     port = _dual_loopback_port()
     support = PlantSupportController()
     support.finish_startup()
+    runtime_diagnostics = PlantRuntimeDiagnostics(stall_threshold_s=0.1)
+    runtime_diagnostics.observe_stage(
+        "rgbRender",
+        0.12,
+        unix_ns=456,
+    )
     store = PlantFrameStore(
         SimpleNamespace(
             robot_id="g1-sim",
@@ -202,6 +209,7 @@ def test_docker_plant_listener_serves_live_rgb_but_rejects_support_write() -> No
         model=None,
         data=None,
         support=support,
+        runtime_diagnostics=runtime_diagnostics,
     )
     jpeg = b"\xff\xd8read-only-fixture\xff\xd9"
     with store._lock:
@@ -219,6 +227,10 @@ def test_docker_plant_listener_serves_live_rgb_but_rejects_support_write() -> No
         assert status == 200
         state = json.loads(body)
         assert state["status"] == "running"
+        assert state["runtimeTiming"]["lastSlowStage"] == "rgbRender"
+        assert state["runtimeTiming"]["stages"]["rgbRender"][
+            "overThresholdCount"
+        ] == 1
         assert "oracle" not in json.dumps(state).lower()
         assert "segmentation" not in json.dumps(state).lower()
         status, _headers, body = _request("127.0.0.2", port, "GET", "/rgb.jpg")

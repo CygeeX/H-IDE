@@ -9,7 +9,7 @@ import math
 from pathlib import Path
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 
 @dataclass
@@ -118,38 +118,88 @@ class TelemetryState:
 
 
 class TelemetryStore:
+    _PEAK_SOURCES = {
+        "navigation_arm_constrained_joints": "navigation_task_peak_arm_constrained_joints",
+        "navigation_arm_raw_max_deviation_rad": "navigation_task_peak_arm_raw_deviation_rad",
+        "navigation_arm_raw_max_error_from_measured_rad": "navigation_task_peak_arm_tracking_error_rad",
+        "navigation_arm_measured_max_deviation_rad": "navigation_task_peak_arm_measured_deviation_rad",
+        "navigation_arm_max_velocity_rps": "navigation_task_peak_arm_velocity_rps",
+        "navigation_arm_max_estimated_torque_nm": "navigation_task_peak_arm_estimated_torque_nm",
+        "lower_body_target_max_error_rad": "navigation_task_peak_lower_body_target_max_error_rad",
+        "lower_body_target_rms_error_rad": "navigation_task_peak_lower_body_target_rms_error_rad",
+    }
+
     def __init__(self, initial: TelemetryState):
         self._value = initial
         self._lock = threading.RLock()
+        self._runtime_diagnostics_provider: Callable[[], Mapping[str, Any]] | None = (
+            None
+        )
+
+    def _apply(self, changes: Mapping[str, Any]) -> None:
+        for key, value in changes.items():
+            if not hasattr(self._value, key):
+                raise KeyError(key)
+            setattr(self._value, key, value)
+        for source, peak in self._PEAK_SOURCES.items():
+            if not self._value.navigation_task_active:
+                break
+            if source not in changes:
+                continue
+            setattr(
+                self._value,
+                peak,
+                max(getattr(self._value, peak), changes[source]),
+            )
+        self._value.updated_at = time.time()
 
     def update(self, **changes: Any) -> TelemetryState:
+        """Update and return the existing isolated state snapshot contract."""
+
         with self._lock:
-            for key, value in changes.items():
-                if not hasattr(self._value, key):
-                    raise KeyError(key)
-                setattr(self._value, key, value)
-            peak_sources = {
-                "navigation_arm_constrained_joints": "navigation_task_peak_arm_constrained_joints",
-                "navigation_arm_raw_max_deviation_rad": "navigation_task_peak_arm_raw_deviation_rad",
-                "navigation_arm_raw_max_error_from_measured_rad": "navigation_task_peak_arm_tracking_error_rad",
-                "navigation_arm_measured_max_deviation_rad": "navigation_task_peak_arm_measured_deviation_rad",
-                "navigation_arm_max_velocity_rps": "navigation_task_peak_arm_velocity_rps",
-                "navigation_arm_max_estimated_torque_nm": "navigation_task_peak_arm_estimated_torque_nm",
-                "lower_body_target_max_error_rad": "navigation_task_peak_lower_body_target_max_error_rad",
-                "lower_body_target_rms_error_rad": "navigation_task_peak_lower_body_target_rms_error_rad",
-            }
-            for source, peak in peak_sources.items():
-                if not self._value.navigation_task_active:
-                    break
-                if source not in changes:
-                    continue
-                setattr(
-                    self._value,
-                    peak,
-                    max(getattr(self._value, peak), changes[source]),
-                )
-            self._value.updated_at = time.time()
+            self._apply(changes)
             return TelemetryState(**self._value.json())
+
+    def update_hot(self, **changes: Any) -> None:
+        """Update without cloning the full state for a callback-rate writer.
+
+        The LowState DDS callback is the only production caller.  Readers still
+        receive isolated snapshots through :meth:`get` or
+        :meth:`snapshot_json`, while ordinary ``update`` keeps its historical
+        return value for compatibility.
+        """
+
+        with self._lock:
+            self._apply(changes)
+
+    def set_runtime_diagnostics_provider(
+        self,
+        provider: Callable[[], Mapping[str, Any]] | None,
+    ) -> None:
+        """Attach a read-only diagnostics snapshot to HTTP telemetry."""
+
+        if provider is not None and not callable(provider):
+            raise TypeError("runtime diagnostics provider must be callable")
+        with self._lock:
+            self._runtime_diagnostics_provider = provider
+
+    def snapshot_json(self) -> dict[str, Any]:
+        """Return one isolated JSON snapshot, including optional timing data."""
+
+        with self._lock:
+            state = self._value.json()
+            provider = self._runtime_diagnostics_provider
+        if provider is None:
+            return state
+        try:
+            state["runtime_diagnostics"] = dict(provider())
+        except Exception as exc:
+            # Diagnostics must never turn the health surface into a process
+            # failure; preserve a bounded, explicit indication instead.
+            state["runtime_diagnostics"] = {
+                "snapshot_error": f"{type(exc).__name__}: {exc}"[:256]
+            }
+        return state
 
     def reset_navigation_task_peaks(self) -> TelemetryState:
         """Start a fresh per-goal diagnostic window without changing control."""
@@ -314,7 +364,7 @@ def serve_telemetry(
             if self.path not in {"/healthz", "/telemetry"}:
                 self.send_error(404)
                 return
-            state = store.get().json()
+            state = store.snapshot_json()
             body = json.dumps(state, ensure_ascii=False).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")

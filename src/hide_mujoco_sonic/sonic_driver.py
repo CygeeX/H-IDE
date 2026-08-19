@@ -32,6 +32,7 @@ from .planner_evidence import (
     PlannerReferenceDeadlineExceeded,
     PlannerReferenceEvidenceGate,
 )
+from .runtime_diagnostics import SonicRuntimeDiagnostics
 from .safety import (
     CmdVelGuard,
     NavigationArmGuard,
@@ -290,9 +291,15 @@ class SonicIntentIngress:
 class SonicDriver:
     _STARTUP_QUALIFICATION_STEPS = 5
 
-    def __init__(self, config: SimConfig, telemetry: TelemetryStore):
+    def __init__(
+        self,
+        config: SimConfig,
+        telemetry: TelemetryStore,
+        runtime_diagnostics: SonicRuntimeDiagnostics | None = None,
+    ):
         self.config = config
         self.telemetry = telemetry
+        self._runtime_diagnostics = runtime_diagnostics
         self._driver_boot_id = uuid4()
         self.guard = CmdVelGuard(
             max_linear_mps=config.max_linear_mps,
@@ -430,6 +437,9 @@ class SonicDriver:
             return
         clock_fault: str | None = None
         received_at_wall_s = self._wall_clock()
+        runtime_diagnostics = getattr(self, "_runtime_diagnostics", None)
+        if runtime_diagnostics is not None:
+            runtime_diagnostics.observe_lowstate(received_at_wall_s)
         with self._control_condition:
             self._lowstate = message
             self._last_lowstate_wall_s = received_at_wall_s
@@ -478,7 +488,7 @@ class SonicDriver:
                                 self._startup_qualification_drop_generation,
                             )
                             self._control_condition.notify_all()
-        self.telemetry.update(
+        self.telemetry.update_hot(
             plant_tick=tick,
             startup_qualification_dropped_samples=(
                 self._startup_qualification_dropped_samples
@@ -679,6 +689,21 @@ class SonicDriver:
             raise RuntimeError("MuJoCo idle support is unavailable during SONIC warm-up")
         self._publish_measured_hold(lowstate)
         self._warm_controller_inference(lowstate)
+        runtime_diagnostics = getattr(self, "_runtime_diagnostics", None)
+        if runtime_diagnostics is not None:
+            runtime_diagnostics.freeze_warm_runtime()
+            gc_state = runtime_diagnostics.snapshot()
+            if gc_state["python_gc_freeze_applied"]:
+                logger.info(
+                    "SONIC warm runtime frozen after collecting %d objects; "
+                    "automatic GC remains enabled",
+                    gc_state["python_gc_warmup_collected_objects"],
+                )
+            else:
+                logger.warning(
+                    "SONIC warm-runtime GC optimization was not applied: %s",
+                    gc_state["python_gc_freeze_error"],
+                )
         if self._fault_latched.is_set():
             raise RuntimeError(self._terminal_fault_reason or "startup fault latched")
 
@@ -843,6 +868,9 @@ class SonicDriver:
         published_at = self._wall_clock()
         with self._control_condition:
             self._last_control_step_wall_s = published_at
+        runtime_diagnostics = getattr(self, "_runtime_diagnostics", None)
+        if runtime_diagnostics is not None:
+            runtime_diagnostics.observe_control_publish(published_at)
 
     def _publish_measured_hold(self, lowstate) -> None:
         self._publish_position_hold(
@@ -1737,6 +1765,9 @@ class SonicDriver:
                     if last_control_step_at is None
                     else max(0.0, checked_at - last_control_step_at)
                 )
+            runtime_diagnostics = getattr(self, "_runtime_diagnostics", None)
+            if runtime_diagnostics is not None:
+                runtime_diagnostics.observe_health_probe(checked_at)
             # The command server serializes intents, stops, control.arm and
             # probes. This support lock therefore produces one authoritative
             # driver snapshot without reading the eventually-consistent HTTP
@@ -2033,11 +2064,34 @@ def run_driver(config: SimConfig) -> None:
         config.telemetry_port,
         docker_observation_host=config.docker_observation_bind_host,
     )
-    driver = SonicDriver(config, telemetry)
+    runtime_diagnostics = SonicRuntimeDiagnostics(
+        stall_threshold_s=min(
+            config.plant_lowstate_stale_s,
+            config.sonic_control_step_stale_s,
+        )
+    )
+    telemetry.set_runtime_diagnostics_provider(runtime_diagnostics.snapshot)
+    try:
+        driver = SonicDriver(
+            config,
+            telemetry,
+            runtime_diagnostics=runtime_diagnostics,
+        )
+    except Exception:
+        runtime_diagnostics.close()
+        raise
 
     # A tiny localhost TCP command server.  ROS bridge is the only intended
     # client; it sends one JSON object per line and never receives actuator data.
-    server = _bind_command_server(config.command_bind_host, config.command_port)
+    try:
+        server = _bind_command_server(
+            config.command_bind_host,
+            config.command_port,
+        )
+    except Exception:
+        driver.stop()
+        runtime_diagnostics.close()
+        raise
     command_server_stop = threading.Event()
 
     def accept_loop():
@@ -2074,6 +2128,7 @@ def run_driver(config: SimConfig) -> None:
         driver.stop()
         command_server_stop.set()
         server.close()
+        runtime_diagnostics.close()
 
 
 def main(argv=None):
