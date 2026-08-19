@@ -1,0 +1,75 @@
+{
+  "bundles": {
+    "mjcf_include": {
+      "path": "generated/mujoco/office_v2.include.xml",
+      "sha256": "e02cad2da68bca4358fac9e0ca954a5045638a2b185e286c4955abd989e031eb"
+    },
+    "mjcf_preview": {
+      "path": "generated/mujoco/office_v2.preview.xml",
+      "sha256": "e7634ab9931a1b26d70c823b582c0bd15f41f8557f33f7b1982f9d32412abced"
+    },
+    "nav2_pgm": {
+      "path": "generated/nav2/office_v2.pgm",
+      "sha256": "47b2ddd54d9f0aa2a220d5b79afcee367cbaa7a57068e4809189f24ab207360d"
+    },
+    "nav2_yaml": {
+      "path": "generated/nav2/office_v2.yaml",
+      "sha256": "846529ec704635c43328bdc432b5e28145b5ca02ccfd67937c53247a4285cea9"
+    }
+  },
+  "contains_semantic_ground_truth": false,
+  "counts": {
+    "collision_geoms": 39,
+    "fixtures": 32,
+    "structures": 16,
+    "visual_geoms": 155
+  },
+  "generator_version": "office-v2-generator/1",
+  "render_assets": [
+    {
+      "path": "generated/mujoco/textures/tex_01.png",
+      "sha256": "bcd3025e9b33a32db4ffb3c3e15ec4684f0053c215e3ac9b155290914f01062d"
+    },
+    {
+      "path": "generated/mujoco/textures/tex_02.png",
+      "sha256": "a0e9402be6d6cf7c0a8e668917ccc8f39a8549928be4f0cdeb2c9983e61e9efc"
+    },
+    {
+      "path": "generated/mujoco/textures/tex_03.png",
+      "sha256": "77f6b1ec4077f3f7ebb7cb94d995c10be843c473323fbee67d59f8d7084a8c91"
+    },
+    {
+      "path": "generated/mujoco/textures/tex_04.png",
+      "sha256": "cc29905bfc685c8bf7e6d1714b822075c61a841976e14510a85201a1fdad91dc"
+    },
+    {
+      "path": "generated/mujoco/textures/tex_05.png",
+      "sha256": "27cc4c2c9f75881f2a779760caa4cf88a4e8b3e7a5c562ee569b04a8cdbb38d0"
+    },
+    {
+      "path": "generated/mujoco/textures/tex_06.png",
+      "sha256": "98eb4aaee92f1d058ad3635047b238b0babdfbe7335d1e58d28341d0be57be19"
+    },
+    {
+      "path": "generated/mujoco/textures/tex_07.png",
+      "sha256": "2b1c301e894b47835c5c7d89748c375fdf5f53cff3391d1f8688d2b89f748172"
+    },
+    {
+      "path": "generated/mujoco/textures/tex_08.png",
+      "sha256": "70d955589546de91208573f380ce36956af81ee4a15ccddf8206c75ee9f092e2"
+    }
+  ],
+  "runtime_boundary": {
+    "allowed": [
+      "generated/mujoco/office_v2.include.xml",
+      "generated/mujoco/textures/*.png",
+      "generated/nav2/office_v2.yaml",
+      "generated/nav2/office_v2.pgm",
+      "generated/visual_manifest.json"
+    ],
+    "evaluation_manifest_must_not_be_mounted": true
+  },
+  "scene_id": "office_v2",
+  "scene_source_sha256": "65d5c2a209f1f99f9a3f9236694560b7ceed601de0f556bbeceddae525602a2a",
+  "schema_version": "h-ide.office-v2-visual/1"
+}

@@ -1,0 +1,2514 @@
+{
+  "access": "OFFLINE_EVALUATOR_ONLY_DO_NOT_MOUNT_IN_PRODUCT",
+  "nav2_collision_geometry": [
+    {
+      "center": [
+        0.0,
+        5.94
+      ],
+      "shape": "box",
+      "size": [
+        16.0,
+        0.12
+      ],
+      "source_id": "boundary_north",
+      "yaw": 0.0
+    },
+    {
+      "center": [
+        0.0,
+        -5.94
+      ],
+      "shape": "box",
+      "size": [
+        16.0,
+        0.12
+      ],
+      "source_id": "boundary_south",
+      "yaw": 0.0
+    },
+    {
+      "center": [
+        -7.94,
+        0.0
+      ],
+      "shape": "box",
+      "size": [
+        0.12,
+        12.0
+      ],
+      "source_id": "boundary_west",
+      "yaw": 0.0
+    },
+    {
+      "center": [
+        7.94,
+        0.0
+      ],
+      "shape": "box",
+      "size": [
+        0.12,
+        12.0
+      ],
+      "source_id": "boundary_east",
+      "yaw": 0.0
+    },
+    {
+      "center": [
+        -6.47,
+        1.35
+      ],
+      "shape": "box",
+      "size": [
+        2.94,
+        0.12
+      ],
+      "source_id": "north_corridor_01",
+      "yaw": 0.0
+    },
+    {
+      "center": [
+        -2.55,
+        1.35
+      ],
+      "shape": "box",
+      "size": [
+        2.1,
+        0.12
+      ],
+      "source_id": "north_corridor_02",
+      "yaw": 0.0
+    },
+    {
+      "center": [
+        1.8,
+        1.35
+      ],
+      "shape": "box",
+      "size": [
+        3.8,
+        0.12
+      ],
+      "source_id": "north_corridor_03",
+      "yaw": 0.0
+    },
+    {
+      "center": [
+        6.52,
+        1.35
+      ],
+      "shape": "box",
+      "size": [
+        2.84,
+        0.12
+      ],
+      "source_id": "north_corridor_04",
+      "yaw": 0.0
+    },
+    {
+      "center": [
+        -1.2,
+        3.645
+      ],
+      "shape": "box",
+      "size": [
+        0.12,
+        4.59
+      ],
+      "source_id": "north_room_divider_west",
+      "yaw": 0.0
+    },
+    {
+      "center": [
+        3.1,
+        3.645
+      ],
+      "shape": "box",
+      "size": [
+        0.12,
+        4.59
+      ],
+      "source_id": "north_room_divider_east",
+      "yaw": 0.0
+    },
+    {
+      "center": [
+        -6.87,
+        -1.35
+      ],
+      "shape": "box",
+      "size": [
+        2.14,
+        0.12
+      ],
+      "source_id": "south_corridor_01",
+      "yaw": 0.0
+    },
+    {
+      "center": [
+        -1.95,
+        -1.35
+      ],
+      "shape": "box",
+      "size": [
+        4.9,
+        0.12
+      ],
+      "source_id": "south_corridor_02",
+      "yaw": 0.0
+    },
+    {
+      "center": [
+        3.2,
+        -1.35
+      ],
+      "shape": "box",
+      "size": [
+        2.6,
+        0.12
+      ],
+      "source_id": "south_corridor_03",
+      "yaw": 0.0
+    },
+    {
+      "center": [
+        6.92,
+        -1.35
+      ],
+      "shape": "box",
+      "size": [
+        2.04,
+        0.12
+      ],
+      "source_id": "south_corridor_04",
+      "yaw": 0.0
+    },
+    {
+      "center": [
+        -2.4,
+        -3.645
+      ],
+      "shape": "box",
+      "size": [
+        0.12,
+        4.59
+      ],
+      "source_id": "south_room_divider_west",
+      "yaw": 0.0
+    },
+    {
+      "center": [
+        3.4,
+        -3.645
+      ],
+      "shape": "box",
+      "size": [
+        0.12,
+        4.59
+      ],
+      "source_id": "south_room_divider_east",
+      "yaw": 0.0
+    },
+    {
+      "center": [
+        0.0,
+        0.0
+      ],
+      "radius": 0.29,
+      "shape": "circle",
+      "source_id": "corridor_column"
+    },
+    {
+      "center": [
+        0.7,
+        3.72
+      ],
+      "shape": "box",
+      "size": [
+        2.7,
+        1.12
+      ],
+      "source_id": "meeting_table",
+      "yaw": 0.0
+    },
+    {
+      "center": [
+        -0.2,
+        4.55
+      ],
+      "radius": 0.3,
+      "shape": "circle",
+      "source_id": "meeting_chair_north_01"
+    },
+    {
+      "center": [
+        1.6,
+        4.55
+      ],
+      "radius": 0.3,
+      "shape": "circle",
+      "source_id": "meeting_chair_north_02"
+    },
+    {
+      "center": [
+        -0.2,
+        2.87
+      ],
+      "radius": 0.3,
+      "shape": "circle",
+      "source_id": "meeting_chair_south_01"
+    },
+    {
+      "center": [
+        1.6,
+        2.87
+      ],
+      "radius": 0.3,
+      "shape": "circle",
+      "source_id": "meeting_chair_south_02"
+    },
+    {
+      "center": [
+        5.48,
+        5.42
+      ],
+      "shape": "box",
+      "size": [
+        4.15,
+        0.72
+      ],
+      "source_id": "pantry_counter",
+      "yaw": 0.0
+    },
+    {
+      "center": [
+        3.62,
+        4.3
+      ],
+      "shape": "box",
+      "size": [
+        0.58,
+        0.58
+      ],
+      "source_id": "water_dispenser",
+      "yaw": 0.0
+    },
+    {
+      "center": [
+        7.28,
+        4.5
+      ],
+      "shape": "box",
+      "size": [
+        0.74,
+        0.72
+      ],
+      "source_id": "pantry_fridge",
+      "yaw": 0.0
+    },
+    {
+      "center": [
+        -5.75,
+        4.65
+      ],
+      "shape": "box",
+      "size": [
+        1.55,
+        0.72
+      ],
+      "source_id": "open_office_desk_01",
+      "yaw": 0.0
+    },
+    {
+      "center": [
+        -3.25,
+        4.65
+      ],
+      "shape": "box",
+      "size": [
+        1.55,
+        0.72
+      ],
+      "source_id": "open_office_desk_02",
+      "yaw": 0.0
+    },
+    {
+      "center": [
+        -5.75,
+        3.75
+      ],
+      "radius": 0.31,
+      "shape": "circle",
+      "source_id": "open_office_chair_01"
+    },
+    {
+      "center": [
+        -3.25,
+        3.75
+      ],
+      "radius": 0.31,
+      "shape": "circle",
+      "source_id": "open_office_chair_02"
+    },
+    {
+      "center": [
+        -7.4,
+        2.65
+      ],
+      "shape": "box",
+      "size": [
+        0.62,
+        1.7
+      ],
+      "source_id": "open_office_cabinet",
+      "yaw": 0.0
+    },
+    {
+      "center": [
+        -2.0,
+        5.25
+      ],
+      "radius": 0.3,
+      "shape": "circle",
+      "source_id": "open_office_plant"
+    },
+    {
+      "center": [
+        -4.55,
+        -3.05
+      ],
+      "shape": "box",
+      "size": [
+        2.1,
+        0.72
+      ],
+      "source_id": "reception_desk",
+      "yaw": 0.0
+    },
+    {
+      "center": [
+        -6.4,
+        -4.65
+      ],
+      "shape": "box",
+      "size": [
+        1.9,
+        0.78
+      ],
+      "source_id": "reception_sofa",
+      "yaw": 1.5708
+    },
+    {
+      "center": [
+        0.45,
+        -4.6
+      ],
+      "shape": "box",
+      "size": [
+        1.7,
+        0.76
+      ],
+      "source_id": "focus_desk",
+      "yaw": 0.0
+    },
+    {
+      "center": [
+        0.45,
+        -3.65
+      ],
+      "radius": 0.31,
+      "shape": "circle",
+      "source_id": "focus_chair"
+    },
+    {
+      "center": [
+        7.35,
+        -4.7
+      ],
+      "shape": "box",
+      "size": [
+        0.72,
+        1.8
+      ],
+      "source_id": "storage_cabinet_01",
+      "yaw": 0.0
+    },
+    {
+      "center": [
+        5.9,
+        -5.38
+      ],
+      "shape": "box",
+      "size": [
+        0.72,
+        1.5
+      ],
+      "source_id": "storage_cabinet_02",
+      "yaw": 1.5708
+    },
+    {
+      "center": [
+        6.9,
+        0.65
+      ],
+      "radius": 0.3,
+      "shape": "circle",
+      "source_id": "corridor_plant"
+    },
+    {
+      "center": [
+        -6.85,
+        -0.78
+      ],
+      "radius": 0.22,
+      "shape": "circle",
+      "source_id": "corridor_waste_bin"
+    }
+  ],
+  "objects": [
+    {
+      "collision": {
+        "height": 2.7,
+        "nav_obstacle": true,
+        "radius": 0.29,
+        "shape": "circle"
+      },
+      "dimensions": [
+        0.58,
+        0.58,
+        2.7
+      ],
+      "id": "corridor_column",
+      "mjcf": {
+        "collision_geoms": [
+          "office_fixture_001_collision_01"
+        ],
+        "mjcf_body": "office_fixture_001",
+        "source_group": "objects",
+        "source_id": "corridor_column",
+        "visual_geoms": [
+          "office_fixture_001_visual_01",
+          "office_fixture_001_visual_02"
+        ]
+      },
+      "pose": [
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "room": "corridor",
+      "semantic": {
+        "aliases": [
+          "柱子",
+          "column"
+        ],
+        "class": "structural_column",
+        "labels": [
+          "走廊立柱",
+          "corridor column"
+        ]
+      }
+    },
+    {
+      "collision": {
+        "height": 0.76,
+        "nav_obstacle": true,
+        "shape": "box",
+        "size": [
+          2.7,
+          1.12
+        ]
+      },
+      "dimensions": [
+        2.7,
+        1.12,
+        0.76
+      ],
+      "id": "meeting_table",
+      "mjcf": {
+        "collision_geoms": [
+          "office_fixture_002_collision_01"
+        ],
+        "mjcf_body": "office_fixture_002",
+        "source_group": "objects",
+        "source_id": "meeting_table",
+        "visual_geoms": [
+          "office_fixture_002_visual_01",
+          "office_fixture_002_visual_02",
+          "office_fixture_002_visual_03",
+          "office_fixture_002_visual_04",
+          "office_fixture_002_visual_05",
+          "office_fixture_002_visual_06"
+        ]
+      },
+      "pose": [
+        0.7,
+        3.72,
+        0.0,
+        0.0
+      ],
+      "room": "meeting_room",
+      "semantic": {
+        "aliases": [
+          "会议室桌子",
+          "conference table"
+        ],
+        "class": "meeting_table",
+        "labels": [
+          "会议桌",
+          "meeting table"
+        ]
+      }
+    },
+    {
+      "collision": {
+        "height": 0.88,
+        "nav_obstacle": true,
+        "radius": 0.3,
+        "shape": "circle"
+      },
+      "dimensions": [
+        0.52,
+        0.52,
+        0.88
+      ],
+      "id": "meeting_chair_north_01",
+      "mjcf": {
+        "collision_geoms": [
+          "office_fixture_003_collision_01"
+        ],
+        "mjcf_body": "office_fixture_003",
+        "source_group": "objects",
+        "source_id": "meeting_chair_north_01",
+        "visual_geoms": [
+          "office_fixture_003_visual_01",
+          "office_fixture_003_visual_02",
+          "office_fixture_003_visual_03",
+          "office_fixture_003_visual_04",
+          "office_fixture_003_visual_05"
+        ]
+      },
+      "pose": [
+        -0.2,
+        4.55,
+        0.0,
+        3.14159
+      ],
+      "room": "meeting_room",
+      "semantic": {
+        "aliases": [
+          "椅子",
+          "chair"
+        ],
+        "class": "chair",
+        "labels": [
+          "会议椅",
+          "meeting chair"
+        ]
+      }
+    },
+    {
+      "collision": {
+        "height": 0.88,
+        "nav_obstacle": true,
+        "radius": 0.3,
+        "shape": "circle"
+      },
+      "dimensions": [
+        0.52,
+        0.52,
+        0.88
+      ],
+      "id": "meeting_chair_north_02",
+      "mjcf": {
+        "collision_geoms": [
+          "office_fixture_004_collision_01"
+        ],
+        "mjcf_body": "office_fixture_004",
+        "source_group": "objects",
+        "source_id": "meeting_chair_north_02",
+        "visual_geoms": [
+          "office_fixture_004_visual_01",
+          "office_fixture_004_visual_02",
+          "office_fixture_004_visual_03",
+          "office_fixture_004_visual_04",
+          "office_fixture_004_visual_05"
+        ]
+      },
+      "pose": [
+        1.6,
+        4.55,
+        0.0,
+        3.14159
+      ],
+      "room": "meeting_room",
+      "semantic": {
+        "aliases": [
+          "椅子",
+          "chair"
+        ],
+        "class": "chair",
+        "labels": [
+          "会议椅",
+          "meeting chair"
+        ]
+      }
+    },
+    {
+      "collision": {
+        "height": 0.88,
+        "nav_obstacle": true,
+        "radius": 0.3,
+        "shape": "circle"
+      },
+      "dimensions": [
+        0.52,
+        0.52,
+        0.88
+      ],
+      "id": "meeting_chair_south_01",
+      "mjcf": {
+        "collision_geoms": [
+          "office_fixture_005_collision_01"
+        ],
+        "mjcf_body": "office_fixture_005",
+        "source_group": "objects",
+        "source_id": "meeting_chair_south_01",
+        "visual_geoms": [
+          "office_fixture_005_visual_01",
+          "office_fixture_005_visual_02",
+          "office_fixture_005_visual_03",
+          "office_fixture_005_visual_04",
+          "office_fixture_005_visual_05"
+        ]
+      },
+      "pose": [
+        -0.2,
+        2.87,
+        0.0,
+        0.0
+      ],
+      "room": "meeting_room",
+      "semantic": {
+        "aliases": [
+          "椅子",
+          "chair"
+        ],
+        "class": "chair",
+        "labels": [
+          "会议椅",
+          "meeting chair"
+        ]
+      }
+    },
+    {
+      "collision": {
+        "height": 0.88,
+        "nav_obstacle": true,
+        "radius": 0.3,
+        "shape": "circle"
+      },
+      "dimensions": [
+        0.52,
+        0.52,
+        0.88
+      ],
+      "id": "meeting_chair_south_02",
+      "mjcf": {
+        "collision_geoms": [
+          "office_fixture_006_collision_01"
+        ],
+        "mjcf_body": "office_fixture_006",
+        "source_group": "objects",
+        "source_id": "meeting_chair_south_02",
+        "visual_geoms": [
+          "office_fixture_006_visual_01",
+          "office_fixture_006_visual_02",
+          "office_fixture_006_visual_03",
+          "office_fixture_006_visual_04",
+          "office_fixture_006_visual_05"
+        ]
+      },
+      "pose": [
+        1.6,
+        2.87,
+        0.0,
+        0.0
+      ],
+      "room": "meeting_room",
+      "semantic": {
+        "aliases": [
+          "椅子",
+          "chair"
+        ],
+        "class": "chair",
+        "labels": [
+          "会议椅",
+          "meeting chair"
+        ]
+      }
+    },
+    {
+      "collision": {
+        "nav_obstacle": false,
+        "shape": "none"
+      },
+      "dimensions": [
+        1.7,
+        0.1,
+        0.95
+      ],
+      "id": "meeting_display",
+      "mjcf": {
+        "collision_geoms": [],
+        "mjcf_body": "office_fixture_007",
+        "source_group": "objects",
+        "source_id": "meeting_display",
+        "visual_geoms": [
+          "office_fixture_007_visual_01",
+          "office_fixture_007_visual_02"
+        ]
+      },
+      "pose": [
+        0.7,
+        5.78,
+        1.15,
+        0.0
+      ],
+      "room": "meeting_room",
+      "semantic": {
+        "aliases": [
+          "屏幕",
+          "display",
+          "monitor"
+        ],
+        "class": "display_screen",
+        "labels": [
+          "会议室显示屏",
+          "meeting-room display"
+        ]
+      }
+    },
+    {
+      "collision": {
+        "nav_obstacle": false,
+        "shape": "none"
+      },
+      "dimensions": [
+        0.78,
+        0.06,
+        0.24
+      ],
+      "id": "meeting_sign",
+      "mjcf": {
+        "collision_geoms": [],
+        "mjcf_body": "office_fixture_008",
+        "source_group": "objects",
+        "source_id": "meeting_sign",
+        "visual_geoms": [
+          "office_fixture_008_visual_01",
+          "office_fixture_008_visual_02"
+        ]
+      },
+      "pose": [
+        -0.78,
+        1.27,
+        1.75,
+        0.0
+      ],
+      "room": "corridor",
+      "semantic": {
+        "aliases": [
+          "MEETING"
+        ],
+        "class": "room_sign",
+        "labels": [
+          "会议室标牌",
+          "meeting sign"
+        ]
+      }
+    },
+    {
+      "collision": {
+        "nav_obstacle": false,
+        "shape": "none"
+      },
+      "dimensions": [
+        0.1,
+        0.1,
+        0.13
+      ],
+      "id": "meeting_coffee_cup",
+      "mjcf": {
+        "collision_geoms": [],
+        "mjcf_body": "office_fixture_009",
+        "source_group": "objects",
+        "source_id": "meeting_coffee_cup",
+        "visual_geoms": [
+          "office_fixture_009_visual_01",
+          "office_fixture_009_visual_02",
+          "office_fixture_009_visual_03"
+        ]
+      },
+      "pose": [
+        0.15,
+        3.62,
+        0.78,
+        0.0
+      ],
+      "room": "meeting_room",
+      "semantic": {
+        "aliases": [
+          "杯子",
+          "cup",
+          "mug"
+        ],
+        "class": "coffee_cup",
+        "labels": [
+          "咖啡杯",
+          "coffee cup"
+        ]
+      }
+    },
+    {
+      "collision": {
+        "height": 0.94,
+        "nav_obstacle": true,
+        "shape": "box",
+        "size": [
+          4.15,
+          0.72
+        ]
+      },
+      "dimensions": [
+        4.15,
+        0.72,
+        0.94
+      ],
+      "id": "pantry_counter",
+      "mjcf": {
+        "collision_geoms": [
+          "office_fixture_010_collision_01"
+        ],
+        "mjcf_body": "office_fixture_010",
+        "source_group": "objects",
+        "source_id": "pantry_counter",
+        "visual_geoms": [
+          "office_fixture_010_visual_01",
+          "office_fixture_010_visual_02",
+          "office_fixture_010_visual_03",
+          "office_fixture_010_visual_04",
+          "office_fixture_010_visual_05"
+        ]
+      },
+      "pose": [
+        5.48,
+        5.42,
+        0.0,
+        0.0
+      ],
+      "room": "pantry",
+      "semantic": {
+        "aliases": [
+          "台面",
+          "counter"
+        ],
+        "class": "pantry_counter",
+        "labels": [
+          "茶水间操作台",
+          "pantry counter"
+        ]
+      }
+    },
+    {
+      "collision": {
+        "height": 1.58,
+        "nav_obstacle": true,
+        "shape": "box",
+        "size": [
+          0.58,
+          0.58
+        ]
+      },
+      "dimensions": [
+        0.58,
+        0.58,
+        1.58
+      ],
+      "id": "water_dispenser",
+      "mjcf": {
+        "collision_geoms": [
+          "office_fixture_011_collision_01"
+        ],
+        "mjcf_body": "office_fixture_011",
+        "source_group": "objects",
+        "source_id": "water_dispenser",
+        "visual_geoms": [
+          "office_fixture_011_visual_01",
+          "office_fixture_011_visual_02",
+          "office_fixture_011_visual_03",
+          "office_fixture_011_visual_04",
+          "office_fixture_011_visual_05"
+        ]
+      },
+      "pose": [
+        3.62,
+        4.3,
+        0.0,
+        0.0
+      ],
+      "room": "pantry",
+      "semantic": {
+        "aliases": [
+          "饮水器",
+          "water cooler"
+        ],
+        "class": "water_dispenser",
+        "labels": [
+          "饮水机",
+          "water dispenser"
+        ]
+      }
+    },
+    {
+      "collision": {
+        "nav_obstacle": false,
+        "shape": "none"
+      },
+      "dimensions": [
+        0.42,
+        0.38,
+        0.48
+      ],
+      "id": "coffee_machine",
+      "mjcf": {
+        "collision_geoms": [],
+        "mjcf_body": "office_fixture_012",
+        "source_group": "objects",
+        "source_id": "coffee_machine",
+        "visual_geoms": [
+          "office_fixture_012_visual_01",
+          "office_fixture_012_visual_02",
+          "office_fixture_012_visual_03",
+          "office_fixture_012_visual_04"
+        ]
+      },
+      "pose": [
+        5.05,
+        5.1,
+        0.95,
+        0.0
+      ],
+      "room": "pantry",
+      "semantic": {
+        "aliases": [
+          "咖啡设备",
+          "espresso machine"
+        ],
+        "class": "coffee_machine",
+        "labels": [
+          "咖啡机",
+          "coffee machine"
+        ]
+      }
+    },
+    {
+      "collision": {
+        "nav_obstacle": false,
+        "shape": "none"
+      },
+      "dimensions": [
+        0.1,
+        0.1,
+        0.13
+      ],
+      "id": "pantry_cup",
+      "mjcf": {
+        "collision_geoms": [],
+        "mjcf_body": "office_fixture_013",
+        "source_group": "objects",
+        "source_id": "pantry_cup",
+        "visual_geoms": [
+          "office_fixture_013_visual_01",
+          "office_fixture_013_visual_02",
+          "office_fixture_013_visual_03"
+        ]
+      },
+      "pose": [
+        5.55,
+        5.1,
+        0.95,
+        0.0
+      ],
+      "room": "pantry",
+      "semantic": {
+        "aliases": [
+          "杯子",
+          "cup",
+          "mug"
+        ],
+        "class": "coffee_cup",
+        "labels": [
+          "白色咖啡杯",
+          "white coffee cup"
+        ]
+      }
+    },
+    {
+      "collision": {
+        "height": 1.92,
+        "nav_obstacle": true,
+        "shape": "box",
+        "size": [
+          0.74,
+          0.72
+        ]
+      },
+      "dimensions": [
+        0.74,
+        0.72,
+        1.92
+      ],
+      "id": "pantry_fridge",
+      "mjcf": {
+        "collision_geoms": [
+          "office_fixture_014_collision_01"
+        ],
+        "mjcf_body": "office_fixture_014",
+        "source_group": "objects",
+        "source_id": "pantry_fridge",
+        "visual_geoms": [
+          "office_fixture_014_visual_01",
+          "office_fixture_014_visual_02",
+          "office_fixture_014_visual_03"
+        ]
+      },
+      "pose": [
+        7.28,
+        4.5,
+        0.0,
+        0.0
+      ],
+      "room": "pantry",
+      "semantic": {
+        "aliases": [
+          "冷藏柜",
+          "fridge"
+        ],
+        "class": "refrigerator",
+        "labels": [
+          "冰箱",
+          "refrigerator"
+        ]
+      }
+    },
+    {
+      "collision": {
+        "nav_obstacle": false,
+        "shape": "none"
+      },
+      "dimensions": [
+        0.78,
+        0.06,
+        0.24
+      ],
+      "id": "pantry_sign",
+      "mjcf": {
+        "collision_geoms": [],
+        "mjcf_body": "office_fixture_015",
+        "source_group": "objects",
+        "source_id": "pantry_sign",
+        "visual_geoms": [
+          "office_fixture_015_visual_01",
+          "office_fixture_015_visual_02"
+        ]
+      },
+      "pose": [
+        4.4,
+        1.27,
+        1.75,
+        0.0
+      ],
+      "room": "corridor",
+      "semantic": {
+        "aliases": [
+          "PANTRY"
+        ],
+        "class": "room_sign",
+        "labels": [
+          "茶水间标牌",
+          "pantry sign"
+        ]
+      }
+    },
+    {
+      "collision": {
+        "height": 0.76,
+        "nav_obstacle": true,
+        "shape": "box",
+        "size": [
+          1.55,
+          0.72
+        ]
+      },
+      "dimensions": [
+        1.55,
+        0.72,
+        0.76
+      ],
+      "id": "open_office_desk_01",
+      "mjcf": {
+        "collision_geoms": [
+          "office_fixture_016_collision_01"
+        ],
+        "mjcf_body": "office_fixture_016",
+        "source_group": "objects",
+        "source_id": "open_office_desk_01",
+        "visual_geoms": [
+          "office_fixture_016_visual_01",
+          "office_fixture_016_visual_02",
+          "office_fixture_016_visual_03",
+          "office_fixture_016_visual_04",
+          "office_fixture_016_visual_05",
+          "office_fixture_016_visual_06"
+        ]
+      },
+      "pose": [
+        -5.75,
+        4.65,
+        0.0,
+        0.0
+      ],
+      "room": "open_office",
+      "semantic": {
+        "aliases": [
+          "办公桌",
+          "desk"
+        ],
+        "class": "office_desk",
+        "labels": [
+          "一号办公桌",
+          "office desk one"
+        ]
+      }
+    },
+    {
+      "collision": {
+        "height": 0.76,
+        "nav_obstacle": true,
+        "shape": "box",
+        "size": [
+          1.55,
+          0.72
+        ]
+      },
+      "dimensions": [
+        1.55,
+        0.72,
+        0.76
+      ],
+      "id": "open_office_desk_02",
+      "mjcf": {
+        "collision_geoms": [
+          "office_fixture_017_collision_01"
+        ],
+        "mjcf_body": "office_fixture_017",
+        "source_group": "objects",
+        "source_id": "open_office_desk_02",
+        "visual_geoms": [
+          "office_fixture_017_visual_01",
+          "office_fixture_017_visual_02",
+          "office_fixture_017_visual_03",
+          "office_fixture_017_visual_04",
+          "office_fixture_017_visual_05",
+          "office_fixture_017_visual_06"
+        ]
+      },
+      "pose": [
+        -3.25,
+        4.65,
+        0.0,
+        0.0
+      ],
+      "room": "open_office",
+      "semantic": {
+        "aliases": [
+          "办公桌",
+          "desk"
+        ],
+        "class": "office_desk",
+        "labels": [
+          "二号办公桌",
+          "office desk two"
+        ]
+      }
+    },
+    {
+      "collision": {
+        "height": 0.9,
+        "nav_obstacle": true,
+        "radius": 0.31,
+        "shape": "circle"
+      },
+      "dimensions": [
+        0.55,
+        0.55,
+        0.9
+      ],
+      "id": "open_office_chair_01",
+      "mjcf": {
+        "collision_geoms": [
+          "office_fixture_018_collision_01"
+        ],
+        "mjcf_body": "office_fixture_018",
+        "source_group": "objects",
+        "source_id": "open_office_chair_01",
+        "visual_geoms": [
+          "office_fixture_018_visual_01",
+          "office_fixture_018_visual_02",
+          "office_fixture_018_visual_03",
+          "office_fixture_018_visual_04",
+          "office_fixture_018_visual_05"
+        ]
+      },
+      "pose": [
+        -5.75,
+        3.75,
+        0.0,
+        0.0
+      ],
+      "room": "open_office",
+      "semantic": {
+        "aliases": [
+          "椅子",
+          "chair"
+        ],
+        "class": "office_chair",
+        "labels": [
+          "办公椅",
+          "office chair"
+        ]
+      }
+    },
+    {
+      "collision": {
+        "height": 0.9,
+        "nav_obstacle": true,
+        "radius": 0.31,
+        "shape": "circle"
+      },
+      "dimensions": [
+        0.55,
+        0.55,
+        0.9
+      ],
+      "id": "open_office_chair_02",
+      "mjcf": {
+        "collision_geoms": [
+          "office_fixture_019_collision_01"
+        ],
+        "mjcf_body": "office_fixture_019",
+        "source_group": "objects",
+        "source_id": "open_office_chair_02",
+        "visual_geoms": [
+          "office_fixture_019_visual_01",
+          "office_fixture_019_visual_02",
+          "office_fixture_019_visual_03",
+          "office_fixture_019_visual_04",
+          "office_fixture_019_visual_05"
+        ]
+      },
+      "pose": [
+        -3.25,
+        3.75,
+        0.0,
+        0.0
+      ],
+      "room": "open_office",
+      "semantic": {
+        "aliases": [
+          "椅子",
+          "chair"
+        ],
+        "class": "office_chair",
+        "labels": [
+          "办公椅",
+          "office chair"
+        ]
+      }
+    },
+    {
+      "collision": {
+        "height": 1.35,
+        "nav_obstacle": true,
+        "shape": "box",
+        "size": [
+          0.62,
+          1.7
+        ]
+      },
+      "dimensions": [
+        0.62,
+        1.7,
+        1.35
+      ],
+      "id": "open_office_cabinet",
+      "mjcf": {
+        "collision_geoms": [
+          "office_fixture_020_collision_01"
+        ],
+        "mjcf_body": "office_fixture_020",
+        "source_group": "objects",
+        "source_id": "open_office_cabinet",
+        "visual_geoms": [
+          "office_fixture_020_visual_01",
+          "office_fixture_020_visual_02",
+          "office_fixture_020_visual_03",
+          "office_fixture_020_visual_04",
+          "office_fixture_020_visual_05",
+          "office_fixture_020_visual_06"
+        ]
+      },
+      "pose": [
+        -7.4,
+        2.65,
+        0.0,
+        0.0
+      ],
+      "room": "open_office",
+      "semantic": {
+        "aliases": [
+          "柜子",
+          "cabinet"
+        ],
+        "class": "storage_cabinet",
+        "labels": [
+          "文件柜",
+          "filing cabinet"
+        ]
+      }
+    },
+    {
+      "collision": {
+        "height": 1.18,
+        "nav_obstacle": true,
+        "radius": 0.3,
+        "shape": "circle"
+      },
+      "dimensions": [
+        0.56,
+        0.56,
+        1.18
+      ],
+      "id": "open_office_plant",
+      "mjcf": {
+        "collision_geoms": [
+          "office_fixture_021_collision_01"
+        ],
+        "mjcf_body": "office_fixture_021",
+        "source_group": "objects",
+        "source_id": "open_office_plant",
+        "visual_geoms": [
+          "office_fixture_021_visual_01",
+          "office_fixture_021_visual_02",
+          "office_fixture_021_visual_03",
+          "office_fixture_021_visual_04",
+          "office_fixture_021_visual_05",
+          "office_fixture_021_visual_06",
+          "office_fixture_021_visual_07"
+        ]
+      },
+      "pose": [
+        -2.0,
+        5.25,
+        0.0,
+        0.0
+      ],
+      "room": "open_office",
+      "semantic": {
+        "aliases": [
+          "植物",
+          "plant"
+        ],
+        "class": "potted_plant",
+        "labels": [
+          "绿植",
+          "potted plant"
+        ]
+      }
+    },
+    {
+      "collision": {
+        "nav_obstacle": false,
+        "shape": "none"
+      },
+      "dimensions": [
+        0.98,
+        0.06,
+        0.24
+      ],
+      "id": "open_office_sign",
+      "mjcf": {
+        "collision_geoms": [],
+        "mjcf_body": "office_fixture_022",
+        "source_group": "objects",
+        "source_id": "open_office_sign",
+        "visual_geoms": [
+          "office_fixture_022_visual_01",
+          "office_fixture_022_visual_02"
+        ]
+      },
+      "pose": [
+        -4.3,
+        1.27,
+        1.75,
+        0.0
+      ],
+      "room": "corridor",
+      "semantic": {
+        "aliases": [
+          "OPEN OFFICE"
+        ],
+        "class": "room_sign",
+        "labels": [
+          "开放办公区标牌",
+          "open-office sign"
+        ]
+      }
+    },
+    {
+      "collision": {
+        "height": 1.05,
+        "nav_obstacle": true,
+        "shape": "box",
+        "size": [
+          2.1,
+          0.72
+        ]
+      },
+      "dimensions": [
+        2.1,
+        0.72,
+        1.05
+      ],
+      "id": "reception_desk",
+      "mjcf": {
+        "collision_geoms": [
+          "office_fixture_023_collision_01"
+        ],
+        "mjcf_body": "office_fixture_023",
+        "source_group": "objects",
+        "source_id": "reception_desk",
+        "visual_geoms": [
+          "office_fixture_023_visual_01",
+          "office_fixture_023_visual_02",
+          "office_fixture_023_visual_03"
+        ]
+      },
+      "pose": [
+        -4.55,
+        -3.05,
+        0.0,
+        0.0
+      ],
+      "room": "reception",
+      "semantic": {
+        "aliases": [
+          "接待台",
+          "reception"
+        ],
+        "class": "reception_desk",
+        "labels": [
+          "前台",
+          "reception desk"
+        ]
+      }
+    },
+    {
+      "collision": {
+        "height": 0.86,
+        "nav_obstacle": true,
+        "shape": "box",
+        "size": [
+          1.9,
+          0.78
+        ]
+      },
+      "dimensions": [
+        1.9,
+        0.78,
+        0.86
+      ],
+      "id": "reception_sofa",
+      "mjcf": {
+        "collision_geoms": [
+          "office_fixture_024_collision_01"
+        ],
+        "mjcf_body": "office_fixture_024",
+        "source_group": "objects",
+        "source_id": "reception_sofa",
+        "visual_geoms": [
+          "office_fixture_024_visual_01",
+          "office_fixture_024_visual_02",
+          "office_fixture_024_visual_03",
+          "office_fixture_024_visual_04",
+          "office_fixture_024_visual_05"
+        ]
+      },
+      "pose": [
+        -6.4,
+        -4.65,
+        0.0,
+        1.5708
+      ],
+      "room": "reception",
+      "semantic": {
+        "aliases": [
+          "沙发",
+          "couch"
+        ],
+        "class": "sofa",
+        "labels": [
+          "接待沙发",
+          "reception sofa"
+        ]
+      }
+    },
+    {
+      "collision": {
+        "nav_obstacle": false,
+        "shape": "none"
+      },
+      "dimensions": [
+        0.98,
+        0.06,
+        0.24
+      ],
+      "id": "reception_sign",
+      "mjcf": {
+        "collision_geoms": [],
+        "mjcf_body": "office_fixture_025",
+        "source_group": "objects",
+        "source_id": "reception_sign",
+        "visual_geoms": [
+          "office_fixture_025_visual_01",
+          "office_fixture_025_visual_02"
+        ]
+      },
+      "pose": [
+        -5.1,
+        -1.27,
+        1.75,
+        3.14159
+      ],
+      "room": "corridor",
+      "semantic": {
+        "aliases": [
+          "RECEPTION"
+        ],
+        "class": "room_sign",
+        "labels": [
+          "前台标牌",
+          "reception sign"
+        ]
+      }
+    },
+    {
+      "collision": {
+        "height": 0.76,
+        "nav_obstacle": true,
+        "shape": "box",
+        "size": [
+          1.7,
+          0.76
+        ]
+      },
+      "dimensions": [
+        1.7,
+        0.76,
+        0.76
+      ],
+      "id": "focus_desk",
+      "mjcf": {
+        "collision_geoms": [
+          "office_fixture_026_collision_01"
+        ],
+        "mjcf_body": "office_fixture_026",
+        "source_group": "objects",
+        "source_id": "focus_desk",
+        "visual_geoms": [
+          "office_fixture_026_visual_01",
+          "office_fixture_026_visual_02",
+          "office_fixture_026_visual_03",
+          "office_fixture_026_visual_04",
+          "office_fixture_026_visual_05",
+          "office_fixture_026_visual_06"
+        ]
+      },
+      "pose": [
+        0.45,
+        -4.6,
+        0.0,
+        0.0
+      ],
+      "room": "focus_office",
+      "semantic": {
+        "aliases": [
+          "办公桌",
+          "desk"
+        ],
+        "class": "office_desk",
+        "labels": [
+          "独立办公室桌子",
+          "focus-office desk"
+        ]
+      }
+    },
+    {
+      "collision": {
+        "height": 0.9,
+        "nav_obstacle": true,
+        "radius": 0.31,
+        "shape": "circle"
+      },
+      "dimensions": [
+        0.55,
+        0.55,
+        0.9
+      ],
+      "id": "focus_chair",
+      "mjcf": {
+        "collision_geoms": [
+          "office_fixture_027_collision_01"
+        ],
+        "mjcf_body": "office_fixture_027",
+        "source_group": "objects",
+        "source_id": "focus_chair",
+        "visual_geoms": [
+          "office_fixture_027_visual_01",
+          "office_fixture_027_visual_02",
+          "office_fixture_027_visual_03",
+          "office_fixture_027_visual_04",
+          "office_fixture_027_visual_05"
+        ]
+      },
+      "pose": [
+        0.45,
+        -3.65,
+        0.0,
+        0.0
+      ],
+      "room": "focus_office",
+      "semantic": {
+        "aliases": [
+          "椅子",
+          "chair"
+        ],
+        "class": "office_chair",
+        "labels": [
+          "独立办公室椅子",
+          "focus-office chair"
+        ]
+      }
+    },
+    {
+      "collision": {
+        "nav_obstacle": false,
+        "shape": "none"
+      },
+      "dimensions": [
+        1.4,
+        0.08,
+        0.9
+      ],
+      "id": "focus_whiteboard",
+      "mjcf": {
+        "collision_geoms": [],
+        "mjcf_body": "office_fixture_028",
+        "source_group": "objects",
+        "source_id": "focus_whiteboard",
+        "visual_geoms": [
+          "office_fixture_028_visual_01",
+          "office_fixture_028_visual_02",
+          "office_fixture_028_visual_03"
+        ]
+      },
+      "pose": [
+        2.95,
+        -4.2,
+        1.1,
+        1.5708
+      ],
+      "room": "focus_office",
+      "semantic": {
+        "aliases": [
+          "写字板",
+          "board"
+        ],
+        "class": "whiteboard",
+        "labels": [
+          "白板",
+          "whiteboard"
+        ]
+      }
+    },
+    {
+      "collision": {
+        "height": 1.82,
+        "nav_obstacle": true,
+        "shape": "box",
+        "size": [
+          0.72,
+          1.8
+        ]
+      },
+      "dimensions": [
+        0.72,
+        1.8,
+        1.82
+      ],
+      "id": "storage_cabinet_01",
+      "mjcf": {
+        "collision_geoms": [
+          "office_fixture_029_collision_01"
+        ],
+        "mjcf_body": "office_fixture_029",
+        "source_group": "objects",
+        "source_id": "storage_cabinet_01",
+        "visual_geoms": [
+          "office_fixture_029_visual_01",
+          "office_fixture_029_visual_02",
+          "office_fixture_029_visual_03",
+          "office_fixture_029_visual_04",
+          "office_fixture_029_visual_05",
+          "office_fixture_029_visual_06"
+        ]
+      },
+      "pose": [
+        7.35,
+        -4.7,
+        0.0,
+        0.0
+      ],
+      "room": "storage",
+      "semantic": {
+        "aliases": [
+          "柜子",
+          "cabinet"
+        ],
+        "class": "storage_cabinet",
+        "labels": [
+          "储物柜",
+          "storage cabinet"
+        ]
+      }
+    },
+    {
+      "collision": {
+        "height": 1.82,
+        "nav_obstacle": true,
+        "shape": "box",
+        "size": [
+          0.72,
+          1.5
+        ]
+      },
+      "dimensions": [
+        0.72,
+        1.5,
+        1.82
+      ],
+      "id": "storage_cabinet_02",
+      "mjcf": {
+        "collision_geoms": [
+          "office_fixture_030_collision_01"
+        ],
+        "mjcf_body": "office_fixture_030",
+        "source_group": "objects",
+        "source_id": "storage_cabinet_02",
+        "visual_geoms": [
+          "office_fixture_030_visual_01",
+          "office_fixture_030_visual_02",
+          "office_fixture_030_visual_03",
+          "office_fixture_030_visual_04",
+          "office_fixture_030_visual_05",
+          "office_fixture_030_visual_06"
+        ]
+      },
+      "pose": [
+        5.9,
+        -5.38,
+        0.0,
+        1.5708
+      ],
+      "room": "storage",
+      "semantic": {
+        "aliases": [
+          "柜子",
+          "cabinet"
+        ],
+        "class": "storage_cabinet",
+        "labels": [
+          "工具柜",
+          "utility cabinet"
+        ]
+      }
+    },
+    {
+      "collision": {
+        "height": 1.18,
+        "nav_obstacle": true,
+        "radius": 0.3,
+        "shape": "circle"
+      },
+      "dimensions": [
+        0.56,
+        0.56,
+        1.18
+      ],
+      "id": "corridor_plant",
+      "mjcf": {
+        "collision_geoms": [
+          "office_fixture_031_collision_01"
+        ],
+        "mjcf_body": "office_fixture_031",
+        "source_group": "objects",
+        "source_id": "corridor_plant",
+        "visual_geoms": [
+          "office_fixture_031_visual_01",
+          "office_fixture_031_visual_02",
+          "office_fixture_031_visual_03",
+          "office_fixture_031_visual_04",
+          "office_fixture_031_visual_05",
+          "office_fixture_031_visual_06",
+          "office_fixture_031_visual_07"
+        ]
+      },
+      "pose": [
+        6.9,
+        0.65,
+        0.0,
+        0.0
+      ],
+      "room": "corridor",
+      "semantic": {
+        "aliases": [
+          "植物",
+          "plant"
+        ],
+        "class": "potted_plant",
+        "labels": [
+          "走廊绿植",
+          "corridor plant"
+        ]
+      }
+    },
+    {
+      "collision": {
+        "height": 0.62,
+        "nav_obstacle": true,
+        "radius": 0.22,
+        "shape": "circle"
+      },
+      "dimensions": [
+        0.38,
+        0.38,
+        0.62
+      ],
+      "id": "corridor_waste_bin",
+      "mjcf": {
+        "collision_geoms": [
+          "office_fixture_032_collision_01"
+        ],
+        "mjcf_body": "office_fixture_032",
+        "source_group": "objects",
+        "source_id": "corridor_waste_bin",
+        "visual_geoms": [
+          "office_fixture_032_visual_01",
+          "office_fixture_032_visual_02"
+        ]
+      },
+      "pose": [
+        -6.85,
+        -0.78,
+        0.0,
+        0.0
+      ],
+      "room": "corridor",
+      "semantic": {
+        "aliases": [
+          "垃圾箱",
+          "bin"
+        ],
+        "class": "waste_bin",
+        "labels": [
+          "垃圾桶",
+          "waste bin"
+        ]
+      }
+    }
+  ],
+  "scene_id": "office_v2",
+  "scene_source_sha256": "65d5c2a209f1f99f9a3f9236694560b7ceed601de0f556bbeceddae525602a2a",
+  "schema_version": "h-ide.office-v2-evaluation/1",
+  "semantic_tests": [
+    {
+      "acceptable_target_ids": [
+        "target_meeting_table_front"
+      ],
+      "expected_object_ids": [
+        "meeting_table"
+      ],
+      "id": "vlm_find_meeting_table",
+      "prompt": "找到会议桌，并给出适合机器人停靠的桌前目标点。"
+    },
+    {
+      "acceptable_target_ids": [
+        "target_water_dispenser"
+      ],
+      "expected_object_ids": [
+        "water_dispenser"
+      ],
+      "id": "vlm_find_water_dispenser",
+      "prompt": "沿走廊寻找饮水机，停在饮水机前。"
+    },
+    {
+      "acceptable_target_ids": [
+        "target_coffee_machine"
+      ],
+      "expected_object_ids": [
+        "coffee_machine",
+        "pantry_sign"
+      ],
+      "id": "vlm_find_coffee_machine",
+      "prompt": "去茶水间的咖啡机旁边。"
+    },
+    {
+      "acceptable_target_ids": [
+        "target_reception"
+      ],
+      "expected_object_ids": [
+        "reception_desk",
+        "reception_sign"
+      ],
+      "id": "vlm_find_reception",
+      "prompt": "找到前台并停在接待人员一侧。"
+    },
+    {
+      "acceptable_target_ids": [
+        "target_corridor_east"
+      ],
+      "expected_object_ids": [
+        "corridor_column"
+      ],
+      "id": "nav_avoid_corridor_column",
+      "prompt": "从西侧起点前往走廊东端，避开固定立柱。"
+    }
+  ],
+  "spawns": [
+    {
+      "clearance_radius": 0.55,
+      "id": "robot_spawn_west",
+      "pose": [
+        -6.45,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "clearance_radius": 0.55,
+      "id": "robot_spawn_east",
+      "pose": [
+        6.1,
+        -0.35,
+        3.14159
+      ]
+    }
+  ],
+  "structures": [
+    {
+      "dimensions": [
+        16.0,
+        0.12,
+        2.7
+      ],
+      "id": "boundary_north",
+      "mjcf": {
+        "collision_geoms": [
+          "office_structure_001_collision_01"
+        ],
+        "mjcf_body": "office_structure_001",
+        "source_group": "structures",
+        "source_id": "boundary_north",
+        "visual_geoms": [
+          "office_structure_001_visual_01"
+        ]
+      },
+      "pose": [
+        0.0,
+        5.94,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "dimensions": [
+        16.0,
+        0.12,
+        2.7
+      ],
+      "id": "boundary_south",
+      "mjcf": {
+        "collision_geoms": [
+          "office_structure_002_collision_01"
+        ],
+        "mjcf_body": "office_structure_002",
+        "source_group": "structures",
+        "source_id": "boundary_south",
+        "visual_geoms": [
+          "office_structure_002_visual_01"
+        ]
+      },
+      "pose": [
+        0.0,
+        -5.94,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "dimensions": [
+        0.12,
+        12.0,
+        2.7
+      ],
+      "id": "boundary_west",
+      "mjcf": {
+        "collision_geoms": [
+          "office_structure_003_collision_01"
+        ],
+        "mjcf_body": "office_structure_003",
+        "source_group": "structures",
+        "source_id": "boundary_west",
+        "visual_geoms": [
+          "office_structure_003_visual_01"
+        ]
+      },
+      "pose": [
+        -7.94,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "dimensions": [
+        0.12,
+        12.0,
+        2.7
+      ],
+      "id": "boundary_east",
+      "mjcf": {
+        "collision_geoms": [
+          "office_structure_004_collision_01"
+        ],
+        "mjcf_body": "office_structure_004",
+        "source_group": "structures",
+        "source_id": "boundary_east",
+        "visual_geoms": [
+          "office_structure_004_visual_01"
+        ]
+      },
+      "pose": [
+        7.94,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "dimensions": [
+        2.94,
+        0.12,
+        2.7
+      ],
+      "id": "north_corridor_01",
+      "mjcf": {
+        "collision_geoms": [
+          "office_structure_005_collision_01"
+        ],
+        "mjcf_body": "office_structure_005",
+        "source_group": "structures",
+        "source_id": "north_corridor_01",
+        "visual_geoms": [
+          "office_structure_005_visual_01"
+        ]
+      },
+      "pose": [
+        -6.47,
+        1.35,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "dimensions": [
+        2.1,
+        0.12,
+        2.7
+      ],
+      "id": "north_corridor_02",
+      "mjcf": {
+        "collision_geoms": [
+          "office_structure_006_collision_01"
+        ],
+        "mjcf_body": "office_structure_006",
+        "source_group": "structures",
+        "source_id": "north_corridor_02",
+        "visual_geoms": [
+          "office_structure_006_visual_01"
+        ]
+      },
+      "pose": [
+        -2.55,
+        1.35,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "dimensions": [
+        3.8,
+        0.12,
+        2.7
+      ],
+      "id": "north_corridor_03",
+      "mjcf": {
+        "collision_geoms": [
+          "office_structure_007_collision_01"
+        ],
+        "mjcf_body": "office_structure_007",
+        "source_group": "structures",
+        "source_id": "north_corridor_03",
+        "visual_geoms": [
+          "office_structure_007_visual_01"
+        ]
+      },
+      "pose": [
+        1.8,
+        1.35,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "dimensions": [
+        2.84,
+        0.12,
+        2.7
+      ],
+      "id": "north_corridor_04",
+      "mjcf": {
+        "collision_geoms": [
+          "office_structure_008_collision_01"
+        ],
+        "mjcf_body": "office_structure_008",
+        "source_group": "structures",
+        "source_id": "north_corridor_04",
+        "visual_geoms": [
+          "office_structure_008_visual_01"
+        ]
+      },
+      "pose": [
+        6.52,
+        1.35,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "dimensions": [
+        0.12,
+        4.59,
+        2.7
+      ],
+      "id": "north_room_divider_west",
+      "mjcf": {
+        "collision_geoms": [
+          "office_structure_009_collision_01"
+        ],
+        "mjcf_body": "office_structure_009",
+        "source_group": "structures",
+        "source_id": "north_room_divider_west",
+        "visual_geoms": [
+          "office_structure_009_visual_01"
+        ]
+      },
+      "pose": [
+        -1.2,
+        3.645,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "dimensions": [
+        0.12,
+        4.59,
+        2.7
+      ],
+      "id": "north_room_divider_east",
+      "mjcf": {
+        "collision_geoms": [
+          "office_structure_010_collision_01"
+        ],
+        "mjcf_body": "office_structure_010",
+        "source_group": "structures",
+        "source_id": "north_room_divider_east",
+        "visual_geoms": [
+          "office_structure_010_visual_01"
+        ]
+      },
+      "pose": [
+        3.1,
+        3.645,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "dimensions": [
+        2.14,
+        0.12,
+        2.7
+      ],
+      "id": "south_corridor_01",
+      "mjcf": {
+        "collision_geoms": [
+          "office_structure_011_collision_01"
+        ],
+        "mjcf_body": "office_structure_011",
+        "source_group": "structures",
+        "source_id": "south_corridor_01",
+        "visual_geoms": [
+          "office_structure_011_visual_01"
+        ]
+      },
+      "pose": [
+        -6.87,
+        -1.35,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "dimensions": [
+        4.9,
+        0.12,
+        2.7
+      ],
+      "id": "south_corridor_02",
+      "mjcf": {
+        "collision_geoms": [
+          "office_structure_012_collision_01"
+        ],
+        "mjcf_body": "office_structure_012",
+        "source_group": "structures",
+        "source_id": "south_corridor_02",
+        "visual_geoms": [
+          "office_structure_012_visual_01"
+        ]
+      },
+      "pose": [
+        -1.95,
+        -1.35,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "dimensions": [
+        2.6,
+        0.12,
+        2.7
+      ],
+      "id": "south_corridor_03",
+      "mjcf": {
+        "collision_geoms": [
+          "office_structure_013_collision_01"
+        ],
+        "mjcf_body": "office_structure_013",
+        "source_group": "structures",
+        "source_id": "south_corridor_03",
+        "visual_geoms": [
+          "office_structure_013_visual_01"
+        ]
+      },
+      "pose": [
+        3.2,
+        -1.35,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "dimensions": [
+        2.04,
+        0.12,
+        2.7
+      ],
+      "id": "south_corridor_04",
+      "mjcf": {
+        "collision_geoms": [
+          "office_structure_014_collision_01"
+        ],
+        "mjcf_body": "office_structure_014",
+        "source_group": "structures",
+        "source_id": "south_corridor_04",
+        "visual_geoms": [
+          "office_structure_014_visual_01"
+        ]
+      },
+      "pose": [
+        6.92,
+        -1.35,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "dimensions": [
+        0.12,
+        4.59,
+        2.7
+      ],
+      "id": "south_room_divider_west",
+      "mjcf": {
+        "collision_geoms": [
+          "office_structure_015_collision_01"
+        ],
+        "mjcf_body": "office_structure_015",
+        "source_group": "structures",
+        "source_id": "south_room_divider_west",
+        "visual_geoms": [
+          "office_structure_015_visual_01"
+        ]
+      },
+      "pose": [
+        -2.4,
+        -3.645,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "dimensions": [
+        0.12,
+        4.59,
+        2.7
+      ],
+      "id": "south_room_divider_east",
+      "mjcf": {
+        "collision_geoms": [
+          "office_structure_016_collision_01"
+        ],
+        "mjcf_body": "office_structure_016",
+        "source_group": "structures",
+        "source_id": "south_room_divider_east",
+        "visual_geoms": [
+          "office_structure_016_visual_01"
+        ]
+      },
+      "pose": [
+        3.4,
+        -3.645,
+        0.0,
+        0.0
+      ]
+    }
+  ],
+  "targets": [
+    {
+      "id": "target_meeting_table_front",
+      "object_id": "meeting_table",
+      "pose": [
+        0.7,
+        2.18,
+        1.5708
+      ],
+      "tolerance": 0.45
+    },
+    {
+      "id": "target_meeting_display",
+      "object_id": "meeting_display",
+      "pose": [
+        0.7,
+        4.7,
+        1.5708
+      ],
+      "tolerance": 0.45
+    },
+    {
+      "id": "target_water_dispenser",
+      "object_id": "water_dispenser",
+      "pose": [
+        3.62,
+        3.48,
+        1.5708
+      ],
+      "tolerance": 0.45
+    },
+    {
+      "id": "target_coffee_machine",
+      "object_id": "coffee_machine",
+      "pose": [
+        5.05,
+        4.15,
+        1.5708
+      ],
+      "tolerance": 0.45
+    },
+    {
+      "id": "target_open_office_desk",
+      "object_id": "open_office_desk_01",
+      "pose": [
+        -5.75,
+        3.2,
+        1.5708
+      ],
+      "tolerance": 0.45
+    },
+    {
+      "id": "target_reception",
+      "object_id": "reception_desk",
+      "pose": [
+        -4.55,
+        -2.1,
+        -1.5708
+      ],
+      "tolerance": 0.45
+    },
+    {
+      "id": "target_focus_desk",
+      "object_id": "focus_desk",
+      "pose": [
+        1.65,
+        -4.6,
+        3.14159
+      ],
+      "tolerance": 0.45
+    },
+    {
+      "id": "target_corridor_east",
+      "object_id": "corridor_plant",
+      "pose": [
+        6.1,
+        0.0,
+        0.0
+      ],
+      "tolerance": 0.35
+    }
+  ],
+  "warning": "Privileged semantic truth; pure-VLM product code must receive RGB/RGB-D only."
+}
