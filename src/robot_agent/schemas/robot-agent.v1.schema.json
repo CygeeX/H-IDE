@@ -349,6 +349,74 @@
       "title": "ControlAcquirePayload",
       "type": "object"
     },
+    "ControlRelease": {
+      "additionalProperties": false,
+      "description": "Explicitly return control authority after all owned work is terminal.",
+      "properties": {
+        "message_id": {
+          "format": "uuid",
+          "title": "Message Id",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/ControlReleasePayload"
+        },
+        "robot_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+          "title": "Robot Id",
+          "type": "string"
+        },
+        "sent_at": {
+          "format": "date-time",
+          "title": "Sent At",
+          "type": "string"
+        },
+        "session_id": {
+          "format": "uuid",
+          "title": "Session Id",
+          "type": "string"
+        },
+        "type": {
+          "const": "control.release",
+          "title": "Type",
+          "type": "string"
+        },
+        "version": {
+          "const": "1.0",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "message_id",
+        "robot_id",
+        "sent_at",
+        "type",
+        "session_id",
+        "payload"
+      ],
+      "title": "ControlRelease",
+      "type": "object"
+    },
+    "ControlReleasePayload": {
+      "additionalProperties": false,
+      "properties": {
+        "reason": {
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason"
+      ],
+      "title": "ControlReleasePayload",
+      "type": "object"
+    },
     "ControlStatus": {
       "additionalProperties": false,
       "properties": {
@@ -1304,6 +1372,7 @@
       "command.request": "#/$defs/CommandRequest",
       "command.status": "#/$defs/CommandStatus",
       "control.acquire": "#/$defs/ControlAcquire",
+      "control.release": "#/$defs/ControlRelease",
       "control.status": "#/$defs/ControlStatus",
       "error": "#/$defs/ErrorMessage",
       "lease.renew": "#/$defs/LeaseRenew",
@@ -1329,6 +1398,9 @@
     },
     {
       "$ref": "#/$defs/ControlAcquire"
+    },
+    {
+      "$ref": "#/$defs/ControlRelease"
     },
     {
       "$ref": "#/$defs/ControlStatus"

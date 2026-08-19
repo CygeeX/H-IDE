@@ -62,6 +62,8 @@ WebSocket client/server（运行时二选一）
 
 - 启动、断线或租约过期都会调用必配的本地 safe-stop，并锁存 `SAFE_HOLD`。
 - 重连不会恢复控制；BFF 必须重新发送 `control.acquire`。
+- 最后一个命令终态后，BFF 必须发送 `control.release`；只有 Agent 回报新的
+  `SAFE_HOLD/confirmed` 后，控制权才算安全归还。
 - 同一 `command_id` 和同一载荷返回已有状态；同 ID 不同载荷会被拒绝。
 - 普通命令只能占用配置中的资源组；safe-stop 绕过锁并取消所有活动 Action。
 - 生产配置必须使用 mTLS。server 模式还会固定客户端叶证书的 SHA-256

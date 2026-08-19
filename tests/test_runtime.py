@@ -25,6 +25,7 @@ from robot_agent.observation import (
     ObservationHealthSample,
     ObservationHealthStatus,
 )
+from robot_agent.outbound import PriorityOutboundQueue
 from robot_agent.protocol import CommandCancel, CommandRequest, WireMessage, parse_wire_message
 from robot_agent.ros_adapter import MotionFaultCancelEvidence, RosActionReadiness
 from robot_agent.runtime import RobotAgentRuntime, RuntimeSafetyError
@@ -306,6 +307,131 @@ async def test_control_acquire_is_the_only_latched_rearm_and_duplicates_are_idem
     await runtime._route_message(message, session_id)
     assert runtime._session.state is ControlState.ACTIVE
     assert ros.control_arm_calls == 2
+    await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_control_release_confirms_one_physical_stop_and_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    ros = FakeRosAdapter()
+    runtime = RobotAgentRuntime(
+        runtime_config(tmp_path, control_arm_enabled=True),
+        ros_adapter=ros,
+    )
+    await runtime.initialize()
+    session_id = uuid4()
+    await runtime._session.connected(session_id)
+    acquire = parse_wire_message(
+        inbound("control.acquire", session_id, {"operator_id": "operator-7"}),
+        expected_robot_id="g1-dev",
+    )
+    release = parse_wire_message(
+        inbound(
+            "control.release",
+            session_id,
+            {"reason": "approved mission reached a terminal state"},
+        ),
+        expected_robot_id="g1-dev",
+    )
+
+    await runtime._route_message(acquire, session_id)
+    runtime._connection_session_id = session_id
+    runtime._outbound = PriorityOutboundQueue(maxsize=32)
+    before = runtime._session.snapshot
+    initial_stops = ros.safe_stop_reasons
+    await runtime._route_message(release, session_id)
+    released = runtime._session.snapshot
+
+    assert released.state is ControlState.SAFE_HOLD
+    assert released.authority_revoked is True
+    assert released.safe_stop_state.value == "confirmed"
+    assert released.safe_stop_epoch == before.safe_stop_epoch + 1
+    assert ros.safe_stop_reasons == initial_stops + 1
+    outbound = []
+    while runtime._outbound.qsize:
+        outbound.append((await runtime._outbound.get()).payload)
+    release_statuses = [
+        item.payload
+        for item in outbound
+        if getattr(item, "type", None) == "control.status"
+    ]
+    assert [item.safe_stop_state for item in release_statuses] == [
+        "requested",
+        "confirmed",
+    ]
+    assert all(item.authority_revoked is True for item in release_statuses)
+    assert all(item.safe_stop_epoch == released.safe_stop_epoch for item in release_statuses)
+
+    # A retried wire message acknowledges the already-confirmed boundary.  It
+    # cannot execute another physical stop or advance the durable epoch.
+    await runtime._route_message(release, session_id)
+    assert runtime._session.snapshot.safe_stop_epoch == released.safe_stop_epoch
+    assert ros.safe_stop_reasons == initial_stops + 1
+    await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_control_release_rejects_active_command_without_revoking_authority(
+    tmp_path: Path,
+) -> None:
+    ros = FakeRosAdapter()
+    runtime = RobotAgentRuntime(runtime_config(tmp_path), ros_adapter=ros)
+    await runtime.initialize()
+    session_id = uuid4()
+    await runtime._session.connected(session_id)
+    acquire = parse_wire_message(
+        inbound("control.acquire", session_id, {"operator_id": "operator-7"}),
+        expected_robot_id="g1-dev",
+    )
+    release = parse_wire_message(
+        inbound("control.release", session_id, {"reason": "terminal"}),
+        expected_robot_id="g1-dev",
+    )
+    await runtime._route_message(acquire, session_id)
+    command_id = uuid4()
+    assert runtime._coordinator._arbiter.claim(command_id, ("motion",)).acquired
+    initial_stops = ros.safe_stop_reasons
+
+    with pytest.raises(SessionStateError, match="zero active or pending"):
+        await runtime._route_message(release, session_id)
+
+    assert runtime._session.state is ControlState.ACTIVE
+    assert runtime._session.snapshot.authority_revoked is False
+    assert ros.safe_stop_reasons == initial_stops
+    runtime._coordinator._arbiter.release(command_id)
+    await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_control_release_failure_stays_revoked_and_cannot_rearm(
+    tmp_path: Path,
+) -> None:
+    ros = FakeRosAdapter()
+    runtime = RobotAgentRuntime(runtime_config(tmp_path), ros_adapter=ros)
+    await runtime.initialize()
+    session_id = uuid4()
+    await runtime._session.connected(session_id)
+    acquire = parse_wire_message(
+        inbound("control.acquire", session_id, {"operator_id": "operator-7"}),
+        expected_robot_id="g1-dev",
+    )
+    release = parse_wire_message(
+        inbound("control.release", session_id, {"reason": "terminal"}),
+        expected_robot_id="g1-dev",
+    )
+    await runtime._route_message(acquire, session_id)
+    ros.safe_stop_succeeded = False
+
+    with pytest.raises(RuntimeSafetyError, match="rejected"):
+        await runtime._route_message(release, session_id)
+
+    snapshot = runtime._session.snapshot
+    assert snapshot.state is ControlState.SAFE_HOLD
+    assert snapshot.authority_revoked is True
+    assert snapshot.safe_stop_state.value == "failed"
+    with pytest.raises(SessionStateError, match="safety fault is latched"):
+        await runtime._route_message(acquire, session_id)
     await runtime.shutdown()
 
 

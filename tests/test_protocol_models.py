@@ -100,6 +100,29 @@ def test_protocol_round_trip_preserves_lease_message() -> None:
     assert reparsed == parsed
 
 
+def test_control_release_is_strict_and_round_trips() -> None:
+    raw = {
+        "version": "1.0",
+        "type": "control.release",
+        "message_id": str(uuid4()),
+        "robot_id": "g1-dev",
+        "session_id": str(uuid4()),
+        "sent_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "payload": {"reason": "approved mission reached a terminal state"},
+    }
+
+    parsed = parse_wire_message(json.dumps(raw), expected_robot_id="g1-dev")
+    reparsed = parse_wire_message(
+        serialize_wire_message(parsed), expected_robot_id="g1-dev"
+    )
+
+    assert parsed.type == "control.release"
+    assert reparsed == parsed
+    raw["payload"] = {"reason": "done", "force": True}
+    with pytest.raises(FrameValidationError, match="force"):
+        parse_wire_message(json.dumps(raw), expected_robot_id="g1-dev")
+
+
 def test_command_request_rejects_invalid_kind_and_ttl() -> None:
     raw = {
         "version": "1.0",

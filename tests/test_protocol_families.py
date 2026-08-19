@@ -41,6 +41,7 @@ def envelope(message_type: str, payload: dict[str, object]) -> dict[str, object]
             },
         ),
         ("control.acquire", {"operator_id": "operator-7"}),
+        ("control.release", {"reason": "mission command reached a terminal state"}),
         (
             "control.status",
             {"state": "ACTIVE", "reason": "control acquired", "lease_sequence": 0},

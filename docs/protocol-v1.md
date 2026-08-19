@@ -23,7 +23,10 @@
 3. BFF 返回 `session.welcome`，租约参数必须与 Agent 本地配置一致，初始状态必须是 `SAFE_HOLD`。
 4. BFF 发 `control.acquire`，Agent 回 `control.status=ACTIVE`。
 5. BFF 每 500 ms 发送单调递增的 `lease.renew`；Agent 回 `lease.status`。
-6. 2 秒内没有有效续租、连接断开或本地故障时，Agent 立即 safe-stop 并锁存 `SAFE_HOLD`。
+6. 最后一个已拥有命令到达终态后，BFF 发送 `control.release`。Agent 先回报
+   `SAFE_HOLD/requested`，物理安全停止确认后再回报同一新 epoch 的
+   `SAFE_HOLD/confirmed`；BFF 随后停止续租。
+7. 2 秒内没有有效续租、连接断开或本地故障时，Agent 立即 safe-stop 并锁存 `SAFE_HOLD`。
 
 `SAFE_HOLD` 只表示控制权已撤销，不能单独证明机器人已经物理停止。新增的兼容字段
 `authority_revoked`、`safe_stop_state=requested|confirmed|failed` 和单调递增的
@@ -39,6 +42,7 @@
 | BFF → Agent | `session.welcome` | 分配 session ID 并确认本地租约策略 |
 | 双向 | `session.goodbye` | 有原因的正常结束 |
 | BFF → Agent | `control.acquire` | 显式获取控制权 |
+| BFF → Agent | `control.release` | 无活动命令时显式归还控制权并确认物理安全停止 |
 | Agent → BFF | `control.status` | `ACTIVE` 或锁存安全态 |
 | BFF → Agent | `lease.renew` | 单调序号续租 |
 | Agent → BFF | `lease.status` | 序号和到期时刻 |

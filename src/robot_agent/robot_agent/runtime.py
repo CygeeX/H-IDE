@@ -65,6 +65,7 @@ from robot_agent.protocol import (
     CommandStatus,
     CommandStatusPayload,
     ControlAcquire,
+    ControlRelease,
     ControlStatus,
     ControlStatusPayload,
     ErrorMessage,
@@ -576,6 +577,36 @@ class RobotAgentRuntime:
                 await self._enqueue_control_status()
                 raise
             await self._enqueue_control_status()
+            return None
+        if isinstance(message, ControlRelease):
+            snapshot = self._session.snapshot
+            if snapshot.session_id != session_id:
+                raise SessionStateError(
+                    "control.release session_id does not own the controlling session"
+                )
+            # Repeated release after a confirmed/failed hold is a read-only,
+            # idempotent status acknowledgement.  In particular, it must not
+            # clear a latched fault or manufacture a fresh safe-stop epoch.
+            if snapshot.state is ControlState.SAFE_HOLD:
+                await self._enqueue_control_status()
+                return None
+            if (
+                self._coordinator.active_commands
+                or self._coordinator.active_nav2_commands
+                or self._coordinator.pending_cancel_confirmations
+                or any(not task.done() for task in self._command_tasks)
+            ):
+                raise SessionStateError(
+                    "control.release requires zero active or pending commands"
+                )
+            reason = f"remote control released: {message.payload.reason}"
+            await self._revoke_authority_for_safe_stop(reason)
+            try:
+                await self._session.ensure_safe_hold(reason, refresh=False)
+            finally:
+                # Success advertises the confirmed physical boundary. Failure
+                # advertises FAILED while authority remains revoked.
+                await self._enqueue_control_status()
             return None
         if isinstance(message, LeaseRenew):
             snapshot = await self._session.renew(

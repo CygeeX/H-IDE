@@ -156,6 +156,18 @@ class ControlAcquire(Envelope):
     payload: ControlAcquirePayload
 
 
+class ControlReleasePayload(StrictModel):
+    reason: str = Field(min_length=1, max_length=256)
+
+
+class ControlRelease(Envelope):
+    """Explicitly return control authority after all owned work is terminal."""
+
+    type: Literal["control.release"]
+    session_id: UUID
+    payload: ControlReleasePayload
+
+
 class ControlStatusPayload(StrictModel):
     state: Literal["UNARMED", "ACTIVE", "SAFE_HOLD"]
     reason: str = Field(min_length=1, max_length=256)
@@ -319,6 +331,7 @@ WireMessage = Annotated[
     | SessionWelcome
     | SessionGoodbye
     | ControlAcquire
+    | ControlRelease
     | ControlStatus
     | LeaseRenew
     | LeaseStatus
