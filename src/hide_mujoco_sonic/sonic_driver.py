@@ -801,18 +801,21 @@ class SonicDriver:
             math.isfinite(float(value)) for value in targets
         ):
             raise ValueError("position hold requires 29 finite joint targets")
-        for index in range(29):
-            motor = self._msg.motor_cmd[index]
-            motor.mode = 1
-            motor.kp = float(self._kp[index])
-            motor.kd = float(self._kd[index])
-            motor.q = float(targets[index])
-            motor.dq = 0.0
-            motor.tau = 0.0
-        self._msg.crc = self._crc.Crc(self._msg)
-        self._publisher.Write(self._msg)
         with self._support_lock:
-            self._last_published_targets = tuple(float(value) for value in targets)
+            selected = self._safe_hold_targets or targets
+            for index in range(29):
+                motor = self._msg.motor_cmd[index]
+                motor.mode = 1
+                motor.kp = float(self._kp[index])
+                motor.kd = float(self._kd[index])
+                motor.q = float(selected[index])
+                motor.dq = 0.0
+                motor.tau = 0.0
+            self._msg.crc = self._crc.Crc(self._msg)
+            self._publisher.Write(self._msg)
+            self._last_published_targets = tuple(
+                float(value) for value in selected
+            )
 
     def _publish_measured_hold(self, lowstate) -> None:
         self._publish_position_hold(
@@ -1301,17 +1304,24 @@ class SonicDriver:
             )
             for index in range(29)
         )
-        for index in range(29):
-            motor = self._msg.motor_cmd[index]
-            motor.mode = 1
-            motor.kp = float(self._kp[index])
-            motor.kd = float(self._kd[index])
-            motor.q = published_targets[index]
-            motor.dq = 0.0
-            motor.tau = 0.0
-        self._msg.crc = self._crc.Crc(self._msg)
-        self._publisher.Write(self._msg)
         with self._support_lock:
+            # Serialize the final DDS write with stop target freezing.  If a
+            # stop wins the lock, this in-flight policy result is replaced by
+            # the exact prior target; if this write wins, the stop freezes the
+            # just-published target.  Either ordering yields a zero target
+            # discontinuity at the actuator boundary.
+            if self._safe_hold_targets is not None:
+                published_targets = self._safe_hold_targets
+            for index in range(29):
+                motor = self._msg.motor_cmd[index]
+                motor.mode = 1
+                motor.kp = float(self._kp[index])
+                motor.kd = float(self._kd[index])
+                motor.q = published_targets[index]
+                motor.dq = 0.0
+                motor.tau = 0.0
+            self._msg.crc = self._crc.Crc(self._msg)
+            self._publisher.Write(self._msg)
             self._last_published_targets = published_targets
         nonzero = any(abs(float(self._msg.motor_cmd[i].q)) > 1e-4 for i in range(29))
         # Legs and waist are the locomotion plant.  Tracking their commanded

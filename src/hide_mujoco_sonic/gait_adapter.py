@@ -524,11 +524,12 @@ class GaitAdapter:
     def _check_reverse_motion(self, observation: BaseObservation, now: float) -> None:
         """Reject cumulative opposite travel, not a humanoid gait-phase swing.
 
-        A walking G1 periodically has negative instantaneous base velocity
-        while transferring weight between feet.  Treating that short phase as
-        reverse travel stopped a valid +X plan after only eight millimetres.
-        Direction safety therefore uses pose displacement in the map/odom
-        frame, matching the independent ROS navigation guard.  Turns likewise
+        A humanoid can show short centre-of-mass or foot-placement transients;
+        the failed run contained eight millimetres of opposite displacement,
+        but lacked foot-contact evidence to classify its cause.  Direction
+        safety therefore does not infer reverse navigation from one velocity
+        phase.  It uses meaningful pose displacement in the map/odom frame,
+        matching the independent ROS navigation guard.  Turns likewise
         integrate adjacent wrapped yaw samples instead of testing one angular
         velocity sample.
         """
