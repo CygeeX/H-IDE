@@ -69,6 +69,18 @@ class _RequestEvidence:
     requested_facing_angle_rad: float | None
 
 
+@dataclass(frozen=True, slots=True)
+class PlannerAuthorityEvidence:
+    """Immutable correlation proof consumed by actuator-authority code."""
+
+    reference_ready: bool
+    intent_generation: int | None
+    intent_signature: str | None
+    accepted_request_generation: int | None
+    accepted_intent_generation: int | None
+    accepted_intent_signature: str | None
+
+
 class PlannerReferenceEvidenceGate:
     """Admit only a uniquely correlated, direction-consistent new reference.
 
@@ -274,6 +286,29 @@ class PlannerReferenceEvidenceGate:
     def reference_ready(self) -> bool:
         with self._lock:
             return self._reference_ready and self._has_current_reference_locked()
+
+    @property
+    def authority_evidence(self) -> PlannerAuthorityEvidence:
+        """Return one typed snapshot of the currently matched reference proof."""
+
+        with self._lock:
+            intent = self._intent if self._intent_active else None
+            accepted = self._accepted_request
+            ready = self._reference_ready and self._has_current_reference_locked()
+            return PlannerAuthorityEvidence(
+                reference_ready=ready,
+                intent_generation=None if intent is None else intent.generation,
+                intent_signature=None if intent is None else intent.signature,
+                accepted_request_generation=(
+                    None if accepted is None else accepted.generation
+                ),
+                accepted_intent_generation=(
+                    None if accepted is None else accepted.intent_generation
+                ),
+                accepted_intent_signature=(
+                    None if accepted is None else accepted.intent_signature
+                ),
+            )
 
     def enforce_required_deadline(self, *, simulation_now_s: float) -> None:
         """Fail closed when a required generation waits too long in MuJoCo time."""

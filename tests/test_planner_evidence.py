@@ -178,6 +178,12 @@ def test_stale_planner_generation_never_unlocks_a_new_nav2_intent() -> None:
         == evidence["sonic_intent_signature"]
         == evidence["sonic_planner_accepted_intent_signature"]
     )
+    authority = gate.authority_evidence
+    assert authority.reference_ready is True
+    assert authority.intent_generation == 2
+    assert authority.accepted_request_generation == 2
+    assert authority.accepted_intent_generation == authority.intent_generation
+    assert authority.accepted_intent_signature == authority.intent_signature
     assert evidence["sonic_planner_ref_cursor"] == 7
     assert evidence["sonic_planner_predicted_root_direction_x"] == -1.0
     assert evidence["sonic_planner_predicted_root_projection_m"] == 1.0
@@ -462,7 +468,7 @@ def test_pure_rotation_yaw_evidence_uses_shortest_delta_across_pi(
     assert evidence["sonic_planner_yaw_consistent"] is True
 
 
-def test_static_joint_handoff_ratio_remains_zero_until_reference_is_ready() -> None:
+def test_static_joint_handoff_switches_only_when_reference_is_ready() -> None:
     handoff = StaticJointHandoff(joint_count=2, warmup_s=0.0, blend_s=0.4)
 
     waiting = handoff.decide(
@@ -483,17 +489,17 @@ def test_static_joint_handoff_ratio_remains_zero_until_reference_is_ready() -> N
         policy=(3.0, 4.0),
         now=1.2,
     )
-    assert admitted.handoff_ratio == 0.0
-    assert admitted.targets == (1.0, 2.0)
-    blended = handoff.decide(
+    assert admitted.handoff_ratio == 1.0
+    assert admitted.targets == (3.0, 4.0)
+    continued = handoff.decide(
         motion_active=True,
         reference_ready=True,
         measured=(1.2, 2.2),
         policy=(3.0, 4.0),
         now=1.4,
     )
-    assert blended.handoff_ratio == pytest.approx(0.5)
-    assert blended.targets == pytest.approx((2.0, 3.0))
+    assert continued.handoff_ratio == 1.0
+    assert continued.targets == (3.0, 4.0)
 
 
 def test_bad_periodic_refresh_retains_the_current_accepted_reference() -> None:

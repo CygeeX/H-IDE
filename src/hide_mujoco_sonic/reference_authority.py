@@ -203,6 +203,42 @@ class ReferenceAuthorityState:
         )
         return self._snapshot
 
+    def refresh(
+        self,
+        *,
+        generation: int,
+        source_sequence: int,
+        planner_intent_generation: int,
+        reference_epoch: int,
+    ) -> ReferenceAuthoritySnapshot:
+        """Prime a newer same-intent epoch decoded after a periodic refresh."""
+
+        self._require_identity(generation, source_sequence, phase="GRANTED")
+        planner_intent_generation = _integer(
+            planner_intent_generation,
+            name="planner_intent_generation",
+            minimum=1,
+        )
+        reference_epoch = _integer(
+            reference_epoch,
+            name="reference_epoch",
+            minimum=1,
+        )
+        current = self._snapshot
+        if planner_intent_generation != current.planner_intent_generation:
+            raise ValueError("refreshed planner intent generation mismatch")
+        if reference_epoch <= current.reference_epoch:
+            raise ValueError("refreshed reference epoch did not advance")
+        self._snapshot = ReferenceAuthoritySnapshot(
+            phase="PRIMED",
+            generation=generation,
+            source_sequence=source_sequence,
+            planner_intent_generation=planner_intent_generation,
+            reference_epoch=reference_epoch,
+            reason="periodic matching reference decoded; awaiting its first DDS target",
+        )
+        return self._snapshot
+
     def revoke(self, reason: str) -> ReferenceAuthoritySnapshot:
         detail = str(reason).strip() or "reference actuator authority revoked"
         previous = self._snapshot

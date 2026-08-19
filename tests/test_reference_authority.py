@@ -65,6 +65,45 @@ def test_reference_authority_revoke_clears_grant_but_preserves_diagnostic_identi
     assert revoked.dds_target_sequence is None
 
 
+def test_periodic_refresh_primes_new_epoch_without_exposing_old_grant() -> None:
+    state = ReferenceAuthorityState()
+    state.require(generation=5, source_sequence=9)
+    state.mark_installed(
+        generation=5,
+        source_sequence=9,
+        planner_intent_generation=2,
+        reference_epoch=4,
+    )
+    state.prime(generation=5, source_sequence=9, reference_epoch=4)
+    state.grant(
+        generation=5,
+        source_sequence=9,
+        reference_epoch=4,
+        granted_at_monotonic_s=2.0,
+        granted_at_tick_ms=200,
+        dds_target_sequence=8,
+    )
+
+    with pytest.raises(ValueError, match="intent generation"):
+        state.refresh(
+            generation=5,
+            source_sequence=9,
+            planner_intent_generation=3,
+            reference_epoch=5,
+        )
+    refreshed = state.refresh(
+        generation=5,
+        source_sequence=9,
+        planner_intent_generation=2,
+        reference_epoch=5,
+    )
+    assert refreshed.phase == "PRIMED"
+    assert refreshed.reference_epoch == 5
+    assert refreshed.actuator_authority is False
+    assert refreshed.granted_at_monotonic_s is None
+    assert refreshed.dds_target_sequence is None
+
+
 def test_duplicate_require_cannot_withdraw_primed_or_granted_authority() -> None:
     state = ReferenceAuthorityState()
     state.require(generation=7, source_sequence=12)
