@@ -22,7 +22,7 @@ from robot_agent.observation import (
 )
 from robot_agent.protocol import WireMessage, parse_wire_message
 from robot_agent.runtime import RobotAgentRuntime, RuntimeSafetyError
-from robot_agent.session import SessionStateError
+from robot_agent.session import ControlState, SessionStateError
 
 
 def runtime_config(
@@ -31,7 +31,28 @@ def runtime_config(
     lease_interval_ms: int = 500,
     lease_timeout_ms: int = 2000,
     observation_enabled: bool = False,
+    control_arm_enabled: bool = False,
+    control_arm_timeout_ms: int = 1000,
 ) -> AgentConfig:
+    safety: dict[str, Any] = {
+        "safe_stop": {
+            "adapter": "service",
+            "ros_name": "/robot/safe_stop",
+            "ros_type": "std_srvs/srv/Trigger",
+            "request": {},
+            "timeout_ms": 1000,
+        },
+        "heartbeat_topic": "/robot_agent/heartbeat",
+        "heartbeat_period_ms": 250,
+    }
+    if control_arm_enabled:
+        safety["control_arm"] = {
+            "adapter": "service",
+            "ros_name": "/robot/control_arm",
+            "ros_type": "std_srvs/srv/Trigger",
+            "request": {},
+            "timeout_ms": control_arm_timeout_ms,
+        }
     return AgentConfig.model_validate(
         {
             "schema_version": "1",
@@ -58,17 +79,7 @@ def runtime_config(
                 "snapshot_hz": 1.0,
                 "outbound_queue_size": 32,
             },
-            "safety": {
-                "safe_stop": {
-                    "adapter": "service",
-                    "ros_name": "/robot/safe_stop",
-                    "ros_type": "std_srvs/srv/Trigger",
-                    "request": {},
-                    "timeout_ms": 1000,
-                },
-                "heartbeat_topic": "/robot_agent/heartbeat",
-                "heartbeat_period_ms": 250,
-            },
+            "safety": safety,
             "commands": {
                 "power.enable": {
                     "adapter": "service",
@@ -104,6 +115,10 @@ class FakeRosAdapter:
         self.safe_stop_reasons = 0
         self.safe_stop_succeeded = True
         self.safe_stop_exception: Exception | None = None
+        self.control_arm_calls = 0
+        self.control_arm_succeeded = True
+        self.control_arm_exception: Exception | None = None
+        self.control_arm_delay_s = 0.0
         self.health_exception: Exception | None = None
 
     def set_callbacks(
@@ -181,6 +196,19 @@ class FakeRosAdapter:
             result={"success": self.safe_stop_succeeded},
         )
 
+    async def control_arm(self, config: SafeStopConfig) -> ExecutionResult:
+        assert config.ros_name == "/robot/control_arm"
+        self.control_arm_calls += 1
+        if self.control_arm_delay_s:
+            await asyncio.sleep(self.control_arm_delay_s)
+        if self.control_arm_exception is not None:
+            raise self.control_arm_exception
+        return ExecutionResult(
+            succeeded=self.control_arm_succeeded,
+            detail="armed" if self.control_arm_succeeded else "rejected",
+            result={"success": self.control_arm_succeeded},
+        )
+
     async def close(self) -> None:
         self.closed = True
 
@@ -227,6 +255,156 @@ def inbound(
 async def next_message(connection: QueueConnection) -> WireMessage:
     raw = await asyncio.wait_for(connection.outgoing.get(), timeout=2)
     return parse_wire_message(raw, expected_robot_id="g1-dev")
+
+
+@pytest.mark.asyncio
+async def test_control_acquire_is_the_only_latched_rearm_and_duplicates_are_idempotent(
+    tmp_path: Path,
+) -> None:
+    ros = FakeRosAdapter()
+    runtime = RobotAgentRuntime(
+        runtime_config(tmp_path, control_arm_enabled=True),
+        ros_adapter=ros,
+    )
+    await runtime.initialize()
+    session_id = uuid4()
+    await runtime._session.connected(session_id)
+    message = parse_wire_message(
+        inbound("control.acquire", session_id, {"operator_id": "operator-7"}),
+        expected_robot_id="g1-dev",
+    )
+
+    await runtime._route_message(message, session_id)
+    assert runtime._session.state is ControlState.ACTIVE
+    assert ros.control_arm_calls == 1
+
+    # A duplicated acquire cannot create another generation while ACTIVE.
+    await runtime._route_message(message, session_id)
+    assert ros.control_arm_calls == 1
+
+    await runtime._session.force_safe_hold("lease expired")
+    assert runtime._session.state is ControlState.SAFE_HOLD
+    await runtime._route_message(message, session_id)
+    assert runtime._session.state is ControlState.ACTIVE
+    assert ros.control_arm_calls == 2
+    await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_failed_control_arm_relatches_stop_and_keeps_safe_hold(
+    tmp_path: Path,
+) -> None:
+    ros = FakeRosAdapter()
+    ros.control_arm_succeeded = False
+    runtime = RobotAgentRuntime(
+        runtime_config(tmp_path, control_arm_enabled=True),
+        ros_adapter=ros,
+    )
+    await runtime.initialize()
+    session_id = uuid4()
+    await runtime._session.connected(session_id)
+    message = parse_wire_message(
+        inbound("control.acquire", session_id, {"operator_id": "operator-7"}),
+        expected_robot_id="g1-dev",
+    )
+
+    with pytest.raises(SessionStateError, match="failed closed"):
+        await runtime._route_message(message, session_id)
+    assert runtime._session.state is ControlState.SAFE_HOLD
+    assert ros.control_arm_calls == 1
+    # Startup stop plus the failure relatch.
+    assert ros.safe_stop_reasons == 2
+    await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_timed_out_control_arm_does_not_block_the_failure_relatch(
+    tmp_path: Path,
+) -> None:
+    ros = FakeRosAdapter()
+    ros.control_arm_delay_s = 60.0
+    runtime = RobotAgentRuntime(
+        runtime_config(
+            tmp_path,
+            control_arm_enabled=True,
+            control_arm_timeout_ms=10,
+        ),
+        ros_adapter=ros,
+    )
+    await runtime.initialize()
+    session_id = uuid4()
+    await runtime._session.connected(session_id)
+    message = parse_wire_message(
+        inbound("control.acquire", session_id, {"operator_id": "operator-7"}),
+        expected_robot_id="g1-dev",
+    )
+
+    with pytest.raises(SessionStateError, match=r"exceeded 0\.010s deadline"):
+        await runtime._route_message(message, session_id)
+    assert runtime._session.state is ControlState.SAFE_HOLD
+    assert ros.control_arm_calls == 1
+    # The timed-out arm task is isolated from the mandatory safety-operation
+    # tracker, so startup stop plus the acquire-failure relatch both execute.
+    assert ros.safe_stop_reasons == 2
+    await asyncio.sleep(0)
+    assert runtime._detached_control_arm_tasks == set()
+    await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_control_arm_rejects_any_preexisting_active_command(
+    tmp_path: Path,
+) -> None:
+    ros = FakeRosAdapter()
+    runtime = RobotAgentRuntime(
+        runtime_config(tmp_path, control_arm_enabled=True),
+        ros_adapter=ros,
+    )
+    await runtime.initialize()
+    session_id = uuid4()
+    await runtime._session.connected(session_id)
+    command_id = uuid4()
+    assert runtime._coordinator._arbiter.claim(
+        command_id, ("motion",)
+    ).acquired is True
+    message = parse_wire_message(
+        inbound("control.acquire", session_id, {"operator_id": "operator-7"}),
+        expected_robot_id="g1-dev",
+    )
+
+    with pytest.raises(SessionStateError, match="zero active"):
+        await runtime._route_message(message, session_id)
+    assert runtime._session.state is ControlState.SAFE_HOLD
+    assert ros.control_arm_calls == 0
+    assert ros.safe_stop_reasons == 2
+    runtime._coordinator._arbiter.release(command_id)
+    await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_latched_session_fault_blocks_control_arm_before_local_release(
+    tmp_path: Path,
+) -> None:
+    ros = FakeRosAdapter()
+    runtime = RobotAgentRuntime(
+        runtime_config(tmp_path, control_arm_enabled=True),
+        ros_adapter=ros,
+    )
+    await runtime.initialize()
+    session_id = uuid4()
+    await runtime._session.connected(session_id)
+    await runtime._session.latch_safety_fault("physical stop acknowledgement lost")
+    message = parse_wire_message(
+        inbound("control.acquire", session_id, {"operator_id": "operator-7"}),
+        expected_robot_id="g1-dev",
+    )
+
+    with pytest.raises(SessionStateError, match="safety fault is latched"):
+        await runtime._route_message(message, session_id)
+    assert runtime._session.state is ControlState.SAFE_HOLD
+    assert ros.control_arm_calls == 0
+    assert ros.safe_stop_reasons == 1
+    await runtime.shutdown()
 
 
 def observation_health(
@@ -1159,6 +1337,11 @@ async def test_back_to_back_request_and_cancel_never_dispatches_command(
     assert cancelled.payload.command_id == command_id
     assert cancelled.payload.state == "CANCELLED"
     assert ros.executions == []
+    safety = await next_message(connection)
+    assert safety.type == "safety.event"
+    status = await next_message(connection)
+    assert status.type == "control.status"
+    assert status.payload.state == "SAFE_HOLD"
 
     await connection.incoming.put(
         inbound("session.goodbye", session_id, {"reason": "test complete"})

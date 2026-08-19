@@ -625,6 +625,25 @@ class RosAdapter:
             values=config.request,
         )
 
+    async def control_arm(self, config: SafeStopConfig) -> ExecutionResult:
+        """Request one local, measured rearm after remote control.acquire."""
+
+        self._require_started()
+        command_id = uuid4()
+        if config.adapter == "service":
+            return await self._execute_service(
+                command_id,
+                ros_name=config.ros_name,
+                ros_type=config.ros_type,
+                values=config.request,
+            )
+        return await self._execute_action(
+            command_id,
+            ros_name=config.ros_name,
+            ros_type=config.ros_type,
+            values=config.request,
+        )
+
     async def publish_observation_demand(
         self,
         *,

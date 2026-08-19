@@ -103,6 +103,24 @@ def collect_diagnostics(config: AgentConfig) -> dict[str, Any]:
             )
         )
 
+    control_arm = config.safety.control_arm
+    if control_arm is not None:
+        try:
+            if control_arm.adapter == "service":
+                get_service(control_arm.ros_type)
+            else:
+                get_action(control_arm.ros_type)
+        except Exception as exc:
+            checks.append(DiagnosticCheck("safety:control-arm", "FAIL", str(exc)))
+        else:
+            checks.append(
+                DiagnosticCheck(
+                    "safety:control-arm",
+                    "PASS",
+                    f"{control_arm.ros_type} -> {control_arm.ros_name}",
+                )
+            )
+
     return {
         "healthy": all(check.status != "FAIL" for check in checks),
         "robot_id": config.robot_id,

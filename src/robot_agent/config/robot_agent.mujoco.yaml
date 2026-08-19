@@ -51,6 +51,15 @@ safety:
     ros_type: std_srvs/srv/Trigger
     request: {}
     timeout_ms: 1000
+  # The MuJoCo Plant keeps safety_stop latched.  A remote control.acquire is
+  # the sole external authorization that may ask the ROS bridge for a newer
+  # generation and a fresh stationary IDLE arm.
+  control_arm:
+    adapter: service
+    ros_name: /robot/control_arm
+    ros_type: std_srvs/srv/Trigger
+    request: {}
+    timeout_ms: 1000
   heartbeat_topic: /robot_agent/safety_heartbeat
   heartbeat_period_ms: 250
 

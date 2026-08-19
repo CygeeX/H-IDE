@@ -541,6 +541,17 @@
     "SafetyConfig": {
       "additionalProperties": false,
       "properties": {
+        "control_arm": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SafeStopConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "heartbeat_period_ms": {
           "default": 250,
           "maximum": 1000,

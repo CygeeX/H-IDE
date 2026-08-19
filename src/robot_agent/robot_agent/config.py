@@ -179,6 +179,10 @@ class SafeStopConfig(StrictConfigModel):
 
 class SafetyConfig(StrictConfigModel):
     safe_stop: SafeStopConfig
+    # Simulation and other latched motion profiles may require one explicit
+    # local rearm after the remote operator acquires control.  Omitted for
+    # platforms whose hardware safety controller owns this transition.
+    control_arm: SafeStopConfig | None = None
     heartbeat_topic: str = Field(pattern=ROS_NAME_PATTERN)
     heartbeat_period_ms: int = Field(default=250, ge=50, le=1_000)
 

@@ -80,7 +80,12 @@ from robot_agent.ros_adapter import (
     RosAdapter,
     StateCallback,
 )
-from robot_agent.session import LeaseError, SessionController, SessionStateError
+from robot_agent.session import (
+    ControlState,
+    LeaseError,
+    SessionController,
+    SessionStateError,
+)
 from robot_agent.state import StateCoalescer, StateEmission
 from robot_agent.transport import ClientTransport, ServerTransport
 
@@ -150,6 +155,8 @@ class RosRuntimeAdapter(Protocol):
 
     async def safe_stop(self, config: SafeStopConfig) -> ExecutionResult: ...
 
+    async def control_arm(self, config: SafeStopConfig) -> ExecutionResult: ...
+
     async def publish_observation_demand(
         self,
         *,
@@ -214,6 +221,7 @@ class RobotAgentRuntime:
         self._command_tasks: set[asyncio.Task[None]] = set()
         self._event_tasks: set[asyncio.Task[None]] = set()
         self._detached_safety_tasks: set[asyncio.Task[Any]] = set()
+        self._detached_control_arm_tasks: set[asyncio.Task[Any]] = set()
         self._background_failure: asyncio.Future[None] | None = None
         self._diagnostics_lock = asyncio.Lock()
         self._state_freshness_lock = threading.RLock()
@@ -479,11 +487,20 @@ class RobotAgentRuntime:
         session_id: UUID,
     ) -> str | None:
         if isinstance(message, ControlAcquire):
-            await self._session.acquire(
-                session_id,
-                operator_id=message.payload.operator_id,
-                at=_now(),
-            )
+            try:
+                await self._session.acquire(
+                    session_id,
+                    operator_id=message.payload.operator_id,
+                    at=_now(),
+                    before_activate=(
+                        self._perform_control_arm
+                        if self.config.safety.control_arm is not None
+                        else None
+                    ),
+                )
+            except Exception:
+                await self._enqueue_control_status()
+                raise
             await self._enqueue_control_status()
             return None
         if isinstance(message, LeaseRenew):
@@ -548,9 +565,13 @@ class RobotAgentRuntime:
                     at=_now(),
                 )
             except CommandCancellationError as exc:
-                await self._perform_safe_stop(str(exc))
+                await self._enter_safe_hold_after_cancel(str(exc))
                 return None
-            if not cancelled:
+            if cancelled:
+                await self._enter_safe_hold_after_cancel(
+                    f"remote operator cancelled command {message.payload.command_id}"
+                )
+            else:
                 record = await self._coordinator.record(message.payload.command_id)
                 if record is not None and record.state in TERMINAL_STATES:
                     await self._enqueue_command_status(record)
@@ -582,7 +603,7 @@ class RobotAgentRuntime:
             return
         except CommandCancellationError as exc:
             await self._enqueue_command_status(exc.record)
-            await self._perform_safe_stop(str(exc))
+            await self._enter_safe_hold_after_cancel(str(exc))
             return
         await self._enqueue_command_status(record)
 
@@ -807,6 +828,50 @@ class RobotAgentRuntime:
             ) from preemption_error
         await self._enqueue_safety(_safety_code(reason), reason)
 
+    async def _enter_safe_hold_after_cancel(self, reason: str) -> None:
+        """A cancellation revokes the current control arm until reacquired."""
+
+        if self._session.state is ControlState.ACTIVE:
+            await self._session.force_safe_hold(reason)
+        else:
+            # Cancellation uncertainty is itself a fresh stop boundary even if
+            # the controlling session was already SAFE_HOLD.
+            await self._perform_safe_stop(reason)
+            await self._session.force_safe_hold(reason)
+        await self._enqueue_control_status()
+
+    async def _perform_control_arm(self) -> None:
+        """Pair remote control.acquire with one local measured arm boundary."""
+
+        config = self.config.safety.control_arm
+        if config is None:
+            return
+        if self._coordinator.active_commands:
+            raise SessionStateError(
+                "control arm requires zero active local commands"
+            )
+        timeout_seconds = config.timeout_ms / 1000.0
+        operation = asyncio.create_task(self._ros.control_arm(config))
+        result, error = await _capture_bounded_task(
+            operation,
+            timeout=timeout_seconds,
+            description="local control arm",
+            # A timed-out arm may still be unwinding inside the ROS executor,
+            # but it must never suppress the stronger safe-stop used to
+            # re-latch the Plant after a lost acknowledgement.
+            detached_tasks=self._detached_control_arm_tasks,
+        )
+        if error is None and result is not None and result.succeeded:
+            return
+        detail = (
+            str(error)
+            if error is not None
+            else result.detail
+            if result is not None
+            else "local control arm returned no result"
+        )
+        raise SessionStateError(f"control arm failed closed: {detail}")
+
     def _on_ros_state(self, path: str, value: Any, observed_at: datetime) -> None:
         self._state.update(path, value, observed_at=observed_at)
         with self._state_freshness_lock:
@@ -868,13 +933,16 @@ class RobotAgentRuntime:
         for binding, detail in guard.stale_bindings(monotonic_now=loop.time()):
             reason = f"observation_watchdog: {detail}"
             try:
-                await self._coordinator.cancel(
+                cancelled = await self._coordinator.cancel(
                     binding.command_id,
                     reason=reason,
                     at=_now(),
                 )
             except CommandCancellationError as exc:
-                await self._perform_safe_stop(str(exc))
+                await self._enter_safe_hold_after_cancel(str(exc))
+            else:
+                if cancelled:
+                    await self._enter_safe_hold_after_cancel(reason)
 
     def _schedule_feedback(self, command_id: UUID, feedback: dict[str, Any]) -> None:
         session_id = self._connection_session_id

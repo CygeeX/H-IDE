@@ -110,6 +110,46 @@ async def test_disconnect_and_reconnect_require_explicit_acquire() -> None:
 
 
 @pytest.mark.asyncio
+async def test_disconnect_cannot_race_atomic_control_activation() -> None:
+    stop_reasons: list[str] = []
+    arm_started = asyncio.Event()
+    finish_arm = asyncio.Event()
+
+    async def safe_stop(reason: str) -> None:
+        stop_reasons.append(reason)
+
+    async def control_arm() -> None:
+        arm_started.set()
+        await finish_arm.wait()
+
+    controller = SessionController(
+        lease_timeout=timedelta(seconds=2),
+        safe_stop=safe_stop,
+    )
+    session_id = uuid4()
+    await controller.connected(session_id)
+    acquiring = asyncio.create_task(
+        controller.acquire(
+            session_id,
+            operator_id="operator-7",
+            at=NOW,
+            before_activate=control_arm,
+        )
+    )
+    await asyncio.wait_for(arm_started.wait(), timeout=1)
+    disconnecting = asyncio.create_task(controller.disconnected("websocket closed"))
+    await asyncio.sleep(0)
+    assert disconnecting.done() is False
+
+    finish_arm.set()
+    assert (await acquiring).state is ControlState.ACTIVE
+    await disconnecting
+    assert controller.state is ControlState.SAFE_HOLD
+    assert controller.session_id is None
+    assert stop_reasons == ["websocket closed"]
+
+
+@pytest.mark.asyncio
 async def test_lease_rejects_wrong_session_and_regressing_sequence() -> None:
     async def safe_stop(reason: str) -> None:
         del reason

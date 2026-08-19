@@ -35,6 +35,7 @@ class SessionSnapshot:
 
 
 SafeStopCallback = Callable[[str], Awaitable[None]]
+ControlArmCallback = Callable[[], Awaitable[None]]
 
 
 class SessionController:
@@ -81,6 +82,7 @@ class SessionController:
         *,
         operator_id: str,
         at: datetime,
+        before_activate: ControlArmCallback | None = None,
     ) -> SessionSnapshot:
         _require_aware(at)
         if not operator_id:
@@ -91,6 +93,18 @@ class SessionController:
                 raise SessionStateError(f"control blocked: {self._latched_fault_reason()}")
             if self._state is ControlState.ACTIVE:
                 return self.snapshot
+            if before_activate is not None:
+                try:
+                    # Keep the session lock across this bounded local arm.  A
+                    # simultaneous lease/disconnect stop therefore cannot
+                    # race SAFE_HOLD -> ACTIVE between the decision to arm and
+                    # the final state transition.
+                    await before_activate()
+                except Exception as exc:
+                    await self._enter_safe_hold(
+                        f"control activation failed closed: {exc}"
+                    )
+                    raise
             self._state = ControlState.ACTIVE
             self._operator_id = operator_id
             self._lease_sequence = -1
