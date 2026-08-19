@@ -68,6 +68,14 @@ observation:
   # the live D435i profile remains at its stricter timeout.
   watchdog_timeout_ms: 5000
 
+diagnostics:
+  enabled: true
+  host: 127.0.0.1
+  port: 8796
+  request_timeout_ms: 1000
+  probe_timeout_ms: 500
+  localization_max_age_ms: 1000
+
 commands:
   navigation.navigate_to_pose:
     adapter: action

@@ -11,7 +11,9 @@ import queue
 import threading
 import time
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import partial
 from typing import Any, Literal, cast
 from uuid import UUID, uuid4
 
@@ -221,6 +223,12 @@ _TERMINAL_GOAL_STATUSES = frozenset(
 )
 
 
+@dataclass(frozen=True)
+class RosActionReadiness:
+    ready: bool
+    reason: str | None = None
+
+
 class RosAdapter:
     """Own all ROS entities on a dedicated MultiThreadedExecutor thread."""
 
@@ -247,9 +255,9 @@ class RosAdapter:
         self._startup_error: BaseException | None = None
         self._thread_error: BaseException | None = None
         self._owner_thread_id: int | None = None
-        self._requests: queue.Queue[
-            tuple[Callable[[], Any], concurrent.futures.Future[Any]]
-        ] = queue.Queue(maxsize=_ROS_REQUEST_QUEUE_SIZE)
+        self._requests: queue.Queue[tuple[Callable[[], Any], concurrent.futures.Future[Any]]] = (
+            queue.Queue(maxsize=_ROS_REQUEST_QUEUE_SIZE)
+        )
         self._started = False
         self._accepting_requests = False
         self._closed = False
@@ -470,9 +478,7 @@ class RosAdapter:
     def _create_observation_bridge(self) -> None:
         if self._observation_configuration is None:
             return
-        demand_topic, health_topic, demand_type, health_type = (
-            self._observation_configuration
-        )
+        demand_topic, health_topic, demand_type, health_type = self._observation_configuration
         demand_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
@@ -509,13 +515,9 @@ class RosAdapter:
                     localization_epoch_id=str(message.localization_epoch_id),
                     status=int(message.status),
                     reason=int(message.reason),
-                    has_last_accepted_sequence=bool(
-                        message.has_last_accepted_sequence
-                    ),
+                    has_last_accepted_sequence=bool(message.has_last_accepted_sequence),
                     last_accepted_sequence=int(message.last_accepted_sequence),
-                    last_accepted_monotonic_ns=int(
-                        message.last_accepted_monotonic_ns
-                    ),
+                    last_accepted_monotonic_ns=int(message.last_accepted_monotonic_ns),
                     capture_age_ms=float(message.capture_age_ms),
                     ack_age_ms=float(message.ack_age_ms),
                     drop_count=int(message.drop_count),
@@ -583,9 +585,7 @@ class RosAdapter:
             )
         values = params
         if command.goal_transform == "navigate_to_pose_v1":
-            values = await self._run_on_ros_thread(
-                lambda: self._navigate_to_pose_values(params)
-            )
+            values = await self._run_on_ros_thread(lambda: self._navigate_to_pose_values(params))
         elif command.goal_transform == "nav2_spin_v2":
             values = nav2_spin_goal_values(params)
         return await self._execute_action(
@@ -672,9 +672,7 @@ class RosAdapter:
         with self._goal_lock:
             self._service_waiters.add(command_id)
         try:
-            client = await self._run_on_ros_thread(
-                lambda: self._service_client(ros_name, ros_type)
-            )
+            client = await self._run_on_ros_thread(lambda: self._service_client(ros_name, ros_type))
             await self._wait_for_ros_ready(client.service_is_ready, f"service {ros_name}")
             request = build_message(ros_type, section="request", values=values)
             begin_request = self._submit_ros_call(
@@ -688,10 +686,10 @@ class RosAdapter:
                 if ros_future is not None and self._pending.get(command_id) is ros_future:
                     self._pending.pop(command_id, None)
                 service_started = self._pending.get(command_id) is not None
-                if ros_future is None and not service_started and (
-                    begin_request is None
-                    or begin_request.cancelled()
-                    or begin_request.done()
+                if (
+                    ros_future is None
+                    and not service_started
+                    and (begin_request is None or begin_request.cancelled() or begin_request.done())
                 ):
                     self._cancel_requested.discard(command_id)
         result = _message_dict(response)
@@ -733,9 +731,7 @@ class RosAdapter:
         with self._goal_lock:
             self._action_waiters.add(command_id)
         try:
-            client = await self._run_on_ros_thread(
-                lambda: self._action_client(ros_name, ros_type)
-            )
+            client = await self._run_on_ros_thread(lambda: self._action_client(ros_name, ros_type))
             await self._wait_for_ros_ready(client.server_is_ready, f"action {ros_name}")
             goal = build_message(ros_type, section="goal", values=values)
 
@@ -1056,10 +1052,44 @@ class RosAdapter:
             ) from self._thread_error
         if self._started and not self._thread.is_alive():
             raise RosAdapterError("ROS executor thread is not running")
+        if self._started and not self._accepting_requests:
+            raise RosAdapterError("ROS executor is not accepting requests")
 
-    def _submit_ros_call(
-        self, callback: Callable[[], Any]
-    ) -> concurrent.futures.Future[Any]:
+    async def nav2_action_readiness(
+        self,
+        commands: Mapping[str, CommandConfig],
+    ) -> dict[str, RosActionReadiness]:
+        """Probe configured Nav2 action servers without dispatching a goal."""
+        self._require_started()
+        results: dict[str, RosActionReadiness] = {}
+        for skill_id, command in sorted(commands.items()):
+            if command.goal_transform not in {"navigate_to_pose_v1", "nav2_spin_v2"}:
+                continue
+            try:
+                ready = bool(
+                    await self._run_on_ros_thread(
+                        partial(self._nav2_action_server_is_ready, command)
+                    )
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                results[skill_id] = RosActionReadiness(
+                    ready=False,
+                    reason=f"probe_failed:{type(exc).__name__}",
+                )
+            else:
+                results[skill_id] = RosActionReadiness(
+                    ready=ready,
+                    reason=None if ready else "action_server_unavailable",
+                )
+        return results
+
+    def _nav2_action_server_is_ready(self, command: CommandConfig) -> bool:
+        self._require_owner_thread()
+        return bool(self._action_client(command.ros_name, command.ros_type).server_is_ready())
+
+    def _submit_ros_call(self, callback: Callable[[], Any]) -> concurrent.futures.Future[Any]:
         future: concurrent.futures.Future[Any] = concurrent.futures.Future()
         with self._lifecycle_lock:
             self._require_started()

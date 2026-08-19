@@ -6,6 +6,8 @@ import asyncio
 import logging
 import math
 import re
+import threading
+import time
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol, TypeVar, cast
@@ -72,7 +74,12 @@ from robot_agent.protocol import (
     parse_wire_message,
     serialize_wire_message,
 )
-from robot_agent.ros_adapter import FeedbackCallback, RosAdapter, StateCallback
+from robot_agent.ros_adapter import (
+    FeedbackCallback,
+    RosActionReadiness,
+    RosAdapter,
+    StateCallback,
+)
 from robot_agent.session import LeaseError, SessionController, SessionStateError
 from robot_agent.state import StateCoalescer, StateEmission
 from robot_agent.transport import ClientTransport, ServerTransport
@@ -127,6 +134,11 @@ class RosRuntimeAdapter(Protocol):
 
     def check_health(self) -> None: ...
 
+    async def nav2_action_readiness(
+        self,
+        commands: Mapping[str, CommandConfig],
+    ) -> dict[str, RosActionReadiness]: ...
+
     async def execute(
         self,
         command_id: UUID,
@@ -166,12 +178,8 @@ class RobotAgentRuntime:
         self._robot_profile: RobotProfileWire | None = None
         self._capability_manifest: CapabilityManifestWire | None = None
         if config.schema_version == "2":
-            self._robot_profile, self._capability_manifest = (
-                build_capability_manifest(config)
-            )
-        self._ros: RosRuntimeAdapter = ros_adapter or RosAdapter(
-            robot_boot_id=self._boot_id
-        )
+            self._robot_profile, self._capability_manifest = build_capability_manifest(config)
+        self._ros: RosRuntimeAdapter = ros_adapter or RosAdapter(robot_boot_id=self._boot_id)
         self._ledger = CommandLedger(config.storage.ledger_path)
         self._state = StateCoalescer(
             change_hz=config.state.change_hz,
@@ -207,6 +215,9 @@ class RobotAgentRuntime:
         self._event_tasks: set[asyncio.Task[None]] = set()
         self._detached_safety_tasks: set[asyncio.Task[Any]] = set()
         self._background_failure: asyncio.Future[None] | None = None
+        self._diagnostics_lock = asyncio.Lock()
+        self._state_freshness_lock = threading.RLock()
+        self._state_received_monotonic: dict[str, float] = {}
         self._initialized = False
         self._closed = False
         self.ready = asyncio.Event()
@@ -257,14 +268,10 @@ class RobotAgentRuntime:
             transport_config = self.config.transport
             if isinstance(transport_config, ClientTransportConfig):
                 transport = ClientTransport(transport_config, self.config.tls)
-                transport_task = asyncio.create_task(
-                    transport.run(self.handle_connection, stop)
-                )
+                transport_task = asyncio.create_task(transport.run(self.handle_connection, stop))
             elif isinstance(transport_config, ServerTransportConfig):
                 server = ServerTransport(transport_config, self.config.tls)
-                transport_task = asyncio.create_task(
-                    server.run(self.handle_connection, stop)
-                )
+                transport_task = asyncio.create_task(server.run(self.handle_connection, stop))
             else:  # pragma: no cover - Pydantic's discriminated union prevents this.
                 raise RuntimeErrorBase("unsupported transport configuration")
             retention_task = asyncio.create_task(self._retention_loop())
@@ -512,9 +519,7 @@ class RobotAgentRuntime:
                 task = asyncio.create_task(self._execute_and_report(message))
                 self._command_tasks.add(task)
                 task.add_done_callback(
-                    lambda completed: self._tracked_task_completed(
-                        completed, self._command_tasks
-                    )
+                    lambda completed: self._tracked_task_completed(completed, self._command_tasks)
                 )
                 await asyncio.sleep(0)
                 return None
@@ -804,6 +809,8 @@ class RobotAgentRuntime:
 
     def _on_ros_state(self, path: str, value: Any, observed_at: datetime) -> None:
         self._state.update(path, value, observed_at=observed_at)
+        with self._state_freshness_lock:
+            self._state_received_monotonic[path] = time.monotonic()
 
     def _on_ros_feedback(self, command_id: UUID, feedback: dict[str, Any]) -> None:
         loop = self._event_loop
@@ -918,12 +925,318 @@ class RobotAgentRuntime:
         if self._closed:
             return
         self._closed = True
+        self.ready.clear()
         await self._ros.close()
         await asyncio.to_thread(self._ledger.close)
+
+    async def diagnostics_snapshot(self) -> dict[str, Any]:
+        """Build one fail-closed, redacted view for the local diagnostics API."""
+        async with self._diagnostics_lock:
+            return await self._diagnostics_snapshot_locked()
+
+    async def _diagnostics_snapshot_locked(self) -> dict[str, Any]:
+        probe_lifecycle_ready = self._initialized and not self._closed
+        ros_ready = False
+        ros_reason: str | None = "runtime_not_initialized"
+        if probe_lifecycle_ready:
+            try:
+                self._ros.check_health()
+            except Exception as exc:
+                ros_reason = f"ros_executor_unavailable:{type(exc).__name__}"
+            else:
+                ros_ready = True
+                ros_reason = None
+
+        nav2_commands = {
+            skill_id: command
+            for skill_id, command in self.config.commands.items()
+            if command.goal_transform in {"navigate_to_pose_v1", "nav2_spin_v2"}
+        }
+        nav2_results: dict[str, RosActionReadiness] = {}
+        nav2_probe_reason: str | None = None
+        if nav2_commands and ros_ready:
+            try:
+                nav2_results = await asyncio.wait_for(
+                    self._ros.nav2_action_readiness(nav2_commands),
+                    timeout=self.config.diagnostics.probe_timeout_ms / 1_000.0,
+                )
+            except asyncio.TimeoutError:
+                nav2_probe_reason = "nav2_probe_timed_out"
+            except Exception as exc:
+                nav2_probe_reason = f"nav2_probe_failed:{type(exc).__name__}"
+        elif nav2_commands:
+            nav2_probe_reason = "ros_executor_unavailable"
+        observed_at = _now()
+        monotonic_now = time.monotonic()
+        lifecycle_ready = self._initialized and not self._closed
+        session_snapshot = self._session.snapshot
+        connection_session_id = self._connection_session_id
+        transport_ready = (
+            lifecycle_ready
+            and connection_session_id is not None
+            and session_snapshot.session_id == connection_session_id
+        )
+        lease_remaining_ms = (
+            None
+            if session_snapshot.lease_deadline is None
+            else (session_snapshot.lease_deadline - observed_at).total_seconds() * 1_000.0
+        )
+        control_ready = (
+            transport_ready
+            and session_snapshot.state.value == "ACTIVE"
+            and lease_remaining_ms is not None
+            and lease_remaining_ms > 0
+        )
+        if session_snapshot.state.value != "ACTIVE":
+            control_reason = "control_not_active"
+        elif lease_remaining_ms is None or lease_remaining_ms <= 0:
+            control_reason = "control_lease_expired"
+        elif not transport_ready:
+            control_reason = "transport_session_unavailable"
+        else:
+            control_reason = None
+        if ros_ready:
+            try:
+                self._ros.check_health()
+            except Exception as exc:
+                ros_ready = False
+                ros_reason = f"ros_executor_unavailable:{type(exc).__name__}"
+
+        nav2_actions: dict[str, dict[str, Any]] = {}
+        for skill_id in sorted(nav2_commands):
+            result = nav2_results.get(skill_id)
+            nav2_actions[skill_id] = {
+                "ready": False if result is None else result.ready,
+                "reason": (
+                    result.reason
+                    if result is not None
+                    else nav2_probe_reason or "nav2_probe_incomplete"
+                ),
+            }
+        nav2_required = bool(nav2_commands)
+        nav2_ready = bool(nav2_actions) and all(
+            bool(action["ready"]) for action in nav2_actions.values()
+        )
+
+        localization_paths = tuple(
+            sorted(
+                path
+                for path in self.config.state_sources
+                if path == "localization" or path.startswith("localization.")
+            )
+        )
+        with self._state_freshness_lock:
+            received = {
+                path: self._state_received_monotonic[path]
+                for path in localization_paths
+                if path in self._state_received_monotonic
+            }
+        localization_complete = bool(localization_paths) and len(received) == len(
+            localization_paths
+        )
+        localization_age_ms = (
+            (monotonic_now - min(received.values())) * 1_000.0 if localization_complete else None
+        )
+        localization_fresh = (
+            localization_age_ms is not None
+            and 0 <= localization_age_ms <= self.config.diagnostics.localization_max_age_ms
+        )
+        localization_required = nav2_required
+        if not localization_paths:
+            localization_reason = "localization_not_configured"
+        elif not localization_complete:
+            localization_reason = "localization_incomplete"
+        elif localization_age_ms is not None and localization_age_ms < 0:
+            localization_reason = "monotonic_clock_regressed"
+        elif not localization_fresh:
+            localization_reason = "localization_stale"
+        else:
+            localization_reason = None
+
+        observation_required = any(
+            command.requires_observation for command in self.config.commands.values()
+        )
+        if self._observation_guard is None:
+            observation = {
+                "ready": False,
+                "status": "DISABLED",
+                "reason": "observation_disabled",
+                "sensorId": None,
+                "localAckAgeMs": None,
+                "healthAgeMs": None,
+                "captureAgeMs": None,
+                "gatewayAckAgeMs": None,
+                "maxAgeMs": self.config.observation.admission_max_age_ms,
+            }
+        else:
+            freshness = self._observation_guard.freshness(monotonic_now=monotonic_now)
+            observation = {
+                "ready": freshness.ready,
+                "status": freshness.status,
+                "reason": freshness.reason,
+                "sensorId": freshness.sensor_id,
+                "localAckAgeMs": _rounded_age(freshness.local_ack_age_ms),
+                "healthAgeMs": _rounded_age(freshness.health_age_ms),
+                "captureAgeMs": _rounded_age(freshness.capture_age_ms),
+                "gatewayAckAgeMs": _rounded_age(freshness.gateway_ack_age_ms),
+                "maxAgeMs": freshness.max_age_ms,
+            }
+
+        checks: dict[str, Any] = {
+            "runtime": {
+                "required": True,
+                "ready": lifecycle_ready,
+                "reason": None if lifecycle_ready else "runtime_not_initialized",
+            },
+            "transportSession": {
+                "required": True,
+                "ready": transport_ready,
+                "reason": None if transport_ready else "transport_session_unavailable",
+            },
+            "control": {
+                "required": True,
+                "ready": control_ready,
+                "state": session_snapshot.state.value,
+                "reason": control_reason,
+                "leaseRemainingMs": _rounded_age(lease_remaining_ms),
+            },
+            "rosExecutor": {
+                "required": True,
+                "ready": ros_ready,
+                "reason": ros_reason,
+            },
+            "nav2Actions": {
+                "required": nav2_required,
+                "ready": nav2_ready,
+                "reason": (
+                    None
+                    if nav2_ready
+                    else nav2_probe_reason or "one_or_more_nav2_actions_unavailable"
+                ),
+                "actions": nav2_actions,
+            },
+            "localization": {
+                "required": localization_required,
+                "ready": localization_fresh,
+                "reason": localization_reason,
+                "ageMs": _rounded_age(localization_age_ms),
+                "maxAgeMs": self.config.diagnostics.localization_max_age_ms,
+                "configuredPaths": list(localization_paths),
+                "observedPaths": sorted(received),
+            },
+            "observation": {
+                "required": observation_required,
+                **observation,
+            },
+        }
+        ready = all(bool(check["ready"]) for check in checks.values() if bool(check["required"]))
+        return {
+            "schemaVersion": "robot-agent.diagnostics/1",
+            "robotId": self.config.robot_id,
+            "robotBootId": str(self._boot_id),
+            "observedAt": observed_at.isoformat(),
+            "ready": ready,
+            "checks": checks,
+        }
+
+    async def capabilities_snapshot(self) -> dict[str, Any]:
+        """Return configured capability metadata without schemas or credentials."""
+        diagnostics = await self.diagnostics_snapshot()
+        nav2_actions = diagnostics["checks"]["nav2Actions"]["actions"]
+        descriptors = (
+            {
+                descriptor.skillId: descriptor
+                for descriptor in self._capability_manifest.capabilities
+            }
+            if self._capability_manifest is not None
+            else {}
+        )
+        capabilities: list[dict[str, Any]] = []
+        for skill_id, command in sorted(self.config.commands.items()):
+            descriptor = descriptors.get(skill_id)
+            endpoint = nav2_actions.get(skill_id)
+            executor = (
+                descriptor.executor
+                if descriptor is not None
+                else "nav2"
+                if command.goal_transform in {"navigate_to_pose_v1", "nav2_spin_v2"}
+                else "ros_action"
+                if command.adapter == "action"
+                else "ros_service"
+            )
+            capabilities.append(
+                {
+                    "skillId": skill_id,
+                    "skillVersion": command.skill_version,
+                    "description": command.description,
+                    "kind": command.capability_kind,
+                    "riskLevel": command.risk_level,
+                    "executor": executor,
+                    "executorProfile": (
+                        descriptor.executorProfile
+                        if descriptor is not None
+                        else command.executor_profile
+                    ),
+                    "cancellable": (
+                        command.adapter == "action"
+                        if command.cancellable is None
+                        else command.cancellable
+                    ),
+                    "interruptible": (
+                        command.adapter == "action"
+                        if command.interruptible is None
+                        else command.interruptible
+                    ),
+                    "timeoutMs": command.timeout_ms,
+                    "resources": list(command.resources),
+                    "requiredSensorIds": list(command.observation_sensor_ids),
+                    "endpointReady": None if endpoint is None else endpoint["ready"],
+                    "endpointReason": None if endpoint is None else endpoint["reason"],
+                }
+            )
+        profile = self.config.robot_profile
+        return {
+            "schemaVersion": "robot-agent.capabilities/1",
+            "robotId": self.config.robot_id,
+            "robotBootId": str(self._boot_id),
+            "observedAt": diagnostics["observedAt"],
+            "capabilitiesDigest": (
+                self._capability_manifest.manifestDigest
+                if self._capability_manifest is not None
+                else self.config.capabilities_digest
+            ),
+            "robotProfile": (
+                None
+                if profile is None
+                else {
+                    "baseType": profile.base_type,
+                    "headMotion": profile.head_motion,
+                    "mapFrameId": profile.map_frame_id,
+                    "baseFrameId": profile.base_frame_id,
+                    "sensors": [
+                        {
+                            "sensorId": sensor.sensor_id,
+                            "kind": sensor.kind,
+                            "frameId": sensor.frame_id,
+                            "fixedMount": sensor.fixed_mount,
+                            "depthCapable": sensor.depth_capable,
+                        }
+                        for sensor in profile.sensors
+                    ],
+                }
+            ),
+            "capabilities": capabilities,
+        }
 
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _rounded_age(value: float | None) -> float | None:
+    if value is None or not math.isfinite(value):
+        return None
+    return round(value, 3)
 
 
 def _safety_code(reason: str) -> str:

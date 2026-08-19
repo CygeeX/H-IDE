@@ -66,6 +66,40 @@ journalctl -u robot-observation-gateway -f -o cat
 
 日志是一行一个 JSON 对象，可按 `robot_id`、`session_id`、`command_id` 和 `event_code` 索引。`doctor` 是只读命令，不会创建台账或调用 ROS 接口。
 
+## 只读运行诊断 API
+
+`diagnostics.enabled` 缺省为 `false`；生产模板也保持关闭。启用时 `host` 必须是字面量
+loopback IP，不能配置为 `0.0.0.0`、LAN 地址或主机名。该端口没有控制接口、CORS 或图像
+输出，不应通过反向代理直接暴露给浏览器；H-IDE 开发者页应由同机后端读取并按自己的
+登录/RBAC 规则转发必要字段。
+
+四个 GET 端点为：
+
+- `/healthz`：只证明 HTTP 进程仍存活，不读取 ROS、会话或传感器状态。
+- `/readyz`：聚合可执行就绪度；任一必需检查失败即返回 503。
+- `/v1/diagnostics`：始终返回当前检查明细，未就绪时仍为 200，便于定位故障。
+- `/v1/capabilities`：返回经过删减的能力、执行器和传感器元数据，不返回配置文件、TLS
+  路径/密钥、命令参数 Schema、原始状态或图像。
+
+`/readyz` 不把“进程启动成功”误报为可控制。它要求 runtime 完成初始化、工作站 transport
+握手存在、控制状态为 `ACTIVE`、ROS executor 可接受请求、所有配置的 Nav2 Action server
+可发现、每个配置的 `localization.*` 字段都在 `localization_max_age_ms` 内更新，以及所有
+`requires_observation` 能力具有不超过 `admission_max_age_ms` 的 `USABLE` accepted ACK。
+因此启动后尚未取得控制权或视觉尚未出首帧时返回 503 是预期行为。
+
+本地配置显式使用 `127.0.0.1:8795`，MuJoCo 配置使用 `127.0.0.1:8796`，避免两套 Agent
+同时开发时冲突。生产若部署同机 H-IDE 代理，可在评审后设置：
+
+```yaml
+diagnostics:
+  enabled: true
+  host: 127.0.0.1
+  port: 8795
+  request_timeout_ms: 1000
+  probe_timeout_ms: 500
+  localization_max_age_ms: 1000
+```
+
 `storage.retention_days` 是命令幂等窗口：Agent 启动时先把遗留非终态命令标记为
 `ABORTED_AGENT_RESTART`，随后在启动阶段和运行期间周期性删除超过该窗口的终态
 命令及其转移历史；非终态记录永不被保留期清理。

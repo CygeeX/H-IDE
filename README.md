@@ -115,6 +115,11 @@ PYTHONPATH=src/robot_agent:${PYTHONPATH} .venv/bin/python -m robot_agent.cli doc
   --config src/robot_agent/config/robot_agent.local.yaml
 ```
 
+本地 profile 还会在 `127.0.0.1:8795` 启动只读运行诊断 API；MuJoCo profile 使用
+`127.0.0.1:8796`。`/healthz` 只表示进程仍可响应，`/readyz` 只有在控制会话、ROS
+executor、全部 Nav2 Action、定位和观测均可执行时才返回 200。详细字段及生产启用方式见
+[运维与部署](docs/operations.md#只读运行诊断-api)。
+
 ## 验证
 
 ```bash

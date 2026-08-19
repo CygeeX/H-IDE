@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from robot_agent.config import ConfigLoadError, load_config
+from robot_agent.diagnostics_api import DiagnosticsApiServer
 from robot_agent.doctor import collect_diagnostics
 from robot_agent.logging_utils import configure_logging
 from robot_agent.runtime import RobotAgentRuntime
@@ -75,28 +76,37 @@ async def _run(config: Any) -> int:
             loop.add_signal_handler(signum, stop.set)
 
     runtime = RobotAgentRuntime(config)
-    runtime_task = asyncio.create_task(runtime.run(stop))
-    ready_task = asyncio.create_task(runtime.ready.wait())
-    done, _ = await asyncio.wait(
-        {runtime_task, ready_task},
-        return_when=asyncio.FIRST_COMPLETED,
-    )
-    if runtime_task in done:
-        ready_task.cancel()
-        await asyncio.gather(ready_task, return_exceptions=True)
-        await runtime_task
-        return 0
-
-    notify("READY=1\nSTATUS=Robot Agent safe core ready")
-    watchdog = asyncio.create_task(watchdog_loop(stop))
+    diagnostics = DiagnosticsApiServer(config.diagnostics, runtime)
+    runtime_task: asyncio.Task[None] | None = None
     try:
-        await runtime_task
+        await diagnostics.start()
+        runtime_task = asyncio.create_task(runtime.run(stop))
+        ready_task = asyncio.create_task(runtime.ready.wait())
+        done, _ = await asyncio.wait(
+            {runtime_task, ready_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if runtime_task in done:
+            ready_task.cancel()
+            await asyncio.gather(ready_task, return_exceptions=True)
+            await runtime_task
+            return 0
+
+        notify("READY=1\nSTATUS=Robot Agent safe core ready")
+        watchdog = asyncio.create_task(watchdog_loop(stop))
+        try:
+            await runtime_task
+        finally:
+            stop.set()
+            watchdog.cancel()
+            await asyncio.gather(watchdog, return_exceptions=True)
+            notify("STOPPING=1\nSTATUS=Robot Agent stopping")
+        return 0
     finally:
         stop.set()
-        watchdog.cancel()
-        await asyncio.gather(watchdog, return_exceptions=True)
-        notify("STOPPING=1\nSTATUS=Robot Agent stopping")
-    return 0
+        await diagnostics.close()
+        if runtime_task is None:
+            await runtime.shutdown()
 
 
 def _print_json(payload: dict[str, Any], *, stream: Any | None = None) -> None:

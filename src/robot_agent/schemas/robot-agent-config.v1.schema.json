@@ -248,6 +248,52 @@
       "title": "CommandConfig",
       "type": "object"
     },
+    "DiagnosticsConfig": {
+      "additionalProperties": false,
+      "description": "Loopback-only, read-only runtime diagnostics endpoint.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "host": {
+          "default": "127.0.0.1",
+          "title": "Host",
+          "type": "string"
+        },
+        "localization_max_age_ms": {
+          "default": 1000,
+          "maximum": 30000,
+          "minimum": 50,
+          "title": "Localization Max Age Ms",
+          "type": "integer"
+        },
+        "port": {
+          "default": 8795,
+          "maximum": 65535,
+          "minimum": 1,
+          "title": "Port",
+          "type": "integer"
+        },
+        "probe_timeout_ms": {
+          "default": 500,
+          "maximum": 5000,
+          "minimum": 50,
+          "title": "Probe Timeout Ms",
+          "type": "integer"
+        },
+        "request_timeout_ms": {
+          "default": 1000,
+          "maximum": 10000,
+          "minimum": 100,
+          "title": "Request Timeout Ms",
+          "type": "integer"
+        }
+      },
+      "title": "DiagnosticsConfig",
+      "type": "object"
+    },
     "JsonValue": {},
     "ObservationConfig": {
       "additionalProperties": false,
@@ -771,6 +817,17 @@
       "minProperties": 1,
       "title": "Commands",
       "type": "object"
+    },
+    "diagnostics": {
+      "$ref": "#/$defs/DiagnosticsConfig",
+      "default": {
+        "enabled": false,
+        "host": "127.0.0.1",
+        "localization_max_age_ms": 1000,
+        "port": 8795,
+        "probe_timeout_ms": 500,
+        "request_timeout_ms": 1000
+      }
     },
     "observation": {
       "$ref": "#/$defs/ObservationConfig",

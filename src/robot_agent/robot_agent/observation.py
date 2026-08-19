@@ -43,6 +43,19 @@ class ObservationHealthSample:
 
 
 @dataclass(frozen=True)
+class ObservationFreshnessSnapshot:
+    ready: bool
+    status: str
+    reason: str | None
+    sensor_id: str | None
+    local_ack_age_ms: float | None
+    health_age_ms: float | None
+    capture_age_ms: float | None
+    gateway_ack_age_ms: float | None
+    max_age_ms: int
+
+
+@dataclass(frozen=True)
 class ObservationBinding:
     command_id: UUID
     observation_session_id: str
@@ -125,12 +138,9 @@ class ObservationMonitor:
             self._last_heartbeat_sequence = sample.heartbeat_sequence
             self._sample = sample
             self._sample_received_monotonic = monotonic_now
-            if (
-                self._accepted_key is not None
-                and (
-                    publisher != self._accepted_key[:2]
-                    or sample.observation_session_id != self._accepted_key[2]
-                )
+            if self._accepted_key is not None and (
+                publisher != self._accepted_key[:2]
+                or sample.observation_session_id != self._accepted_key[2]
             ):
                 self._accepted_key = None
                 self._accepted_received_monotonic = None
@@ -154,6 +164,57 @@ class ObservationMonitor:
     def current_sample(self) -> ObservationHealthSample | None:
         with self._lock:
             return self._sample
+
+    def freshness(self, *, monotonic_now: float) -> ObservationFreshnessSnapshot:
+        """Return an ACK-based readiness view without exposing stream identity data."""
+        with self._lock:
+            sample = self._sample
+            accepted_at = self._accepted_received_monotonic
+            sample_received_at = self._sample_received_monotonic
+        maximum = self._config.admission_max_age_ms
+        if sample is None or sample_received_at is None:
+            return ObservationFreshnessSnapshot(
+                ready=False,
+                status="UNAVAILABLE",
+                reason="no_observation_health",
+                sensor_id=None,
+                local_ack_age_ms=None,
+                health_age_ms=None,
+                capture_age_ms=None,
+                gateway_ack_age_ms=None,
+                max_age_ms=maximum,
+            )
+
+        health_age_ms = (monotonic_now - sample_received_at) * 1_000.0
+        local_ack_age_ms = None if accepted_at is None else (monotonic_now - accepted_at) * 1_000.0
+        status = ObservationHealthStatus(sample.status).name
+        capture_age_ms = sample.capture_age_ms if math.isfinite(sample.capture_age_ms) else None
+        gateway_ack_age_ms = sample.ack_age_ms if math.isfinite(sample.ack_age_ms) else None
+
+        reason: str | None = None
+        if health_age_ms < 0 or (local_ack_age_ms is not None and local_ack_age_ms < 0):
+            reason = "monotonic_clock_regressed"
+        elif sample.status != ObservationHealthStatus.USABLE:
+            reason = "observation_not_usable"
+        elif local_ack_age_ms is None:
+            reason = "no_accepted_observation_ack"
+        elif local_ack_age_ms > maximum:
+            reason = "local_observation_ack_stale"
+        elif gateway_ack_age_ms is None or gateway_ack_age_ms > maximum:
+            reason = "gateway_observation_ack_stale"
+        elif capture_age_ms is None or capture_age_ms > maximum:
+            reason = "observation_capture_stale"
+        return ObservationFreshnessSnapshot(
+            ready=reason is None,
+            status=status,
+            reason=reason,
+            sensor_id=sample.sensor_id,
+            local_ack_age_ms=local_ack_age_ms,
+            health_age_ms=health_age_ms,
+            capture_age_ms=capture_age_ms,
+            gateway_ack_age_ms=gateway_ack_age_ms,
+            max_age_ms=maximum,
+        )
 
     def _valid_sample(
         self,
@@ -186,8 +247,7 @@ class ObservationMonitor:
         ):
             return False
         if sample.has_last_accepted_sequence and (
-            not sample.observation_session_id
-            or sample.last_accepted_monotonic_ns == 0
+            not sample.observation_session_id or sample.last_accepted_monotonic_ns == 0
         ):
             return False
         if status is ObservationHealthStatus.USABLE:
@@ -282,6 +342,9 @@ class ObservationGuard:
 
     def current_health(self) -> ObservationHealthSample | None:
         return self._monitor.current_sample()
+
+    def freshness(self, *, monotonic_now: float) -> ObservationFreshnessSnapshot:
+        return self._monitor.freshness(monotonic_now=monotonic_now)
 
     def admit(
         self,

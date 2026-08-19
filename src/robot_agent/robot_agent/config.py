@@ -47,9 +47,7 @@ def _is_rfc3339_datetime(value: object) -> bool:
     if RFC3339_DATETIME_RE.fullmatch(value) is None:
         return False
     try:
-        normalized = value.removesuffix("Z") + (
-            "+00:00" if value.endswith("Z") else ""
-        )
+        normalized = value.removesuffix("Z") + ("+00:00" if value.endswith("Z") else "")
         parsed = datetime.fromisoformat(normalized)
     except ValueError:
         return False
@@ -115,12 +113,7 @@ class TLSConfig(StrictConfigModel):
     @model_validator(mode="after")
     def validate_material(self) -> TLSConfig:
         if not self.enabled:
-            if (
-                self.ca_file
-                or self.cert_file
-                or self.key_file
-                or self.peer_certificate_sha256
-            ):
+            if self.ca_file or self.cert_file or self.key_file or self.peer_certificate_sha256:
                 raise ValueError("TLS material must not be set when TLS is disabled")
             return self
         missing = [
@@ -210,6 +203,28 @@ class ObservationConfig(StrictConfigModel):
         return self
 
 
+class DiagnosticsConfig(StrictConfigModel):
+    """Loopback-only, read-only runtime diagnostics endpoint."""
+
+    enabled: bool = False
+    host: str = "127.0.0.1"
+    port: int = Field(default=8795, ge=1, le=65_535)
+    request_timeout_ms: int = Field(default=1_000, ge=100, le=10_000)
+    probe_timeout_ms: int = Field(default=500, ge=50, le=5_000)
+    localization_max_age_ms: int = Field(default=1_000, ge=50, le=30_000)
+
+    @field_validator("host")
+    @classmethod
+    def require_literal_loopback(cls, value: str) -> str:
+        try:
+            address = ipaddress.ip_address(value)
+        except ValueError as exc:
+            raise ValueError("diagnostics host must be a literal loopback IP address") from exc
+        if not address.is_loopback:
+            raise ValueError("diagnostics host must be a loopback IP address")
+        return value
+
+
 class CommandConfig(StrictConfigModel):
     adapter: Literal["service", "action"]
     ros_name: str = Field(pattern=ROS_NAME_PATTERN)
@@ -223,9 +238,9 @@ class CommandConfig(StrictConfigModel):
         pattern=r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?$",
     )
     description: str | None = Field(default=None, min_length=1, max_length=512)
-    capability_kind: Literal[
-        "motion", "observation", "manipulation", "safety", "non_motion"
-    ] = "non_motion"
+    capability_kind: Literal["motion", "observation", "manipulation", "safety", "non_motion"] = (
+        "non_motion"
+    )
     risk_level: Literal["low", "medium", "high", "critical"] = "medium"
     cancellable: bool | None = None
     interruptible: bool | None = None
@@ -353,12 +368,9 @@ class CommandConfig(StrictConfigModel):
         elif self.observation_sensor_ids:
             raise ValueError("observation_sensor_ids require requires_observation: true")
         if self.goal_transform == "navigate_to_pose_v1" and (
-            self.adapter != "action"
-            or self.ros_type != "nav2_msgs/action/NavigateToPose"
+            self.adapter != "action" or self.ros_type != "nav2_msgs/action/NavigateToPose"
         ):
-            raise ValueError(
-                "navigate_to_pose_v1 requires nav2_msgs/action/NavigateToPose"
-            )
+            raise ValueError("navigate_to_pose_v1 requires nav2_msgs/action/NavigateToPose")
         if self.goal_transform == "nav2_spin_v2" and (
             self.adapter != "action" or self.ros_type != "nav2_msgs/action/Spin"
         ):
@@ -419,9 +431,7 @@ class RobotProfileConfig(StrictConfigModel):
 
     @field_validator("sensors")
     @classmethod
-    def unique_sensors(
-        cls, value: tuple[RobotSensorConfig, ...]
-    ) -> tuple[RobotSensorConfig, ...]:
+    def unique_sensors(cls, value: tuple[RobotSensorConfig, ...]) -> tuple[RobotSensorConfig, ...]:
         identifiers = [sensor.sensor_id for sensor in value]
         if len(identifiers) != len(set(identifiers)):
             raise ValueError("robot_profile sensor IDs must be unique")
@@ -443,6 +453,7 @@ class AgentConfig(StrictConfigModel):
     state: StateOutputConfig
     safety: SafetyConfig
     observation: ObservationConfig = ObservationConfig()
+    diagnostics: DiagnosticsConfig = DiagnosticsConfig()
     robot_profile: RobotProfileConfig | None = None
     commands: dict[str, CommandConfig] = Field(min_length=1, max_length=256)
     state_sources: dict[str, StateSourceConfig] = Field(default_factory=dict)
@@ -473,9 +484,7 @@ class AgentConfig(StrictConfigModel):
             any(command.requires_observation for command in self.commands.values())
             and not self.observation.enabled
         ):
-            raise ValueError(
-                "commands requiring observation need observation.enabled: true"
-            )
+            raise ValueError("commands requiring observation need observation.enabled: true")
         if self.robot_profile is not None:
             sensor_ids = {sensor.sensor_id for sensor in self.robot_profile.sensors}
             required_sensor_ids = {
@@ -498,14 +507,10 @@ class AgentConfig(StrictConfigModel):
             if not self.tls.enabled:
                 self._validate_plaintext_host(parsed.hostname)
             if self.tls.peer_certificate_sha256 is not None:
-                raise ValueError(
-                    "peer_certificate_sha256 is only valid for server transport"
-                )
+                raise ValueError("peer_certificate_sha256 is only valid for server transport")
         elif self.tls.enabled:
             if self.tls.peer_certificate_sha256 is None:
-                raise ValueError(
-                    "TLS server transport requires peer_certificate_sha256"
-                )
+                raise ValueError("TLS server transport requires peer_certificate_sha256")
         else:
             self._validate_plaintext_host(self.transport.host)
         return self

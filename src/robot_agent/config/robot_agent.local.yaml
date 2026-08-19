@@ -59,6 +59,14 @@ observation:
   admission_max_age_ms: 500
   watchdog_timeout_ms: 750
 
+diagnostics:
+  enabled: true
+  host: 127.0.0.1
+  port: 8795
+  request_timeout_ms: 1000
+  probe_timeout_ms: 500
+  localization_max_age_ms: 1000
+
 commands:
   power.enable:
     adapter: service
