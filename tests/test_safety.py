@@ -288,7 +288,7 @@ def test_goal_progress_guard_ignores_small_detour_and_equivalent_replan():
     assert guard.latched is False
 
 
-def test_static_joint_handoff_holds_idle_then_blends_policy():
+def test_static_joint_handoff_is_binary_hold_or_exact_policy_authority():
     now = [1.0]
     handoff = StaticJointHandoff(joint_count=2, warmup_s=0.3, blend_s=0.4, clock=lambda: now[0])
     idle = handoff.decide(motion_active=False, measured=[1.0, 2.0], policy=[9.0, 9.0])
@@ -297,15 +297,13 @@ def test_static_joint_handoff_holds_idle_then_blends_policy():
 
     now[0] = 2.0
     start = handoff.decide(motion_active=True, measured=[1.1, 2.1], policy=[3.0, 4.0])
-    assert start.targets == pytest.approx((1.0, 2.0))
-    assert start.motion_handoff_active is True
+    assert start.targets == pytest.approx((3.0, 4.0))
+    assert start.handoff_ratio == 1.0
+    assert start.motion_handoff_active is False
     now[0] = 2.5
-    blend = handoff.decide(motion_active=True, measured=[1.2, 2.2], policy=[3.0, 4.0])
-    assert blend.handoff_ratio == pytest.approx(0.5)
-    assert blend.targets == pytest.approx((2.0, 3.0))
-    now[0] = 2.8
-    active = handoff.decide(motion_active=True, measured=[1.3, 2.3], policy=[3.0, 4.0])
-    assert active.targets == pytest.approx((3.0, 4.0))
+    active = handoff.decide(motion_active=True, measured=[1.2, 2.2], policy=[3.1, 3.9])
+    assert active.handoff_ratio == 1.0
+    assert active.targets == pytest.approx((3.1, 3.9))
     assert active.motion_handoff_active is False
 
     stopped = handoff.decide(motion_active=False, measured=[2.8, 3.8], policy=[0.0, 0.0])
@@ -347,8 +345,8 @@ def test_static_joint_handoff_freezes_published_preload_without_reanchoring():
         policy=[1.50, 1.50],
         now=10.0,
     )
-    assert started.handoff_ratio == 0.0
-    assert started.targets == pytest.approx((1.10, 1.90))
+    assert started.handoff_ratio == 1.0
+    assert started.targets == pytest.approx((1.50, 1.50))
 
 
 def test_cmd_vel_is_bounded_and_converted_to_slow_walk():
@@ -594,32 +592,35 @@ def test_cmd_vel_guard_uses_wall_age_but_simulation_dt_for_facing_integration():
     assert stale.facing_angle_rad == pytest.approx(0.004)
 
 
-def test_navigation_arm_guard_clamps_policy_excursion_and_slew():
+def test_navigation_arm_guard_passes_valid_policy_target_unchanged():
     guard = NavigationArmGuard(
         [0.2, 0.6],
         max_deviation_rad=[0.4, 0.5],
         max_velocity_rps=[1.0, 2.0],
     )
 
-    first = guard.apply([-3.0, 2.0], measured=[0.2, 0.6], dt=0.02)
+    first = guard.apply([0.18, 0.64], measured=[0.2, 0.6], dt=0.02)
     assert first.targets == pytest.approx((0.18, 0.64))
     assert first.max_step_rad == pytest.approx(0.04)
-    assert first.constrained_joints == 2
+    assert first.constrained_joints == 0
 
-    second = guard.apply([-3.0, 2.0], measured=[99.0, 99.0], dt=0.02)
+    second = guard.apply([0.16, 0.68], measured=[99.0, 99.0], dt=0.02)
     assert second.targets == pytest.approx((0.16, 0.68))
-    assert second.constrained_joints == 2
+    assert second.constrained_joints == 0
 
 
-def test_navigation_arm_guard_recovers_from_non_finite_target():
+def test_navigation_arm_guard_rejects_excursion_slew_and_non_finite_target():
     guard = NavigationArmGuard(
         [0.2],
         max_deviation_rad=[0.4],
         max_velocity_rps=[1.0],
     )
-    result = guard.apply([float("nan")], measured=[0.2], dt=0.02)
-    assert result.targets == pytest.approx((0.2,))
-    assert result.constrained_joints == 1
+    with pytest.raises(ValueError, match="finite"):
+        guard.apply([float("nan")], measured=[0.2], dt=0.02)
+    with pytest.raises(ValueError, match="envelope"):
+        guard.apply([0.7], measured=[0.2], dt=0.02)
+    with pytest.raises(ValueError, match="slew"):
+        guard.apply([0.3], measured=[0.2], dt=0.02)
 
 
 def test_navigation_arm_guard_anchors_exact_actuator_preload_before_slew():
@@ -637,10 +638,11 @@ def test_navigation_arm_guard_anchors_exact_actuator_preload_before_slew():
     )
     assert first.targets == pytest.approx((0.30, -0.30))
 
-    # Even an out-of-envelope frozen target is not snapped to the envelope;
-    # recovery begins from the actual actuator boundary at the normal slew cap.
+    # Even an out-of-envelope frozen target is not rewritten.  A policy-provided
+    # recovery target is accepted unchanged only when it moves toward the
+    # envelope at the configured slew cap.
     guard.anchor([0.60, -0.60])
-    recovery = guard.apply([0.0, 0.0], measured=[0.0, 0.0], dt=0.02)
+    recovery = guard.apply([0.58, -0.58], measured=[0.0, 0.0], dt=0.02)
     assert recovery.targets == pytest.approx((0.58, -0.58))
 
 

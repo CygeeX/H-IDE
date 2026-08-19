@@ -678,15 +678,18 @@ class JointCommandDecision:
 
 
 class StaticJointHandoff:
-    """Hold measured joints at rest and blend safely into SONIC locomotion.
+    """Select either an exact static hold or an authority-owned policy target.
 
     SONIC's learned ``IDLE`` clip is a posture transition, not a zero-motion
     actuator command.  The simulation bridge therefore latches measured joints
-    whenever Nav2 is idle, while still allowing the neural controller to update
-    internally. SONIC's learned IDLE clip is not a zero-displacement brake, so
-    every Nav2 zero/cancel immediately latches the measured posture. On the next
-    Nav2 command the handoff gives the asynchronous planner a short warm-up and
-    blends from the held pose into policy targets.
+    whenever Nav2 is idle.  A policy target is emitted only after the matching
+    reference owns actuator authority, and is then emitted exactly: post-policy
+    blending would create a target the learned controller neither predicted nor
+    records in its action history.
+
+    ``warmup_s`` and ``blend_s`` remain validated constructor inputs solely for
+    configuration compatibility; binary authority deliberately does not use
+    either duration.
     """
 
     def __init__(
@@ -708,7 +711,6 @@ class StaticJointHandoff:
         self.blend_s = float(blend_s)
         self._clock = clock
         self._hold: tuple[float, ...] | None = None
-        self._motion_started_at: float | None = None
         self._active = False
 
     def decide(
@@ -736,31 +738,13 @@ class StaticJointHandoff:
             if self._active or self._hold is None:
                 self._hold = measured_values
             self._active = False
-            self._motion_started_at = None
             return JointCommandDecision(self._hold, True, False, 0.0)
 
-        if not self._active:
-            # Preserve the exact actuator target that was already holding the
-            # robot while the asynchronous planner was preparing this
-            # reference.  Re-anchoring to the measured joint angles here would
-            # erase the small PD preload that balances gravity and create a
-            # target discontinuity on the first motion-authorized frame.
-            if self._hold is None:
-                self._hold = measured_values
-            self._motion_started_at = current
-            self._active = True
-        assert self._hold is not None and self._motion_started_at is not None
-        elapsed = max(0.0, current - self._motion_started_at)
-        ratio = min(1.0, max(0.0, (elapsed - self.warmup_s) / self.blend_s))
-        targets = tuple(
-            held * (1.0 - ratio) + planned * ratio
-            for held, planned in zip(self._hold, policy_values, strict=True)
-        )
-        return JointCommandDecision(targets, False, ratio < 1.0, ratio)
+        self._active = True
+        return JointCommandDecision(policy_values, False, False, 1.0)
 
     def reset(self) -> None:
         self._hold = None
-        self._motion_started_at = None
         self._active = False
 
     def freeze(self, targets: Sequence[float]) -> None:
@@ -774,7 +758,6 @@ class StaticJointHandoff:
         """
 
         self._hold = self._validate(targets, "frozen")
-        self._motion_started_at = None
         self._active = False
 
     def _validate(self, values: Sequence[float], label: str) -> tuple[float, ...]:
@@ -1173,13 +1156,14 @@ class JointGuardResult:
 
 
 class NavigationArmGuard:
-    """Keep SONIC arm targets inside the navigation-only safety envelope.
+    """Verify SONIC arm targets without rewriting learned-controller output.
 
     SONIC is a whole-body policy, so even a Nav2 walking command can produce
     targets for all fourteen arm joints.  H-IDE's current simulation profile
     has no manipulation capability; large upper-body excursions are therefore
-    neither required nor safe.  This guard preserves a small counter-swing,
-    while bounding absolute travel and per-tick slew after policy inference.
+    neither required nor safe.  This guard rejects non-finite, out-of-envelope,
+    or discontinuous policy targets.  A valid target passes through bit-for-bit
+    (after float conversion), so executed-action feedback matches DDS exactly.
 
     It deliberately runs *after* SONIC and before ``rt/lowcmd``.  The lower
     body and waist remain untouched, and this guard cannot create motion on its
@@ -1224,51 +1208,45 @@ class NavigationArmGuard:
         if not math.isfinite(float(dt)) or dt <= 0:
             raise ValueError("arm guard dt must be finite and positive")
 
+        raw_targets = tuple(float(value) for value in targets)
+        if not all(math.isfinite(value) for value in raw_targets):
+            raise ValueError("arm policy targets must be finite")
         if self._last is None:
             initial = measured if measured is not None else self.nominal
-            anchor = tuple(
-                self._clamp_to_envelope(float(value), index)
-                if math.isfinite(float(value))
-                else self.nominal[index]
-                for index, value in enumerate(initial)
-            )
+            anchor = tuple(float(value) for value in initial)
+            if not all(math.isfinite(value) for value in anchor):
+                raise ValueError("arm verifier anchor must be finite")
         else:
             anchor = self._last
 
-        guarded: list[float] = []
-        constrained = 0
         max_step = 0.0
-        for index, raw_value in enumerate(targets):
-            raw = float(raw_value)
-            if not math.isfinite(raw):
-                raw = self.nominal[index]
-                constrained += 1
-            bounded = self._clamp_to_envelope(raw, index)
-            if not math.isclose(bounded, raw, rel_tol=0.0, abs_tol=1e-9):
-                constrained += 1
+        for index, raw in enumerate(raw_targets):
+            if not self._within_envelope_or_recovering(raw, anchor[index], index):
+                raise ValueError(
+                    f"arm policy target {index} exceeds the navigation envelope"
+                )
             allowed_step = self.max_velocity_rps[index] * float(dt)
-            delta = bounded - anchor[index]
-            step = max(-allowed_step, min(allowed_step, delta))
-            if not math.isclose(step, delta, rel_tol=0.0, abs_tol=1e-9):
-                constrained += 1
-            guarded.append(anchor[index] + step)
+            step = raw - anchor[index]
+            if abs(step) > allowed_step + 1e-9:
+                raise ValueError(
+                    f"arm policy target {index} exceeds the per-tick slew limit"
+                )
             max_step = max(max_step, abs(step))
 
-        self._last = tuple(guarded)
-        return JointGuardResult(self._last, min(constrained, len(self.nominal)), max_step)
+        self._last = raw_targets
+        return JointGuardResult(self._last, 0, max_step)
 
     def reset(self) -> None:
         self._last = None
 
     def anchor(self, targets: Sequence[float]) -> None:
-        """Seed slew limiting from the exact actuator-side arm targets.
+        """Seed verification from the exact actuator-side arm targets.
 
         A planner handoff freezes the complete last-published 29-DoF command.
         The arm limiter must therefore start from those fourteen actuator
-        targets as well, not from lagging measured angles.  The anchor is kept
-        exact even when it lies outside the nominal envelope; the next policy
-        sample can only move it back toward that envelope at the configured
-        per-tick velocity limit.
+        targets as well, not from lagging measured angles.  An anchor already
+        outside the nominal envelope may only stay fixed or recover toward it,
+        within the configured per-tick velocity limit.
         """
 
         values = tuple(float(value) for value in targets)
@@ -1278,7 +1256,20 @@ class NavigationArmGuard:
             raise ValueError("arm anchor vector must be finite")
         self._last = values
 
-    def _clamp_to_envelope(self, value: float, index: int) -> float:
+    def _within_envelope_or_recovering(
+        self,
+        value: float,
+        anchor: float,
+        index: int,
+    ) -> bool:
         center = self.nominal[index]
         radius = self.max_deviation_rad[index]
-        return max(center - radius, min(center + radius, value))
+        lower = center - radius
+        upper = center + radius
+        if lower <= value <= upper:
+            return True
+        if anchor > upper:
+            return upper < value <= anchor
+        if anchor < lower:
+            return anchor <= value < lower
+        return False

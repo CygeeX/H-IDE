@@ -815,11 +815,11 @@ def test_actual_29dof_dds_targets_are_continuous_at_start_replan_and_stop() -> N
     driver, writes = _publishing_driver(clock)
     initial = tuple(float(value) for value in DEFAULT_ANGLES)
     measured = _lowstate(initial, arm_lag_rad=0.50)
-    policy = tuple(value + 0.40 for value in initial)
+    policy = tuple(value + 0.02 for value in initial)
     driver._last_published_targets = initial
 
-    # First required reference: ratio zero must cross the real publish path as
-    # the complete frozen 29-DoF target, even though measured arms lag by 0.5rad.
+    # A granted reference crosses the real publish path unchanged.  The exact
+    # frozen boundary seeds the verifier even though measured arms lag by 0.5rad.
     assert driver._freeze_planner_handoff_boundary() is True
     first = driver._joint_handoff.decide(
         motion_active=True,
@@ -828,19 +828,19 @@ def test_actual_29dof_dds_targets_are_continuous_at_start_replan_and_stop() -> N
         policy=policy,
         now=1.0,
     )
-    assert first.handoff_ratio == 0.0
+    assert first.handoff_ratio == 1.0
     published = driver._publish(
         _action(driver, first.targets),
         measured,
         control_dt_s=0.02,
         constrain_arms=True,
     )
-    assert published == pytest.approx(initial)
-    assert writes[-1] == pytest.approx(initial)
+    assert published == pytest.approx(policy)
+    assert writes[-1] == pytest.approx(policy)
 
-    # A mid-gait required generation freezes the last actual DDS command. Both
-    # the waiting frame and the newly accepted reference's ratio-zero frame are
-    # identical at all 29 actuators; the following blend advances smoothly.
+    # A mid-gait required generation freezes the last actual DDS command while
+    # waiting. Once authority is granted, the policy owns the complete target;
+    # no post-policy blend creates an unrecorded synthetic action.
     assert driver._freeze_planner_handoff_boundary() is True
     waiting = driver._joint_handoff.decide(
         motion_active=True,
@@ -871,36 +871,36 @@ def test_actual_29dof_dds_targets_are_continuous_at_start_replan_and_stop() -> N
         control_dt_s=0.02,
         constrain_arms=True,
     )
-    assert admitted.handoff_ratio == 0.0
-    assert admitted_published == pytest.approx(waiting_published)
-    assert writes[-1] == pytest.approx(waiting_published)
+    assert admitted.handoff_ratio == 1.0
+    assert admitted_published == pytest.approx(policy)
+    assert writes[-1] == pytest.approx(policy)
 
-    blended = driver._joint_handoff.decide(
+    continued = driver._joint_handoff.decide(
         motion_active=True,
         reference_ready=True,
         measured=tuple(state.q for state in measured.motor_state),
         policy=policy,
         now=2.47,
     )
-    blended_published = driver._publish(
-        _action(driver, blended.targets),
+    continued_published = driver._publish(
+        _action(driver, continued.targets),
         measured,
         control_dt_s=0.02,
         constrain_arms=True,
     )
-    assert 0.0 < blended.handoff_ratio < 1.0
-    assert blended_published == pytest.approx(blended.targets)
-    assert writes[-1] == pytest.approx(blended.targets)
+    assert continued.handoff_ratio == 1.0
+    assert continued_published == pytest.approx(continued.targets)
+    assert writes[-1] == pytest.approx(continued.targets)
 
     # A stop racing the policy path freezes and republishes the exact last DDS
     # vector rather than any measured position.
     assert driver._freeze_last_published_hold() is True
     stopped_measurement = _lowstate(
-        tuple(value - 0.30 for value in blended_published)
+        tuple(value - 0.30 for value in continued_published)
     )
     driver._publish_frozen_hold(stopped_measurement)
-    assert writes[-1] == pytest.approx(blended_published)
-    assert driver._last_published_targets == pytest.approx(blended_published)
+    assert writes[-1] == pytest.approx(continued_published)
+    assert driver._last_published_targets == pytest.approx(continued_published)
 
 
 def test_local_idle_watchdog_transition_freezes_actual_29dof_dds_target() -> None:
@@ -1065,8 +1065,8 @@ def test_mid_gait_replan_reject_wait_accept_and_bad_refresh_use_actual_dds_bound
     assert waiting.handoff_ratio == 0.0
     assert waiting_published == pytest.approx(active_published)
 
-    # The matching -X generation unlocks only a new ratio-zero frame, then
-    # blends from the same frozen actuator boundary.
+    # The matching -X generation transfers binary authority to the exact policy
+    # target; the actuator verifier observes it but does not blend or rewrite it.
     planner.request_replan(7, _PlannerState(math.pi))
     planner.result = (_planner_motion(-0.50), 17)
     assert planner.try_get_new_motion() is not None
@@ -1083,8 +1083,8 @@ def test_mid_gait_replan_reject_wait_accept_and_bad_refresh_use_actual_dds_bound
         control_dt_s=0.02,
         constrain_arms=True,
     )
-    assert admitted.handoff_ratio == 0.0
-    assert admitted_published == pytest.approx(active_published)
+    assert admitted.handoff_ratio == 1.0
+    assert admitted_published == pytest.approx(admitted.targets)
 
     new_policy_target = tuple(value - 0.01 for value in active_target)
     blended = driver._joint_handoff.decide(
