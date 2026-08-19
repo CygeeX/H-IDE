@@ -46,6 +46,12 @@ class TelemetryState:
     motion_handoff_active: bool = False
     motion_handoff_ratio: float = 0.0
     plant_support_mode: str = "unknown"
+    plant_support_requested_mode: str = "unknown"
+    plant_support_confirmed_mode: str = "unknown"
+    plant_support_stop_pending: bool = False
+    plant_support_safety_latched: bool = False
+    plant_support_stop_generation: int | None = None
+    plant_support_rearm_generation: int | None = None
     pose: dict[str, float] = field(default_factory=lambda: {"x": 0.0, "y": 0.0, "z": 0.0, "yaw": 0.0})
     joint_target_nonzero: bool = False
     navigation_arm_guard_active: bool = True

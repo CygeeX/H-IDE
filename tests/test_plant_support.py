@@ -48,6 +48,37 @@ def test_support_controller_fault_terminates_instead_of_resetting() -> None:
         support.require_healthy()
 
 
+def test_safety_stop_is_sticky_until_strictly_newer_explicit_rearm() -> None:
+    support = PlantSupportController()
+    support.finish_startup()
+    assert support.set_mode("safety_stop") == "safety_stop"
+    state = support.state()
+    assert state["safetyStopLatched"] is True
+    assert state["safetyStopEpoch"] == 1
+
+    for mode in ("idle", "locomotion"):
+        with pytest.raises(ValueError, match="explicit control rearm"):
+            support.set_mode(mode)
+    assert support.state()["mode"] == "safety_stop"
+
+    assert support.rearm(101) == "idle"
+    assert support.state()["lastRearmGeneration"] == 101
+    assert support.set_mode("locomotion") == "locomotion"
+    assert support.set_mode("safety_stop") == "safety_stop"
+    with pytest.raises(ValueError, match="strictly newer"):
+        support.rearm(101)
+    assert support.rearm(102) == "idle"
+
+
+def test_physics_fault_cannot_be_rearmed_online() -> None:
+    support = PlantSupportController()
+    support.latch_fault("physics invalid")
+
+    with pytest.raises(ValueError, match="physics fault is latched"):
+        support.rearm(1)
+    assert support.state()["mode"] == "safety_stop"
+
+
 def test_locomotion_keeps_vertical_roll_and_pitch_fall_arrest() -> None:
     raw = np.asarray([10.0, 20.0, 30.0, 40.0, 50.0, 60.0])
     pose = np.zeros(13)

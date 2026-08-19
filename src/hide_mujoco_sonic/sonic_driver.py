@@ -12,6 +12,7 @@ from collections import deque
 import copy
 from dataclasses import dataclass
 import hashlib
+import json
 import logging
 import math
 import os
@@ -19,7 +20,6 @@ from pathlib import Path
 import threading
 import time
 from typing import Any
-from urllib import request
 
 from .config import SimConfig
 from .network import require_loopback_bind_host
@@ -39,7 +39,7 @@ from .telemetry import (
     TelemetryStore,
     serve_telemetry,
 )
-from .transport import parse_lines
+from .transport import parse_lines, rearm_plant_support, set_plant_support
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +93,7 @@ class IngressDecision:
     wz: float = 0.0
     heading_yaw: float | None = None
     reason: str | None = None
+    arm_acknowledged: bool = False
 
 
 class SonicIntentIngress:
@@ -115,6 +116,35 @@ class SonicIntentIngress:
         self.generation: int | None = None
         self.sequence = 0
         self.armed = False
+        self.support_stop_generation: int | None = None
+
+    def revoke(self) -> None:
+        """Drop motion authority without manufacturing a new generation."""
+
+        self.armed = False
+
+    def latch_support_stop(self) -> int:
+        """Record the generation stopped by an externally confirmed Plant latch."""
+
+        stopped = 0 if self.generation is None else self.generation
+        if self.support_stop_generation is None:
+            self.support_stop_generation = stopped
+        else:
+            self.support_stop_generation = max(
+                self.support_stop_generation, stopped
+            )
+        self.armed = False
+        return self.support_stop_generation
+
+    def confirm_support_rearm(self, generation: int) -> None:
+        if (
+            self.support_stop_generation is None
+            or generation <= self.support_stop_generation
+            or generation != self.generation
+            or not self.armed
+        ):
+            raise ValueError("support rearm confirmation does not match the armed generation")
+        self.support_stop_generation = None
 
     @staticmethod
     def _integer(value: object, *, minimum: int) -> int:
@@ -160,6 +190,9 @@ class SonicIntentIngress:
             raise ValueError("intent safety flags must be booleans")
         if payload.get("mode") not in {"IDLE", "SLOW_WALK"}:
             raise ValueError("unsupported SONIC mode")
+        control_arm = payload.get("control_arm", False)
+        if not isinstance(control_arm, bool):
+            raise ValueError("control_arm must be a boolean")
 
         head_yaw = self._finite(payload, "head_yaw_rad")
         head_pitch = self._finite(payload, "head_pitch_rad")
@@ -188,19 +221,37 @@ class SonicIntentIngress:
         # malformed non-zero tail on a stop envelope can therefore never reach
         # CmdVelGuard or the learned model.
         if stop_requested or not motion_enabled:
-            self.armed = (
+            arm_candidate = (
                 state == "IDLE"
                 and not stop_requested
                 and bool(stop_acknowledged)
             )
+            reason = str(payload["reason"]) if payload.get("reason") else None
+            if control_arm and not arm_candidate:
+                raise ValueError(
+                    "control_arm requires a stopped, acknowledged IDLE intent"
+                )
+            if self.support_stop_generation is not None:
+                if not control_arm:
+                    arm_candidate = False
+                    reason = "plant safety_stop requires explicit control.acquire rearm"
+                elif generation <= self.support_stop_generation:
+                    arm_candidate = False
+                    reason = "control rearm requires a strictly newer generation"
+            was_armed = self.armed
+            self.armed = arm_candidate
             return IngressDecision(
                 "stop",
                 generation,
                 sequence,
                 state,
                 heading_yaw=heading,
-                reason=(str(payload["reason"]) if payload.get("reason") else None),
+                reason=reason,
+                arm_acknowledged=(arm_candidate and not was_armed),
             )
+
+        if control_arm:
+            raise ValueError("control_arm cannot carry motion")
 
         if not self.armed:
             return IngressDecision(
@@ -286,6 +337,10 @@ class SonicDriver:
         )
         self._static_hold_active = True
         self._plant_support_mode: str | None = None
+        self._plant_support_stop_pending = False
+        self._plant_support_safety_latched = False
+        self._plant_support_stop_generation: int | None = None
+        self._support_lock = threading.RLock()
 
         # These imports are intentionally lazy: `check` and safety tests must
         # work without ROS/Unitree SDK/ONNX installed.
@@ -807,38 +862,250 @@ class SonicDriver:
             with condition:
                 condition.notify_all()
 
-    def _set_plant_support_mode(self, mode: str) -> bool:
-        """Switch only MuJoCo's fall-arrest profile over loopback.
+    def _latch_plant_support_stop(self, *, reason: str) -> int:
+        """Synchronize an externally confirmed Plant stop into SONIC.
 
-        The endpoint has no qpos/qvel or navigation controls.  A failed release
-        therefore prevents policy locomotion instead of silently walking while
-        the simulator tether is in an unknown state.
+        This method never releases support.  It invalidates the current ingress
+        authority and records the stopped generation so periodic IDLE traffic,
+        an old ``/cmd_vel``, or a bridge reconnect cannot clear the latch.
         """
 
-        if mode == self._plant_support_mode:
-            return True
-        body = (f'{{"mode":"{mode}"}}').encode("utf-8")
-        http_request = request.Request(
-            f"http://127.0.0.1:{self.config.plant_port}/support",
-            data=body,
-            headers={"Content-Type": "application/json"},
-            method="POST",
+        with self._support_lock:
+            stopped_generation = self._intent_ingress.latch_support_stop()
+            self._plant_support_mode = "safety_stop"
+            self._plant_support_stop_pending = False
+            self._plant_support_safety_latched = True
+            self._plant_support_stop_generation = stopped_generation
+        self.guard.stop(source="plant_safety_stop")
+        self._navigation_task_active = False
+        self._joint_handoff.reset()
+        self._arm_guard.reset()
+        self.telemetry.update(
+            nav2_state="safety_stop",
+            navigation_task_active=False,
+            last_cmd_vx=0.0,
+            last_cmd_vy=0.0,
+            last_cmd_wz=0.0,
+            static_hold_active=True,
+            plant_support_mode="safety_stop",
+            plant_support_requested_mode="safety_stop",
+            plant_support_confirmed_mode="safety_stop",
+            plant_support_stop_pending=False,
+            plant_support_safety_latched=True,
+            plant_support_stop_generation=stopped_generation,
+            last_error=reason,
         )
+        return stopped_generation
+
+    def _ensure_plant_support_stopped(self, *, reason: str) -> bool:
+        """Strengthen Plant support after an uncertain/racing transition.
+
+        A lost HTTP acknowledgement can mean that a rearm reached the Plant
+        even though SONIC saw a timeout.  Always issue the stronger idempotent
+        safety transition before reporting failure.  If that confirmation is
+        also unavailable, software authority remains revoked and telemetry
+        reports the Plant as unavailable rather than guessing its state.
+        """
+
         try:
-            with request.urlopen(http_request, timeout=0.20) as response:
-                if response.status != 200:
-                    raise RuntimeError(
-                        f"plant support endpoint returned {response.status}"
+            state = set_plant_support(
+                "127.0.0.1",
+                self.config.plant_port,
+                "safety_stop",
+                timeout=0.30,
+            )
+            if state.get("mode") != "safety_stop":
+                raise RuntimeError("Plant did not confirm safety_stop")
+        except Exception as exc:
+            with self._support_lock:
+                stopped_generation = self._intent_ingress.latch_support_stop()
+                self._plant_support_mode = None
+                self._plant_support_stop_pending = True
+                self._plant_support_safety_latched = True
+                self._plant_support_stop_generation = stopped_generation
+            self.guard.stop(source="plant_safety_stop_unconfirmed")
+            self._navigation_task_active = False
+            self._joint_handoff.reset()
+            self._arm_guard.reset()
+            self.telemetry.update(
+                nav2_state="safety_stop",
+                navigation_task_active=False,
+                last_cmd_vx=0.0,
+                last_cmd_vy=0.0,
+                last_cmd_wz=0.0,
+                static_hold_active=True,
+                plant_support_mode="unavailable",
+                plant_support_requested_mode="safety_stop",
+                plant_support_confirmed_mode="unavailable",
+                plant_support_stop_pending=True,
+                plant_support_safety_latched=True,
+                plant_support_stop_generation=stopped_generation,
+                last_error=f"{reason}; Plant safety-stop confirmation failed: {exc}",
+            )
+            return False
+        self._latch_plant_support_stop(reason=reason)
+        return True
+
+    def _rearm_plant_support(self, generation: int) -> bool:
+        """Confirm one explicit control.acquire rearm, only back to IDLE."""
+
+        with self._support_lock:
+            stopped_generation = self._plant_support_stop_generation
+            if (
+                not self._plant_support_safety_latched
+                or self._plant_support_stop_pending
+                or stopped_generation is None
+                or generation <= stopped_generation
+                or generation != self._intent_ingress.generation
+                or not self._intent_ingress.armed
+            ):
+                self.telemetry.update(
+                    plant_support_mode="safety_stop",
+                    plant_support_requested_mode="idle",
+                    plant_support_confirmed_mode="safety_stop",
+                    plant_support_safety_latched=True,
+                    last_error=(
+                        "plant safety_stop rearm rejected without a strictly "
+                        "newer armed generation"
+                    ),
+                )
+                return False
+        try:
+            state = rearm_plant_support(
+                "127.0.0.1",
+                self.config.plant_port,
+                generation,
+                timeout=0.30,
+            )
+        except Exception as exc:
+            self._ensure_plant_support_stopped(
+                reason=f"MuJoCo support rearm failed: {exc}"
+            )
+            return False
+        with self._support_lock:
+            try:
+                self._intent_ingress.confirm_support_rearm(generation)
+            except ValueError as exc:
+                # The Plant has moved only to IDLE, never locomotion.  Relatch
+                # immediately if the ingress generation changed during the
+                # request; a failed relatch is surfaced as unavailable/faulted
+                # rather than treating the stale release as motion authority.
+                self._ensure_plant_support_stopped(
+                    reason=f"Plant rearm raced ingress: {exc}"
+                )
+                return False
+            self._plant_support_mode = str(state["mode"])
+            self._plant_support_stop_pending = False
+            self._plant_support_safety_latched = False
+            self._plant_support_stop_generation = None
+        self._joint_handoff.reset()
+        self._arm_guard.reset()
+        self.telemetry.update(
+            nav2_state="idle",
+            navigation_task_active=False,
+            plant_support_mode="idle",
+            plant_support_requested_mode="idle",
+            plant_support_confirmed_mode="idle",
+            plant_support_stop_pending=False,
+            plant_support_safety_latched=False,
+            plant_support_stop_generation=None,
+            plant_support_rearm_generation=generation,
+            last_error=None,
+        )
+        return True
+
+    def _set_plant_support_mode(self, mode: str) -> bool:
+        """Switch only MuJoCo's confirmed fall-arrest profile over loopback."""
+
+        self.telemetry.update(plant_support_requested_mode=mode)
+        with self._support_lock:
+            if (
+                self._plant_support_stop_pending
+                or self._plant_support_safety_latched
+            ):
+                # safety_stop is a stronger static hold than IDLE.  It remains
+                # latched until _rearm_plant_support confirms control.acquire;
+                # the 50 Hz IDLE loop must never write it away.
+                if mode in {"idle", "safety_stop"}:
+                    confirmed_mode = (
+                        "safety_stop"
+                        if self._plant_support_safety_latched
+                        else self._plant_support_mode or "unknown"
                     )
-                response.read(1024)
+                    self.telemetry.update(
+                        plant_support_mode=confirmed_mode,
+                        plant_support_requested_mode="safety_stop",
+                        plant_support_confirmed_mode=confirmed_mode,
+                        plant_support_stop_pending=self._plant_support_stop_pending,
+                        plant_support_safety_latched=self._plant_support_safety_latched,
+                    )
+                    return True
+                confirmed_mode = (
+                    "safety_stop"
+                    if self._plant_support_safety_latched
+                    else self._plant_support_mode or "unknown"
+                )
+                self.telemetry.update(
+                    plant_support_mode=confirmed_mode,
+                    plant_support_requested_mode="safety_stop",
+                    plant_support_confirmed_mode=confirmed_mode,
+                    plant_support_stop_pending=self._plant_support_stop_pending,
+                    plant_support_safety_latched=self._plant_support_safety_latched,
+                    last_error=(
+                        "MuJoCo locomotion rejected while plant safety_stop is latched"
+                    ),
+                )
+                return False
+            if mode == self._plant_support_mode:
+                return True
+        try:
+            state = set_plant_support(
+                "127.0.0.1",
+                self.config.plant_port,
+                mode,
+                timeout=0.20,
+            )
         except Exception as exc:
             self.telemetry.update(
                 plant_support_mode="unavailable",
+                plant_support_confirmed_mode="unavailable",
                 last_error=f"MuJoCo support transition failed: {exc}",
             )
             return False
-        self._plant_support_mode = mode
-        self.telemetry.update(plant_support_mode=mode)
+        confirmed_mode = str(state.get("mode", ""))
+        if confirmed_mode != mode:
+            self.telemetry.update(
+                plant_support_mode="unavailable",
+                plant_support_confirmed_mode="unavailable",
+                last_error=(
+                    "MuJoCo support transition returned an unexpected confirmed mode"
+                ),
+            )
+            return False
+        with self._support_lock:
+            stop_raced_transition = (
+                self._plant_support_stop_pending
+                or self._plant_support_safety_latched
+            )
+            stop_already_confirmed = self._plant_support_safety_latched
+        if stop_raced_transition:
+            # Never let a slower idle/locomotion response erase a stronger
+            # stop accepted on the command thread while this request was in
+            # flight.  A pending stop is synchronously strengthened here; an
+            # already confirmed latch needs no second Plant write.
+            if not stop_already_confirmed:
+                self._ensure_plant_support_stopped(
+                    reason="Plant safety-stop raced a support transition"
+                )
+            return mode != "locomotion"
+        with self._support_lock:
+            self._plant_support_mode = confirmed_mode
+        self.telemetry.update(
+            plant_support_mode=confirmed_mode,
+            plant_support_confirmed_mode=confirmed_mode,
+            plant_support_stop_pending=False,
+            plant_support_safety_latched=False,
+        )
         return True
 
     def _apply_intent(self, dt: float, *, simulation_now_s: float):
@@ -1187,6 +1454,31 @@ class SonicDriver:
                     desired_support_mode
                 )
                 if not support_ready and desired_support_mode == "locomotion":
+                    with self._support_lock:
+                        expected_safety_stop = (
+                            self._plant_support_stop_pending
+                            or self._plant_support_safety_latched
+                        )
+                    if expected_safety_stop:
+                        # A lease release/cancel can race a policy tick that
+                        # was already computing.  Publish only measured hold
+                        # for that tick and keep the recoverable safety latch;
+                        # this is not a controller/physics fault that should
+                        # force a process restart.
+                        self.guard.stop(source="plant_safety_stop")
+                        self._navigation_task_active = False
+                        self._joint_handoff.reset()
+                        self._arm_guard.reset()
+                        self._static_hold_active = True
+                        self._publish_measured_hold(lowstate)
+                        self.telemetry.update(
+                            nav2_state="safety_stop",
+                            navigation_task_active=False,
+                            static_hold_active=True,
+                            motion_handoff_active=False,
+                            motion_handoff_ratio=0.0,
+                        )
+                        continue
                     raise RuntimeError(
                         "MuJoCo support transition failed during locomotion"
                     )
@@ -1244,26 +1536,78 @@ class SonicDriver:
             with condition:
                 condition.notify_all()
 
-    def accept_json(self, payload: dict[str, Any]) -> None:
+    def accept_json(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        if payload.get("type") == "plant_support_state":
+            if payload.get("schema_version") != "h-ide.plant-support-state/v1":
+                raise ValueError("unsupported plant support state schema")
+            if payload.get("mode") != "safety_stop":
+                raise ValueError("external support notifications may only strengthen safety_stop")
+            if payload.get("source") not in {
+                "robot_agent_safe_stop",
+                "navigation_guard",
+            }:
+                raise ValueError("unsupported plant support state source")
+            reason = str(
+                payload.get("reason") or "MuJoCo plant safety_stop was engaged"
+            )
+            stopped_generation = self._latch_plant_support_stop(reason=reason)
+            if self._fault_latched.is_set():
+                self.telemetry.update(
+                    status="failed",
+                    control_clock_status="fault",
+                    motion_ready=False,
+                    last_error=self._terminal_fault_reason,
+                )
+            return {
+                "ok": True,
+                "mode": "safety_stop",
+                "stopped_generation": stopped_generation,
+            }
         if self._fault_latched.is_set():
             self.guard.stop(source="terminal_fault")
-            return
+            if payload.get("control_arm") or payload.get("request_id"):
+                raise RuntimeError(
+                    "SONIC terminal fault requires an explicit process restart"
+                )
+            return None
         if payload.get("type") == "stop":
             self.guard.stop(source="bridge_stop")
-            self._intent_ingress.armed = False
             self._navigation_task_active = False
             reason = payload.get("reason")
+            with self._support_lock:
+                self._intent_ingress.revoke()
+                if payload.get("source") == "robot_agent_safe_stop":
+                    self._plant_support_stop_pending = True
+                support_latched = self._plant_support_safety_latched
+                support_pending = self._plant_support_stop_pending
+                confirmed_mode = self._plant_support_mode or "unknown"
+            if support_pending:
+                self._joint_handoff.reset()
+                self._arm_guard.reset()
             self.telemetry.update(
-                nav2_state="safety_stop" if reason else "idle",
+                nav2_state=(
+                    "safety_stop"
+                    if reason or support_pending or support_latched
+                    else "idle"
+                ),
                 navigation_task_active=False,
                 last_cmd_vx=0.0,
                 last_cmd_vy=0.0,
                 last_cmd_wz=0.0,
+                plant_support_mode=confirmed_mode,
+                plant_support_requested_mode=(
+                    "safety_stop" if support_pending else confirmed_mode
+                ),
+                plant_support_confirmed_mode=confirmed_mode,
+                plant_support_stop_pending=support_pending,
+                plant_support_safety_latched=support_latched,
                 last_error=str(reason) if reason else None,
             )
-            return
+            return None
+        control_arm = payload.get("control_arm", False)
         try:
-            decision = self._intent_ingress.accept(payload)
+            with self._support_lock:
+                decision = self._intent_ingress.accept(payload)
         except (KeyError, TypeError, ValueError) as exc:
             self.guard.stop(source="invalid_gait_intent")
             self._navigation_task_active = False
@@ -1277,23 +1621,65 @@ class SonicDriver:
             )
             raise
         if decision.action == "ignore":
-            return
+            return None
         if decision.heading_yaw is not None:
             self.guard.observe_heading(decision.heading_yaw)
+        if control_arm:
+            if not decision.arm_acknowledged or decision.generation is None:
+                raise ValueError(
+                    "control_arm did not produce a fresh stationary IDLE acknowledgement"
+                )
+            if not self._rearm_plant_support(decision.generation):
+                with self._support_lock:
+                    self._intent_ingress.revoke()
+                raise RuntimeError("explicit Plant support rearm failed")
+            return {
+                "ok": True,
+                "mode": "idle",
+                "generation": decision.generation,
+            }
         if decision.action == "stop":
             # Stop/motion_enabled authority is obeyed before any values enter
             # CmdVelGuard or the SONIC model mapping.
             self.guard.stop(source="gait_adapter")
             self._navigation_task_active = False
+            with self._support_lock:
+                support_latched = (
+                    self._plant_support_stop_pending
+                    or self._plant_support_safety_latched
+                )
             self.telemetry.update(
-                nav2_state=("idle" if decision.state == "IDLE" else "safety_stop"),
+                nav2_state=(
+                    "idle"
+                    if decision.state == "IDLE" and not support_latched
+                    else "safety_stop"
+                ),
                 navigation_task_active=False,
                 last_cmd_vx=0.0,
                 last_cmd_vy=0.0,
                 last_cmd_wz=0.0,
                 last_error=decision.reason,
             )
-            return
+            return None
+        with self._support_lock:
+            support_latched = (
+                self._plant_support_stop_pending
+                or self._plant_support_safety_latched
+            )
+        if support_latched:
+            self.guard.stop(source="plant_safety_stop")
+            self._navigation_task_active = False
+            self.telemetry.update(
+                nav2_state="safety_stop",
+                navigation_task_active=False,
+                last_cmd_vx=0.0,
+                last_cmd_vy=0.0,
+                last_cmd_wz=0.0,
+                plant_support_mode="safety_stop",
+                plant_support_safety_latched=True,
+                last_error="motion rejected while Plant safety_stop is latched",
+            )
+            return None
         if not self._motion_ready.is_set():
             # A command received while ONNX is warming cannot be replayed after
             # startup/qualification.  Hold it at the actuator boundary and
@@ -1308,7 +1694,7 @@ class SonicDriver:
                 last_cmd_wz=0.0,
                 last_error="SONIC control loop is still warming",
             )
-            return
+            return None
         if not self._navigation_task_active:
             self.telemetry.reset_navigation_task_peaks()
             self._navigation_task_active = True
@@ -1321,6 +1707,7 @@ class SonicDriver:
             last_cmd_wz=decision.wz,
             last_error=None,
         )
+        return None
 
 
 def run_driver(config: SimConfig) -> None:
@@ -1353,7 +1740,40 @@ def run_driver(config: SimConfig) -> None:
                 try:
                     messages, _ = parse_lines(data + (b"" if data.endswith(b"\n") else b"\n"))
                     for message in messages:
-                        driver.accept_json(message)
+                        request_id = message.get("request_id")
+                        try:
+                            response = driver.accept_json(message)
+                            if request_id is not None:
+                                acknowledgement = {
+                                    "request_id": request_id,
+                                    "ok": True,
+                                    **(response or {}),
+                                }
+                                conn.sendall(
+                                    (
+                                        json.dumps(
+                                            acknowledgement,
+                                            separators=(",", ":"),
+                                        )
+                                        + "\n"
+                                    ).encode("utf-8")
+                                )
+                        except Exception as exc:
+                            if request_id is None:
+                                raise
+                            conn.sendall(
+                                (
+                                    json.dumps(
+                                        {
+                                            "request_id": request_id,
+                                            "ok": False,
+                                            "error": str(exc)[:512],
+                                        },
+                                        separators=(",", ":"),
+                                    )
+                                    + "\n"
+                                ).encode("utf-8")
+                            )
                 except Exception as exc:
                     logger.warning("invalid bridge command: %s", exc)
 

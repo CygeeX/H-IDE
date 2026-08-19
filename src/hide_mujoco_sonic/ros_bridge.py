@@ -8,6 +8,7 @@ kept in the plant/observation adapter; this node never invents localization.
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import math
 import os
 import time
@@ -29,7 +30,7 @@ from .safety import (
     RotationDirectionGuard,
     TranslationHeadingGuard,
 )
-from .transport import send_json, set_plant_support
+from .transport import request_json, send_json, set_plant_support
 
 
 class RosBridgeUnavailable(RuntimeError):
@@ -118,12 +119,13 @@ def run_ros_bridge(config: SimConfig) -> None:
         import rclpy
         from geometry_msgs.msg import PoseWithCovarianceStamped, Twist
         from nav_msgs.msg import Odometry, Path
+        from std_srvs.srv import Trigger
     except ImportError as exc:  # pragma: no cover - depends on ROS installation
         raise RosBridgeUnavailable("rclpy and geometry_msgs are required for ros-bridge") from exc
 
     rclpy.init()
     node = rclpy.create_node("h_ide_mujoco_sonic_bridge")
-    generation = _new_bridge_generation()
+    generation = {"value": _new_bridge_generation()}
     gait = GaitAdapter(
         GaitAdapterConfig(
             command_timeout_s=config.command_timeout_s,
@@ -137,12 +139,13 @@ def run_ros_bridge(config: SimConfig) -> None:
             max_facing_delta_rad=config.max_facing_lead_rad,
         )
     )
-    # ``arm`` is attempted only from a fresh measured odometry callback. It
-    # cannot arm while the base is moving. Cancel, motion/post-motion stale,
-    # and fault transitions require a newer generation; only a never-moved
-    # IDLE observation reconnect may explicitly re-arm the same generation.
-    gait.advance_generation(generation)
+    # GaitAdapter may recover a never-moved IDLE observation reconnect within
+    # one generation, but that local synchronization never releases a Plant
+    # safety_stop.  Only /robot/control_arm, reached from control.acquire,
+    # advances generation and carries the explicit Plant rearm bit.
+    gait.advance_generation(generation["value"])
     latest_heading = {"yaw": None}
+    latest_observation: dict[str, BaseObservation | None] = {"value": None}
     bridge_fault = {"reason": None}
     direction_guard = MotionDirectionGuard()
     goal_guard = GoalProgressGuard()
@@ -189,7 +192,7 @@ def run_ros_bridge(config: SimConfig) -> None:
         if bridge_fault["reason"] is None:
             bridge_fault["reason"] = f"{source}: {reason}"
         now = time.monotonic()
-        intent = gait.cancel(generation, now, now=now)
+        intent = gait.cancel(generation["value"], now, now=now)
         send_intent(intent)
         if reason:
             set_plant_support(
@@ -197,6 +200,18 @@ def run_ros_bridge(config: SimConfig) -> None:
                 config.plant_port,
                 "safety_stop",
                 timeout=0.3,
+            )
+            request_json(
+                config.command_host,
+                config.command_port,
+                {
+                    "type": "plant_support_state",
+                    "schema_version": "h-ide.plant-support-state/v1",
+                    "source": "navigation_guard",
+                    "mode": "safety_stop",
+                    "reason": f"{source}: {reason}",
+                },
+                timeout=0.5,
             )
 
     def on_pose(message: PoseWithCovarianceStamped):
@@ -307,7 +322,7 @@ def run_ros_bridge(config: SimConfig) -> None:
         pitch = math.asin(max(-1.0, min(1.0, pitch_term)))
         twist = message.twist.twist
         observation = BaseObservation(
-            generation=generation,
+            generation=generation["value"],
             timestamp_s=observation_timestamp,
             x=float(pose.position.x),
             y=float(pose.position.y),
@@ -318,11 +333,12 @@ def run_ros_bridge(config: SimConfig) -> None:
             vy_body=float(twist.linear.y),
             wz=float(twist.angular.z),
         )
+        latest_observation["value"] = observation
         intent = gait.ingest_observation(observation, now=now)
         if bridge_fault["reason"] is None and gait.state is GaitState.DISARMED:
             # A successful result proves this exact observation was fresh and
             # stationary; rejected attempts remain fail-closed.
-            armed = gait.arm(generation, now=now)
+            armed = gait.arm(generation["value"], now=now)
             if armed.state == GaitState.IDLE.value:
                 intent = armed
         try:
@@ -387,7 +403,7 @@ def run_ros_bridge(config: SimConfig) -> None:
             return
         intent = gait.ingest_twist(
             Nav2Twist(
-                generation=generation,
+                generation=generation["value"],
                 timestamp_s=now,
                 vx=vx,
                 vy=vy,
@@ -401,10 +417,96 @@ def run_ros_bridge(config: SimConfig) -> None:
         except Exception as exc:
             node.get_logger().error(f"failed to deliver Nav2 gait intent: {exc}")
 
+    def control_arm(_request, response):
+        """Use one explicit Robot Agent control.acquire to rearm the plant."""
+
+        if bridge_fault["reason"] is not None:
+            response.success = False
+            response.message = (
+                "navigation safety interlock is latched; process restart is required"
+            )
+            return response
+        if gait.state in {
+            GaitState.STARTING,
+            GaitState.WALKING,
+            GaitState.TURNING,
+            GaitState.STOPPING,
+        }:
+            response.success = False
+            response.message = "control arm rejected while a gait is active or stopping"
+            return response
+        now = time.monotonic()
+        measured = latest_observation["value"]
+        if measured is None:
+            response.success = False
+            response.message = "control arm requires a measured base observation"
+            return response
+        if now - measured.timestamp_s > gait.config.observation_timeout_s:
+            response.success = False
+            response.message = "control arm requires a fresh base observation"
+            return response
+        if not gait._is_stationary(measured):
+            response.success = False
+            response.message = "control arm rejected while the measured base is moving"
+            return response
+
+        next_generation = max(
+            generation["value"] + 1,
+            _new_bridge_generation(),
+        )
+        generation["value"] = next_generation
+        gait.advance_generation(next_generation, now=now)
+        current_observation = replace(measured, generation=next_generation)
+        latest_observation["value"] = current_observation
+        gait.ingest_observation(current_observation, now=now)
+        armed = gait.arm(next_generation, now=now)
+        if armed.state != GaitState.IDLE.value:
+            response.success = False
+            response.message = armed.reason or "fresh stationary gait arm was rejected"
+            return response
+        payload = _intent_payload(
+            armed,
+            measured_heading_yaw=latest_heading["yaw"],
+        )
+        payload["control_arm"] = True
+        try:
+            acknowledgement = request_json(
+                config.command_host,
+                config.command_port,
+                payload,
+                timeout=0.75,
+            )
+            if (
+                acknowledgement.get("mode") != "idle"
+                or acknowledgement.get("generation") != next_generation
+            ):
+                raise RuntimeError("SONIC did not confirm the armed IDLE generation")
+        except Exception as exc:
+            failed_at = time.monotonic()
+            stopped = gait.cancel(
+                next_generation,
+                failed_at,
+                now=failed_at,
+            )
+            try:
+                send_intent(stopped)
+            except Exception:
+                pass
+            response.success = False
+            response.message = f"control arm failed closed: {exc}"
+            return response
+
+        response.success = True
+        response.message = (
+            f"control generation {next_generation} armed at stationary IDLE"
+        )
+        return response
+
     node.create_subscription(Twist, config.cmd_vel_topic, on_cmd, 10)
     node.create_subscription(Odometry, config.odom_topic, on_odom, 10)
     node.create_subscription(PoseWithCovarianceStamped, config.localization_topic, on_pose, 10)
     node.create_subscription(Path, config.nav_path_topic, on_path, 10)
+    node.create_service(Trigger, "/robot/control_arm", control_arm)
 
     def watchdog():
         now = time.monotonic()

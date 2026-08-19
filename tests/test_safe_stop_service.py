@@ -18,9 +18,14 @@ def test_safe_stop_reaches_sonic_and_engages_plant_damping() -> None:
         calls.append(("support", args, kwargs))
         return {"mode": "safety_stop"}
 
+    def confirm_command(*args, **kwargs):
+        calls.append(("confirm", args, kwargs))
+        return {"ok": True, "mode": "safety_stop"}
+
     message = execute_safe_stop(
         config,
         send_command=send_command,
+        confirm_command=confirm_command,
         set_support=set_support,
     )
 
@@ -30,3 +35,6 @@ def test_safe_stop_reaches_sonic_and_engages_plant_damping() -> None:
     assert calls[0][1][2]["reason"]
     assert calls[1][0] == "support"
     assert calls[1][1][2] == "safety_stop"
+    assert calls[2][0] == "confirm"
+    assert calls[2][1][2]["type"] == "plant_support_state"
+    assert calls[2][1][2]["mode"] == "safety_stop"

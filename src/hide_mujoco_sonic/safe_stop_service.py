@@ -13,13 +13,14 @@ import os
 from typing import Iterable
 
 from .config import SimConfig
-from .transport import send_json, set_plant_support
+from .transport import request_json, send_json, set_plant_support
 
 
 def execute_safe_stop(
     config: SimConfig,
     *,
     send_command=send_json,
+    confirm_command=request_json,
     set_support=set_plant_support,
 ) -> str:
     """Stop SONIC intent and engage velocity-only MuJoCo emergency damping."""
@@ -35,6 +36,18 @@ def execute_safe_stop(
         timeout=0.5,
     )
     set_support("127.0.0.1", config.plant_port, "safety_stop", timeout=0.5)
+    confirm_command(
+        config.command_host,
+        config.command_port,
+        {
+            "type": "plant_support_state",
+            "schema_version": "h-ide.plant-support-state/v1",
+            "source": "robot_agent_safe_stop",
+            "mode": "safety_stop",
+            "reason": "Robot Agent requested simulation safe-stop",
+        },
+        timeout=0.5,
+    )
     return "SONIC stopped and MuJoCo emergency damping engaged"
 
 

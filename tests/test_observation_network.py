@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 import socket
+import threading
 
 import pytest
 
@@ -17,6 +18,7 @@ from hide_mujoco_sonic.config import SimConfig
 from hide_mujoco_sonic.plant import PlantFrameStore, PlantSupportController
 from hide_mujoco_sonic.sonic_driver import _bind_command_server
 from hide_mujoco_sonic.telemetry import TelemetryState, TelemetryStore, serve_telemetry
+from hide_mujoco_sonic.transport import request_json
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -62,6 +64,52 @@ def _request(host: str, port: int, method: str, path: str, body: bytes | None = 
         return response.status, dict(response.getheaders()), response.read()
     finally:
         connection.close()
+
+
+def test_loopback_command_request_requires_a_matching_positive_ack() -> None:
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = int(server.getsockname()[1])
+    received: list[dict[str, object]] = []
+
+    def respond() -> None:
+        connection, _address = server.accept()
+        with connection:
+            raw = b""
+            while b"\n" not in raw:
+                raw += connection.recv(4096)
+            payload = json.loads(raw.split(b"\n", 1)[0])
+            received.append(payload)
+            connection.sendall(
+                (
+                    json.dumps(
+                        {
+                            "request_id": payload["request_id"],
+                            "ok": True,
+                            "mode": "idle",
+                        }
+                    )
+                    + "\n"
+                ).encode("utf-8")
+            )
+
+    worker = threading.Thread(target=respond, daemon=True)
+    worker.start()
+    try:
+        response = request_json(
+            "127.0.0.1",
+            port,
+            {"type": "test", "request_id": "request-7"},
+            timeout=1.0,
+        )
+    finally:
+        worker.join(timeout=2)
+        server.close()
+
+    assert worker.is_alive() is False
+    assert received == [{"type": "test", "request_id": "request-7"}]
+    assert response == {"request_id": "request-7", "ok": True, "mode": "idle"}
 
 
 def test_docker_gateway_resolution_is_exact_and_interface_bound() -> None:
@@ -192,6 +240,25 @@ def test_docker_plant_listener_serves_live_rgb_but_rejects_support_write() -> No
         assert status == 200
         assert support.state()["mode"] == "locomotion"
 
+        safety = json.dumps({"mode": "safety_stop"}).encode("utf-8")
+        status, _headers, _body = _request(
+            "127.0.0.1", port, "POST", "/support", safety
+        )
+        assert status == 200
+        ordinary_idle = json.dumps({"mode": "idle"}).encode("utf-8")
+        status, _headers, _body = _request(
+            "127.0.0.1", port, "POST", "/support", ordinary_idle
+        )
+        assert status == 422
+        assert support.state()["mode"] == "safety_stop"
+        explicit_rearm = json.dumps({"generation": 11}).encode("utf-8")
+        status, _headers, body = _request(
+            "127.0.0.1", port, "POST", "/support/rearm", explicit_rearm
+        )
+        assert status == 200
+        assert json.loads(body)["mode"] == "idle"
+        assert json.loads(body)["lastRearmGeneration"] == 11
+
         rejected = json.dumps({"mode": "safety_stop"}).encode("utf-8")
         status, headers, body = _request(
             "127.0.0.2", port, "POST", "/support", rejected
@@ -199,6 +266,6 @@ def test_docker_plant_listener_serves_live_rgb_but_rejects_support_write() -> No
         assert status == 405
         assert headers["Allow"] == "GET"
         assert body == b""
-        assert support.state()["mode"] == "locomotion"
+        assert support.state()["mode"] == "idle"
     finally:
         store.close()

@@ -48,6 +48,8 @@ class PlantSupportController:
         self._updated_at = time.time()
         self._fault: str | None = None
         self._last_simulation_time: float | None = None
+        self._last_rearm_generation = -1
+        self._safety_stop_epoch = 0
         self._lock = threading.RLock()
 
     @property
@@ -66,7 +68,46 @@ class PlantSupportController:
                 raise ValueError(
                     f"plant physics fault is latched: {self._fault}"
                 )
+            if self._mode == "safety_stop" and value != "safety_stop":
+                raise ValueError(
+                    "plant safety_stop is latched; explicit control rearm is required"
+                )
+            if value == "safety_stop" and self._mode != "safety_stop":
+                self._safety_stop_epoch += 1
             self._mode = value
+            self._updated_at = time.time()
+            return self._mode
+
+    def rearm(self, generation: int) -> str:
+        """Release a non-fault safety latch to IDLE for one newer authority.
+
+        Normal support transitions can only strengthen a stop once the plant
+        reaches ``safety_stop``.  The ROS bridge owns the fresh stationary
+        observation and SONIC owns this rearm call; requiring a strictly newer
+        generation prevents periodic IDLE traffic or a replayed Nav2 command
+        from releasing the latch.  A physics fault remains process-restart
+        only and is never recoverable through this method.
+        """
+
+        if (
+            isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation <= 0
+        ):
+            raise ValueError("rearm generation must be a positive integer")
+        with self._lock:
+            if self._fault is not None:
+                raise ValueError(
+                    f"plant physics fault is latched: {self._fault}"
+                )
+            if self._mode != "safety_stop":
+                raise ValueError("plant rearm requires a latched safety_stop")
+            if generation <= self._last_rearm_generation:
+                raise ValueError(
+                    "plant rearm generation must be strictly newer than the last release"
+                )
+            self._mode = "idle"
+            self._last_rearm_generation = generation
             self._updated_at = time.time()
             return self._mode
 
@@ -85,6 +126,8 @@ class PlantSupportController:
             newly_latched = self._fault is None
             if newly_latched:
                 self._fault = detail
+            if self._mode != "safety_stop":
+                self._safety_stop_epoch += 1
             self._mode = "safety_stop"
             self._updated_at = time.time()
             return newly_latched
@@ -129,6 +172,13 @@ class PlantSupportController:
                 "mode": self._mode,
                 "updatedAt": self._updated_at,
                 "fault": self._fault,
+                "safetyStopLatched": self._mode == "safety_stop",
+                "safetyStopEpoch": self._safety_stop_epoch,
+                "lastRearmGeneration": (
+                    None
+                    if self._last_rearm_generation < 0
+                    else self._last_rearm_generation
+                ),
             }
 
 
@@ -466,6 +516,16 @@ class PlantFrameStore:
                         with store._lock:
                             body = store._depth
                         content_type = "application/octet-stream"
+                    elif (
+                        parsed.path == "/support"
+                        and not read_only
+                        and self.client_address[0] in {"127.0.0.1", "::1"}
+                    ):
+                        body = json.dumps(
+                            store.support.state(),
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                        content_type = "application/json"
                     else:
                         self.send_error(404)
                         return
@@ -497,7 +557,7 @@ class PlantFrameStore:
                         self.end_headers()
                         return
                     parsed = urlparse(self.path)
-                    if parsed.path != "/support":
+                    if parsed.path not in {"/support", "/support/rearm"}:
                         self.send_error(404)
                         return
                     if self.client_address[0] not in {"127.0.0.1", "::1"}:
@@ -510,7 +570,18 @@ class PlantFrameStore:
                         payload = json.loads(self.rfile.read(length))
                         if not isinstance(payload, dict):
                             raise ValueError("support request must be an object")
-                        store.support.set_mode(str(payload.get("mode", "")))
+                        if parsed.path == "/support":
+                            if set(payload) != {"mode"}:
+                                raise ValueError(
+                                    "support request must contain only mode"
+                                )
+                            store.support.set_mode(str(payload.get("mode", "")))
+                        else:
+                            if set(payload) != {"generation"}:
+                                raise ValueError(
+                                    "support rearm request must contain only generation"
+                                )
+                            store.support.rearm(payload.get("generation"))
                         body = json.dumps(
                             store.support.state(),
                             separators=(",", ":"),
