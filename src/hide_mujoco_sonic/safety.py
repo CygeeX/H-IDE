@@ -1009,6 +1009,20 @@ class CmdVelGuard:
     def measured_heading(self) -> float | None:
         return self._measured_heading
 
+    @property
+    def command_zero(self) -> bool:
+        """Whether both the admitted Nav2 target and filtered command are zero.
+
+        This is an observational safety predicate. It never advances the
+        watchdog or smoothing state, so a health probe cannot create motion or
+        turn a pending stop into an acknowledgement.
+        """
+
+        return (
+            not self._is_nonzero(self._last)
+            and all(abs(value) <= 1e-9 for value in (self._vx, self._vy, self._wz))
+        )
+
     def observe_heading(self, yaw: float) -> None:
         """Anchor SONIC's global facing frame to measured ``map→base`` yaw.
 

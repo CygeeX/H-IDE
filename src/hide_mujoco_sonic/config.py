@@ -137,10 +137,18 @@ class SimConfig:
                 "sonic_control_step_stale_s must cover at least two control "
                 "periods and must not exceed 0.10s"
             )
+        confirmation_handoff_s = (
+            STALE_HEALTH_CONFIRMATION_PROBES * health_probe_period_s
+            + health_probe_timeout_s
+        )
+        if confirmation_handoff_s >= 0.10:
+            raise ValueError(
+                "motion health confirmation must remain below the 0.10s "
+                "Robot Agent cancellation-start handoff budget"
+            )
         if (
             max(plant_lowstate_stale_s, sonic_control_step_stale_s)
-            + STALE_HEALTH_CONFIRMATION_PROBES * health_probe_period_s
-            + health_probe_timeout_s
+            + confirmation_handoff_s
             >= 0.30
         ):
             raise ValueError(

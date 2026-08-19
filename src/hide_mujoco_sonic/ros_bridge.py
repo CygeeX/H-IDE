@@ -30,6 +30,7 @@ from .motion_fault import (
     SonicHealthFaultGate,
     SonicHealth,
     motion_fault_qos,
+    require_fresh_motion_health,
     sonic_health_probe,
 )
 from .safety import (
@@ -170,6 +171,10 @@ def run_ros_bridge(config: SimConfig) -> None:
         plant_lowstate_stale_s=config.plant_lowstate_stale_s,
         sonic_control_step_stale_s=config.sonic_control_step_stale_s,
     )
+    health_quarantine: dict[str, str | bool | None] = {
+        "active": False,
+        "code": None,
+    }
     direction_guard = MotionDirectionGuard()
     goal_guard = GoalProgressGuard()
     heading_guard = TranslationHeadingGuard(
@@ -184,6 +189,25 @@ def run_ros_bridge(config: SimConfig) -> None:
         translation_violation_s=config.spin_translation_violation_s,
     )
     stability_guard = BodyStabilityGuard()
+
+    def request_sonic_health(request_id: UUID) -> SonicHealth:
+        """Read one correlated, strict v2 health snapshot from SONIC."""
+
+        response = request_json(
+            config.command_host,
+            config.command_port,
+            sonic_health_probe(
+                robot_id=config.robot_id,
+                producer_boot_id=fault_latch.producer_boot_id,
+                request_id=request_id,
+            ),
+            timeout=config.sonic_health_probe_timeout_s,
+        )
+        return SonicHealth.from_response(
+            response,
+            expected_request_id=request_id,
+            expected_robot_id=config.robot_id,
+        )
 
     def interlock_reason() -> str | None:
         reasons = [
@@ -569,6 +593,60 @@ def run_ros_bridge(config: SimConfig) -> None:
             response.success = False
             response.message = "control arm rejected while a gait is active or stopping"
             return response
+
+        health_request_id = uuid4()
+        try:
+            health = request_sonic_health(health_request_id)
+        except Exception as exc:
+            reason = f"SONIC health probe failed during control arm: {exc}"
+            try:
+                latch_stop(
+                    source="sonic_driver",
+                    code="SONIC_UNAVAILABLE",
+                    reason=reason,
+                )
+            except Exception as delivery_exc:
+                node.get_logger().error(
+                    f"failed to enforce control-arm health stop: {delivery_exc}"
+                )
+            response.success = False
+            response.message = reason
+            return response
+
+        health_decision = health_fault_gate.observe(
+            health,
+            gait_state=gait.state,
+        )
+        if health_decision.confirmed_cause is not None:
+            cause = health_decision.confirmed_cause
+            try:
+                latch_stop(
+                    source=cause.source,
+                    code=cause.code,
+                    reason=cause.reason,
+                    downstream_boot_id=health.driver_boot_id,
+                    probe_request_id=health_request_id,
+                )
+            except Exception as delivery_exc:
+                node.get_logger().error(
+                    f"failed to enforce control-arm health fault: {delivery_exc}"
+                )
+            response.success = False
+            response.message = f"control arm rejected: {cause.code}"
+            return response
+        try:
+            require_fresh_motion_health(
+                health,
+                plant_lowstate_stale_s=config.plant_lowstate_stale_s,
+                sonic_control_step_stale_s=config.sonic_control_step_stale_s,
+            )
+        except ValueError as exc:
+            # Age-only degradation is recoverable while the exact safety hold
+            # remains confirmed, but it can never authorize a new generation.
+            response.success = False
+            response.message = f"control arm requires fresh SONIC health: {exc}"
+            return response
+
         now = time.monotonic()
         measured = latest_observation["value"]
         if measured is None:
@@ -661,21 +739,7 @@ def run_ros_bridge(config: SimConfig) -> None:
             return
         request_id = uuid4()
         try:
-            response = request_json(
-                config.command_host,
-                config.command_port,
-                sonic_health_probe(
-                    robot_id=config.robot_id,
-                    producer_boot_id=fault_latch.producer_boot_id,
-                    request_id=request_id,
-                ),
-                timeout=config.sonic_health_probe_timeout_s,
-            )
-            health = SonicHealth.from_response(
-                response,
-                expected_request_id=request_id,
-                expected_robot_id=config.robot_id,
-            )
+            health = request_sonic_health(request_id)
         except Exception as exc:
             try:
                 latch_stop(
@@ -691,8 +755,33 @@ def run_ros_bridge(config: SimConfig) -> None:
             return
 
         previous_pending = health_fault_gate.pending
-        decision = health_fault_gate.observe(health)
+        decision = health_fault_gate.observe(
+            health,
+            gait_state=gait.state,
+        )
         pending = decision.pending
+        quarantined = decision.quarantined_cause
+        if quarantined is not None:
+            if (
+                health_quarantine["active"] is not True
+                or health_quarantine["code"] != quarantined.code
+            ):
+                node.get_logger().warning(
+                    "motion health age fault quarantined in confirmed safe hold "
+                    f"driverBootId={decision.driver_boot_id} "
+                    f"source={quarantined.source} code={quarantined.code} "
+                    f"quarantinedCount={decision.quarantined_stale_count}; "
+                    "new control remains blocked until health is fresh"
+                )
+            health_quarantine["active"] = True
+            health_quarantine["code"] = quarantined.code
+        elif health_quarantine["active"] is True:
+            node.get_logger().info(
+                "motion health safe-hold quarantine cleared "
+                f"driverBootId={decision.driver_boot_id}"
+            )
+            health_quarantine["active"] = False
+            health_quarantine["code"] = None
         if pending is not None and pending != previous_pending:
             node.get_logger().warning(
                 "motion health stale confirmation pending "

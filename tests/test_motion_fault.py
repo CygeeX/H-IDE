@@ -6,6 +6,7 @@ from uuid import UUID
 
 import pytest
 
+from hide_mujoco_sonic.gait_adapter import GaitState
 from hide_mujoco_sonic.motion_fault import (
     MOTION_FAULT_SCHEMA_VERSION,
     MotionFaultLatch,
@@ -14,6 +15,7 @@ from hide_mujoco_sonic.motion_fault import (
     SonicHealth,
     classify_sonic_health,
     motion_fault_qos,
+    require_fresh_motion_health,
     sonic_health_probe,
     validate_sonic_health_request,
 )
@@ -52,11 +54,18 @@ def health_response(
     age: float | None = 0.02,
     control_age: float | None = 0.01,
     driver_boot_id: UUID = DRIVER_BOOT_ID,
+    plant_support_mode: str = "idle",
+    plant_support_safety_latched: bool = False,
+    plant_support_stop_pending: bool = False,
+    static_hold_active: bool = True,
+    navigation_task_active: bool = False,
+    motion_authorized: bool = True,
+    nav2_command_zero: bool = True,
 ) -> dict[str, object]:
     return {
         "request_id": str(REQUEST_ID),
         "ok": True,
-        "schema_version": "h-ide.sonic-health/v1",
+        "schema_version": "h-ide.sonic-health/v2",
         "robot_id": "g1-sim",
         "driver_boot_id": str(driver_boot_id),
         "status": status,
@@ -65,6 +74,13 @@ def health_response(
         "motion_ready": motion_ready,
         "last_lowstate_age_s": age,
         "last_control_step_age_s": control_age,
+        "plant_support_mode": plant_support_mode,
+        "plant_support_safety_latched": plant_support_safety_latched,
+        "plant_support_stop_pending": plant_support_stop_pending,
+        "static_hold_active": static_hold_active,
+        "navigation_task_active": navigation_task_active,
+        "motion_authorized": motion_authorized,
+        "nav2_command_zero": nav2_command_zero,
     }
 
 
@@ -81,6 +97,29 @@ def health_fault_gate() -> SonicHealthFaultGate:
         plant_lowstate_stale_s=0.10,
         sonic_control_step_stale_s=0.10,
     )
+
+
+def observe(
+    gate: SonicHealthFaultGate,
+    health: SonicHealth,
+    *,
+    gait_state: GaitState = GaitState.IDLE,
+):
+    return gate.observe(health, gait_state=gait_state)
+
+
+def safe_hold_health(**overrides) -> SonicHealth:
+    values = {
+        "plant_support_mode": "safety_stop",
+        "plant_support_safety_latched": True,
+        "plant_support_stop_pending": False,
+        "static_hold_active": True,
+        "navigation_task_active": False,
+        "motion_authorized": False,
+        "nav2_command_zero": True,
+    }
+    values.update(overrides)
+    return parse_health(**values)
 
 
 def test_motion_fault_v1_is_strict_and_round_trips() -> None:
@@ -319,12 +358,147 @@ def test_sonic_probe_contract_and_health_classification_are_strict() -> None:
             expected_request_id=REQUEST_ID,
             expected_robot_id="g1-sim",
         )
+    with pytest.raises(ValueError, match="fields do not match"):
+        SonicHealth.from_response(
+            {**health_response(), "legacy_guess": "SAFE_HOLD"},
+            expected_request_id=REQUEST_ID,
+            expected_robot_id="g1-sim",
+        )
+    with pytest.raises(ValueError, match="support mode is invalid"):
+        SonicHealth.from_response(
+            {**health_response(), "plant_support_mode": "looks_stopped"},
+            expected_request_id=REQUEST_ID,
+            expected_robot_id="g1-sim",
+        )
+    with pytest.raises(ValueError, match="authorize motion while support is latched"):
+        SonicHealth.from_response(
+            {
+                **health_response(),
+                "plant_support_mode": "safety_stop",
+                "plant_support_safety_latched": True,
+                "motion_authorized": True,
+            },
+            expected_request_id=REQUEST_ID,
+            expected_robot_id="g1-sim",
+        )
+
+
+def test_safe_hold_quarantines_age_only_faults_without_latching() -> None:
+    gate = health_fault_gate()
+
+    for count, age in enumerate((0.111029, 0.136, 0.451), start=1):
+        decision = observe(gate, safe_hold_health(age=age))
+        assert decision.confirmed_cause is None
+        assert decision.pending is None
+        assert decision.settled_safe_hold is True
+        assert decision.quarantined_cause is not None
+        assert decision.quarantined_cause.code == "PLANT_LOWSTATE_STALE"
+        assert decision.quarantined_stale_count == count
+
+    recovered = observe(gate, safe_hold_health(age=0.020))
+    assert recovered.confirmed_cause is None
+    assert recovered.pending is None
+    assert recovered.quarantined_cause is None
+    assert recovered.settled_safe_hold is False
+
+
+@pytest.mark.parametrize(
+    ("health", "gait_state"),
+    [
+        (
+            safe_hold_health(age=0.111029, plant_support_stop_pending=True),
+            GaitState.IDLE,
+        ),
+        (safe_hold_health(age=0.111029, static_hold_active=False), GaitState.IDLE),
+        (safe_hold_health(age=0.111029, nav2_command_zero=False), GaitState.IDLE),
+        (safe_hold_health(age=0.111029), GaitState.DISARMED),
+        (safe_hold_health(age=0.111029), GaitState.STARTING),
+        (safe_hold_health(age=0.111029), GaitState.WALKING),
+        (safe_hold_health(age=0.111029), GaitState.TURNING),
+    ],
+)
+def test_incomplete_or_non_idle_hold_never_quarantines_active_age_faults(
+    health: SonicHealth,
+    gait_state: GaitState,
+) -> None:
+    gate = health_fault_gate()
+
+    first = observe(gate, health, gait_state=gait_state)
+    second = observe(gate, health, gait_state=gait_state)
+
+    assert first.quarantined_cause is None
+    assert first.pending is not None
+    assert first.pending.count == 1
+    assert second.confirmed_cause is not None
+    assert second.confirmed_cause.code == "PLANT_LOWSTATE_STALE"
+
+
+def test_motion_authority_after_quarantine_restarts_strict_confirmation() -> None:
+    gate = health_fault_gate()
+    quarantined = observe(gate, safe_hold_health(age=0.111029))
+    assert quarantined.quarantined_cause is not None
+
+    first_active = observe(gate, parse_health(age=0.136))
+    second_active = observe(gate, parse_health(age=0.151))
+
+    assert first_active.pending is not None
+    assert first_active.pending.count == 1
+    assert first_active.confirmed_cause is None
+    assert second_active.confirmed_cause is not None
+    assert second_active.confirmed_cause.code == "PLANT_LOWSTATE_STALE"
+
+
+def test_control_acquisition_requires_fresh_confirmed_safe_hold() -> None:
+    require_fresh_motion_health(
+        safe_hold_health(),
+        plant_lowstate_stale_s=0.10,
+        sonic_control_step_stale_s=0.10,
+    )
+
+    with pytest.raises(ValueError, match="PLANT_LOWSTATE_STALE"):
+        require_fresh_motion_health(
+            safe_hold_health(age=0.101),
+            plant_lowstate_stale_s=0.10,
+            sonic_control_step_stale_s=0.10,
+        )
+    with pytest.raises(ValueError, match="confirmed settled safety hold"):
+        require_fresh_motion_health(
+            parse_health(),
+            plant_lowstate_stale_s=0.10,
+            sonic_control_step_stale_s=0.10,
+        )
+
+
+def test_terminal_and_boot_change_remain_immediate_in_safe_hold() -> None:
+    terminal_gate = health_fault_gate()
+    terminal = observe(
+        terminal_gate,
+        safe_hold_health(
+            status="fault",
+            terminal_fault=True,
+            reason="control loop failed",
+            motion_ready=False,
+        ),
+    )
+    assert terminal.confirmed_cause is not None
+    assert terminal.confirmed_cause.code == "SONIC_TERMINAL_FAULT"
+    assert terminal.quarantined_cause is None
+
+    boot_gate = health_fault_gate()
+    assert observe(boot_gate, safe_hold_health()).confirmed_cause is None
+    changed = observe(
+        boot_gate,
+        safe_hold_health(driver_boot_id=NEW_DRIVER_BOOT_ID),
+    )
+    assert changed.confirmed_cause is not None
+    assert changed.confirmed_cause.code == "SONIC_BOOT_CHANGED"
+    assert changed.quarantined_cause is None
 
 
 def test_stale_health_gate_requires_same_boot_and_code_twice() -> None:
     gate = health_fault_gate()
 
-    first = gate.observe(parse_health(age=0.111029))
+    first = observe(gate, parse_health(age=0.111029))
     assert first.confirmed_cause is None
     assert first.required_count == 2
     assert first.pending is not None
@@ -336,7 +510,7 @@ def test_stale_health_gate_requires_same_boot_and_code_twice() -> None:
     assert first.pending.latest_age_s == pytest.approx(0.111029)
     assert first.filtered_transient_count == 0
 
-    second = gate.observe(parse_health(age=0.136))
+    second = observe(gate, parse_health(age=0.136))
     assert second.confirmed_cause is not None
     assert second.confirmed_cause.code == "PLANT_LOWSTATE_STALE"
     assert second.pending is not None
@@ -348,13 +522,13 @@ def test_stale_health_gate_requires_same_boot_and_code_twice() -> None:
 def test_stale_health_gate_healthy_probe_resets_pending() -> None:
     gate = health_fault_gate()
 
-    assert gate.observe(parse_health(age=0.111029)).pending is not None
-    healthy = gate.observe(parse_health(age=0.020))
+    assert observe(gate, parse_health(age=0.111029)).pending is not None
+    healthy = observe(gate, parse_health(age=0.020))
     assert healthy.confirmed_cause is None
     assert healthy.pending is None
     assert healthy.filtered_transient_count == 1
 
-    repeated = gate.observe(parse_health(age=0.111029))
+    repeated = observe(gate, parse_health(age=0.111029))
     assert repeated.confirmed_cause is None
     assert repeated.pending is not None
     assert repeated.pending.count == 1
@@ -363,11 +537,11 @@ def test_stale_health_gate_healthy_probe_resets_pending() -> None:
 def test_stale_health_gate_different_code_starts_a_new_sequence() -> None:
     gate = health_fault_gate()
 
-    lowstate = gate.observe(parse_health(age=0.111029))
+    lowstate = observe(gate, parse_health(age=0.111029))
     assert lowstate.pending is not None
     assert lowstate.pending.code == "PLANT_LOWSTATE_STALE"
 
-    control = gate.observe(parse_health(age=0.020, control_age=0.111029))
+    control = observe(gate, parse_health(age=0.020, control_age=0.111029))
     assert control.confirmed_cause is None
     assert control.pending is not None
     assert control.pending.code == "SONIC_CONTROL_STALE"
@@ -378,8 +552,11 @@ def test_stale_health_gate_different_code_starts_a_new_sequence() -> None:
 def test_stale_health_gate_driver_boot_change_is_immediate() -> None:
     gate = health_fault_gate()
 
-    assert gate.observe(parse_health(age=0.111029)).pending is not None
-    changed = gate.observe(parse_health(age=0.020, driver_boot_id=NEW_DRIVER_BOOT_ID))
+    assert observe(gate, parse_health(age=0.111029)).pending is not None
+    changed = observe(
+        gate,
+        parse_health(age=0.020, driver_boot_id=NEW_DRIVER_BOOT_ID),
+    )
     assert changed.pending is None
     assert changed.confirmed_cause is not None
     assert changed.confirmed_cause.code == "SONIC_BOOT_CHANGED"
@@ -410,7 +587,7 @@ def test_stale_health_gate_driver_boot_change_is_immediate() -> None:
 def test_stale_health_gate_non_temporal_faults_are_immediate(
     overrides: dict[str, object], expected_code: str
 ) -> None:
-    decision = health_fault_gate().observe(parse_health(**overrides))
+    decision = observe(health_fault_gate(), parse_health(**overrides))
 
     assert decision.pending is None
     assert decision.confirmed_cause is not None
@@ -433,7 +610,7 @@ def test_confirmed_stale_health_trips_fault_latch_exactly_once() -> None:
         stops += 1
 
     for age in (0.111029, 0.136, 0.151):
-        decision = gate.observe(parse_health(age=age))
+        decision = observe(gate, parse_health(age=age))
         cause = decision.confirmed_cause
         if cause is not None:
             latch.trip(

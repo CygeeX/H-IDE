@@ -1737,6 +1737,20 @@ class SonicDriver:
                     if last_control_step_at is None
                     else max(0.0, checked_at - last_control_step_at)
                 )
+            # The command server serializes intents, stops, control.arm and
+            # probes. This support lock therefore produces one authoritative
+            # driver snapshot without reading the eventually-consistent HTTP
+            # telemetry surface or guessing from display strings.
+            with self._support_lock:
+                plant_support_mode = self._plant_support_mode or "unavailable"
+                plant_support_safety_latched = (
+                    self._plant_support_safety_latched
+                )
+                plant_support_stop_pending = self._plant_support_stop_pending
+                motion_authorized = self._intent_ingress.armed
+                static_hold_active = self._static_hold_active
+                navigation_task_active = self._navigation_task_active
+                nav2_command_zero = self.guard.command_zero
             terminal_fault = self._fault_latched.is_set()
             motion_ready = (
                 not terminal_fault
@@ -1773,6 +1787,13 @@ class SonicDriver:
                 "motion_ready": motion_ready,
                 "last_lowstate_age_s": lowstate_age,
                 "last_control_step_age_s": control_step_age,
+                "plant_support_mode": plant_support_mode,
+                "plant_support_safety_latched": plant_support_safety_latched,
+                "plant_support_stop_pending": plant_support_stop_pending,
+                "static_hold_active": static_hold_active,
+                "navigation_task_active": navigation_task_active,
+                "motion_authorized": motion_authorized,
+                "nav2_command_zero": nav2_command_zero,
             }
         if payload.get("type") == "plant_support_state":
             if payload.get("schema_version") != "h-ide.plant-support-state/v1":

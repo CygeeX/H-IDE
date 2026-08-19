@@ -286,12 +286,19 @@ class FakeGuard:
     def __init__(self) -> None:
         self.accepted: list[tuple[float, float, float, str]] = []
         self.stops: list[str] = []
+        self._command_zero = True
 
     def accept(self, vx, vy, wz, *, source):
         self.accepted.append((vx, vy, wz, source))
+        self._command_zero = not any(abs(value) > 1e-9 for value in (vx, vy, wz))
 
     def stop(self, *, source="watchdog"):
         self.stops.append(source)
+        self._command_zero = True
+
+    @property
+    def command_zero(self):
+        return self._command_zero
 
     def observe_heading(self, yaw):
         assert math.isfinite(yaw)
@@ -346,6 +353,7 @@ def bare_driver(clock: Clock) -> SonicDriver:
     driver._plant_support_stop_generation = None
     driver._last_published_targets = tuple(0.0 for _ in range(29))
     driver._safe_hold_targets = None
+    driver._static_hold_active = True
     driver._joint_handoff = SimpleNamespace(
         reset=lambda: None,
         freeze=lambda _targets: None,
@@ -383,6 +391,14 @@ def test_sonic_health_probe_is_strict_read_only_and_reports_terminal_fault() -> 
     assert ready.motion_ready is True
     assert ready.last_lowstate_age_s == pytest.approx(0.02)
     assert ready.last_control_step_age_s == pytest.approx(0.01)
+    assert ready.plant_support_mode == "idle"
+    assert ready.plant_support_safety_latched is False
+    assert ready.plant_support_stop_pending is False
+    assert ready.static_hold_active is True
+    assert ready.navigation_task_active is False
+    assert ready.motion_authorized is False
+    assert ready.nav2_command_zero is True
+    assert ready.confirmed_safe_hold is False
     assert driver.telemetry.values == telemetry_before
     assert (driver.guard.accepted, driver.guard.stops) == guard_before
 

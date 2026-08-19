@@ -383,6 +383,26 @@ def test_explicit_nav2_zero_stops_without_a_smoothing_tail():
     assert stopped.has_movement is False
 
 
+def test_command_zero_is_read_only_and_requires_the_filtered_tail_to_stop():
+    now = [100.0]
+    guard = CmdVelGuard(
+        timeout_s=0.25,
+        clock=lambda: now[0],
+        smoothing_alpha=0.5,
+    )
+    assert guard.command_zero is True
+
+    guard.accept(0.2, 0.0, 0.0)
+    assert guard.command_zero is False
+    guard.intent(now=100.01, dt=0.02)
+    guard.stop(source="test_stop")
+    assert guard.command_zero is False
+
+    stopped = guard.intent(now=100.02, dt=0.02)
+    assert stopped.mode == "IDLE"
+    assert guard.command_zero is True
+
+
 def test_sub_sonic_terminal_velocity_is_held_idle():
     now = [100.0]
     guard = CmdVelGuard(

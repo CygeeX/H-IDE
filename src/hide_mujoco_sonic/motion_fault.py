@@ -16,9 +16,11 @@ import threading
 from typing import Any, Callable, Mapping
 from uuid import UUID, uuid4
 
+from .gait_adapter import GaitState
+
 
 MOTION_FAULT_SCHEMA_VERSION = "h-ide.motion-safety-fault/v1"
-SONIC_HEALTH_SCHEMA_VERSION = "h-ide.sonic-health/v1"
+SONIC_HEALTH_SCHEMA_VERSION = "h-ide.sonic-health/v2"
 MOTION_FAULT_MAX_BYTES = 4096
 STALE_HEALTH_CONFIRMATION_PROBES = 2
 
@@ -80,6 +82,23 @@ _HEALTH_RESPONSE_FIELDS = frozenset(
         "motion_ready",
         "last_lowstate_age_s",
         "last_control_step_age_s",
+        "plant_support_mode",
+        "plant_support_safety_latched",
+        "plant_support_stop_pending",
+        "static_hold_active",
+        "navigation_task_active",
+        "motion_authorized",
+        "nav2_command_zero",
+    }
+)
+_PLANT_SUPPORT_MODES = frozenset(
+    {
+        "unknown",
+        "unavailable",
+        "startup",
+        "idle",
+        "locomotion",
+        "safety_stop",
     }
 )
 
@@ -407,6 +426,32 @@ class SonicHealth:
     motion_ready: bool
     last_lowstate_age_s: float | None
     last_control_step_age_s: float | None
+    plant_support_mode: str
+    plant_support_safety_latched: bool
+    plant_support_stop_pending: bool
+    static_hold_active: bool
+    navigation_task_active: bool
+    motion_authorized: bool
+    nav2_command_zero: bool
+
+    @property
+    def confirmed_safe_hold(self) -> bool:
+        """Whether the driver proves a settled, authority-free physical hold.
+
+        This deliberately excludes the bridge-side gait state.  The caller must
+        additionally prove :class:`GaitState.IDLE` before an age-only fault may
+        be quarantined; a wire response cannot attest to the ROS state machine.
+        """
+
+        return (
+            self.plant_support_mode == "safety_stop"
+            and self.plant_support_safety_latched
+            and not self.plant_support_stop_pending
+            and self.static_hold_active
+            and not self.navigation_task_active
+            and not self.motion_authorized
+            and self.nav2_command_zero
+        )
 
     @classmethod
     def from_response(
@@ -431,10 +476,23 @@ class SonicHealth:
         status = str(value.get("status", ""))
         if status not in {"warming", "ready", "stopped", "fault"}:
             raise ValueError("SONIC health response status is invalid")
-        terminal_fault = value.get("terminal_fault")
-        motion_ready = value.get("motion_ready")
-        if not isinstance(terminal_fault, bool) or not isinstance(motion_ready, bool):
+        boolean_fields = (
+            "terminal_fault",
+            "motion_ready",
+            "plant_support_safety_latched",
+            "plant_support_stop_pending",
+            "static_hold_active",
+            "navigation_task_active",
+            "motion_authorized",
+            "nav2_command_zero",
+        )
+        if not all(isinstance(value.get(field), bool) for field in boolean_fields):
             raise ValueError("SONIC health response flags must be booleans")
+        terminal_fault = value["terminal_fault"]
+        motion_ready = value["motion_ready"]
+        support_mode = value.get("plant_support_mode")
+        if not isinstance(support_mode, str) or support_mode not in _PLANT_SUPPORT_MODES:
+            raise ValueError("SONIC health response Plant support mode is invalid")
         reason_value = value.get("reason")
         if reason_value is not None:
             reason_value = _bounded_text(reason_value, "reason", maximum=512)
@@ -482,6 +540,23 @@ class SonicHealth:
             raise ValueError(
                 "ready SONIC health must include LowState and control-step ages"
             )
+        support_latched = value["plant_support_safety_latched"]
+        support_pending = value["plant_support_stop_pending"]
+        motion_authorized = value["motion_authorized"]
+        navigation_task_active = value["navigation_task_active"]
+        nav2_command_zero = value["nav2_command_zero"]
+        if support_latched and motion_authorized:
+            raise ValueError(
+                "SONIC health response cannot authorize motion while support is latched"
+            )
+        if navigation_task_active and not motion_authorized:
+            raise ValueError(
+                "SONIC health response cannot report a task without motion authority"
+            )
+        if navigation_task_active and nav2_command_zero:
+            raise ValueError(
+                "SONIC health response active task must carry a non-zero Nav2 command"
+            )
         return cls(
             request_id=request_id,
             robot_id=robot_id,
@@ -492,6 +567,13 @@ class SonicHealth:
             motion_ready=motion_ready,
             last_lowstate_age_s=age,
             last_control_step_age_s=control_age,
+            plant_support_mode=support_mode,
+            plant_support_safety_latched=support_latched,
+            plant_support_stop_pending=support_pending,
+            static_hold_active=value["static_hold_active"],
+            navigation_task_active=navigation_task_active,
+            motion_authorized=motion_authorized,
+            nav2_command_zero=nav2_command_zero,
         )
 
 
@@ -519,6 +601,9 @@ class HealthFaultDecision:
     required_count: int
     driver_boot_id: UUID
     filtered_transient_count: int
+    quarantined_cause: MotionFaultCause | None
+    settled_safe_hold: bool
+    quarantined_stale_count: int
 
 
 class SonicHealthFaultGate:
@@ -557,6 +642,7 @@ class SonicHealthFaultGate:
         self._driver_boot_id: UUID | None = None
         self._pending: PendingStaleHealth | None = None
         self._filtered_transient_count = 0
+        self._quarantined_stale_count = 0
 
     @property
     def pending(self) -> PendingStaleHealth | None:
@@ -571,6 +657,8 @@ class SonicHealthFaultGate:
         *,
         health: SonicHealth,
         confirmed_cause: MotionFaultCause | None = None,
+        quarantined_cause: MotionFaultCause | None = None,
+        settled_safe_hold: bool = False,
     ) -> HealthFaultDecision:
         return HealthFaultDecision(
             confirmed_cause=confirmed_cause,
@@ -578,6 +666,9 @@ class SonicHealthFaultGate:
             required_count=self._required_count,
             driver_boot_id=health.driver_boot_id,
             filtered_transient_count=self._filtered_transient_count,
+            quarantined_cause=quarantined_cause,
+            settled_safe_hold=settled_safe_hold,
+            quarantined_stale_count=self._quarantined_stale_count,
         )
 
     @staticmethod
@@ -597,7 +688,14 @@ class SonicHealthFaultGate:
             self._filtered_transient_count += 1
         self._pending = None
 
-    def observe(self, health: SonicHealth) -> HealthFaultDecision:
+    def observe(
+        self,
+        health: SonicHealth,
+        *,
+        gait_state: GaitState,
+    ) -> HealthFaultDecision:
+        if not isinstance(gait_state, GaitState):
+            raise TypeError("gait_state must be a GaitState")
         previous_boot = self._driver_boot_id
         if previous_boot is None:
             self._driver_boot_id = health.driver_boot_id
@@ -629,6 +727,18 @@ class SonicHealthFaultGate:
             self._clear_pending(filtered=True)
             return self._decision(health=health, confirmed_cause=cause)
 
+        settled_safe_hold = (
+            gait_state is GaitState.IDLE and health.confirmed_safe_hold
+        )
+        if settled_safe_hold:
+            self._clear_pending(filtered=True)
+            self._quarantined_stale_count += 1
+            return self._decision(
+                health=health,
+                quarantined_cause=cause,
+                settled_safe_hold=True,
+            )
+
         age = self._age_for_cause(health, cause)
         identity = (health.driver_boot_id, cause.code)
         previous = self._pending
@@ -657,6 +767,31 @@ class SonicHealthFaultGate:
             confirmed_cause=(
                 cause if self._pending.count >= self._required_count else None
             ),
+        )
+
+
+def require_fresh_motion_health(
+    health: SonicHealth,
+    *,
+    plant_lowstate_stale_s: float,
+    sonic_control_step_stale_s: float,
+) -> None:
+    """Reject control acquisition unless the current motion path is fresh.
+
+    A settled safe hold may quarantine age-only faults for observation, but it
+    never converts stale evidence into new motion authority.
+    """
+
+    cause = classify_sonic_health(
+        health,
+        plant_lowstate_stale_s=plant_lowstate_stale_s,
+        sonic_control_step_stale_s=sonic_control_step_stale_s,
+    )
+    if cause is not None:
+        raise ValueError(f"{cause.code}: {cause.reason}")
+    if not health.confirmed_safe_hold:
+        raise ValueError(
+            "SONIC control acquisition requires a confirmed settled safety hold"
         )
 
 

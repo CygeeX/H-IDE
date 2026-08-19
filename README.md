@@ -101,14 +101,22 @@ non-semantic integrity manifest.
   event ID and health-probe request ID for isolation and de-duplication.
   Robot Agent remains the sole Nav2 action owner and cancels only its correlated
   goal handle; the simulator never uses a global `CancelGoal(all)` operation.
-* The existing loopback-only port 8793 also accepts a read-only SONIC health
-  probe. It exposes both LowState reception age and last successful control-step
-  age. Age-only faults require two consecutive 25 ms probes with the same
-  driver boot ID and fault code; a healthy probe clears the pending sample.
-  Terminal faults, unavailability, probe failures, and driver boot changes
-  remain immediate. The 100 ms stale bound plus two probe periods and the 20 ms
-  timeout yields a 170 ms worst-case detection budget, below Robot Agent's
-  300 ms cancellation budget, without placing ROS code inside SONIC.
+* The existing loopback-only port 8793 also accepts a strict, read-only
+  `h-ide.sonic-health/v2` probe. In addition to LowState/control-step ages and
+  the immutable driver boot ID, it carries typed Plant-support latch/pending,
+  static-hold, Nav2-task, motion-authority and zero-command facts. Age-only
+  faults require two consecutive 25 ms probes with the same driver boot ID and
+  fault code while motion is authorized or the gait is not settled at IDLE.
+  A fully confirmed `safety_stop + IDLE + static hold + authority revoked +
+  zero command + no task` quarantines age-only degradation instead of emitting
+  an irreversible motion fault; a fresh probe recovers it, and `control.acquire`
+  remains blocked until both ages are fresh. Terminal faults, unavailability,
+  probe failures, and driver boot changes remain immediate. The 100 ms stale
+  bound plus two probe periods and the 20 ms timeout yields a 170 ms worst-case
+  detection budget. The 70 ms confirmation handoff leaves 30 ms for the
+  latched ROS event to begin Robot Agent cancellation within 100 ms; Robot
+  Agent retains the 300 ms Nav2 terminal deadline, without placing ROS code
+  inside SONIC.
 * Robot Agent diagnostics remain loopback-only on `127.0.0.1:8796`. The
   launcher starts a separate proxy on Docker's dynamically verified default
   bridge at port `8797`; it can forward only bodyless GET requests for

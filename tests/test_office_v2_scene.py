@@ -427,6 +427,12 @@ def test_supported_configs_all_select_the_same_verified_office_v2_bundle() -> No
             )
         )
         assert (
+            STALE_HEALTH_CONFIRMATION_PROBES
+            * config.sonic_health_probe_period_s
+            + config.sonic_health_probe_timeout_s
+            < 0.10
+        )
+        assert (
             max(
                 config.plant_lowstate_stale_s,
                 config.sonic_control_step_stale_s,
