@@ -34,6 +34,8 @@ class TelemetryState:
     control_tick_ms: int | None = None
     control_dt_s: float | None = None
     control_clock_status: str = "waiting"
+    controller_warmup_complete: bool = False
+    controller_warmup_wall_s: float | None = None
     controller_resync_count: int = 0
     static_hold_active: bool = True
     motion_handoff_active: bool = False

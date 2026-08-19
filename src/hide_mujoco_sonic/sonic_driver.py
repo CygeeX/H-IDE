@@ -206,6 +206,7 @@ class SonicDriver:
         self._control_condition = threading.Condition(self._lowstate_lock)
         self._control_clock = PlantControlClock(control_hz=config.control_hz)
         self._control_clock_armed = False
+        self._control_consumer_ready = threading.Event()
         self._pending_control_sample: tuple[Any, PlantControlStep] | None = None
         self._wall_clock = time.monotonic
         self._control_clock_armed_at_wall_s: float | None = None
@@ -302,6 +303,8 @@ class SonicDriver:
         with self._control_condition:
             self._lowstate = message
             self._last_lowstate_wall_s = received_at_wall_s
+            if not self._control_clock_armed:
+                self._control_condition.notify_all()
             if restarted:
                 clock_fault = (
                     "MuJoCo plant tick rolled back; explicit process restart required"
@@ -329,21 +332,74 @@ class SonicDriver:
             # continuity.  Never rebuild history or replay missed policy ticks.
             self._latch_terminal_fault(clock_fault)
 
-    def _arm_simulation_clock(self) -> None:
-        """Start policy advancement from the freshest completed plant sample."""
+    def _wait_for_initial_lowstate(self, *, timeout_s: float = 5.0):
+        """Wait for plant state while the strict control clock remains disarmed."""
 
+        deadline = self._wall_clock() + timeout_s
         with self._control_condition:
-            self._control_clock.reset()
-            self._pending_control_sample = None
-            self._control_clock_armed = True
-            self._control_clock_armed_at_wall_s = self._wall_clock()
-            lowstate = self._lowstate
-            if lowstate is not None:
-                step = self._control_clock.observe(int(lowstate.tick))
-                assert step is not None
-                self._pending_control_sample = (lowstate, step)
-            self._control_condition.notify_all()
-        self.telemetry.update(control_clock_status="simulation_time_50hz")
+            while (
+                self._lowstate is None
+                and not self._fault_latched.is_set()
+                and not self._stop.is_set()
+            ):
+                remaining = deadline - self._wall_clock()
+                if remaining <= 0:
+                    break
+                self._control_condition.wait(timeout=min(0.10, remaining))
+            if self._lowstate is None:
+                raise RuntimeError("timed out waiting for initial MuJoCo LowState")
+            return self._lowstate
+
+    def _warm_controller_inference(self) -> None:
+        """Warm encoder/decoder kernels without advancing SONIC controller state."""
+
+        import numpy as np
+
+        self.telemetry.update(control_clock_status="warming_inference")
+        started_at = self._wall_clock()
+        pipeline = self._controller.controller
+
+        # ``run_encoder`` and ``build_decoder_obs`` are pure reads of the
+        # already-initialized history buffers.  Calling the sessions directly
+        # warms their kernels without incrementing the runtime step, advancing
+        # the reference cursor, requesting a plan, or publishing a motor target.
+        encoder_output = np.asarray(pipeline.run_encoder())
+        decoder_observation = np.asarray(
+            pipeline.build_decoder_obs(), dtype=np.float32
+        ).reshape(1, -1)
+        decoder_output = np.asarray(
+            pipeline.decoder.run(
+                None,
+                {pipeline.decoder_input: decoder_observation},
+            )[0]
+        )
+        if not np.all(np.isfinite(encoder_output)):
+            raise RuntimeError("SONIC encoder warm-up produced non-finite output")
+        if not np.all(np.isfinite(decoder_output)):
+            raise RuntimeError("SONIC decoder warm-up produced non-finite output")
+        elapsed = max(0.0, self._wall_clock() - started_at)
+        logger.info(
+            "SONIC encoder/decoder warm-up complete in %.3fs; control clock remains disarmed",
+            elapsed,
+        )
+        self.telemetry.update(
+            controller_warmup_complete=True,
+            controller_warmup_wall_s=elapsed,
+            control_clock_status="warm_ready_to_arm",
+        )
+
+    def _prepare_idle_startup(self) -> None:
+        """Hold the plant and warm inference before strict clock handoff."""
+
+        lowstate = self._wait_for_initial_lowstate()
+        if self._fault_latched.is_set():
+            raise RuntimeError(self._terminal_fault_reason or "startup fault latched")
+        if not self._set_plant_support_mode("idle"):
+            raise RuntimeError("MuJoCo idle support is unavailable during SONIC warm-up")
+        self._publish_measured_hold(lowstate)
+        self._warm_controller_inference()
+        if self._fault_latched.is_set():
+            raise RuntimeError(self._terminal_fault_reason or "startup fault latched")
 
     def _next_control_sample(
         self,
@@ -354,6 +410,28 @@ class SonicDriver:
 
         clock_fault: str | None = None
         with self._control_condition:
+            if (
+                not self._control_clock_armed
+                and not self._fault_latched.is_set()
+                and not self._stop.is_set()
+            ):
+                # This is the startup handshake.  The current LowState is only
+                # a time baseline; it is deliberately discarded rather than
+                # queued as a policy step.  Because this happens while holding
+                # the condition lock, the callback cannot observe the armed
+                # flag until this consumer has entered ``wait`` below.
+                if self._lowstate is None:
+                    raise RuntimeError("cannot arm SONIC clock without LowState")
+                self._control_clock.reset()
+                baseline = self._control_clock.observe(int(self._lowstate.tick))
+                assert baseline is not None
+                self._pending_control_sample = None
+                self._control_clock_armed_at_wall_s = self._wall_clock()
+                self._control_clock_armed = True
+                self._control_consumer_ready.set()
+                self.telemetry.update(
+                    control_clock_status="simulation_time_50hz_waiting_first_step"
+                )
             if (
                 self._pending_control_sample is None
                 and not self._fault_latched.is_set()
@@ -754,8 +832,17 @@ class SonicDriver:
         )
 
     def run(self):
-        self.telemetry.update(status="running")
-        self._arm_simulation_clock()
+        self.telemetry.update(
+            status="warming",
+            control_clock_status="disarmed_static_warmup",
+        )
+        try:
+            self._prepare_idle_startup()
+        except Exception as exc:
+            self._latch_terminal_fault(f"SONIC startup fault: {exc}")
+            self._stop.set()
+        else:
+            self.telemetry.update(status="running")
         while not self._stop.is_set():
             sample = self._next_control_sample()
             if self._fault_latched.is_set():
@@ -841,6 +928,7 @@ class SonicDriver:
                 self.telemetry.update(
                     control_tick_ms=control_step.tick_ms,
                     control_dt_s=control_step.dt_s,
+                    control_clock_status="simulation_time_50hz",
                     static_hold_active=decision.static_hold_active,
                     motion_handoff_active=decision.motion_handoff_active,
                     motion_handoff_ratio=decision.handoff_ratio,
@@ -914,6 +1002,21 @@ class SonicDriver:
                 last_cmd_vy=0.0,
                 last_cmd_wz=0.0,
                 last_error=decision.reason,
+            )
+            return
+        if not self._control_consumer_ready.is_set():
+            # A command received while ONNX is warming cannot be replayed after
+            # startup.  Hold it at the actuator boundary and require a fresh
+            # gait-adapter intent after the strict consumer handshake.
+            self.guard.stop(source="sonic_startup_hold")
+            self._navigation_task_active = False
+            self.telemetry.update(
+                nav2_state="startup_hold",
+                navigation_task_active=False,
+                last_cmd_vx=0.0,
+                last_cmd_vy=0.0,
+                last_cmd_wz=0.0,
+                last_error="SONIC control loop is still warming",
             )
             return
         if not self._navigation_task_active:

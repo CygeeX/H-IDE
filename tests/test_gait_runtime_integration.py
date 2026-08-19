@@ -301,6 +301,8 @@ def bare_driver(clock: Clock) -> SonicDriver:
     driver._control_condition = threading.Condition(driver._lowstate_lock)
     driver._control_clock = PlantControlClock(control_hz=50)
     driver._control_clock_armed = False
+    driver._control_consumer_ready = threading.Event()
+    driver._control_consumer_ready.set()
     driver._pending_control_sample = None
     driver._wall_clock = clock
     driver._control_clock_armed_at_wall_s = None
