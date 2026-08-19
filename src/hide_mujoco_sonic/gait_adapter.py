@@ -238,6 +238,7 @@ class GaitAdapter:
         self._stationary_samples = 0
         self._last_stop_observation_timestamp: float | None = None
         self._stop_acknowledged = False
+        self._safe_stop_requested = False
 
     def advance_generation(self, generation: int, *, now: float | None = None) -> SonicIntent:
         """Invalidate all buffered motion and select a newer plant generation."""
@@ -391,6 +392,50 @@ class GaitAdapter:
             ),
             now=now,
         )
+
+    def request_safe_stop(
+        self,
+        generation: int,
+        *,
+        now: float | None = None,
+    ) -> SonicIntent:
+        """Begin one recoverable stop from fresh post-request measurements.
+
+        Unlike a Nav2 cancel, this transition deliberately enters ``STOPPING``
+        even when the gait is already IDLE or DISARMED.  The external
+        safe-stop contract therefore cannot turn a pre-request zero-velocity
+        sample into proof of a new physical stop.  Replays in the same
+        generation are idempotent and do not reset evidence already collected
+        for the active correlated stop.
+
+        A gait ``FAULT`` is terminal and remains on the separate motion-fault
+        path; this method never converts it into a recoverable normal stop.
+        """
+
+        timestamp = self._resolve_now(now)
+        if not self._valid_generation(generation):
+            self._trip_fault("invalid safe-stop generation", timestamp)
+            return self._emit(timestamp)
+        if generation != self.generation:
+            return self._emit(
+                timestamp,
+                reason="safe-stop rejected for inactive generation",
+            )
+        if self.state is GaitState.FAULT:
+            return self._emit(timestamp)
+        if self._safe_stop_requested:
+            return self._emit(timestamp)
+
+        self._safe_stop_requested = True
+        self._requires_new_generation = True
+        self._command = None
+        self._last_command_timestamp = None
+        self._request_stop(
+            "Robot Agent requested a correlated simulation safe-stop",
+            terminal=GaitState.DISARMED,
+            now=timestamp,
+        )
+        return self._emit(timestamp)
 
     def tick(self, *, now: float | None = None) -> SonicIntent:
         """Advance timeout/acknowledgement state without an incoming event."""
@@ -721,8 +766,28 @@ class GaitAdapter:
         self._reference_authority_source_sequence = None
         self._reference_authority_epoch = None
         self._reference_authority_dds_sequence = None
+        self._safe_stop_requested = False
 
     def _observe_stop_ack(self, observation: BaseObservation, now: float) -> None:
+        # Callback arrival after a stop request is not enough: a queued ROS
+        # sample may have been captured while the old motion command still had
+        # authority.  Both values share the monotonic domain established by
+        # the bridge, so only capture timestamps strictly after this stop began
+        # may contribute evidence.
+        if (
+            self._stop_started_at is None
+            or observation.timestamp_s <= self._stop_started_at
+        ):
+            return
+        if now - observation.timestamp_s > self.config.observation_timeout_s:
+            # A delayed sample cannot prove the robot's current state.  Break
+            # the evidence window as well as rejecting this sample so a later
+            # fresh capture cannot bridge an unobserved interval.
+            self._stationary_since = None
+            self._stationary_samples = 0
+            self._last_stop_observation_timestamp = observation.timestamp_s
+            self._stop_acknowledged = False
+            return
         if (
             self._last_stop_observation_timestamp is not None
             and observation.timestamp_s <= self._last_stop_observation_timestamp
@@ -735,13 +800,14 @@ class GaitAdapter:
             self._stop_acknowledged = False
             return
         if self._stationary_since is None:
-            self._stationary_since = now
+            self._stationary_since = observation.timestamp_s
             self._stationary_samples = 1
         else:
             self._stationary_samples += 1
         self._stop_acknowledged = (
             self._stationary_samples >= self.config.stop_ack_samples
-            and now - self._stationary_since >= self.config.stop_ack_s
+            and observation.timestamp_s - self._stationary_since
+            >= self.config.stop_ack_s
         )
 
     def _reset_stop_ack(self) -> None:
@@ -774,6 +840,7 @@ class GaitAdapter:
         self._cumulative_yaw = 0.0
         self._stop_started_at = None
         self._stop_terminal = GaitState.IDLE
+        self._safe_stop_requested = False
         self._reset_stop_ack()
 
     def _desired_state(self, command: Nav2Twist) -> GaitState:

@@ -308,6 +308,160 @@ def test_cancel_stops_then_requires_a_new_generation() -> None:
     assert adapter.arm(2, now=10.25).state == "IDLE"
 
 
+def _adapter_in_nonfault_state(state: str) -> tuple[GaitAdapter, float]:
+    if state == "DISARMED":
+        adapter = GaitAdapter()
+        adapter.advance_generation(1, now=10.0)
+        adapter.ingest_observation(observation(10.01), now=10.01)
+        return adapter, 10.02
+
+    adapter = armed_adapter()
+    if state == "IDLE":
+        return adapter, 10.02
+    if state == "STARTING":
+        adapter.ingest_twist(twist(10.02, vx=0.2), now=10.02)
+        return adapter, 10.03
+    if state == "WALKING":
+        starting = adapter.ingest_twist(twist(10.02, vx=0.2), now=10.02)
+        grant_reference(adapter, starting)
+        adapter.ingest_observation(observation(10.03, vx=0.06), now=10.03)
+        return adapter, 10.04
+    if state == "TURNING":
+        starting = adapter.ingest_twist(twist(10.02, wz=0.2), now=10.02)
+        grant_reference(adapter, starting)
+        adapter.ingest_observation(observation(10.03, wz=0.06), now=10.03)
+        return adapter, 10.04
+    if state == "STOPPING":
+        adapter.ingest_twist(twist(10.02, vx=0.2), now=10.02)
+        adapter.ingest_twist(twist(10.03), now=10.03)
+        # This pre-transaction stationary sample must be discarded by the
+        # correlated safe-stop request below.
+        adapter.ingest_observation(observation(10.04), now=10.04)
+        return adapter, 10.05
+    raise AssertionError(f"unsupported test state {state}")
+
+
+@pytest.mark.parametrize(
+    "initial_state",
+    ["DISARMED", "IDLE", "STARTING", "WALKING", "TURNING", "STOPPING"],
+)
+def test_request_safe_stop_requires_post_transaction_stationary_samples_from_every_nonfault_state(
+    initial_state: str,
+) -> None:
+    adapter, requested_at = _adapter_in_nonfault_state(initial_state)
+
+    requested = adapter.request_safe_stop(1, now=requested_at)
+    assert requested.state == "STOPPING"
+    assert requested.stop_requested is True
+    assert requested.stop_acknowledged is False
+    assert requested.motion_enabled is False
+
+    first_at = requested_at + 0.01
+    first = adapter.ingest_observation(observation(first_at), now=first_at)
+    assert first.state == "STOPPING"
+    assert first.stop_acknowledged is False
+
+    final_at = first_at + 0.16
+    final = adapter.ingest_observation(observation(final_at), now=final_at)
+    assert final.state == "DISARMED"
+    assert final.stop_acknowledged is True
+    assert adapter.arm(1, now=final_at + 0.01).state == "DISARMED"
+
+
+def test_request_safe_stop_retry_does_not_reset_stationary_evidence() -> None:
+    adapter = armed_adapter()
+    requested = adapter.request_safe_stop(1, now=10.02)
+    first = adapter.ingest_observation(observation(10.03), now=10.03)
+    assert first.state == "STOPPING"
+
+    repeated = adapter.request_safe_stop(1, now=10.10)
+    assert repeated.state == "STOPPING"
+    assert repeated.sequence > requested.sequence
+    final = adapter.ingest_observation(observation(10.19), now=10.19)
+    assert final.state == "DISARMED"
+    assert final.stop_acknowledged is True
+
+
+def test_request_safe_stop_rejects_delayed_pre_request_capture_timestamps() -> None:
+    adapter = armed_adapter()
+    requested = adapter.request_safe_stop(1, now=10.20)
+    assert requested.state == "STOPPING"
+
+    delayed_first = adapter.ingest_observation(
+        observation(10.05),
+        now=10.21,
+    )
+    delayed_second = adapter.ingest_observation(
+        observation(10.19),
+        now=10.37,
+    )
+    assert delayed_first.state == delayed_second.state == "STOPPING"
+    assert delayed_first.stop_acknowledged is False
+    assert delayed_second.stop_acknowledged is False
+
+    post_request_first = adapter.ingest_observation(
+        observation(10.21),
+        now=10.38,
+    )
+    assert post_request_first.state == "STOPPING"
+    assert post_request_first.stop_acknowledged is False
+    confirmed = adapter.ingest_observation(
+        observation(10.37),
+        now=10.54,
+    )
+    assert confirmed.state == "DISARMED"
+    assert confirmed.stop_acknowledged is True
+
+
+def test_request_safe_stop_uses_capture_span_not_callback_arrival_span() -> None:
+    adapter = armed_adapter()
+    adapter.request_safe_stop(1, now=10.20)
+
+    first = adapter.ingest_observation(observation(10.201), now=10.21)
+    delayed_arrival = adapter.ingest_observation(
+        observation(10.202),
+        now=10.37,
+    )
+    assert first.state == delayed_arrival.state == "STOPPING"
+    assert delayed_arrival.stop_acknowledged is False
+
+    confirmed = adapter.ingest_observation(
+        observation(10.36),
+        now=10.38,
+    )
+    assert confirmed.state == "DISARMED"
+    assert confirmed.stop_acknowledged is True
+
+
+def test_request_safe_stop_stale_captures_break_stationary_evidence() -> None:
+    adapter = armed_adapter()
+    adapter.request_safe_stop(1, now=10.20)
+
+    stale_first = adapter.ingest_observation(observation(10.21), now=12.00)
+    stale_second = adapter.ingest_observation(observation(10.37), now=12.10)
+    assert stale_first.state == stale_second.state == "STOPPING"
+    assert stale_second.stop_acknowledged is False
+
+    fresh_first = adapter.ingest_observation(observation(12.11), now=12.11)
+    assert fresh_first.state == "STOPPING"
+    assert fresh_first.stop_acknowledged is False
+    confirmed = adapter.ingest_observation(observation(12.27), now=12.27)
+    assert confirmed.state == "DISARMED"
+    assert confirmed.stop_acknowledged is True
+
+
+def test_request_safe_stop_never_converts_fault_to_normal_stop() -> None:
+    adapter = armed_adapter()
+    fault = adapter.ingest_twist(twist(10.02, vx=math.nan), now=10.02)
+    assert fault.state == "FAULT"
+    fault_started_at = adapter._stop_started_at
+
+    repeated = adapter.request_safe_stop(1, now=10.03)
+    assert repeated.state == "FAULT"
+    assert adapter._safe_stop_requested is False
+    assert adapter._stop_started_at == fault_started_at
+
+
 def test_stale_nav2_command_fails_closed_and_disarms_after_stop_ack() -> None:
     adapter = armed_adapter()
     adapter.ingest_twist(twist(10.02, vx=0.2), now=10.02)
