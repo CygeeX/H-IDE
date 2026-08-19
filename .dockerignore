@@ -1,0 +1,10 @@
+node_modules
+.mastra
+data
+.git
+.env
+*.db
+*.db-shm
+*.db-wal
+test
+coverage

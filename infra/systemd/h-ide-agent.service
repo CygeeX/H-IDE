@@ -1,0 +1,32 @@
+[Unit]
+Description=H-IDE Mastra planning supervisor
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=h-ide-agent
+Group=h-ide-agent
+WorkingDirectory=/var/lib/h-ide-agent
+EnvironmentFile=/etc/h-ide-agent/agent.env
+Environment=HOST=127.0.0.1
+Environment=PORT=4111
+Environment=PLANNING_DATABASE_URL=file:/var/lib/h-ide-agent/planning.db
+Environment=MASTRA_MEMORY_URL=file:/var/lib/h-ide-agent/memory.db
+StateDirectory=h-ide-agent
+ExecStart=/usr/bin/node /opt/h-ide-agent/.mastra/output/index.mjs
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/h-ide-agent
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
