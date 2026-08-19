@@ -16,6 +16,7 @@ import yaml
 
 from tools.build_scene import BuildPaths, build_scene
 from hide_mujoco_sonic.config import SimConfig
+from hide_mujoco_sonic.motion_fault import STALE_HEALTH_CONFIRMATION_PROBES
 from hide_mujoco_sonic.plant import (
     apply_process_start_spawn,
     configure_tracking_viewer,
@@ -430,7 +431,7 @@ def test_supported_configs_all_select_the_same_verified_office_v2_bundle() -> No
                 config.plant_lowstate_stale_s,
                 config.sonic_control_step_stale_s,
             )
-            + config.sonic_health_probe_period_s
+            + STALE_HEALTH_CONFIRMATION_PROBES * config.sonic_health_probe_period_s
             + config.sonic_health_probe_timeout_s
             < 0.30
         )

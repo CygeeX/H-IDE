@@ -20,6 +20,7 @@ from uuid import UUID, uuid4
 MOTION_FAULT_SCHEMA_VERSION = "h-ide.motion-safety-fault/v1"
 SONIC_HEALTH_SCHEMA_VERSION = "h-ide.sonic-health/v1"
 MOTION_FAULT_MAX_BYTES = 4096
+STALE_HEALTH_CONFIRMATION_PROBES = 2
 
 _FAULT_FIELDS = frozenset(
     {
@@ -50,6 +51,12 @@ _FAULT_SOURCES = frozenset(
 )
 _CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 _ROBOT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_TEMPORAL_STALE_CODES = frozenset(
+    {
+        "PLANT_LOWSTATE_STALE",
+        "SONIC_CONTROL_STALE",
+    }
+)
 
 _HEALTH_REQUEST_FIELDS = frozenset(
     {
@@ -495,6 +502,164 @@ class MotionFaultCause:
     reason: str
 
 
+@dataclass(frozen=True, slots=True)
+class PendingStaleHealth:
+    driver_boot_id: UUID
+    source: str
+    code: str
+    count: int
+    first_age_s: float
+    latest_age_s: float
+
+
+@dataclass(frozen=True, slots=True)
+class HealthFaultDecision:
+    confirmed_cause: MotionFaultCause | None
+    pending: PendingStaleHealth | None
+    required_count: int
+    driver_boot_id: UUID
+    filtered_transient_count: int
+
+
+class SonicHealthFaultGate:
+    """Confirm age-only health faults without delaying hard fault classes.
+
+    A single scheduler spike must not permanently poison a simulator boot.  The
+    two temporal age faults therefore require two consecutive probes with the
+    same driver boot and code.  Terminal/unavailable health and a driver boot
+    change remain immediate.  The immutable :class:`MotionFaultLatch` remains
+    responsible for exactly-once publication and local stop I/O.
+    """
+
+    def __init__(
+        self,
+        *,
+        plant_lowstate_stale_s: float,
+        sonic_control_step_stale_s: float,
+        required_stale_samples: int = STALE_HEALTH_CONFIRMATION_PROBES,
+    ) -> None:
+        for value, field in (
+            (plant_lowstate_stale_s, "plant_lowstate_stale_s"),
+            (sonic_control_step_stale_s, "sonic_control_step_stale_s"),
+        ):
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{field} must be finite and positive")
+        if (
+            isinstance(required_stale_samples, bool)
+            or required_stale_samples != STALE_HEALTH_CONFIRMATION_PROBES
+        ):
+            raise ValueError(
+                f"required_stale_samples is fixed at {STALE_HEALTH_CONFIRMATION_PROBES}"
+            )
+        self._plant_lowstate_stale_s = float(plant_lowstate_stale_s)
+        self._sonic_control_step_stale_s = float(sonic_control_step_stale_s)
+        self._required_count = required_stale_samples
+        self._driver_boot_id: UUID | None = None
+        self._pending: PendingStaleHealth | None = None
+        self._filtered_transient_count = 0
+
+    @property
+    def pending(self) -> PendingStaleHealth | None:
+        return self._pending
+
+    @property
+    def filtered_transient_count(self) -> int:
+        return self._filtered_transient_count
+
+    def _decision(
+        self,
+        *,
+        health: SonicHealth,
+        confirmed_cause: MotionFaultCause | None = None,
+    ) -> HealthFaultDecision:
+        return HealthFaultDecision(
+            confirmed_cause=confirmed_cause,
+            pending=self._pending,
+            required_count=self._required_count,
+            driver_boot_id=health.driver_boot_id,
+            filtered_transient_count=self._filtered_transient_count,
+        )
+
+    @staticmethod
+    def _age_for_cause(health: SonicHealth, cause: MotionFaultCause) -> float:
+        if cause.code == "PLANT_LOWSTATE_STALE":
+            age = health.last_lowstate_age_s
+        elif cause.code == "SONIC_CONTROL_STALE":
+            age = health.last_control_step_age_s
+        else:  # pragma: no cover - caller restricts this helper to stale codes
+            raise ValueError("cause is not a temporal stale fault")
+        if age is None or not math.isfinite(age) or age < 0:
+            raise ValueError("temporal stale fault did not include a valid age")
+        return float(age)
+
+    def _clear_pending(self, *, filtered: bool) -> None:
+        if filtered and self._pending is not None:
+            self._filtered_transient_count += 1
+        self._pending = None
+
+    def observe(self, health: SonicHealth) -> HealthFaultDecision:
+        previous_boot = self._driver_boot_id
+        if previous_boot is None:
+            self._driver_boot_id = health.driver_boot_id
+        elif previous_boot != health.driver_boot_id:
+            self._clear_pending(filtered=True)
+            self._driver_boot_id = health.driver_boot_id
+            return self._decision(
+                health=health,
+                confirmed_cause=MotionFaultCause(
+                    source="sonic_driver",
+                    code="SONIC_BOOT_CHANGED",
+                    reason=(
+                        "SONIC driver boot identity changed while the ROS "
+                        f"bridge remained active ({previous_boot} -> "
+                        f"{health.driver_boot_id})"
+                    ),
+                ),
+            )
+
+        cause = classify_sonic_health(
+            health,
+            plant_lowstate_stale_s=self._plant_lowstate_stale_s,
+            sonic_control_step_stale_s=self._sonic_control_step_stale_s,
+        )
+        if cause is None:
+            self._clear_pending(filtered=True)
+            return self._decision(health=health)
+        if cause.code not in _TEMPORAL_STALE_CODES:
+            self._clear_pending(filtered=True)
+            return self._decision(health=health, confirmed_cause=cause)
+
+        age = self._age_for_cause(health, cause)
+        identity = (health.driver_boot_id, cause.code)
+        previous = self._pending
+        if previous is None or (previous.driver_boot_id, previous.code) != identity:
+            self._clear_pending(filtered=previous is not None)
+            self._pending = PendingStaleHealth(
+                driver_boot_id=health.driver_boot_id,
+                source=cause.source,
+                code=cause.code,
+                count=1,
+                first_age_s=age,
+                latest_age_s=age,
+            )
+            return self._decision(health=health)
+
+        self._pending = PendingStaleHealth(
+            driver_boot_id=previous.driver_boot_id,
+            source=previous.source,
+            code=previous.code,
+            count=previous.count + 1,
+            first_age_s=previous.first_age_s,
+            latest_age_s=age,
+        )
+        return self._decision(
+            health=health,
+            confirmed_cause=(
+                cause if self._pending.count >= self._required_count else None
+            ),
+        )
+
+
 def classify_sonic_health(
     health: SonicHealth,
     *,
@@ -531,10 +696,10 @@ def classify_sonic_health(
             else f"{health.last_lowstate_age_s:.6f}s"
         )
         return MotionFaultCause(
-            source="mujoco_plant",
+            source="sonic_driver",
             code="PLANT_LOWSTATE_STALE",
             reason=(
-                f"MuJoCo LowState age {age} exceeds the "
+                f"LowState reception age {age} exceeds the "
                 f"{threshold:.6f}s safety bound"
             ),
         )

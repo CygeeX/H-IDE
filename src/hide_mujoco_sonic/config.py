@@ -9,6 +9,7 @@ from typing import Any
 
 import yaml
 
+from .motion_fault import STALE_HEALTH_CONFIRMATION_PROBES
 from .network import require_loopback_bind_host, resolve_docker_observation_bind_host
 from .scene_runtime import RuntimeScene, load_runtime_scene
 
@@ -138,7 +139,7 @@ class SimConfig:
             )
         if (
             max(plant_lowstate_stale_s, sonic_control_step_stale_s)
-            + health_probe_period_s
+            + STALE_HEALTH_CONFIRMATION_PROBES * health_probe_period_s
             + health_probe_timeout_s
             >= 0.30
         ):

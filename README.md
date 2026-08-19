@@ -92,8 +92,9 @@ non-semantic integrity manifest.
   so all accepted map motion still comes from SONIC.
 * A Nav2 cancel, bridge disconnect, or stale command publishes an idle SONIC
   intent and sends a zero/hold command to the MuJoCo plant.
-* GaitAdapter faults, SONIC loss/terminal faults, and stale Plant or SONIC
-  control steps publish one strict `h-ide.motion-safety-fault/v1` JSON event on
+* GaitAdapter faults, SONIC loss/terminal faults, and confirmed stale LowState
+  reception or SONIC control steps publish one strict
+  `h-ide.motion-safety-fault/v1` JSON event on
   `/h_ide/g1_sim/motion_safety_fault` with reliable, transient-local QoS. The
   event is published before the local Plant/SONIC stop is attempted. It carries
   robot/epoch, bridge and driver boot IDs, source sequence, control generation,
@@ -101,9 +102,13 @@ non-semantic integrity manifest.
   Robot Agent remains the sole Nav2 action owner and cancels only its correlated
   goal handle; the simulator never uses a global `CancelGoal(all)` operation.
 * The existing loopback-only port 8793 also accepts a read-only SONIC health
-  probe. It exposes both LowState age and last successful control-step age; the
-  25 ms probe, 20 ms timeout, and 100 ms stale bounds stay below the 300 ms
-  Robot Agent cancellation budget without placing ROS code inside SONIC.
+  probe. It exposes both LowState reception age and last successful control-step
+  age. Age-only faults require two consecutive 25 ms probes with the same
+  driver boot ID and fault code; a healthy probe clears the pending sample.
+  Terminal faults, unavailability, probe failures, and driver boot changes
+  remain immediate. The 100 ms stale bound plus two probe periods and the 20 ms
+  timeout yields a 170 ms worst-case detection budget, below Robot Agent's
+  300 ms cancellation budget, without placing ROS code inside SONIC.
 * Robot Agent diagnostics remain loopback-only on `127.0.0.1:8796`. The
   launcher starts a separate proxy on Docker's dynamically verified default
   bridge at port `8797`; it can forward only bodyless GET requests for

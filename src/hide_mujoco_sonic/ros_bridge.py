@@ -27,8 +27,8 @@ from .gait_adapter import (
 from .motion_fault import (
     MotionFaultLatch,
     MotionSafetyFault,
+    SonicHealthFaultGate,
     SonicHealth,
-    classify_sonic_health,
     motion_fault_qos,
     sonic_health_probe,
 )
@@ -166,7 +166,10 @@ def run_ros_bridge(config: SimConfig) -> None:
     latest_heading = {"yaw": None}
     latest_observation: dict[str, BaseObservation | None] = {"value": None}
     bridge_fault = {"reason": None}
-    sonic_boot_id: dict[str, UUID | None] = {"value": None}
+    health_fault_gate = SonicHealthFaultGate(
+        plant_lowstate_stale_s=config.plant_lowstate_stale_s,
+        sonic_control_step_stale_s=config.sonic_control_step_stale_s,
+    )
     direction_guard = MotionDirectionGuard()
     goal_guard = GoalProgressGuard()
     heading_guard = TranslationHeadingGuard(
@@ -687,33 +690,38 @@ def run_ros_bridge(config: SimConfig) -> None:
                 )
             return
 
-        previous_boot = sonic_boot_id["value"]
-        if previous_boot is None:
-            sonic_boot_id["value"] = health.driver_boot_id
-        elif previous_boot != health.driver_boot_id:
-            try:
-                latch_stop(
-                    source="sonic_driver",
-                    code="SONIC_BOOT_CHANGED",
-                    reason=(
-                        "SONIC driver boot identity changed while the ROS "
-                        f"bridge remained active ({previous_boot} -> "
-                        f"{health.driver_boot_id})"
-                    ),
-                    downstream_boot_id=health.driver_boot_id,
-                    probe_request_id=request_id,
-                )
-            except Exception as delivery_exc:
-                node.get_logger().error(
-                    f"failed to enforce SONIC-restart stop: {delivery_exc}"
-                )
-            return
+        previous_pending = health_fault_gate.pending
+        decision = health_fault_gate.observe(health)
+        pending = decision.pending
+        if pending is not None and pending != previous_pending:
+            node.get_logger().warning(
+                "motion health stale confirmation pending "
+                f"driverBootId={pending.driver_boot_id} "
+                f"source={pending.source} code={pending.code} "
+                f"count={pending.count}/{decision.required_count} "
+                f"firstAgeS={pending.first_age_s:.6f} "
+                f"latestAgeS={pending.latest_age_s:.6f} "
+                "filteredTransientCount="
+                f"{decision.filtered_transient_count}"
+            )
+        elif (
+            previous_pending is not None
+            and pending is None
+            and decision.confirmed_cause is None
+        ):
+            node.get_logger().info(
+                "motion health stale confirmation cleared by healthy probe "
+                f"driverBootId={previous_pending.driver_boot_id} "
+                f"source={previous_pending.source} "
+                f"code={previous_pending.code} "
+                f"priorCount={previous_pending.count}/"
+                f"{decision.required_count} "
+                f"firstAgeS={previous_pending.first_age_s:.6f} "
+                "filteredTransientCount="
+                f"{decision.filtered_transient_count}"
+            )
 
-        cause = classify_sonic_health(
-            health,
-            plant_lowstate_stale_s=config.plant_lowstate_stale_s,
-            sonic_control_step_stale_s=config.sonic_control_step_stale_s,
-        )
+        cause = decision.confirmed_cause
         if cause is None:
             return
         try:
