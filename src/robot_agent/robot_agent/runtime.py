@@ -9,7 +9,7 @@ import math
 import re
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol, TypeVar, cast
 from uuid import UUID, uuid4
@@ -235,6 +235,12 @@ class RobotAgentRuntime:
             safe_stop=self._perform_safe_stop,
             initial_safe_stop_epoch=self._ledger.latest_safe_stop_epoch,
         )
+        # Fault ingress runs on the ROS owner thread while command dispatch runs
+        # on asyncio.  This one lock makes latch-vs-dispatch ordering explicit:
+        # an accepted fault either blocks the final dispatch gate, or observes
+        # the command already registered as the exact locally owned execution.
+        self._motion_fault_lock = threading.RLock()
+        self._motion_fault_ingress_latched = threading.Event()
         self._observation_guard = (
             ObservationGuard(
                 config.observation,
@@ -253,6 +259,8 @@ class RobotAgentRuntime:
             executor=self._ros,
             observation_guard=self._observation_guard,
             status_callback=self._enqueue_command_status,
+            dispatch_boundary=self._motion_fault_dispatch_boundary,
+            dispatch_interlock=self._assert_motion_fault_not_latched,
         )
         self._outbound: PriorityOutboundQueue | None = None
         self._event_loop: asyncio.AbstractEventLoop | None = None
@@ -266,9 +274,7 @@ class RobotAgentRuntime:
         self._diagnostics_lock = asyncio.Lock()
         self._state_freshness_lock = threading.RLock()
         self._state_received_monotonic: dict[str, float] = {}
-        self._motion_fault_lock = threading.RLock()
         self._motion_fault_deduplicator = MotionFaultDeduplicator()
-        self._motion_fault_ingress_latched = threading.Event()
         self._motion_fault_latest: MotionSafetyFault | None = None
         self._motion_fault_latest_evidence: MotionFaultCancelEvidence | None = None
         self._motion_fault_latest_outcome: str | None = None
@@ -1334,6 +1340,13 @@ class RobotAgentRuntime:
             raise SessionStateError(
                 "control blocked: a motion-safety fault is latched"
             )
+
+    @contextlib.contextmanager
+    def _motion_fault_dispatch_boundary(self) -> Iterator[None]:
+        """Serialize final local dispatch against ROS-thread fault ingress."""
+
+        with self._motion_fault_lock:
+            yield
 
     def _accept_observation_health(self, sample: ObservationHealthSample) -> None:
         guard = self._observation_guard

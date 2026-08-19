@@ -81,6 +81,8 @@ class CommandCoordinator:
         executor: CommandExecutor,
         observation_guard: ObservationGuard | None = None,
         status_callback: Callable[[CommandRecord], Awaitable[None]] | None = None,
+        dispatch_boundary: Callable[[], contextlib.AbstractContextManager[None]] | None = None,
+        dispatch_interlock: Callable[[], None] | None = None,
     ) -> None:
         self._commands = dict(commands)
         self._ledger = ledger
@@ -89,6 +91,8 @@ class CommandCoordinator:
         self._executor = executor
         self._observation_guard = observation_guard
         self._status_callback = status_callback
+        self._dispatch_boundary = dispatch_boundary or contextlib.nullcontext
+        self._dispatch_interlock = dispatch_interlock
         self._tasks: dict[UUID, asyncio.Task[Any]] = {}
         self._registration_locks: dict[UUID, asyncio.Lock] = {}
         self._executing: set[UUID] = set()
@@ -274,7 +278,7 @@ class CommandCoordinator:
             self._ledger.transition,
             payload.command_id,
             CommandState.RUNNING,
-            detail="command dispatched to local adapter",
+            detail="command admitted; preparing local adapter dispatch",
             at=_utc_now(),
         )
         if self._status_callback is not None:
@@ -312,7 +316,7 @@ class CommandCoordinator:
                 detail="command expired while preparing local dispatch",
                 at=_utc_now(),
             )
-        timeout_seconds = min(command.timeout_ms / 1000.0, remaining_before_execution)
+        execution_parameters = adapter_params(command, payload.params)
         if self._observation_guard is not None:
             try:
                 await self._observation_guard.command_started(observation_binding)
@@ -325,16 +329,79 @@ class CommandCoordinator:
                     detail=f"observation demand publication failed: {type(exc).__name__}: {exc}",
                     at=_utc_now(),
                 )
-        self._executing.add(payload.command_id)
-        if command.goal_transform in {"navigate_to_pose_v1", "nav2_spin_v2"}:
-            self._active_nav2.add(payload.command_id)
-        execution_task = asyncio.create_task(
-            self._executor.execute(
+
+        # This is the final dispatch boundary.  The runtime supplies the same
+        # cross-thread lock used by motion-fault ingress, so exactly one of two
+        # things becomes true before the lock is released:
+        #
+        # * the fault latch wins and no executor task can be created; or
+        # * this command is marked as the owned Nav2 execution before ingress
+        #   can latch, allowing the fault handler to cancel its exact goal.
+        #
+        # Session state and pending cancellation are checked in this same
+        # synchronous section.  In particular, there is no dispatch gap after
+        # the awaited observation-demand publication above.
+        execution_task: asyncio.Task[ExecutionResult] | None = None
+        timeout_seconds = 0.0
+        blocked_state = CommandState.CANCELLED
+        blocked_detail: str | None = None
+        pending_cancellation = False
+        with self._dispatch_boundary():
+            if payload.command_id in self._cancel_reasons:
+                pending_cancellation = True
+            else:
+                try:
+                    if self._dispatch_interlock is not None:
+                        self._dispatch_interlock()
+                    self._session.assert_can_command(request.session_id)
+                except SessionStateError as exc:
+                    blocked_detail = f"local dispatch interlocked: {exc}"
+                if (
+                    blocked_detail is None
+                    and payload.command_id not in self._arbiter.active_commands
+                ):
+                    blocked_detail = "safe stop preempted command before local dispatch"
+                remaining_at_dispatch = remaining_seconds()
+                if blocked_detail is None and remaining_at_dispatch <= 0:
+                    blocked_state = CommandState.TIMED_OUT
+                    blocked_detail = "command expired before final local dispatch"
+                if blocked_detail is None:
+                    timeout_seconds = min(
+                        command.timeout_ms / 1000.0,
+                        remaining_at_dispatch,
+                    )
+                    self._executing.add(payload.command_id)
+                    if command.goal_transform in {
+                        "navigate_to_pose_v1",
+                        "nav2_spin_v2",
+                    }:
+                        self._active_nav2.add(payload.command_id)
+                    execution_task = asyncio.create_task(
+                        self._executor.execute(
+                            payload.command_id,
+                            command,
+                            execution_parameters,
+                        )
+                    )
+
+        if execution_task is None:
+            self._arbiter.release(payload.command_id)
+            if self._observation_guard is not None:
+                with contextlib.suppress(Exception):
+                    await self._observation_guard.command_finished(observation_binding)
+            if pending_cancellation:
+                cancelled = await self._take_pre_dispatch_cancellation(payload.command_id)
+                if cancelled is not None:
+                    return cancelled
+                blocked_detail = "cancellation interlocked final local dispatch"
+            return await asyncio.to_thread(
+                self._ledger.transition,
                 payload.command_id,
-                command,
-                adapter_params(command, payload.params),
+                blocked_state,
+                detail=blocked_detail or "local dispatch was interlocked",
+                at=_utc_now(),
             )
-        )
+
         try:
             result = await asyncio.wait_for(
                 asyncio.shield(execution_task),

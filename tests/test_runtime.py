@@ -1366,6 +1366,121 @@ async def test_motion_fault_isolated_exact_cancel_and_terminal_after_physical_st
 
 
 @pytest.mark.asyncio
+async def test_motion_fault_at_observation_await_tail_interlocks_final_dispatch(
+    tmp_path: Path,
+) -> None:
+    """A ROS-thread latch must win even before its asyncio handler can run."""
+
+    config = fault_runtime_config(tmp_path)
+    ros = FaultAwareFakeRosAdapter()
+    runtime = RobotAgentRuntime(config, ros_adapter=ros)
+    await runtime.initialize()
+    assert ros.motion_fault_callback is not None
+
+    session_id = uuid4()
+    await runtime._session.connected(session_id)
+    await runtime._session.acquire(
+        session_id,
+        operator_id="operator-7",
+        at=datetime.now(timezone.utc),
+    )
+    command_id = uuid4()
+    event_id = uuid4()
+    producer_boot_id = uuid4()
+    fault_raw = motion_fault_json(
+        event_id=event_id,
+        producer_boot_id=producer_boot_id,
+    )
+
+    class FaultAtObservationTail:
+        def __init__(self) -> None:
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+            self.fault_emitted = asyncio.Event()
+            self.finished = asyncio.Event()
+
+        def admit(
+            self,
+            requested_command_id: UUID,
+            command: CommandConfig,
+            params: dict[str, Any],
+            *,
+            monotonic_now: float,
+        ) -> ObservationBinding:
+            del command, params, monotonic_now
+            return ObservationBinding(
+                command_id=requested_command_id,
+                observation_session_id="observation-race",
+                sensor_id="head_rgbd",
+                scene_version="",
+                robot_boot_id=str(runtime._boot_id),
+                localization_epoch_id="g1-sim-map-epoch-1",
+            )
+
+        async def command_started(self, binding: ObservationBinding | None) -> None:
+            assert binding is not None
+            self.entered.set()
+            await self.release.wait()
+            # This is deliberately the final operation before the awaited
+            # method returns.  _handle_motion_safety_fault cannot run until
+            # this coroutine yields again, so only the cross-thread ingress
+            # latch and final dispatch boundary can prevent execution.
+            assert ros.motion_fault_callback is not None
+            ros.motion_fault_callback(fault_raw, time.monotonic_ns())
+            self.fault_emitted.set()
+
+        async def command_finished(self, binding: ObservationBinding | None) -> None:
+            assert binding is not None
+            self.finished.set()
+
+    observation = FaultAtObservationTail()
+    runtime._coordinator._observation_guard = observation  # type: ignore[assignment]
+    request = parse_wire_message(
+        inbound(
+            "command.request",
+            session_id,
+            {
+                "command_id": str(command_id),
+                "kind": "navigation.navigate_to_pose",
+                "issued_at": datetime.now(timezone.utc).isoformat(),
+                "ttl_ms": 5000,
+                "params": {},
+            },
+        ),
+        expected_robot_id="g1-dev",
+    )
+    assert isinstance(request, CommandRequest)
+
+    submission = asyncio.create_task(
+        runtime._coordinator.submit(request, at=datetime.now(timezone.utc))
+    )
+    await asyncio.wait_for(observation.entered.wait(), timeout=1)
+    observation.release.set()
+    await asyncio.wait_for(observation.fault_emitted.wait(), timeout=1)
+    terminal = await asyncio.wait_for(submission, timeout=1)
+
+    assert terminal.state is CommandState.CANCELLED
+    assert "motion-safety fault is latched" in terminal.detail
+    assert ros.executions == []
+    assert ros.exact_fault_cancels == []
+    assert observation.finished.is_set() is True
+    assert runtime._motion_fault_ingress_latched.is_set() is True
+
+    await asyncio.wait_for(ros.fault_stop_started.wait(), timeout=1)
+    assert runtime._session.snapshot.safe_stop_state.value == "requested"
+    ros.release_fault_stop.set()
+    await asyncio.gather(*tuple(runtime._motion_fault_tasks))
+
+    assert runtime._session.snapshot.safe_stop_state.value == "confirmed"
+    assert runtime._session.snapshot.can_acquire is False
+    audit = runtime._ledger.motion_fault_events()[-1]
+    assert audit.event_id == event_id
+    assert audit.command_id is None
+    assert audit.outcome == "no_active_nav2_goal"
+    await runtime.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_ros_executor_failure_terminates_active_connection(tmp_path: Path) -> None:
     ros = FakeRosAdapter()
     runtime = RobotAgentRuntime(runtime_config(tmp_path), ros_adapter=ros)
