@@ -220,6 +220,10 @@ class GaitAdapter:
         self._motion_started_in_generation = False
 
         self._start_at: float | None = None
+        self._reference_wait_started_at: float | None = None
+        self._reference_authority_source_sequence: int | None = None
+        self._reference_authority_epoch: int | None = None
+        self._reference_authority_dds_sequence: int | None = None
         self._active_kind: GaitState | None = None
         self._active_direction: tuple[float, float] | None = None
         self._active_turn_sign = 0.0
@@ -285,9 +289,10 @@ class GaitAdapter:
             return self._emit(timestamp)
 
         if self.state in (GaitState.STARTING, GaitState.WALKING, GaitState.TURNING):
-            self._check_reverse_motion(observation, timestamp)
-            if self.state is GaitState.STARTING:
-                self._check_start_ack(observation)
+            if self.state is not GaitState.STARTING or self._start_at is not None:
+                self._check_reverse_motion(observation, timestamp)
+                if self.state is GaitState.STARTING:
+                    self._check_start_ack(observation)
 
         if self.state in (GaitState.STOPPING, GaitState.FAULT):
             self._observe_stop_ack(observation, timestamp)
@@ -394,6 +399,78 @@ class GaitAdapter:
         self._evaluate(timestamp)
         return self._emit(timestamp)
 
+    def observe_reference_authority(
+        self,
+        *,
+        generation: int,
+        source_sequence: int,
+        reference_epoch: int,
+        dds_target_sequence: int,
+        granted_at_monotonic_s: float,
+        now: float | None = None,
+    ) -> bool:
+        """Start measured-motion timing from one correlated successful DDS grant."""
+
+        timestamp = self._resolve_now(now)
+        integer_values = (
+            (generation, 0, "generation"),
+            (source_sequence, 1, "source_sequence"),
+            (reference_epoch, 1, "reference_epoch"),
+            (dds_target_sequence, 1, "dds_target_sequence"),
+        )
+        for value, minimum, name in integer_values:
+            if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+                raise ValueError(f"reference authority {name} is invalid")
+        granted_at = float(granted_at_monotonic_s)
+        if (
+            not math.isfinite(granted_at)
+            or granted_at < 0
+            or granted_at > timestamp + self.config.future_timestamp_tolerance_s
+        ):
+            raise ValueError("reference authority grant timestamp is invalid")
+        if self.state is not GaitState.STARTING or generation != self.generation:
+            return False
+        required_sequence = self._reference_authority_source_sequence
+        wait_started_at = self._reference_wait_started_at
+        if (
+            required_sequence is None
+            or wait_started_at is None
+            or source_sequence != required_sequence
+            or granted_at < wait_started_at
+        ):
+            return False
+        if self._start_at is not None:
+            return bool(
+                reference_epoch == self._reference_authority_epoch
+                and dds_target_sequence == self._reference_authority_dds_sequence
+                and granted_at == self._start_at
+            )
+
+        self._start_at = granted_at
+        self._reference_authority_epoch = reference_epoch
+        self._reference_authority_dds_sequence = dds_target_sequence
+        self._motion_started_in_generation = True
+        self.reason = "waiting for measured gait start"
+        observation = self._observation
+        if self._motion_anchor is None and observation is not None:
+            self._motion_anchor = (
+                observation.x,
+                observation.y,
+                observation.yaw,
+            )
+            self._previous_yaw = observation.yaw
+            if self._active_direction is None:
+                self._expected_map_direction = None
+            else:
+                direction_x, direction_y = self._active_direction
+                cosine = math.cos(observation.yaw)
+                sine = math.sin(observation.yaw)
+                self._expected_map_direction = (
+                    cosine * direction_x - sine * direction_y,
+                    sine * direction_x + cosine * direction_y,
+                )
+        return True
+
     def _evaluate(self, now: float) -> None:
         if self.state is GaitState.FAULT:
             return
@@ -469,13 +546,13 @@ class GaitAdapter:
                 self._trip_fault("measured base did not acknowledge gait start before timeout", now)
 
     def _begin_start(self, desired: GaitState, command: Nav2Twist, now: float) -> None:
-        # Record authority grant, not only measured movement.  If observation
-        # later disappears, a STARTING lifecycle must never be downgraded to
-        # the startup-only same-generation recovery path.
-        self._motion_started_in_generation = True
         self.state = GaitState.STARTING
-        self.reason = "waiting for measured gait start"
-        self._start_at = now
+        self.reason = "waiting for matched SONIC reference actuator authority"
+        self._start_at = None
+        self._reference_wait_started_at = now
+        self._reference_authority_source_sequence = None
+        self._reference_authority_epoch = None
+        self._reference_authority_dds_sequence = None
         self._active_kind = desired
         linear = math.hypot(command.vx, command.vy)
         if desired is GaitState.WALKING and linear > 0:
@@ -490,6 +567,9 @@ class GaitAdapter:
             self._expected_map_direction = None
             self._previous_yaw = None
         else:
+            # Capture the pre-authority pose.  Health polling can observe the
+            # first DDS grant up to one probe period later; re-anchoring at that
+            # point would erase the first physical displacement segment.
             self._motion_anchor = (observation.x, observation.y, observation.yaw)
             self._previous_yaw = observation.yaw
             if self._active_direction is None:
@@ -506,6 +586,8 @@ class GaitAdapter:
         self._stop_acknowledged = False
 
     def _check_start_ack(self, observation: BaseObservation) -> None:
+        if self._start_at is None or observation.timestamp_s < self._start_at:
+            return
         if self._active_kind is GaitState.WALKING and self._active_direction is not None:
             projection = (
                 observation.vx_body * self._active_direction[0]
@@ -596,6 +678,10 @@ class GaitAdapter:
         self.reason = reason
         self._stop_started_at = now
         self._stop_terminal = terminal
+        self._reference_wait_started_at = None
+        self._reference_authority_source_sequence = None
+        self._reference_authority_epoch = None
+        self._reference_authority_dds_sequence = None
         self._reset_stop_ack()
 
     def _complete_stop(self) -> None:
@@ -603,6 +689,10 @@ class GaitAdapter:
         reason = self.reason
         self.state = terminal
         self._start_at = None
+        self._reference_wait_started_at = None
+        self._reference_authority_source_sequence = None
+        self._reference_authority_epoch = None
+        self._reference_authority_dds_sequence = None
         self._active_kind = None
         self._active_direction = None
         self._active_turn_sign = 0.0
@@ -626,6 +716,11 @@ class GaitAdapter:
         self.reason = reason
         self._requires_new_generation = True
         self._stop_started_at = now
+        self._start_at = None
+        self._reference_wait_started_at = None
+        self._reference_authority_source_sequence = None
+        self._reference_authority_epoch = None
+        self._reference_authority_dds_sequence = None
 
     def _observe_stop_ack(self, observation: BaseObservation, now: float) -> None:
         if (
@@ -666,6 +761,10 @@ class GaitAdapter:
         self._requires_new_generation = False
         self._motion_started_in_generation = False
         self._start_at = None
+        self._reference_wait_started_at = None
+        self._reference_authority_source_sequence = None
+        self._reference_authority_epoch = None
+        self._reference_authority_dds_sequence = None
         self._active_kind = None
         self._active_direction = None
         self._active_turn_sign = 0.0
@@ -720,6 +819,11 @@ class GaitAdapter:
 
     def _emit(self, now: float, *, reason: str | None = None) -> SonicIntent:
         self._sequence += 1
+        if (
+            self.state is GaitState.STARTING
+            and self._reference_authority_source_sequence is None
+        ):
+            self._reference_authority_source_sequence = self._sequence
         moving = self.state in (
             GaitState.STARTING,
             GaitState.WALKING,

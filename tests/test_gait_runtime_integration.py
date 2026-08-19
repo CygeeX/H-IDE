@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import math
 import threading
 from types import SimpleNamespace
@@ -15,9 +16,15 @@ from hide_mujoco_sonic.gait_adapter import (
 )
 from hide_mujoco_sonic.ros_bridge import (
     _intent_payload,
+    _observe_health_reference_authority,
     _ros_stamp_in_monotonic_domain,
 )
-from hide_mujoco_sonic.motion_fault import SonicHealth, sonic_health_probe
+from hide_mujoco_sonic.motion_fault import (
+    HealthFaultDecision,
+    MotionFaultCause,
+    SonicHealth,
+    sonic_health_probe,
+)
 from hide_mujoco_sonic.planner_evidence import (
     PlannerReferenceDeadlineExceeded,
     PlannerReferenceEvidenceGate,
@@ -110,6 +117,67 @@ def decide(ingress: SonicIntentIngress, intent):
     return ingress.accept(_intent_payload(intent, measured_heading_yaw=0.0))
 
 
+def grant_reference(
+    adapter: GaitAdapter,
+    starting,
+    *,
+    granted_at: float,
+    reference_epoch: int = 1,
+    dds_sequence: int = 1,
+) -> None:
+    assert adapter.observe_reference_authority(
+        generation=int(starting.generation),
+        source_sequence=starting.sequence,
+        reference_epoch=reference_epoch,
+        dds_target_sequence=dds_sequence,
+        granted_at_monotonic_s=granted_at,
+        now=granted_at,
+    ) is True
+
+
+def reference_health(starting, *, granted_at: float) -> SonicHealth:
+    return SonicHealth(
+        request_id=UUID("40000000-0000-4000-8000-000000000004"),
+        robot_id="g1-sim",
+        driver_boot_id=UUID("30000000-0000-4000-8000-000000000003"),
+        status="ready",
+        terminal_fault=False,
+        reason=None,
+        motion_ready=True,
+        last_lowstate_age_s=0.01,
+        last_control_step_age_s=0.01,
+        plant_support_mode="locomotion",
+        plant_support_safety_latched=False,
+        plant_support_stop_pending=False,
+        static_hold_active=False,
+        navigation_task_active=True,
+        motion_authorized=True,
+        nav2_command_zero=False,
+        matched_reference_actuator_authority=True,
+        reference_authority_state="GRANTED",
+        reference_authority_generation=int(starting.generation),
+        reference_authority_source_sequence=starting.sequence,
+        reference_authority_intent_generation=1,
+        reference_authority_epoch=2,
+        reference_authority_granted_at_monotonic_s=granted_at,
+        reference_authority_granted_tick_ms=500,
+        reference_authority_dds_target_sequence=7,
+    )
+
+
+def healthy_decision(health: SonicHealth) -> HealthFaultDecision:
+    return HealthFaultDecision(
+        confirmed_cause=None,
+        pending=None,
+        required_count=2,
+        driver_boot_id=health.driver_boot_id,
+        filtered_transient_count=0,
+        quarantined_cause=None,
+        settled_safe_hold=False,
+        quarantined_stale_count=0,
+    )
+
+
 def test_ros_stamp_preserves_capture_age_in_monotonic_domain() -> None:
     assert _ros_stamp_in_monotonic_domain(
         seconds=1_000,
@@ -134,6 +202,54 @@ def test_ros_stamp_preserves_capture_age_in_monotonic_domain() -> None:
         )
 
 
+def test_bridge_starts_measurement_clock_from_healthy_first_dds_grant() -> None:
+    clock = Clock()
+    adapter, _ = runtime(clock)
+    clock.value = 10.01
+    starting = adapter.ingest_twist(twist(clock, vx=0.20), now=clock.value)
+    later = adapter.tick(now=10.02)
+    health = reference_health(starting, granted_at=10.015)
+
+    assert later.sequence > starting.sequence
+    assert _observe_health_reference_authority(
+        adapter,
+        health,
+        healthy_decision(health),
+        now=10.025,
+    ) is True
+    assert adapter._start_at == pytest.approx(10.015)
+
+
+def test_bridge_does_not_grant_authority_before_hard_fault_decision() -> None:
+    clock = Clock()
+    adapter, _ = runtime(clock)
+    clock.value = 10.01
+    starting = adapter.ingest_twist(twist(clock, vx=0.20), now=clock.value)
+    terminal = replace(
+        reference_health(starting, granted_at=10.015),
+        status="fault",
+        terminal_fault=True,
+        reason="terminal driver fault",
+        motion_ready=False,
+    )
+    decision = replace(
+        healthy_decision(terminal),
+        confirmed_cause=MotionFaultCause(
+            source="sonic_driver",
+            code="SONIC_TERMINAL_FAULT",
+            reason="terminal driver fault",
+        ),
+    )
+
+    assert _observe_health_reference_authority(
+        adapter,
+        terminal,
+        decision,
+        now=10.025,
+    ) is False
+    assert adapter._start_at is None
+
+
 def test_replay_straight_turn_and_zero_stops_before_mapping() -> None:
     clock = Clock()
     adapter, ingress = runtime(clock)
@@ -147,6 +263,7 @@ def test_replay_straight_turn_and_zero_stops_before_mapping() -> None:
         0.0,
         0.0,
     )
+    grant_reference(adapter, starting, granted_at=clock.value)
 
     clock.value += 0.01
     walking = adapter.ingest_observation(
@@ -188,10 +305,12 @@ def test_replay_terminal_events_never_reach_model_motion(terminal: str) -> None:
     clock = Clock()
     adapter, ingress = runtime(clock)
     clock.value += 0.01
+    starting = adapter.ingest_twist(twist(clock, vx=0.20), now=clock.value)
     decide(
         ingress,
-        adapter.ingest_twist(twist(clock, vx=0.20), now=clock.value),
+        starting,
     )
+    grant_reference(adapter, starting, granted_at=clock.value)
     clock.value += 0.01
     decide(
         ingress,
@@ -541,12 +660,9 @@ def test_gait_fault_freezes_last_published_targets_and_latches_plant(
         _intent_payload(adapter.tick(now=clock.value), measured_heading_yaw=0.0)
     )
     clock.value += 0.01
-    driver.accept_json(
-        _intent_payload(
-            adapter.ingest_twist(twist(clock, vx=0.20), now=clock.value),
-            measured_heading_yaw=0.0,
-        )
-    )
+    starting = adapter.ingest_twist(twist(clock, vx=0.20), now=clock.value)
+    driver.accept_json(_intent_payload(starting, measured_heading_yaw=0.0))
+    grant_reference(adapter, starting, granted_at=clock.value)
     clock.value += 0.01
     adapter.ingest_observation(
         observation(clock, vx=0.06, x=0.01),

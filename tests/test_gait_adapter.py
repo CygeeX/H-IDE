@@ -64,6 +64,25 @@ def armed_adapter(*, config: GaitAdapterConfig | None = None) -> GaitAdapter:
     return adapter
 
 
+def grant_reference(
+    adapter: GaitAdapter,
+    starting,
+    *,
+    granted_at: float = 10.025,
+    reference_epoch: int = 1,
+    dds_sequence: int = 1,
+) -> None:
+    assert starting.state == "STARTING"
+    assert adapter.observe_reference_authority(
+        generation=int(starting.generation),
+        source_sequence=starting.sequence,
+        reference_epoch=reference_epoch,
+        dds_target_sequence=dds_sequence,
+        granted_at_monotonic_s=granted_at,
+        now=granted_at,
+    ) is True
+
+
 def acknowledge_stop(
     adapter: GaitAdapter,
     *,
@@ -94,6 +113,7 @@ def test_walk_requires_arm_and_measured_start_ack() -> None:
     assert starting.schema_version == "h-ide.sonic-intent/v1"
     assert starting.head_yaw_rad == 0.0
     assert starting.head_pitch_rad == 0.0
+    grant_reference(adapter, starting)
 
     walking = adapter.ingest_observation(observation(10.03, vx=0.06), now=10.03)
     assert walking.state == "WALKING"
@@ -109,9 +129,148 @@ def test_turn_is_derived_only_from_nav2_and_has_fixed_head() -> None:
     assert starting.facing_delta_rad == pytest.approx(-0.1)
     assert starting.source == "nav2"
     assert starting.head_yaw_rad == starting.head_pitch_rad == 0.0
+    grant_reference(adapter, starting)
 
     turning = adapter.ingest_observation(observation(10.03, wz=-0.08), now=10.03)
     assert turning.state == "TURNING"
+
+
+def test_planner_wait_does_not_consume_measured_start_timeout() -> None:
+    adapter = armed_adapter(
+        config=GaitAdapterConfig(
+            command_timeout_s=5.0,
+            observation_timeout_s=5.0,
+            start_timeout_s=0.50,
+        )
+    )
+    starting = adapter.ingest_twist(twist(10.02, vx=0.2), now=10.02)
+
+    assert adapter.tick(now=11.00).state == "STARTING"
+    assert adapter._start_at is None
+    assert adapter.observe_reference_authority(
+        generation=1,
+        source_sequence=starting.sequence,
+        reference_epoch=2,
+        dds_target_sequence=9,
+        granted_at_monotonic_s=11.00,
+        now=11.00,
+    ) is True
+    assert adapter.tick(now=11.50).state == "STARTING"
+    fault = adapter.tick(now=11.501)
+    assert fault.state == "FAULT"
+    assert "acknowledge gait start" in (fault.reason or "")
+
+
+def test_start_ack_requires_exact_first_dds_authority_identity_and_new_observation() -> None:
+    adapter = armed_adapter()
+    starting = adapter.ingest_twist(twist(10.02, vx=0.2), now=10.02)
+    pre_grant = adapter.ingest_observation(
+        observation(10.03, vx=0.20, x=0.004),
+        now=10.03,
+    )
+    assert pre_grant.state == "STARTING"
+
+    common = dict(
+        generation=1,
+        reference_epoch=3,
+        dds_target_sequence=12,
+        granted_at_monotonic_s=10.03,
+        now=10.03,
+    )
+    assert adapter.observe_reference_authority(
+        source_sequence=starting.sequence - 1,
+        **common,
+    ) is False
+    assert adapter.observe_reference_authority(
+        source_sequence=starting.sequence + 1,
+        **common,
+    ) is False
+    assert adapter.observe_reference_authority(
+        source_sequence=starting.sequence,
+        granted_at_monotonic_s=10.019,
+        generation=1,
+        reference_epoch=3,
+        dds_target_sequence=12,
+        now=10.03,
+    ) is False
+    with pytest.raises(ValueError, match="timestamp"):
+        adapter.observe_reference_authority(
+            source_sequence=starting.sequence,
+            generation=1,
+            reference_epoch=3,
+            dds_target_sequence=12,
+            granted_at_monotonic_s=10.20,
+            now=10.03,
+        )
+
+    assert adapter.observe_reference_authority(
+        source_sequence=starting.sequence,
+        **common,
+    ) is True
+    assert adapter.observe_reference_authority(
+        generation=1,
+        source_sequence=starting.sequence,
+        reference_epoch=3,
+        dds_target_sequence=12,
+        granted_at_monotonic_s=10.031,
+        now=10.031,
+    ) is False
+    assert adapter.ingest_observation(
+        observation(10.031, vx=0.06, x=0.005),
+        now=10.031,
+    ).state == "WALKING"
+
+
+def test_repeated_starting_emissions_keep_first_admitted_authority_sequence() -> None:
+    adapter = armed_adapter()
+    admitted = adapter.ingest_twist(twist(10.02, vx=0.2), now=10.02)
+    later = adapter.tick(now=10.03)
+    latest = adapter.tick(now=10.04)
+
+    assert admitted.state == later.state == latest.state == "STARTING"
+    assert admitted.sequence < later.sequence < latest.sequence
+    assert adapter.observe_reference_authority(
+        generation=1,
+        source_sequence=latest.sequence,
+        reference_epoch=1,
+        dds_target_sequence=1,
+        granted_at_monotonic_s=10.04,
+        now=10.04,
+    ) is False
+    assert adapter.observe_reference_authority(
+        generation=1,
+        source_sequence=admitted.sequence,
+        reference_epoch=1,
+        dds_target_sequence=1,
+        granted_at_monotonic_s=10.04,
+        now=10.04,
+    ) is True
+
+
+def test_health_probe_delay_does_not_erase_pre_authority_motion_anchor() -> None:
+    adapter = armed_adapter(config=GaitAdapterConfig(max_linear_mps=0.25))
+    starting = adapter.ingest_twist(twist(10.02, vx=0.2), now=10.02)
+    # At the configured 0.25m/s limit the base may move about 6mm between the
+    # first DDS write and a 25ms health probe.  This sample must not replace the
+    # pre-motion admission pose.
+    adapter.ingest_observation(
+        observation(10.05, vx=-0.08, x=-0.006),
+        now=10.05,
+    )
+    assert adapter.observe_reference_authority(
+        generation=1,
+        source_sequence=starting.sequence,
+        reference_epoch=1,
+        dds_target_sequence=1,
+        granted_at_monotonic_s=10.025,
+        now=10.05,
+    ) is True
+    fault = adapter.ingest_observation(
+        observation(10.28, vx=-0.08, x=-0.061),
+        now=10.28,
+    )
+    assert fault.state == "FAULT"
+    assert "opposes Nav2" in (fault.reason or "")
 
 
 def test_nav2_zero_waits_for_multiple_measured_stop_samples() -> None:
@@ -207,12 +366,14 @@ def test_stale_observation_during_motion_latches_fault(active_state: str) -> Non
     config = GaitAdapterConfig(command_timeout_s=1.0, observation_timeout_s=0.20)
     adapter = armed_adapter(config=config)
     if active_state == "TURNING":
-        adapter.ingest_twist(twist(10.02, wz=0.2), now=10.02)
+        starting = adapter.ingest_twist(twist(10.02, wz=0.2), now=10.02)
+        grant_reference(adapter, starting)
         adapter.ingest_observation(observation(10.03, wz=0.06), now=10.03)
         stale_at = 10.24
     else:
-        adapter.ingest_twist(twist(10.02, vx=0.2), now=10.02)
+        starting = adapter.ingest_twist(twist(10.02, vx=0.2), now=10.02)
         if active_state == "WALKING":
+            grant_reference(adapter, starting)
             adapter.ingest_observation(observation(10.03, vx=0.06), now=10.03)
             stale_at = 10.24
         else:
@@ -235,7 +396,8 @@ def test_stale_observation_during_motion_latches_fault(active_state: str) -> Non
 def test_idle_stale_after_prior_motion_still_requires_new_generation() -> None:
     config = GaitAdapterConfig(command_timeout_s=1.0, observation_timeout_s=0.20)
     adapter = armed_adapter(config=config)
-    adapter.ingest_twist(twist(10.02, vx=0.2), now=10.02)
+    starting = adapter.ingest_twist(twist(10.02, vx=0.2), now=10.02)
+    grant_reference(adapter, starting)
     adapter.ingest_observation(observation(10.03, vx=0.06), now=10.03)
     assert adapter.ingest_twist(twist(10.04), now=10.04).state == "STOPPING"
     acknowledge_stop(adapter, first=10.05, terminal="IDLE")
@@ -253,11 +415,12 @@ def test_idle_stale_after_prior_motion_still_requires_new_generation() -> None:
 
 def test_humanoid_gait_phase_reverse_velocity_does_not_latch_fault() -> None:
     adapter = armed_adapter()
-    adapter.ingest_twist(twist(10.02, vx=0.2), now=10.02)
+    starting = adapter.ingest_twist(twist(10.02, vx=0.2), now=10.02)
+    grant_reference(adapter, starting)
     adapter.ingest_observation(observation(10.03, vx=0.06), now=10.03)
-    # A G1 briefly rocks backward while loading the next foot.  Eight
-    # millimetres of opposite displacement must not be treated as reversed
-    # navigation merely because instantaneous base velocity is negative.
+    # A single sample may be a centre-of-mass or foot-placement transient; its
+    # cause is unknown without contact evidence.  Eight millimetres of opposite
+    # displacement is not meaningful cumulative reverse navigation.
     transient = adapter.ingest_observation(
         observation(10.10, vx=-0.10, x=-0.008),
         now=10.10,
@@ -267,7 +430,8 @@ def test_humanoid_gait_phase_reverse_velocity_does_not_latch_fault() -> None:
 
 def test_cumulative_measured_reverse_translation_latches_fault() -> None:
     adapter = armed_adapter()
-    adapter.ingest_twist(twist(10.02, vx=0.2), now=10.02)
+    starting = adapter.ingest_twist(twist(10.02, vx=0.2), now=10.02)
+    grant_reference(adapter, starting)
     adapter.ingest_observation(observation(10.03, vx=0.06, x=0.01), now=10.03)
     fault = adapter.ingest_observation(
         observation(10.10, vx=-0.08, x=-0.07),
@@ -280,7 +444,8 @@ def test_cumulative_measured_reverse_translation_latches_fault() -> None:
 
 def test_sustained_measured_reverse_turn_latches_fault() -> None:
     adapter = armed_adapter()
-    adapter.ingest_twist(twist(10.02, wz=0.3), now=10.02)
+    starting = adapter.ingest_twist(twist(10.02, wz=0.3), now=10.02)
+    grant_reference(adapter, starting)
     adapter.ingest_observation(observation(10.03, wz=0.06, yaw=0.01), now=10.03)
     adapter.ingest_observation(observation(10.04, wz=-0.08, yaw=-0.02), now=10.04)
     fault = adapter.ingest_observation(

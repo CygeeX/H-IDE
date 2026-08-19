@@ -25,6 +25,7 @@ from .gait_adapter import (
     SonicIntent,
 )
 from .motion_fault import (
+    HealthFaultDecision,
     MotionFaultLatch,
     MotionSafetyFault,
     SonicHealthFaultGate,
@@ -114,6 +115,47 @@ def _ros_stamp_in_monotonic_domain(
     if age_s < -0.05:
         raise ValueError("odometry timestamp is in the future")
     return float(monotonic_now_s) - max(0.0, age_s)
+
+
+def _observe_health_reference_authority(
+    gait: GaitAdapter,
+    health: SonicHealth,
+    decision: HealthFaultDecision,
+    *,
+    now: float,
+) -> bool:
+    """Forward a correlated first-DDS grant only from a healthy snapshot."""
+
+    if (
+        decision.confirmed_cause is not None
+        or decision.pending is not None
+        or decision.quarantined_cause is not None
+        or health.terminal_fault
+        or not health.motion_ready
+        or not health.matched_reference_actuator_authority
+    ):
+        return False
+    generation = health.reference_authority_generation
+    source_sequence = health.reference_authority_source_sequence
+    reference_epoch = health.reference_authority_epoch
+    dds_sequence = health.reference_authority_dds_target_sequence
+    granted_at = health.reference_authority_granted_at_monotonic_s
+    if (
+        generation is None
+        or source_sequence is None
+        or reference_epoch <= 0
+        or dds_sequence is None
+        or granted_at is None
+    ):
+        raise ValueError("granted SONIC health lacks reference authority evidence")
+    return gait.observe_reference_authority(
+        generation=generation,
+        source_sequence=source_sequence,
+        reference_epoch=reference_epoch,
+        dds_target_sequence=dds_sequence,
+        granted_at_monotonic_s=granted_at,
+        now=now,
+    )
 
 
 def run_ros_bridge(config: SimConfig) -> None:
@@ -753,6 +795,38 @@ def run_ros_bridge(config: SimConfig) -> None:
             health,
             gait_state=gait.state,
         )
+        try:
+            granted = _observe_health_reference_authority(
+                gait,
+                health,
+                decision,
+                now=time.monotonic(),
+            )
+        except ValueError as exc:
+            try:
+                latch_stop(
+                    source="sonic_driver",
+                    code="SONIC_HEALTH_CONTRACT_FAULT",
+                    reason=f"invalid reference authority health: {exc}",
+                    downstream_boot_id=health.driver_boot_id,
+                    probe_request_id=request_id,
+                )
+            except Exception as delivery_exc:
+                node.get_logger().error(
+                    "failed to enforce reference-authority health fault: "
+                    f"{delivery_exc}"
+                )
+            return
+        if granted:
+            node.get_logger().info(
+                "matched SONIC reference obtained actuator authority "
+                f"generation={health.reference_authority_generation} "
+                f"sourceSequence={health.reference_authority_source_sequence} "
+                f"referenceEpoch={health.reference_authority_epoch} "
+                "ddsTargetSequence="
+                f"{health.reference_authority_dds_target_sequence}"
+            )
+
         pending = decision.pending
         quarantined = decision.quarantined_cause
         if quarantined is not None:
