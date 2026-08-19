@@ -50,7 +50,6 @@ from .sonic_pipeline import (
     DEBUG_PRINT_EVERY,
     DEFAULT_ANGLES,
     DEFAULT_HEIGHT,
-    ENCODER_UPDATE_EVERY,
     LM,
     MOTION_SETS,
     MovementState,
@@ -59,7 +58,9 @@ from .sonic_pipeline import (
     apply_pico_loco_axes,
     clamp_mode_params,
     compute_kp_kd,
+    hardware_target_vector,
     make_ort_session_options,
+    observation_state,
     ort_providers,
     process_joystick,
     should_replan_request,
@@ -202,9 +203,9 @@ def _extract_loco_from_action(action: dict | None) -> tuple[np.ndarray, np.ndarr
 
 
 class SonicRuntime:
-    """Shared SONIC control loop state (standalone demo + locomotion controller)."""
+    """Shared SONIC loop with explicit planner and actuator transactions."""
 
-    def __init__(self, force_cpu: bool = False):
+    def __init__(self, force_cpu: bool = False, *, auto_reference_authority: bool = True):
         require_package("onnxruntime", extra="unitree_g1")
         planner_path = hf_hub_download(repo_id="nvidia/GEAR-SONIC", filename="planner_sonic.onnx")
         encoder_path = hf_hub_download(repo_id="nvidia/GEAR-SONIC", filename="model_encoder.onnx")
@@ -222,23 +223,201 @@ class SonicRuntime:
         self.ms = MovementState()
         self.planner = SonicPlanner(planner_sess, planner_path)
         self.controller = PlannerController(self.planner, encoder_sess, decoder_sess)
-
-        motion = self.planner.initialize(DEFAULT_ANGLES, self.ms)
-        self.controller.load_initial_motion(motion)
-        self.planner.start_subprocess(self.controller, use_gpu=self.use_gpu)
-
         self.step = 0
         self.replan_timer = 0.0
         self.last_ms = snapshot_ms(self.ms)
+        self.auto_reference_authority = bool(auto_reference_authority)
+        self._initialized = False
+        self._planner_worker_started = False
+        self._matching_reference_loaded = False
+        self._reference_install_epoch = 0
+        self._minimum_acquirable_epoch: int | None = None
+        self._policy_step_pending = False
 
     @property
     def pipeline(self):
         return self.controller
 
+    @property
+    def initialized(self):
+        """Whether a complete measured LowState seeded the live runtime."""
+
+        return self._initialized
+
+    @property
+    def reference_authority(self):
+        return self.controller.reference_authority
+
+    @property
+    def execution_feedback_pending(self):
+        return self._policy_step_pending
+
+    @property
+    def reference_install_epoch(self):
+        """Monotonic count of planner motions installed in the live buffer."""
+
+        return self._reference_install_epoch
+
+    @property
+    def matching_reference_installed(self):
+        """Whether the latest required reference was accepted and installed."""
+
+        return self._matching_reference_loaded
+
+    def _start_planner_worker(self):
+        if self._planner_worker_started:
+            return
+        self.planner.start_subprocess(self.controller, use_gpu=self.use_gpu)
+        self._planner_worker_started = True
+
+    def initialize_from_observation(self, obs: dict) -> bool:
+        """Idempotently initialize planner/history from the first real LowState.
+
+        This synchronous method is safe to call during a startup preparation
+        phase before a real-time clock is armed. It never advances ``step`` or
+        ``ref_cursor`` and construction itself performs no planner inference.
+        """
+
+        q, _dq, _ang, _quat = observation_state(obs, require_complete=True)
+        if self._initialized:
+            return False
+        motion = self.planner.initialize(q, self.ms)
+        self.controller.load_initial_motion(motion)
+        self.controller.seed_history(obs, executed_target=q)
+        self._matching_reference_loaded = True
+        self._reference_install_epoch += 1
+        self._start_planner_worker()
+        self._initialized = True
+        if self.auto_reference_authority:
+            self.controller.set_reference_authority(
+                actuator_authority=True,
+                matching_reference_ready=True,
+            )
+        return True
+
+    def revoke_reference_authority(
+        self,
+        *,
+        discard_reference: bool = True,
+        discard_pending_execution: bool = False,
+    ):
+        """Stop playback while preserving an in-flight publish transaction.
+
+        A stop may win after inference but before DDS. By default the pending
+        candidate remains open so the publisher can acknowledge the frozen
+        target it actually writes. Cursor advancement is independently blocked
+        by revoked authority. Only a terminal abort with no possible publish
+        should set ``discard_pending_execution=True``.
+        """
+
+        if discard_pending_execution and self.controller.execution_feedback_pending:
+            self.controller.discard_pending_execution()
+            self._policy_step_pending = False
+        self.controller.set_reference_authority(
+            actuator_authority=False,
+            matching_reference_ready=False,
+        )
+        self.controller.playing = False
+        if discard_reference:
+            self._matching_reference_loaded = False
+
+    def request_reference(self, obs: dict):
+        """Request a plan from fresh measurement without running encoder/decoder.
+
+        The async planner request/result API remains visible to generation-scoped
+        evidence adapters. No history, token, action, runtime step, or playback
+        cursor is advanced on this planning-only path.
+        """
+
+        if not self._initialized:
+            raise RuntimeError("SONIC must be initialized from LowState before planning-only requests")
+        if self._policy_step_pending or self.controller.execution_feedback_pending:
+            raise RuntimeError("cannot rebase SONIC planning with unpublished policy output")
+        self.revoke_reference_authority(
+            discard_reference=True,
+            discard_pending_execution=True,
+        )
+        self.controller.load_measured_reference(obs)
+        self._minimum_acquirable_epoch = self._reference_install_epoch + 1
+        self.planner.request_replan(self.controller.ref_cursor, self.ms)
+        self.replan_timer = 0.0
+        self.ms.needs_replan = False
+        self.last_ms = snapshot_ms(self.ms)
+
+    def poll_reference(self) -> bool:
+        """Poll and blend one accepted async plan without policy-state progress."""
+
+        result = self.planner.try_get_new_motion()
+        if result is None:
+            return False
+        self.controller.blend_new_motion(*result)
+        self.controller.reinit_heading = True
+        self._matching_reference_loaded = True
+        self._reference_install_epoch += 1
+        return True
+
+    def acquire_reference(self, obs: dict, *, executed_target, expected_install_epoch: int | None = None):
+        """Acquire a loaded matching plan at the actual actuator boundary.
+
+        Manual-authority integrations must pass the exact epoch they observed
+        after their evidence-filtered ``poll_reference``. Thus the synchronous
+        startup/IDLE motion cannot be mistaken for a new intent's accepted plan.
+        """
+
+        if not self._initialized:
+            raise RuntimeError("SONIC must be initialized from LowState before authority acquisition")
+        if not self._matching_reference_loaded:
+            raise RuntimeError("SONIC cannot acquire authority without a loaded matching reference")
+        if not self.auto_reference_authority:
+            minimum = self._minimum_acquirable_epoch
+            if expected_install_epoch is None or isinstance(expected_install_epoch, bool):
+                raise RuntimeError("manual SONIC authority requires an exact reference install epoch")
+            if (
+                minimum is None
+                or self._reference_install_epoch < minimum
+                or int(expected_install_epoch) != self._reference_install_epoch
+            ):
+                raise RuntimeError("manual SONIC authority epoch does not identify the requested plan")
+        if self._policy_step_pending or self.controller.execution_feedback_pending:
+            raise RuntimeError("SONIC cannot acquire authority with unpublished policy output")
+        # Validate the boundary before mutating any recurrent state.
+        boundary = hardware_target_vector(executed_target)
+        self.controller.seed_history(obs, executed_target=boundary)
+        self.controller.reinit_heading = True
+        self.controller.first_motion = True
+        self.controller.playing = True
+        self.controller.set_reference_authority(
+            actuator_authority=True,
+            matching_reference_ready=True,
+        )
+        self.step = 0
+        self.replan_timer = 0.0
+        self.last_ms = snapshot_ms(self.ms)
+        self._minimum_acquirable_epoch = None
+
+    def record_executed_target(self, target):
+        """Commit a successful publish, then advance exactly one ref frame."""
+
+        if not self._policy_step_pending:
+            raise RuntimeError("SONIC runtime has no policy step awaiting publish feedback")
+        executed = self.controller.record_executed_target(target)
+        self.controller.advance_cursor()
+        self._policy_step_pending = False
+        return executed
+
     def tick(self, obs: dict, *, debug: bool | None = None, use_joystick: bool = True) -> dict:
         if not obs:
-            self.step += 1
             return {}
+
+        if not self._initialized:
+            self.initialize_from_observation(obs)
+        if not self.reference_authority:
+            if not self.auto_reference_authority:
+                return {}
+            if not self._matching_reference_loaded:
+                raise RuntimeError("automatic SONIC authority has no initialized reference")
+            q, _dq, _ang, _quat = observation_state(obs, require_complete=True)
+            self.acquire_reference(obs, executed_target=q)
 
         if use_joystick:
             process_joystick(obs, self.ms, self.controller)
@@ -252,33 +431,72 @@ class SonicRuntime:
             self.ms.needs_replan = False
             self.last_ms = snapshot_ms(self.ms)
 
-        do_enc = self.step % ENCODER_UPDATE_EVERY == 0
+        # Official deploy parity: the encoder token is fresh on every 50 Hz
+        # policy tick; cadence must not depend on a mutable/debug counter.
+        do_enc = True
         if debug is None:
             debug = self.step % DEBUG_PRINT_EVERY == 0
         action = self.controller.step(obs, update_encoder=do_enc, debug=debug)
+        self._policy_step_pending = True
 
-        result = self.planner.try_get_new_motion()
-        if result:
-            self.controller.blend_new_motion(*result)
+        self.poll_reference()
 
-        self.controller.advance_cursor()
         self.step += 1
         return action
 
     def reset(self):
-        self.ms = MovementState()
+        self.revoke_reference_authority(
+            discard_reference=True,
+            discard_pending_execution=True,
+        )
+        # Do not run synchronous re-initialization concurrently with an old
+        # async planner worker. A later measured initialization starts a fresh
+        # worker after its initial motion is installed.
+        if self._planner_worker_started:
+            self.planner.stop_subprocess()
+            self._planner_worker_started = False
+        # Preserve the wrapper/runtime alias rather than replacing ``self.ms``.
+        self.ms.__dict__.clear()
+        self.ms.__dict__.update(vars(MovementState()))
         self.controller.reinit_heading = True
-        self.controller.playing = True
         self.step = 0
         self.replan_timer = 0.0
         self.last_ms = snapshot_ms(self.ms)
+        self._initialized = False
+        self._minimum_acquirable_epoch = None
 
     def shutdown(self):
-        self.planner.stop_subprocess()
+        if self._planner_worker_started:
+            self.planner.stop_subprocess()
+            self._planner_worker_started = False
 
 
 class SonicWholeBodyController:
-    """Full-body SONIC controller for UnitreeG1's background controller thread."""
+    """Full-body SONIC controller for UnitreeG1's background controller thread.
+
+    Integrations that arbitrate the actuator externally must construct with
+    ``auto_reference_authority=False`` and follow this transaction protocol::
+
+        initialize_from_lowstate(lowstate)
+        revoke_reference_authority()
+        request_reference(fresh_lowstate)
+        while not poll_reference():
+            ...  # hold the actuator; no policy tick or cursor progress
+        acquire_reference(
+            fresh_lowstate,
+            executed_target=last_published_29,
+            expected_install_epoch=reference_install_epoch,
+        )
+        candidate = run_step({}, lowstate)
+        publish(candidate)
+        record_executed_target(final_published_29)
+
+    ``poll_reference`` must be observed through the owner's matching-reference
+    evidence gate. A stop racing ``run_step`` revokes authority but preserves
+    pending feedback: publish the frozen target, then record it; the cursor does
+    not advance while authority is revoked. Only a terminal path that cannot
+    publish anything may discard pending execution explicitly.
+    """
 
     control_dt = CONTROL_DT
     full_body = True
@@ -291,6 +509,9 @@ class SonicWholeBodyController:
         self,
         force_cpu: bool = False,
         *,
+        auto_reference_authority: bool = True,
+        enable_startup_blend: bool | None = None,
+        allow_operator_intent: bool | None = None,
         enable_smpl_root: bool = False,
         root_smoothing_alpha: float = 0.15,
         enable_smpl_stream: bool = False,
@@ -298,11 +519,24 @@ class SonicWholeBodyController:
         smpl_port: int | None = None,
     ):
         logger.info("Loading SONIC whole-body controller...")
-        self._runtime = SonicRuntime(force_cpu=force_cpu)
+        self._runtime = SonicRuntime(
+            force_cpu=force_cpu,
+            auto_reference_authority=auto_reference_authority,
+        )
         self.kp = self._runtime.kp
         self.kd = self._runtime.kd
         self.controller = self._runtime.controller
         self.ms = self._runtime.ms
+        if enable_startup_blend is None:
+            enable_startup_blend = auto_reference_authority
+        if enable_startup_blend and not auto_reference_authority:
+            raise ValueError("manual SONIC authority cannot enable post-policy startup blending")
+        self._startup_blend_enabled = bool(enable_startup_blend)
+        if allow_operator_intent is None:
+            allow_operator_intent = auto_reference_authority
+        if allow_operator_intent and not auto_reference_authority:
+            raise ValueError("manual SONIC authority accepts intent only from its owning integration")
+        self._allow_operator_intent = bool(allow_operator_intent)
 
         # When True, the per-frame SMPL root quaternion steers the mode-2 anchor.
         # Off by default: even with smoothing this changes the anchor/heading and is
@@ -351,6 +585,80 @@ class SonicWholeBodyController:
             LM(self.ms.mode).name,
             self._smpl_stream is not None,
         )
+
+    @property
+    def initialized(self) -> bool:
+        return self._runtime.initialized
+
+    @property
+    def reference_authority(self) -> bool:
+        return self._runtime.reference_authority
+
+    @property
+    def execution_feedback_pending(self) -> bool:
+        return self._runtime.execution_feedback_pending or self.controller.execution_feedback_pending
+
+    @property
+    def reference_install_epoch(self) -> int:
+        return self._runtime.reference_install_epoch
+
+    @property
+    def matching_reference_installed(self) -> bool:
+        return self._runtime.matching_reference_installed
+
+    def initialize_from_lowstate(self, lowstate) -> bool:
+        """Initialize planner/history from LowState without a policy tick."""
+
+        if lowstate is None:
+            raise ValueError("SONIC initialization requires a LowState")
+        return self._runtime.initialize_from_observation(lowstate_to_obs(lowstate))
+
+    def request_reference(self, lowstate) -> None:
+        """Begin a planning-only measured rebase for a new intent."""
+
+        if lowstate is None:
+            raise ValueError("SONIC reference request requires a LowState")
+        self._runtime.request_reference(lowstate_to_obs(lowstate))
+
+    def poll_reference(self) -> bool:
+        """Poll/blend an async reference without running the policy."""
+
+        return self._runtime.poll_reference()
+
+    def acquire_reference(
+        self,
+        lowstate,
+        *,
+        executed_target,
+        expected_install_epoch: int | None = None,
+    ) -> None:
+        """Rebase policy history and acquire a matching planner reference."""
+
+        if lowstate is None:
+            raise ValueError("SONIC authority acquisition requires a LowState")
+        self._runtime.acquire_reference(
+            lowstate_to_obs(lowstate),
+            executed_target=executed_target,
+            expected_install_epoch=expected_install_epoch,
+        )
+
+    def revoke_reference_authority(
+        self,
+        *,
+        discard_reference: bool = True,
+        discard_pending_execution: bool = False,
+    ) -> None:
+        self._runtime.revoke_reference_authority(
+            discard_reference=discard_reference,
+            discard_pending_execution=discard_pending_execution,
+        )
+
+    def record_executed_target(self, target):
+        """Record a target only after its complete actuator publish succeeds."""
+
+        if self._runtime.execution_feedback_pending:
+            return self._runtime.record_executed_target(target)
+        return self.controller.record_executed_target(target)
 
     def _init_smpl_stream(self) -> None:
         # Lazy import so the zmq dependency is only required when streaming is on.
@@ -407,7 +715,7 @@ class SonicWholeBodyController:
         Controls: WASD move, Q/E turn, 1-8 select mode, 9/0 speed down/up,
         -/= height down/up, R replan, Space emergency-stop -> IDLE.
         """
-        if action is None:
+        if not self._allow_operator_intent or action is None:
             return
         keys = action.get(KEYBOARD_KEYS_FIELD)
         if keys is None:
@@ -483,6 +791,8 @@ class SonicWholeBodyController:
         yaw-accumulator + mode-dependent speed curves, not the keyboard-parity map), and
         A+B / X+Y edge-cycle the locomotion mode within the current motion set.
         """
+        if not self._allow_operator_intent:
+            return
         lx, ly, rx, ry = (float(v) for v in axes)
         apply_pico_loco_axes(lx, ly, rx, ry, self.ms)
 
@@ -512,6 +822,14 @@ class SonicWholeBodyController:
         encoder/decoder run directly (planner bypassed). One command per tick, so the
         VLA's commanded pose is what SONIC tracks.
         """
+        if not self._runtime.initialized:
+            self._runtime.initialize_from_observation(obs)
+        if not self._runtime.reference_authority:
+            if not self._runtime.auto_reference_authority:
+                return {}
+            q, _dq, _ang, _quat = observation_state(obs, require_complete=True)
+            self._runtime.acquire_reference(obs, executed_target=q)
+
         ref, anchor = _wb34_to_reference(wb)
         c = self.controller
         if c.encode_mode != 0:
@@ -549,7 +867,7 @@ class SonicWholeBodyController:
             c.motion_timesteps = n
             c.ref_cursor = 0
         c.playing = True
-        do_enc = self._wb_step % ENCODER_UPDATE_EVERY == 0
+        do_enc = True
         out = c.step(obs, update_encoder=do_enc, debug=False)
         if self._wb_step % 25 == 0:
             tgt = np.array([out[f"{m.name}.q"] for m in G1_29_JointIndex], np.float32)
@@ -600,7 +918,7 @@ class SonicWholeBodyController:
         ``out`` is the policy's ``<joint>.q`` target dict for this tick; the blend ratio
         climbs 0->1 over the ramp, after which the raw policy target passes through.
         """
-        if self._init_step >= self._init_ramp_steps or not out:
+        if not self._startup_blend_enabled or self._init_step >= self._init_ramp_steps or not out:
             return out
         if self._init_step == 0:
             # Capture the robot's actual pose as the interpolation start point.
@@ -686,18 +1004,26 @@ class SonicWholeBodyController:
             # Replicate the original encode_mode-1 handling: when the PICO controller
             # sticks are forwarded, drive locomotion from them directly (and skip the
             # wireless-remote joystick read). Otherwise leave the remote/keyboard path.
-            if loco is not None:
+            if loco is not None and self._allow_operator_intent:
                 self._process_pico_loco(loco[0], loco[1])
                 out = self._runtime.tick(obs, debug=False, use_joystick=False)
             else:
-                out = self._runtime.tick(obs, debug=False, use_joystick=True)
+                out = self._runtime.tick(
+                    obs,
+                    debug=False,
+                    use_joystick=self._allow_operator_intent,
+                )
         else:
             # No (or stale) teleop reference: fall back to locomotion so the robot stays balanced.
             if self.controller.encode_mode != 0:
                 self.controller.smpl_root_quat = None
                 self._smoothed_root_quat = None
                 self._exit_wholebody()
-            out = self._runtime.tick(obs, debug=False)
+            out = self._runtime.tick(
+                obs,
+                debug=False,
+                use_joystick=self._allow_operator_intent,
+            )
 
         # Startup interpolation: blend from the robot's initial pose into the policy's
         # commanded target over INIT_RAMP_S, regardless of mode.

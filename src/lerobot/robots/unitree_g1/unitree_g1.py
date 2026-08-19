@@ -359,6 +359,12 @@ class UnitreeG1(Robot):
                 ctrl_kp = self.controller.kp if hasattr(self.controller, "kp") else None
                 ctrl_kd = self.controller.kd if hasattr(self.controller, "kd") else None
                 self.publish_lowcmd(controller_action, kp=ctrl_kp, kd=ctrl_kd)
+                # SONIC's recurrent action history and reference cursor are a
+                # two-phase transaction: only a successful complete DDS write
+                # may commit the target that was actually executed.
+                record_executed = getattr(self.controller, "record_executed_target", None)
+                if controller_action and callable(record_executed):
+                    record_executed(controller_action)
 
             elapsed = time.time() - start_time
             sleep_time = max(0, control_dt - elapsed)

@@ -35,7 +35,7 @@ Three cooperating ONNX models:
     background thread (``_planner_worker``) and its 30 Hz output is resampled to
     50 Hz. New motions are cross-faded into the live buffer (``blend_new_motion``).
   * **encoder**  – compresses the reference window into a 64-D latent ``token``
-    (refreshed every ``ENCODER_UPDATE_EVERY`` ticks).
+    (refreshed every 50 Hz control tick, matching the deploy controller).
   * **decoder**  – every tick, maps the token + recent proprioception history to a
     residual action that is scaled and added to ``DEFAULT_ANGLES``.
 
@@ -137,19 +137,24 @@ def _action_scale(k):
     return 0.25 * EFFORT[k] / (ARMATURE[k] * NATURAL_FREQ**2)
 
 
-# Per-joint motor model (IsaacLab order): legs, waist, then arms. Single source of
-# truth for both ACTION_SCALE and compute_kp_kd().
+# Per-joint motor model in Unitree/MuJoCo deploy order: grouped left leg, right
+# leg, waist, then arms. Single source of truth for both actuator-side
+# ACTION_SCALE and compute_kp_kd(). Decoder actions are permuted into this order
+# before the scale is applied.
 MOTOR_MODELS = (
     ["7520_22", "7520_22", "7520_14", "7520_22", "5020", "5020"] * 2
     + ["7520_14", "5020", "5020"]
     + ["5020", "5020", "5020", "5020", "5020", "4010", "4010"] * 2
 )
-ACTION_SCALE = np.array([_action_scale(k) for k in MOTOR_MODELS], dtype=np.float32)  # (29,) IsaacLab order
+ACTION_SCALE = np.array([_action_scale(k) for k in MOTOR_MODELS], dtype=np.float32)  # (29,) deploy order
 
 CONTROL_DT = 0.02  # 50 Hz control period (s)
 DEFAULT_HEIGHT = 0.788740  # nominal pelvis height (m)
 TOKEN_DIM = 64  # encoder latent size
-ENCODER_UPDATE_EVERY = 5  # refresh the encoder token every N ticks (decoder runs every tick)
+# The official deploy loop runs both encoder and decoder at 50 Hz.  Keep this
+# public constant for downstream callers, but make the parity requirement
+# explicit rather than permitting a stale token for four out of five ticks.
+ENCODER_UPDATE_EVERY = 1
 DEBUG_PRINT_EVERY = 100  # ticks between debug prints
 MOTION_LOOK_AHEAD_STEPS = 2  # frames ahead used to seed a replan context (hide planner latency)
 INITIAL_RANDOM_SEED = 1234
@@ -165,6 +170,36 @@ REPLAN_INTERVAL = {"running": 0.1, "crawling": 0.2, "boxing": 1.0, "default": 1.
 def _mujoco_to_isaaclab(a):
     """Reorder a 29-vector from MuJoCo/deploy order into policy order."""
     return a[MUJOCO_TO_ISAACLAB]
+
+
+def normalized_action_to_hardware_target(action_isaaclab):
+    """Map one normalized policy action to a 29-DoF hardware target.
+
+    The decoder emits IsaacLab-order residuals.  ``DEFAULT_ANGLES`` and
+    ``ACTION_SCALE`` are in Unitree/MuJoCo deploy order, so the residual is
+    permuted before scaling.  Keeping this conversion in one public helper
+    prevents the publish-feedback inverse from drifting away from inference.
+    """
+
+    action = np.asarray(action_isaaclab, dtype=np.float32)
+    if action.shape != (29,) or not np.all(np.isfinite(action)):
+        raise ValueError("normalized SONIC action must contain 29 finite values")
+    return DEFAULT_ANGLES_MUJOCO + action[ISAACLAB_TO_MUJOCO] * ACTION_SCALE
+
+
+def hardware_target_to_normalized_action(target_mujoco):
+    """Invert a final published 29-DoF target into decoder action coordinates.
+
+    This is intentionally defined on the *final actuator target*, after any
+    safety or handoff layer.  The returned IsaacLab-order residual is what the
+    next decoder observation must carry in its action-history slot.
+    """
+
+    target = np.asarray(target_mujoco, dtype=np.float32)
+    if target.shape != (29,) or not np.all(np.isfinite(target)):
+        raise ValueError("published SONIC target must contain 29 finite values")
+    residual_mujoco = (target - DEFAULT_ANGLES_MUJOCO) / ACTION_SCALE
+    return residual_mujoco[MUJOCO_TO_ISAACLAB].astype(np.float32)
 
 
 # Keep the established public name for callers in the LeRobot feature branch;
@@ -187,7 +222,7 @@ def compute_kp_kd():
     """Derive per-joint PD gains (kp, kd) from motor armature and target bandwidth.
 
     Ankle and waist joints get a x2 factor for extra stiffness. Returns two
-    (29,) float32 arrays in IsaacLab joint order.
+    (29,) float32 arrays in Unitree/MuJoCo deploy order.
     """
 
     def s(k):
@@ -538,6 +573,69 @@ def should_replan_request(ms: MovementState, last: MovementSnapshot, replan_time
 # ── Encoder / Decoder ─────────────────────────────────────────────────────────
 
 
+def observation_state(robot_obs, *, require_complete=False):
+    """Extract one deploy-order proprioceptive sample from a robot observation.
+
+    ``require_complete`` is used at planner/authority boundaries: a joystick or
+    other partial dict must never be mistaken for the first real LowState and
+    padded with the nominal pose. The regular decoder path keeps its historical
+    permissive defaults for standalone callers.
+    """
+
+    jnames = [motor.name for motor in G1_29_JointIndex]
+    if require_complete:
+        required = [f"{name}.{field}" for name in jnames for field in ("q", "dq")]
+        required += [f"imu.quat.{axis}" for axis in "wxyz"]
+        required += [f"imu.gyro.{axis}" for axis in "xyz"]
+        missing = [key for key in required if key not in robot_obs]
+        if missing:
+            raise ValueError(
+                f"SONIC requires a complete measured LowState; missing {len(missing)} proprioceptive fields"
+            )
+    q = np.array(
+        [
+            robot_obs.get(f"{name}.q", DEFAULT_ANGLES[motor.value])
+            for motor, name in zip(G1_29_JointIndex, jnames, strict=True)
+        ],
+        np.float32,
+    )
+    dq = np.array([robot_obs.get(f"{name}.dq", 0.0) for name in jnames], np.float32)
+    quat = np.array(
+        [
+            robot_obs.get("imu.quat.w", 1.0),
+            robot_obs.get("imu.quat.x", 0.0),
+            robot_obs.get("imu.quat.y", 0.0),
+            robot_obs.get("imu.quat.z", 0.0),
+        ],
+        np.float32,
+    )
+    ang = np.array([robot_obs.get(f"imu.gyro.{axis}", 0.0) for axis in "xyz"], np.float32)
+    if not all(np.all(np.isfinite(value)) for value in (q, dq, quat, ang)):
+        raise ValueError("SONIC measured state must contain only finite values")
+    quat_norm = float(np.linalg.norm(quat))
+    if quat_norm < 1e-8:
+        raise ValueError("SONIC measured IMU quaternion must be non-degenerate")
+    if require_complete and abs(quat_norm - 1.0) > 1e-3:
+        raise ValueError("SONIC authoritative IMU quaternion must already be normalized")
+    return q, dq, ang, quat / quat_norm
+
+
+def hardware_target_vector(target):
+    """Normalize a target dict/vector into 29 values in hardware order."""
+
+    if isinstance(target, dict):
+        missing = [f"{motor.name}.q" for motor in G1_29_JointIndex if f"{motor.name}.q" not in target]
+        if missing:
+            raise ValueError(
+                f"published SONIC target feedback must contain all 29 joints; missing {len(missing)}"
+            )
+        target = [target[f"{motor.name}.q"] for motor in G1_29_JointIndex]
+    values = np.asarray(target, dtype=np.float32)
+    if values.shape != (29,) or not np.all(np.isfinite(values)):
+        raise ValueError("published SONIC target feedback must contain 29 finite values")
+    return values
+
+
 class StandingEncoderDecoder:
     """Runs the encoder + decoder ONNX models and owns the proprioception history.
 
@@ -559,7 +657,15 @@ class StandingEncoderDecoder:
         if enc_dim != 1762 or dec_dim != 994:
             raise RuntimeError(f"Unexpected dims encoder={enc_dim}, decoder={dec_dim}")
         self.token = np.zeros(TOKEN_DIM, np.float32)
-        self.last_action_mj = np.zeros(29, np.float32)
+        # Raw decoder output is diagnostic only. The recurrent action history
+        # is driven by the final actuator target acknowledged through
+        # ``record_executed_target``. ``last_action_mj`` remains as a legacy
+        # alias even though the stored vector is in IsaacLab/policy order.
+        self.last_raw_action_il = np.zeros(29, np.float32)
+        self.last_executed_action_il = np.zeros(29, np.float32)
+        self.last_action_mj = self.last_raw_action_il.copy()
+        self.last_policy_target_mujoco = DEFAULT_ANGLES.copy()
+        self._execution_feedback_pending = False
         self.h_q_mj = [np.zeros(29, np.float32)] * 10
         self.h_dq_mj = [np.zeros(29, np.float32)] * 10
         self.h_ang = [np.zeros(3, np.float32)] * 10
@@ -585,11 +691,57 @@ class StandingEncoderDecoder:
         self.h_q_mj = [q_il - DEFAULT_ANGLES_ISAACLAB] + self.h_q_mj[:-1]
         self.h_dq_mj = [dq_il] + self.h_dq_mj[:-1]
         self.h_ang = [ang.copy()] + self.h_ang[:-1]
-        self.h_act_mj = [self.last_action_mj.copy()] + self.h_act_mj[:-1]
+        self.h_act_mj = [self.last_executed_action_il.copy()] + self.h_act_mj[:-1]
         self.h_quat = [quat.copy()] + self.h_quat[:-1]
         if not self._heading_init:
             self.init_base_quat = quat.copy()
             self._heading_init = True
+
+    @property
+    def execution_feedback_pending(self):
+        """Whether a decoded candidate still lacks final publish feedback."""
+
+        return self._execution_feedback_pending
+
+    def seed_history(self, robot_obs, *, executed_target=None):
+        """Rebase all decoder history slots from one complete measured state.
+
+        Reacquiring actuator authority is a discontinuity in ownership, not ten
+        fictitious policy ticks. Fill all ten slots from the same real sample
+        and seed action history from the target that actually owns the actuator
+        boundary (the measured pose when no separate published hold is given).
+        """
+
+        q, dq, ang, quat = observation_state(robot_obs, require_complete=True)
+        target = q if executed_target is None else hardware_target_vector(executed_target)
+        executed_action = hardware_target_to_normalized_action(target)
+        q_il = _mujoco_to_isaaclab(q) - DEFAULT_ANGLES_ISAACLAB
+        dq_il = _mujoco_to_isaaclab(dq)
+        self.h_q_mj = [q_il.copy() for _ in range(10)]
+        self.h_dq_mj = [dq_il.copy() for _ in range(10)]
+        self.h_ang = [ang.copy() for _ in range(10)]
+        self.h_act_mj = [executed_action.copy() for _ in range(10)]
+        self.h_quat = [quat.copy() for _ in range(10)]
+        self.last_executed_action_il = executed_action.copy()
+        self.init_base_quat = quat.copy()
+        self._heading_init = True
+        self._execution_feedback_pending = False
+        return q, dq, ang, quat
+
+    def record_executed_target(self, target):
+        """Commit a successfully published actuator target to action history."""
+
+        if not self._execution_feedback_pending:
+            raise RuntimeError("SONIC has no policy target awaiting publish feedback")
+        values = hardware_target_vector(target)
+        self.last_executed_action_il = hardware_target_to_normalized_action(values)
+        self._execution_feedback_pending = False
+        return self.last_executed_action_il.copy()
+
+    def discard_pending_execution(self):
+        """Revoke an unpublished candidate without changing executed history."""
+
+        self._execution_feedback_pending = False
 
     def _heading_quat(self, q):
         h = calc_heading(q) / 2.0
@@ -688,27 +840,11 @@ class StandingEncoderDecoder:
             debug: print action/delta norms.
 
         Returns:
-            dict of ``<joint>.q`` target positions (rad) in IsaacLab joint order.
+            dict of ``<joint>.q`` target positions (rad) in hardware order.
         """
-        jnames = [m.name for m in G1_29_JointIndex]
-        q = np.array(
-            [
-                robot_obs.get(f"{n}.q", DEFAULT_ANGLES[m.value])
-                for m, n in zip(G1_29_JointIndex, jnames, strict=False)
-            ],
-            np.float32,
-        )
-        dq = np.array([robot_obs.get(f"{n}.dq", 0.0) for n in jnames], np.float32)
-        quat = np.array(
-            [
-                robot_obs.get("imu.quat.w", 1),
-                robot_obs.get("imu.quat.x", 0),
-                robot_obs.get("imu.quat.y", 0),
-                robot_obs.get("imu.quat.z", 0),
-            ],
-            np.float32,
-        )
-        ang = np.array([robot_obs.get(f"imu.gyro.{a}", 0) for a in "xyz"], np.float32)
+        if self._execution_feedback_pending:
+            raise RuntimeError("previous SONIC policy target was not acknowledged by the actuator publisher")
+        q, dq, ang, quat = observation_state(robot_obs)
         self.update_history(q, dq, ang, quat)
         if update_encoder:
             self.token = self.run_encoder()
@@ -717,8 +853,11 @@ class StandingEncoderDecoder:
             .squeeze()
             .astype(np.float32)
         )
+        self.last_raw_action_il = action_mj.copy()
         self.last_action_mj = action_mj.copy()
-        target = DEFAULT_ANGLES + action_mj[ISAACLAB_TO_MUJOCO] * ACTION_SCALE
+        target = normalized_action_to_hardware_target(action_mj)
+        self.last_policy_target_mujoco = target.copy()
+        self._execution_feedback_pending = True
         if debug:
             delta = target - q
             logger.debug(
@@ -1051,7 +1190,44 @@ class PlannerController(StandingEncoderDecoder):
         self.delta_heading = 0.0
         self.reinit_heading = False
         self.playing = self.first_motion = False
+        self.actuator_authority = False
+        self.matching_reference_ready = False
         self.motion_lock = threading.Lock()
+
+    @property
+    def reference_authority(self):
+        """True only when both actuator ownership and a matching plan are proven."""
+
+        return self.actuator_authority and self.matching_reference_ready
+
+    def set_reference_authority(self, *, actuator_authority, matching_reference_ready):
+        """Set the two independent prerequisites for reference playback."""
+
+        self.actuator_authority = bool(actuator_authority)
+        self.matching_reference_ready = bool(matching_reference_ready)
+
+    def load_measured_reference(self, robot_obs):
+        """Rebase the planning context from a fresh LowState without policy work.
+
+        This changes only the one-frame reference buffer. It deliberately does
+        not touch decoder history, token, raw/executed action, or the reference
+        cursor beyond resetting it to frame zero.
+        """
+
+        q, _dq, _ang, _quat = observation_state(robot_obs, require_complete=True)
+        q_il = _mujoco_to_isaaclab(q)
+        with self.motion_lock:
+            self.motion_timesteps = 1
+            self.motion_joint_positions[0] = q_il
+            self.motion_joint_velocities[0] = 0.0
+            self.motion_body_pos[0] = (0.0, 0.0, DEFAULT_HEIGHT)
+            # Planner initial context is local and heading-neutral. The decoder
+            # heading is separately rebased from the measured IMU at acquisition.
+            self.motion_body_quats[0] = (1.0, 0.0, 0.0, 0.0)
+            self.init_ref_quat = self.motion_body_quats[0].copy()
+            self.ref_cursor = 0
+            self.first_motion = True
+            self.playing = False
 
     def load_initial_motion(self, motion):
         """Copy the planner's first motion into the live buffer and start playback."""
@@ -1226,7 +1402,7 @@ class PlannerController(StandingEncoderDecoder):
 
     def advance_cursor(self):
         """Advance the reference cursor one frame per 50 Hz tick (no wall-clock catch-up)."""
-        if not self.playing:
+        if not self.playing or not self.reference_authority:
             return
         with self.motion_lock:
             if self.motion_timesteps > 0:
