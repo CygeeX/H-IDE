@@ -108,11 +108,16 @@ def test_auth_migration_is_expand_only_versioned_and_idempotent(tmp_path) -> Non
             "name": "assistant_v2_typed_scene_memory",
             "appliedAt": migrations[5]["appliedAt"],
         },
+        {
+            "version": 7,
+            "name": "mission_v2_autonomy_policy",
+            "appliedAt": migrations[6]["appliedAt"],
+        },
     ]
     first.close()
 
     reopened = SQLiteStore(str(db_path))
-    assert len(reopened.schema_migrations()) == 6
+    assert len(reopened.schema_migrations()) == 7
     assert reopened.get_robot("legacy-robot")["sentinel"] == "preserved"
     tables = {
         row[0]
@@ -134,6 +139,10 @@ def test_auth_migration_is_expand_only_versioned_and_idempotent(tmp_path) -> Non
         "scene_landmarks",
         "scene_landmark_observations",
         "scene_landmark_aliases",
+        "autonomy_preferences",
+        "autonomy_policy_decisions",
+        "autonomy_grants",
+        "robot_site_bindings",
     } <= tables
     reopened.close()
 

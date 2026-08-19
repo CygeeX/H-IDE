@@ -567,3 +567,27 @@ def test_human_required_revision_is_not_active_until_separately_approved() -> No
     assert approved["activeRevision"]["sequence"] == 3
     assert approved["activeRevision"]["disposition"] == "human_approved"
     assert len(approved["authorizations"]) == 2
+
+
+def test_planner_cannot_activate_a_physical_policy_inherited_revision() -> None:
+    runtime = MissionRuntime(SQLiteStore(":memory:"))
+    record = runtime.approve(_plan(), approved_by="tester")
+    active = record["activeRevision"]
+    proposed = PlanRevision(
+        revisionId="revision-policy-inherited-2",
+        missionId="plan-1",
+        sequence=2,
+        parentRevisionId=active["revisionId"],
+        objective="继续执行物理导航",
+        nodes=list(_plan().nodes),
+        reasonCode="planner_retry",
+        reason="Planner attempted to inherit physical authority",
+        changeSummary=["Retry navigation"],
+        disposition=ApprovalDisposition.POLICY_INHERITED,
+        authorizationId=record["authorization"]["authorizationId"],
+        createdBy="h-ide-agent",
+        createdAt=utc_now(),
+    )
+
+    with pytest.raises(MissionConflict, match="physical revisions require"):
+        runtime.apply_revision(proposed)

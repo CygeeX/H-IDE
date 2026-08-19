@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+import hmac
+import json
 import math
 import os
 from pathlib import Path
@@ -963,6 +965,66 @@ def create_app(
         raise ValueError("spatial confirmation drift thresholds must be finite and non-negative")
     context = _ControlContext(store, token, adapter_map, scene_adapter)
     context.seed()
+    primary_robot_id = (
+        os.getenv("ROBOT_AGENT_ID", "robot-1").strip()
+        if "robot_agent" in context.adapters
+        else "robot-1"
+    )
+    primary_target = (
+        "sim"
+        if "robot_agent" not in context.adapters
+        or (
+            simulation_gateway_driver is not None
+            and primary_robot_id == simulation_robot_id
+        )
+        else "real"
+    )
+    store.bind_robot_site(
+        primary_robot_id,
+        site_id=auth_service.default_site_id,
+        execution_target=primary_target,
+    )
+    if simulation_gateway_driver is not None:
+        store.bind_robot_site(
+            simulation_robot_id,
+            site_id=auth_service.default_site_id,
+            execution_target="sim",
+        )
+    raw_robot_bindings = os.getenv("ROBOT_SITE_BINDINGS_JSON", "").strip()
+    if raw_robot_bindings:
+        try:
+            configured_bindings = json.loads(raw_robot_bindings)
+        except json.JSONDecodeError as exc:
+            raise ValueError("ROBOT_SITE_BINDINGS_JSON must be valid JSON") from exc
+        if not isinstance(configured_bindings, Mapping):
+            raise ValueError("ROBOT_SITE_BINDINGS_JSON must be a robot-keyed object")
+        for configured_robot, configured_binding in configured_bindings.items():
+            if (
+                not isinstance(configured_robot, str)
+                or not configured_robot.strip()
+                or not isinstance(configured_binding, Mapping)
+            ):
+                raise ValueError("ROBOT_SITE_BINDINGS_JSON contains an invalid binding")
+            configured_site = configured_binding.get("siteId")
+            configured_target = configured_binding.get("executionTarget")
+            if (
+                not isinstance(configured_site, str)
+                or not configured_site.strip()
+                or configured_site.strip() == "*"
+                or any(
+                    character.isspace() or ord(character) < 32
+                    for character in configured_site.strip()
+                )
+                or configured_target not in {"sim", "real"}
+            ):
+                raise ValueError(
+                    "ROBOT_SITE_BINDINGS_JSON bindings require siteId and sim/real executionTarget"
+                )
+            store.bind_robot_site(
+                configured_robot.strip(),
+                site_id=configured_site.strip(),
+                execution_target=str(configured_target),
+            )
 
     # Optional live simulation path. The normal Robot Agent adapter above
     # continues to serve the physical robot. A second, explicitly configured
@@ -1280,6 +1342,7 @@ def create_app(
     app.state.assistant = assistant_service
     app.state.mission_runtime = mission_runtime
     app.state.mission = mission_service
+    app.state.mission_policy = mission_service.policy
     app.state.speech = speech_adapter
     app.state.realtime_speech = realtime_speech
     app.state.visual_mission = VisualMissionRuntime(
@@ -1365,6 +1428,7 @@ def create_app(
                 details.update(
                     {
                         "adapter": "robot_agent",
+                        "robotAgentObservedAt": utc_now().isoformat(),
                         "robotBootId": value.get("robotBootId"),
                         "capabilitiesDigest": value.get("capabilitiesDigest"),
                         "executionBackend": value.get("executionBackend"),
@@ -1421,6 +1485,10 @@ def create_app(
                     details.pop("sourceMode", None)
                 observation = value.get("observation")
                 if isinstance(observation, Mapping):
+                    details["observationStatus"] = str(
+                        observation.get("status") or "UNKNOWN"
+                    ).upper()
+                    details["observationObservedAt"] = utc_now().isoformat()
                     observation_session_id = observation.get("sessionId")
                     if isinstance(observation_session_id, str) and observation_session_id:
                         details["observationSessionId"] = observation_session_id
@@ -1434,6 +1502,8 @@ def create_app(
                 else:
                     details.pop("observationSessionId", None)
                     details.pop("observationLocalizationEpochId", None)
+                    details.pop("observationStatus", None)
+                    details.pop("observationObservedAt", None)
                 localization_epoch_id = (
                     _robot_agent_localization_epoch_id()
                     if robot_id == primary_robot_id
@@ -1663,6 +1733,11 @@ def create_app(
         safety_error = _motion_safety_error(robot, definition)
         if safety_error:
             raise ValueError(safety_error)
+        # The issue-time check is intentionally repeated against the freshly
+        # refreshed Robot Agent snapshot immediately before ActionRuntime.
+        # A stale/revoked/cross-revision grant or changed health can therefore
+        # never ride on an earlier successful decision.
+        mission_service.policy.authorize_dispatch(skill)
         mapping = MappingVersion(
             mappingId=(
                 f"mission-{descriptor.skillId.replace('.', '-')}-"
@@ -2004,7 +2079,14 @@ def create_app(
             revision_id=pending_revision if isinstance(pending_revision, str) else revision_id,
         )
 
-    app.include_router(create_mission_router(mission_service, token))
+    mission_internal_token = os.getenv("MISSION_V2_INTERNAL_TOKEN", "").strip()
+    if mission_internal_token and hmac.compare_digest(mission_internal_token, token):
+        raise ValueError(
+            "MISSION_V2_INTERNAL_TOKEN must be independent from the browser legacy token"
+        )
+    app.include_router(
+        create_mission_router(mission_service, mission_internal_token or None)
+    )
     app.include_router(
         create_simulation_router(
             simulation,

@@ -718,6 +718,138 @@ export interface AuthSessionResponse {
   csrfToken?: string;
 }
 
+export type SceneInspectionStatus = "open" | "completed" | "cancelled";
+export type SceneCheckpointStatus =
+  | "stopped"
+  | "captured"
+  | "named"
+  | "confirmed"
+  | "superseded"
+  | "cancelled";
+export type SceneLandmarkStatus = "candidate" | "confirmed" | "superseded";
+
+export interface SceneMemoryCapabilities {
+  mode: "SCENE_TEACH";
+  stateFlow: SceneCheckpointStatus[];
+  semanticProvider: "qwen";
+  allowedSources: string[];
+  retiredSources: string[];
+  authority: "observation_only";
+  executionEligible: false;
+  navigationDispatch: "forbidden";
+  humanConfirmationRequired: true;
+}
+
+export interface SceneInspectionCheckpoint {
+  checkpointId: string;
+  inspectionId: string;
+  sequence: number;
+  status: SceneCheckpointStatus;
+  robotPose: PoseMap;
+  localizationEpochId: string;
+  observedAt: string;
+  frameId?: string | null;
+  evidenceSha256?: string | null;
+  evidenceRef?: string | null;
+  vlmProvider?: string | null;
+  vlmModel?: string | null;
+  confidence?: number | null;
+  capturedAt?: string | null;
+  recordVersion: number;
+  createdAt: string;
+  updatedAt: string;
+  motionAllowed: false;
+  navigationDispatched: false;
+}
+
+export interface SceneInspectionSession {
+  inspectionId: string;
+  ownerUserId: string;
+  siteId: string;
+  robotId: string;
+  purpose?: string | null;
+  mapFrameId: "map";
+  localizationEpochId: string;
+  status: SceneInspectionStatus;
+  recordVersion: number;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string | null;
+  cancelledAt?: string | null;
+  mode: "SCENE_TEACH";
+  motionAllowed: false;
+  navigationDispatched: false;
+  checkpoints?: SceneInspectionCheckpoint[];
+}
+
+export interface SceneLandmarkAlias {
+  aliasId: string;
+  landmarkId: string;
+  alias: string;
+  status: "active" | "superseded";
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface SceneLandmarkObservation {
+  observationId: string;
+  landmarkId: string;
+  inspectionId: string;
+  checkpointId: string;
+  status: SceneLandmarkStatus;
+  mapPose: PoseMap;
+  covariance: number[];
+  localizationEpochId: string;
+  robotPose: PoseMap;
+  frameId: string;
+  frameSha256: string;
+  evidenceSha256: string;
+  evidenceRef: string;
+  vlmProvider: string;
+  vlmModel: string;
+  bbox: Record<string, unknown>;
+  depth: Record<string, unknown>;
+  tfProvenance: Record<string, unknown>;
+  confidence: number;
+  supportCount: number;
+  authority: "observation_only";
+  executionEligible: false;
+  confirmedByUserId?: string | null;
+  confirmedAt?: string | null;
+  recordVersion: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface SceneLandmark {
+  landmarkId: string;
+  rootLandmarkId: string;
+  revision: number;
+  ownerUserId: string;
+  siteId: string;
+  inspectionId: string;
+  checkpointId: string;
+  canonicalName: string;
+  description?: string | null;
+  status: SceneLandmarkStatus;
+  sourceKind: "SCENE_TEACH";
+  authority: "observation_only";
+  executionEligible: false;
+  navigationDispatched: false;
+  currentObservation?: SceneLandmarkObservation | null;
+  aliases: SceneLandmarkAlias[];
+  supersedesLandmarkId?: string | null;
+  supersededByLandmarkId?: string | null;
+  supersededReason?: string | null;
+  confirmedByUserId?: string | null;
+  confirmedAt?: string | null;
+  invalidatedByUserId?: string | null;
+  invalidatedAt?: string | null;
+  recordVersion: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface ControlEvent {
   eventId?: number;
   commandId?: string;

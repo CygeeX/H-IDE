@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import inspect
 from typing import Any, Mapping
 
 from packages.control_core.assistant_models import (
@@ -13,6 +14,7 @@ from packages.control_core.assistant_models import (
 )
 
 from .conversation_client import ConversationClient
+from .mission_policy import PolicyActor
 
 
 MissionDraftCreator = Callable[[Mapping[str, Any]], Mapping[str, Any]]
@@ -101,6 +103,7 @@ class ConversationGateway:
         requested_by: str,
         modality: str,
         mission_history: list[Mapping[str, Any]],
+        mission_actor: PolicyActor | None = None,
     ) -> ConversationGatewayResult:
         routed = self.client.route_turn(request)
         if routed.conversationId != request.conversationId:
@@ -226,8 +229,7 @@ class ConversationGateway:
         if self.mission_draft_creator is None:
             raise ConversationGatewayError("Mission V2 draft service is unavailable")
         assert request.robotId is not None
-        draft = self.mission_draft_creator(
-            {
+        brief = {
                 "robotId": request.robotId,
                 "requestedBy": requested_by,
                 "objective": request.text,
@@ -235,6 +237,17 @@ class ConversationGateway:
                 "modality": modality,
                 "history": [dict(item) for item in mission_history],
             }
+        creator_parameters = inspect.signature(
+            self.mission_draft_creator
+        ).parameters.values()
+        accepts_actor = any(
+            item.name == "actor" or item.kind is inspect.Parameter.VAR_KEYWORD
+            for item in creator_parameters
+        )
+        draft = (
+            self.mission_draft_creator(brief, actor=mission_actor)
+            if mission_actor is not None and accepts_actor
+            else self.mission_draft_creator(brief)
         )
         draft_id = draft.get("draftId")
         if not isinstance(draft_id, str) or not draft_id:

@@ -943,6 +943,49 @@ describe("control console", () => {
     expect(screen.getByRole("combobox", { name: "对话机器人" })).toHaveTextContent("机器人 1");
   });
 
+  it("opens scene teaching from the scoped user tool drawer without exposing developer tools", async () => {
+    const fallback = vi.mocked(fetch).getMockImplementation();
+    window.history.replaceState({}, "", "/app");
+    vi.mocked(fetch).mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/api/v1/auth/me")) {
+        return Promise.resolve(response({ principal: {
+          userId: "scene-user-ui", username: "scene-user-ui", displayName: "巡检用户",
+          role: "USER", siteId: "default", authenticationMethod: "session",
+          scopes: ["api:access", "robots:read", "assistant:use", "scene-memory:use", "speech:use", "missions:use", "events:read"],
+        } }));
+      }
+      if (url.endsWith("/api/v2/scene-memory/capabilities")) {
+        return Promise.resolve(response({
+          mode: "SCENE_TEACH",
+          stateFlow: ["stopped", "captured", "named", "confirmed"],
+          semanticProvider: "qwen",
+          allowedSources: ["qwen_vlm", "rgbd", "tf"],
+          retiredSources: ["pcd_annotation", "oracle", "foundationpose", "fake"],
+          authority: "observation_only",
+          executionEligible: false,
+          navigationDispatch: "forbidden",
+          humanConfirmationRequired: true,
+        }));
+      }
+      if (url.includes("/api/v2/scene-memory/inspections?") || url.includes("/api/v2/scene-memory/landmarks?")) {
+        return Promise.resolve(response([]));
+      }
+      return fallback!(input, init) as Promise<Response>;
+    });
+
+    render(<App />);
+    await screen.findByText("今天想和机器人做什么？");
+    fireEvent.click(screen.getByRole("button", { name: "打开工具" }));
+    expect(screen.getByRole("button", { name: /巡检与记忆/ })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /手动控制|系统诊断|仿真观测台/ })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /巡检与记忆/ }));
+
+    expect(await screen.findByRole("region", { name: "巡检与记忆" })).toBeInTheDocument();
+    expect(window.location.pathname).toBe("/app/scene-memory");
+    expect(screen.getByText(/浏览器不会伪造停稳位姿/)).toBeInTheDocument();
+  });
+
   it("logs in with Cookie credentials and applies the CSRF token to the first write", async () => {
     const fallback = vi.mocked(fetch).getMockImplementation();
     window.history.replaceState({}, "", "/app");

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fastapi.testclient import TestClient
+import pytest
 from typing import Any, Mapping
 
 from packages.simulation_core import SimulationRuntime
@@ -10,10 +11,19 @@ from tests.test_mission_v2_api import FakeMissionPlanningClient
 
 
 TOKEN = "simulation-test-token"
+INTERNAL_TOKEN = "simulation-mission-internal-test-token"
+
+
+@pytest.fixture(autouse=True)
+def mission_internal_callback_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MISSION_V2_INTERNAL_TOKEN", INTERNAL_TOKEN)
 
 
 def auth() -> dict[str, str]:
-    return {"Authorization": f"Bearer {TOKEN}"}
+    return {
+        "Authorization": f"Bearer {TOKEN}",
+        "X-H-IDE-Mission-Internal-Token": INTERNAL_TOKEN,
+    }
 
 
 class SimulationReplanClient(FakeMissionPlanningClient):

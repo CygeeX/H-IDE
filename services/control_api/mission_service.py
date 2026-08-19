@@ -46,6 +46,7 @@ from packages.mission_core import (
 )
 
 from .mission_client import MissionPlanningClient
+from .mission_policy import MissionPolicy, MissionPolicyDenied, PolicyActor
 from .store import SQLiteStore
 
 
@@ -87,11 +88,14 @@ class MissionService:
         planner: MissionPlanningClient,
         *,
         allow_synthetic_profile: bool = False,
+        policy: MissionPolicy | None = None,
     ) -> None:
         self.store = store
         self.runtime = runtime
         self.planner = planner
         self.allow_synthetic_profile = allow_synthetic_profile
+        self.policy = policy or MissionPolicy(store)
+        self.store.recover_mission_draft_approvals()
         self.robot_refresher: Callable[[str | None], None] | None = None
         self.skill_dispatcher: Callable[[Any], Mapping[str, Any]] | None = None
         self.skill_reconciler: Callable[[Any], Mapping[str, Any]] | None = None
@@ -640,7 +644,18 @@ class MissionService:
             "worldRecords": [item.model_dump(mode="json") for item in world_records],
         }
 
-    def create_draft(self, body: Mapping[str, Any]) -> dict[str, Any]:
+    def create_draft(
+        self,
+        body: Mapping[str, Any],
+        *,
+        actor: PolicyActor | None = None,
+    ) -> dict[str, Any]:
+        robot_id = _id(
+            body.get("robotId", os.getenv("ROBOT_AGENT_ID", "robot-1")),
+            "robotId",
+        )
+        if actor is not None:
+            self.policy.require_robot_access(robot_id, actor)
         brief = self.build_brief(body)
         raw = self.planner.create_draft(brief)
         payload = raw.get("plan") if isinstance(raw.get("plan"), Mapping) else raw
@@ -658,7 +673,15 @@ class MissionService:
             raise MissionServiceError("Mission planner returned a stale capability manifest")
         if plan.envelope.workstationCapabilityDigest != brief["envelope"]["workstationCapabilityDigest"]:
             raise MissionServiceError("Mission planner returned a stale workstation capability catalog")
-        if not self.store.save_mission_draft(plan.planId, plan.robotId, plan.model_dump(mode="json")):
+        owner = None if actor is None or actor.is_legacy else actor.user_id
+        site = None if actor is None or actor.is_legacy else actor.site_id
+        if not self.store.save_mission_draft(
+            plan.planId,
+            plan.robotId,
+            plan.model_dump(mode="json"),
+            owner_user_id=owner,
+            site_id=site,
+        ):
             existing = self.store.get_mission_draft(plan.planId)
             if existing is None or existing.get("plan") != plan.model_dump(mode="json"):
                 raise MissionServiceError("mission draft ID is already bound to another plan")
@@ -694,14 +717,54 @@ class MissionService:
             raise MissionServiceError("mission draft changed during rejection")
         return self.get_draft(draft_id)
 
-    def approve_draft(self, draft_id: str, approved_by: str) -> dict[str, Any]:
+    def approve_draft(
+        self,
+        draft_id: str,
+        approved_by: str,
+        *,
+        actor: PolicyActor,
+        resource_owner_user_id: str | None = None,
+        resource_site_id: str | None = None,
+    ) -> dict[str, Any]:
         draft = self.get_draft(draft_id)
         if draft["status"] != "draft":
             raise MissionServiceError(f"mission draft is not confirmable (status={draft['status']})")
+        if not self.store.set_mission_draft_status(
+            draft_id, "approving", expected_status="draft"
+        ):
+            raise MissionServiceError("mission draft changed during approval")
+        try:
+            return self._approve_claimed_draft(
+                draft_id,
+                approved_by,
+                actor=actor,
+                resource_owner_user_id=resource_owner_user_id,
+                resource_site_id=resource_site_id,
+                draft=draft,
+            )
+        except Exception:
+            mission_exists = self.store.get_mission(draft_id) is not None
+            self.store.set_mission_draft_status(
+                draft_id,
+                "approved" if mission_exists else "draft",
+                expected_status="approving",
+            )
+            raise
+
+    def _approve_claimed_draft(
+        self,
+        draft_id: str,
+        approved_by: str,
+        *,
+        actor: PolicyActor,
+        resource_owner_user_id: str | None,
+        resource_site_id: str | None,
+        draft: Mapping[str, Any],
+    ) -> dict[str, Any]:
         plan = MissionPlanDraft.model_validate(draft["plan"])
         if self.robot_refresher is not None:
             self.robot_refresher(plan.robotId)
-        robot = self.store.get_robot(plan.robotId) or {}
+        robot, profile, manifest = self._robot_manifest(plan.robotId)
         self._assert_live_mission_identity(plan, robot)
         requires_navigation_origin = any(
             node.skillId in _BASE_NAVIGATION_SKILLS for node in plan.nodes
@@ -724,7 +787,30 @@ class MissionService:
             robot_id=plan.robotId,
             scene_refs=[item.model_dump(mode="json") for item in plan.envelope.sceneRefs],
         )
-        mission = self.runtime.approve(plan, approved_by=approved_by, mission_id=draft_id)
+        prepared = self.policy.prepare_human_confirmation(
+            actor=actor,
+            plan=plan,
+            revision=1,
+            authorization_id=f"auth-{draft_id}-1",
+            robot=robot,
+            profile=profile,
+            manifest=manifest,
+            workstation=self._workstation_descriptors(),
+            is_replan=False,
+        )
+        owner = None if actor.is_legacy else resource_owner_user_id
+        site = None if actor.is_legacy else resource_site_id
+        if not actor.is_legacy and (not owner or not site):
+            raise MissionServiceError("mission draft owner binding is unavailable")
+        mission = self.runtime.approve(
+            plan,
+            approved_by=approved_by,
+            mission_id=draft_id,
+            owner_user_id=owner,
+            site_id=site,
+            autonomy_decision=prepared.decision,
+            autonomy_grant=prepared.grant,
+        )
         if isinstance(pose, Mapping):
             details = robot.get("details") if isinstance(robot.get("details"), Mapping) else {}
             mission = self.runtime.record_world(
@@ -753,7 +839,10 @@ class MissionService:
             )
         for scene_record in scene_records:
             mission = self.runtime.record_world(scene_record)
-        self.store.set_mission_draft_status(draft_id, "approved", expected_status="draft")
+        if not self.store.set_mission_draft_status(
+            draft_id, "approved", expected_status="approving"
+        ):
+            raise MissionServiceError("mission draft changed during approval")
         return mission
 
     def get_mission(self, mission_id: str, *, after_sequence: int = 0) -> dict[str, Any]:
@@ -808,7 +897,8 @@ class MissionService:
             raise MissionServiceError("visual evidence content digest does not match Mission record")
         return content, bound_media_type
 
-    def start(self, mission_id: str) -> dict[str, Any]:
+    def start(self, mission_id: str, *, actor: PolicyActor) -> dict[str, Any]:
+        self.policy.validate_start(self.runtime.get(mission_id), actor)
         return self.runtime.start(mission_id)
 
     @staticmethod
@@ -1693,7 +1783,13 @@ class MissionService:
             ),
         )
 
-    def advance(self, mission_id: str, *, maximum_steps: int = 20) -> dict[str, Any]:
+    def advance(
+        self,
+        mission_id: str,
+        *,
+        maximum_steps: int = 20,
+        actor: PolicyActor,
+    ) -> dict[str, Any]:
         """Advance a Mission until it blocks, waits on I/O, or terminates."""
 
         limit = max(1, min(int(maximum_steps), 100))
@@ -1705,6 +1801,7 @@ class MissionService:
                 status is MissionStatus.READY
                 and record["snapshot"].get("activeNodeId") is None
             ):
+                self.policy.validate_start(record, actor)
                 record = self.runtime.start(mission_id)
                 actions.append({"kind": "started"})
                 continue
@@ -1755,7 +1852,9 @@ class MissionService:
                     }
                 )
                 break
-            outcome = self.issue_skill(mission_id, node.nodeId, skill_input)
+            outcome = self.issue_skill(
+                mission_id, node.nodeId, skill_input, actor=actor
+            )
             actions.append(
                 {
                     "kind": "skill_issued",
@@ -1932,6 +2031,7 @@ class MissionService:
                 MissionStatus.FAILED,
                 MissionStatus.CANCELLED,
             }:
+                self.store.revoke_autonomy_grants(mission_id)
                 return {"mission": record, "receipt": receipt}
         cancelled_mission = self.runtime.intervene(
             MissionIntervention(
@@ -1943,6 +2043,7 @@ class MissionService:
                 requestedAt=utc_now(),
             )
         )
+        self.store.revoke_autonomy_grants(mission_id)
         return {"mission": cancelled_mission, "receipt": receipt}
 
     def _complete_visual_skill(
@@ -2156,7 +2257,13 @@ class MissionService:
                 )
         return completed
 
-    def issue_resolved_skill(self, mission_id: str, node_id: str) -> dict[str, Any]:
+    def issue_resolved_skill(
+        self,
+        mission_id: str,
+        node_id: str,
+        *,
+        actor: PolicyActor,
+    ) -> dict[str, Any]:
         """Issue one node using only server-derived, reviewed skill input.
 
         The HTTP compatibility endpoint used to accept an arbitrary ``input``
@@ -2175,9 +2282,17 @@ class MissionService:
             mission_id,
             node_id,
             self._build_node_input(record, node),
+            actor=actor,
         )
 
-    def issue_skill(self, mission_id: str, node_id: str, input: Mapping[str, Any]) -> dict[str, Any]:
+    def issue_skill(
+        self,
+        mission_id: str,
+        node_id: str,
+        input: Mapping[str, Any],
+        *,
+        actor: PolicyActor,
+    ) -> dict[str, Any]:
         mission = self.runtime.get(mission_id)
         plan = MissionPlanDraft.model_validate(mission["plan"])
         if self.robot_refresher is not None:
@@ -2227,6 +2342,20 @@ class MissionService:
             ):
                 raise MissionServiceError("skill input attempts to override observationSessionId")
             payload["observationSessionId"] = observation_session_id
+        try:
+            self.policy.authorize_skill(
+                record=mission,
+                node=node,
+                input_payload=payload,
+                actor=actor,
+                robot=robot,
+                profile=self._robot_manifest(plan.robotId)[1],
+                manifest=manifest,
+                workstation=workstation_descriptors,
+                operation="skill.issue",
+            )
+        except MissionPolicyDenied as exc:
+            raise MissionServiceError(str(exc)) from exc
         # The live capability descriptor is the authority for the command
         # lifetime.  Robot Agent rejects a request whose TTL is greater than
         # the command registry maximum, even when the operation timeout itself
@@ -2361,7 +2490,16 @@ class MissionService:
         }
         raw = self.planner.create_revision(request)
         payload = raw.get("revision") if isinstance(raw.get("revision"), Mapping) else raw
-        revision = PlanRevision.model_validate(payload)
+        revision_payload = dict(payload)
+        proposed_nodes = revision_payload.get("nodes")
+        has_physical = isinstance(proposed_nodes, list) and any(
+            isinstance(item, Mapping) and item.get("skillId") in _BASE_NAVIGATION_SKILLS
+            for item in proposed_nodes
+        )
+        if has_physical or revision_payload.get("disposition") == "human_approved":
+            revision_payload["disposition"] = "human_required"
+            revision_payload["authorizationId"] = None
+        revision = PlanRevision.model_validate(revision_payload)
         return self.runtime.apply_revision(revision)
 
     def approve_revision(
@@ -2370,6 +2508,7 @@ class MissionService:
         revision_id: str,
         *,
         approved_by: str,
+        actor: PolicyActor,
     ) -> dict[str, Any]:
         record = self.runtime.get(mission_id)
         plan = MissionPlanDraft.model_validate(record["plan"])
@@ -2383,10 +2522,35 @@ class MissionService:
             [item.model_dump(mode="json") for item in self._workstation_descriptors()]
         ) != plan.envelope.workstationCapabilityDigest:
             raise MissionServiceError("Mission workstation capability catalog is stale")
+        pending = next(
+            (
+                PlanRevision.model_validate(item)
+                for item in record.get("revisions", [])
+                if item.get("revisionId") == revision_id
+            ),
+            None,
+        )
+        if pending is None:
+            raise MissionServiceError("pending mission revision not found")
+        approved_sequence = pending.sequence + 1
+        revised_plan = plan.model_copy(update={"nodes": pending.nodes})
+        prepared = self.policy.prepare_human_confirmation(
+            actor=actor,
+            plan=revised_plan,
+            revision=approved_sequence,
+            authorization_id=f"auth-{mission_id}-{approved_sequence}",
+            robot=robot,
+            profile=self._robot_manifest(plan.robotId)[1],
+            manifest=manifest,
+            workstation=self._workstation_descriptors(),
+            is_replan=True,
+        )
         return self.runtime.approve_pending_revision(
             mission_id,
             revision_id,
             approved_by=approved_by,
+            autonomy_decision=prepared.decision,
+            autonomy_grant=prepared.grant,
         )
 
     def score_candidates(self, mission_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
@@ -2459,7 +2623,16 @@ class MissionService:
         raw = self.planner.evaluate_event(payload, context)
         if raw.get("kind") == "replan" and isinstance(raw.get("revision"), Mapping):
             revision_payload = dict(raw["revision"])
-            if force_human_review:
+            has_physical = isinstance(revision_payload.get("nodes"), list) and any(
+                isinstance(item, Mapping)
+                and item.get("skillId") in _BASE_NAVIGATION_SKILLS
+                for item in revision_payload["nodes"]
+            )
+            if (
+                force_human_review
+                or has_physical
+                or revision_payload.get("disposition") == "human_approved"
+            ):
                 revision_payload["disposition"] = "human_required"
                 revision_payload["authorizationId"] = None
                 revision_payload["reason"] = (

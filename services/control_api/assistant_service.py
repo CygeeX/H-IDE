@@ -380,19 +380,36 @@ class AssistantService:
             gateway = self.conversation_gateway
             if gateway is None:
                 raise RuntimeError("Assistant V2 conversation gateway is unavailable")
+            binding = self.store.get_resource_owner(
+                "assistant_conversation", conversation_id
+            )
+            mission_actor = None
+            if binding is not None:
+                from .auth import Role
+                from .mission_policy import PolicyActor
+
+                owner_user_id = str(binding["ownerUserId"])
+                user = self.store.get_user(owner_user_id)
+                if user is None:
+                    raise RuntimeError(
+                        "conversation owner identity is unavailable for Mission creation"
+                    )
+                mission_actor = PolicyActor(
+                    user_id=owner_user_id,
+                    role=Role(str(user["role"])),
+                    site_id=str(binding["siteId"]),
+                )
             result = gateway.handle(
                 task_id=task_id,
                 request=route_request,
                 requested_by=str(conversation["requestedBy"]),
                 modality=str(raw_request.get("modality") or "text"),
                 mission_history=list(prepared_memory.mission_history),
+                mission_actor=mission_actor,
             )
             if self.store.is_assistant_turn_cancelled(task_id):
                 return
             if result.missionDraftId is not None:
-                binding = self.store.get_resource_owner(
-                    "assistant_conversation", conversation_id
-                )
                 if binding is not None:
                     self.store.bind_resource_owner(
                         "mission_draft",

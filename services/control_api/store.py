@@ -851,6 +851,124 @@ class SQLiteStore:
                     """,
                 ),
             ),
+            (
+                7,
+                "mission_v2_autonomy_policy",
+                (
+                    """
+                    CREATE TABLE autonomy_preferences (
+                        user_id TEXT NOT NULL,
+                        site_id TEXT NOT NULL,
+                        execution_target TEXT NOT NULL
+                            CHECK(execution_target IN ('sim', 'real')),
+                        mode TEXT NOT NULL CHECK(mode IN (
+                            'ASK_EVERY_ACTION',
+                            'ASK_RISKY_OR_COMPLEX',
+                            'AUTO_WITHIN_LIMITS'
+                        )),
+                        version INTEGER NOT NULL DEFAULT 1 CHECK(version >= 1),
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        PRIMARY KEY(user_id, site_id, execution_target),
+                        FOREIGN KEY(user_id) REFERENCES users(user_id)
+                    )
+                    """,
+                    """
+                    CREATE TABLE autonomy_policy_decisions (
+                        decision_id TEXT PRIMARY KEY,
+                        operation TEXT NOT NULL,
+                        principal_user_id TEXT NOT NULL,
+                        principal_role TEXT NOT NULL
+                            CHECK(principal_role IN ('USER', 'DEVELOPER', 'ADMIN')),
+                        site_id TEXT NOT NULL,
+                        robot_id TEXT,
+                        execution_target TEXT NOT NULL
+                            CHECK(execution_target IN ('sim', 'real')),
+                        plan_id TEXT,
+                        plan_revision INTEGER CHECK(
+                            plan_revision IS NULL OR plan_revision >= 0
+                        ),
+                        node_id TEXT,
+                        skill_id TEXT NOT NULL,
+                        effect TEXT NOT NULL
+                            CHECK(effect IN ('ALLOW', 'REQUIRE_CONFIRM', 'DENY')),
+                        code TEXT NOT NULL,
+                        explanation TEXT NOT NULL,
+                        effective_risk TEXT,
+                        failed_checks_json TEXT NOT NULL DEFAULT '[]',
+                        request_json TEXT NOT NULL,
+                        request_sha256 TEXT NOT NULL,
+                        grant_id TEXT,
+                        created_at TEXT NOT NULL
+                    )
+                    """,
+                    """
+                    CREATE INDEX autonomy_policy_decisions_plan_time_idx
+                        ON autonomy_policy_decisions(
+                            plan_id, plan_revision, created_at, decision_id
+                        )
+                    """,
+                    """
+                    CREATE INDEX autonomy_policy_decisions_subject_time_idx
+                        ON autonomy_policy_decisions(
+                            principal_user_id, site_id, created_at, decision_id
+                        )
+                    """,
+                    """
+                    CREATE TABLE autonomy_grants (
+                        grant_id TEXT PRIMARY KEY,
+                        authorization_id TEXT NOT NULL UNIQUE,
+                        subject_user_id TEXT NOT NULL,
+                        subject_role TEXT NOT NULL
+                            CHECK(subject_role IN ('USER', 'DEVELOPER', 'ADMIN')),
+                        site_id TEXT NOT NULL,
+                        robot_id TEXT NOT NULL,
+                        execution_target TEXT NOT NULL
+                            CHECK(execution_target IN ('sim', 'real')),
+                        plan_id TEXT NOT NULL,
+                        plan_revision INTEGER NOT NULL CHECK(plan_revision >= 1),
+                        action_scope_json TEXT NOT NULL,
+                        max_risk TEXT NOT NULL
+                            CHECK(max_risk IN ('LOW', 'MEDIUM', 'HIGH', 'CRITICAL')),
+                        max_distance_m REAL NOT NULL CHECK(max_distance_m >= 0),
+                        max_speed_mps REAL NOT NULL CHECK(max_speed_mps >= 0),
+                        max_rotation_rad REAL NOT NULL CHECK(max_rotation_rad >= 0),
+                        max_angular_speed_rad_s REAL NOT NULL
+                            CHECK(max_angular_speed_rad_s >= 0),
+                        issued_at TEXT NOT NULL,
+                        expires_at TEXT NOT NULL,
+                        revoked_at TEXT,
+                        created_by_decision_id TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        UNIQUE(
+                            subject_user_id, site_id, robot_id,
+                            execution_target, plan_id, plan_revision
+                        ),
+                        FOREIGN KEY(created_by_decision_id)
+                            REFERENCES autonomy_policy_decisions(decision_id)
+                    )
+                    """,
+                    """
+                    CREATE INDEX autonomy_grants_plan_revision_idx
+                        ON autonomy_grants(plan_id, plan_revision, revoked_at, expires_at)
+                    """,
+                    """
+                    CREATE TABLE robot_site_bindings (
+                        robot_id TEXT PRIMARY KEY,
+                        site_id TEXT NOT NULL,
+                        execution_target TEXT NOT NULL
+                            CHECK(execution_target IN ('sim', 'real')),
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                    """,
+                    """
+                    CREATE INDEX robot_site_bindings_site_target_idx
+                        ON robot_site_bindings(site_id, execution_target, robot_id)
+                    """,
+                ),
+            ),
         )
         for version, name, statements in migrations:
             applied = self._connection.execute(
@@ -1787,6 +1905,33 @@ class SQLiteStore:
             for row in rows
         ]
 
+    def _bind_resource_owner_locked(
+        self,
+        resource_type: str,
+        resource_id: str,
+        *,
+        owner_user_id: str,
+        site_id: str,
+        now: str,
+    ) -> None:
+        existing = self._connection.execute(
+            "SELECT owner_user_id, site_id FROM resource_acl "
+            "WHERE resource_type = ? AND resource_id = ?",
+            (resource_type, resource_id),
+        ).fetchone()
+        if existing is not None:
+            if (
+                str(existing["owner_user_id"]) != owner_user_id
+                or str(existing["site_id"]) != site_id
+            ):
+                raise ValueError("resource owner binding is immutable")
+            return
+        self._connection.execute(
+            "INSERT INTO resource_acl(resource_type, resource_id, owner_user_id, site_id, "
+            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (resource_type, resource_id, owner_user_id, site_id, now, now),
+        )
+
     def bind_resource_owner(
         self,
         resource_type: str,
@@ -1797,15 +1942,18 @@ class SQLiteStore:
     ) -> dict[str, Any]:
         now = self._now()
         with self._lock:
-            self._connection.execute(
-                "INSERT INTO resource_acl(resource_type, resource_id, owner_user_id, site_id, "
-                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(resource_type, resource_id) DO UPDATE SET "
-                "owner_user_id=excluded.owner_user_id, site_id=excluded.site_id, "
-                "updated_at=excluded.updated_at",
-                (resource_type, resource_id, owner_user_id, site_id, now, now),
-            )
-            self._connection.commit()
+            try:
+                self._bind_resource_owner_locked(
+                    resource_type,
+                    resource_id,
+                    owner_user_id=owner_user_id,
+                    site_id=site_id,
+                    now=now,
+                )
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
         return {
             "resourceType": resource_type,
             "resourceId": resource_id,
@@ -1827,6 +1975,390 @@ class SQLiteStore:
             "resourceId": str(row["resource_id"]),
             "ownerUserId": str(row["owner_user_id"]),
             "siteId": str(row["site_id"]),
+            "createdAt": str(row["created_at"]),
+            "updatedAt": str(row["updated_at"]),
+        }
+
+    # ------------------------------------------------------------------
+    # Mission V2 deterministic autonomy policy
+    # ------------------------------------------------------------------
+
+    def get_autonomy_preference(
+        self,
+        user_id: str,
+        site_id: str,
+        execution_target: str,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM autonomy_preferences "
+                "WHERE user_id = ? AND site_id = ? AND execution_target = ?",
+                (user_id, site_id, execution_target),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "userId": str(row["user_id"]),
+            "siteId": str(row["site_id"]),
+            "executionTarget": str(row["execution_target"]),
+            "mode": str(row["mode"]),
+            "version": int(row["version"]),
+            "createdAt": str(row["created_at"]),
+            "updatedAt": str(row["updated_at"]),
+        }
+
+    def set_autonomy_preference(
+        self,
+        *,
+        user_id: str,
+        site_id: str,
+        execution_target: str,
+        mode: str,
+        expected_version: int | None = None,
+    ) -> dict[str, Any]:
+        now = self._now()
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                row = self._connection.execute(
+                    "SELECT version FROM autonomy_preferences "
+                    "WHERE user_id = ? AND site_id = ? AND execution_target = ?",
+                    (user_id, site_id, execution_target),
+                ).fetchone()
+                if row is None:
+                    if expected_version not in {None, 0}:
+                        raise ValueError("autonomy preference version conflict")
+                    self._connection.execute(
+                        "INSERT INTO autonomy_preferences("
+                        "user_id, site_id, execution_target, mode, version, created_at, updated_at"
+                        ") VALUES (?, ?, ?, ?, 1, ?, ?)",
+                        (user_id, site_id, execution_target, mode, now, now),
+                    )
+                else:
+                    current = int(row["version"])
+                    if expected_version is not None and expected_version != current:
+                        raise ValueError("autonomy preference version conflict")
+                    cursor = self._connection.execute(
+                        "UPDATE autonomy_preferences SET mode = ?, version = ?, updated_at = ? "
+                        "WHERE user_id = ? AND site_id = ? AND execution_target = ? "
+                        "AND version = ?",
+                        (
+                            mode,
+                            current + 1,
+                            now,
+                            user_id,
+                            site_id,
+                            execution_target,
+                            current,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise ValueError("autonomy preference version conflict")
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+        value = self.get_autonomy_preference(user_id, site_id, execution_target)
+        assert value is not None
+        return value
+
+    @staticmethod
+    def _policy_decision_values(decision: Mapping[str, Any]) -> tuple[Any, ...]:
+        return (
+            decision["decisionId"],
+            decision["operation"],
+            decision["principalUserId"],
+            decision["principalRole"],
+            decision["siteId"],
+            decision.get("robotId"),
+            decision["executionTarget"],
+            decision.get("planId"),
+            decision.get("planRevision"),
+            decision.get("nodeId"),
+            decision["skillId"],
+            decision["effect"],
+            decision["code"],
+            decision["explanation"],
+            decision.get("effectiveRisk"),
+            _encode(decision.get("failedChecks", [])),
+            _encode(decision["request"]),
+            decision["requestSha256"],
+            decision.get("grantId"),
+            decision["createdAt"],
+        )
+
+    def _insert_policy_decision_locked(self, decision: Mapping[str, Any]) -> None:
+        values = self._policy_decision_values(decision)
+        existing = self._connection.execute(
+            "SELECT request_sha256, effect, code FROM autonomy_policy_decisions "
+            "WHERE decision_id = ?",
+            (decision["decisionId"],),
+        ).fetchone()
+        if existing is not None:
+            if (
+                str(existing["request_sha256"]) != decision["requestSha256"]
+                or str(existing["effect"]) != decision["effect"]
+                or str(existing["code"]) != decision["code"]
+            ):
+                raise ValueError("policy decision ID is bound to another decision")
+            return
+        self._connection.execute(
+            "INSERT INTO autonomy_policy_decisions("
+            "decision_id, operation, principal_user_id, principal_role, site_id, "
+            "robot_id, execution_target, plan_id, plan_revision, node_id, skill_id, "
+            "effect, code, explanation, effective_risk, failed_checks_json, request_json, "
+            "request_sha256, grant_id, created_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            values,
+        )
+
+    def record_autonomy_policy_decision(
+        self,
+        decision: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        with self._lock:
+            try:
+                self._insert_policy_decision_locked(decision)
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+        return dict(decision)
+
+    def list_autonomy_policy_decisions(
+        self,
+        *,
+        plan_id: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        bounded = max(1, min(int(limit), 1_000))
+        query = "SELECT * FROM autonomy_policy_decisions"
+        values: tuple[Any, ...]
+        if plan_id is None:
+            values = (bounded,)
+        else:
+            query += " WHERE plan_id = ?"
+            values = (plan_id, bounded)
+        query += " ORDER BY created_at DESC, decision_id DESC LIMIT ?"
+        with self._lock:
+            rows = self._connection.execute(query, values).fetchall()
+        return [
+            {
+                "decisionId": str(row["decision_id"]),
+                "operation": str(row["operation"]),
+                "principalUserId": str(row["principal_user_id"]),
+                "principalRole": str(row["principal_role"]),
+                "siteId": str(row["site_id"]),
+                "robotId": row["robot_id"],
+                "executionTarget": str(row["execution_target"]),
+                "planId": row["plan_id"],
+                "planRevision": row["plan_revision"],
+                "nodeId": row["node_id"],
+                "skillId": str(row["skill_id"]),
+                "effect": str(row["effect"]),
+                "code": str(row["code"]),
+                "explanation": str(row["explanation"]),
+                "effectiveRisk": row["effective_risk"],
+                "failedChecks": _decode(row["failed_checks_json"]),
+                "request": _decode(row["request_json"]),
+                "requestSha256": str(row["request_sha256"]),
+                "grantId": row["grant_id"],
+                "createdAt": str(row["created_at"]),
+            }
+            for row in rows
+        ]
+
+    @staticmethod
+    def _autonomy_grant_values(grant: Mapping[str, Any], now: str) -> tuple[Any, ...]:
+        return (
+            grant["grantId"],
+            grant["authorizationId"],
+            grant["subjectUserId"],
+            grant["subjectRole"],
+            grant["siteId"],
+            grant["robotId"],
+            grant["executionTarget"],
+            grant["planId"],
+            grant["planRevision"],
+            _encode(grant["actionScope"]),
+            grant["maxRisk"],
+            grant["maxDistanceM"],
+            grant["maxSpeedMps"],
+            grant["maxRotationRad"],
+            grant["maxAngularSpeedRadS"],
+            grant["issuedAt"],
+            grant["expiresAt"],
+            grant.get("revokedAt"),
+            grant["createdByDecisionId"],
+            now,
+            now,
+        )
+
+    def _insert_autonomy_grant_locked(
+        self,
+        grant: Mapping[str, Any],
+        *,
+        now: str,
+    ) -> None:
+        existing = self._connection.execute(
+            "SELECT * FROM autonomy_grants WHERE grant_id = ? OR authorization_id = ?",
+            (grant["grantId"], grant["authorizationId"]),
+        ).fetchone()
+        if existing is not None:
+            if (
+                str(existing["grant_id"]) != grant["grantId"]
+                or str(existing["authorization_id"]) != grant["authorizationId"]
+                or str(existing["subject_user_id"]) != grant["subjectUserId"]
+                or str(existing["site_id"]) != grant["siteId"]
+                or str(existing["robot_id"]) != grant["robotId"]
+                or str(existing["execution_target"]) != grant["executionTarget"]
+                or str(existing["plan_id"]) != grant["planId"]
+                or int(existing["plan_revision"]) != int(grant["planRevision"])
+            ):
+                raise ValueError("autonomy grant identity conflict")
+            return
+        self._connection.execute(
+            "INSERT INTO autonomy_grants("
+            "grant_id, authorization_id, subject_user_id, subject_role, site_id, robot_id, "
+            "execution_target, plan_id, plan_revision, action_scope_json, max_risk, "
+            "max_distance_m, max_speed_mps, max_rotation_rad, max_angular_speed_rad_s, "
+            "issued_at, expires_at, revoked_at, created_by_decision_id, created_at, updated_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            self._autonomy_grant_values(grant, now),
+        )
+
+    def save_autonomy_grant(self, grant: Mapping[str, Any]) -> dict[str, Any]:
+        now = self._now()
+        with self._lock:
+            try:
+                self._insert_autonomy_grant_locked(grant, now=now)
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+        value = self.get_autonomy_grant(str(grant["grantId"]))
+        assert value is not None
+        return value
+
+    @staticmethod
+    def _autonomy_grant_record(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "grantId": str(row["grant_id"]),
+            "authorizationId": str(row["authorization_id"]),
+            "subjectUserId": str(row["subject_user_id"]),
+            "subjectRole": str(row["subject_role"]),
+            "siteId": str(row["site_id"]),
+            "robotId": str(row["robot_id"]),
+            "executionTarget": str(row["execution_target"]),
+            "planId": str(row["plan_id"]),
+            "planRevision": int(row["plan_revision"]),
+            "actionScope": _decode(row["action_scope_json"]),
+            "maxRisk": str(row["max_risk"]),
+            "maxDistanceM": float(row["max_distance_m"]),
+            "maxSpeedMps": float(row["max_speed_mps"]),
+            "maxRotationRad": float(row["max_rotation_rad"]),
+            "maxAngularSpeedRadS": float(row["max_angular_speed_rad_s"]),
+            "issuedAt": str(row["issued_at"]),
+            "expiresAt": str(row["expires_at"]),
+            "revokedAt": row["revoked_at"],
+            "createdByDecisionId": str(row["created_by_decision_id"]),
+            "createdAt": str(row["created_at"]),
+            "updatedAt": str(row["updated_at"]),
+        }
+
+    def get_autonomy_grant(self, grant_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM autonomy_grants WHERE grant_id = ?",
+                (grant_id,),
+            ).fetchone()
+        return None if row is None else self._autonomy_grant_record(row)
+
+    def get_autonomy_grant_by_authorization(
+        self,
+        authorization_id: str,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM autonomy_grants WHERE authorization_id = ?",
+                (authorization_id,),
+            ).fetchone()
+        return None if row is None else self._autonomy_grant_record(row)
+
+    def revoke_autonomy_grants(
+        self,
+        plan_id: str,
+        *,
+        except_revision: int | None = None,
+    ) -> int:
+        now = self._now()
+        where = "plan_id = ? AND revoked_at IS NULL"
+        values: list[Any] = [now, now, plan_id]
+        if except_revision is not None:
+            where += " AND plan_revision <> ?"
+            values.append(except_revision)
+        with self._lock:
+            cursor = self._connection.execute(
+                f"UPDATE autonomy_grants SET revoked_at = ?, updated_at = ? WHERE {where}",
+                values,
+            )
+            self._connection.commit()
+        return int(cursor.rowcount)
+
+    def bind_robot_site(
+        self,
+        robot_id: str,
+        *,
+        site_id: str,
+        execution_target: str,
+    ) -> dict[str, Any]:
+        now = self._now()
+        with self._lock:
+            try:
+                row = self._connection.execute(
+                    "SELECT site_id, execution_target, created_at FROM robot_site_bindings "
+                    "WHERE robot_id = ?",
+                    (robot_id,),
+                ).fetchone()
+                if row is None:
+                    self._connection.execute(
+                        "INSERT INTO robot_site_bindings("
+                        "robot_id, site_id, execution_target, created_at, updated_at"
+                        ") VALUES (?, ?, ?, ?, ?)",
+                        (robot_id, site_id, execution_target, now, now),
+                    )
+                    created_at = now
+                else:
+                    if (
+                        str(row["site_id"]) != site_id
+                        or str(row["execution_target"]) != execution_target
+                    ):
+                        raise ValueError("robot site binding is immutable")
+                    created_at = str(row["created_at"])
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+        return {
+            "robotId": robot_id,
+            "siteId": site_id,
+            "executionTarget": execution_target,
+            "createdAt": created_at,
+            "updatedAt": now,
+        }
+
+    def get_robot_site_binding(self, robot_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM robot_site_bindings WHERE robot_id = ?",
+                (robot_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "robotId": str(row["robot_id"]),
+            "siteId": str(row["site_id"]),
+            "executionTarget": str(row["execution_target"]),
             "createdAt": str(row["created_at"]),
             "updatedAt": str(row["updated_at"]),
         }
@@ -3250,6 +3782,11 @@ class SQLiteStore:
         revision: Mapping[str, Any],
         snapshot: Mapping[str, Any],
         event: Mapping[str, Any],
+        *,
+        owner_user_id: str | None = None,
+        site_id: str | None = None,
+        autonomy_decision: Mapping[str, Any] | None = None,
+        autonomy_grant: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Atomically create an approved immutable Mission and event 1.
 
@@ -3274,6 +3811,18 @@ class SQLiteStore:
         revision_id = revision_payload.get("revisionId")
         if snapshot_payload.get("activeRevisionId") != revision_id:
             raise ValueError("initial mission revision binding mismatch")
+        if (owner_user_id is None) != (site_id is None):
+            raise ValueError("mission owner and site must be provided together")
+        if autonomy_grant is not None and autonomy_decision is None:
+            raise ValueError("autonomy grant requires its policy decision")
+        if autonomy_grant is not None and (
+            autonomy_grant.get("authorizationId")
+            != authorization_payload.get("authorizationId")
+            or autonomy_grant.get("planId") != mission_id
+            or int(autonomy_grant.get("planRevision", -1))
+            != int(revision_payload.get("sequence", -2))
+        ):
+            raise ValueError("initial autonomy grant binding mismatch")
         now = self._now()
         with self._lock:
             try:
@@ -3325,6 +3874,18 @@ class SQLiteStore:
                         authorization_payload.get("approvedAt", now),
                     ),
                 )
+                if owner_user_id is not None and site_id is not None:
+                    self._bind_resource_owner_locked(
+                        "mission",
+                        mission_id,
+                        owner_user_id=owner_user_id,
+                        site_id=site_id,
+                        now=now,
+                    )
+                if autonomy_decision is not None:
+                    self._insert_policy_decision_locked(autonomy_decision)
+                if autonomy_grant is not None:
+                    self._insert_autonomy_grant_locked(autonomy_grant, now=now)
                 self._connection.execute(
                     "INSERT INTO mission_events(mission_id, sequence, event_id, event_type, payload_json, created_at) "
                     "VALUES (?, 1, ?, ?, ?, ?)",
@@ -3357,16 +3918,33 @@ class SQLiteStore:
         plan: Mapping[str, Any],
         *,
         status: str = "draft",
+        owner_user_id: str | None = None,
+        site_id: str | None = None,
     ) -> bool:
+        if (owner_user_id is None) != (site_id is None):
+            raise ValueError("mission draft owner and site must be provided together")
         now = self._now()
         with self._lock:
-            cursor = self._connection.execute(
-                "INSERT INTO mission_drafts(draft_id, robot_id, plan_json, status, error, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, NULL, ?, ?) ON CONFLICT(draft_id) DO NOTHING",
-                (draft_id, robot_id, _encode(plan), status, now, now),
-            )
-            self._connection.commit()
-            return cursor.rowcount == 1
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                cursor = self._connection.execute(
+                    "INSERT INTO mission_drafts(draft_id, robot_id, plan_json, status, error, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, NULL, ?, ?) ON CONFLICT(draft_id) DO NOTHING",
+                    (draft_id, robot_id, _encode(plan), status, now, now),
+                )
+                if owner_user_id is not None and site_id is not None:
+                    self._bind_resource_owner_locked(
+                        "mission_draft",
+                        draft_id,
+                        owner_user_id=owner_user_id,
+                        site_id=site_id,
+                        now=now,
+                    )
+                self._connection.commit()
+                return cursor.rowcount == 1
+            except Exception:
+                self._connection.rollback()
+                raise
 
     def get_mission_draft(self, draft_id: str) -> dict[str, Any] | None:
         with self._lock:
@@ -3405,6 +3983,26 @@ class SQLiteStore:
             )
             self._connection.commit()
             return cursor.rowcount == 1
+
+    def recover_mission_draft_approvals(self) -> int:
+        """Resolve only the local CAS claim after an interrupted approval.
+
+        If the atomic Mission row exists, approval authority already exists
+        and the draft is finalized. Otherwise it is safe to return the draft
+        to review. No physical skill is replayed.
+        """
+
+        now = self._now()
+        with self._lock:
+            cursor = self._connection.execute(
+                "UPDATE mission_drafts SET status = CASE "
+                "WHEN EXISTS(SELECT 1 FROM missions WHERE mission_id = draft_id) "
+                "THEN 'approved' ELSE 'draft' END, updated_at = ? "
+                "WHERE status = 'approving'",
+                (now,),
+            )
+            self._connection.commit()
+        return int(cursor.rowcount)
 
     def list_mission_drafts(self, *, limit: int = 100) -> list[dict[str, Any]]:
         with self._lock:
@@ -3522,6 +4120,8 @@ class SQLiteStore:
         event: Mapping[str, Any],
         revision: Mapping[str, Any] | None = None,
         authorization: Mapping[str, Any] | None = None,
+        autonomy_decision: Mapping[str, Any] | None = None,
+        autonomy_grant: Mapping[str, Any] | None = None,
         world_record: Mapping[str, Any] | None = None,
         skill_request: Mapping[str, Any] | None = None,
         skill_progress: Mapping[str, Any] | None = None,
@@ -3538,6 +4138,24 @@ class SQLiteStore:
             raise ValueError("mission transition identity mismatch")
         if snapshot_payload.get("lastSequence") != next_sequence or event_payload.get("sequence") != next_sequence:
             raise ValueError("mission event and snapshot sequence mismatch")
+        if autonomy_grant is not None and (
+            authorization is None or autonomy_decision is None
+        ):
+            raise ValueError(
+                "autonomy grant requires an authorization and policy decision"
+            )
+        if autonomy_grant is not None:
+            grant_payload = dict(_jsonable(autonomy_grant))
+            authorization_payload = dict(_jsonable(authorization or {}))
+            revision_payload = dict(_jsonable(revision or {}))
+            if (
+                grant_payload.get("authorizationId")
+                != authorization_payload.get("authorizationId")
+                or grant_payload.get("planId") != mission_id
+                or int(grant_payload.get("planRevision", -1))
+                != int(revision_payload.get("sequence", -2))
+            ):
+                raise ValueError("autonomy grant transition binding mismatch")
         now = self._now()
         with self._lock:
             try:
@@ -3581,6 +4199,15 @@ class SQLiteStore:
                             authorization_payload.get("approvedAt", now),
                         ),
                     )
+                if autonomy_decision is not None:
+                    self._insert_policy_decision_locked(autonomy_decision)
+                if autonomy_grant is not None:
+                    self._connection.execute(
+                        "UPDATE autonomy_grants SET revoked_at = ?, updated_at = ? "
+                        "WHERE plan_id = ? AND revoked_at IS NULL",
+                        (now, now, mission_id),
+                    )
+                    self._insert_autonomy_grant_locked(autonomy_grant, now=now)
                 if world_record is not None:
                     record_payload = dict(_jsonable(world_record))
                     if record_payload.get("missionId") != mission_id:

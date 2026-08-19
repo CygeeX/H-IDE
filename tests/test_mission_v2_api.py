@@ -35,6 +35,16 @@ from services.control_api.mission_service import MissionService
 
 
 TOKEN = "mission-v2-test-token"
+INTERNAL_TOKEN = "mission-v2-internal-test-token"
+
+
+@pytest.fixture(autouse=True)
+def mission_internal_callback_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MISSION_V2_INTERNAL_TOKEN", INTERNAL_TOKEN)
+    # These legacy-flow tests explicitly exercise the pre-authenticated
+    # developer compatibility path. Production defaults keep REAL disabled;
+    # dedicated policy/ACL tests assert that fail-closed default.
+    monkeypatch.setenv("MISSION_POLICY_ALLOW_LEGACY_REAL", "true")
 
 
 def test_rotation_intent_preserves_explicit_degrees_instead_of_using_direction_default() -> None:
@@ -719,7 +729,10 @@ class PoseDropMissionRobotDriver(MissionRobotDriver):
 
 
 def headers() -> dict[str, str]:
-    return {"Authorization": f"Bearer {TOKEN}"}
+    return {
+        "Authorization": f"Bearer {TOKEN}",
+        "X-H-IDE-Mission-Internal-Token": INTERNAL_TOKEN,
+    }
 
 
 def test_current_robot_pose_refreshes_after_human_review_delay(monkeypatch) -> None:

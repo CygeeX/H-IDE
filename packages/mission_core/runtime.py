@@ -46,6 +46,7 @@ class MissionStore(Protocol):
         revision: Mapping[str, Any],
         snapshot: Mapping[str, Any],
         event: Mapping[str, Any],
+        **values: Any,
     ) -> dict[str, Any]: ...
 
     def get_mission(self, mission_id: str, *, after_sequence: int = 0) -> dict[str, Any] | None: ...
@@ -77,6 +78,9 @@ _RISK_ORDER = {
     RiskLevel.HIGH: 2,
     RiskLevel.CRITICAL: 3,
 }
+_PHYSICAL_SKILLS = frozenset(
+    {"navigation.navigate_to_pose", "navigation.rotate"}
+)
 
 
 def _plain(value: Any) -> dict[str, Any]:
@@ -107,6 +111,10 @@ class MissionRuntime:
         *,
         approved_by: str,
         mission_id: str | None = None,
+        owner_user_id: str | None = None,
+        site_id: str | None = None,
+        autonomy_decision: Mapping[str, Any] | None = None,
+        autonomy_grant: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         plan = draft if isinstance(draft, MissionPlanDraft) else MissionPlanDraft.model_validate(draft)
         owner = non_empty_id(approved_by, "approvedBy")
@@ -167,6 +175,10 @@ class MissionRuntime:
             _plain(revision),
             _plain(snapshot),
             _plain(event),
+            owner_user_id=owner_user_id,
+            site_id=site_id,
+            autonomy_decision=autonomy_decision,
+            autonomy_grant=autonomy_grant,
         )
 
     def get(self, mission_id: str, *, after_sequence: int = 0) -> dict[str, Any]:
@@ -846,6 +858,17 @@ class MissionRuntime:
         snapshot = self._snapshot(record)
         active = self._revision(record)
         plan = MissionPlanDraft.model_validate(record["plan"])
+        if value.disposition is ApprovalDisposition.HUMAN_APPROVED:
+            raise MissionConflict(
+                "planner revisions cannot claim human approval; use the explicit approval endpoint"
+            )
+        if (
+            value.disposition is ApprovalDisposition.POLICY_INHERITED
+            and any(node.skillId in _PHYSICAL_SKILLS for node in value.nodes)
+        ):
+            raise MissionConflict(
+                "physical revisions require explicit human approval in this release"
+            )
         if value.sequence != active.sequence + 1 or value.parentRevisionId != active.revisionId:
             raise MissionConflict("mission revision sequence or parent is stale")
         allowed = set(plan.envelope.allowedSkillIds)
@@ -919,6 +942,8 @@ class MissionRuntime:
         revision_id: str,
         *,
         approved_by: str,
+        autonomy_decision: Mapping[str, Any] | None = None,
+        autonomy_grant: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Approve a stored human-required proposal as a new immutable revision."""
 
@@ -1021,6 +1046,8 @@ class MissionRuntime:
             event,
             revision=_plain(approved),
             authorization=_plain(authorization),
+            autonomy_decision=autonomy_decision,
+            autonomy_grant=autonomy_grant,
             node_states=node_states,
         )
 

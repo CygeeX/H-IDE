@@ -32,6 +32,7 @@ import type { ActiveSceneContext } from "./scene-workspace";
 import { VisualMissionCard } from "./visual-mission-card";
 import { SimulationWorkspace } from "./simulation-workspace";
 import { DeveloperDiagnostics } from "./developer-diagnostics";
+import { SceneMemoryWorkspace } from "./scene-memory-workspace";
 import {
   latestMissionVisualResult,
   MissionVisualEvidenceDrawer,
@@ -49,6 +50,7 @@ interface VoiceUiState {
 }
 type AppRoute =
   | { kind: "chat"; shell: "user" | "developer"; conversationId?: string }
+  | { kind: "scene-memory"; shell: "user" | "developer" }
   | { kind: "simulation"; shell: "developer" }
   | { kind: "diagnostics"; shell: "developer" }
   | { kind: "interfaces"; shell: "developer" };
@@ -285,6 +287,8 @@ function EmptyState({ children }: { children: React.ReactNode }) {
 }
 
 function parseAppRoute(pathname: string): AppRoute {
+  if (pathname === "/developer/scene-memory" || pathname.startsWith("/developer/scene-memory/")) return { kind: "scene-memory", shell: "developer" };
+  if (pathname === "/app/scene-memory" || pathname.startsWith("/app/scene-memory/")) return { kind: "scene-memory", shell: "user" };
   if (pathname === "/developer/diagnostics" || pathname.startsWith("/developer/diagnostics/")) return { kind: "diagnostics", shell: "developer" };
   if (pathname === "/developer/simulation" || pathname.startsWith("/developer/simulation/")) return { kind: "simulation", shell: "developer" };
   if (pathname === "/developer/interfaces" || pathname.startsWith("/developer/interfaces/")) return { kind: "interfaces", shell: "developer" };
@@ -412,6 +416,7 @@ function App() {
 
 function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLogout: () => void }) {
   const [route, navigate] = useAppRoute();
+  const canUseSceneMemory = principal.scopes.includes("scene-memory:use");
   const canDevelop = (principal.role === "DEVELOPER" || principal.role === "ADMIN")
     && principal.scopes.includes("diagnostics:read");
   const developerMode = canDevelop && route.shell === "developer";
@@ -1921,6 +1926,7 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
         principal={principal}
         developerMode={developerMode}
         canDevelop={canDevelop}
+        canUseTools={developerMode || canUseSceneMemory}
         onModeChange={(mode) => navigate(chatPath(mode, currentConversationEntry?.conversationId))}
         onLogout={onLogout}
       />
@@ -1983,6 +1989,22 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
         onRobotChange={selectRobotForNewTask}
       /> : null}
 
+      {route.kind === "scene-memory" ? <WorkspacePage
+        title="巡检与记忆"
+        subtitle="用纯 Qwen VLM 观察环境，由人确认后保存场景记忆"
+        onBack={() => navigate(conversationPath)}
+      >
+        <SceneMemoryWorkspace
+          principal={principal}
+          robots={robots}
+          selectedRobotId={selectedRobotId}
+          developerMode={developerMode}
+          apiFetch={apiFetch}
+          apiFetchBlob={apiFetchBlob}
+          onBackToChat={() => navigate(conversationPath)}
+        />
+      </WorkspacePage> : null}
+
       {route.kind === "simulation" ? <WorkspacePage
         title="仿真观测台"
         subtitle="MuJoCo + SONIC、Nav2 联调与连续任务回放"
@@ -2026,12 +2048,18 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
         <DeveloperDiagnostics apiFetch={apiFetch} robotId={selectedRobotId || undefined} />
       </WorkspacePage> : null}
 
-      {developerMode && toolMenuOpen ? <ToolMenu
+      {toolMenuOpen && (developerMode || canUseSceneMemory) ? <ToolMenu
+        developerMode={developerMode}
+        canUseSceneMemory={canUseSceneMemory}
         advancedMode={advancedMode}
         offlineVoiceFallback={voiceCaptureMode === "offline_wav"}
         onAdvancedModeChange={setAdvancedMode}
         onOfflineVoiceFallbackChange={toggleOfflineVoiceFallback}
         onClose={() => setToolMenuOpen(false)}
+        onSceneMemory={() => {
+          setToolMenuOpen(false);
+          navigate(route.shell === "developer" ? "/developer/scene-memory" : "/app/scene-memory");
+        }}
         onControl={() => { setToolMenuOpen(false); setControlPanelOpen(true); }}
         onSimulation={() => { setToolMenuOpen(false); navigate("/developer/simulation"); }}
         onDiagnostics={() => { setToolMenuOpen(false); navigate("/developer/diagnostics"); }}
@@ -2128,6 +2156,7 @@ function AppTitlebar({
   principal,
   developerMode,
   canDevelop,
+  canUseTools,
   onModeChange,
   onLogout,
 }: {
@@ -2141,6 +2170,7 @@ function AppTitlebar({
   principal: AuthPrincipal;
   developerMode: boolean;
   canDevelop: boolean;
+  canUseTools: boolean;
   onModeChange: (mode: "user" | "developer") => void;
   onLogout: () => void;
 }) {
@@ -2165,7 +2195,7 @@ function AppTitlebar({
         <button className={developerMode ? "active" : ""} type="button" onClick={() => onModeChange("developer")}>开发者</button>
       </div> : null}
       <button className="icon-button" type="button" onClick={onOpenHistory} aria-label="任务历史"><Icon name="history" /></button>
-      {developerMode ? <button className="icon-button titlebar-tools-button" type="button" onClick={onOpenTools} aria-label="打开工具" title="工具">
+      {canUseTools ? <button className="icon-button titlebar-tools-button" type="button" onClick={onOpenTools} aria-label="打开工具" title="工具">
         <Icon name="tools" /><span>工具</span>
       </button> : null}
       <span className="account-chip" title={`${principal.username} · ${principal.role}`}><span>{principal.displayName.slice(0, 1).toUpperCase()}</span><b>{principal.displayName}</b></span>
@@ -2224,11 +2254,14 @@ function WorkspacePage({ title, subtitle, onBack, children }: { title: string; s
 }
 
 function ToolMenu({
+  developerMode,
+  canUseSceneMemory,
   advancedMode,
   offlineVoiceFallback,
   onAdvancedModeChange,
   onOfflineVoiceFallbackChange,
   onClose,
+  onSceneMemory,
   onControl,
   onSimulation,
   onDiagnostics,
@@ -2236,11 +2269,14 @@ function ToolMenu({
   onInterfaces,
   onRefresh,
 }: {
+  developerMode: boolean;
+  canUseSceneMemory: boolean;
   advancedMode: boolean;
   offlineVoiceFallback: boolean;
   onAdvancedModeChange: (value: boolean) => void;
   onOfflineVoiceFallbackChange: (value: boolean) => void;
   onClose: () => void;
+  onSceneMemory: () => void;
   onControl: () => void;
   onSimulation: () => void;
   onDiagnostics: () => void;
@@ -2250,15 +2286,16 @@ function ToolMenu({
 }) {
   return <><button className="popover-scrim" type="button" onClick={onClose} aria-label="关闭工具" /><aside className="tool-menu" aria-label="H-IDE 工具">
     <div className="tool-menu-header"><span>工具</span><button className="icon-button" type="button" onClick={onClose} aria-label="关闭"><Icon name="close" /></button></div>
-    <button type="button" onClick={onControl}><span className="tool-icon"><Icon name="control" /></span><span><strong>手动控制</strong><small>测试高层动作与停止</small></span><Icon name="chevron" /></button>
-    <button type="button" onClick={onSimulation}><span className="tool-icon"><Icon name="activity" /></span><span><strong>仿真观测台</strong><small>连续任务、障碍与回放</small></span><Icon name="chevron" /></button>
-    <button type="button" onClick={onDiagnostics}><span className="tool-icon"><Icon name="activity" /></span><span><strong>系统诊断</strong><small>执行链存活、就绪度与具体故障</small></span><Icon name="chevron" /></button>
+    {canUseSceneMemory ? <button type="button" onClick={onSceneMemory}><span className="tool-icon"><Icon name="map" /></span><span><strong>巡检与记忆</strong><small>带机器人认识环境，确认它应该记住什么</small></span><Icon name="chevron" /></button> : null}
+    {developerMode ? <button type="button" onClick={onControl}><span className="tool-icon"><Icon name="control" /></span><span><strong>手动控制</strong><small>测试高层动作与停止</small></span><Icon name="chevron" /></button> : null}
+    {developerMode ? <button type="button" onClick={onSimulation}><span className="tool-icon"><Icon name="activity" /></span><span><strong>仿真观测台</strong><small>连续任务、障碍与回放</small></span><Icon name="chevron" /></button> : null}
+    {developerMode ? <button type="button" onClick={onDiagnostics}><span className="tool-icon"><Icon name="activity" /></span><span><strong>系统诊断</strong><small>执行链存活、就绪度与具体故障</small></span><Icon name="chevron" /></button> : null}
     <button type="button" onClick={onHistory}><span className="tool-icon"><Icon name="history" /></span><span><strong>任务历史</strong><small>恢复规划、审核和执行记录</small></span><Icon name="chevron" /></button>
-    <button type="button" onClick={onRefresh}><span className="tool-icon"><Icon name="refresh" /></span><span><strong>刷新状态</strong><small>重新读取机器人与接口快照</small></span><Icon name="chevron" /></button>
+    {developerMode ? <button type="button" onClick={onRefresh}><span className="tool-icon"><Icon name="refresh" /></span><span><strong>刷新状态</strong><small>重新读取机器人与接口快照</small></span><Icon name="chevron" /></button> : null}
     <div className="tool-separator" />
     <label className="advanced-toggle"><span><strong>离线 WAV 转写降级</strong><small>显式启用批量 Whisper；默认使用低延迟流式语音</small></span><input type="checkbox" checked={offlineVoiceFallback} onChange={(event) => onOfflineVoiceFallbackChange(event.target.checked)} /><i /></label>
-    <label className="advanced-toggle"><span><strong>工程模式</strong><small>显示接口与调试工具</small></span><input type="checkbox" checked={advancedMode} onChange={(event) => onAdvancedModeChange(event.target.checked)} /><i /></label>
-    {advancedMode ? <button type="button" onClick={onInterfaces}><span className="tool-icon"><Icon name="interface" /></span><span><strong>接口中心</strong><small>映射版本、探测与回滚</small></span><Icon name="chevron" /></button> : null}
+    {developerMode ? <label className="advanced-toggle"><span><strong>工程模式</strong><small>显示接口与调试工具</small></span><input type="checkbox" checked={advancedMode} onChange={(event) => onAdvancedModeChange(event.target.checked)} /><i /></label> : null}
+    {developerMode && advancedMode ? <button type="button" onClick={onInterfaces}><span className="tool-icon"><Icon name="interface" /></span><span><strong>接口中心</strong><small>映射版本、探测与回滚</small></span><Icon name="chevron" /></button> : null}
   </aside></>;
 }
 
