@@ -212,6 +212,57 @@ stall; a matching GC pause or health-probe gap instead supports SONIC
 process/GIL scheduling as the cause.  These diagnostics do not widen the
 100-ms safety limits or replay stale samples.
 
+### Read-only SAFE_HOLD soak evidence
+
+After a coordinated cold start has reached Robot Agent `STANDBY`, collect the
+ten-minute pre-motion record without sending a control, Nav2, reset, stop, or
+rearm request:
+
+```bash
+cd /home/phi/learn-projects/h-ide-mujoco-sonic
+.venv/bin/python tools/idle_soak_monitor.py \
+  --output var/acceptance/$(date -u +%Y%m%dT%H%M%SZ)-safe-hold/idle-soak.jsonl
+```
+
+The default duration is 605 seconds so the recorded first-to-last observation
+spans at least ten minutes. Plant and SONIC are sampled at 2 Hz; the more
+expensive Robot Agent diagnostics probe is sampled every five seconds. Network
+access is compiled down to bodyless GET requests against exactly
+`127.0.0.1:8794/state`, `127.0.0.1:8792/telemetry`, and
+`127.0.0.1:8796/v1/diagnostics`. There is no URL override or mutable client.
+
+The JSONL path is create-exclusive: an existing file, target symlink, or
+symlinked ancestor is rejected. It contains a complete baseline and final
+checkpoint, compact 2-Hz samples, full raw checkpoints every ten seconds, and
+an immediate full checkpoint whenever a cumulative runtime-stall counter or
+motion-critical PID/start-time identity changes. The monitor also scans only
+new data in the motion-critical runtime logs for QACC, NaN/non-finite,
+numerical-instability, implicit-reset, teleport/rollback, traceback, and crash
+clues. The existing `MotionAcceptanceEvaluator` remains the single source of
+truth for SAFE_HOLD structure, pose drift, fall/tilt, unexpected intent, fault
+trace, reset clues, and arm limits; the soak monitor adds stricter stationary
+root-speed and lower-body limits.
+
+The result deliberately has two verdicts:
+
+- `safeHoldSafetyPass` means the robot remained structurally stationary and
+  Robot Agent remained ready in authority-revoked `STANDBY`, with no numerical,
+  process-identity, counter-rollback, or terminal-fault evidence.
+- `movementReleaseAllowed` additionally requires zero increase from the
+  baseline in every Plant and SONIC over-threshold runtime counter and no stale
+  marker in the runtime logs.
+
+An isolated age/stage stall may therefore leave `safeHoldSafetyPass=true` while
+forcing `movementReleaseAllowed=false`. If Robot Agent remained ready, the
+record also sets `quarantineExercised=true`: this proves the safe-hold
+quarantine did not permanently fault the agent, but the observed performance
+stall still blocks a motion attempt. With no natural stall,
+`quarantineExercised=false`; the injected offline safety tests remain the
+evidence for that unexercised branch. Exit status is zero only when movement is
+released, one for a completed HOLD/failed record, and two for setup errors.
+`--duration` exists for offline and short diagnostic tests; reducing it does
+not produce ten-minute acceptance evidence.
+
 ## Acceptance gate before deleting the old deterministic backend
 
 The deterministic/FakeAdapter code is retained only as a migration fixture.
