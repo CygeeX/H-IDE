@@ -69,7 +69,12 @@ class RunningAdapter(FakeAdapter):
 
     def dispatch(self, request, mapping):
         self.dispatches.append((request, mapping))
-        return AdapterResult(status="running")
+        outcome = AdapterResult(status="running")
+        # Keep the fake transport internally coherent: reconciliation may race
+        # the watchdog before the short test lease expires.  A command that
+        # dispatch reported as running must not immediately query as unknown.
+        self._results[request.commandId] = outcome
+        return outcome
 
 
 class VpnLostAdapter(FakeAdapter):
