@@ -28,9 +28,10 @@ from .motion_fault import (
     validate_sonic_health_request,
 )
 from .network import require_loopback_bind_host
-from .normal_stop import NormalStopSnapshot, NormalStopState
+from .normal_stop import NormalStopIdentity, NormalStopSnapshot, NormalStopState
 from .normal_stop_wire import (
     NormalStopBeginRequest,
+    NormalStopPlantRequest,
     NormalStopStationaryRequest,
     NormalStopWireError,
     canonical_normal_stop_json,
@@ -108,6 +109,10 @@ _NORMAL_STOP_ZERO_FIELDS = (
 
 class _NormalStopBoundaryError(RuntimeError):
     """A local actuator/reference stop boundary could not be established."""
+
+
+class _NormalStopLocalHoldError(RuntimeError):
+    """Plant stopped, but the driver cannot prove its exact local hold."""
 
 
 def _bind_command_server(host: str, port: int):
@@ -1628,6 +1633,16 @@ class SonicDriver:
 
         self.telemetry.update(plant_support_requested_mode=mode)
         with self._support_lock:
+            if (
+                mode == "locomotion"
+                and self._normal_stop_static_boundary_locked()
+            ):
+                # A moving tick prepared before braking/rearm may arrive here
+                # after the stronger exact hold was established.  In
+                # particular, DRIVER_CONFIRMED is not a permanent phase
+                # fence: the safe target itself blocks Plant locomotion until
+                # a matching reference has been primed and releases it.
+                return False
             transition_token = self._support_transition_token_locked()
             if (
                 self._plant_support_stop_pending
@@ -2448,6 +2463,101 @@ class SonicDriver:
             published_target_q_rad=published_targets,
         )
 
+    def _normal_stop_fences_motion_locked(self) -> bool:
+        normal_stop = getattr(self, "_normal_stop", None)
+        phase = (
+            normal_stop.snapshot.phase
+            if isinstance(normal_stop, NormalStopState)
+            else "NONE"
+        )
+        return phase in {
+            "BRAKING",
+            "STATIONARY_ACK",
+            "PLANT_CONFIRMED",
+            "FAILED",
+        }
+
+    def _normal_stop_static_boundary_locked(self) -> bool:
+        """Return the current recoverable stop's physical/local hold fence."""
+
+        return (
+            self._plant_support_stop_pending
+            or self._plant_support_safety_latched
+            or self._safe_hold_targets is not None
+            or self._normal_stop_fences_motion_locked()
+        )
+
+    def _rejected_locomotion_is_static_boundary_locked(self) -> bool:
+        """Classify a failed old support request without escalating a stop."""
+
+        return self._normal_stop_static_boundary_locked()
+
+    def _commit_rejected_locomotion_tick_locked(
+        self,
+        transition_token: tuple[int, int | None],
+    ) -> bool:
+        """Drop an old tick if rearm changed its established stop boundary."""
+
+        if (
+            transition_token != self._support_transition_token_locked()
+            or not self._rejected_locomotion_is_static_boundary_locked()
+        ):
+            return False
+        self._commit_static_hold_decision_locked(True)
+        return True
+
+    def _publish_rejected_locomotion_tick_if_current(
+        self,
+        lowstate: object,
+        transition_token: tuple[int, int | None],
+    ) -> bool:
+        """Publish one frozen tick without inverting control/support locks."""
+
+        with self._support_lock:
+            if not self._commit_rejected_locomotion_tick_locked(
+                transition_token
+            ):
+                return False
+            frozen_targets = (
+                self._safe_hold_targets or self._last_published_targets
+            )
+        # The publish path eventually marks the control step under
+        # _control_condition.  Release support first because control.arm owns
+        # that condition before acquiring support.
+        if frozen_targets is None:
+            self._publish_frozen_hold(lowstate)
+        else:
+            self._publish_position_hold(frozen_targets)
+        return True
+
+    def _commit_static_hold_decision_locked(
+        self,
+        decision_static_hold_active: bool,
+    ) -> bool:
+        """Fence a prepared 50 Hz decision against a correlated stop.
+
+        A policy tick may calculate a moving handoff before the command thread
+        freezes the actuator boundary, then resume after the complete normal
+        stop.  Its final health-facing write must share the support lock and
+        may never overwrite a stronger active, failed, Plant-latched, or exact
+        actuator hold.  A completed transaction stops fencing only after an
+        explicit rearm and matching reference have released those physical
+        facts.
+
+        The caller owns ``_support_lock``.
+        """
+
+        if not isinstance(decision_static_hold_active, bool):
+            raise TypeError("static-hold decision must be boolean")
+        effective_static_hold = (
+            decision_static_hold_active
+            or self._normal_stop_static_boundary_locked()
+        )
+        if decision_static_hold_active and not self._static_hold_active:
+            self._arm_guard.reset()
+        self._static_hold_active = effective_static_hold
+        return effective_static_hold
+
     def run(self):
         self.telemetry.update(
             status="warming",
@@ -2608,8 +2718,10 @@ class SonicDriver:
                 if not support_ready and desired_support_mode == "locomotion":
                     with self._support_lock:
                         expected_safety_stop = (
-                            self._plant_support_stop_pending
-                            or self._plant_support_safety_latched
+                            self._rejected_locomotion_is_static_boundary_locked()
+                        )
+                        rejected_transition_token = (
+                            self._support_transition_token_locked()
                         )
                     if expected_safety_stop:
                         # A lease release/cancel can race a policy tick that
@@ -2617,12 +2729,15 @@ class SonicDriver:
                         # for that tick and keep the recoverable safety latch;
                         # this is not a controller/physics fault that should
                         # force a process restart.
-                        self._stop_navigation_at_boundary(
-                            source="plant_safety_stop"
-                        )
-                        self._arm_guard.reset()
-                        self._static_hold_active = True
-                        self._publish_frozen_hold(lowstate)
+                        if not self._publish_rejected_locomotion_tick_if_current(
+                            lowstate,
+                            rejected_transition_token,
+                        ):
+                            # A successful newer rearm/reference release won
+                            # after the old support response.  It owns the
+                            # boundary; this tick has no remaining authority
+                            # to revoke or publish.
+                            continue
                         self.telemetry.update(
                             nav2_state="safety_stop",
                             navigation_task_active=False,
@@ -2634,9 +2749,12 @@ class SonicDriver:
                     raise RuntimeError(
                         "MuJoCo support transition failed during locomotion"
                     )
-                if decision.static_hold_active and not self._static_hold_active:
-                    self._arm_guard.reset()
-                self._static_hold_active = decision.static_hold_active
+                with self._support_lock:
+                    effective_static_hold = (
+                        self._commit_static_hold_decision_locked(
+                            decision.static_hold_active
+                        )
+                    )
                 output_action = {
                     f"{self._joint_name(index)}.q": target
                     for index, target in enumerate(decision.targets)
@@ -2646,7 +2764,7 @@ class SonicDriver:
                     lowstate,
                     control_dt_s=control_step.dt_s,
                     control_tick_ms=control_step.tick_ms,
-                    constrain_arms=not decision.static_hold_active,
+                    constrain_arms=not effective_static_hold,
                 )
                 self._record_control_trace(
                     lowstate=lowstate,
@@ -2661,9 +2779,17 @@ class SonicDriver:
                     control_tick_ms=control_step.tick_ms,
                     control_dt_s=control_step.dt_s,
                     control_clock_status="simulation_time_50hz_motion_ready",
-                    static_hold_active=decision.static_hold_active,
-                    motion_handoff_active=decision.motion_handoff_active,
-                    motion_handoff_ratio=decision.handoff_ratio,
+                    static_hold_active=effective_static_hold,
+                    motion_handoff_active=(
+                        decision.motion_handoff_active
+                        if not effective_static_hold
+                        else False
+                    ),
+                    motion_handoff_ratio=(
+                        decision.handoff_ratio
+                        if not effective_static_hold
+                        else 0.0
+                    ),
                     **self._planner_telemetry_fields(),
                 )
             except Exception as exc:
@@ -3148,11 +3274,292 @@ class SonicDriver:
                 response=response,
             )
 
+    def _require_normal_stop_local_hold_locked(
+        self,
+        identity: NormalStopIdentity,
+        *,
+        plant_epoch: int,
+    ) -> None:
+        """Prove every local fact required for DRIVER_CONFIRMED.
+
+        The caller owns the support and terminal locks.  Plant evidence may
+        establish the external support facts, but it cannot manufacture an
+        actuator boundary, revoke a reference, or make a non-zero command
+        static.  Those facts must already be exact from the braking phase.
+        """
+
+        generation = identity.control_generation
+        last_targets = self._last_published_targets
+        safe_targets = self._safe_hold_targets
+        try:
+            exact_targets = (
+                isinstance(last_targets, tuple)
+                and isinstance(safe_targets, tuple)
+                and len(last_targets) == 29
+                and len(safe_targets) == 29
+                and all(math.isfinite(float(value)) for value in last_targets)
+                and all(math.isfinite(float(value)) for value in safe_targets)
+                and safe_targets == last_targets
+            )
+            authority = self._reference_authority.snapshot
+            facts = {
+                "exact executed static-hold targets": exact_targets,
+                "static hold": self._static_hold_active is True,
+                "zero command": self.guard.command_zero is True,
+                "inactive navigation task": self._navigation_task_active is False,
+                "revoked ingress": (
+                    self._intent_ingress.generation == generation
+                    and self._intent_ingress.armed is False
+                    and self._intent_ingress.staged_control_arm_generation is None
+                    and self._intent_ingress.support_stop_generation == generation
+                ),
+                "revoked reference authority": (
+                    authority.phase == "REVOKED"
+                    and authority.actuator_authority is False
+                    and self._reference_request_pending is False
+                ),
+                "confirmed Plant support latch": (
+                    self._plant_support_mode == "safety_stop"
+                    and self._plant_support_safety_latched is True
+                    and self._plant_support_stop_pending is False
+                    and self._plant_support_stop_generation == generation
+                    and self._normal_stop_plant_safety_stop_epoch == plant_epoch
+                ),
+            }
+        except Exception as exc:
+            raise _NormalStopLocalHoldError(
+                f"normal-stop local safe hold could not be inspected: {exc}"
+            ) from exc
+        missing = [name for name, present in facts.items() if not present]
+        if missing:
+            raise _NormalStopLocalHoldError(
+                "normal-stop local safe hold is incomplete: " + ", ".join(missing)
+            )
+
+    def _handle_normal_stop_plant(
+        self,
+        payload: Mapping[str, object],
+    ) -> dict[str, object]:
+        canonical_request = canonical_normal_stop_json(payload)
+        try:
+            with self._support_lock:
+                state = self._ensure_normal_stop_runtime_locked()
+                current = state.snapshot
+                identity = current.identity
+                bridge_boot_id = self._normal_stop_bridge_boot_id
+                if identity is None or bridge_boot_id is None:
+                    raise NormalStopWireError(
+                        "normal-stop Plant acknowledgement has no active identity"
+                    )
+                # Correlation is complete before Plant evidence is returned to
+                # this handler.  An old identity/boot therefore cannot mutate
+                # ingress, support, epoch, or the normal-stop state machine.
+                request = parse_normal_stop_request(
+                    payload,
+                    expected_robot_id=self.config.robot_id,
+                    expected_bridge_boot_id=bridge_boot_id,
+                    expected_driver_boot_id=self._driver_boot_id,
+                    expected_identity=identity,
+                )
+                if not isinstance(request, NormalStopPlantRequest):
+                    raise NormalStopWireError(
+                        "normal-stop Plant request type is invalid"
+                    )
+                with self._terminal_fault_lock:
+                    if self._fault_latched.is_set():
+                        raise RuntimeError(
+                            "SONIC terminal fault cannot confirm normal stop"
+                        )
+                    if self._stop.is_set():
+                        raise RuntimeError(
+                            "SONIC shutdown cannot confirm normal stop"
+                        )
+                    replay = self._normal_stop_replay_locked(
+                        request_id=request.request_id,
+                        canonical_request=canonical_request,
+                    )
+                if replay is not None:
+                    return replay
+
+                evidence = request.plant
+                plant_epoch = evidence.safety_stop_epoch
+                failure_reason: str | None = None
+                if not evidence.confirmed:
+                    failure_reason = (
+                        "Plant normal-stop confirmation failed: "
+                        f"{evidence.error}"
+                    )[:512]
+                else:
+                    assert plant_epoch is not None
+                    if (
+                        evidence.last_rearm_generation is not None
+                        and evidence.last_rearm_generation
+                        > identity.control_generation
+                    ):
+                        failure_reason = (
+                            "Plant normal-stop evidence has a rearm generation "
+                            "newer than the stopped control generation"
+                        )
+
+                if current.phase == "DRIVER_CONFIRMED":
+                    if failure_reason is not None:
+                        raise NormalStopWireError(
+                            "a confirmed normal stop cannot accept failed Plant evidence"
+                        )
+                    if (
+                        plant_epoch
+                        != self._normal_stop_plant_safety_stop_epoch
+                    ):
+                        raise NormalStopWireError(
+                            "normal-stop Plant retry epoch does not match the transaction"
+                        )
+                    with self._terminal_fault_lock:
+                        if self._fault_latched.is_set() or self._stop.is_set():
+                            raise RuntimeError(
+                                "SONIC shutdown/fault won normal-stop Plant retry"
+                            )
+                        if (
+                            plant_epoch
+                            != self._normal_stop_last_confirmed_plant_epoch
+                        ):
+                            raise NormalStopWireError(
+                                "normal-stop Plant retry epoch is not the last "
+                                "driver-confirmed epoch"
+                            )
+                        try:
+                            self._require_normal_stop_local_hold_locked(
+                                identity,
+                                plant_epoch=plant_epoch,
+                            )
+                        except _NormalStopLocalHoldError as exc:
+                            # A new request ID is a fresh observation, not a
+                            # byte-equivalent transport replay.  A legitimate
+                            # later rearm or fact drift invalidates the old
+                            # safe-hold result without manufacturing a terminal
+                            # fault.  The original request ID remains cached as
+                            # the historical transaction response.
+                            raise NormalStopWireError(
+                                "normal-stop Plant retry no longer has the "
+                                f"confirmed local hold: {exc}"
+                            ) from exc
+                        snapshot = state.confirm_driver(identity)
+                    response = self._normal_stop_response_locked(
+                        request_id=request.request_id,
+                        snapshot=snapshot,
+                        plant_epoch=plant_epoch,
+                        expected_phases=frozenset({"DRIVER_CONFIRMED"}),
+                    )
+                    return self._record_normal_stop_replay_locked(
+                        request_id=request.request_id,
+                        canonical_request=canonical_request,
+                        response=response,
+                    )
+
+                if current.phase != "STATIONARY_ACK":
+                    raise NormalStopWireError(
+                        "Plant acknowledgement requires the STATIONARY_ACK phase"
+                    )
+                if (
+                    failure_reason is None
+                    and plant_epoch is not None
+                    and plant_epoch
+                    <= self._normal_stop_last_confirmed_plant_epoch
+                ):
+                    failure_reason = (
+                        "Plant safety-stop epoch did not advance beyond the "
+                        "last confirmed transaction"
+                    )
+                if (
+                    failure_reason is None
+                    and self._normal_stop_plant_safety_stop_epoch is not None
+                ):
+                    raise _NormalStopLocalHoldError(
+                        "stationary normal stop already carries a Plant epoch"
+                    )
+
+                if failure_reason is not None:
+                    with self._terminal_fault_lock:
+                        if self._fault_latched.is_set():
+                            raise RuntimeError(
+                                "SONIC terminal fault won failed Plant evidence"
+                            )
+                        if self._stop.is_set():
+                            raise RuntimeError(
+                                "SONIC shutdown won failed Plant evidence"
+                            )
+                        snapshot = state.fail(
+                            identity,
+                            reason=failure_reason,
+                        )
+                    response = self._normal_stop_response_locked(
+                        request_id=request.request_id,
+                        snapshot=snapshot,
+                        plant_epoch=None,
+                        expected_phases=frozenset({"FAILED"}),
+                    )
+                    return self._record_normal_stop_replay_locked(
+                        request_id=request.request_id,
+                        canonical_request=canonical_request,
+                        response=response,
+                    )
+
+                assert plant_epoch is not None
+                # The external Plant proof and every local authority fact form
+                # one short commit.  No boundary, network, planner, guard, or
+                # handoff call occurs while the terminal lock is retained.
+                with self._terminal_fault_lock:
+                    if self._fault_latched.is_set():
+                        raise RuntimeError(
+                            "SONIC terminal fault won Plant confirmation"
+                        )
+                    if self._stop.is_set():
+                        raise RuntimeError(
+                            "SONIC shutdown won Plant confirmation"
+                        )
+                    state.confirm_plant(identity)
+                    stopped_generation = self._intent_ingress.latch_support_stop()
+                    self._plant_support_mode = "safety_stop"
+                    self._plant_support_stop_pending = False
+                    self._plant_support_safety_latched = True
+                    self._plant_support_stop_generation = identity.control_generation
+                    self._normal_stop_plant_safety_stop_epoch = plant_epoch
+                    if stopped_generation != identity.control_generation:
+                        raise _NormalStopLocalHoldError(
+                            "Plant stop generation does not match the transaction"
+                        )
+                    self._require_normal_stop_local_hold_locked(
+                        identity,
+                        plant_epoch=plant_epoch,
+                    )
+                    snapshot = state.confirm_driver(identity)
+                    self._normal_stop_last_confirmed_plant_epoch = plant_epoch
+
+                response = self._normal_stop_response_locked(
+                    request_id=request.request_id,
+                    snapshot=snapshot,
+                    plant_epoch=plant_epoch,
+                    expected_phases=frozenset({"DRIVER_CONFIRMED"}),
+                )
+                return self._record_normal_stop_replay_locked(
+                    request_id=request.request_id,
+                    canonical_request=canonical_request,
+                    response=response,
+                )
+        except _NormalStopLocalHoldError as exc:
+            self._latch_terminal_fault(
+                f"normal-stop driver hold fault: {exc}",
+            )
+            raise RuntimeError(
+                f"normal-stop driver hold fault: {exc}"
+            ) from exc
+
     def accept_json(self, payload: dict[str, Any]) -> dict[str, Any] | None:
         if payload.get("type") == "normal_stop_begin":
             return self._handle_normal_stop_begin(payload)
         if payload.get("type") == "normal_stop_stationary_ack":
             return self._handle_normal_stop_stationary(payload)
+        if payload.get("type") == "normal_stop_plant_ack":
+            return self._handle_normal_stop_plant(payload)
         if (
             isinstance(payload.get("type"), str)
             and str(payload["type"]).startswith("normal_stop_")

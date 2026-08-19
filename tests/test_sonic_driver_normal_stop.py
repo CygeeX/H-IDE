@@ -10,6 +10,7 @@ from hide_mujoco_sonic.normal_stop import NormalStopIdentity, NormalStopState
 from hide_mujoco_sonic.normal_stop_wire import (
     NormalStopWireError,
     normal_stop_begin_request,
+    normal_stop_plant_request,
     normal_stop_stationary_request,
     parse_normal_stop_response,
 )
@@ -22,6 +23,7 @@ BRIDGE_BOOT_ID = UUID("20000000-0000-4000-8000-000000000002")
 NEW_BRIDGE_BOOT_ID = UUID("20000000-0000-4000-8000-000000000004")
 REQUEST_ID = UUID("10000000-0000-4000-8000-000000000001")
 STATIONARY_REQUEST_ID = UUID("10000000-0000-4000-8000-000000000010")
+PLANT_REQUEST_ID = UUID("10000000-0000-4000-8000-000000000020")
 ROBOT_ID = "g1-sim"
 
 
@@ -192,6 +194,61 @@ def stationary_request(
             ),
         ),
     )
+
+
+def plant_success(
+    *,
+    epoch: int = 9,
+    last_rearm_generation: int | None = 10,
+) -> dict[str, object]:
+    return {
+        "confirmed": True,
+        "mode": "safety_stop",
+        "safety_stop_latched": True,
+        "safety_stop_epoch": epoch,
+        "last_rearm_generation": last_rearm_generation,
+        "fault": None,
+        "error": None,
+    }
+
+
+def plant_failure(error: str = "Plant confirmation timed out") -> dict[str, object]:
+    return {
+        "confirmed": False,
+        "mode": None,
+        "safety_stop_latched": None,
+        "safety_stop_epoch": None,
+        "last_rearm_generation": None,
+        "fault": None,
+        "error": error,
+    }
+
+
+def plant_request(
+    *,
+    identity: NormalStopIdentity,
+    request_id: UUID = PLANT_REQUEST_ID,
+    bridge_boot_id: UUID = BRIDGE_BOOT_ID,
+    driver_boot_id: UUID = DRIVER_BOOT_ID,
+    plant: dict[str, object] | None = None,
+) -> dict[str, object]:
+    return normal_stop_plant_request(
+        request_id=request_id,
+        robot_id=ROBOT_ID,
+        bridge_boot_id=bridge_boot_id,
+        driver_boot_id=driver_boot_id,
+        identity=identity,
+        plant=plant_success() if plant is None else plant,
+    )
+
+
+def enter_stationary(driver: SonicDriver, clock: Clock) -> NormalStopIdentity:
+    driver.accept_json(begin_request(clock))
+    identity = driver._normal_stop.snapshot.identity
+    assert identity is not None
+    driver.accept_json(stationary_request(clock, identity=identity))
+    assert driver._normal_stop.snapshot.phase == "STATIONARY_ACK"
+    return identity
 
 
 def complete_state(driver: SonicDriver) -> None:
@@ -769,6 +826,722 @@ def test_terminal_fault_claim_and_plant_halt_do_not_wait_for_begin_boundary(
     assert driver._normal_stop_bridge_boot_id is None
     assert driver._intent_ingress.sequence == 0
     assert driver._plant_support_stop_pending is False
+
+
+@pytest.mark.parametrize("last_rearm_generation", [None, 9, 10])
+def test_plant_ack_atomically_confirms_exact_driver_hold(
+    last_rearm_generation: int | None,
+) -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    identity = enter_stationary(driver, clock)
+    driver._normal_stop_last_confirmed_plant_epoch = 8
+    payload = plant_request(
+        identity=identity,
+        plant=plant_success(
+            epoch=9,
+            last_rearm_generation=last_rearm_generation,
+        ),
+    )
+
+    response = driver.accept_json(payload)
+
+    assert response is not None
+    parsed = parse_normal_stop_response(
+        response,
+        expected_request_id=PLANT_REQUEST_ID,
+        expected_robot_id=ROBOT_ID,
+        expected_driver_boot_id=DRIVER_BOOT_ID,
+        expected_identity=identity,
+        expected_control_generation=10,
+        expected_gait_source_sequence=20,
+        expected_phases=frozenset({"DRIVER_CONFIRMED"}),
+    )
+    assert parsed.ok is True
+    assert parsed.normal_stop.safe_hold_confirmed is True
+    assert parsed.plant_safety_stop_epoch == 9
+    assert driver._normal_stop.snapshot.phase == "DRIVER_CONFIRMED"
+    assert driver._normal_stop_plant_safety_stop_epoch == 9
+    assert driver._normal_stop_last_confirmed_plant_epoch == 9
+    assert driver._plant_support_mode == "safety_stop"
+    assert driver._plant_support_safety_latched is True
+    assert driver._plant_support_stop_pending is False
+    assert driver._plant_support_stop_generation == 10
+    assert driver._intent_ingress.support_stop_generation == 10
+    assert driver._intent_ingress.armed is False
+    assert driver._safe_hold_targets == driver._last_published_targets
+    assert driver._static_hold_active is True
+    assert driver.guard.command_zero is True
+    assert driver._navigation_task_active is False
+    assert driver._reference_authority.snapshot.phase == "REVOKED"
+    assert driver.accept_json(payload) == response
+
+
+def test_plant_retry_with_new_request_id_requires_the_same_epoch() -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    identity = enter_stationary(driver, clock)
+    first = driver.accept_json(plant_request(identity=identity))
+    assert first is not None
+    retry_id = UUID("10000000-0000-4000-8000-000000000021")
+
+    retry = driver.accept_json(
+        plant_request(identity=identity, request_id=retry_id)
+    )
+
+    assert retry is not None
+    parsed = parse_normal_stop_response(
+        retry,
+        expected_request_id=retry_id,
+        expected_identity=identity,
+        expected_phases=frozenset({"DRIVER_CONFIRMED"}),
+    )
+    assert parsed.plant_safety_stop_epoch == 9
+    before = driver._normal_stop.snapshot
+    with pytest.raises(NormalStopWireError, match="retry epoch"):
+        driver.accept_json(
+            plant_request(
+                identity=identity,
+                request_id=UUID("10000000-0000-4000-8000-000000000022"),
+                plant=plant_success(epoch=10),
+            )
+        )
+    assert driver._normal_stop.snapshot is before
+    assert driver._normal_stop_last_confirmed_plant_epoch == 9
+
+
+@pytest.mark.parametrize("drift", ["rearmed", "target_changed"])
+def test_new_plant_request_id_rechecks_the_current_local_hold(drift: str) -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    identity = enter_stationary(driver, clock)
+    original_payload = plant_request(identity=identity)
+    original_response = driver.accept_json(original_payload)
+    assert original_response is not None
+    if drift == "rearmed":
+        driver._plant_support_mode = "idle"
+        driver._plant_support_safety_latched = False
+        driver._plant_support_stop_generation = None
+        driver._intent_ingress.support_stop_generation = None
+    else:
+        driver._safe_hold_targets = tuple(0.2 for _ in range(29))
+
+    with pytest.raises(NormalStopWireError, match="no longer has"):
+        driver.accept_json(
+            plant_request(
+                identity=identity,
+                request_id=UUID("10000000-0000-4000-8000-000000000023"),
+            )
+        )
+
+    assert driver._normal_stop.snapshot.phase == "DRIVER_CONFIRMED"
+    assert driver._fault_latched.is_set() is False
+    assert driver.accept_json(original_payload) == original_response
+
+
+@pytest.mark.parametrize(
+    "evidence_case",
+    ["failed", "stale_epoch", "future_rearm"],
+)
+def test_failed_or_dynamically_invalid_plant_evidence_latches_normal_failure(
+    evidence_case: str,
+) -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    identity = enter_stationary(driver, clock)
+    if evidence_case == "failed":
+        plant = plant_failure()
+    elif evidence_case == "stale_epoch":
+        driver._normal_stop_last_confirmed_plant_epoch = 9
+        plant = plant_success(epoch=9)
+    else:
+        plant = plant_success(epoch=10, last_rearm_generation=11)
+    payload = plant_request(identity=identity, plant=plant)
+
+    response = driver.accept_json(payload)
+
+    assert response is not None
+    parsed = parse_normal_stop_response(
+        response,
+        expected_request_id=PLANT_REQUEST_ID,
+        expected_identity=identity,
+        expected_phases=frozenset({"FAILED"}),
+    )
+    assert parsed.ok is False
+    assert parsed.normal_stop.safe_hold_confirmed is False
+    assert parsed.plant_safety_stop_epoch is None
+    assert driver._normal_stop.snapshot.phase == "FAILED"
+    assert driver._normal_stop_plant_safety_stop_epoch is None
+    assert driver._plant_support_stop_pending is True
+    assert driver._plant_support_safety_latched is False
+    assert driver._fault_latched.is_set() is False
+    assert driver._terminal_plant_halt_attempted is False
+    assert driver.accept_json(payload) == response
+
+
+def test_old_plant_identity_and_boot_are_rejected_before_state_consumption(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    identity = enter_stationary(driver, clock)
+    old_identity = NormalStopIdentity(
+        UUID("40000000-0000-4000-8000-000000000041"),
+        identity.control_generation,
+        identity.gait_source_sequence,
+        identity.stop_epoch,
+    )
+    before = driver._normal_stop.snapshot
+
+    def unexpected_plant(_identity: NormalStopIdentity):
+        raise AssertionError("old Plant evidence reached the state machine")
+
+    monkeypatch.setattr(driver._normal_stop, "confirm_plant", unexpected_plant)
+    with pytest.raises(NormalStopWireError, match="transaction identity"):
+        driver.accept_json(plant_request(identity=old_identity))
+    with pytest.raises(NormalStopWireError, match="bridge boot"):
+        driver.accept_json(
+            plant_request(identity=identity, bridge_boot_id=NEW_BRIDGE_BOOT_ID)
+        )
+    with pytest.raises(NormalStopWireError, match="driver boot"):
+        driver.accept_json(
+            plant_request(
+                identity=identity,
+                driver_boot_id=UUID("30000000-0000-4000-8000-000000000030"),
+            )
+        )
+
+    assert driver._normal_stop.snapshot is before
+    assert driver._normal_stop_plant_safety_stop_epoch is None
+    assert driver._normal_stop_last_confirmed_plant_epoch == 0
+    assert driver._plant_support_stop_pending is True
+
+
+@pytest.mark.parametrize(
+    "missing_fact",
+    [
+        "safe_targets",
+        "target_mismatch",
+        "target_nonfinite",
+        "static_hold",
+        "zero_command",
+        "navigation_task",
+        "ingress_latch",
+        "reference_authority",
+        "reference_request",
+    ],
+)
+def test_every_missing_local_hold_fact_prevents_driver_confirmation(
+    missing_fact: str,
+) -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    identity = enter_stationary(driver, clock)
+    if missing_fact == "safe_targets":
+        driver._safe_hold_targets = None
+    elif missing_fact == "target_mismatch":
+        driver._safe_hold_targets = tuple(0.1 for _ in range(29))
+    elif missing_fact == "target_nonfinite":
+        driver._safe_hold_targets = (float("nan"),) + tuple(
+            0.0 for _ in range(28)
+        )
+    elif missing_fact == "static_hold":
+        driver._static_hold_active = False
+    elif missing_fact == "zero_command":
+        driver.guard._command_zero = False
+    elif missing_fact == "navigation_task":
+        driver._navigation_task_active = True
+    elif missing_fact == "ingress_latch":
+        driver._intent_ingress.latch_support_stop = lambda: 10  # type: ignore[method-assign]
+    elif missing_fact == "reference_authority":
+        driver._reference_authority.require(generation=10, source_sequence=20)
+    else:
+        driver._reference_request_pending = True
+    terminal_reasons: list[str] = []
+
+    def fake_terminal(reason: str, **_kwargs: object) -> None:
+        terminal_reasons.append(reason)
+        driver._fault_latched.set()
+
+    driver._latch_terminal_fault = fake_terminal  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="driver hold fault"):
+        driver.accept_json(plant_request(identity=identity))
+
+    assert len(terminal_reasons) == 1
+    assert driver._fault_latched.is_set() is True
+    assert driver._normal_stop.snapshot.phase == "PLANT_CONFIRMED"
+    assert driver._normal_stop.snapshot.safe_hold_confirmed is False
+    assert driver._normal_stop_last_confirmed_plant_epoch == 0
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+def test_late_plant_ack_after_shutdown_or_terminal_has_no_side_effect(
+    terminal: bool,
+) -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    identity = enter_stationary(driver, clock)
+    before = driver._normal_stop.snapshot
+    support_before = (
+        driver._plant_support_mode,
+        driver._plant_support_stop_pending,
+        driver._plant_support_safety_latched,
+        driver._plant_support_stop_generation,
+        driver._intent_ingress.support_stop_generation,
+    )
+    if terminal:
+        driver._fault_latched.set()
+        expected = "terminal fault"
+    else:
+        driver._stop.set()
+        expected = "shutdown"
+
+    with pytest.raises(RuntimeError, match=expected):
+        driver.accept_json(plant_request(identity=identity))
+
+    assert driver._normal_stop.snapshot is before
+    assert (
+        driver._plant_support_mode,
+        driver._plant_support_stop_pending,
+        driver._plant_support_safety_latched,
+        driver._plant_support_stop_generation,
+        driver._intent_ingress.support_stop_generation,
+    ) == support_before
+    assert driver._normal_stop_plant_safety_stop_epoch is None
+    assert driver._normal_stop_last_confirmed_plant_epoch == 0
+
+
+def test_shutdown_winning_plant_parse_prevents_final_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    identity = enter_stationary(driver, clock)
+    payload = plant_request(identity=identity)
+    before = driver._normal_stop.snapshot
+    parsed = threading.Event()
+    release_parse = threading.Event()
+    from hide_mujoco_sonic import sonic_driver as sonic_driver_module
+
+    original_parse = sonic_driver_module.parse_normal_stop_request
+
+    def gated_parse(*args: object, **kwargs: object):
+        result = original_parse(*args, **kwargs)  # type: ignore[arg-type]
+        parsed.set()
+        assert release_parse.wait(timeout=2.0)
+        return result
+
+    monkeypatch.setattr(sonic_driver_module, "parse_normal_stop_request", gated_parse)
+    errors: list[Exception] = []
+
+    def invoke_handler() -> None:
+        try:
+            driver.accept_json(payload)
+        except Exception as exc:
+            errors.append(exc)
+
+    handler = threading.Thread(target=invoke_handler)
+    handler.start()
+    assert parsed.wait(timeout=2.0)
+    shutdown = threading.Thread(target=driver.stop)
+    shutdown.start()
+    assert driver._stop.wait(timeout=2.0)
+    release_parse.set()
+    handler.join(timeout=2.0)
+    shutdown.join(timeout=2.0)
+
+    assert len(errors) == 1
+    assert "shutdown" in str(errors[0])
+    assert driver._normal_stop.snapshot is before
+    assert driver._normal_stop_plant_safety_stop_epoch is None
+    assert driver._normal_stop_last_confirmed_plant_epoch == 0
+    assert driver._plant_support_stop_pending is True
+
+
+def test_plant_commit_winning_linearization_precedes_shutdown() -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    identity = enter_stationary(driver, clock)
+    payload = plant_request(identity=identity)
+    entered_commit = threading.Event()
+    release_commit = threading.Event()
+    original_confirm = driver._normal_stop.confirm_plant
+
+    def gated_confirm(value: NormalStopIdentity):
+        snapshot = original_confirm(value)
+        entered_commit.set()
+        assert release_commit.wait(timeout=2.0)
+        return snapshot
+
+    driver._normal_stop.confirm_plant = gated_confirm  # type: ignore[method-assign]
+    responses: list[dict[str, object] | None] = []
+    errors: list[Exception] = []
+
+    def invoke_handler() -> None:
+        try:
+            responses.append(driver.accept_json(payload))
+        except Exception as exc:
+            errors.append(exc)
+
+    handler = threading.Thread(target=invoke_handler)
+    handler.start()
+    assert entered_commit.wait(timeout=2.0)
+    shutdown_started = threading.Event()
+
+    def invoke_shutdown() -> None:
+        shutdown_started.set()
+        driver.stop()
+
+    shutdown = threading.Thread(target=invoke_shutdown)
+    shutdown.start()
+    assert shutdown_started.wait(timeout=2.0)
+    release_commit.set()
+    handler.join(timeout=2.0)
+    shutdown.join(timeout=2.0)
+
+    assert errors == []
+    assert len(responses) == 1
+    assert driver._normal_stop.snapshot.phase == "DRIVER_CONFIRMED"
+    assert driver._normal_stop_last_confirmed_plant_epoch == 9
+    assert driver._stop.is_set() is True
+
+
+def test_late_moving_tick_cannot_overwrite_confirmed_static_hold() -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    decision_ready = threading.Event()
+    release_old_tick = threading.Event()
+    outcomes: list[tuple[bool, bool, bool]] = []
+
+    def finish_old_tick() -> None:
+        # The tick prepared a moving decision before normal-stop begin.
+        prepared_static_decision = False
+        decision_ready.set()
+        assert release_old_tick.wait(timeout=2.0)
+        support_ready = driver._set_plant_support_mode("locomotion")
+        with driver._support_lock:
+            expected_static_boundary = (
+                driver._rejected_locomotion_is_static_boundary_locked()
+            )
+            effective_static_hold = driver._commit_static_hold_decision_locked(
+                prepared_static_decision
+            )
+        outcomes.append(
+            (
+                support_ready,
+                expected_static_boundary,
+                effective_static_hold,
+            )
+        )
+
+    old_tick = threading.Thread(target=finish_old_tick)
+    old_tick.start()
+    assert decision_ready.wait(timeout=2.0)
+    identity = enter_stationary(driver, clock)
+    original = driver.accept_json(plant_request(identity=identity))
+    assert original is not None
+    assert driver._normal_stop.snapshot.phase == "DRIVER_CONFIRMED"
+
+    release_old_tick.set()
+    old_tick.join(timeout=2.0)
+
+    assert old_tick.is_alive() is False
+    assert outcomes == [(False, True, True)]
+    assert driver._static_hold_active is True
+    retry_id = UUID("10000000-0000-4000-8000-000000000024")
+    retry = driver.accept_json(
+        plant_request(identity=identity, request_id=retry_id)
+    )
+    assert retry is not None
+    assert retry["normal_stop"]["safe_hold_confirmed"] is True  # type: ignore[index]
+
+
+def test_confirmed_stop_releases_static_fence_only_after_rearm_and_reference() -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    identity = enter_stationary(driver, clock)
+    driver.accept_json(plant_request(identity=identity))
+    assert driver._normal_stop.snapshot.phase == "DRIVER_CONFIRMED"
+
+    clock.value += 0.01
+    arm_intent = stationary_intent(clock, generation=11, sequence=1)
+    arm_intent.update(
+        state="IDLE",
+        stop_requested=False,
+        control_arm=True,
+        reason="explicit control rearm",
+    )
+    with driver._support_lock:
+        decision = driver._intent_ingress.accept(
+            arm_intent,
+            defer_control_arm=True,
+        )
+        assert decision.arm_acknowledged is True
+        driver._commit_staged_plant_support_rearm_locked(11)
+        # Rearm alone retains the exact actuator hold until the matching
+        # reference is installed and primed.
+        assert driver._normal_stop_static_boundary_locked() is True
+        assert driver._commit_static_hold_decision_locked(False) is True
+
+        driver._reference_authority.require(generation=11, source_sequence=1)
+        driver._reference_authority.mark_installed(
+            generation=11,
+            source_sequence=1,
+            planner_intent_generation=1,
+            reference_epoch=1,
+        )
+        driver._reference_authority.prime(
+            generation=11,
+            source_sequence=1,
+            reference_epoch=1,
+        )
+        # This is the exact release performed by
+        # _progress_reference_transaction after the measured rebase.
+        driver._safe_hold_targets = None
+        assert driver._normal_stop_static_boundary_locked() is False
+        assert driver._commit_static_hold_decision_locked(False) is False
+        assert driver._rejected_locomotion_is_static_boundary_locked() is False
+
+    assert driver._normal_stop.snapshot.phase == "DRIVER_CONFIRMED"
+    assert driver._static_hold_active is False
+
+
+def test_rearm_wins_before_late_rejected_tick_without_revoking_new_authority() -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    identity = enter_stationary(driver, clock)
+    driver.accept_json(plant_request(identity=identity))
+    classified = threading.Event()
+    release_old_tick = threading.Event()
+    outcomes: list[bool] = []
+    publishes: list[object] = []
+
+    def finish_old_tick() -> None:
+        assert driver._set_plant_support_mode("locomotion") is False
+        with driver._support_lock:
+            assert driver._rejected_locomotion_is_static_boundary_locked()
+            token = driver._support_transition_token_locked()
+        classified.set()
+        assert release_old_tick.wait(timeout=2.0)
+        with driver._support_lock:
+            committed = driver._commit_rejected_locomotion_tick_locked(token)
+            if committed:
+                publishes.append("obsolete frozen publish")
+        outcomes.append(committed)
+
+    old_tick = threading.Thread(target=finish_old_tick)
+    old_tick.start()
+    assert classified.wait(timeout=2.0)
+
+    clock.value += 0.01
+    arm_intent = stationary_intent(clock, generation=11, sequence=1)
+    arm_intent.update(
+        state="IDLE",
+        stop_requested=False,
+        control_arm=True,
+        reason="explicit control rearm",
+    )
+    with driver._support_lock:
+        decision = driver._intent_ingress.accept(
+            arm_intent,
+            defer_control_arm=True,
+        )
+        assert decision.arm_acknowledged is True
+        driver._commit_staged_plant_support_rearm_locked(11)
+        driver._reference_authority.require(generation=11, source_sequence=1)
+        driver._reference_authority.mark_installed(
+            generation=11,
+            source_sequence=1,
+            planner_intent_generation=1,
+            reference_epoch=1,
+        )
+        driver._reference_authority.prime(
+            generation=11,
+            source_sequence=1,
+            reference_epoch=1,
+        )
+        driver._safe_hold_targets = None
+
+    release_old_tick.set()
+    old_tick.join(timeout=2.0)
+
+    assert old_tick.is_alive() is False
+    assert outcomes == [False]
+    assert publishes == []
+    assert driver._intent_ingress.generation == 11
+    assert driver._intent_ingress.armed is True
+    assert driver._reference_authority.snapshot.phase == "PRIMED"
+    assert driver.guard.stops == ["normal_stop_begin"]
+    assert driver._normal_stop.snapshot.phase == "DRIVER_CONFIRMED"
+
+
+def test_late_tick_cannot_release_plant_before_matching_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    decision_ready = threading.Event()
+    release_old_tick = threading.Event()
+    plant_calls: list[str] = []
+    outcomes: list[bool] = []
+
+    def plant_support(
+        _host: str,
+        _port: int,
+        mode: str,
+        **_kwargs: object,
+    ) -> dict[str, object]:
+        plant_calls.append(mode)
+        return {"mode": mode}
+
+    monkeypatch.setattr(
+        "hide_mujoco_sonic.sonic_driver.set_plant_support",
+        plant_support,
+    )
+
+    def finish_old_tick() -> None:
+        # This locomotion decision predates the entire stop transaction.
+        decision_ready.set()
+        assert release_old_tick.wait(timeout=2.0)
+        outcomes.append(driver._set_plant_support_mode("locomotion"))
+
+    old_tick = threading.Thread(target=finish_old_tick)
+    old_tick.start()
+    assert decision_ready.wait(timeout=2.0)
+    identity = enter_stationary(driver, clock)
+    driver.accept_json(plant_request(identity=identity))
+
+    clock.value += 0.01
+    arm_intent = stationary_intent(clock, generation=11, sequence=1)
+    arm_intent.update(
+        state="IDLE",
+        stop_requested=False,
+        control_arm=True,
+        reason="explicit control rearm",
+    )
+    with driver._support_lock:
+        decision = driver._intent_ingress.accept(
+            arm_intent,
+            defer_control_arm=True,
+        )
+        assert decision.arm_acknowledged is True
+        driver._commit_staged_plant_support_rearm_locked(11)
+        assert driver._safe_hold_targets is not None
+
+    release_old_tick.set()
+    old_tick.join(timeout=2.0)
+
+    assert old_tick.is_alive() is False
+    assert outcomes == [False]
+    assert plant_calls == []
+    assert driver._plant_support_mode == "idle"
+
+    with driver._support_lock:
+        driver._reference_authority.require(generation=11, source_sequence=1)
+        driver._reference_authority.mark_installed(
+            generation=11,
+            source_sequence=1,
+            planner_intent_generation=1,
+            reference_epoch=1,
+        )
+        driver._reference_authority.prime(
+            generation=11,
+            source_sequence=1,
+            reference_epoch=1,
+        )
+        driver._safe_hold_targets = None
+
+    assert driver._set_plant_support_mode("locomotion") is True
+    assert plant_calls == ["locomotion"]
+    assert driver._plant_support_mode == "locomotion"
+
+
+def test_rejected_tick_publish_does_not_invert_control_and_support_locks() -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    driver._control_condition = threading.Condition(threading.RLock())
+    driver.accept_json(begin_request(clock))
+    with driver._support_lock:
+        token = driver._support_transition_token_locked()
+    control_holds_condition = threading.Event()
+    publish_entered = threading.Event()
+    support_acquired = threading.Event()
+    publish_finished = threading.Event()
+    results: list[bool] = []
+
+    def fake_publish(_targets: tuple[float, ...]) -> None:
+        publish_entered.set()
+        with driver._control_condition:
+            publish_finished.set()
+
+    driver._publish_position_hold = fake_publish  # type: ignore[method-assign]
+
+    def control_arm_lock_order() -> None:
+        with driver._control_condition:
+            control_holds_condition.set()
+            assert publish_entered.wait(timeout=2.0)
+            acquired = driver._support_lock.acquire(timeout=1.0)
+            if acquired:
+                try:
+                    support_acquired.set()
+                finally:
+                    driver._support_lock.release()
+
+    control_thread = threading.Thread(target=control_arm_lock_order)
+    control_thread.start()
+    assert control_holds_condition.wait(timeout=2.0)
+    publish_thread = threading.Thread(
+        target=lambda: results.append(
+            driver._publish_rejected_locomotion_tick_if_current(
+                object(),
+                token,
+            )
+        )
+    )
+    publish_thread.start()
+    control_thread.join(timeout=2.0)
+    publish_thread.join(timeout=2.0)
+
+    assert control_thread.is_alive() is False
+    assert publish_thread.is_alive() is False
+    assert support_acquired.is_set() is True
+    assert publish_finished.is_set() is True
+    assert results == [True]
+
+
+def test_late_locomotion_support_rejection_is_expected_during_braking() -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    decision_ready = threading.Event()
+    release_old_tick = threading.Event()
+    outcomes: list[tuple[bool, bool]] = []
+
+    def finish_old_tick() -> None:
+        decision_ready.set()
+        assert release_old_tick.wait(timeout=2.0)
+        support_ready = driver._set_plant_support_mode("locomotion")
+        with driver._support_lock:
+            expected_static_boundary = (
+                driver._rejected_locomotion_is_static_boundary_locked()
+            )
+        outcomes.append((support_ready, expected_static_boundary))
+
+    old_tick = threading.Thread(target=finish_old_tick)
+    old_tick.start()
+    assert decision_ready.wait(timeout=2.0)
+    driver.accept_json(begin_request(clock))
+    assert driver._normal_stop.snapshot.phase == "BRAKING"
+    assert driver._plant_support_stop_pending is False
+    assert driver._plant_support_safety_latched is False
+
+    release_old_tick.set()
+    old_tick.join(timeout=2.0)
+
+    assert old_tick.is_alive() is False
+    assert outcomes == [(False, True)]
+    assert driver._fault_latched.is_set() is False
+    assert driver._normal_stop.snapshot.phase == "BRAKING"
 
 
 def test_new_bridge_boot_resets_only_sequence_after_confirmed_generation() -> None:

@@ -2389,7 +2389,17 @@ def test_arm_verifier_runtime_fault_halts_plant_without_normal_safety_stop(
     driver._startup_qualifying = False
     driver._pending_decoder_heading_delta_rad = 0.0
     support_modes: list[str] = []
+    static_decisions: list[bool] = []
     terminal_halts: list[str] = []
+    original_static_commit = driver._commit_static_hold_decision_locked
+
+    def observed_static_commit(decision: bool) -> bool:
+        static_decisions.append(decision)
+        return original_static_commit(decision)
+
+    driver._commit_static_hold_decision_locked = (  # type: ignore[method-assign]
+        observed_static_commit
+    )
 
     class RuntimeController:
         execution_feedback_pending = False
@@ -2471,6 +2481,7 @@ def test_arm_verifier_runtime_fault_halts_plant_without_normal_safety_stop(
     assert terminal_halts == [driver._terminal_fault_reason]
     assert "safety_stop" not in support_modes
     assert support_modes == ["locomotion"]
+    assert static_decisions == [False]
     assert len(writes) == 1
     assert writes[0] == pytest.approx(boundary)
     assert controller.shutdown_called is True
@@ -3321,6 +3332,10 @@ def test_support_transition_race_preserves_the_stronger_stop(monkeypatch) -> Non
     driver.accept_json(
         _intent_payload(adapter.tick(now=clock.value), measured_heading_yaw=0.0)
     )
+    # This test isolates an already-authorized support transition.  Model the
+    # matching-reference rebase that releases the earlier IDLE actuator hold.
+    # The still-frozen case is covered by the normal-stop late-tick tests.
+    driver._safe_hold_targets = None
     calls: list[str] = []
 
     def racing_support(_host, _port, mode, **_kwargs):
