@@ -23,6 +23,7 @@ from typing import Any
 
 from .config import SimConfig
 from .network import require_loopback_bind_host
+from .planner_evidence import PlannerReferenceEvidenceGate
 from .safety import (
     CmdVelGuard,
     NavigationArmGuard,
@@ -362,6 +363,11 @@ class SonicDriver:
         self._msg = unitree_hg_msg_dds__LowCmd_()
         self._controller_type = SonicWholeBodyController
         self._controller = self._controller_type(force_cpu=config.force_cpu)
+        self._planner_evidence = PlannerReferenceEvidenceGate()
+        self._planner_evidence.bind(
+            self._controller.controller.planner,
+            reference_owner=self._controller.controller,
+        )
         self._kp = self._controller.kp
         self._kd = self._controller.kd
         self._arm_guard = self._new_arm_guard()
@@ -825,6 +831,7 @@ class SonicDriver:
     def _freeze_last_published_hold(self) -> bool:
         """Keep the actuator boundary continuous across a stop transition."""
 
+        self._revoke_planner_reference("actuator boundary entered static hold")
         with self._support_lock:
             targets = self._last_published_targets
             if targets is None:
@@ -1146,6 +1153,33 @@ class SonicDriver:
         )
         return True
 
+    def _planner_reference_cursor(self) -> int | None:
+        controller = getattr(self, "_controller", None)
+        pipeline = getattr(controller, "controller", None)
+        raw_cursor = getattr(pipeline, "ref_cursor", None)
+        if isinstance(raw_cursor, bool):
+            return None
+        try:
+            cursor = int(raw_cursor)
+        except (TypeError, ValueError):
+            return None
+        return cursor if cursor >= 0 else None
+
+    def _planner_telemetry_fields(self) -> dict[str, Any]:
+        evidence = getattr(self, "_planner_evidence", None)
+        if evidence is None:
+            return {}
+        return evidence.telemetry_fields(
+            ref_cursor=self._planner_reference_cursor()
+        )
+
+    def _revoke_planner_reference(self, reason: str) -> None:
+        evidence = getattr(self, "_planner_evidence", None)
+        if evidence is None:
+            return
+        evidence.revoke(reason)
+        self.telemetry.update(**self._planner_telemetry_fields())
+
     def _apply_intent(self, dt: float, *, simulation_now_s: float):
         intent = self.guard.intent(dt=dt)
         controller = self._controller
@@ -1165,6 +1199,7 @@ class SonicDriver:
         # clock as the policy cursor, handoff blend, and arm slew guard.  Wall
         # time remains valid only for ingress freshness/watchdog decisions.
         admitted = self._intent_gate.admit(intent, now=simulation_now_s)
+        self._planner_evidence.observe_intent(intent, admitted=admitted)
         starting_motion = intent.mode != "IDLE" and (previous is None or previous.mode == "IDLE")
         if intent.mode == "IDLE":
             if previous is None or previous.mode != "IDLE":
@@ -1216,6 +1251,7 @@ class SonicDriver:
             sonic_facing_angle_rad=intent.facing_angle_rad,
             sonic_decoder_heading_delta_rad=float(decoder.delta_heading),
             cmd_vel_age_s=(None if received_at is None else max(0.0, time.monotonic() - received_at)),
+            **self._planner_telemetry_fields(),
         )
         return intent
 
@@ -1393,6 +1429,14 @@ class SonicDriver:
         handoff_ratio: float,
     ) -> None:
         states = lowstate.motor_state
+        planner_evidence = getattr(self, "_planner_evidence", None)
+        planner_trace = (
+            {}
+            if planner_evidence is None
+            else planner_evidence.trace_fields(
+                ref_cursor=self._planner_reference_cursor()
+            )
+        )
         self._fault_trace.record(
             plant_tick_ms=control_step.tick_ms,
             control_dt_s=control_step.dt_s,
@@ -1403,6 +1447,7 @@ class SonicDriver:
                 "facing_angle_rad": intent.facing_angle_rad,
                 "has_movement": intent.has_movement,
                 "stale": intent.stale,
+                **planner_trace,
             },
             handoff_ratio=handoff_ratio,
             plant_support_mode=self._plant_support_mode or "unknown",
@@ -1474,6 +1519,7 @@ class SonicDriver:
                         if intent.mode != "IDLE"
                         else 0.0
                     ),
+                    **self._planner_telemetry_fields(),
                 )
                 if self._pending_decoder_heading_delta_rad:
                     # ``run_step`` has now consumed ``reinit_heading`` and
@@ -1492,6 +1538,7 @@ class SonicDriver:
                 with self._support_lock:
                     decision = self._joint_handoff.decide(
                         motion_active=intent.mode != "IDLE",
+                        reference_ready=self._planner_evidence.reference_ready,
                         measured=measured,
                         policy=policy_targets,
                         now=control_step.tick_ms / 1_000.0,
@@ -1562,6 +1609,7 @@ class SonicDriver:
                     static_hold_active=decision.static_hold_active,
                     motion_handoff_active=decision.motion_handoff_active,
                     motion_handoff_ratio=decision.handoff_ratio,
+                    **self._planner_telemetry_fields(),
                 )
             except Exception as exc:
                 self._latch_terminal_fault(f"SONIC runtime fault: {exc}")

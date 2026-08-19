@@ -715,17 +715,24 @@ class StaticJointHandoff:
         self,
         *,
         motion_active: bool,
+        reference_ready: bool = True,
         measured: Sequence[float],
         policy: Sequence[float],
         now: float | None = None,
     ) -> JointCommandDecision:
+        if not isinstance(motion_active, bool) or not isinstance(reference_ready, bool):
+            raise ValueError("handoff motion/reference readiness flags must be booleans")
         measured_values = self._validate(measured, "measured")
         policy_values = self._validate(policy, "policy")
         current = float(self._clock() if now is None else now)
         if not math.isfinite(current):
             raise ValueError("handoff time must be finite")
 
-        if not motion_active:
+        # An asynchronous policy target is not motion authority.  A newly
+        # admitted Nav2 intent must remain at an exact zero handoff ratio until
+        # the planner evidence gate has accepted a generation-matched reference
+        # whose predicted root displacement agrees with that intent.
+        if not motion_active or not reference_ready:
             if self._active or self._hold is None:
                 self._hold = measured_values
             self._active = False

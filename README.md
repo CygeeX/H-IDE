@@ -69,6 +69,12 @@ non-semantic integrity manifest.
 * Continuous Nav2 corrections are latched before SONIC replanning: start/stop
   transitions are immediate, while in-motion clip updates are rate-limited so
   asynchronous planner results cannot overtake newer commands.
+* Every admitted motion intent and asynchronous planner request has a local
+  generation/signature lineage.  The static joint handoff stays at ratio zero
+  until a uniquely correlated new reference is blendable at the live cursor;
+  translational references must also predict positive root displacement in the
+  requested direction.  Ambiguous, stale and opposite-direction results are
+  dropped rather than guessed.
 * A Nav2 angular-only `cmd_vel` selects SONIC's zero-translation facing-change
   plan.  Rotation is therefore still owned by Nav2 and never by a direct motor
   or head command.
@@ -132,7 +138,10 @@ copying partial `PYTHONPATH` values into a terminal.
 The service exposes a small local telemetry endpoint for the H-IDE adapter at
 `http://127.0.0.1:8792/healthz` and `.../telemetry`.  It is intentionally a
 read-only observation surface.  H-IDE's simulation API can proxy this status
-and show whether the real MuJoCo/SONIC chain is running.
+and show whether the real MuJoCo/SONIC chain is running.  Planner-evidence
+fields expose the current intent generation/signature, request and accepted
+generations, reference cursor, and predicted root direction/projection.  The
+same fields are copied into every bounded pre-fault control-trace sample.
 
 ## Acceptance gate before deleting the old deterministic backend
 

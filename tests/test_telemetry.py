@@ -53,7 +53,18 @@ def test_joint_fault_trace_is_bounded_named_and_strict_json(tmp_path):
         trace.record(
             plant_tick_ms=tick,
             control_dt_s=0.02,
-            intent={"mode": "SLOW_WALK", "speed_mps": 0.1},
+            intent={
+                "mode": "SLOW_WALK",
+                "speed_mps": 0.1,
+                "intent_generation": 7,
+                "intent_signature": "intent-sha256",
+                "planner_request_generation": 11,
+                "planner_accepted_generation": 11,
+                "planner_ref_cursor": 3,
+                "planner_predicted_root_direction_x": 1.0,
+                "planner_predicted_root_direction_y": 0.0,
+                "planner_predicted_root_projection_m": 0.4,
+            },
             handoff_ratio=0.5,
             plant_support_mode="locomotion",
             measured_q_rad=values,
@@ -70,6 +81,14 @@ def test_joint_fault_trace_is_bounded_named_and_strict_json(tmp_path):
     assert payload["sample_count"] == 2
     assert [sample["plant_tick_ms"] for sample in payload["samples"]] == [20, 40]
     assert payload["samples"][-1]["measured_q_rad"][-1] is None
+    assert payload["samples"][-1]["intent"]["intent_generation"] == 7.0
+    assert payload["samples"][-1]["intent"]["intent_signature"] == "intent-sha256"
+    assert payload["samples"][-1]["intent"]["planner_request_generation"] == 11.0
+    assert payload["samples"][-1]["intent"]["planner_accepted_generation"] == 11.0
+    assert payload["samples"][-1]["intent"]["planner_ref_cursor"] == 3.0
+    assert payload["samples"][-1]["intent"][
+        "planner_predicted_root_projection_m"
+    ] == 0.4
     assert payload["gains"] == {"kp": [10.0, 20.0], "kd": [1.0, 2.0]}
 
     path = trace.persist(tmp_path / "sonic-fault-trace.json", payload)
