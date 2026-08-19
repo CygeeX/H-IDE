@@ -83,12 +83,14 @@ else:
 logger = logging.getLogger(__name__)
 
 # ── Constants ────────────────────────────────────────────────────────────────
-# Robot/motor physical constants and the joint-order permutation tables. All
-# 29-vectors are in IsaacLab joint order unless the name says ``_MUJOCO``.
+# Robot/motor physical constants and the joint-order permutation tables.
 
-# Nominal standing pose (rad), 29 joints in IsaacLab order. Actions are residuals
-# added on top of this; also used as the planner/encoder standing reference.
-DEFAULT_ANGLES = np.array(
+# Nominal standing pose (rad), in the MuJoCo / Unitree SDK deploy order used by
+# ``G1_29_JointIndex`` and ``rt/lowstate``.  This matches NVIDIA's official
+# ``policy_parameters.hpp``; the pinned feature branch previously labelled the
+# same grouped vector as IsaacLab order, which made its initial planner context
+# apply the permutation twice.
+DEFAULT_ANGLES_MUJOCO = np.array(
     [
         -0.312,
         0.0,
@@ -160,13 +162,16 @@ BLEND_FRAMES = 8  # cross-fade length when swapping in a freshly planned motion
 REPLAN_INTERVAL = {"running": 0.1, "crawling": 0.2, "boxing": 1.0, "default": 1.0}
 
 
-def _to_mujoco(a):
-    """Reorder a 29-vector from IsaacLab order into MuJoCo/deploy order."""
+def _mujoco_to_isaaclab(a):
+    """Reorder a 29-vector from MuJoCo/deploy order into policy order."""
     return a[MUJOCO_TO_ISAACLAB]
 
 
-DEFAULT_ANGLES_MUJOCO = _to_mujoco(DEFAULT_ANGLES)
-ENCODER_STANDING_REF = DEFAULT_ANGLES.copy()
+# Keep the established public name for callers in the LeRobot feature branch;
+# its actual and now-documented layout is the Unitree/MuJoCo deploy order.
+DEFAULT_ANGLES = DEFAULT_ANGLES_MUJOCO
+DEFAULT_ANGLES_ISAACLAB = _mujoco_to_isaaclab(DEFAULT_ANGLES_MUJOCO)
+ENCODER_STANDING_REF = DEFAULT_ANGLES_ISAACLAB.copy()
 
 # Joint-index subsets (IsaacLab order) used to slice encoder observations.
 LOWER_BODY_IL = np.array([0, 3, 6, 9, 13, 17, 1, 4, 7, 10, 14, 18], dtype=np.int32)  # 12 leg joints
@@ -454,7 +459,9 @@ class MovementState:
     loop watches to decide when to request a fresh motion from the planner.
     """
 
-    mode: int = LM.SLOW_WALK  # not IDLE — walking modes respond to WASD
+    # Match NVIDIA's deploy state: boot into a static plan. H-IDE/Nav2 changes
+    # this to SLOW_WALK only while a non-zero movement command is present.
+    mode: int = LM.IDLE
     speed: float = -1.0
     height: float = -1.0
     facing_angle: float = 0.0
@@ -573,10 +580,10 @@ class StandingEncoderDecoder:
     def update_history(self, q, dq, ang, quat):
         """Push the latest proprioception (pos/vel/gyro/orientation) into the 10-frame buffers."""
         quat = quat / (np.linalg.norm(quat) + 1e-8)
-        q_mj = _to_mujoco(q)
-        dq_mj = _to_mujoco(dq)
-        self.h_q_mj = [q_mj - DEFAULT_ANGLES_MUJOCO] + self.h_q_mj[:-1]
-        self.h_dq_mj = [dq_mj] + self.h_dq_mj[:-1]
+        q_il = _mujoco_to_isaaclab(q)
+        dq_il = _mujoco_to_isaaclab(dq)
+        self.h_q_mj = [q_il - DEFAULT_ANGLES_ISAACLAB] + self.h_q_mj[:-1]
+        self.h_dq_mj = [dq_il] + self.h_dq_mj[:-1]
         self.h_ang = [ang.copy()] + self.h_ang[:-1]
         self.h_act_mj = [self.last_action_mj.copy()] + self.h_act_mj[:-1]
         self.h_quat = [quat.copy()] + self.h_quat[:-1]
@@ -880,9 +887,9 @@ class SonicPlanner:
 
     @staticmethod
     def build_initial_context(joint_positions):
-        """Build a 4-frame standing context (MuJoCo qpos layout) from a pose."""
+        """Build a 4-frame context from a MuJoCo/Unitree ordered pose."""
         ctx = np.zeros((4, 36), np.float32)
-        jp_mj = joint_positions.astype(np.float32)[ISAACLAB_TO_MUJOCO]
+        jp_mj = joint_positions.astype(np.float32)
         for n in range(4):
             ctx[n, 2] = DEFAULT_HEIGHT
             ctx[n, 3] = 1.0
