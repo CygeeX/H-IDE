@@ -79,6 +79,8 @@ class RobotAgentWebSocketPeer:
         self._lease_sequence = 0
         self._control_safe_stop_truth_supported = False
         self._control_safe_stop_epoch: int | None = None
+        self._release_baseline_epoch: int | None = None
+        self._release_baseline_boot_id: str | None = None
         self._commands: dict[str, ProtocolCommand] = {}
         self._statuses: dict[str, ProtocolCommandStatus] = {}
         self._heartbeat_stop = threading.Event()
@@ -131,6 +133,70 @@ class RobotAgentWebSocketPeer:
         with self._io_lock:
             self._ensure_connected_locked()
             return self._renew_locked()
+
+    def release(self, robot_id: str, reason: str) -> Mapping[str, Any]:
+        if robot_id != self.robot_id:
+            raise ValueError("robot identity mismatch")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("control release reason is required")
+        detail = reason.strip()
+        if len(detail) > 256:
+            raise ValueError("control release reason is too long")
+        self._stop_heartbeat()
+        with self._io_lock:
+            self._ensure_connected_locked()
+            if self._release_baseline_epoch is None:
+                if (
+                    not self._control_safe_stop_truth_supported
+                    or self._control_safe_stop_epoch is None
+                ):
+                    raise RuntimeError(
+                        "Robot Agent control release is unconfirmed: peer does not "
+                        "publish atomic safe-stop truth"
+                    )
+                self._release_baseline_epoch = self._control_safe_stop_epoch
+                self._release_baseline_boot_id = self.robot_boot_id
+            baseline_epoch = self._release_baseline_epoch
+            baseline_boot_id = self._release_baseline_boot_id
+            if self.robot_boot_id != baseline_boot_id:
+                raise RuntimeError(
+                    "Robot Agent restarted before control release was confirmed"
+                )
+            self._send("control.release", {"reason": detail})
+            deadline = time.monotonic() + 5.0
+            while True:
+                message = self._receive("control.status", deadline=deadline)
+                status = self._record_control_status(message["payload"])
+                if self.robot_boot_id != baseline_boot_id:
+                    raise RuntimeError(
+                        "Robot Agent restarted before control release was confirmed"
+                    )
+                epoch = status.safe_stop_epoch
+                fresh = epoch is not None and epoch > baseline_epoch
+                if (
+                    fresh
+                    and status.state == "SAFE_HOLD"
+                    and status.authority_revoked is True
+                    and status.safe_stop_state == "confirmed"
+                ):
+                    result = {
+                        "state": "SAFE_HOLD",
+                        "authorityRevoked": True,
+                        "safeStopState": "confirmed",
+                        "safeStopEpoch": epoch,
+                    }
+                    self._release_baseline_epoch = None
+                    self._release_baseline_boot_id = None
+                    return result
+                if (
+                    fresh
+                    and status.state == "SAFE_HOLD"
+                    and status.authority_revoked is True
+                    and status.safe_stop_state == "failed"
+                ):
+                    raise RuntimeError(
+                        "Robot Agent physical safe-stop failed during control release"
+                    )
 
     def submit(self, command: ProtocolCommand) -> ProtocolCommandStatus:
         if command.robot_id != self.robot_id:
@@ -214,11 +280,7 @@ class RobotAgentWebSocketPeer:
             return status
 
     def close(self) -> None:
-        self._heartbeat_stop.set()
-        thread = self._heartbeat_thread
-        self._heartbeat_thread = None
-        if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=1)
+        self._stop_heartbeat(timeout=1.0, strict=False)
         with self._io_lock:
             socket = self._socket
             self._socket = None
@@ -418,6 +480,23 @@ class RobotAgentWebSocketPeer:
         )
         self._heartbeat_thread = thread
         thread.start()
+
+    def _stop_heartbeat(
+        self,
+        *,
+        timeout: float = 2.5,
+        strict: bool = True,
+    ) -> None:
+        self._heartbeat_stop.set()
+        thread = self._heartbeat_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=timeout)
+            if strict and thread.is_alive():
+                raise RuntimeError("Robot Agent lease heartbeat did not stop")
+        if self._heartbeat_thread is thread and (
+            thread is None or not thread.is_alive()
+        ):
+            self._heartbeat_thread = None
 
     @staticmethod
     def _status(message: Mapping[str, Any]) -> ProtocolCommandStatus:

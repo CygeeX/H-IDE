@@ -34,6 +34,14 @@ class RobotAgentGatewayDriver:
         self._lease_sequence = 0
         self._active_robot: str | None = None
         self._lease_lock = threading.RLock()
+        self._command_robots: dict[str, str] = {}
+        self._command_identities: dict[str, tuple[str, str, str]] = {}
+        self._active_commands: dict[str, set[str]] = {}
+        self._terminal_statuses: dict[str, ProtocolCommandStatus] = {}
+        self._terminal_unreleased: dict[str, set[str]] = {}
+        self._released_commands: dict[str, dict[str, Any]] = {}
+        self._cancel_confirmed_commands: set[str] = set()
+        self._release_pending: set[str] = set()
 
     def discover(self, robot_id: str | None = None) -> AdapterResult:
         value = self.peer.discover(robot_id)
@@ -61,27 +69,216 @@ class RobotAgentGatewayDriver:
         )
 
     def dispatch(self, request: CommandRequest, mapping: MappingVersion) -> AdapterResult:
-        self._ensure_lease(request.robotId)
-        canonical = json.dumps(request.payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
-        ttl_ms = max(1, int((request.expiresAt - request.issuedAt).total_seconds() * 1000))
-        status = self.peer.submit(
-            ProtocolCommand(
-                command_id=self._wire_command_id(request.commandId),
-                robot_id=request.robotId,
-                kind=request.commandKey,
-                issued_at=request.issuedAt.astimezone(timezone.utc),
-                ttl_ms=ttl_ms,
-                params=request.payload,
-                payload_hash=hashlib.sha256(canonical).hexdigest(),
+        wire_command_id = self._wire_command_id(request.commandId)
+        canonical = json.dumps(
+            request.payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode()
+        payload_hash = hashlib.sha256(canonical).hexdigest()
+        identity = (request.robotId, request.commandKey, payload_hash)
+        with self._lease_lock:
+            existing_identity = self._command_identities.get(wire_command_id)
+            if existing_identity is not None and existing_identity != identity:
+                return AdapterResult(
+                    status="rejected",
+                    error="Robot Agent command ID payload conflict",
+                    details={"protocolState": "REJECTED"},
+                )
+            terminal = self._terminal_statuses.get(wire_command_id)
+            if terminal is not None:
+                return self._result_after_terminal_release(
+                    terminal,
+                    robot_id=request.robotId,
+                    wire_command_id=wire_command_id,
+                )
+            self._ensure_lease(request.robotId)
+            ttl_ms = max(
+                1,
+                int(
+                    (request.expiresAt - request.issuedAt).total_seconds()
+                    * 1000
+                ),
             )
-        )
-        return self._result(status)
+            self._command_robots[wire_command_id] = request.robotId
+            self._command_identities[wire_command_id] = identity
+            self._active_commands.setdefault(request.robotId, set()).add(
+                wire_command_id
+            )
+            status = self.peer.submit(
+                ProtocolCommand(
+                    command_id=wire_command_id,
+                    robot_id=request.robotId,
+                    kind=request.commandKey,
+                    issued_at=request.issuedAt.astimezone(timezone.utc),
+                    ttl_ms=ttl_ms,
+                    params=request.payload,
+                    payload_hash=payload_hash,
+                )
+            )
+            return self._result_after_terminal_release(
+                status,
+                robot_id=request.robotId,
+                wire_command_id=wire_command_id,
+            )
 
     def cancel(self, command_id: str) -> AdapterResult:
-        return self._result(self.peer.cancel(self._wire_command_id(command_id)))
+        wire_command_id = self._wire_command_id(command_id)
+        with self._lease_lock:
+            terminal = self._terminal_statuses.get(wire_command_id)
+            if terminal is not None:
+                robot_id = self._command_robots.get(wire_command_id)
+                if robot_id is None:
+                    return self._result(terminal)
+                return self._result_after_terminal_release(
+                    terminal,
+                    robot_id=robot_id,
+                    wire_command_id=wire_command_id,
+                )
+            status = self.peer.cancel(wire_command_id)
+            robot_id = self._command_robots.get(wire_command_id)
+            if robot_id is None:
+                return self._result(status)
+            if status.state == "CANCELLED":
+                # The frozen cancel contract already waits for a new confirmed
+                # SAFE_HOLD truth before returning CANCELLED.
+                self._mark_terminal(robot_id, wire_command_id)
+                self._terminal_statuses[wire_command_id] = status
+                self._cancel_confirmed_commands.add(wire_command_id)
+                pending = self._terminal_unreleased.get(robot_id)
+                if pending is not None:
+                    pending.discard(wire_command_id)
+                    if not pending:
+                        self._terminal_unreleased.pop(robot_id, None)
+                if not self._active_commands.get(robot_id):
+                    self._active_robot = None
+                    self._release_pending.discard(robot_id)
+                return self._result(status)
+            return self._result_after_terminal_release(
+                status,
+                robot_id=robot_id,
+                wire_command_id=wire_command_id,
+            )
 
     def query(self, command_id: str) -> AdapterResult:
-        return self._result(self.peer.query(self._wire_command_id(command_id)))
+        wire_command_id = self._wire_command_id(command_id)
+        with self._lease_lock:
+            status = self._terminal_statuses.get(wire_command_id)
+            if status is None:
+                status = self.peer.query(wire_command_id)
+            robot_id = self._command_robots.get(wire_command_id)
+            if robot_id is None:
+                return self._result(status)
+            return self._result_after_terminal_release(
+                status,
+                robot_id=robot_id,
+                wire_command_id=wire_command_id,
+            )
+
+    @staticmethod
+    def _terminal(status: ProtocolCommandStatus) -> bool:
+        return status.state in STATUS_MAP and status.state not in {
+            "RECEIVED",
+            "RUNNING",
+        }
+
+    def _mark_terminal(self, robot_id: str, wire_command_id: str) -> None:
+        active = self._active_commands.setdefault(robot_id, set())
+        active.discard(wire_command_id)
+        if not active:
+            self._active_commands.pop(robot_id, None)
+        self._terminal_unreleased.setdefault(robot_id, set()).add(
+            wire_command_id
+        )
+
+    @staticmethod
+    def _with_control_release(
+        status: ProtocolCommandStatus,
+        truth: Mapping[str, Any],
+    ) -> AdapterResult:
+        result = RobotAgentGatewayDriver._result(status)
+        release = dict(truth)
+        payload = dict(result.result) if isinstance(result.result, Mapping) else {}
+        payload["controlRelease"] = release
+        return AdapterResult(
+            status=result.status,
+            result=payload,
+            error=result.error,
+            details={**result.details, "controlRelease": release},
+        )
+
+    def _result_after_terminal_release(
+        self,
+        status: ProtocolCommandStatus,
+        *,
+        robot_id: str,
+        wire_command_id: str,
+    ) -> AdapterResult:
+        """Expose a terminal command only after idle control is released.
+
+        A second command may share the same Robot Agent control session.  In
+        that case the first terminal must not revoke authority underneath the
+        still-active command.  The last terminal command owns the release and
+        keeps returning ``unavailable`` on any uncertain handshake so
+        ActionRuntime retains its local motion lease.
+        """
+
+        if not self._terminal(status):
+            self._active_commands.setdefault(robot_id, set()).add(
+                wire_command_id
+            )
+            return self._result(status)
+        self._terminal_statuses[wire_command_id] = status
+        if wire_command_id in self._cancel_confirmed_commands:
+            return self._result(status)
+        released = self._released_commands.get(wire_command_id)
+        if released is not None:
+            return self._with_control_release(status, released)
+        self._mark_terminal(robot_id, wire_command_id)
+        if self._active_commands.get(robot_id):
+            return self._result(status)
+        self._release_pending.add(robot_id)
+        try:
+            released = self.peer.release(
+                robot_id,
+                f"terminal command {wire_command_id} released control",
+            )
+        except Exception as exc:
+            return AdapterResult(
+                status="unavailable",
+                error=f"Robot Agent terminal control release is unconfirmed: {exc}",
+                details={"protocolState": status.state},
+            )
+        expected: dict[str, Any] = {
+            "state": "SAFE_HOLD",
+            "authorityRevoked": True,
+            "safeStopState": "confirmed",
+        }
+        if not isinstance(released, Mapping) or any(
+            released.get(key) != value for key, value in expected.items()
+        ):
+            return AdapterResult(
+                status="unavailable",
+                error="Robot Agent terminal control release returned invalid safety truth",
+                details={"protocolState": status.state},
+            )
+        epoch = released.get("safeStopEpoch")
+        if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 1:
+            return AdapterResult(
+                status="unavailable",
+                error="Robot Agent terminal control release returned invalid safe-stop epoch",
+                details={"protocolState": status.state},
+            )
+        release_truth = {**expected, "safeStopEpoch": epoch}
+        for terminal_command_id in self._terminal_unreleased.pop(
+            robot_id, set()
+        ):
+            self._released_commands[terminal_command_id] = release_truth
+        self._release_pending.discard(robot_id)
+        if self._active_robot == robot_id:
+            self._active_robot = None
+        return self._with_control_release(status, release_truth)
 
     @staticmethod
     def _wire_command_id(command_id: str) -> str:
@@ -106,6 +303,10 @@ class RobotAgentGatewayDriver:
 
     def _ensure_lease(self, robot_id: str) -> None:
         with self._lease_lock:
+            if robot_id in self._release_pending:
+                raise RuntimeError(
+                    "a prior terminal control release is not confirmed"
+                )
             if self._active_robot == robot_id:
                 self._lease_sequence += 1
                 try:

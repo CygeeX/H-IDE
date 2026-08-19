@@ -117,6 +117,9 @@ def _peer_from_env() -> RobotAgentProtocol:
         def renew(self, robot_id, sequence):
             raise RuntimeError("Robot Agent Gateway backend is not configured")
 
+        def release(self, robot_id, reason):
+            raise RuntimeError("Robot Agent Gateway backend is not configured")
+
         def submit(self, command):
             raise RuntimeError("Robot Agent Gateway backend is not configured")
 

@@ -30,6 +30,7 @@ from packages.control_core.capabilities import (
 from packages.control_core.validation import utc_now
 from packages.scene_core import Point3D, PoseMap, SceneRef
 from packages.mission_core import (
+    MissionConflict,
     MissionEnvelope,
     MissionIntervention,
     MissionNode,
@@ -1892,6 +1893,67 @@ class MissionService:
             "actions": actions,
             "stoppedBecause": record["snapshot"]["status"],
         }
+
+    def converge_supervised_missions(
+        self,
+        *,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Advance already-started physical Missions without a browser poll.
+
+        ``approved`` is deliberately excluded: the existing explicit start /
+        advance boundary remains the onset of execution.  Once a reviewed
+        Mission is READY or owns an in-flight request, this supervisor may
+        reconcile it and continue nodes covered by the same exact grant.  A
+        replan that reaches ``awaiting_review`` is never selected again until
+        a human approves its new revision.
+        """
+
+        bounded_limit = max(1, min(int(limit), 500))
+        outcomes: list[dict[str, Any]] = []
+        eligible = {
+            MissionStatus.READY,
+            MissionStatus.PLANNING,
+            MissionStatus.DISPATCHING,
+            MissionStatus.EXECUTING,
+        }
+        for record in self.runtime.list(limit=bounded_limit):
+            try:
+                status = MissionStatus(record["snapshot"]["status"])
+                revision = PlanRevision.model_validate(record["activeRevision"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if status not in eligible or not any(
+                node.skillId in _BASE_NAVIGATION_SKILLS
+                for node in revision.nodes
+            ):
+                continue
+            terminal_reconciliation_only = status in {
+                MissionStatus.DISPATCHING,
+                MissionStatus.EXECUTING,
+                MissionStatus.PLANNING,
+            }
+            try:
+                actor = self.policy.actor_from_exact_grant(
+                    record,
+                    require_current=not terminal_reconciliation_only,
+                )
+                result = self.advance(
+                    str(record["missionId"]),
+                    # One step absorbs an external terminal or evaluates one
+                    # failure without accidentally issuing fresh work under
+                    # an expired/revoked grant. READY is the only state allowed
+                    # to continue the reviewed revision in the same pass.
+                    maximum_steps=(1 if terminal_reconciliation_only else 20),
+                    actor=actor,
+                )
+            except (MissionConflict, MissionPolicyDenied):
+                # Another API/supervisor call may have won the optimistic CAS,
+                # or an exact/current grant may no longer exist. Both are safe
+                # stop conditions for this pass, never reasons to redispatch.
+                continue
+            outcomes.append(result)
+        return outcomes
 
     def respond(self, mission_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
         """Add an operator message to an existing Mission and re-evaluate it."""

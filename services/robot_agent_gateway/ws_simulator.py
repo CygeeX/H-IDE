@@ -149,6 +149,27 @@ class WebSocketProtocolSimulator:
                         "sequence": renewed["sequence"],
                         "expires_at": renewed["expiresAt"],
                     })
+                elif message["type"] == "control.release":
+                    require_payload_fields(payload, {"reason"})
+                    reason = payload["reason"]
+                    if (
+                        not isinstance(reason, str)
+                        or not reason.strip()
+                        or len(reason.strip()) > 256
+                    ):
+                        raise ValueError("control release reason is invalid")
+                    released = self.backend.release(
+                        self.backend.robot_id,
+                        reason,
+                    )
+                    self._send(websocket, "control.status", session_id, {
+                        "state": released["state"],
+                        "reason": "simulator control released",
+                        "lease_sequence": None,
+                        "authority_revoked": released["authorityRevoked"],
+                        "safe_stop_state": released["safeStopState"],
+                        "safe_stop_epoch": released["safeStopEpoch"],
+                    })
                 elif message["type"] == "command.request":
                     require_payload_fields(payload, {"command_id", "kind", "issued_at", "ttl_ms", "params"})
                     params = payload["params"]

@@ -59,6 +59,13 @@ _PROJECTED_STATE_KEYS = _OBSERVATION_STATE_KEYS | _LOCALIZATION_POSE_STATE_KEYS
 # can shorten it without widening the service configuration surface.
 _CANCEL_CONFIRMATION_TIMEOUT_SECONDS = 5.0
 
+# Normal terminal completion is not permission to retain motion authority.
+# The peer sends an explicit ``control.release`` and waits for a *new* measured
+# SAFE_HOLD boundary before the terminal command is allowed to escape to the
+# Control API.  Keep this private for the same reason as cancellation: tests
+# may shorten it, while deployments cannot silently widen the safety budget.
+_CONTROL_RELEASE_CONFIRMATION_TIMEOUT_SECONDS = 5.0
+
 
 @dataclass
 class _PendingTerminalPose:
@@ -211,6 +218,12 @@ class RobotAgentInboundPeer:
         self._control_safe_stop_state: str | None = None
         self._control_safe_stop_epoch: int | None = None
         self._control_safe_stop_truth_supported = False
+        # A release retry must compare against the epoch that preceded the
+        # *first* release request. Robot Agent deliberately keeps the same
+        # epoch for an idempotent retry after SAFE_HOLD is already confirmed.
+        self._release_baseline_revision: int | None = None
+        self._release_baseline_epoch: int | None = None
+        self._release_baseline_boot_id: str | None = None
         self._lease_sequence = -1
         self._lease_acks: dict[int, str] = {}
         self._commands: dict[str, ProtocolCommand] = {}
@@ -489,6 +502,98 @@ class RobotAgentInboundPeer:
                 expires_at = self._lease_acks.pop(current)
             return {"sequence": current, "expiresAt": expires_at}
 
+    def release(self, robot_id: str, reason: str) -> Mapping[str, Any]:
+        """Relinquish control and prove a fresh physical SAFE_HOLD boundary.
+
+        Stopping the heartbeat first prevents a concurrent renewal from
+        restoring an ACTIVE lease after ``control.release``.  Legacy peers do
+        not expose enough physical truth to acknowledge a normal release, so
+        they fail closed while the stopped heartbeat still lets their lease
+        watchdog remove authority.
+        """
+
+        if robot_id != self.robot_id:
+            raise ValueError("robot identity mismatch")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("control release reason is required")
+        detail = reason.strip()
+        if len(detail) > 256:
+            raise ValueError("control release reason is too long")
+        self._stop_heartbeat()
+        with self._condition:
+            if not self._connected:
+                raise RuntimeError("Robot Agent disconnected before control release")
+            if self._release_baseline_epoch is None:
+                if (
+                    not self._control_safe_stop_truth_supported
+                    or self._control_safe_stop_epoch is None
+                ):
+                    raise RuntimeError(
+                        "Robot Agent control release is unconfirmed: peer does not "
+                        "publish atomic safe-stop truth"
+                    )
+                self._release_baseline_revision = self._control_revision
+                self._release_baseline_epoch = self._control_safe_stop_epoch
+                self._release_baseline_boot_id = self.robot_boot_id
+            baseline_revision = self._release_baseline_revision
+            baseline_epoch = self._release_baseline_epoch
+            baseline_boot_id = self._release_baseline_boot_id
+            if self.robot_boot_id != baseline_boot_id:
+                raise RuntimeError(
+                    "Robot Agent restarted before control release was confirmed"
+                )
+        assert baseline_revision is not None
+        assert baseline_epoch is not None
+        self._send("control.release", {"reason": detail})
+        deadline = time.monotonic() + _CONTROL_RELEASE_CONFIRMATION_TIMEOUT_SECONDS
+        with self._condition:
+            while True:
+                if not self._connected:
+                    raise RuntimeError(
+                        "Robot Agent disconnected before confirmed control release"
+                    )
+                if self.robot_boot_id != baseline_boot_id:
+                    raise RuntimeError(
+                        "Robot Agent restarted before control release was confirmed"
+                    )
+                epoch = self._control_safe_stop_epoch
+                fresh = (
+                    self._control_revision > baseline_revision
+                    and epoch is not None
+                    and epoch > baseline_epoch
+                )
+                if (
+                    fresh
+                    and self._control_state == "SAFE_HOLD"
+                    and self._control_authority_revoked is True
+                    and self._control_safe_stop_state == "confirmed"
+                ):
+                    result = {
+                        "state": "SAFE_HOLD",
+                        "authorityRevoked": True,
+                        "safeStopState": "confirmed",
+                        "safeStopEpoch": epoch,
+                    }
+                    self._release_baseline_revision = None
+                    self._release_baseline_epoch = None
+                    self._release_baseline_boot_id = None
+                    return result
+                if (
+                    fresh
+                    and self._control_state == "SAFE_HOLD"
+                    and self._control_authority_revoked is True
+                    and self._control_safe_stop_state == "failed"
+                ):
+                    raise RuntimeError(
+                        "Robot Agent physical safe-stop failed during control release"
+                    )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        "timed out waiting for a new confirmed SAFE_HOLD control release"
+                    )
+                self._condition.wait(remaining)
+
     def submit(self, command: ProtocolCommand) -> ProtocolCommandStatus:
         if command.robot_id != self.robot_id:
             return ProtocolCommandStatus(command.command_id, "REJECTED", "robot identity mismatch")
@@ -564,6 +669,34 @@ class RobotAgentInboundPeer:
         with self._condition:
             status = self._statuses.get(command_id)
             if status is not None:
+                pending = self._terminal_pose_pending.get(command_id)
+                if pending is not None and status.state == "SUCCEEDED":
+                    elapsed = time.monotonic() - pending.started_monotonic
+                    if elapsed < self.terminal_pose_max_wait_seconds:
+                        return ProtocolCommandStatus(
+                            command_id=status.command_id,
+                            state="RUNNING",
+                            detail="Nav2 terminal received; final pose is settling",
+                            progress=status.progress,
+                            result=status.result,
+                        )
+                    result = dict(status.result or {})
+                    result["finalPoseRelation"] = "settlement_timeout"
+                    result["terminalSettleDurationMs"] = round(
+                        elapsed * 1000.0, 3
+                    )
+                    status = ProtocolCommandStatus(
+                        command_id=status.command_id,
+                        state=status.state,
+                        detail=status.detail,
+                        progress=status.progress,
+                        result=result,
+                    )
+                    self._statuses[command_id] = status
+                    self._terminal_pose_pending.pop(command_id, None)
+                    self._status_revisions[command_id] = (
+                        self._status_revisions.get(command_id, 0) + 1
+                    )
                 return status
         return ProtocolCommandStatus(command_id, "REJECTED", "command not found in gateway ledger")
 
@@ -671,11 +804,7 @@ class RobotAgentInboundPeer:
             }
 
     def close(self) -> None:
-        self._heartbeat_stop.set()
-        thread = self._heartbeat_thread
-        self._heartbeat_thread = None
-        if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=1)
+        self._stop_heartbeat(timeout=1.0, strict=False)
         with self._condition:
             connected = self._connected
         if connected:
@@ -1169,6 +1298,27 @@ class RobotAgentInboundPeer:
         with self._condition:
             self._heartbeat_thread = thread
         thread.start()
+
+    def _stop_heartbeat(
+        self,
+        *,
+        timeout: float = 2.5,
+        strict: bool = True,
+    ) -> None:
+        """Stop and join the lease-renewal owner before releasing authority."""
+
+        self._heartbeat_stop.set()
+        with self._condition:
+            thread = self._heartbeat_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=timeout)
+            if strict and thread.is_alive():
+                raise RuntimeError("Robot Agent lease heartbeat did not stop")
+        with self._condition:
+            if self._heartbeat_thread is thread and (
+                thread is None or not thread.is_alive()
+            ):
+                self._heartbeat_thread = None
 
     @staticmethod
     def _status(message: Mapping[str, Any]) -> ProtocolCommandStatus:

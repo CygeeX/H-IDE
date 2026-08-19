@@ -566,6 +566,112 @@ class MissionPolicy:
             expires_at=_utc(value["expiresAt"]),
         )
 
+    def actor_from_exact_grant(
+        self,
+        record: Mapping[str, Any],
+        *,
+        require_current: bool,
+    ) -> PolicyActor:
+        """Restore only the principal captured by an exact durable grant.
+
+        The background Mission supervisor is not an authentication or
+        authorization source.  It may reconstruct the already-confirmed
+        principal so an in-flight receipt can converge without a browser, but
+        it never mints or widens a grant.  ``require_current=False`` is limited
+        to terminal reconciliation, where an expired/revoked grant must not
+        strand a command whose physical outcome already exists.
+        """
+
+        try:
+            plan = MissionPlanDraft.model_validate(record["plan"])
+            revision = PlanRevision.model_validate(record["activeRevision"])
+            authorization_id = str(record["authorization"]["authorizationId"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise MissionPolicyDenied(
+                "Mission has no valid authorization identity"
+            ) from exc
+        grant = self.store.get_autonomy_grant_by_authorization(authorization_id)
+        if grant is None:
+            raise MissionPolicyDenied("Mission has no exact confirmation grant")
+        physical_scope = {
+            node.skillId for node in revision.nodes if node.skillId in _PHYSICAL_SKILLS
+        }
+        action_scope = grant.get("actionScope")
+        failed: list[str] = []
+        exact = {
+            "authorizationId": authorization_id,
+            "robotId": plan.robotId,
+            "planId": plan.planId,
+            "planRevision": revision.sequence,
+        }
+        failed.extend(
+            key for key, expected in exact.items() if grant.get(key) != expected
+        )
+        if (
+            not isinstance(action_scope, list)
+            or not physical_scope.issubset(
+                {item for item in action_scope if isinstance(item, str)}
+            )
+        ):
+            failed.append("actionScope")
+        subject_user_id = grant.get("subjectUserId")
+        subject_role = grant.get("subjectRole")
+        site_id = grant.get("siteId")
+        if not all(
+            isinstance(value, str) and value
+            for value in (subject_user_id, subject_role, site_id)
+        ):
+            failed.append("subject")
+        if failed:
+            raise MissionPolicyDenied(
+                "Mission confirmation grant is not exact: "
+                + ", ".join(sorted(set(failed)))
+            )
+        try:
+            role = Role(str(subject_role))
+        except ValueError as exc:
+            raise MissionPolicyDenied(
+                "Mission confirmation grant role is invalid"
+            ) from exc
+        is_legacy = subject_user_id == "legacy-developer"
+        if is_legacy and role is not Role.DEVELOPER:
+            raise MissionPolicyDenied("legacy confirmation grant role is invalid")
+        actor = PolicyActor(
+            user_id=str(subject_user_id),
+            role=role,
+            site_id=str(site_id),
+            is_legacy=is_legacy,
+        )
+        if not require_current:
+            # Absorbing an already-issued command result must survive a later
+            # binding or account change. No new physical work is admitted by
+            # this path; the immutable grant remains the sole identity source.
+            return actor
+        binding = self.robot_binding(plan.robotId)
+        if (
+            grant.get("executionTarget") != str(binding["executionTarget"])
+            or actor.site_id != str(binding["siteId"])
+        ):
+            raise MissionPolicyDenied(
+                "Mission confirmation grant no longer matches the robot binding"
+            )
+        if grant.get("revokedAt") is not None:
+            raise MissionPolicyDenied("Mission confirmation grant was revoked")
+        if _utc(grant["expiresAt"]) <= datetime.now(timezone.utc):
+            raise MissionPolicyDenied("Mission confirmation grant expired")
+        if not is_legacy:
+            current_user = self.store.get_user(actor.user_id)
+            if (
+                current_user is None
+                or current_user.get("status") != "active"
+                or current_user.get("role") != actor.role.value
+                or current_user.get("siteId") != actor.site_id
+            ):
+                raise MissionPolicyDenied(
+                    "confirmation principal is no longer active in the granted role/site"
+                )
+        return actor
+
     def validate_start(self, record: Mapping[str, Any], actor: PolicyActor) -> None:
         revision = PlanRevision.model_validate(record["activeRevision"])
         if not any(node.skillId in _PHYSICAL_SKILLS for node in revision.nodes):

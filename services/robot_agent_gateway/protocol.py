@@ -40,6 +40,8 @@ class RobotAgentProtocol(Protocol):
 
     def renew(self, robot_id: str, sequence: int) -> Mapping[str, Any]: ...
 
+    def release(self, robot_id: str, reason: str) -> Mapping[str, Any]: ...
+
     def submit(self, command: ProtocolCommand) -> ProtocolCommandStatus: ...
 
     def cancel(self, command_id: str) -> ProtocolCommandStatus: ...
@@ -71,6 +73,7 @@ class ProtocolSimulator:
         self.control_state = "UNARMED"
         self.lease_sequence = -1
         self.lease_expires_at: datetime | None = None
+        self.safe_stop_epoch = 0
         self.commands: dict[str, tuple[ProtocolCommand, ProtocolCommandStatus]] = {}
         self.submit_count = 0
         self._lock = threading.RLock()
@@ -104,6 +107,28 @@ class ProtocolSimulator:
         self.lease_sequence = sequence
         self.lease_expires_at = datetime.now(timezone.utc) + timedelta(seconds=2)
         return {"sequence": sequence, "expiresAt": self.lease_expires_at.isoformat()}
+
+    def release(self, robot_id: str, reason: str) -> Mapping[str, Any]:
+        if robot_id != self.robot_id:
+            raise ValueError("robot identity mismatch")
+        if (
+            not isinstance(reason, str)
+            or not reason.strip()
+            or len(reason.strip()) > 256
+        ):
+            raise ValueError("control release reason is required")
+        with self._lock:
+            if any(status.state not in TERMINAL for _, status in self.commands.values()):
+                raise ValueError("control cannot be released while a command is active")
+            self.control_state = "SAFE_HOLD"
+            self.lease_expires_at = None
+            self.safe_stop_epoch += 1
+            return {
+                "state": "SAFE_HOLD",
+                "authorityRevoked": True,
+                "safeStopState": "confirmed",
+                "safeStopEpoch": self.safe_stop_epoch,
+            }
 
     def submit(self, command: ProtocolCommand) -> ProtocolCommandStatus:
         with self._lock:

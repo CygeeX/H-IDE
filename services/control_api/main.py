@@ -47,6 +47,7 @@ from packages.control_core.models import (
     CommandReceipt,
     CommandRequest,
     CommandSource,
+    CommandStatus,
     MappingVersion,
     PlanDraft,
     RobotState,
@@ -880,6 +881,7 @@ def create_app(
     auth_token: str | None = None,
     adapters: Mapping[str | Transport, CommandAdapter] | None = None,
     watchdog_interval: float = 0.1,
+    mission_supervisor_interval: float | None = None,
     planning_client: PlanningClient | None = None,
     conversation_client: ConversationClient | None = None,
     mission_planning_client: MissionPlanningClient | None = None,
@@ -1963,13 +1965,86 @@ def create_app(
         try:
             receipt = context.runtime.reconcile(skill.requestId)
         except ValueError:
-            # MissionRuntime suspends active Missions on process restart.  A
-            # new process must not replay or pretend to own the command; keep
-            # the persisted receipt for explicit recovery instead.
+            # A restarted Control API has no in-memory ActionRuntime owner,
+            # but the independently deployed Gateway retains the immutable
+            # command ledger. Query that exact ID; never redispatch it and
+            # never convert an unproved/not-found response into a terminal.
             persisted = record.get("receipt")
+            persisted_request = record.get("request")
             if not isinstance(persisted, Mapping):
                 raise ValueError("persisted Mission command receipt is invalid")
-            return {"mode": "robot_agent", "receipt": dict(persisted)}
+            if not isinstance(persisted_request, Mapping):
+                raise ValueError("persisted Mission command request is invalid")
+            command = CommandRequest.model_validate(persisted_request)
+            if (
+                command.commandId != skill.requestId
+                or command.robotId != skill.robotId
+                or command.commandKey != skill.skillId
+                or command.transport is not Transport.ROBOT_AGENT
+            ):
+                raise ValueError("persisted Mission command identity is invalid")
+            adapter = context.adapters.get(Transport.ROBOT_AGENT.value)
+            if adapter is None:
+                return {"mode": "robot_agent", "receipt": dict(persisted)}
+            outcome = adapter.query(command.commandId)
+            outcome_status = str(outcome.status).strip().lower()
+            if outcome_status in {"unavailable", "running", "accepted", "pending"}:
+                return {"mode": "robot_agent", "receipt": dict(persisted)}
+            release = (
+                outcome.result.get("controlRelease")
+                if isinstance(outcome.result, Mapping)
+                else None
+            )
+            release_epoch = (
+                release.get("safeStopEpoch")
+                if isinstance(release, Mapping)
+                else None
+            )
+            release_confirmed = (
+                isinstance(release, Mapping)
+                and release.get("state") == "SAFE_HOLD"
+                and release.get("authorityRevoked") is True
+                and release.get("safeStopState") == "confirmed"
+                and isinstance(release_epoch, int)
+                and not isinstance(release_epoch, bool)
+                and release_epoch >= 1
+            )
+            # A Gateway restart may answer "command not found" even though
+            # the old Robot Agent outcome is unknown. Only its fresh release
+            # proof permits a recovered physical terminal to escape.
+            if not release_confirmed:
+                return {"mode": "robot_agent", "receipt": dict(persisted)}
+            terminal_status = {
+                "succeeded": CommandStatus.SUCCEEDED,
+                "success": CommandStatus.SUCCEEDED,
+                "ok": CommandStatus.SUCCEEDED,
+                "completed": CommandStatus.SUCCEEDED,
+                "failed": CommandStatus.FAILED,
+                "cancelled": CommandStatus.CANCELLED,
+                "canceled": CommandStatus.CANCELLED,
+                "expired": CommandStatus.EXPIRED,
+                "timed_out": CommandStatus.EXPIRED,
+                "timeout": CommandStatus.EXPIRED,
+                "rejected": CommandStatus.REJECTED,
+                "unknown": CommandStatus.UNKNOWN,
+            }.get(outcome_status)
+            if terminal_status is None:
+                return {"mode": "robot_agent", "receipt": dict(persisted)}
+            previous = CommandReceipt.model_validate(persisted)
+            receipt = CommandReceipt.model_validate(
+                {
+                    **previous.model_dump(mode="json", by_alias=False),
+                    "status": terminal_status,
+                    "completedAt": utc_now(),
+                    "result": outcome.result,
+                    "error": (
+                        None
+                        if terminal_status is CommandStatus.SUCCEEDED
+                        else outcome.error
+                        or f"Robot Agent command {outcome_status}"
+                    ),
+                }
+            )
         # The immutable request may legitimately be expired by the time an
         # asynchronous Robot Agent command reaches a terminal state.  It was
         # fully validated at dispatch; reconciliation must update only its
@@ -2103,24 +2178,66 @@ def create_app(
         watchdog_seconds = 0.1
     if not math.isfinite(watchdog_seconds) or watchdog_seconds <= 0:
         watchdog_seconds = 0.1
+    try:
+        supervisor_seconds = float(
+            os.getenv("MISSION_SUPERVISOR_INTERVAL_SECONDS", "1.0")
+            if mission_supervisor_interval is None
+            else mission_supervisor_interval
+        )
+    except (TypeError, ValueError, OverflowError):
+        supervisor_seconds = 1.0
+    if not math.isfinite(supervisor_seconds) or supervisor_seconds <= 0:
+        supervisor_seconds = 1.0
     watchdog_stop = threading.Event()
+    diagnostic_lock = threading.Lock()
+
+    def background_diagnostic(message: str, exc: Exception) -> None:
+        # A disconnected robot must not grow this in-memory trail without
+        # bound while the supervisor keeps retrying fail closed.
+        with diagnostic_lock:
+            context.runtime.diagnostics.append(
+                {"message": message, "error": str(exc)}
+            )
+            if len(context.runtime.diagnostics) > 200:
+                del context.runtime.diagnostics[:-200]
 
     def watchdog() -> None:
         while not watchdog_stop.wait(watchdog_seconds):
             try:
                 context.runtime.tick()
             except Exception as exc:
-                context.runtime.diagnostics.append({"message": "runtime watchdog failed", "error": str(exc)})
+                background_diagnostic("runtime watchdog failed", exc)
+
+    def mission_supervisor() -> None:
+        # Network reconciliation is intentionally isolated from the local
+        # motion-lease watchdog. A slow Gateway cannot delay lease expiry.
+        while not watchdog_stop.wait(supervisor_seconds):
+            try:
+                mission_service.converge_supervised_missions()
+            except Exception as exc:
+                background_diagnostic("Mission supervisor failed", exc)
 
     watchdog_thread = threading.Thread(target=watchdog, name="control-runtime-watchdog", daemon=True)
+    mission_supervisor_thread = threading.Thread(
+        target=mission_supervisor,
+        name="control-mission-supervisor",
+        daemon=True,
+    )
     watchdog_thread.start()
+    mission_supervisor_thread.start()
 
     def stop_watchdog() -> None:
         watchdog_stop.set()
         if threading.current_thread() is not watchdog_thread:
             watchdog_thread.join(timeout=max(0.5, watchdog_seconds * 4))
+        if threading.current_thread() is not mission_supervisor_thread:
+            mission_supervisor_thread.join(
+                timeout=min(5.0, max(0.5, supervisor_seconds * 4))
+            )
 
     app.state.stop_watchdog = stop_watchdog
+    app.state.watchdog_thread = watchdog_thread
+    app.state.mission_supervisor_thread = mission_supervisor_thread
     app.router.add_event_handler("shutdown", stop_watchdog)
     app.router.add_event_handler("shutdown", assistant_service.close)
     app.router.add_event_handler("shutdown", simulation.close)
