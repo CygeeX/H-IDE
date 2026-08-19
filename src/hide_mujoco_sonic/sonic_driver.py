@@ -2115,14 +2115,14 @@ class SonicDriver:
         if decision.action == "stop":
             # Stop/motion_enabled authority is obeyed before any values enter
             # CmdVelGuard or the SONIC model mapping.
+            if decision.state == "FAULT":
+                self._latch_terminal_fault(
+                    decision.reason or "gait adapter entered FAULT"
+                )
+                return None
             self._freeze_last_published_hold()
             self.guard.stop(source="gait_adapter")
             self._navigation_task_active = False
-            if decision.state == "FAULT":
-                self._ensure_plant_support_stopped(
-                    reason=decision.reason
-                    or f"gait adapter entered {decision.state}"
-                )
             with self._support_lock:
                 support_latched = (
                     self._plant_support_stop_pending

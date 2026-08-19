@@ -634,7 +634,7 @@ def test_driver_obeys_stop_before_model_guard_mapping() -> None:
     assert driver.guard.stops[-1] == "gait_adapter"
 
 
-def test_gait_fault_freezes_last_published_targets_and_latches_plant(
+def test_gait_fault_freezes_target_and_latches_terminal_without_recoverable_support(
     monkeypatch,
 ) -> None:
     clock = Clock()
@@ -679,10 +679,12 @@ def test_gait_fault_freezes_last_published_targets_and_latches_plant(
     )
 
     assert fault.state == "FAULT"
-    assert support_calls == ["safety_stop"]
-    assert driver._plant_support_safety_latched is True
-    assert driver.telemetry.values["plant_support_mode"] == "safety_stop"
-    assert driver.telemetry.values["nav2_state"] == "safety_stop"
+    assert support_calls == []
+    assert driver._fault_latched.is_set()
+    assert driver._terminal_fault_reason == fault.reason
+    assert driver._plant_support_safety_latched is False
+    assert driver.telemetry.values["status"] == "failed"
+    assert driver.telemetry.values["nav2_state"] == "fault_latched"
     assert driver._safe_hold_targets == published
     assert frozen and all(targets == published for targets in frozen)
 
