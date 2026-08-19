@@ -29,7 +29,7 @@ def test_safe_stop_reaches_sonic_and_engages_plant_damping() -> None:
         set_support=set_support,
     )
 
-    assert "emergency damping" in message
+    assert "emergency support" in message
     assert calls[0][0] == "command"
     assert calls[0][1][2]["type"] == "stop"
     assert calls[0][1][2]["reason"]

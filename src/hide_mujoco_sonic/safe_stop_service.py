@@ -2,8 +2,10 @@
 
 Robot Agent requires a local safe-stop endpoint during startup and whenever a
 lease expires.  A successful response means both layers have been commanded:
-SONIC intent is zeroed and the MuJoCo plant has engaged emergency velocity and
-attitude damping.  The service fails closed when either operation is rejected.
+SONIC intent is zeroed and the MuJoCo plant has engaged bounded translational
+and attitude support.  The service fails closed when either operation is
+rejected.  A separately latched motion-safety fault uses the terminal Plant
+halt endpoint and can never be reported as a successful recoverable stop.
 """
 
 from __future__ import annotations
@@ -23,7 +25,7 @@ def execute_safe_stop(
     confirm_command=request_json,
     set_support=set_plant_support,
 ) -> str:
-    """Stop SONIC intent and engage velocity-only MuJoCo emergency damping."""
+    """Stop SONIC intent and engage bounded MuJoCo emergency support."""
 
     send_command(
         config.command_host,
@@ -48,7 +50,7 @@ def execute_safe_stop(
         },
         timeout=0.5,
     )
-    return "SONIC stopped and MuJoCo emergency damping engaged"
+    return "SONIC stopped and MuJoCo emergency support engaged"
 
 
 def run(config: SimConfig) -> None:

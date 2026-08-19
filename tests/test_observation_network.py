@@ -23,7 +23,7 @@ from hide_mujoco_sonic.render_workers import RenderedFrame
 from hide_mujoco_sonic.sonic_driver import _bind_command_server
 from hide_mujoco_sonic.telemetry import TelemetryState, TelemetryStore, serve_telemetry
 from hide_mujoco_sonic.runtime_diagnostics import PlantRuntimeDiagnostics
-from hide_mujoco_sonic.transport import request_json
+from hide_mujoco_sonic.transport import latch_plant_physics_fault, request_json
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -382,5 +382,63 @@ def test_docker_plant_listener_serves_live_rgb_but_rejects_support_write() -> No
         )
         assert status == 503
         assert json.loads(body)["observationStatus"] == "stale"
+    finally:
+        store.close()
+
+
+def test_terminal_motion_fault_latches_plant_without_a_reset_path() -> None:
+    port = _dual_loopback_port()
+    support = PlantSupportController()
+    support.finish_startup()
+    store = PlantFrameStore(
+        SimpleNamespace(
+            robot_id="g1-sim",
+            localization_epoch_id="test-epoch",
+        ),
+        support=support,
+        runtime_diagnostics=PlantRuntimeDiagnostics(stall_threshold_s=0.1),
+    )
+    store.serve(
+        "127.0.0.1",
+        port,
+        docker_observation_host="127.0.0.2",
+    )
+    try:
+        reason = "gait_adapter/GAIT_ADAPTER_FAULT: start acknowledgement failed"
+        state = latch_plant_physics_fault(
+            "127.0.0.1",
+            port,
+            reason,
+            timeout=1.0,
+        )
+        assert state["mode"] == "safety_stop"
+        assert state["safetyStopLatched"] is True
+        assert state["fault"] == reason
+
+        # The Docker bridge listener is GET-only and cannot inject or clear a
+        # terminal physics fault.
+        payload = json.dumps({"reason": "replacement"}).encode("utf-8")
+        status, headers, body = _request(
+            "127.0.0.2",
+            port,
+            "POST",
+            "/support/fault",
+            payload,
+        )
+        assert status == 405
+        assert headers["Allow"] == "GET"
+        assert body == b""
+
+        # Neither ordinary support traffic nor explicit rearm can recover a
+        # physics fault; only a new Plant process can create a new state.
+        status, _headers, _body = _request(
+            "127.0.0.1",
+            port,
+            "POST",
+            "/support/rearm",
+            json.dumps({"generation": 99}).encode("utf-8"),
+        )
+        assert status == 422
+        assert support.state()["fault"] == reason
     finally:
         store.close()

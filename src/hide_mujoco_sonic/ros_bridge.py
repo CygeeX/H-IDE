@@ -40,7 +40,11 @@ from .safety import (
     RotationDirectionGuard,
     TranslationHeadingGuard,
 )
-from .transport import request_json, send_json, set_plant_support
+from .transport import (
+    latch_plant_physics_fault,
+    request_json,
+    send_json,
+)
 
 
 class RosBridgeUnavailable(RuntimeError):
@@ -256,6 +260,20 @@ def run_ros_bridge(config: SimConfig) -> None:
         def local_stop() -> None:
             errors: list[str] = []
             intent = stop_intent
+            # A motion-safety event is terminal for this Plant generation.
+            # Latch the physics fault before delivering any joint-level stop so
+            # the simulator cannot integrate a dynamically unsupported frozen
+            # pose.  Recovery is an explicit process restart; no reset or
+            # teleport path exists here.
+            try:
+                latch_plant_physics_fault(
+                    "127.0.0.1",
+                    config.plant_port,
+                    f"{source}/{code}: {bounded_reason}"[:512],
+                    timeout=0.3,
+                )
+            except Exception as exc:
+                errors.append(f"Plant terminal halt: {exc}")
             try:
                 if intent is None:
                     now = time.monotonic()
@@ -263,30 +281,6 @@ def run_ros_bridge(config: SimConfig) -> None:
                 send_intent(intent)
             except Exception as exc:
                 errors.append(f"SONIC stop delivery: {exc}")
-            try:
-                set_plant_support(
-                    "127.0.0.1",
-                    config.plant_port,
-                    "safety_stop",
-                    timeout=0.3,
-                )
-            except Exception as exc:
-                errors.append(f"Plant safety_stop: {exc}")
-            try:
-                request_json(
-                    config.command_host,
-                    config.command_port,
-                    {
-                        "type": "plant_support_state",
-                        "schema_version": "h-ide.plant-support-state/v1",
-                        "source": "navigation_guard",
-                        "mode": "safety_stop",
-                        "reason": f"{source}/{code}: {bounded_reason}",
-                    },
-                    timeout=0.5,
-                )
-            except Exception as exc:
-                errors.append(f"SONIC support latch: {exc}")
             if errors:
                 raise RuntimeError("; ".join(errors))
 

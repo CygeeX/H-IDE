@@ -191,7 +191,7 @@ def test_tilt_fall_arrest_is_continuous_across_pi_yaw() -> None:
     assert torques[0] == pytest.approx(torques[1], abs=0.01)
 
 
-def test_safety_stop_damps_velocity_without_pulling_to_origin() -> None:
+def test_safety_stop_damps_translation_without_pulling_or_yaw_feedback() -> None:
     raw = np.asarray([999.0, 999.0, 30.0, 40.0, 50.0, 999.0])
     pose = np.zeros(13)
     pose[3] = 1.0
@@ -202,4 +202,4 @@ def test_safety_stop_damps_velocity_without_pulling_to_origin() -> None:
 
     result = stabilized_support_wrench(raw, pose, "safety_stop")
 
-    assert result.tolist() == [-270.0, 360.0, 30.0, 6.0, -9.0, -40.0]
+    assert result.tolist() == [-270.0, 360.0, 30.0, 6.0, -9.0, 0.0]

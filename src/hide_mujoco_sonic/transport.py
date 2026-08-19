@@ -71,8 +71,53 @@ def set_plant_support(
         if response.status != 200:
             raise RuntimeError(f"plant support endpoint returned {response.status}")
         payload = json.loads(response.read(1024))
-    if not isinstance(payload, dict) or payload.get("mode") != mode:
+    if (
+        not isinstance(payload, dict)
+        or payload.get("mode") != mode
+        or payload.get("fault") is not None
+    ):
         raise RuntimeError("plant support endpoint did not confirm requested mode")
+    return payload
+
+
+def latch_plant_physics_fault(
+    host: str,
+    port: int,
+    reason: str,
+    *,
+    timeout: float = 0.3,
+    urlopen=request.urlopen,
+) -> dict[str, Any]:
+    """Latch a terminal Plant fault before another MuJoCo integration step.
+
+    This endpoint is reserved for an already-latched motion safety event.  It
+    never resets state or asks the support tether to stabilize a dynamic pose;
+    the authoritative Plant loop observes the fault and exits fail-closed.
+    """
+
+    detail = str(reason).strip()
+    if not detail or len(detail) > 512:
+        raise ValueError("plant physics fault reason must contain 1..512 characters")
+    body = json.dumps({"reason": detail}, separators=(",", ":")).encode("utf-8")
+    http_request = request.Request(
+        f"http://{host}:{int(port)}/support/fault",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urlopen(http_request, timeout=timeout) as response:
+        if response.status != 200:
+            raise RuntimeError(
+                f"plant physics fault endpoint returned {response.status}"
+            )
+        payload = json.loads(response.read(1024))
+    if (
+        not isinstance(payload, dict)
+        or payload.get("mode") != "safety_stop"
+        or payload.get("safetyStopLatched") is not True
+        or payload.get("fault") != detail
+    ):
+        raise RuntimeError("plant did not confirm the terminal physics fault")
     return payload
 
 

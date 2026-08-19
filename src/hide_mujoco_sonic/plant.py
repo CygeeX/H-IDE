@@ -339,11 +339,20 @@ def stabilized_support_wrench(
         wrench[5] = 0.0
     elif mode == "safety_stop":
         # Emergency braking is velocity damping, never a position target.  It
-        # cannot drive toward the map origin; it only dissipates current
-        # translation/yaw while retaining vertical and attitude fall arrest.
+        # cannot drive toward the map origin.  Only damp world X/Y here while
+        # retaining vertical and attitude fall arrest.  Applying a yaw torque
+        # directly to the tethered torso is not equivalent to actuator-space
+        # damping: an accepted 0.2 m run showed that ``-80 * wz`` creates an
+        # unbounded, numerically unstable sampled-data loop through the
+        # waist/contact dynamics.  A
+        # high-fidelity reconstructed replay left the validated envelope in
+        # 64 ms and reached BADQACC in 76 ms, while the same frozen joint
+        # targets with X/Y-only damping remained bounded for two seconds.
+        # A controlled yaw stop must therefore come from the SONIC joint
+        # controller; a terminal gait fault halts the Plant separately.
         wrench[0] = -180.0 * float(state[7])
         wrench[1] = -180.0 * float(state[8])
-        wrench[5] = -80.0 * float(state[12])
+        wrench[5] = 0.0
     elif mode == "startup":
         wrench[5] = 0.0
     else:
@@ -882,7 +891,11 @@ class PlantFrameStore:
                         self.end_headers()
                         return
                     parsed = urlparse(self.path)
-                    if parsed.path not in {"/support", "/support/rearm"}:
+                    if parsed.path not in {
+                        "/support",
+                        "/support/rearm",
+                        "/support/fault",
+                    }:
                         self.send_error(404)
                         return
                     if self.client_address[0] not in {"127.0.0.1", "::1"}:
@@ -901,12 +914,23 @@ class PlantFrameStore:
                                     "support request must contain only mode"
                                 )
                             store.support.set_mode(str(payload.get("mode", "")))
-                        else:
+                        elif parsed.path == "/support/rearm":
                             if set(payload) != {"generation"}:
                                 raise ValueError(
                                     "support rearm request must contain only generation"
                                 )
                             store.support.rearm(payload.get("generation"))
+                        else:
+                            if set(payload) != {"reason"}:
+                                raise ValueError(
+                                    "support fault request must contain only reason"
+                                )
+                            reason = str(payload.get("reason", "")).strip()
+                            if not reason or len(reason) > 512:
+                                raise ValueError(
+                                    "support fault reason must contain 1..512 characters"
+                                )
+                            store.support.latch_fault(reason)
                         body = json.dumps(
                             store.support.state(),
                             separators=(",", ":"),
@@ -1040,10 +1064,17 @@ def run_plant(config: SimConfig) -> int:
         original_band_advance = support_band.Advance
 
         def _fall_arrest_support(pose):
+            # Snapshot the mode before checking the terminal latch.  If an
+            # HTTP fault arrives between these two reads, require_healthy()
+            # aborts.  If it arrives immediately afterwards, this one in-flight
+            # step retains the previously observed support mode rather than
+            # applying a newly selected emergency wrench to a dynamic pose.
+            support_mode = support_controller.mode
+            support_controller.require_healthy()
             return stabilized_support_wrench(
                 original_band_advance(pose),
                 pose,
-                support_controller.mode,
+                support_mode,
                 tilt_kp=250.0,
                 tilt_kd=30.0,
             )
@@ -1164,6 +1195,12 @@ def run_plant(config: SimConfig) -> int:
             unix_ns=time.time_ns(),
         )
         try:
+            # A terminal motion fault is latched by the bridge before it asks
+            # SONIC to freeze any joint target.  Check it before entering the
+            # upstream step so the Plant exits instead of integrating a
+            # dynamically unsupported posture.  The support callback repeats
+            # the check at the last safe point before mj_step.
+            support_controller.require_healthy()
             result = original_sim_step()
             physics_monitor.observe()
             return result
