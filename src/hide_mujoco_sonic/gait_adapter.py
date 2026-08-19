@@ -130,9 +130,9 @@ class GaitAdapterConfig:
     stop_ack_s: float = 0.15
     stop_ack_samples: int = 2
     stop_timeout_s: float = 2.0
-    reverse_linear_mps: float = 0.04
-    reverse_angular_rps: float = 0.05
-    reverse_hold_s: float = 0.10
+    reverse_translation_m: float = 0.04
+    reverse_min_travel_m: float = 0.06
+    reverse_rotation_rad: float = 0.05
     max_tilt_rad: float = 0.55
     direction_restart_rad: float = math.radians(100.0)
     turn_preview_s: float = 0.20
@@ -154,9 +154,9 @@ class GaitAdapterConfig:
             self.stop_angular_ack_rps,
             self.stop_ack_s,
             self.stop_timeout_s,
-            self.reverse_linear_mps,
-            self.reverse_angular_rps,
-            self.reverse_hold_s,
+            self.reverse_translation_m,
+            self.reverse_min_travel_m,
+            self.reverse_rotation_rad,
             self.max_tilt_rad,
             self.direction_restart_rad,
             self.turn_preview_s,
@@ -223,7 +223,10 @@ class GaitAdapter:
         self._active_kind: GaitState | None = None
         self._active_direction: tuple[float, float] | None = None
         self._active_turn_sign = 0.0
-        self._reverse_since: float | None = None
+        self._motion_anchor: tuple[float, float, float] | None = None
+        self._expected_map_direction: tuple[float, float] | None = None
+        self._previous_yaw: float | None = None
+        self._cumulative_yaw = 0.0
 
         self._stop_started_at: float | None = None
         self._stop_terminal = GaitState.IDLE
@@ -481,7 +484,25 @@ class GaitAdapter:
         else:
             self._active_direction = None
             self._active_turn_sign = math.copysign(1.0, command.wz)
-        self._reverse_since = None
+        observation = self._observation
+        if observation is None:
+            self._motion_anchor = None
+            self._expected_map_direction = None
+            self._previous_yaw = None
+        else:
+            self._motion_anchor = (observation.x, observation.y, observation.yaw)
+            self._previous_yaw = observation.yaw
+            if self._active_direction is None:
+                self._expected_map_direction = None
+            else:
+                direction_x, direction_y = self._active_direction
+                cosine = math.cos(observation.yaw)
+                sine = math.sin(observation.yaw)
+                self._expected_map_direction = (
+                    cosine * direction_x - sine * direction_y,
+                    sine * direction_x + cosine * direction_y,
+                )
+        self._cumulative_yaw = 0.0
         self._stop_acknowledged = False
 
     def _check_start_ack(self, observation: BaseObservation) -> None:
@@ -501,28 +522,57 @@ class GaitAdapter:
                 self._start_at = None
 
     def _check_reverse_motion(self, observation: BaseObservation, now: float) -> None:
-        reverse = False
-        description = ""
-        if self._active_kind is GaitState.WALKING and self._active_direction is not None:
-            projection = (
-                observation.vx_body * self._active_direction[0]
-                + observation.vy_body * self._active_direction[1]
-            )
-            reverse = projection <= -self.config.reverse_linear_mps
-            description = f"measured translation opposes Nav2 (projection={projection:.3f}m/s)"
-        elif self._active_kind is GaitState.TURNING and self._active_turn_sign:
-            signed_rate = self._active_turn_sign * observation.wz
-            reverse = signed_rate <= -self.config.reverse_angular_rps
-            description = f"measured rotation opposes Nav2 (signed_rate={signed_rate:.3f}rad/s)"
+        """Reject cumulative opposite travel, not a humanoid gait-phase swing.
 
-        if not reverse:
-            self._reverse_since = None
+        A walking G1 periodically has negative instantaneous base velocity
+        while transferring weight between feet.  Treating that short phase as
+        reverse travel stopped a valid +X plan after only eight millimetres.
+        Direction safety therefore uses pose displacement in the map/odom
+        frame, matching the independent ROS navigation guard.  Turns likewise
+        integrate adjacent wrapped yaw samples instead of testing one angular
+        velocity sample.
+        """
+
+        anchor = self._motion_anchor
+        if (
+            self._active_kind is GaitState.WALKING
+            and anchor is not None
+            and self._expected_map_direction is not None
+        ):
+            dx = observation.x - anchor[0]
+            dy = observation.y - anchor[1]
+            travel = math.hypot(dx, dy)
+            projection = (
+                dx * self._expected_map_direction[0]
+                + dy * self._expected_map_direction[1]
+            )
+            if (
+                travel >= self.config.reverse_min_travel_m
+                and projection <= -self.config.reverse_translation_m
+            ):
+                self._trip_fault(
+                    "measured translation opposes Nav2 "
+                    f"(travel={travel:.3f}m, reverse_projection={-projection:.3f}m)",
+                    now,
+                )
             return
-        if self._reverse_since is None:
-            self._reverse_since = now
+
+        if self._active_kind is not GaitState.TURNING or not self._active_turn_sign:
             return
-        if now - self._reverse_since >= self.config.reverse_hold_s:
-            self._trip_fault(description, now)
+        if self._previous_yaw is None:
+            self._previous_yaw = observation.yaw
+            return
+        self._cumulative_yaw += self._wrap_angle(
+            observation.yaw - self._previous_yaw
+        )
+        self._previous_yaw = observation.yaw
+        signed_progress = self._active_turn_sign * self._cumulative_yaw
+        if signed_progress <= -self.config.reverse_rotation_rad:
+            self._trip_fault(
+                "measured rotation opposes Nav2 "
+                f"(reverse={-signed_progress:.3f}rad)",
+                now,
+            )
 
     def _motion_change_requires_stop(self, desired: GaitState, command: Nav2Twist) -> bool:
         if self._active_kind is None or desired is not self._active_kind:
@@ -555,7 +605,10 @@ class GaitAdapter:
         self._active_kind = None
         self._active_direction = None
         self._active_turn_sign = 0.0
-        self._reverse_since = None
+        self._motion_anchor = None
+        self._expected_map_direction = None
+        self._previous_yaw = None
+        self._cumulative_yaw = 0.0
         self._stop_started_at = None
         if terminal is GaitState.IDLE:
             self.reason = None
@@ -615,7 +668,10 @@ class GaitAdapter:
         self._active_kind = None
         self._active_direction = None
         self._active_turn_sign = 0.0
-        self._reverse_since = None
+        self._motion_anchor = None
+        self._expected_map_direction = None
+        self._previous_yaw = None
+        self._cumulative_yaw = 0.0
         self._stop_started_at = None
         self._stop_terminal = GaitState.IDLE
         self._reset_stop_ack()
@@ -759,6 +815,10 @@ class GaitAdapter:
             return all(math.isfinite(float(value)) for value in values)
         except (TypeError, ValueError):
             return False
+
+    @staticmethod
+    def _wrap_angle(value: float) -> float:
+        return (float(value) + math.pi) % (2.0 * math.pi) - math.pi
 
 
 __all__ = [

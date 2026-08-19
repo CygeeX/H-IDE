@@ -35,14 +35,17 @@ def observation(
     vx: float = 0.0,
     vy: float = 0.0,
     wz: float = 0.0,
+    x: float = 0.0,
+    y: float = 0.0,
+    yaw: float = 0.0,
     roll: float = 0.0,
 ) -> BaseObservation:
     return BaseObservation(
         generation=generation,
         timestamp_s=clock.value,
-        x=0.0,
-        y=0.0,
-        yaw=0.0,
+        x=x,
+        y=y,
+        yaw=yaw,
         roll=roll,
         pitch=0.0,
         vx_body=vx,
@@ -70,7 +73,6 @@ def runtime(clock: Clock, *, generation: int = 1):
         max_angular_rps=0.25,
         linear_deadband_mps=0.10,
         angular_deadband_rps=0.05,
-        reverse_hold_s=0.05,
     )
     adapter = GaitAdapter(config, clock=clock)
     ingress = SonicIntentIngress(clock=clock, max_age_s=0.50)
@@ -192,11 +194,11 @@ def test_replay_terminal_events_never_reach_model_motion(terminal: str) -> None:
     elif terminal == "reverse":
         clock.value += 0.01
         adapter.ingest_observation(
-            observation(clock, vx=-0.08), now=clock.value
+            observation(clock, vx=-0.08, x=-0.02), now=clock.value
         )
         clock.value += 0.06
         intent = adapter.ingest_observation(
-            observation(clock, vx=-0.08), now=clock.value
+            observation(clock, vx=-0.08, x=-0.07), now=clock.value
         )
     else:
         clock.value += 0.01
@@ -322,7 +324,12 @@ def bare_driver(clock: Clock) -> SonicDriver:
     driver._plant_support_stop_pending = False
     driver._plant_support_safety_latched = False
     driver._plant_support_stop_generation = None
-    driver._joint_handoff = SimpleNamespace(reset=lambda: None)
+    driver._last_published_targets = tuple(0.0 for _ in range(29))
+    driver._safe_hold_targets = None
+    driver._joint_handoff = SimpleNamespace(
+        reset=lambda: None,
+        freeze=lambda _targets: None,
+    )
     driver._arm_guard = SimpleNamespace(reset=lambda: None)
     return driver
 
@@ -345,6 +352,62 @@ def test_driver_obeys_stop_before_model_guard_mapping() -> None:
     driver.accept_json(payload)
     assert driver.guard.accepted == [(0.20, 0.0, 0.0, "nav2")]
     assert driver.guard.stops[-1] == "gait_adapter"
+
+
+def test_gait_fault_freezes_last_published_targets_and_latches_plant(
+    monkeypatch,
+) -> None:
+    clock = Clock()
+    adapter, _ = runtime(clock)
+    driver = bare_driver(clock)
+    published = tuple(0.01 * index for index in range(29))
+    frozen: list[tuple[float, ...]] = []
+    driver._last_published_targets = published
+    driver._joint_handoff = SimpleNamespace(
+        freeze=lambda targets: frozen.append(tuple(targets)),
+    )
+    support_calls: list[str] = []
+
+    def confirm_support(_host, _port, mode, **_kwargs):
+        support_calls.append(mode)
+        return {"mode": mode}
+
+    monkeypatch.setattr(
+        "hide_mujoco_sonic.sonic_driver.set_plant_support",
+        confirm_support,
+    )
+    driver.accept_json(
+        _intent_payload(adapter.tick(now=clock.value), measured_heading_yaw=0.0)
+    )
+    clock.value += 0.01
+    driver.accept_json(
+        _intent_payload(
+            adapter.ingest_twist(twist(clock, vx=0.20), now=clock.value),
+            measured_heading_yaw=0.0,
+        )
+    )
+    clock.value += 0.01
+    adapter.ingest_observation(
+        observation(clock, vx=0.06, x=0.01),
+        now=clock.value,
+    )
+    clock.value += 0.01
+    fault = adapter.ingest_observation(
+        observation(clock, vx=-0.10, x=-0.07),
+        now=clock.value,
+    )
+
+    driver.accept_json(
+        _intent_payload(fault, measured_heading_yaw=0.0)
+    )
+
+    assert fault.state == "FAULT"
+    assert support_calls == ["safety_stop"]
+    assert driver._plant_support_safety_latched is True
+    assert driver.telemetry.values["plant_support_mode"] == "safety_stop"
+    assert driver.telemetry.values["nav2_state"] == "safety_stop"
+    assert driver._safe_hold_targets == published
+    assert frozen and all(targets == published for targets in frozen)
 
 
 def test_driver_requires_startup_qualification_before_accepting_motion() -> None:
@@ -760,7 +823,8 @@ def test_driver_rejects_raw_cmd_vel_and_fails_closed() -> None:
             }
         )
     assert driver.guard.accepted == []
-    assert driver.guard.stops[-1] == "invalid_gait_intent"
+    assert "invalid_gait_intent" in driver.guard.stops
+    assert driver.guard.stops[-1] == "plant_safety_stop_unconfirmed"
 
 
 def test_driver_tick_rollback_is_terminal_and_never_resyncs() -> None:

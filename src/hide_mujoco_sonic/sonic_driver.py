@@ -340,6 +340,8 @@ class SonicDriver:
         self._plant_support_stop_pending = False
         self._plant_support_safety_latched = False
         self._plant_support_stop_generation: int | None = None
+        self._last_published_targets: tuple[float, ...] | None = None
+        self._safe_hold_targets: tuple[float, ...] | None = None
         self._support_lock = threading.RLock()
 
         # These imports are intentionally lazy: `check` and safety tests must
@@ -791,17 +793,50 @@ class SonicDriver:
             )
         return complete
 
-    def _publish_measured_hold(self, lowstate) -> None:
+    def _publish_position_hold(
+        self,
+        targets: tuple[float, ...],
+    ) -> None:
+        if len(targets) != 29 or not all(
+            math.isfinite(float(value)) for value in targets
+        ):
+            raise ValueError("position hold requires 29 finite joint targets")
         for index in range(29):
             motor = self._msg.motor_cmd[index]
             motor.mode = 1
             motor.kp = float(self._kp[index])
             motor.kd = float(self._kd[index])
-            motor.q = float(lowstate.motor_state[index].q)
+            motor.q = float(targets[index])
             motor.dq = 0.0
             motor.tau = 0.0
         self._msg.crc = self._crc.Crc(self._msg)
         self._publisher.Write(self._msg)
+        with self._support_lock:
+            self._last_published_targets = tuple(float(value) for value in targets)
+
+    def _publish_measured_hold(self, lowstate) -> None:
+        self._publish_position_hold(
+            tuple(float(lowstate.motor_state[index].q) for index in range(29))
+        )
+
+    def _freeze_last_published_hold(self) -> bool:
+        """Keep the actuator boundary continuous across a stop transition."""
+
+        with self._support_lock:
+            targets = self._last_published_targets
+            if targets is None:
+                return False
+            self._safe_hold_targets = targets
+            self._joint_handoff.freeze(targets)
+            return True
+
+    def _publish_frozen_hold(self, lowstate) -> None:
+        with self._support_lock:
+            targets = self._safe_hold_targets or self._last_published_targets
+        if targets is None:
+            self._publish_measured_hold(lowstate)
+            return
+        self._publish_position_hold(targets)
 
     def _latch_terminal_fault(self, reason: str) -> None:
         """Latch a non-recoverable process fault without rebuilding state."""
@@ -809,6 +844,7 @@ class SonicDriver:
         if self._fault_latched.is_set():
             return
         self._terminal_fault_reason = str(reason)
+        self._freeze_last_published_hold()
         self.guard.stop(source="terminal_fault")
         self._navigation_task_active = False
         self._startup_qualifying = False
@@ -870,6 +906,7 @@ class SonicDriver:
         an old ``/cmd_vel``, or a bridge reconnect cannot clear the latch.
         """
 
+        self._freeze_last_published_hold()
         with self._support_lock:
             stopped_generation = self._intent_ingress.latch_support_stop()
             self._plant_support_mode = "safety_stop"
@@ -878,7 +915,6 @@ class SonicDriver:
             self._plant_support_stop_generation = stopped_generation
         self.guard.stop(source="plant_safety_stop")
         self._navigation_task_active = False
-        self._joint_handoff.reset()
         self._arm_guard.reset()
         self.telemetry.update(
             nav2_state="safety_stop",
@@ -907,6 +943,7 @@ class SonicDriver:
         reports the Plant as unavailable rather than guessing its state.
         """
 
+        self._freeze_last_published_hold()
         try:
             state = set_plant_support(
                 "127.0.0.1",
@@ -925,7 +962,6 @@ class SonicDriver:
                 self._plant_support_stop_generation = stopped_generation
             self.guard.stop(source="plant_safety_stop_unconfirmed")
             self._navigation_task_active = False
-            self._joint_handoff.reset()
             self._arm_guard.reset()
             self.telemetry.update(
                 nav2_state="safety_stop",
@@ -998,7 +1034,6 @@ class SonicDriver:
             self._plant_support_stop_pending = False
             self._plant_support_safety_latched = False
             self._plant_support_stop_generation = None
-        self._joint_handoff.reset()
         self._arm_guard.reset()
         self.telemetry.update(
             nav2_state="idle",
@@ -1276,6 +1311,8 @@ class SonicDriver:
             motor.tau = 0.0
         self._msg.crc = self._crc.Crc(self._msg)
         self._publisher.Write(self._msg)
+        with self._support_lock:
+            self._last_published_targets = published_targets
         nonzero = any(abs(float(self._msg.motor_cmd[i].q)) > 1e-4 for i in range(29))
         # Legs and waist are the locomotion plant.  Tracking their commanded
         # joint references separately from the arms tells an operator whether
@@ -1395,7 +1432,7 @@ class SonicDriver:
                     lowstate = self._lowstate
                 try:
                     if lowstate is not None:
-                        self._publish_measured_hold(lowstate)
+                        self._publish_frozen_hold(lowstate)
                 finally:
                     self._stop.set()
                 break
@@ -1438,12 +1475,17 @@ class SonicDriver:
                     float(lowstate.motor_state[index].q) for index in range(29)
                 )
                 policy_targets = self._action_targets(policy_action, lowstate)
-                decision = self._joint_handoff.decide(
-                    motion_active=intent.mode != "IDLE",
-                    measured=measured,
-                    policy=policy_targets,
-                    now=control_step.tick_ms / 1_000.0,
-                )
+                # The command thread may freeze the exact last-published
+                # targets while this 50 Hz thread is preparing a stop.  Use
+                # the support lock as the single serialization boundary so a
+                # measured re-anchor cannot race that stronger hold.
+                with self._support_lock:
+                    decision = self._joint_handoff.decide(
+                        motion_active=intent.mode != "IDLE",
+                        measured=measured,
+                        policy=policy_targets,
+                        now=control_step.tick_ms / 1_000.0,
+                    )
                 if decision.static_hold_active:
                     desired_support_mode = "idle"
                 elif intent.mode != "IDLE" and decision.handoff_ratio > 0.0:
@@ -1467,10 +1509,9 @@ class SonicDriver:
                         # force a process restart.
                         self.guard.stop(source="plant_safety_stop")
                         self._navigation_task_active = False
-                        self._joint_handoff.reset()
                         self._arm_guard.reset()
                         self._static_hold_active = True
-                        self._publish_measured_hold(lowstate)
+                        self._publish_frozen_hold(lowstate)
                         self.telemetry.update(
                             nav2_state="safety_stop",
                             navigation_task_active=False,
@@ -1515,7 +1556,7 @@ class SonicDriver:
             except Exception as exc:
                 self._latch_terminal_fault(f"SONIC runtime fault: {exc}")
                 try:
-                    self._publish_measured_hold(lowstate)
+                    self._publish_frozen_hold(lowstate)
                 finally:
                     self._stop.set()
                 break
@@ -1564,6 +1605,7 @@ class SonicDriver:
                 "stopped_generation": stopped_generation,
             }
         if self._fault_latched.is_set():
+            self._freeze_last_published_hold()
             self.guard.stop(source="terminal_fault")
             if payload.get("control_arm") or payload.get("request_id"):
                 raise RuntimeError(
@@ -1571,6 +1613,7 @@ class SonicDriver:
                 )
             return None
         if payload.get("type") == "stop":
+            self._freeze_last_published_hold()
             self.guard.stop(source="bridge_stop")
             self._navigation_task_active = False
             reason = payload.get("reason")
@@ -1582,7 +1625,6 @@ class SonicDriver:
                 support_pending = self._plant_support_stop_pending
                 confirmed_mode = self._plant_support_mode or "unknown"
             if support_pending:
-                self._joint_handoff.reset()
                 self._arm_guard.reset()
             self.telemetry.update(
                 nav2_state=(
@@ -1609,8 +1651,12 @@ class SonicDriver:
             with self._support_lock:
                 decision = self._intent_ingress.accept(payload)
         except (KeyError, TypeError, ValueError) as exc:
+            self._freeze_last_published_hold()
             self.guard.stop(source="invalid_gait_intent")
             self._navigation_task_active = False
+            self._ensure_plant_support_stopped(
+                reason=f"invalid gait intent: {exc}"
+            )
             self.telemetry.update(
                 nav2_state="safety_stop",
                 navigation_task_active=False,
@@ -1641,8 +1687,14 @@ class SonicDriver:
         if decision.action == "stop":
             # Stop/motion_enabled authority is obeyed before any values enter
             # CmdVelGuard or the SONIC model mapping.
+            self._freeze_last_published_hold()
             self.guard.stop(source="gait_adapter")
             self._navigation_task_active = False
+            if decision.state == "FAULT":
+                self._ensure_plant_support_stopped(
+                    reason=decision.reason
+                    or f"gait adapter entered {decision.state}"
+                )
             with self._support_lock:
                 support_latched = (
                     self._plant_support_stop_pending
@@ -1699,6 +1751,8 @@ class SonicDriver:
             self.telemetry.reset_navigation_task_peaks()
             self._navigation_task_active = True
             self.telemetry.update(navigation_task_active=True)
+        with self._support_lock:
+            self._safe_hold_targets = None
         self.guard.accept(decision.vx, decision.vy, decision.wz, source="nav2")
         self.telemetry.update(
             nav2_state="commanding",

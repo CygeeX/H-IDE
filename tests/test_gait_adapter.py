@@ -20,15 +20,18 @@ def observation(
     vx: float = 0.0,
     vy: float = 0.0,
     wz: float = 0.0,
+    x: float = 0.0,
+    y: float = 0.0,
+    yaw: float = 0.0,
     roll: float = 0.0,
     pitch: float = 0.0,
 ) -> BaseObservation:
     return BaseObservation(
         generation=generation,
         timestamp_s=timestamp,
-        x=0.0,
-        y=0.0,
-        yaw=0.0,
+        x=x,
+        y=y,
+        yaw=yaw,
         roll=roll,
         pitch=pitch,
         vx_body=vx,
@@ -248,25 +251,42 @@ def test_idle_stale_after_prior_motion_still_requires_new_generation() -> None:
     assert "newer generation" in (rejected.reason or "")
 
 
-def test_sustained_measured_reverse_translation_latches_fault() -> None:
-    config = GaitAdapterConfig(reverse_hold_s=0.05)
-    adapter = armed_adapter(config=config)
+def test_humanoid_gait_phase_reverse_velocity_does_not_latch_fault() -> None:
+    adapter = armed_adapter()
     adapter.ingest_twist(twist(10.02, vx=0.2), now=10.02)
     adapter.ingest_observation(observation(10.03, vx=0.06), now=10.03)
-    assert adapter.ingest_observation(observation(10.04, vx=-0.08), now=10.04).state == "WALKING"
-    fault = adapter.ingest_observation(observation(10.10, vx=-0.08), now=10.10)
+    # A G1 briefly rocks backward while loading the next foot.  Eight
+    # millimetres of opposite displacement must not be treated as reversed
+    # navigation merely because instantaneous base velocity is negative.
+    transient = adapter.ingest_observation(
+        observation(10.10, vx=-0.10, x=-0.008),
+        now=10.10,
+    )
+    assert transient.state == "WALKING"
+
+
+def test_cumulative_measured_reverse_translation_latches_fault() -> None:
+    adapter = armed_adapter()
+    adapter.ingest_twist(twist(10.02, vx=0.2), now=10.02)
+    adapter.ingest_observation(observation(10.03, vx=0.06, x=0.01), now=10.03)
+    fault = adapter.ingest_observation(
+        observation(10.10, vx=-0.08, x=-0.07),
+        now=10.10,
+    )
     assert fault.state == "FAULT"
     assert fault.velocity_x_mps == 0.0
     assert "opposes Nav2" in (fault.reason or "")
 
 
 def test_sustained_measured_reverse_turn_latches_fault() -> None:
-    config = GaitAdapterConfig(reverse_hold_s=0.05)
-    adapter = armed_adapter(config=config)
+    adapter = armed_adapter()
     adapter.ingest_twist(twist(10.02, wz=0.3), now=10.02)
-    adapter.ingest_observation(observation(10.03, wz=0.06), now=10.03)
-    adapter.ingest_observation(observation(10.04, wz=-0.08), now=10.04)
-    fault = adapter.ingest_observation(observation(10.10, wz=-0.08), now=10.10)
+    adapter.ingest_observation(observation(10.03, wz=0.06, yaw=0.01), now=10.03)
+    adapter.ingest_observation(observation(10.04, wz=-0.08, yaw=-0.02), now=10.04)
+    fault = adapter.ingest_observation(
+        observation(10.10, wz=-0.08, yaw=-0.06),
+        now=10.10,
+    )
     assert fault.state == "FAULT"
     assert "rotation opposes Nav2" in (fault.reason or "")
 

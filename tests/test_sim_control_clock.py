@@ -60,6 +60,10 @@ def _bare_driver(
     driver._terminal_fault_reason = None
     driver._navigation_task_active = False
     driver._stop = threading.Event()
+    driver._support_lock = threading.RLock()
+    driver._last_published_targets = None
+    driver._safe_hold_targets = None
+    driver._joint_handoff = SimpleNamespace(freeze=lambda _targets: None)
     return driver
 
 

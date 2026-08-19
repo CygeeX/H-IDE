@@ -321,6 +321,26 @@ def test_static_joint_handoff_holds_idle_then_blends_policy():
     assert held.targets == pytest.approx((2.8, 3.8))
 
 
+def test_static_joint_handoff_freezes_published_preload_without_reanchoring():
+    handoff = StaticJointHandoff(joint_count=2)
+    # These are actuator targets, not measured angles.  Their small error from
+    # measured position represents the PD preload balancing gravity.
+    handoff.freeze([1.10, 1.90])
+
+    stopped = handoff.decide(
+        motion_active=False,
+        measured=[1.00, 2.00],
+        policy=[9.0, 9.0],
+    )
+    assert stopped.targets == pytest.approx((1.10, 1.90))
+    held = handoff.decide(
+        motion_active=False,
+        measured=[0.95, 2.05],
+        policy=[9.0, 9.0],
+    )
+    assert held.targets == pytest.approx((1.10, 1.90))
+
+
 def test_cmd_vel_is_bounded_and_converted_to_slow_walk():
     now = [100.0]
     guard = CmdVelGuard(max_linear_mps=0.25, max_angular_rps=0.5, timeout_s=0.25, clock=lambda: now[0], smoothing_alpha=1.0)

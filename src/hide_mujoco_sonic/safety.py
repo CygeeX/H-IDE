@@ -750,6 +750,20 @@ class StaticJointHandoff:
         self._motion_started_at = None
         self._active = False
 
+    def freeze(self, targets: Sequence[float]) -> None:
+        """Freeze an already-published actuator target without re-anchoring.
+
+        A physical stop must be target-continuous.  Replacing the last
+        published target with the current measured position removes the small
+        PD error that supplies gravity-balancing torque and can destabilize a
+        standing humanoid.  Callers therefore pass the exact last target that
+        crossed the actuator boundary.
+        """
+
+        self._hold = self._validate(targets, "frozen")
+        self._motion_started_at = None
+        self._active = False
+
     def _validate(self, values: Sequence[float], label: str) -> tuple[float, ...]:
         result = tuple(float(value) for value in values)
         if len(result) != self.joint_count:
