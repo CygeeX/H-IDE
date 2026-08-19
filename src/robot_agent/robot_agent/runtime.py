@@ -599,7 +599,10 @@ class RobotAgentRuntime:
                 raise SessionStateError(
                     "control.release requires zero active or pending commands"
                 )
-            reason = f"remote control released: {message.payload.reason}"
+            # The peer reason is already bounded by the wire schema, but the
+            # local provenance prefix must not make the outbound
+            # ControlStatusPayload exceed its own 256-character contract.
+            reason = f"remote control released: {message.payload.reason}"[:256]
             await self._revoke_authority_for_safe_stop(reason)
             try:
                 await self._session.ensure_safe_hold(reason, refresh=False)

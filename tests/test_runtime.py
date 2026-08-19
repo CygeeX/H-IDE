@@ -436,6 +436,37 @@ async def test_control_release_failure_stays_revoked_and_cannot_rearm(
 
 
 @pytest.mark.asyncio
+async def test_control_release_maximum_reason_keeps_status_wire_valid(
+    tmp_path: Path,
+) -> None:
+    ros = FakeRosAdapter()
+    runtime = RobotAgentRuntime(runtime_config(tmp_path), ros_adapter=ros)
+    await runtime.initialize()
+    session_id = uuid4()
+    await runtime._session.connected(session_id)
+    acquire = parse_wire_message(
+        inbound("control.acquire", session_id, {"operator_id": "operator-7"}),
+        expected_robot_id="g1-dev",
+    )
+    release = parse_wire_message(
+        inbound("control.release", session_id, {"reason": "r" * 256}),
+        expected_robot_id="g1-dev",
+    )
+    await runtime._route_message(acquire, session_id)
+    runtime._connection_session_id = session_id
+    runtime._outbound = PriorityOutboundQueue(maxsize=32)
+
+    await runtime._route_message(release, session_id)
+
+    assert len(runtime._session.snapshot.reason) == 256
+    while runtime._outbound.qsize:
+        item = (await runtime._outbound.get()).payload
+        if getattr(item, "type", None) == "control.status":
+            assert len(item.payload.reason) <= 256
+    await runtime.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_failed_control_arm_relatches_stop_and_keeps_safe_hold(
     tmp_path: Path,
 ) -> None:
