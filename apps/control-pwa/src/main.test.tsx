@@ -18,6 +18,42 @@ vi.mock("./audio", () => ({
   },
 }));
 
+vi.mock("./streaming-speech", () => ({
+  speechWebSocketUrl: () => "ws://localhost/api/v2/speech/stream",
+  BrowserStreamingSpeechSession: class {
+    private callbacks: {
+      onPhase?: (phase: string) => void;
+      onPartial?: (event: { text: string }) => void;
+      onFinal?: (event: { text: string; utteranceId: string }) => void;
+      onMetrics?: (metrics: { framesSent: number; audioMsSent: number }) => void;
+    };
+    constructor(options: { callbacks?: {
+      onPhase?: (phase: string) => void;
+      onPartial?: (event: { text: string }) => void;
+      onFinal?: (event: { text: string; utteranceId: string }) => void;
+      onMetrics?: (metrics: { framesSent: number; audioMsSent: number }) => void;
+    } }) {
+      this.callbacks = options.callbacks ?? {};
+    }
+    async start() {
+      this.callbacks.onPhase?.("listening");
+      this.callbacks.onMetrics?.({ framesSent: 5, audioMsSent: 200 });
+      this.callbacks.onPartial?.({ text: "临时识别文本" });
+    }
+    async finish() {
+      this.callbacks.onFinal?.({ text: "语音要求机器人向前移动", utteranceId: "utterance-ui" });
+      this.callbacks.onPhase?.("closed");
+    }
+    async cancel() { this.callbacks.onPhase?.("closed"); }
+  },
+  StreamingPcmPlayer: class {
+    async unlock() { return undefined; }
+    async speak() { return undefined; }
+    stop() { return undefined; }
+    async close() { return undefined; }
+  },
+}));
+
 const authHeaders = { "content-type": "application/json" };
 let draftExpiresAt = "2099-01-01T00:00:00Z";
 let confirmConflict = false;
@@ -250,6 +286,7 @@ describe("control console", () => {
       const url = String(input);
       if (url.endsWith("/api/v1/auth/me")) {
         return Promise.resolve(response({
+          csrfToken: "csrf-ui",
           principal: {
             userId: "developer-ui",
             username: "developer-ui",
@@ -672,6 +709,8 @@ describe("control console", () => {
     render(<App />);
     await screen.findAllByText("robot-1");
     fireEvent.click(screen.getByRole("button", { name: "开始语音输入" }));
+    expect(await screen.findByText("临时识别文本")).toBeInTheDocument();
+    expect(screen.getByLabelText("任务描述")).toHaveValue("");
     fireEvent.click(await screen.findByRole("button", { name: "停止录音并发送" }));
 
     expect((await screen.findAllByText("语音要求机器人向前移动")).length).toBeGreaterThanOrEqual(1);
@@ -679,7 +718,20 @@ describe("control console", () => {
     expect(screen.getByLabelText("任务描述")).toHaveValue("");
     expect(await screen.findByRole("region", { name: "Mission V2 计划审核" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "按住确认并执行" })).not.toBeDisabled();
+    expect(vi.mocked(fetch).mock.calls.some(([input]) => String(input).includes("/speech/transcriptions"))).toBe(false);
     expect(vi.mocked(fetch).mock.calls.some(([input]) => String(input).endsWith("/api/v2/missions/drafts/mission-ui/approve"))).toBe(false);
+  });
+
+  it("uses complete-WAV Whisper only after the developer explicitly enables the fallback", async () => {
+    render(<App />);
+    await screen.findAllByText("robot-1");
+    fireEvent.click(screen.getByRole("button", { name: "打开工具" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: /离线 WAV 转写降级/ }));
+    fireEvent.click(screen.getByRole("button", { name: "开始语音输入" }));
+    fireEvent.click(await screen.findByRole("button", { name: "停止录音并发送" }));
+
+    await waitFor(() => expect(vi.mocked(fetch).mock.calls.some(([input]) =>
+      String(input).includes("/speech/transcriptions"))).toBe(true));
   });
 
   it("restores a durable Mission V2 from history after page reload", async () => {

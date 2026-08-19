@@ -21,6 +21,13 @@ import type {
 } from "./contracts";
 import { isAssistantTurnTerminal, isTerminal, isVisualMissionPlan, statusLabel } from "./contracts";
 import { BrowserWavRecorder } from "./audio";
+import {
+  BrowserStreamingSpeechSession,
+  speechWebSocketUrl,
+  StreamingPcmPlayer,
+  type StreamingSpeechMetrics,
+  type StreamingSpeechPhase,
+} from "./streaming-speech";
 import type { ActiveSceneContext } from "./scene-workspace";
 import { VisualMissionCard } from "./visual-mission-card";
 import { SimulationWorkspace } from "./simulation-workspace";
@@ -33,6 +40,12 @@ import "./app.css";
 import "./chat-shell.css";
 
 type ConnectionState = "connecting" | "live" | "offline";
+type VoiceCaptureMode = "streaming" | "offline_wav";
+interface VoiceUiState {
+  phase: StreamingSpeechPhase;
+  partial: string;
+  metrics: StreamingSpeechMetrics;
+}
 type AppRoute =
   | { kind: "chat"; shell: "user" | "developer"; conversationId?: string }
   | { kind: "simulation"; shell: "developer" }
@@ -72,6 +85,10 @@ function cookieValue(name: string): string {
 
 function setCsrfToken(value: string | undefined): void {
   inMemoryCsrfToken = value?.trim() ?? "";
+}
+
+function csrfToken(): string {
+  return inMemoryCsrfToken || cookieValue("hide_csrf");
 }
 
 export function apiErrorDetail(body: unknown, fallback: string): string {
@@ -142,6 +159,28 @@ async function apiFetchBlob(path: string): Promise<Blob> {
   return blob;
 }
 
+async function fetchSpeechReply(text: string, signal: AbortSignal): Promise<Response> {
+  const headers = new Headers({
+    accept: "application/octet-stream",
+    "content-type": "application/json",
+  });
+  if (API_TOKEN) headers.set("authorization", `Bearer ${API_TOKEN}`);
+  else if (csrfToken()) headers.set("x-csrf-token", csrfToken());
+  const response = await fetch(apiUrl("/api/v2/speech/tts"), {
+    method: "POST",
+    headers,
+    credentials: "include",
+    body: JSON.stringify({ text, locale: "zh-CN" }),
+    signal,
+  });
+  if (!response.ok) {
+    let detail = response.statusText;
+    try { detail = apiErrorDetail(await response.json(), detail); } catch { /* Binary errors may be empty. */ }
+    throw new ApiFailure(detail || `语音回复请求失败 (${response.status})`, response.status);
+  }
+  return response;
+}
+
 function makeId(prefix: string): string {
   const random = typeof crypto !== "undefined" && "randomUUID" in crypto
     ? crypto.randomUUID()
@@ -171,6 +210,13 @@ function friendlyError(error: unknown): string {
       return "计划已过期，未发送任何机器人命令。请根据原任务重新规划后再审核。";
     }
     return error.message;
+  }
+  if (error instanceof DOMException) {
+    if (error.name === "NotAllowedError" || error.name === "SecurityError") {
+      return "麦克风权限被拒绝；请在浏览器站点设置中允许 H-IDE 使用麦克风";
+    }
+    if (error.name === "NotFoundError") return "没有检测到可用麦克风";
+    if (error.name === "NotReadableError") return "麦克风正被其他应用占用，暂时无法录音";
   }
   if (error instanceof Error) return error.message;
   return "请求失败，请检查工作站连接";
@@ -385,6 +431,23 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
   const [transcriptionId, setTranscriptionId] = useState<string | null>(null);
   const [recording, setRecording] = useState(false);
   const [voiceBusy, setVoiceBusy] = useState(false);
+  const [voiceCaptureMode, setVoiceCaptureMode] = useState<VoiceCaptureMode>(() => {
+    try {
+      return window.localStorage.getItem("h-ide-offline-wav-fallback") === "true"
+        ? "offline_wav"
+        : "streaming";
+    } catch {
+      return "streaming";
+    }
+  });
+  const [voiceReplyEnabled, setVoiceReplyEnabled] = useState(() => {
+    try { return window.localStorage.getItem("h-ide-voice-replies") === "true"; } catch { return false; }
+  });
+  const [voiceUi, setVoiceUi] = useState<VoiceUiState>({
+    phase: "idle",
+    partial: "",
+    metrics: { framesSent: 0, audioMsSent: 0 },
+  });
   const [reviewFeedback, setReviewFeedback] = useState("");
   const [draft, setDraft] = useState<AssistantDraft | null>(null);
   const [missionDraft, setMissionDraft] = useState<MissionDraftRecordV2 | null>(null);
@@ -420,6 +483,11 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
   const reconnectTimer = useRef<number | undefined>(undefined);
   const socketRef = useRef<WebSocket | null>(null);
   const recorderRef = useRef<BrowserWavRecorder | null>(null);
+  const streamingSpeechRef = useRef<BrowserStreamingSpeechSession | null>(null);
+  const speechPlayerRef = useRef<StreamingPcmPlayer | null>(null);
+  const voiceReplyEnabledRef = useRef(voiceReplyEnabled);
+  voiceReplyEnabledRef.current = voiceReplyEnabled;
+  const finalTranscriptRef = useRef(new Set<string>());
   const restoredConversationRef = useRef(false);
   const restoredMissionRef = useRef(false);
   const assistantConversationRef = useRef<AssistantConversation | null>(assistantConversation);
@@ -650,7 +718,28 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
   useEffect(() => () => {
     void recorderRef.current?.cancel();
     recorderRef.current = null;
+    void streamingSpeechRef.current?.cancel();
+    streamingSpeechRef.current = null;
+    void speechPlayerRef.current?.close();
+    speechPlayerRef.current = null;
   }, []);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        "h-ide-offline-wav-fallback",
+        String(voiceCaptureMode === "offline_wav"),
+      );
+    } catch {
+      // Local preferences are optional in private browsing.
+    }
+  }, [voiceCaptureMode]);
+
+  useEffect(() => {
+    try { window.localStorage.setItem("h-ide-voice-replies", String(voiceReplyEnabled)); } catch {
+      // Local preferences are optional in private browsing.
+    }
+  }, [voiceReplyEnabled]);
 
   useEffect(() => {
     let disposed = false;
@@ -830,6 +919,20 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
     throw new Error("Agent 规划超时，可取消后重新提交");
   }, [refreshConversation]);
 
+  const speakAssistantReply = useCallback((text: string | undefined) => {
+    const reply = text?.trim();
+    if (!reply || !voiceReplyEnabledRef.current) return;
+    const player = speechPlayerRef.current ?? new StreamingPcmPlayer();
+    speechPlayerRef.current = player;
+    void player.speak(reply, fetchSpeechReply, {
+      onFirstByte: (milliseconds) => setVoiceUi((current) => ({
+        ...current,
+        metrics: { ...current.metrics, ttsFirstByteMs: milliseconds },
+      })),
+      onError: (message) => setError(`语音回复未播放：${message}`),
+    });
+  }, []);
+
   const sendAssistantMessage = useCallback(async (
     rawText: string,
     modality: "text" | "voice" = "text",
@@ -888,13 +991,14 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
       setAssistantConversations((current) => current.map((item) => item.conversationId === conversation.conversationId
         ? { ...item, status: "planning", updatedAt: new Date().toISOString() }
         : item));
-      await monitorAssistantTurn(accepted.taskId, conversation.robotId);
+      const terminal = await monitorAssistantTurn(accepted.taskId, conversation.robotId);
+      speakAssistantReply(terminal.result?.assistantMessage);
     } catch (reason) {
       setError(friendlyError(reason));
     } finally {
       setAssistantBusy(false);
     }
-  }, [assistantBusy, connection, ensureAssistantConversation, monitorAssistantTurn, selectedRobotId]);
+  }, [assistantBusy, connection, ensureAssistantConversation, monitorAssistantTurn, selectedRobotId, speakAssistantReply]);
 
   const advanceMission = useCallback(async (missionId: string) => {
     const advanced = await apiFetch<MissionAdvanceResultV2>(
@@ -924,8 +1028,9 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
         createdAt: new Date().toISOString(),
       },
     ]);
+    speakAssistantReply(message);
     return advanced;
-  }, []);
+  }, [speakAssistantReply]);
 
   const sendMissionMessage = useCallback(async (
     rawText: string,
@@ -979,24 +1084,26 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
         response.mission,
         ...current.filter((item) => item.missionId !== response.mission.missionId),
       ]);
+      const reply = response.decision?.kind === "replan"
+        ? "已结合你的补充生成持续任务修订；请审核变化后继续。"
+        : response.decision?.reason ?? "已记录补充信息，等待人工处理。";
       setMissionMessages((current) => [
         ...current,
         {
           messageId: makeId("mission-message"),
           role: "assistant",
-          content: response.decision?.kind === "replan"
-            ? "已结合你的补充生成持续任务修订；请审核变化后继续。"
-            : response.decision?.reason ?? "已记录补充信息，等待人工处理。",
+          content: reply,
           modality: "text",
           createdAt: new Date().toISOString(),
         },
       ]);
+      speakAssistantReply(reply);
     } catch (reason) {
       setError(friendlyError(reason));
     } finally {
       setAssistantBusy(false);
     }
-  }, [assistantBusy, connection, missionRecord, sendAssistantMessage]);
+  }, [assistantBusy, connection, missionRecord, sendAssistantMessage, speakAssistantReply]);
 
   const submitAssistantMessage = useCallback((event: FormEvent) => {
     event.preventDefault();
@@ -1423,20 +1530,100 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
           setError("工作站当前离线，语音任务不会录制后排队发送。");
           return;
         }
+        // Barge-in is deterministic: microphone intent cancels every queued
+        // or playing TTS source before requesting capture permission.
+        speechPlayerRef.current?.stop();
+        setVoiceUi((current) => ({ ...current, partial: "" }));
+        setVoiceBusy(true);
         try {
-          const recorder = new BrowserWavRecorder();
-          await recorder.start();
-          recorderRef.current = recorder;
+          if (voiceCaptureMode === "offline_wav") {
+            const recorder = new BrowserWavRecorder();
+            await recorder.start();
+            recorderRef.current = recorder;
+            setVoiceUi((current) => ({ ...current, phase: "listening" }));
+            setRecording(true);
+            setVoiceBusy(false);
+            setNotice("离线 WAV 降级已启用；再次点击后批量转写并发送");
+            return;
+          }
+          if (API_TOKEN) {
+            throw new Error("浏览器流式语音要求 Cookie 登录；Bearer 工程模式只能显式使用离线 WAV 降级");
+          }
+          const csrf = csrfToken();
+          if (!csrf) throw new Error("语音会话缺少 CSRF 凭证，请重新登录 H-IDE");
+          const sessionKey = `speech-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+          let session: BrowserStreamingSpeechSession;
+          session = new BrowserStreamingSpeechSession({
+            url: speechWebSocketUrl(API_BASE),
+            csrfToken: csrf,
+            locale: "zh-CN",
+            callbacks: {
+              onPhase: (phase) => {
+                setVoiceUi((current) => ({ ...current, phase }));
+                if (["closed", "error"].includes(phase)) setRecording(false);
+              },
+              onPartial: ({ text }) => {
+                // Partial text is intentionally ephemeral. It never mutates
+                // the composer and therefore cannot be edited into, or sent
+                // around, the ConversationGateway / PlanDraft boundary.
+                setVoiceUi((current) => ({ ...current, partial: text }));
+              },
+              onFinal: ({ text, utteranceId }) => {
+                const finalKey = `${sessionKey}:${utteranceId || text}`;
+                if (finalTranscriptRef.current.has(finalKey)) return;
+                finalTranscriptRef.current.add(finalKey);
+                setRecording(false);
+                setVoiceBusy(true);
+                setVoiceUi((current) => ({ ...current, phase: "finalizing", partial: text }));
+                setNotice("语音已识别并直接发送给 H-IDE；机器人行动仍受 PlanDraft 审核约束");
+                void session.finish().catch((reason) => setError(friendlyError(reason)));
+                void (missionRecord?.snapshot.status === "needs_input"
+                  ? sendMissionMessage(text, "voice", null)
+                  : sendAssistantMessage(text, "voice", null))
+                  .finally(() => {
+                    setVoiceBusy(false);
+                    setVoiceUi((current) => ({ ...current, partial: "" }));
+                  });
+              },
+              onMetrics: (metrics) => setVoiceUi((current) => ({ ...current, metrics })),
+              onError: (message) => {
+                setError(message);
+                setRecording(false);
+                setVoiceBusy(false);
+              },
+            },
+          });
+          streamingSpeechRef.current = session;
+          await session.start();
           setRecording(true);
-          setNotice("正在录音；再次点击后将转写内容直接发送给调度 Agent");
+          setVoiceBusy(false);
+          setNotice("正在流式聆听；识别结果会直接发送，不会写入文本框");
         } catch (reason) {
+          await streamingSpeechRef.current?.cancel().catch(() => undefined);
+          streamingSpeechRef.current = null;
+          setVoiceUi((current) => ({ ...current, phase: "error", partial: "" }));
+          setVoiceBusy(false);
           setError(friendlyError(reason));
         }
         return;
       }
+
       setVoiceBusy(true);
       setRecording(false);
       try {
+        if (voiceCaptureMode === "streaming") {
+          const session = streamingSpeechRef.current;
+          if (!session) throw new Error("流式语音会话已经关闭");
+          const finalsBefore = finalTranscriptRef.current.size;
+          await session.finish();
+          streamingSpeechRef.current = null;
+          if (finalTranscriptRef.current.size === finalsBefore) {
+            setNotice("这次没有识别到有效语音，请靠近麦克风后重试");
+            setVoiceUi((current) => ({ ...current, partial: "" }));
+          }
+          return;
+        }
+
         const wav = await recorderRef.current?.stop();
         recorderRef.current = null;
         if (!wav) throw new Error("没有可转写的录音");
@@ -1447,7 +1634,7 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
           method: "POST",
           body: form,
         });
-        setNotice("语音已转写并发送；任何真机动作仍需审核 PlanDraft");
+        setNotice("离线语音已批量转写并发送；任何机器人动作仍受 PlanDraft 约束");
         if (missionRecord?.snapshot.status === "needs_input") {
           await sendMissionMessage(transcript.text, "voice", transcript.transcriptionId);
         } else {
@@ -1456,12 +1643,55 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
       } catch (reason) {
         await recorderRef.current?.cancel();
         recorderRef.current = null;
+        await streamingSpeechRef.current?.cancel().catch(() => undefined);
+        streamingSpeechRef.current = null;
         setError(friendlyError(reason));
       } finally {
         setVoiceBusy(false);
       }
     })();
-  }, [connection, missionRecord?.snapshot.status, recording, sendAssistantMessage, sendMissionMessage]);
+  }, [
+    connection,
+    missionRecord?.snapshot.status,
+    recording,
+    sendAssistantMessage,
+    sendMissionMessage,
+    voiceCaptureMode,
+  ]);
+
+  const toggleVoiceReplies = useCallback(() => {
+    void (async () => {
+      if (voiceReplyEnabled) {
+        speechPlayerRef.current?.stop();
+        setVoiceReplyEnabled(false);
+        setNotice("语音回复已关闭");
+        return;
+      }
+      try {
+        const player = speechPlayerRef.current ?? new StreamingPcmPlayer();
+        speechPlayerRef.current = player;
+        await player.unlock();
+        setVoiceReplyEnabled(true);
+        setNotice("语音回复已开启；开始说话会立即打断播放");
+      } catch (reason) {
+        setError(`无法开启语音回复：${friendlyError(reason)}`);
+      }
+    })();
+  }, [voiceReplyEnabled]);
+
+  const toggleOfflineVoiceFallback = useCallback((enabled: boolean) => {
+    void recorderRef.current?.cancel();
+    recorderRef.current = null;
+    void streamingSpeechRef.current?.cancel();
+    streamingSpeechRef.current = null;
+    setRecording(false);
+    setVoiceBusy(false);
+    setVoiceUi((current) => ({ ...current, phase: "idle", partial: "" }));
+    setVoiceCaptureMode(enabled ? "offline_wav" : "streaming");
+    setNotice(enabled
+      ? "已显式启用离线 WAV 批量转写；它不是默认语音链路"
+      : "已恢复 AudioWorklet 流式语音");
+  }, []);
 
   const createMapping = useCallback((event: FormEvent) => {
     event.preventDefault();
@@ -1717,9 +1947,13 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
         busy={assistantBusy}
         voiceBusy={voiceBusy}
         recording={recording}
+        voiceUi={voiceUi}
+        voiceCaptureMode={voiceCaptureMode}
+        voiceReplyEnabled={voiceReplyEnabled}
         connection={connection}
         onSubmit={submitAssistantMessage}
         onVoice={toggleVoiceRecording}
+        onToggleVoiceReplies={toggleVoiceReplies}
         onCancelPlanning={cancelAssistantTurn}
         onConfirm={confirmDraft}
         onConfirmMission={confirmMissionDraft}
@@ -1776,7 +2010,9 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
 
       {developerMode && toolMenuOpen ? <ToolMenu
         advancedMode={advancedMode}
+        offlineVoiceFallback={voiceCaptureMode === "offline_wav"}
         onAdvancedModeChange={setAdvancedMode}
+        onOfflineVoiceFallbackChange={toggleOfflineVoiceFallback}
         onClose={() => setToolMenuOpen(false)}
         onControl={() => { setToolMenuOpen(false); setControlPanelOpen(true); }}
         onSimulation={() => { setToolMenuOpen(false); navigate("/developer/simulation"); }}
@@ -1823,7 +2059,7 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
 type IconName =
   | "logo" | "plus" | "history" | "tools" | "robot" | "map" | "stop"
   | "close" | "warning" | "check" | "mic" | "send" | "attach" | "control"
-  | "interface" | "refresh" | "back" | "spark" | "chevron" | "activity";
+  | "interface" | "refresh" | "back" | "spark" | "chevron" | "activity" | "volume";
 
 function Icon({ name }: { name: IconName }) {
   const common = { fill: "none", stroke: "currentColor", strokeWidth: 1.8, strokeLinecap: "round" as const, strokeLinejoin: "round" as const };
@@ -1848,6 +2084,7 @@ function Icon({ name }: { name: IconName }) {
     spark: <><path d="m12 3 1.2 4.3L17 9l-3.8 1.7L12 15l-1.2-4.3L7 9l3.8-1.7z" /><path d="m18.5 14 .6 2.1L21 17l-1.9.9-.6 2.1-.6-2.1L16 17l1.9-.9z" /></>,
     chevron: <path d="m9 6 6 6-6 6" />,
     activity: <><path d="M3 12h4l2-6 4 12 2-6h6" /></>,
+    volume: <><path d="M4 10v4h4l5 4V6l-5 4z" /><path d="M16 9a4 4 0 0 1 0 6M18.5 6.5a8 8 0 0 1 0 11" /></>,
   };
   return <svg className="app-icon" viewBox="0 0 24 24" aria-hidden="true" {...common}>{paths[name]}</svg>;
 }
@@ -1969,7 +2206,9 @@ function WorkspacePage({ title, subtitle, onBack, children }: { title: string; s
 
 function ToolMenu({
   advancedMode,
+  offlineVoiceFallback,
   onAdvancedModeChange,
+  onOfflineVoiceFallbackChange,
   onClose,
   onControl,
   onSimulation,
@@ -1978,7 +2217,9 @@ function ToolMenu({
   onRefresh,
 }: {
   advancedMode: boolean;
+  offlineVoiceFallback: boolean;
   onAdvancedModeChange: (value: boolean) => void;
+  onOfflineVoiceFallbackChange: (value: boolean) => void;
   onClose: () => void;
   onControl: () => void;
   onSimulation: () => void;
@@ -1993,6 +2234,7 @@ function ToolMenu({
     <button type="button" onClick={onHistory}><span className="tool-icon"><Icon name="history" /></span><span><strong>任务历史</strong><small>恢复规划、审核和执行记录</small></span><Icon name="chevron" /></button>
     <button type="button" onClick={onRefresh}><span className="tool-icon"><Icon name="refresh" /></span><span><strong>刷新状态</strong><small>重新读取机器人与接口快照</small></span><Icon name="chevron" /></button>
     <div className="tool-separator" />
+    <label className="advanced-toggle"><span><strong>离线 WAV 转写降级</strong><small>显式启用批量 Whisper；默认使用低延迟流式语音</small></span><input type="checkbox" checked={offlineVoiceFallback} onChange={(event) => onOfflineVoiceFallbackChange(event.target.checked)} /><i /></label>
     <label className="advanced-toggle"><span><strong>工程模式</strong><small>显示接口与调试工具</small></span><input type="checkbox" checked={advancedMode} onChange={(event) => onAdvancedModeChange(event.target.checked)} /><i /></label>
     {advancedMode ? <button type="button" onClick={onInterfaces}><span className="tool-icon"><Icon name="interface" /></span><span><strong>接口中心</strong><small>映射版本、探测与回滚</small></span><Icon name="chevron" /></button> : null}
   </aside></>;
@@ -2133,9 +2375,13 @@ function ChatWorkspace({
   busy,
   voiceBusy,
   recording,
+  voiceUi,
+  voiceCaptureMode,
+  voiceReplyEnabled,
   connection,
   onSubmit,
   onVoice,
+  onToggleVoiceReplies,
   onCancelPlanning,
   onConfirm,
   onConfirmMission,
@@ -2172,9 +2418,13 @@ function ChatWorkspace({
   busy: boolean;
   voiceBusy: boolean;
   recording: boolean;
+  voiceUi: VoiceUiState;
+  voiceCaptureMode: VoiceCaptureMode;
+  voiceReplyEnabled: boolean;
   connection: ConnectionState;
   onSubmit: (event: FormEvent) => void;
   onVoice: () => void;
+  onToggleVoiceReplies: () => void;
   onCancelPlanning: () => void;
   onConfirm: () => void;
   onConfirmMission: () => void;
@@ -2274,9 +2524,11 @@ function ChatWorkspace({
     <div className="composer-region">
       {activeTurn ? <div className="active-task-dock"><span className="planning-pulse" /><span>H-IDE 正在理解并回复</span><button type="button" onClick={onCancelPlanning}>取消</button></div> : busy ? <div className="active-task-dock"><span className="planning-pulse" /><span>正在准备或推进机器人任务</span></div> : null}
       <form className="chat-composer" onSubmit={onSubmit}>
-        <div className="composer-contexts">{developerMode ? <span><Icon name="robot" />{robot?.name ?? robot?.robotId ?? "未选择机器人"}</span> : <label className="user-robot-picker"><Icon name="robot" /><select aria-label="对话机器人" value={robot?.robotId ?? ""} onChange={(event) => onRobotChange(event.target.value)}>{robots.map((item, index) => <option key={item.robotId} value={item.robotId}>{item.name ?? `机器人 ${index + 1}`}</option>)}</select></label>}{developerMode ? <span className={`composer-health ${robot?.connected ? "connected" : "offline"}`}>{robot?.connected ? "代理在线" : "代理离线"}</span> : null}</div>
-        <textarea id="assistant-task" aria-label="任务描述" value={text} onChange={(event) => setText(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} rows={1} maxLength={4000} placeholder={connection === "live" ? "描述任务，或按住麦克风说话…" : "工作站离线，任务草稿不会发送"} disabled={connection !== "live"} />
-        <div className="composer-actions"><div><button className={`composer-icon-button voice-button ${recording ? "recording" : ""}`} type="button" onClick={onVoice} disabled={voiceBusy || busy || connection !== "live"} aria-label={recording ? "停止录音并发送" : "开始语音输入"}><Icon name="mic" /></button><span className="composer-hint">{recording ? "正在聆听，再次点击发送" : voiceBusy ? "正在识别并发送…" : "Enter 发送 · Shift+Enter 换行"}</span></div><button className="send-button" type="submit" disabled={busy || !text.trim() || connection !== "live"} aria-label="发送给 H-IDE"><Icon name="send" /></button></div>
+        <div className="composer-contexts">{developerMode ? <span><Icon name="robot" />{robot?.name ?? robot?.robotId ?? "未选择机器人"}</span> : <label className="user-robot-picker"><Icon name="robot" /><select aria-label="对话机器人" value={robot?.robotId ?? ""} onChange={(event) => onRobotChange(event.target.value)}>{robots.map((item, index) => <option key={item.robotId} value={item.robotId}>{item.name ?? `机器人 ${index + 1}`}</option>)}</select></label>}{developerMode ? <span className={`composer-health ${robot?.connected ? "connected" : "offline"}`}>{robot?.connected ? "代理在线" : "代理离线"}</span> : null}<button className={voiceReplyEnabled ? "attached" : ""} type="button" onClick={onToggleVoiceReplies} aria-label={voiceReplyEnabled ? "关闭语音回复" : "开启语音回复"}><Icon name="volume" />{voiceReplyEnabled ? "语音回复开" : "语音回复关"}</button>{developerMode ? <span>{voiceCaptureMode === "streaming" ? "流式 ASR" : "离线 WAV 降级"}</span> : null}</div>
+        <textarea id="assistant-task" aria-label="任务描述" value={text} onChange={(event) => setText(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} rows={1} maxLength={4000} placeholder={connection === "live" ? "描述任务，或点击麦克风说话…" : "工作站离线，任务草稿不会发送"} disabled={connection !== "live"} />
+        {voiceUi.partial ? <div className="voice-live-transcript" role="status" aria-live="polite"><span className="voice-wave" /> <b>{voiceUi.phase === "finalizing" ? "已识别" : "正在听"}</b><span>{voiceUi.partial}</span></div> : null}
+        <div className="composer-actions"><div><button className={`composer-icon-button voice-button ${recording ? "recording" : ""}`} type="button" onClick={onVoice} disabled={voiceBusy || busy || connection !== "live"} aria-label={recording ? "停止录音并发送" : "开始语音输入"}><Icon name="mic" /></button><span className="composer-hint">{recording ? (voiceCaptureMode === "streaming" ? "流式聆听中，再次点击结束" : "离线录音中，再次点击批量转写") : voiceBusy ? "正在识别并发送…" : "Enter 发送 · Shift+Enter 换行"}</span></div><button className="send-button" type="submit" disabled={busy || !text.trim() || connection !== "live"} aria-label="发送给 H-IDE"><Icon name="send" /></button></div>
+        {developerMode ? <details className="speech-metrics"><summary>语音链路指标</summary><span>状态 {voiceUi.phase}</span><span>首个 partial {voiceUi.metrics.firstPartialMs === undefined ? "—" : `${Math.round(voiceUi.metrics.firstPartialMs)} ms`}</span><span>停说→final {voiceUi.metrics.endToFinalMs === undefined ? "—" : `${Math.round(voiceUi.metrics.endToFinalMs)} ms`}</span><span>TTS 首包 {voiceUi.metrics.ttsFirstByteMs === undefined ? "—" : `${Math.round(voiceUi.metrics.ttsFirstByteMs)} ms`}</span><span>{voiceUi.metrics.framesSent} 帧 · {voiceUi.metrics.audioMsSent} ms 音频</span></details> : null}
       </form>
       <p className="composer-disclaimer">聊天和问答不会控制机器人；行动计划会在获得相应授权后执行。</p>
     </div>
@@ -2648,9 +2900,9 @@ function AssistantView({
               type="button"
               onClick={onVoice}
               disabled={voiceBusy || busy}
-              aria-label={recording ? "停止录音并转写" : "开始语音输入"}
+              aria-label={recording ? "停止流式语音" : "开始语音输入"}
             >
-              <span className="input-mode-icon">◉</span><strong>{recording ? "停止并转写" : "语音助手"}</strong><small>{voiceBusy ? "正在转写…" : "本地 Whisper · WAV"}</small>
+              <span className="input-mode-icon">◉</span><strong>{recording ? "停止流式语音" : "语音助手"}</strong><small>{voiceBusy ? "正在发送…" : "AudioWorklet · 流式 ASR"}</small>
             </button>
           </div>
           <div className={`scene-context-chip ${activeSceneContext ? "attached" : ""}`}>
