@@ -20,6 +20,7 @@ from .protocol import TERMINAL, ProtocolCommand, ProtocolCommandStatus
 from .wire import (
     SUBPROTOCOL,
     build_message,
+    parse_control_status_payload,
     parse_message,
     parse_timestamp,
     require_payload_fields,
@@ -206,6 +207,10 @@ class RobotAgentInboundPeer:
         self._control_state = "SAFE_HOLD"
         self._control_reason = "Robot Agent is not connected"
         self._control_revision = 0
+        self._control_authority_revoked: bool | None = None
+        self._control_safe_stop_state: str | None = None
+        self._control_safe_stop_epoch: int | None = None
+        self._control_safe_stop_truth_supported = False
         self._lease_sequence = -1
         self._lease_acks: dict[int, str] = {}
         self._commands: dict[str, ProtocolCommand] = {}
@@ -368,6 +373,10 @@ class RobotAgentInboundPeer:
                 self.capability_manifest = capability_manifest
                 self._control_state = "SAFE_HOLD"
                 self._control_reason = "new session requires explicit control.acquire"
+                self._control_authority_revoked = None
+                self._control_safe_stop_state = None
+                self._control_safe_stop_epoch = None
+                self._control_safe_stop_truth_supported = False
                 self._last_error = None
                 self._projected_state = {}
                 self._state_sequence = -1
@@ -566,6 +575,11 @@ class RobotAgentInboundPeer:
             if current.state in TERMINAL:
                 return current
             control_revision = self._control_revision
+            safe_stop_epoch = (
+                self._control_safe_stop_epoch
+                if self._control_safe_stop_truth_supported
+                else None
+            )
         try:
             self._send(
                 "command.cancel",
@@ -599,14 +613,36 @@ class RobotAgentInboundPeer:
                     if (
                         self._control_revision > control_revision
                         and self._control_state == "SAFE_HOLD"
+                        and safe_stop_epoch is not None
+                        and self._control_safe_stop_truth_supported
+                        and self._control_authority_revoked is True
+                        and self._control_safe_stop_state == "confirmed"
+                        and self._control_safe_stop_epoch is not None
+                        and self._control_safe_stop_epoch > safe_stop_epoch
                     ):
                         return status
+                    if (
+                        self._control_revision > control_revision
+                        and self._control_state == "SAFE_HOLD"
+                        and safe_stop_epoch is not None
+                        and self._control_safe_stop_truth_supported
+                        and self._control_authority_revoked is True
+                        and self._control_safe_stop_state == "failed"
+                        and self._control_safe_stop_epoch is not None
+                        and self._control_safe_stop_epoch > safe_stop_epoch
+                    ):
+                        return ProtocolCommandStatus(
+                            command_id,
+                            "ABORTED_AGENT_RESTART",
+                            "cancellation outcome is unknown: Robot Agent physical "
+                            "safe-stop confirmation failed",
+                        )
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     if status.state == "CANCELLED":
                         detail = (
                             "cancellation outcome is unknown: CANCELLED was received "
-                            "without a new SAFE_HOLD confirmation"
+                            "without a new confirmed SAFE_HOLD safety truth"
                         )
                     else:
                         detail = (
@@ -627,6 +663,9 @@ class RobotAgentInboundPeer:
                 "robotId": self.robot_id,
                 "robotBootId": self.robot_boot_id,
                 "controlState": self._control_state,
+                "authorityRevoked": self._control_authority_revoked,
+                "safeStopState": self._control_safe_stop_state,
+                "safeStopEpoch": self._control_safe_stop_epoch,
                 "lastError": self._last_error,
                 "observation": self._observation_snapshot_locked(),
             }
@@ -652,10 +691,7 @@ class RobotAgentInboundPeer:
         payload = message["payload"]
         with self._condition:
             if message_type == "control.status":
-                require_payload_fields(payload, {"state", "reason", "lease_sequence"})
-                self._control_state = str(payload["state"])
-                self._control_reason = str(payload["reason"])
-                self._control_revision += 1
+                self._record_control_status_locked(payload)
             elif message_type == "lease.status":
                 require_payload_fields(payload, {"sequence", "expires_at"})
                 self._lease_acks[int(payload["sequence"])] = str(payload["expires_at"])
@@ -717,6 +753,30 @@ class RobotAgentInboundPeer:
             # Safety and telemetry envelopes remain accepted without being
             # projected into the command path.
             self._condition.notify_all()
+
+    def _record_control_status_locked(self, payload: Mapping[str, Any]) -> None:
+        status = parse_control_status_payload(payload)
+        if (
+            self._control_safe_stop_truth_supported
+            and not status.has_safe_stop_truth
+        ):
+            raise ValueError(
+                "control.status omitted safety truth after it was provided"
+            )
+        if status.has_safe_stop_truth:
+            assert status.safe_stop_epoch is not None
+            if (
+                self._control_safe_stop_epoch is not None
+                and status.safe_stop_epoch < self._control_safe_stop_epoch
+            ):
+                raise ValueError("control.status safe_stop_epoch decreased")
+            self._control_safe_stop_truth_supported = True
+        self._control_state = status.state
+        self._control_reason = status.reason
+        self._control_authority_revoked = status.authority_revoked
+        self._control_safe_stop_state = status.safe_stop_state
+        self._control_safe_stop_epoch = status.safe_stop_epoch
+        self._control_revision += 1
 
     def _record_state_locked(
         self,
@@ -1039,6 +1099,10 @@ class RobotAgentInboundPeer:
         self._connected = False
         self._control_state = "SAFE_HOLD"
         self._control_reason = reason
+        self._control_authority_revoked = None
+        self._control_safe_stop_state = None
+        self._control_safe_stop_epoch = None
+        self._control_safe_stop_truth_supported = False
         self._loop = None
         self._websocket = None
         self._async_send_lock = None

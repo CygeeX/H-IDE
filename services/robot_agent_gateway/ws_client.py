@@ -16,7 +16,14 @@ from websockets.sync.client import ClientConnection, connect
 
 from .capability_handshake import validate_optional_capability_handshake
 from .protocol import ProtocolCommand, ProtocolCommandStatus
-from .wire import SUBPROTOCOL, build_message, parse_message, require_payload_fields
+from .wire import (
+    SUBPROTOCOL,
+    ControlStatusPayload,
+    build_message,
+    parse_control_status_payload,
+    parse_message,
+    require_payload_fields,
+)
 
 
 class RobotAgentWebSocketPeer:
@@ -70,6 +77,8 @@ class RobotAgentWebSocketPeer:
         self._socket: ClientConnection | None = None
         self._io_lock = threading.RLock()
         self._lease_sequence = 0
+        self._control_safe_stop_truth_supported = False
+        self._control_safe_stop_epoch: int | None = None
         self._commands: dict[str, ProtocolCommand] = {}
         self._statuses: dict[str, ProtocolCommandStatus] = {}
         self._heartbeat_stop = threading.Event()
@@ -104,13 +113,14 @@ class RobotAgentWebSocketPeer:
             deadline = time.monotonic() + 5
             while True:
                 message = self._receive("control.status", deadline=deadline)
-                payload = message["payload"]
-                require_payload_fields(payload, {"state", "reason", "lease_sequence"})
-                if payload["state"] == "ACTIVE":
-                    self._lease_sequence = int(payload["lease_sequence"])
+                status = self._record_control_status(message["payload"])
+                if status.state == "ACTIVE":
+                    self._lease_sequence = int(status.lease_sequence or 0)
                     break
-                if payload["state"] != "SAFE_HOLD":
-                    raise RuntimeError(f"Robot Agent control is not active: {payload['reason']}")
+                if status.state != "SAFE_HOLD":
+                    raise RuntimeError(
+                        f"Robot Agent control is not active: {status.reason}"
+                    )
         self._start_heartbeat()
         return {"state": "ACTIVE", "leaseSequence": self._lease_sequence}
 
@@ -224,6 +234,8 @@ class RobotAgentWebSocketPeer:
                 finally:
                     socket.close()
             self.session_id = None
+            self._control_safe_stop_truth_supported = False
+            self._control_safe_stop_epoch = None
 
     def _ensure_connected(self) -> None:
         with self._io_lock:
@@ -296,7 +308,32 @@ class RobotAgentWebSocketPeer:
             self.capability_manifest = (
                 capability_handshake.capability_manifest.model_dump(mode="json")
             )
+        self._control_safe_stop_truth_supported = False
+        self._control_safe_stop_epoch = None
         self._heartbeat_stop.clear()
+
+    def _record_control_status(
+        self,
+        payload: Mapping[str, Any],
+    ) -> ControlStatusPayload:
+        status = parse_control_status_payload(payload)
+        if (
+            self._control_safe_stop_truth_supported
+            and not status.has_safe_stop_truth
+        ):
+            raise ValueError(
+                "control.status omitted safety truth after it was provided"
+            )
+        if status.has_safe_stop_truth:
+            assert status.safe_stop_epoch is not None
+            if (
+                self._control_safe_stop_epoch is not None
+                and status.safe_stop_epoch < self._control_safe_stop_epoch
+            ):
+                raise ValueError("control.status safe_stop_epoch decreased")
+            self._control_safe_stop_truth_supported = True
+            self._control_safe_stop_epoch = status.safe_stop_epoch
+        return status
 
     def _send(self, message_type: str, payload: Mapping[str, Any]) -> None:
         if self._socket is None or self.session_id is None:

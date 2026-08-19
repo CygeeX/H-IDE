@@ -7,6 +7,7 @@ import time
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
+import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
@@ -22,7 +23,13 @@ from packages.control_core.capabilities import (
 from services.robot_agent_gateway import ws_inbound
 from services.robot_agent_gateway.main import create_app
 from services.robot_agent_gateway.protocol import ProtocolCommand, ProtocolCommandStatus
-from services.robot_agent_gateway.wire import SUBPROTOCOL, build_message, parse_message
+from services.robot_agent_gateway.wire import (
+    SUBPROTOCOL,
+    WireProtocolError,
+    build_message,
+    parse_control_status_payload,
+    parse_message,
+)
 from services.robot_agent_gateway.ws_inbound import RobotAgentInboundPeer
 
 CAPABILITIES = ("navigation.navigate_to_pose", "command.cancel", "command.query")
@@ -211,6 +218,7 @@ def _cancel_test_peer(
     monkeypatch,
     *,
     timeout_seconds: float,
+    safety_truth: bool = True,
 ) -> tuple[RobotAgentInboundPeer, str, threading.Event]:
     monkeypatch.setattr(
         ws_inbound,
@@ -230,6 +238,10 @@ def _cancel_test_peer(
         peer._connected = True
         peer._control_state = "ACTIVE"
         peer._control_revision = 3
+        peer._control_safe_stop_truth_supported = safety_truth
+        peer._control_authority_revoked = False if safety_truth else None
+        peer._control_safe_stop_state = "confirmed" if safety_truth else None
+        peer._control_safe_stop_epoch = 7 if safety_truth else None
         peer._statuses[command_id] = ProtocolCommandStatus(
             command_id,
             "RUNNING",
@@ -291,8 +303,27 @@ def test_cancel_ignores_running_revisions_and_waits_for_new_safe_hold(
             "type": "control.status",
             "payload": {
                 "state": "SAFE_HOLD",
+                "reason": "safe stop requested",
+                "lease_sequence": None,
+                "authority_revoked": True,
+                "safe_stop_state": "requested",
+                "safe_stop_epoch": 8,
+            },
+        }
+    )
+    worker.join(timeout=0.02)
+    assert worker.is_alive()
+
+    peer._record_message(
+        {
+            "type": "control.status",
+            "payload": {
+                "state": "SAFE_HOLD",
                 "reason": "safe stop completed",
                 "lease_sequence": None,
+                "authority_revoked": True,
+                "safe_stop_state": "confirmed",
+                "safe_stop_epoch": 8,
             },
         }
     )
@@ -315,7 +346,240 @@ def test_cancel_without_new_safe_hold_times_out_as_unknown(monkeypatch) -> None:
     worker.join(timeout=0.5)
     assert not worker.is_alive()
     assert results[0].state == "ABORTED_AGENT_RESTART"
-    assert "without a new SAFE_HOLD" in results[0].detail
+    assert "without a new confirmed SAFE_HOLD" in results[0].detail
+
+
+def test_cancel_legacy_safe_hold_without_truth_times_out_as_unknown(monkeypatch) -> None:
+    peer, command_id, sent = _cancel_test_peer(
+        monkeypatch,
+        timeout_seconds=0.05,
+        safety_truth=False,
+    )
+    results: list[ProtocolCommandStatus] = []
+    worker = threading.Thread(target=lambda: results.append(peer.cancel(command_id)))
+    worker.start()
+    assert sent.wait(timeout=0.5)
+    _record_command_status(peer, command_id, "CANCELLED")
+    peer._record_message(
+        {
+            "type": "control.status",
+            "payload": {
+                "state": "SAFE_HOLD",
+                "reason": "legacy safe hold",
+                "lease_sequence": None,
+            },
+        }
+    )
+
+    worker.join(timeout=0.5)
+    assert not worker.is_alive()
+    assert results[0].state == "ABORTED_AGENT_RESTART"
+    assert "safety truth" in results[0].detail
+
+
+def test_cancel_failed_safe_stop_returns_unknown_immediately(monkeypatch) -> None:
+    peer, command_id, sent = _cancel_test_peer(
+        monkeypatch,
+        timeout_seconds=0.5,
+    )
+    results: list[ProtocolCommandStatus] = []
+    worker = threading.Thread(target=lambda: results.append(peer.cancel(command_id)))
+    worker.start()
+    assert sent.wait(timeout=0.5)
+    _record_command_status(peer, command_id, "CANCELLED")
+    peer._record_message(
+        {
+            "type": "control.status",
+            "payload": {
+                "state": "SAFE_HOLD",
+                "reason": "safe stop failed",
+                "lease_sequence": None,
+                "authority_revoked": True,
+                "safe_stop_state": "failed",
+                "safe_stop_epoch": 8,
+            },
+        }
+    )
+
+    worker.join(timeout=0.2)
+    assert not worker.is_alive()
+    assert results[0].state == "ABORTED_AGENT_RESTART"
+    assert "safe-stop confirmation failed" in results[0].detail
+
+
+def test_cancel_stale_confirmed_epoch_does_not_confirm(monkeypatch) -> None:
+    peer, command_id, sent = _cancel_test_peer(
+        monkeypatch,
+        timeout_seconds=0.05,
+    )
+    results: list[ProtocolCommandStatus] = []
+    worker = threading.Thread(target=lambda: results.append(peer.cancel(command_id)))
+    worker.start()
+    assert sent.wait(timeout=0.5)
+    _record_command_status(peer, command_id, "CANCELLED")
+    peer._record_message(
+        {
+            "type": "control.status",
+            "payload": {
+                "state": "SAFE_HOLD",
+                "reason": "stale safe stop confirmation",
+                "lease_sequence": None,
+                "authority_revoked": True,
+                "safe_stop_state": "confirmed",
+                "safe_stop_epoch": 7,
+            },
+        }
+    )
+
+    worker.join(timeout=0.5)
+    assert not worker.is_alive()
+    assert results[0].state == "ABORTED_AGENT_RESTART"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"authority_revoked": True},
+        {
+            "authority_revoked": "true",
+            "safe_stop_state": "confirmed",
+            "safe_stop_epoch": 1,
+        },
+        {
+            "authority_revoked": True,
+            "safe_stop_state": "complete",
+            "safe_stop_epoch": 1,
+        },
+        {
+            "authority_revoked": True,
+            "safe_stop_state": "confirmed",
+            "safe_stop_epoch": -1,
+        },
+    ],
+)
+def test_control_status_rejects_partial_or_invalid_safety_truth(
+    overrides: dict[str, object],
+) -> None:
+    payload: dict[str, object] = {
+        "state": "SAFE_HOLD",
+        "reason": "test safety truth",
+        "lease_sequence": None,
+        **overrides,
+    }
+    with pytest.raises(WireProtocolError):
+        parse_control_status_payload(payload)
+
+
+def test_control_status_cannot_downgrade_after_safety_truth() -> None:
+    peer = RobotAgentInboundPeer(
+        robot_id="g1-dev",
+        expected_capabilities_digest=CAPABILITY_DIGEST,
+        capabilities=CAPABILITIES,
+        allow_plaintext_loopback=True,
+        heartbeat=False,
+    )
+    peer._record_message(
+        {
+            "type": "control.status",
+            "payload": {
+                "state": "SAFE_HOLD",
+                "reason": "safe stop confirmed",
+                "lease_sequence": None,
+                "authority_revoked": True,
+                "safe_stop_state": "confirmed",
+                "safe_stop_epoch": 4,
+            },
+        }
+    )
+    with pytest.raises(ValueError, match="omitted safety truth"):
+        peer._record_message(
+            {
+                "type": "control.status",
+                "payload": {
+                    "state": "SAFE_HOLD",
+                    "reason": "unsafe protocol downgrade",
+                    "lease_sequence": None,
+                },
+            }
+        )
+
+
+def test_inbound_handshake_and_reconnect_accept_additive_control_truth() -> None:
+    peer = RobotAgentInboundPeer(
+        robot_id="g1-dev",
+        expected_capabilities_digest=CAPABILITY_DIGEST,
+        capabilities=CAPABILITIES,
+        allow_plaintext_loopback=True,
+        heartbeat=False,
+    )
+
+    def handshake(websocket, *, epoch: int) -> str:
+        websocket.send_text(
+            build_message(
+                "session.hello",
+                robot_id="g1-dev",
+                session_id=None,
+                payload={
+                    "agent_version": "test-agent",
+                    "boot_id": BOOT_ID,
+                    "supported_versions": ["1.0"],
+                    "transport_mode": "client",
+                    "capabilities_digest": CAPABILITY_DIGEST,
+                },
+            )
+        )
+        welcome = parse_message(
+            websocket.receive_text(),
+            expected_robot_id="g1-dev",
+        )
+        assert welcome["type"] == "session.welcome"
+        session_id = welcome["session_id"]
+        assert isinstance(session_id, str)
+        websocket.send_text(
+            build_message(
+                "control.status",
+                robot_id="g1-dev",
+                session_id=session_id,
+                payload={
+                    "state": "SAFE_HOLD",
+                    "reason": "safe stop confirmed",
+                    "lease_sequence": None,
+                    "authority_revoked": True,
+                    "safe_stop_state": "confirmed",
+                    "safe_stop_epoch": epoch,
+                },
+            )
+        )
+        deadline = time.monotonic() + 1.0
+        snapshot = peer.connection_snapshot()
+        while snapshot["safeStopEpoch"] != epoch and time.monotonic() < deadline:
+            time.sleep(0.01)
+            snapshot = peer.connection_snapshot()
+        assert snapshot["connected"] is True
+        assert snapshot["authorityRevoked"] is True
+        assert snapshot["safeStopState"] == "confirmed"
+        assert snapshot["safeStopEpoch"] == epoch
+        assert snapshot["lastError"] is None
+        return session_id
+
+    with TestClient(create_app(peer, internal_token="test-token")) as client:
+        with client.websocket_connect(
+            "/agent",
+            subprotocols=[SUBPROTOCOL],
+        ) as websocket:
+            first_session = handshake(websocket, epoch=11)
+
+        deadline = time.monotonic() + 1.0
+        while peer.connection_snapshot()["connected"] and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert peer.connection_snapshot()["connected"] is False
+
+        with client.websocket_connect(
+            "/agent",
+            subprotocols=[SUBPROTOCOL],
+        ) as websocket:
+            second_session = handshake(websocket, epoch=12)
+            assert second_session != first_session
 
 
 def test_inbound_gateway_accepts_agent_client_and_tracks_terminal_status() -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 from typing import Any, Mapping
@@ -12,10 +13,34 @@ PROTOCOL_VERSION = "1.0"
 SUBPROTOCOL = "robot-agent.v1"
 MAX_TEXT_FRAME_BYTES = 65_536
 _ENVELOPE_FIELDS = {"version", "type", "message_id", "robot_id", "session_id", "sent_at", "payload"}
+_CONTROL_STATES = {"UNARMED", "ACTIVE", "SAFE_HOLD"}
+_SAFE_STOP_STATES = {"requested", "confirmed", "failed"}
+_CONTROL_STATUS_FIELDS = {"state", "reason", "lease_sequence"}
+_CONTROL_STATUS_SAFETY_FIELDS = {
+    "authority_revoked",
+    "safe_stop_state",
+    "safe_stop_epoch",
+}
 
 
 class WireProtocolError(ValueError):
     pass
+
+
+@dataclass(frozen=True)
+class ControlStatusPayload:
+    """Validated control.status data, including optional additive safety truth."""
+
+    state: str
+    reason: str
+    lease_sequence: int | None
+    authority_revoked: bool | None
+    safe_stop_state: str | None
+    safe_stop_epoch: int | None
+
+    @property
+    def has_safe_stop_truth(self) -> bool:
+        return self.authority_revoked is not None
 
 
 def utc_now() -> datetime:
@@ -107,3 +132,77 @@ def require_payload_fields(
     optional = optional_fields or set()
     if not fields.issubset(payload) or not set(payload).issubset(fields | optional):
         raise WireProtocolError("wire payload fields are invalid")
+
+
+def parse_control_status_payload(payload: Mapping[str, Any]) -> ControlStatusPayload:
+    """Validate legacy and additive-V1 ``control.status`` payloads.
+
+    The safety fields are one atomic truth tuple.  Accepting a partial tuple
+    would make ``None`` indistinguishable from a legacy peer and could turn a
+    ``requested`` physical stop into a false confirmation.
+    """
+
+    require_payload_fields(
+        payload,
+        _CONTROL_STATUS_FIELDS,
+        optional_fields=_CONTROL_STATUS_SAFETY_FIELDS,
+    )
+    state = payload["state"]
+    if not isinstance(state, str) or state not in _CONTROL_STATES:
+        raise WireProtocolError("control.status state is invalid")
+    reason = payload["reason"]
+    if not isinstance(reason, str) or not reason or len(reason) > 256:
+        raise WireProtocolError("control.status reason is invalid")
+    lease_sequence = payload["lease_sequence"]
+    if (
+        lease_sequence is not None
+        and (
+            isinstance(lease_sequence, bool)
+            or not isinstance(lease_sequence, int)
+            or lease_sequence < 0
+        )
+    ):
+        raise WireProtocolError("control.status lease_sequence is invalid")
+
+    supplied_safety_fields = set(payload) & _CONTROL_STATUS_SAFETY_FIELDS
+    if supplied_safety_fields and supplied_safety_fields != _CONTROL_STATUS_SAFETY_FIELDS:
+        raise WireProtocolError(
+            "control.status safety truth fields must be provided together"
+        )
+    if not supplied_safety_fields:
+        return ControlStatusPayload(
+            state=state,
+            reason=reason,
+            lease_sequence=lease_sequence,
+            authority_revoked=None,
+            safe_stop_state=None,
+            safe_stop_epoch=None,
+        )
+
+    authority_revoked = payload["authority_revoked"]
+    if not isinstance(authority_revoked, bool):
+        raise WireProtocolError("control.status authority_revoked is invalid")
+    safe_stop_state = payload["safe_stop_state"]
+    if not isinstance(safe_stop_state, str) or safe_stop_state not in _SAFE_STOP_STATES:
+        raise WireProtocolError("control.status safe_stop_state is invalid")
+    safe_stop_epoch = payload["safe_stop_epoch"]
+    if (
+        isinstance(safe_stop_epoch, bool)
+        or not isinstance(safe_stop_epoch, int)
+        or safe_stop_epoch < 0
+    ):
+        raise WireProtocolError("control.status safe_stop_epoch is invalid")
+    if state == "ACTIVE" and (
+        authority_revoked or safe_stop_state != "confirmed"
+    ):
+        raise WireProtocolError("ACTIVE control.status safety truth is inconsistent")
+    if state != "ACTIVE" and not authority_revoked:
+        raise WireProtocolError("inactive control.status safety truth is inconsistent")
+    return ControlStatusPayload(
+        state=state,
+        reason=reason,
+        lease_sequence=lease_sequence,
+        authority_revoked=authority_revoked,
+        safe_stop_state=safe_stop_state,
+        safe_stop_epoch=safe_stop_epoch,
+    )

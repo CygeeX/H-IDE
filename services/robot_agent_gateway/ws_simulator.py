@@ -120,6 +120,9 @@ class WebSocketProtocolSimulator:
                 "state": "SAFE_HOLD",
                 "reason": "new session requires explicit control.acquire",
                 "lease_sequence": 0,
+                "authority_revoked": True,
+                "safe_stop_state": "confirmed",
+                "safe_stop_epoch": 0,
             })
             for raw in websocket:
                 message = parse_message(
@@ -135,6 +138,9 @@ class WebSocketProtocolSimulator:
                         "state": state["state"],
                         "reason": "simulator control acquired",
                         "lease_sequence": state["leaseSequence"],
+                        "authority_revoked": False,
+                        "safe_stop_state": "confirmed",
+                        "safe_stop_epoch": 0,
                     })
                 elif message["type"] == "lease.renew":
                     require_payload_fields(payload, {"sequence"})
