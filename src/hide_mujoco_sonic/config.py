@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import os
 from pathlib import Path
 import re
@@ -51,6 +52,7 @@ class SimConfig:
     max_spin_translation_m: float
     spin_translation_violation_s: float
     command_timeout_s: float
+    planner_reference_timeout_s: float
     motion_handoff_warmup_s: float
     motion_handoff_blend_s: float
     control_hz: int
@@ -90,7 +92,8 @@ class SimConfig:
             "max_translation_heading_error_rad", "translation_heading_violation_s",
             "max_spin_reverse_rad", "max_spin_translation_m",
             "spin_translation_violation_s",
-            "command_timeout_s", "motion_handoff_warmup_s", "motion_handoff_blend_s",
+            "command_timeout_s", "planner_reference_timeout_s",
+            "motion_handoff_warmup_s", "motion_handoff_blend_s",
             "control_hz", "camera_hz", "observation_hz",
             "force_cpu", "onscreen", "offscreen", "startup_support_s", "startup_horizontal_support_s", "model_scene",
             "scene_runtime_manifest",
@@ -145,10 +148,43 @@ class SimConfig:
             )
         if not 0 < float(raw["command_timeout_s"]):
             raise ValueError("command_timeout_s must be positive")
-        if float(raw["motion_handoff_warmup_s"]) < 0:
-            raise ValueError("motion_handoff_warmup_s must be non-negative")
-        if float(raw["motion_handoff_blend_s"]) <= 0:
-            raise ValueError("motion_handoff_blend_s must be positive")
+        planner_reference_timeout_s = float(raw["planner_reference_timeout_s"])
+        motion_handoff_warmup_s = float(raw["motion_handoff_warmup_s"])
+        motion_handoff_blend_s = float(raw["motion_handoff_blend_s"])
+        if (
+            not math.isfinite(planner_reference_timeout_s)
+            or planner_reference_timeout_s <= 0
+        ):
+            raise ValueError("planner_reference_timeout_s must be finite and positive")
+        if (
+            not math.isfinite(motion_handoff_warmup_s)
+            or motion_handoff_warmup_s < 0
+        ):
+            raise ValueError(
+                "motion_handoff_warmup_s must be finite and non-negative"
+            )
+        if (
+            not math.isfinite(motion_handoff_blend_s)
+            or motion_handoff_blend_s <= 0
+        ):
+            raise ValueError("motion_handoff_blend_s must be finite and positive")
+        gait_start_timeout_s = max(
+            1.5,
+            motion_handoff_warmup_s + motion_handoff_blend_s + 0.75,
+        )
+        # The planner deadline uses authoritative MuJoCo time.  Leave at least
+        # two control frames after the zero-ratio warm-up for measured gait
+        # acknowledgement before the ROS bridge's existing STARTING deadline.
+        if (
+            planner_reference_timeout_s
+            + motion_handoff_warmup_s
+            + 2.0 / control_hz
+            >= gait_start_timeout_s
+        ):
+            raise ValueError(
+                "planner reference deadline must precede the gait-start "
+                "deadline after handoff warm-up"
+            )
         if not 0 < float(raw["max_linear_mps"]) <= 0.5:
             raise ValueError("max_linear_mps must be in (0, 0.5]")
         if not 0 < float(raw["min_walk_command_mps"]) < float(raw["max_linear_mps"]):
@@ -256,8 +292,9 @@ class SimConfig:
             max_spin_translation_m=float(raw["max_spin_translation_m"]),
             spin_translation_violation_s=float(raw["spin_translation_violation_s"]),
             command_timeout_s=float(raw["command_timeout_s"]),
-            motion_handoff_warmup_s=float(raw["motion_handoff_warmup_s"]),
-            motion_handoff_blend_s=float(raw["motion_handoff_blend_s"]),
+            planner_reference_timeout_s=planner_reference_timeout_s,
+            motion_handoff_warmup_s=motion_handoff_warmup_s,
+            motion_handoff_blend_s=motion_handoff_blend_s,
             control_hz=control_hz,
             camera_hz=int(raw["camera_hz"]),
             observation_hz=int(raw["observation_hz"]),

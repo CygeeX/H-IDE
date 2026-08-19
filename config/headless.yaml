@@ -31,6 +31,7 @@ max_spin_reverse_rad: 0.05
 max_spin_translation_m: 0.30
 spin_translation_violation_s: 0.50
 command_timeout_s: 0.25
+planner_reference_timeout_s: 0.75
 motion_handoff_warmup_s: 0.35
 motion_handoff_blend_s: 0.40
 # Apply SONIC's learned IDLE transition only for this bounded interval after a

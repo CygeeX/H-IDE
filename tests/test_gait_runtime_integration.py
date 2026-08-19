@@ -18,7 +18,17 @@ from hide_mujoco_sonic.ros_bridge import (
     _ros_stamp_in_monotonic_domain,
 )
 from hide_mujoco_sonic.motion_fault import SonicHealth, sonic_health_probe
-from hide_mujoco_sonic.safety import PlantControlClock, PlantTickGuard
+from hide_mujoco_sonic.planner_evidence import (
+    PlannerReferenceDeadlineExceeded,
+    PlannerReferenceEvidenceGate,
+)
+from hide_mujoco_sonic.safety import (
+    MovementIntent,
+    PlantControlClock,
+    PlantTickGuard,
+    ReplanIntentGate,
+    StaticJointHandoff,
+)
 from hide_mujoco_sonic.sonic_driver import (
     SonicDriver,
     SonicIntentIngress,
@@ -340,7 +350,10 @@ def bare_driver(clock: Clock) -> SonicDriver:
         reset=lambda: None,
         freeze=lambda _targets: None,
     )
-    driver._arm_guard = SimpleNamespace(reset=lambda: None)
+    driver._arm_guard = SimpleNamespace(
+        reset=lambda: None,
+        anchor=lambda _targets: None,
+    )
     return driver
 
 
@@ -538,6 +551,486 @@ def test_new_planner_generation_freezes_the_exact_actuator_boundary() -> None:
     assert driver._freeze_planner_handoff_boundary() is True
     assert frozen == [published]
     assert driver._safe_hold_targets is None
+
+
+def _publishing_driver(clock: Clock):
+    driver = bare_driver(clock)
+    writes: list[tuple[float, ...]] = []
+
+    class Publisher:
+        @staticmethod
+        def Write(message) -> None:
+            writes.append(
+                tuple(float(message.motor_cmd[index].q) for index in range(29))
+            )
+
+    driver._msg = SimpleNamespace(
+        mode_machine=0,
+        crc=0,
+        motor_cmd=[
+            SimpleNamespace(mode=0, kp=0.0, kd=0.0, q=0.0, dq=0.0, tau=0.0)
+            for _ in range(29)
+        ],
+    )
+    driver._publisher = Publisher()
+    driver._crc = SimpleNamespace(Crc=lambda _message: 0)
+    driver._kp = tuple(20.0 for _ in range(29))
+    driver._kd = tuple(1.0 for _ in range(29))
+    driver._last_control_step_wall_s = None
+    driver._joint_handoff = StaticJointHandoff(
+        warmup_s=0.35,
+        blend_s=0.40,
+    )
+    driver._arm_guard = driver._new_arm_guard()
+    return driver, writes
+
+
+def _lowstate(targets: tuple[float, ...], *, arm_lag_rad: float = 0.0):
+    states = []
+    for index, target in enumerate(targets):
+        measured = target - arm_lag_rad if index >= 15 else target
+        states.append(SimpleNamespace(q=measured, dq=0.0, tau_est=0.0))
+    return SimpleNamespace(mode_machine=0, motor_state=states)
+
+
+def _action(driver: SonicDriver, targets: tuple[float, ...]) -> dict[str, float]:
+    return {
+        f"{driver._joint_name(index)}.q": float(target)
+        for index, target in enumerate(targets)
+    }
+
+
+class _PlannerState:
+    def __init__(self, movement_angle_rad: float) -> None:
+        self.mode = 1
+        self.speed = 0.2
+        self.height = -1.0
+        self.has_movement = True
+        self.movement_angle_rad = float(movement_angle_rad)
+
+    @property
+    def movement_direction(self) -> tuple[float, float, float]:
+        return (
+            math.cos(self.movement_angle_rad),
+            math.sin(self.movement_angle_rad),
+            0.0,
+        )
+
+    @property
+    def facing_direction(self) -> tuple[float, float, float]:
+        return (1.0, 0.0, 0.0)
+
+
+class _AsyncPlanner:
+    def __init__(self) -> None:
+        self.gen_frame = 0
+        self.result = None
+
+    def request_replan(self, cursor, _movement_state) -> None:
+        self.gen_frame = int(cursor) + 10
+
+    def try_get_new_motion(self):
+        result = self.result
+        self.result = None
+        return result
+
+
+def _planner_motion(dx: float, dy: float = 0.0):
+    return SimpleNamespace(
+        timesteps=3,
+        body_positions=(
+            (0.0, 0.0, 0.8),
+            (dx / 2.0, dy / 2.0, 0.8),
+            (dx, dy, 0.8),
+        ),
+    )
+
+
+def _movement_intent(angle_rad: float) -> MovementIntent:
+    return MovementIntent(
+        mode="SLOW_WALK",
+        speed_mps=0.2,
+        movement_angle_rad=float(angle_rad),
+        facing_angle_rad=0.0,
+        has_movement=True,
+        stale=False,
+    )
+
+
+def test_actual_29dof_dds_targets_are_continuous_at_start_replan_and_stop() -> None:
+    from lerobot.robots.unitree_g1.controllers.sonic_pipeline import DEFAULT_ANGLES
+
+    clock = Clock()
+    driver, writes = _publishing_driver(clock)
+    initial = tuple(float(value) for value in DEFAULT_ANGLES)
+    measured = _lowstate(initial, arm_lag_rad=0.50)
+    policy = tuple(value + 0.40 for value in initial)
+    driver._last_published_targets = initial
+
+    # First required reference: ratio zero must cross the real publish path as
+    # the complete frozen 29-DoF target, even though measured arms lag by 0.5rad.
+    assert driver._freeze_planner_handoff_boundary() is True
+    first = driver._joint_handoff.decide(
+        motion_active=True,
+        reference_ready=True,
+        measured=tuple(state.q for state in measured.motor_state),
+        policy=policy,
+        now=1.0,
+    )
+    assert first.handoff_ratio == 0.0
+    published = driver._publish(
+        _action(driver, first.targets),
+        measured,
+        control_dt_s=0.02,
+        constrain_arms=True,
+    )
+    assert published == pytest.approx(initial)
+    assert writes[-1] == pytest.approx(initial)
+
+    # A mid-gait required generation freezes the last actual DDS command. Both
+    # the waiting frame and the newly accepted reference's ratio-zero frame are
+    # identical at all 29 actuators; the following blend advances smoothly.
+    assert driver._freeze_planner_handoff_boundary() is True
+    waiting = driver._joint_handoff.decide(
+        motion_active=True,
+        reference_ready=False,
+        measured=tuple(state.q for state in measured.motor_state),
+        policy=policy,
+        now=2.0,
+    )
+    waiting_published = driver._publish(
+        _action(driver, waiting.targets),
+        measured,
+        control_dt_s=0.02,
+        constrain_arms=False,
+    )
+    assert waiting_published == pytest.approx(published)
+    assert writes[-1] == pytest.approx(published)
+
+    admitted = driver._joint_handoff.decide(
+        motion_active=True,
+        reference_ready=True,
+        measured=tuple(state.q for state in measured.motor_state),
+        policy=policy,
+        now=2.1,
+    )
+    admitted_published = driver._publish(
+        _action(driver, admitted.targets),
+        measured,
+        control_dt_s=0.02,
+        constrain_arms=True,
+    )
+    assert admitted.handoff_ratio == 0.0
+    assert admitted_published == pytest.approx(waiting_published)
+    assert writes[-1] == pytest.approx(waiting_published)
+
+    blended = driver._joint_handoff.decide(
+        motion_active=True,
+        reference_ready=True,
+        measured=tuple(state.q for state in measured.motor_state),
+        policy=policy,
+        now=2.47,
+    )
+    blended_published = driver._publish(
+        _action(driver, blended.targets),
+        measured,
+        control_dt_s=0.02,
+        constrain_arms=True,
+    )
+    assert 0.0 < blended.handoff_ratio < 1.0
+    assert blended_published == pytest.approx(blended.targets)
+    assert writes[-1] == pytest.approx(blended.targets)
+
+    # A stop racing the policy path freezes and republishes the exact last DDS
+    # vector rather than any measured position.
+    assert driver._freeze_last_published_hold() is True
+    stopped_measurement = _lowstate(
+        tuple(value - 0.30 for value in blended_published)
+    )
+    driver._publish_frozen_hold(stopped_measurement)
+    assert writes[-1] == pytest.approx(blended_published)
+    assert driver._last_published_targets == pytest.approx(blended_published)
+
+
+def test_local_idle_watchdog_transition_freezes_actual_29dof_dds_target() -> None:
+    from lerobot.robots.unitree_g1.controllers.sonic_pipeline import DEFAULT_ANGLES
+
+    clock = Clock()
+    driver, writes = _publishing_driver(clock)
+    boundary = tuple(float(value) for value in DEFAULT_ANGLES)
+    measured = _lowstate(boundary, arm_lag_rad=0.40)
+    driver._publish(
+        _action(driver, boundary),
+        measured,
+        control_dt_s=0.02,
+        constrain_arms=False,
+    )
+
+    driver._intent_gate = ReplanIntentGate()
+    assert driver._intent_gate.admit(_movement_intent(0.0), now=1.0) is True
+    idle = MovementIntent(
+        mode="IDLE",
+        speed_mps=0.0,
+        movement_angle_rad=0.0,
+        facing_angle_rad=0.0,
+        has_movement=False,
+        stale=True,
+    )
+    driver.guard = SimpleNamespace(intent=lambda **_kwargs: idle, last_received_at=None)
+    driver._controller = SimpleNamespace(
+        controller=SimpleNamespace(reinit_heading=False, delta_heading=0.0),
+        ms=SimpleNamespace(
+            mode=None,
+            speed=None,
+            movement_angle=None,
+            facing_angle=None,
+            has_movement=None,
+            needs_replan=None,
+        ),
+    )
+    driver._planner_evidence = PlannerReferenceEvidenceGate()
+    driver._decoder_facing_rad = 0.0
+    driver._pending_decoder_heading_delta_rad = 0.0
+    driver._last_intent_signature = None
+
+    stopped_intent = driver._apply_intent(0.02, simulation_now_s=2.0)
+    assert stopped_intent.mode == "IDLE"
+    stopped = driver._joint_handoff.decide(
+        motion_active=False,
+        reference_ready=False,
+        measured=tuple(state.q for state in measured.motor_state),
+        policy=tuple(value + 0.10 for value in boundary),
+        now=2.0,
+    )
+    stopped_published = driver._publish(
+        _action(driver, stopped.targets),
+        measured,
+        control_dt_s=0.02,
+        constrain_arms=False,
+    )
+
+    assert stopped.static_hold_active is True
+    assert stopped.handoff_ratio == 0.0
+    assert stopped_published == pytest.approx(boundary)
+    assert writes[-1] == pytest.approx(boundary)
+
+
+def test_mid_gait_replan_reject_wait_accept_and_bad_refresh_use_actual_dds_boundary() -> None:
+    from lerobot.robots.unitree_g1.controllers.sonic_pipeline import DEFAULT_ANGLES
+
+    clock = Clock()
+    driver, writes = _publishing_driver(clock)
+    measured = _lowstate(
+        tuple(float(value) for value in DEFAULT_ANGLES),
+        arm_lag_rad=0.35,
+    )
+    initial_target = tuple(float(value) for value in DEFAULT_ANGLES)
+    driver._publish(
+        _action(driver, initial_target),
+        measured,
+        control_dt_s=0.02,
+        constrain_arms=False,
+    )
+
+    planner = _AsyncPlanner()
+    reference_owner = SimpleNamespace(ref_cursor=0)
+    driver._planner_evidence = PlannerReferenceEvidenceGate(
+        required_timeout_s=0.75
+    )
+    driver._planner_evidence.bind(planner, reference_owner=reference_owner)
+
+    # Establish a fully active +X reference so the next intent is genuinely a
+    # mid-gait replan rather than another startup case.
+    driver._planner_evidence.observe_intent(
+        _movement_intent(0.0), admitted=True, simulation_now_s=1.0
+    )
+    planner.request_replan(5, _PlannerState(0.0))
+    planner.result = (_planner_motion(0.50), 15)
+    assert planner.try_get_new_motion() is not None
+    assert driver._freeze_planner_handoff_boundary() is True
+    driver._joint_handoff.decide(
+        motion_active=True,
+        reference_ready=True,
+        measured=tuple(state.q for state in measured.motor_state),
+        policy=initial_target,
+        now=1.0,
+    )
+    active_target = tuple(value + 0.02 for value in initial_target)
+    active = driver._joint_handoff.decide(
+        motion_active=True,
+        reference_ready=True,
+        measured=tuple(state.q for state in measured.motor_state),
+        policy=active_target,
+        now=1.80,
+    )
+    assert active.handoff_ratio == 1.0
+    active_published = driver._publish(
+        _action(driver, active.targets),
+        measured,
+        control_dt_s=0.02,
+        constrain_arms=True,
+    )
+    assert active_published == pytest.approx(active_target)
+
+    # A new -X intent freezes all 29 last-published targets. Its first result
+    # predicts +X and is rejected; an empty planner cycle also keeps ratio zero.
+    assert driver._freeze_planner_handoff_boundary() is True
+    driver._planner_evidence.observe_intent(
+        _movement_intent(math.pi), admitted=True, simulation_now_s=2.0
+    )
+    planner.request_replan(6, _PlannerState(math.pi))
+    planner.result = (_planner_motion(0.40), 16)
+    assert planner.try_get_new_motion() is None
+    rejected = driver._joint_handoff.decide(
+        motion_active=True,
+        reference_ready=driver._planner_evidence.reference_ready,
+        measured=tuple(state.q for state in measured.motor_state),
+        policy=tuple(value - 0.05 for value in active_target),
+        now=2.10,
+    )
+    assert rejected.handoff_ratio == 0.0
+    rejected_published = driver._publish(
+        _action(driver, rejected.targets),
+        measured,
+        control_dt_s=0.02,
+        constrain_arms=False,
+    )
+    assert rejected_published == pytest.approx(active_published)
+
+    assert planner.try_get_new_motion() is None
+    waiting = driver._joint_handoff.decide(
+        motion_active=True,
+        reference_ready=driver._planner_evidence.reference_ready,
+        measured=tuple(state.q for state in measured.motor_state),
+        policy=tuple(value - 0.05 for value in active_target),
+        now=2.60,
+    )
+    waiting_published = driver._publish(
+        _action(driver, waiting.targets),
+        measured,
+        control_dt_s=0.02,
+        constrain_arms=False,
+    )
+    assert waiting.handoff_ratio == 0.0
+    assert waiting_published == pytest.approx(active_published)
+
+    # The matching -X generation unlocks only a new ratio-zero frame, then
+    # blends from the same frozen actuator boundary.
+    planner.request_replan(7, _PlannerState(math.pi))
+    planner.result = (_planner_motion(-0.50), 17)
+    assert planner.try_get_new_motion() is not None
+    admitted = driver._joint_handoff.decide(
+        motion_active=True,
+        reference_ready=driver._planner_evidence.reference_ready,
+        measured=tuple(state.q for state in measured.motor_state),
+        policy=tuple(value - 0.02 for value in active_target),
+        now=2.70,
+    )
+    admitted_published = driver._publish(
+        _action(driver, admitted.targets),
+        measured,
+        control_dt_s=0.02,
+        constrain_arms=True,
+    )
+    assert admitted.handoff_ratio == 0.0
+    assert admitted_published == pytest.approx(active_published)
+
+    new_policy_target = tuple(value - 0.01 for value in active_target)
+    blended = driver._joint_handoff.decide(
+        motion_active=True,
+        reference_ready=driver._planner_evidence.reference_ready,
+        measured=tuple(state.q for state in measured.motor_state),
+        policy=new_policy_target,
+        now=3.50,
+    )
+    blended_published = driver._publish(
+        _action(driver, blended.targets),
+        measured,
+        control_dt_s=0.02,
+        constrain_arms=True,
+    )
+    assert blended.handoff_ratio == 1.0
+    assert blended_published == pytest.approx(new_policy_target)
+
+    # A later periodic result for the same intent is directionally bad. It is
+    # discarded while the accepted reference remains active; the next policy
+    # frame therefore continues, rather than snapping to measured or ratio zero.
+    accepted_generation = driver._planner_evidence.telemetry_fields(
+        ref_cursor=reference_owner.ref_cursor
+    )["sonic_planner_accepted_generation"]
+    planner.request_replan(8, _PlannerState(math.pi))
+    planner.result = (_planner_motion(0.30), 18)
+    assert planner.try_get_new_motion() is None
+    assert driver._planner_evidence.reference_ready is True
+    continued_target = tuple(value - 0.01 for value in new_policy_target)
+    continued = driver._joint_handoff.decide(
+        motion_active=True,
+        reference_ready=driver._planner_evidence.reference_ready,
+        measured=tuple(state.q for state in measured.motor_state),
+        policy=continued_target,
+        now=3.52,
+    )
+    continued_published = driver._publish(
+        _action(driver, continued.targets),
+        measured,
+        control_dt_s=0.02,
+        constrain_arms=True,
+    )
+    assert continued.handoff_ratio == 1.0
+    assert continued_published == pytest.approx(continued_target)
+    evidence = driver._planner_evidence.telemetry_fields(
+        ref_cursor=reference_owner.ref_cursor
+    )
+    assert evidence["sonic_planner_accepted_generation"] == accepted_generation
+    assert evidence["sonic_planner_required_pending"] is False
+    assert writes[-1] == pytest.approx(continued_target)
+
+
+def test_required_planner_deadline_latches_terminal_exact_target_hold() -> None:
+    clock = Clock()
+    driver, writes = _publishing_driver(clock)
+    boundary = tuple(0.01 * index for index in range(29))
+    driver._last_published_targets = boundary
+    driver._joint_handoff = StaticJointHandoff()
+    driver._planner_evidence = PlannerReferenceEvidenceGate(
+        required_timeout_s=0.75
+    )
+    driver._planner_evidence.observe_intent(
+        _movement_intent(0.0),
+        admitted=True,
+        simulation_now_s=4.0,
+    )
+    assert driver._freeze_planner_handoff_boundary() is True
+    measured = _lowstate(boundary, arm_lag_rad=0.40)
+    waiting = driver._joint_handoff.decide(
+        motion_active=True,
+        reference_ready=False,
+        measured=tuple(state.q for state in measured.motor_state),
+        policy=tuple(value + 0.10 for value in boundary),
+        now=4.74,
+    )
+    waiting_published = driver._publish(
+        _action(driver, waiting.targets),
+        measured,
+        control_dt_s=0.02,
+        constrain_arms=False,
+    )
+    assert waiting.handoff_ratio == 0.0
+    assert waiting_published == pytest.approx(boundary)
+
+    with pytest.raises(PlannerReferenceDeadlineExceeded, match="timed out"):
+        driver._enforce_planner_reference_deadline(simulation_now_s=4.75)
+
+    driver._publish_frozen_hold(measured)
+
+    assert driver._fault_latched.is_set() is True
+    assert driver._safe_hold_targets == boundary
+    assert writes[-1] == pytest.approx(boundary)
+    assert driver._last_published_targets == pytest.approx(boundary)
+    assert driver.guard.stops[-1] == "terminal_fault"
+    assert "required SONIC planner reference timed out" in str(
+        driver.telemetry.values["last_error"]
+    )
 
 
 def test_driver_requires_startup_qualification_before_accepting_motion() -> None:

@@ -74,7 +74,11 @@ non-semantic integrity manifest.
   until a uniquely correlated new reference is blendable at the live cursor;
   translational references must also predict positive root displacement in the
   requested direction.  Ambiguous, stale and opposite-direction results are
-  dropped rather than guessed.
+  dropped rather than guessed. Each required generation freezes the exact last
+  29-DoF DDS target and blends from that boundary; if a matching reference is
+  still absent after `planner_reference_timeout_s` of MuJoCo time, SONIC enters
+  a terminal exact-target hold. A bad periodic refresh is discarded without
+  revoking the currently proven reference.
 * A Nav2 angular-only `cmd_vel` selects SONIC's zero-translation facing-change
   plan.  Rotation is therefore still owned by Nav2 and never by a direct motor
   or head command.

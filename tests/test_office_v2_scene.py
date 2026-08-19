@@ -413,6 +413,18 @@ def test_supported_configs_all_select_the_same_verified_office_v2_bundle() -> No
         assert config.sonic_health_probe_timeout_s == pytest.approx(0.020)
         assert config.plant_lowstate_stale_s == pytest.approx(0.10)
         assert config.sonic_control_step_stale_s == pytest.approx(0.10)
+        assert config.planner_reference_timeout_s == pytest.approx(0.75)
+        assert (
+            config.planner_reference_timeout_s
+            + config.motion_handoff_warmup_s
+            + 2.0 / config.control_hz
+            < max(
+                1.5,
+                config.motion_handoff_warmup_s
+                + config.motion_handoff_blend_s
+                + 0.75,
+            )
+        )
         assert (
             max(
                 config.plant_lowstate_stale_s,

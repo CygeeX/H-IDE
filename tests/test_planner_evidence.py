@@ -5,7 +5,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from hide_mujoco_sonic.planner_evidence import PlannerReferenceEvidenceGate
+from hide_mujoco_sonic.planner_evidence import (
+    PlannerReferenceDeadlineExceeded,
+    PlannerReferenceEvidenceGate,
+)
 from hide_mujoco_sonic.safety import MovementIntent, StaticJointHandoff
 
 
@@ -216,3 +219,93 @@ def test_static_joint_handoff_ratio_remains_zero_until_reference_is_ready() -> N
     )
     assert blended.handoff_ratio == pytest.approx(0.5)
     assert blended.targets == pytest.approx((2.0, 3.0))
+
+
+def test_bad_periodic_refresh_retains_the_current_accepted_reference() -> None:
+    planner = FakePlanner()
+    gate = PlannerReferenceEvidenceGate(required_timeout_s=0.75)
+    gate.bind(planner, reference_owner=SimpleNamespace(ref_cursor=0))
+    gate.observe_intent(intent(0.0), admitted=True, simulation_now_s=2.0)
+    planner.request_replan(5, FakeMovementState(movement_angle=0.0))
+    planner.result = (motion(0.6), 15)
+    assert planner.try_get_new_motion() is not None
+    accepted = gate.telemetry_fields(ref_cursor=0)
+    assert gate.reference_ready is True
+    assert accepted["sonic_planner_accepted_generation"] == 1
+
+    # SONIC periodically refreshes an unchanged walking intent. A bad candidate
+    # must be dropped without withdrawing the already proven reference that is
+    # currently driving the actuator handoff.
+    planner.request_replan(6, FakeMovementState(movement_angle=0.0))
+    planner.result = (motion(-0.4), 16)
+    assert planner.try_get_new_motion() is None
+
+    retained = gate.telemetry_fields(ref_cursor=1)
+    assert gate.reference_ready is True
+    assert retained["sonic_planner_reference_ready"] is True
+    assert retained["sonic_planner_required_pending"] is False
+    assert retained["sonic_planner_accepted_generation"] == 1
+    assert retained["sonic_planner_predicted_root_projection_m"] == pytest.approx(0.6)
+    assert retained["sonic_planner_direction_consistent"] is True
+    assert "retaining current accepted" in retained["sonic_planner_evidence_reason"]
+
+
+def test_mid_gait_required_replan_rejects_old_reference_then_accepts_new_one() -> None:
+    planner = FakePlanner()
+    gate = PlannerReferenceEvidenceGate(required_timeout_s=0.75)
+    gate.bind(planner, reference_owner=SimpleNamespace(ref_cursor=0))
+    gate.observe_intent(intent(0.0), admitted=True, simulation_now_s=3.0)
+    planner.request_replan(5, FakeMovementState(movement_angle=0.0))
+    planner.result = (motion(0.5), 15)
+    assert planner.try_get_new_motion() is not None
+
+    gate.observe_intent(intent(math.pi), admitted=True, simulation_now_s=3.2)
+    assert gate.reference_ready is False
+    assert gate.telemetry_fields(ref_cursor=1)["sonic_planner_required_pending"] is True
+
+    planner.request_replan(6, FakeMovementState(movement_angle=math.pi))
+    planner.result = (motion(0.4), 16)
+    assert planner.try_get_new_motion() is None
+    assert gate.reference_ready is False
+
+    planner.request_replan(7, FakeMovementState(movement_angle=math.pi))
+    planner.result = (motion(-0.7), 17)
+    assert planner.try_get_new_motion() is not None
+    gate.enforce_required_deadline(simulation_now_s=3.94)
+    evidence = gate.telemetry_fields(ref_cursor=2)
+    assert evidence["sonic_planner_reference_ready"] is True
+    assert evidence["sonic_planner_required_pending"] is False
+    assert evidence["sonic_planner_accepted_intent_generation"] == 2
+
+
+def test_required_reference_never_returning_expires_on_mujoco_time() -> None:
+    gate = PlannerReferenceEvidenceGate(required_timeout_s=0.75)
+    gate.observe_intent(intent(0.0), admitted=True, simulation_now_s=10.0)
+
+    gate.enforce_required_deadline(simulation_now_s=10.74)
+    with pytest.raises(PlannerReferenceDeadlineExceeded, match="generation 1"):
+        gate.enforce_required_deadline(simulation_now_s=10.75)
+
+    evidence = gate.telemetry_fields(ref_cursor=0)
+    assert evidence["sonic_planner_reference_ready"] is False
+    assert evidence["sonic_planner_required_pending"] is True
+    assert evidence["sonic_planner_required_deadline_s"] == pytest.approx(10.75)
+    assert "timed out" in evidence["sonic_planner_evidence_reason"]
+
+
+def test_rejected_mid_gait_reference_remains_pending_until_deadline() -> None:
+    planner = FakePlanner()
+    gate = PlannerReferenceEvidenceGate(required_timeout_s=0.75)
+    gate.bind(planner, reference_owner=SimpleNamespace(ref_cursor=0))
+    gate.observe_intent(intent(0.0), admitted=True, simulation_now_s=20.0)
+    planner.request_replan(1, FakeMovementState(movement_angle=0.0))
+    planner.result = (motion(0.5), 11)
+    assert planner.try_get_new_motion() is not None
+
+    gate.observe_intent(intent(math.pi), admitted=True, simulation_now_s=21.0)
+    planner.request_replan(2, FakeMovementState(movement_angle=math.pi))
+    planner.result = (motion(0.5), 12)
+    assert planner.try_get_new_motion() is None
+    gate.enforce_required_deadline(simulation_now_s=21.74)
+    with pytest.raises(PlannerReferenceDeadlineExceeded, match="limit=0.750s"):
+        gate.enforce_required_deadline(simulation_now_s=21.75)

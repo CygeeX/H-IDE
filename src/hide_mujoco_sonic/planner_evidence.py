@@ -24,6 +24,10 @@ from .safety import MovementIntent
 _MIN_DIRECTIONAL_PROJECTION_M = 1e-4
 
 
+class PlannerReferenceDeadlineExceeded(RuntimeError):
+    """A required Nav2 intent did not obtain a safe SONIC reference in time."""
+
+
 def _signature(payload: dict[str, object]) -> str:
     encoded = json.dumps(
         payload,
@@ -70,8 +74,12 @@ class PlannerReferenceEvidenceGate:
     translation contract.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, required_timeout_s: float = 0.75) -> None:
+        timeout = float(required_timeout_s)
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("planner reference timeout must be finite and positive")
         self._lock = threading.RLock()
+        self.required_timeout_s = timeout
         self._bound = False
         self._reference_owner: object | None = None
         self._intent_counter = 0
@@ -85,6 +93,7 @@ class PlannerReferenceEvidenceGate:
         self._predicted_direction: tuple[float, float] | None = None
         self._predicted_projection_m: float | None = None
         self._direction_consistent: bool | None = None
+        self._required_started_at_s: float | None = None
         self._reason = "no Nav2 motion intent"
 
     @staticmethod
@@ -152,7 +161,13 @@ class PlannerReferenceEvidenceGate:
         movement_dot = movement[0] * expected[0] + movement[1] * expected[1]
         return speed > 0.0 and movement_dot >= 1.0 - 1e-6
 
-    def observe_intent(self, intent: MovementIntent, *, admitted: bool) -> None:
+    def observe_intent(
+        self,
+        intent: MovementIntent,
+        *,
+        admitted: bool,
+        simulation_now_s: float | None = None,
+    ) -> None:
         """Observe one intent admitted (or debounced) by ``ReplanIntentGate``."""
 
         if not admitted:
@@ -160,6 +175,13 @@ class PlannerReferenceEvidenceGate:
         if intent.mode == "IDLE":
             self.revoke("Nav2 intent is IDLE")
             return
+        started_at: float | None = None
+        if simulation_now_s is not None:
+            started_at = float(simulation_now_s)
+            if not math.isfinite(started_at) or started_at < 0:
+                raise ValueError(
+                    "planner reference generation requires finite non-negative MuJoCo time"
+                )
         requested_direction = (
             (
                 math.cos(float(intent.movement_angle_rad)),
@@ -187,6 +209,7 @@ class PlannerReferenceEvidenceGate:
             self._predicted_direction = None
             self._predicted_projection_m = None
             self._direction_consistent = None
+            self._required_started_at_s = started_at
             self._reason = "awaiting a matching SONIC planner reference"
 
     def revoke(self, reason: str) -> None:
@@ -195,12 +218,74 @@ class PlannerReferenceEvidenceGate:
         with self._lock:
             self._intent_active = False
             self._reference_ready = False
+            self._required_started_at_s = None
             self._reason = str(reason)
+
+    def _has_current_reference_locked(self) -> bool:
+        intent = self._intent if self._intent_active else None
+        accepted = self._accepted_request
+        return bool(
+            intent is not None
+            and accepted is not None
+            and accepted.matches_intent
+            and accepted.intent_generation == intent.generation
+            and accepted.intent_signature == intent.signature
+        )
+
+    def _reject_result_locked(self, reason: str) -> bool:
+        """Reject one candidate without revoking a proven periodic predecessor."""
+
+        if self._has_current_reference_locked():
+            self._reference_ready = True
+            self._reason = f"{reason}; retaining current accepted planner reference"
+        else:
+            self._reference_ready = False
+            self._reason = reason
+        return False
 
     @property
     def reference_ready(self) -> bool:
         with self._lock:
-            return self._intent_active and self._reference_ready
+            return self._reference_ready and self._has_current_reference_locked()
+
+    def enforce_required_deadline(self, *, simulation_now_s: float) -> None:
+        """Fail closed when a required generation waits too long in MuJoCo time."""
+
+        current = float(simulation_now_s)
+        if not math.isfinite(current) or current < 0:
+            raise ValueError(
+                "planner reference deadline requires finite non-negative MuJoCo time"
+            )
+        failure: str | None = None
+        with self._lock:
+            if not self._intent_active or self._has_current_reference_locked():
+                return
+            started_at = self._required_started_at_s
+            if started_at is None:
+                failure = (
+                    "required SONIC planner generation has no authoritative "
+                    "MuJoCo start timestamp"
+                )
+            elif current < started_at:
+                failure = (
+                    "MuJoCo time moved backwards while awaiting a required "
+                    "SONIC planner generation"
+                )
+            elif current - started_at >= self.required_timeout_s:
+                intent_generation = (
+                    None if self._intent is None else self._intent.generation
+                )
+                failure = (
+                    "required SONIC planner reference timed out for intent "
+                    f"generation {intent_generation} after "
+                    f"{current - started_at:.3f}s MuJoCo time "
+                    f"(limit={self.required_timeout_s:.3f}s)"
+                )
+            if failure is not None:
+                self._reference_ready = False
+                self._reason = failure
+        if failure is not None:
+            raise PlannerReferenceDeadlineExceeded(failure)
 
     def bind(self, planner: object, *, reference_owner: object) -> None:
         """Instrument one live LeRobot planner instance exactly once."""
@@ -334,20 +419,19 @@ class PlannerReferenceEvidenceGate:
                 raise ValueError
         except (TypeError, ValueError):
             with self._lock:
-                self._reference_ready = False
-                self._reason = "planner result does not expose (motion, gen_frame)"
+                self._reject_result_locked(
+                    "planner result does not expose (motion, gen_frame)"
+                )
             return False
 
         with self._lock:
             requests = self._requests_by_frame.pop(gen_frame, [])
             intent = self._intent if self._intent_active else None
             if len(requests) != 1:
-                self._reference_ready = False
-                self._reason = (
+                return self._reject_result_locked(
                     f"planner result gen_frame {gen_frame} has "
                     f"{len(requests)} matching requests"
                 )
-                return False
             request = requests[0]
             current_matches = bool(
                 intent is not None
@@ -356,9 +440,9 @@ class PlannerReferenceEvidenceGate:
                 and request.intent_signature == intent.signature
             )
             if not current_matches:
-                self._reference_ready = False
-                self._reason = "planner result belongs to a stale or mismatched intent"
-                return False
+                return self._reject_result_locked(
+                    "planner result belongs to a stale or mismatched intent"
+                )
             reference_owner = self._reference_owner
             try:
                 raw_cursor = getattr(reference_owner, "ref_cursor")
@@ -372,28 +456,31 @@ class PlannerReferenceEvidenceGate:
                 ):
                     raise ValueError
             except (AttributeError, TypeError, ValueError):
-                self._reference_ready = False
-                self._reason = "planner result cannot be blended at the live reference cursor"
-                return False
+                return self._reject_result_locked(
+                    "planner result cannot be blended at the live reference cursor"
+                )
             try:
                 direction, projection, consistent = self._predicted_root_motion(
                     motion,
                     request.requested_direction,
                 )
             except ValueError as exc:
-                self._reference_ready = False
-                self._predicted_direction = None
-                self._predicted_projection_m = None
-                self._direction_consistent = False
-                self._reason = str(exc)
-                return False
+                if not self._has_current_reference_locked():
+                    self._predicted_direction = None
+                    self._predicted_projection_m = None
+                    self._direction_consistent = False
+                return self._reject_result_locked(str(exc))
+            if not consistent:
+                if not self._has_current_reference_locked():
+                    self._predicted_direction = direction
+                    self._predicted_projection_m = projection
+                    self._direction_consistent = False
+                return self._reject_result_locked(
+                    "planner root projection opposes or does not realize the Nav2 direction"
+                )
             self._predicted_direction = direction
             self._predicted_projection_m = projection
-            self._direction_consistent = consistent
-            if not consistent:
-                self._reference_ready = False
-                self._reason = "planner root projection opposes or does not realize the Nav2 direction"
-                return False
+            self._direction_consistent = True
             self._accepted_request = request
             self._reference_ready = True
             self._reason = "matching direction-consistent planner reference accepted"
@@ -440,7 +527,17 @@ class PlannerReferenceEvidenceGate:
                     None if accepted is None else accepted.planner_signature
                 ),
                 "sonic_planner_reference_ready": (
-                    self._intent_active and self._reference_ready
+                    self._reference_ready and self._has_current_reference_locked()
+                ),
+                "sonic_planner_required_pending": (
+                    self._intent_active and not self._has_current_reference_locked()
+                ),
+                "sonic_planner_required_started_at_s": self._required_started_at_s,
+                "sonic_planner_required_timeout_s": self.required_timeout_s,
+                "sonic_planner_required_deadline_s": (
+                    None
+                    if self._required_started_at_s is None
+                    else self._required_started_at_s + self.required_timeout_s
                 ),
                 "sonic_planner_ref_cursor": ref_cursor,
                 "sonic_planner_requested_root_direction_x": (
@@ -470,4 +567,7 @@ class PlannerReferenceEvidenceGate:
         }
 
 
-__all__ = ["PlannerReferenceEvidenceGate"]
+__all__ = [
+    "PlannerReferenceDeadlineExceeded",
+    "PlannerReferenceEvidenceGate",
+]

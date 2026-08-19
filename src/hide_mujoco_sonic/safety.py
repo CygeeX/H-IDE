@@ -1246,6 +1246,24 @@ class NavigationArmGuard:
     def reset(self) -> None:
         self._last = None
 
+    def anchor(self, targets: Sequence[float]) -> None:
+        """Seed slew limiting from the exact actuator-side arm targets.
+
+        A planner handoff freezes the complete last-published 29-DoF command.
+        The arm limiter must therefore start from those fourteen actuator
+        targets as well, not from lagging measured angles.  The anchor is kept
+        exact even when it lies outside the nominal envelope; the next policy
+        sample can only move it back toward that envelope at the configured
+        per-tick velocity limit.
+        """
+
+        values = tuple(float(value) for value in targets)
+        if len(values) != len(self.nominal):
+            raise ValueError("arm anchor vector has an unexpected length")
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("arm anchor vector must be finite")
+        self._last = values
+
     def _clamp_to_envelope(self, value: float, index: int) -> float:
         center = self.nominal[index]
         radius = self.max_deviation_rad[index]

@@ -64,6 +64,10 @@ def _bare_driver(
     driver._last_published_targets = None
     driver._safe_hold_targets = None
     driver._joint_handoff = SimpleNamespace(freeze=lambda _targets: None)
+    driver._arm_guard = SimpleNamespace(
+        reset=lambda: None,
+        anchor=lambda _targets: None,
+    )
     return driver
 
 

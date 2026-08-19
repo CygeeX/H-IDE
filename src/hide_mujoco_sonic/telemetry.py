@@ -39,6 +39,10 @@ class TelemetryState:
     sonic_planner_accepted_intent_signature: str | None = None
     sonic_planner_accepted_signature: str | None = None
     sonic_planner_reference_ready: bool = False
+    sonic_planner_required_pending: bool = False
+    sonic_planner_required_started_at_s: float | None = None
+    sonic_planner_required_timeout_s: float | None = None
+    sonic_planner_required_deadline_s: float | None = None
     sonic_planner_ref_cursor: int | None = None
     sonic_planner_requested_root_direction_x: float | None = None
     sonic_planner_requested_root_direction_y: float | None = None

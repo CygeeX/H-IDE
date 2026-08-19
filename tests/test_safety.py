@@ -602,6 +602,28 @@ def test_navigation_arm_guard_recovers_from_non_finite_target():
     assert result.constrained_joints == 1
 
 
+def test_navigation_arm_guard_anchors_exact_actuator_preload_before_slew():
+    guard = NavigationArmGuard(
+        [0.0, 0.0],
+        max_deviation_rad=[0.4, 0.4],
+        max_velocity_rps=[1.0, 1.0],
+    )
+    guard.anchor([0.30, -0.30])
+
+    first = guard.apply(
+        [0.30, -0.30],
+        measured=[-0.20, 0.20],
+        dt=0.02,
+    )
+    assert first.targets == pytest.approx((0.30, -0.30))
+
+    # Even an out-of-envelope frozen target is not snapped to the envelope;
+    # recovery begins from the actual actuator boundary at the normal slew cap.
+    guard.anchor([0.60, -0.60])
+    recovery = guard.apply([0.0, 0.0], measured=[0.0, 0.0], dt=0.02)
+    assert recovery.targets == pytest.approx((0.58, -0.58))
+
+
 def test_base_to_camera_preserves_ros_optical_axes():
     # Optical +X points base-right (-Y), +Y points down (-Z), and +Z points
     # base-forward (+X). The map-space camera quaternion below encodes exactly

@@ -28,7 +28,10 @@ from .motion_fault import (
     validate_sonic_health_request,
 )
 from .network import require_loopback_bind_host
-from .planner_evidence import PlannerReferenceEvidenceGate
+from .planner_evidence import (
+    PlannerReferenceDeadlineExceeded,
+    PlannerReferenceEvidenceGate,
+)
 from .safety import (
     CmdVelGuard,
     NavigationArmGuard,
@@ -370,7 +373,9 @@ class SonicDriver:
         self._msg = unitree_hg_msg_dds__LowCmd_()
         self._controller_type = SonicWholeBodyController
         self._controller = self._controller_type(force_cpu=config.force_cpu)
-        self._planner_evidence = PlannerReferenceEvidenceGate()
+        self._planner_evidence = PlannerReferenceEvidenceGate(
+            required_timeout_s=config.planner_reference_timeout_s
+        )
         self._planner_evidence.bind(
             self._controller.controller.planner,
             reference_owner=self._controller.controller,
@@ -829,6 +834,7 @@ class SonicDriver:
             self._last_published_targets = tuple(
                 float(value) for value in selected
             )
+            self._arm_guard.anchor(self._last_published_targets[15:29])
         self._mark_control_step_published()
 
     def _mark_control_step_published(self) -> None:
@@ -853,6 +859,7 @@ class SonicDriver:
                 return False
             self._safe_hold_targets = targets
             self._joint_handoff.freeze(targets)
+            self._arm_guard.anchor(targets[15:29])
             return True
 
     def _freeze_planner_handoff_boundary(self) -> bool:
@@ -871,6 +878,7 @@ class SonicDriver:
             if targets is None:
                 return False
             self._joint_handoff.freeze(targets)
+            self._arm_guard.anchor(targets[15:29])
             return True
 
     def _publish_frozen_hold(self, lowstate) -> None:
@@ -1232,9 +1240,25 @@ class SonicDriver:
         # clock as the policy cursor, handoff blend, and arm slew guard.  Wall
         # time remains valid only for ingress freshness/watchdog decisions.
         admitted = self._intent_gate.admit(intent, now=simulation_now_s)
-        if admitted and intent.mode != "IDLE":
-            self._freeze_planner_handoff_boundary()
-        self._planner_evidence.observe_intent(intent, admitted=admitted)
+        # Every newly required motion generation, and every transition back to
+        # IDLE, starts at the exact 29-DoF actuator target that crossed DDS.
+        # The IDLE branch matters when the local cmd_vel watchdog fires before
+        # an explicit Robot Agent stop arrives: StaticJointHandoff must not
+        # replace the gravity-balancing target with lagging measured angles.
+        requires_actuator_boundary = admitted and (
+            intent.mode != "IDLE"
+            or (previous is not None and previous.mode != "IDLE")
+        )
+        if requires_actuator_boundary:
+            if not self._freeze_planner_handoff_boundary():
+                raise RuntimeError(
+                    "intent transition has no published actuator boundary"
+                )
+        self._planner_evidence.observe_intent(
+            intent,
+            admitted=admitted,
+            simulation_now_s=simulation_now_s,
+        )
         starting_motion = intent.mode != "IDLE" and (previous is None or previous.mode == "IDLE")
         if intent.mode == "IDLE":
             if previous is None or previous.mode != "IDLE":
@@ -1290,6 +1314,21 @@ class SonicDriver:
         )
         return intent
 
+    def _enforce_planner_reference_deadline(
+        self,
+        *,
+        simulation_now_s: float,
+    ) -> None:
+        """Turn a required-reference timeout into a terminal actuator hold."""
+
+        try:
+            self._planner_evidence.enforce_required_deadline(
+                simulation_now_s=simulation_now_s
+            )
+        except PlannerReferenceDeadlineExceeded as exc:
+            self._latch_terminal_fault(str(exc))
+            raise
+
     @staticmethod
     def _angular_delta(value: float, previous: float) -> float:
         return (float(value) - float(previous) + math.pi) % (2.0 * math.pi) - math.pi
@@ -1344,21 +1383,7 @@ class SonicDriver:
             abs(float(lowstate.motor_state[index].tau_est))
             for index in range(15, 29)
         ]
-        guarded_arm = (
-            self._arm_guard.apply(
-                raw_arm,
-                measured=measured_arm,
-                dt=control_dt_s,
-            )
-            if constrain_arms
-            else None
-        )
-        guarded_by_index = (
-            dict(zip(range(15, 29), guarded_arm.targets, strict=True))
-            if guarded_arm is not None
-            else {}
-        )
-        raw_targets = [
+        raw_targets = tuple(
             float(
                 action.get(
                     f"{self._joint_name(index)}.q",
@@ -1366,15 +1391,8 @@ class SonicDriver:
                 )
             )
             for index in range(29)
-        ]
-        published_targets = tuple(
-            float(
-                guarded_by_index[index]
-                if index in guarded_by_index
-                else raw_targets[index]
-            )
-            for index in range(29)
         )
+        guarded_arm = None
         with self._support_lock:
             # Serialize the final DDS write with stop target freezing.  If a
             # stop wins the lock, this in-flight policy result is replaced by
@@ -1383,6 +1401,29 @@ class SonicDriver:
             # discontinuity at the actuator boundary.
             if self._safe_hold_targets is not None:
                 published_targets = self._safe_hold_targets
+            elif constrain_arms:
+                # The arm guard is actuator state too.  Run it under the same
+                # boundary lock as stop freezing, and seed it from each frozen
+                # target so a zero-ratio planner handoff cannot re-anchor to
+                # lagging measured joints.
+                guarded_arm = self._arm_guard.apply(
+                    raw_arm,
+                    measured=measured_arm,
+                    dt=control_dt_s,
+                )
+                guarded_by_index = dict(
+                    zip(range(15, 29), guarded_arm.targets, strict=True)
+                )
+                published_targets = tuple(
+                    float(
+                        guarded_by_index[index]
+                        if index in guarded_by_index
+                        else raw_targets[index]
+                    )
+                    for index in range(29)
+                )
+            else:
+                published_targets = raw_targets
             for index in range(29):
                 motor = self._msg.motor_cmd[index]
                 motor.mode = 1
@@ -1394,6 +1435,8 @@ class SonicDriver:
             self._msg.crc = self._crc.Crc(self._msg)
             self._publisher.Write(self._msg)
             self._last_published_targets = published_targets
+            if guarded_arm is None:
+                self._arm_guard.anchor(published_targets[15:29])
         self._mark_control_step_published()
         nonzero = any(abs(float(self._msg.motor_cmd[i].q)) > 1e-4 for i in range(29))
         # Legs and waist are the locomotion plant.  Tracking their commanded
@@ -1549,6 +1592,9 @@ class SonicDriver:
                 # This call, its history, and its reference cursor advance only
                 # after 20 ms of authoritative MuJoCo time.
                 policy_action = self._controller.run_step({}, lowstate)
+                self._enforce_planner_reference_deadline(
+                    simulation_now_s=control_step.tick_ms / 1_000.0
+                )
                 self.telemetry.update(
                     sonic_policy_speed_mps=(
                         max(0.0, float(self._controller.ms.speed))
