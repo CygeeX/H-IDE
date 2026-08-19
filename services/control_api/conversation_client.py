@@ -59,21 +59,39 @@ class MastraConversationClient:
 
     def route_turn(self, request: ConversationTurnRequest) -> ConversationTurnResponse:
         payload = request.model_dump(mode="json", by_alias=False, exclude_none=True)
-        try:
+
+        def post(candidate: Mapping[str, Any]):
             if self.client is None:
-                response = httpx.post(
+                return httpx.post(
                     f"{self.base_url}/internal/v2/conversation-turns",
                     headers=self._headers,
-                    json=payload,
+                    json=dict(candidate),
                     timeout=self.timeout_seconds,
                     trust_env=False,
                 )
-            else:
-                response = self.client.post(
-                    f"{self.base_url}/internal/v2/conversation-turns",
-                    headers=self._headers,
-                    json=payload,
-                )
+            return self.client.post(
+                f"{self.base_url}/internal/v2/conversation-turns",
+                headers=self._headers,
+                json=dict(candidate),
+            )
+
+        try:
+            response = post(payload)
+            # Expand-only deployment compatibility: an older Agent has a
+            # strict schema and returns 422 for the new memoryContext field.
+            # Retry once with the server-generated digest-checked summary in
+            # the legacy field; never fall back for other status codes.
+            rejects_memory_context = (
+                response.status_code == 422
+                and "memorycontext" in response.text.casefold()
+            )
+            if rejects_memory_context and request.memoryContext is not None:
+                legacy_payload = dict(payload)
+                legacy_payload.pop("memoryContext", None)
+                durable = request.memoryContext.durableSummary
+                if durable is not None:
+                    legacy_payload["summary"] = durable.text
+                response = post(legacy_payload)
             response.raise_for_status()
             raw = response.json()
         except (httpx.HTTPError, ValueError) as exc:

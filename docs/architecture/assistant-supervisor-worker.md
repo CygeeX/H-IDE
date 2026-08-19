@@ -100,8 +100,21 @@ Worker 并行生成 `PlanFragment`，结构化 Agent 再把所有 fragment 合�
 计算坐标，工具不替模型决策，也不把 PCD 当作实时占用、可达性或安全结论；工作站
 不生成路径。
 
-Mastra memory 按 `conversationId` 隔离，用于模型连续性；H-IDE SQLite 中的消息
-历史仍是权威记录，每次请求都会重新发送。两个数据库不能替代彼此。
+H-IDE SQLite 是对话业务真源。Control API 从已通过 owner/site ACL 的 conversation
+逐轮读取不可变消息，发送最近 20 条（总计不超过 40000 字符），并把更早完整轮次
+生成带 SHA-256、覆盖轮次和修订号的确定性审计摘要；每次选择的 recent message ID、
+relevant memory ID、用户输入摘要和 principal scope 都写入 expand-only audit 表。原始
+消息不因摘要、归档或软删除而删除。浏览器传入的 `memoryContext` 或旧 `summary` 不会
+透传；wire context 固定声明 `providedBy=H_IDE_SERVER` 与
+`authority=CONVERSATIONAL_ONLY`。
+
+Mastra memory 是 Agent 侧的第二份连续性缓存，按 H-IDE 派生的 principal resource
+scope + `conversationId` 隔离，不能取代 H-IDE 记录。摘要、近期历史和最多 8 条相关
+摘录始终是不可信对话数据：可帮助理解“那里”指会议桌，但常见 map/pose 坐标会在
+H-IDE 投影时省略，不能证明位置、可见性、障碍、可达性或安全。行动仍必须由 Mission
+V2、typed SceneMemory、当前视觉/定位和 Robot Agent/Nav2 重新 grounding 与校验。
+旧 Agent 若尚未声明 `memoryContext`，内部客户端只对该 422 做一次兼容重试，使用同一
+服务端摘要的旧 `summary` 字段；响应仍按新契约严格解析。
 
 ## 从 PlanProposal 到执行
 
@@ -143,9 +156,11 @@ dispatch 之前返回冲突，要求用户重新规划。
 | 审核 | `POST /assistant/drafts/{draftId}/{confirm|revise|reject}` |
 | 转写 | `POST /speech/transcriptions`（multipart WAV） |
 
-H-IDE 与 Mastra 之间只使用 `/internal/v1/planning-turns`，两边共享独立的
-`MASTRA_INTERNAL_TOKEN`。Mastra 生成的 Agent、memory 和 Studio/API 路由也受同一
-token 保护，只有 `/healthz` 和 `/readyz` 可匿名访问；该端口不得转发给浏览器。
+H-IDE 与 Mastra 之间的 Assistant V2 路由使用
+`/internal/v2/conversation-turns`，旧规划流程使用 `/internal/v1/planning-turns`；
+两边共享独立的 `MASTRA_INTERNAL_TOKEN`。Mastra 生成的 Agent、memory 和 Studio/API
+路由也受同一 token 保护，只有 `/healthz` 和 `/readyz` 可匿名访问；该端口不得转发给
+浏览器。
 
 主要轮次状态是 `queued → running → needs_input|cannot_plan|draft_ready|failed`；
 草案状态是 `draft → confirming → confirmed|failed|partial|unknown`，或由审核进入

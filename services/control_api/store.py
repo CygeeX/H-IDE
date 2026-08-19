@@ -15,6 +15,7 @@ from pathlib import Path
 import sqlite3
 import threading
 from typing import Any, Iterable, Mapping
+import uuid
 
 from pydantic import BaseModel
 
@@ -568,6 +569,57 @@ class SQLiteStore:
                     """
                     CREATE INDEX assistant_conversations_lifecycle_updated_idx
                         ON assistant_conversations(deleted_at, archived_at, updated_at DESC)
+                    """,
+                ),
+            ),
+            (
+                4,
+                "assistant_v2_server_owned_conversation_memory",
+                (
+                    """
+                    CREATE TABLE assistant_conversation_summaries (
+                        conversation_id TEXT NOT NULL,
+                        summary_revision INTEGER NOT NULL,
+                        summary_id TEXT NOT NULL,
+                        summary_text TEXT NOT NULL,
+                        covered_through_turn INTEGER NOT NULL,
+                        generated_at TEXT NOT NULL,
+                        method TEXT NOT NULL
+                            CHECK(method IN ('SERVER_COMPACTION', 'OPERATOR_APPROVED')),
+                        content_sha256 TEXT NOT NULL,
+                        source_sha256 TEXT NOT NULL,
+                        source_message_ids_json TEXT NOT NULL DEFAULT '[]',
+                        created_at TEXT NOT NULL,
+                        PRIMARY KEY(conversation_id, summary_revision),
+                        FOREIGN KEY(conversation_id)
+                            REFERENCES assistant_conversations(conversation_id)
+                    )
+                    """,
+                    """
+                    CREATE UNIQUE INDEX assistant_conversation_summary_identity_uq
+                        ON assistant_conversation_summaries(conversation_id, summary_id,
+                            summary_revision)
+                    """,
+                    """
+                    CREATE TABLE assistant_conversation_memory_audits (
+                        audit_id TEXT PRIMARY KEY,
+                        conversation_id TEXT NOT NULL,
+                        context_revision INTEGER NOT NULL,
+                        resource_id TEXT NOT NULL,
+                        summary_revision INTEGER,
+                        recent_message_ids_json TEXT NOT NULL DEFAULT '[]',
+                        selected_memory_ids_json TEXT NOT NULL DEFAULT '[]',
+                        query_sha256 TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        UNIQUE(conversation_id, context_revision),
+                        FOREIGN KEY(conversation_id)
+                            REFERENCES assistant_conversations(conversation_id)
+                    )
+                    """,
+                    """
+                    CREATE INDEX assistant_conversation_memory_audit_time_idx
+                        ON assistant_conversation_memory_audits(
+                            conversation_id, created_at, audit_id)
                     """,
                 ),
             ),
@@ -1751,6 +1803,184 @@ class SQLiteStore:
                 "modality": row["modality"],
                 "transcriptionId": row["transcription_id"],
                 "createdAt": row["created_at"],
+            }
+            for row in rows
+        ]
+
+    @staticmethod
+    def _assistant_conversation_summary_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "summaryId": str(row["summary_id"]),
+            "revision": int(row["summary_revision"]),
+            "text": str(row["summary_text"]),
+            "coveredThroughTurn": int(row["covered_through_turn"]),
+            "generatedAt": str(row["generated_at"]),
+            "method": str(row["method"]),
+            "contentSha256": str(row["content_sha256"]),
+            "sourceSha256": str(row["source_sha256"]),
+            "sourceMessageIds": _decode(row["source_message_ids_json"]),
+            "createdAt": str(row["created_at"]),
+        }
+
+    def get_assistant_conversation_summary(
+        self,
+        conversation_id: str,
+    ) -> dict[str, Any] | None:
+        """Return the newest append-only H-IDE summary revision."""
+
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM assistant_conversation_summaries "
+                "WHERE conversation_id = ? ORDER BY summary_revision DESC LIMIT 1",
+                (conversation_id,),
+            ).fetchone()
+        return None if row is None else self._assistant_conversation_summary_row(row)
+
+    def record_assistant_conversation_memory_context(
+        self,
+        conversation_id: str,
+        *,
+        resource_id: str,
+        query_sha256: str,
+        recent_message_ids: Iterable[str],
+        selected_memory_ids: Iterable[str],
+        summary: Mapping[str, Any] | None,
+        source_sha256: str | None = None,
+        source_message_ids: Iterable[str] = (),
+    ) -> dict[str, Any]:
+        """Append one summary revision when needed and one context-use audit.
+
+        Raw messages are never rewritten or deleted.  A summary is another
+        append-only audit projection of those messages, while every request to
+        the internal conversation router receives a monotonically increasing
+        context revision scoped to this H-IDE conversation.
+        """
+
+        recent_ids = [str(value) for value in recent_message_ids]
+        selected_ids = [str(value) for value in selected_memory_ids]
+        source_ids = [str(value) for value in source_message_ids]
+        now = self._now()
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                conversation = self._connection.execute(
+                    "SELECT conversation_id FROM assistant_conversations "
+                    "WHERE conversation_id = ?",
+                    (conversation_id,),
+                ).fetchone()
+                if conversation is None:
+                    raise ValueError("assistant conversation not found")
+
+                latest = self._connection.execute(
+                    "SELECT * FROM assistant_conversation_summaries "
+                    "WHERE conversation_id = ? "
+                    "ORDER BY summary_revision DESC LIMIT 1",
+                    (conversation_id,),
+                ).fetchone()
+                if summary is not None:
+                    candidate_coverage = int(summary["coveredThroughTurn"])
+                    candidate_source = str(source_sha256 or "")
+                    should_append = latest is None or (
+                        candidate_coverage >= int(latest["covered_through_turn"])
+                        and (
+                            candidate_coverage > int(latest["covered_through_turn"])
+                            or candidate_source != str(latest["source_sha256"])
+                        )
+                    )
+                    if should_append:
+                        summary_revision = (
+                            1 if latest is None else int(latest["summary_revision"]) + 1
+                        )
+                        self._connection.execute(
+                            "INSERT INTO assistant_conversation_summaries("
+                            "conversation_id, summary_revision, summary_id, summary_text, "
+                            "covered_through_turn, generated_at, method, content_sha256, "
+                            "source_sha256, source_message_ids_json, created_at"
+                            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            (
+                                conversation_id,
+                                summary_revision,
+                                str(summary["summaryId"]),
+                                str(summary["text"]),
+                                candidate_coverage,
+                                str(summary["generatedAt"]),
+                                str(summary["method"]),
+                                str(summary["contentSha256"]),
+                                candidate_source,
+                                _encode(source_ids),
+                                now,
+                            ),
+                        )
+                        latest = self._connection.execute(
+                            "SELECT * FROM assistant_conversation_summaries "
+                            "WHERE conversation_id = ? AND summary_revision = ?",
+                            (conversation_id, summary_revision),
+                        ).fetchone()
+
+                revision_row = self._connection.execute(
+                    "SELECT COALESCE(MAX(context_revision), 0) AS revision "
+                    "FROM assistant_conversation_memory_audits WHERE conversation_id = ?",
+                    (conversation_id,),
+                ).fetchone()
+                context_revision = int(revision_row["revision"]) + 1
+                audit_id = f"conversation-memory-audit-{uuid.uuid4().hex}"
+                self._connection.execute(
+                    "INSERT INTO assistant_conversation_memory_audits("
+                    "audit_id, conversation_id, context_revision, resource_id, "
+                    "summary_revision, recent_message_ids_json, "
+                    "selected_memory_ids_json, query_sha256, created_at"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        audit_id,
+                        conversation_id,
+                        context_revision,
+                        resource_id,
+                        None if latest is None else int(latest["summary_revision"]),
+                        _encode(recent_ids),
+                        _encode(selected_ids),
+                        query_sha256,
+                        now,
+                    ),
+                )
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+        return {
+            "auditId": audit_id,
+            "contextRevision": context_revision,
+            "summary": (
+                None
+                if latest is None
+                else self._assistant_conversation_summary_row(latest)
+            ),
+        }
+
+    def list_assistant_conversation_memory_audits(
+        self,
+        conversation_id: str,
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM assistant_conversation_memory_audits "
+                "WHERE conversation_id = ? ORDER BY context_revision",
+                (conversation_id,),
+            ).fetchall()
+        return [
+            {
+                "auditId": str(row["audit_id"]),
+                "conversationId": str(row["conversation_id"]),
+                "contextRevision": int(row["context_revision"]),
+                "resourceId": str(row["resource_id"]),
+                "summaryRevision": (
+                    None
+                    if row["summary_revision"] is None
+                    else int(row["summary_revision"])
+                ),
+                "recentMessageIds": _decode(row["recent_message_ids_json"]),
+                "selectedMemoryIds": _decode(row["selected_memory_ids_json"]),
+                "querySha256": str(row["query_sha256"]),
+                "createdAt": str(row["created_at"]),
             }
             for row in rows
         ]

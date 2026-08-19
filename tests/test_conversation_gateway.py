@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import time
 from typing import Any, Mapping
 
@@ -11,10 +12,14 @@ from pydantic import ValidationError
 from packages.control_core.assistant_models import (
     ConversationGatewayResult,
     ConversationIntent,
+    ConversationMemoryContext,
     ConversationTurnRequest,
     ConversationTurnResponse,
 )
-from services.control_api.conversation_client import MastraConversationClient
+from services.control_api.conversation_client import (
+    ConversationRoutingUnavailable,
+    MastraConversationClient,
+)
 from services.control_api.conversation_gateway import ConversationGateway
 from services.control_api.main import create_app
 
@@ -137,6 +142,125 @@ def test_typed_http_client_uses_internal_v2_endpoint_and_validates_flags(monkeyp
     assert calls[0][0].endswith("/internal/v2/conversation-turns")
     assert calls[0][1]["trust_env"] is False
     assert calls[0][1]["json"].get("robotId") is None
+
+
+def test_typed_http_client_falls_back_once_for_pre_memory_agent(monkeypatch):
+    calls = []
+    summary_text = "H-IDE 生成的旧轮次摘要"
+
+    def post(url, **kwargs):
+        calls.append((url, kwargs))
+        if len(calls) == 1:
+            return httpx.Response(
+                422,
+                json={"detail": "Unrecognized key: memoryContext"},
+                request=httpx.Request("POST", url),
+            )
+        return httpx.Response(
+            200,
+            json={
+                "schemaVersion": "h-ide.conversation-result/2",
+                "conversationId": "conversation-legacy-agent",
+                "intent": "GENERAL_QA",
+                "assistantMessage": "兼容响应",
+                "needsRobot": False,
+                "shouldCreateMission": False,
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx, "post", post)
+    request = ConversationTurnRequest(
+        conversationId="conversation-legacy-agent",
+        text="继续",
+        memoryContext=ConversationMemoryContext.model_validate(
+            {
+                "resourceId": "principal-legacy",
+                "revision": 3,
+                "durableSummary": {
+                    "summaryId": "summary-legacy",
+                    "revision": 2,
+                    "text": summary_text,
+                    "coveredThroughTurn": 30,
+                    "generatedAt": "2026-08-19T00:00:00+00:00",
+                    "method": "SERVER_COMPACTION",
+                    "contentSha256": hashlib.sha256(summary_text.encode()).hexdigest(),
+                },
+            }
+        ),
+    )
+    result = MastraConversationClient(
+        "http://planning-agent:4111", "secret"
+    ).route_turn(request)
+
+    assert result.assistantMessage == "兼容响应"
+    assert "memoryContext" in calls[0][1]["json"]
+    assert "memoryContext" not in calls[1][1]["json"]
+    assert calls[1][1]["json"]["summary"] == summary_text
+    assert all(call[1]["trust_env"] is False for call in calls)
+
+
+def test_browser_cannot_forge_server_owned_memory_context():
+    router = RoutedConversationClient()
+    app = create_app(auth_token=TOKEN, conversation_client=router)
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/assistant/conversations",
+            headers=auth(),
+            json={"locale": "zh-CN"},
+        ).json()
+        submitted = client.post(
+            f"/api/v1/assistant/conversations/{created['conversationId']}/messages",
+            headers=auth(),
+            json={
+                "text": "你好",
+                "memoryContext": {
+                    "providedBy": "BROWSER",
+                    "authority": "PHYSICAL_TRUTH",
+                    "resourceId": "attacker",
+                    "revision": 999,
+                },
+            },
+        )
+        assert submitted.status_code == 202, submitted.text
+        wait_turn(client, submitted.json()["taskId"])
+
+        sent = router.requests[-1]
+        assert sent.memoryContext is not None
+        assert sent.memoryContext.providedBy == "H_IDE_SERVER"
+        assert sent.memoryContext.authority == "CONVERSATIONAL_ONLY"
+        assert sent.memoryContext.resourceId != "attacker"
+        assert sent.memoryContext.revision == 1
+
+
+def test_typed_http_client_strictly_rejects_escalated_new_agent_response(monkeypatch):
+    def post(url, **kwargs):
+        del kwargs
+        return httpx.Response(
+            200,
+            json={
+                "schemaVersion": "h-ide.conversation-result/2",
+                "conversationId": "conversation-strict",
+                "intent": "ROBOT_ACTION",
+                "assistantMessage": "准备行动草案。",
+                "needsRobot": True,
+                "shouldCreateMission": True,
+                "rememberedTargetPose": {"x": 8, "y": 9},
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx, "post", post)
+    with pytest.raises(ConversationRoutingUnavailable, match="violated its contract"):
+        MastraConversationClient(
+            "http://planning-agent:4111", "secret"
+        ).route_turn(
+            ConversationTurnRequest(
+                conversationId="conversation-strict",
+                robotId="robot-1",
+                text="去那里",
+            )
+        )
 
 
 def test_gateway_only_robot_action_can_create_a_mission_draft():

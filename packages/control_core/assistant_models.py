@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
+import hashlib
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -72,6 +73,94 @@ class ConversationHistoryMessage(AssistantContract):
         return non_empty_id(value, "content")
 
 
+class ConversationDurableSummary(AssistantContract):
+    """Auditable H-IDE-owned conversational summary.
+
+    The digest makes accidental/cross-row summary substitution fail before the
+    internal Agent boundary.  The summary is conversational context only; it
+    is deliberately not a scene, localization, or safety contract.
+    """
+
+    summaryId: str = Field(min_length=1, max_length=160)
+    revision: int = Field(ge=0)
+    text: str = Field(min_length=1, max_length=12000)
+    coveredThroughTurn: int = Field(ge=0)
+    generatedAt: datetime
+    method: Literal["SERVER_COMPACTION", "OPERATOR_APPROVED"]
+    contentSha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("summaryId", "text")
+    @classmethod
+    def _strings(cls, value: str, info):
+        return non_empty_id(value, info.field_name)
+
+    @field_validator("generatedAt")
+    @classmethod
+    def _generated_at(cls, value: datetime) -> datetime:
+        return as_utc(value)
+
+    @model_validator(mode="after")
+    def _digest_matches_text(self):
+        digest = hashlib.sha256(self.text.encode("utf-8")).hexdigest()
+        if digest != self.contentSha256:
+            raise ValueError("durable summary digest does not match its text")
+        return self
+
+
+class ConversationMemorySnippet(AssistantContract):
+    memoryId: str = Field(min_length=1, max_length=160)
+    kind: Literal[
+        "USER_PREFERENCE",
+        "CONVERSATION_FACT",
+        "PRIOR_DECISION",
+        "ONGOING_TOPIC",
+        "CONVERSATION_EXCERPT",
+    ]
+    text: str = Field(min_length=1, max_length=2000)
+    recordedAt: datetime
+    sourceTurn: int | None = Field(default=None, ge=0)
+    relevanceScore: float | None = Field(default=None, ge=0, le=1)
+
+    @field_validator("memoryId", "text")
+    @classmethod
+    def _strings(cls, value: str, info):
+        return non_empty_id(value, info.field_name)
+
+    @field_validator("recordedAt")
+    @classmethod
+    def _recorded_at(cls, value: datetime) -> datetime:
+        return as_utc(value)
+
+
+class ConversationMemoryContext(AssistantContract):
+    """Server-selected, non-physical context for conversation continuity."""
+
+    schemaVersion: Literal["h-ide.conversation-memory-context/1"] = (
+        "h-ide.conversation-memory-context/1"
+    )
+    providedBy: Literal["H_IDE_SERVER"] = "H_IDE_SERVER"
+    authority: Literal["CONVERSATIONAL_ONLY"] = "CONVERSATIONAL_ONLY"
+    resourceId: str = Field(min_length=1, max_length=160)
+    revision: int = Field(ge=0)
+    durableSummary: ConversationDurableSummary | None = None
+    relevantMemories: list[ConversationMemorySnippet] = Field(
+        default_factory=list,
+        max_length=8,
+    )
+
+    @field_validator("resourceId")
+    @classmethod
+    def _resource_id(cls, value: str) -> str:
+        return non_empty_id(value, "resourceId")
+
+    @field_validator("relevantMemories")
+    @classmethod
+    def _memory_budget(cls, value):
+        if sum(len(item.text) for item in value) > 12000:
+            raise ValueError("relevant memory snippets exceed the 12000 character budget")
+        return FrozenList(value)
+
+
 class ConversationTurnRequest(AssistantContract):
     """Bounded request sent from the H-IDE gateway to the routing Agent."""
 
@@ -81,7 +170,10 @@ class ConversationTurnRequest(AssistantContract):
     locale: str = Field(default="zh-CN", min_length=2, max_length=35)
     text: str = Field(min_length=1, max_length=8000)
     history: list[ConversationHistoryMessage] = Field(default_factory=list, max_length=20)
+    # Compatibility only. New H-IDE servers build memoryContext from their
+    # persisted transcript; browser-provided summaries are never forwarded.
     summary: str | None = Field(default=None, min_length=1, max_length=12000)
+    memoryContext: ConversationMemoryContext | None = None
 
     @field_validator("conversationId", "robotId", "locale", "text", "summary")
     @classmethod
@@ -91,6 +183,8 @@ class ConversationTurnRequest(AssistantContract):
     @field_validator("history")
     @classmethod
     def _history(cls, value):
+        if sum(len(item.content) for item in value) > 40000:
+            raise ValueError("recent conversation history exceeds the 40000 character budget")
         return FrozenList(value)
 
 
@@ -501,9 +595,12 @@ __all__ = [
     "AssistantTurnEvent",
     "AssistantContract",
     "CannotPlanResult",
+    "ConversationDurableSummary",
     "ConversationGatewayResult",
     "ConversationHistoryMessage",
     "ConversationIntent",
+    "ConversationMemoryContext",
+    "ConversationMemorySnippet",
     "ConversationMessage",
     "ConversationRole",
     "ConversationRoute",

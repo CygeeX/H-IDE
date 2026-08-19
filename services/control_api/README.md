@@ -76,8 +76,13 @@ configured.
   /api/v1/assistant/turns/{taskId}` polls the durable result, `GET .../events`
   returns ordered event-compatible output, and the per-turn visual-evidence
   proxy keeps the Vision credential out of the browser. Full message history is
-  retained locally while Mastra receives only the bounded recent window plus
-  an optional server-owned summary. Conversation display names and recoverable
+  the H-IDE business source of truth. Mastra receives only a server-assembled
+  window of at most 20 messages, an append-only digest-checked summary and at
+  most eight relevant conversational excerpts. Every context selection has a
+  durable revision/audit row; browser `memoryContext` values are ignored and
+  remembered map/pose coordinates are redacted before routing or Mission
+  history. This context may resolve semantic pronouns but has no scene,
+  localization, reachability, or safety authority. Conversation display names and recoverable
   lifecycle state are managed with `PATCH
   /api/v1/assistant/conversations/{conversationId}` (`title`, `archived`, and
   `deleted`). `DELETE` writes the same deletion tombstone and never physically

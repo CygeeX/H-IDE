@@ -93,11 +93,16 @@ def test_auth_migration_is_expand_only_versioned_and_idempotent(tmp_path) -> Non
             "name": "assistant_v2_conversation_lifecycle",
             "appliedAt": migrations[2]["appliedAt"],
         },
+        {
+            "version": 4,
+            "name": "assistant_v2_server_owned_conversation_memory",
+            "appliedAt": migrations[3]["appliedAt"],
+        },
     ]
     first.close()
 
     reopened = SQLiteStore(str(db_path))
-    assert len(reopened.schema_migrations()) == 3
+    assert len(reopened.schema_migrations()) == 4
     assert reopened.get_robot("legacy-robot")["sentinel"] == "preserved"
     tables = {
         row[0]
@@ -112,6 +117,8 @@ def test_auth_migration_is_expand_only_versioned_and_idempotent(tmp_path) -> Non
         "login_audits",
         "resource_acl",
         "assistant_turn_events",
+        "assistant_conversation_summaries",
+        "assistant_conversation_memory_audits",
     } <= tables
     reopened.close()
 

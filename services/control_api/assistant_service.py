@@ -35,6 +35,7 @@ from packages.control_core.validation import non_empty_id
 
 from .planning_client import PlanningClient
 from .conversation_gateway import ConversationGateway
+from .conversation_memory import ConversationMemoryContextBuilder
 from .scene_client import SceneContextClient, SceneContextUnavailable
 from .store import (
     AssistantConversationConflict,
@@ -85,6 +86,7 @@ class AssistantService:
         self.scene_context_client = scene_context_client
         self.draft_ttl_seconds = draft_ttl_seconds
         self.conversation_gateway = conversation_gateway
+        self.conversation_memory = ConversationMemoryContextBuilder(store)
         self._threads: dict[str, threading.Thread] = {}
         self._threads_lock = threading.Lock()
         self.store.recover_active_assistant_turns()
@@ -203,7 +205,6 @@ class AssistantService:
                     "locale": body.get("locale", conversation["locale"]),
                     "text": text,
                     "history": [],
-                    "summary": conversation.get("summary"),
                 }
             )
             task_id = _new_id("task")
@@ -333,21 +334,19 @@ class AssistantService:
             conversation = self.store.get_assistant_conversation(conversation_id)
             if conversation is None:
                 raise AssistantNotFound("assistant conversation not found")
-            messages = self.store.list_assistant_messages(conversation_id)
-            prior_messages = [item for item in messages if item.get("taskId") != task_id]
-            recent_history = [
-                {"role": item["role"], "content": item["content"]}
-                for item in prior_messages
-                if item.get("role") in {"user", "assistant"}
-            ][-20:]
+            prepared_memory = self.conversation_memory.prepare(
+                conversation_id,
+                str(raw_request.get("text") or ""),
+                exclude_task_id=task_id,
+            )
             route_request = ConversationTurnRequest.model_validate(
                 {
                     "conversationId": conversation_id,
                     "robotId": conversation.get("robotId"),
                     "locale": raw_request.get("locale", conversation["locale"]),
                     "text": raw_request.get("text"),
-                    "history": recent_history,
-                    "summary": conversation.get("summary"),
+                    "history": list(prepared_memory.history),
+                    "memoryContext": prepared_memory.memory_context,
                 }
             )
             gateway = self.conversation_gateway
@@ -358,7 +357,7 @@ class AssistantService:
                 request=route_request,
                 requested_by=str(conversation["requestedBy"]),
                 modality=str(raw_request.get("modality") or "text"),
-                mission_history=recent_history,
+                mission_history=list(prepared_memory.mission_history),
             )
             if self.store.is_assistant_turn_cancelled(task_id):
                 return
