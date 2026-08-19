@@ -32,6 +32,7 @@ from .planner_evidence import (
     PlannerReferenceDeadlineExceeded,
     PlannerReferenceEvidenceGate,
 )
+from .reference_authority import ReferenceAuthorityState
 from .runtime_diagnostics import SonicRuntimeDiagnostics
 from .safety import (
     CmdVelGuard,
@@ -402,6 +403,8 @@ class SonicDriver:
         self._last_published_targets: tuple[float, ...] | None = None
         self._safe_hold_targets: tuple[float, ...] | None = None
         self._support_lock = threading.RLock()
+        self._reference_authority = ReferenceAuthorityState()
+        self._dds_target_sequence = 0
 
         # These imports are intentionally lazy: `check` and safety tests must
         # work without ROS/Unitree SDK/ONNX installed.
@@ -1903,6 +1906,7 @@ class SonicDriver:
                 static_hold_active = self._static_hold_active
                 navigation_task_active = self._navigation_task_active
                 nav2_command_zero = self.guard.command_zero
+                authority = self._reference_authority.snapshot
             terminal_fault = self._fault_latched.is_set()
             motion_ready = (
                 not terminal_fault
@@ -1946,6 +1950,25 @@ class SonicDriver:
                 "navigation_task_active": navigation_task_active,
                 "motion_authorized": motion_authorized,
                 "nav2_command_zero": nav2_command_zero,
+                "matched_reference_actuator_authority": (
+                    authority.actuator_authority
+                ),
+                "reference_authority_state": authority.phase,
+                "reference_authority_generation": authority.generation,
+                "reference_authority_source_sequence": authority.source_sequence,
+                "reference_authority_intent_generation": (
+                    authority.planner_intent_generation
+                ),
+                "reference_authority_epoch": authority.reference_epoch,
+                "reference_authority_granted_at_monotonic_s": (
+                    authority.granted_at_monotonic_s
+                ),
+                "reference_authority_granted_tick_ms": (
+                    authority.granted_at_tick_ms
+                ),
+                "reference_authority_dds_target_sequence": (
+                    authority.dds_target_sequence
+                ),
             }
         if payload.get("type") == "plant_support_state":
             if payload.get("schema_version") != "h-ide.plant-support-state/v1":

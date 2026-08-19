@@ -65,6 +65,29 @@ def test_reference_authority_revoke_clears_grant_but_preserves_diagnostic_identi
     assert revoked.dds_target_sequence is None
 
 
+def test_duplicate_require_cannot_withdraw_primed_or_granted_authority() -> None:
+    state = ReferenceAuthorityState()
+    state.require(generation=7, source_sequence=12)
+    state.mark_installed(
+        generation=7,
+        source_sequence=12,
+        planner_intent_generation=5,
+        reference_epoch=2,
+    )
+    primed = state.prime(generation=7, source_sequence=12, reference_epoch=2)
+    assert state.require(generation=7, source_sequence=12) is primed
+    granted = state.grant(
+        generation=7,
+        source_sequence=12,
+        reference_epoch=2,
+        granted_at_monotonic_s=4.0,
+        granted_at_tick_ms=400,
+        dds_target_sequence=9,
+    )
+    assert state.require(generation=7, source_sequence=12) is granted
+    assert state.snapshot.actuator_authority is True
+
+
 def test_reference_authority_rejects_stale_identity_epoch_and_early_grant() -> None:
     state = ReferenceAuthorityState()
     state.require(generation=3, source_sequence=10)

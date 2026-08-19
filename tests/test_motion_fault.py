@@ -61,6 +61,15 @@ def health_response(
     navigation_task_active: bool = False,
     motion_authorized: bool = True,
     nav2_command_zero: bool = True,
+    matched_reference_actuator_authority: bool = False,
+    reference_authority_state: str = "REVOKED",
+    reference_authority_generation: int | None = None,
+    reference_authority_source_sequence: int | None = None,
+    reference_authority_intent_generation: int | None = None,
+    reference_authority_epoch: int = 0,
+    reference_authority_granted_at_monotonic_s: float | None = None,
+    reference_authority_granted_tick_ms: int | None = None,
+    reference_authority_dds_target_sequence: int | None = None,
 ) -> dict[str, object]:
     return {
         "request_id": str(REQUEST_ID),
@@ -81,6 +90,19 @@ def health_response(
         "navigation_task_active": navigation_task_active,
         "motion_authorized": motion_authorized,
         "nav2_command_zero": nav2_command_zero,
+        "matched_reference_actuator_authority": matched_reference_actuator_authority,
+        "reference_authority_state": reference_authority_state,
+        "reference_authority_generation": reference_authority_generation,
+        "reference_authority_source_sequence": reference_authority_source_sequence,
+        "reference_authority_intent_generation": reference_authority_intent_generation,
+        "reference_authority_epoch": reference_authority_epoch,
+        "reference_authority_granted_at_monotonic_s": (
+            reference_authority_granted_at_monotonic_s
+        ),
+        "reference_authority_granted_tick_ms": reference_authority_granted_tick_ms,
+        "reference_authority_dds_target_sequence": (
+            reference_authority_dds_target_sequence
+        ),
     }
 
 
@@ -380,6 +402,54 @@ def test_sonic_probe_contract_and_health_classification_are_strict() -> None:
             },
             expected_request_id=REQUEST_ID,
             expected_robot_id="g1-sim",
+        )
+
+
+def test_health_exposes_only_first_dds_grant_as_reference_actuator_authority() -> None:
+    primed = parse_health(
+        navigation_task_active=True,
+        motion_authorized=True,
+        nav2_command_zero=False,
+        reference_authority_state="PRIMED",
+        reference_authority_generation=42,
+        reference_authority_source_sequence=7,
+        reference_authority_intent_generation=3,
+        reference_authority_epoch=2,
+    )
+    assert primed.matched_reference_actuator_authority is False
+
+    granted = parse_health(
+        navigation_task_active=True,
+        motion_authorized=True,
+        nav2_command_zero=False,
+        matched_reference_actuator_authority=True,
+        reference_authority_state="GRANTED",
+        reference_authority_generation=42,
+        reference_authority_source_sequence=7,
+        reference_authority_intent_generation=3,
+        reference_authority_epoch=2,
+        reference_authority_granted_at_monotonic_s=100.25,
+        reference_authority_granted_tick_ms=2500,
+        reference_authority_dds_target_sequence=11,
+    )
+    assert granted.matched_reference_actuator_authority is True
+    assert granted.reference_authority_state == "GRANTED"
+    assert granted.reference_authority_dds_target_sequence == 11
+
+    with pytest.raises(ValueError, match="flag and reference authority state"):
+        parse_health(
+            navigation_task_active=True,
+            motion_authorized=True,
+            nav2_command_zero=False,
+            matched_reference_actuator_authority=True,
+            reference_authority_state="PRIMED",
+            reference_authority_generation=42,
+            reference_authority_source_sequence=7,
+            reference_authority_intent_generation=3,
+            reference_authority_epoch=2,
+            reference_authority_granted_at_monotonic_s=100.25,
+            reference_authority_granted_tick_ms=2500,
+            reference_authority_dds_target_sequence=11,
         )
 
 

@@ -17,6 +17,7 @@ from typing import Any, Callable, Mapping
 from uuid import UUID, uuid4
 
 from .gait_adapter import GaitState
+from .reference_authority import REFERENCE_AUTHORITY_PHASES
 
 
 MOTION_FAULT_SCHEMA_VERSION = "h-ide.motion-safety-fault/v1"
@@ -89,6 +90,15 @@ _HEALTH_RESPONSE_FIELDS = frozenset(
         "navigation_task_active",
         "motion_authorized",
         "nav2_command_zero",
+        "matched_reference_actuator_authority",
+        "reference_authority_state",
+        "reference_authority_generation",
+        "reference_authority_source_sequence",
+        "reference_authority_intent_generation",
+        "reference_authority_epoch",
+        "reference_authority_granted_at_monotonic_s",
+        "reference_authority_granted_tick_ms",
+        "reference_authority_dds_target_sequence",
     }
 )
 _PLANT_SUPPORT_MODES = frozenset(
@@ -433,6 +443,15 @@ class SonicHealth:
     navigation_task_active: bool
     motion_authorized: bool
     nav2_command_zero: bool
+    matched_reference_actuator_authority: bool
+    reference_authority_state: str
+    reference_authority_generation: int | None
+    reference_authority_source_sequence: int | None
+    reference_authority_intent_generation: int | None
+    reference_authority_epoch: int
+    reference_authority_granted_at_monotonic_s: float | None
+    reference_authority_granted_tick_ms: int | None
+    reference_authority_dds_target_sequence: int | None
 
     @property
     def confirmed_safe_hold(self) -> bool:
@@ -485,6 +504,7 @@ class SonicHealth:
             "navigation_task_active",
             "motion_authorized",
             "nav2_command_zero",
+            "matched_reference_actuator_authority",
         )
         if not all(isinstance(value.get(field), bool) for field in boolean_fields):
             raise ValueError("SONIC health response flags must be booleans")
@@ -545,6 +565,83 @@ class SonicHealth:
         motion_authorized = value["motion_authorized"]
         navigation_task_active = value["navigation_task_active"]
         nav2_command_zero = value["nav2_command_zero"]
+        actuator_authority = value["matched_reference_actuator_authority"]
+        authority_state = value.get("reference_authority_state")
+        if (
+            not isinstance(authority_state, str)
+            or authority_state not in REFERENCE_AUTHORITY_PHASES
+        ):
+            raise ValueError("SONIC reference authority state is invalid")
+
+        def optional_integer(field: str, *, minimum: int) -> int | None:
+            raw = value.get(field)
+            if raw is None:
+                return None
+            if isinstance(raw, bool) or not isinstance(raw, int) or raw < minimum:
+                raise ValueError(f"{field} must be an integer >= {minimum} or null")
+            return raw
+
+        authority_generation = optional_integer(
+            "reference_authority_generation", minimum=0
+        )
+        authority_source_sequence = optional_integer(
+            "reference_authority_source_sequence", minimum=1
+        )
+        authority_intent_generation = optional_integer(
+            "reference_authority_intent_generation", minimum=1
+        )
+        authority_epoch = optional_integer("reference_authority_epoch", minimum=0)
+        if authority_epoch is None:
+            raise ValueError("reference_authority_epoch must not be null")
+        authority_granted_tick = optional_integer(
+            "reference_authority_granted_tick_ms", minimum=0
+        )
+        authority_dds_sequence = optional_integer(
+            "reference_authority_dds_target_sequence", minimum=1
+        )
+        raw_granted_at = value.get("reference_authority_granted_at_monotonic_s")
+        authority_granted_at: float | None
+        if raw_granted_at is None:
+            authority_granted_at = None
+        elif isinstance(raw_granted_at, bool):
+            raise ValueError(
+                "reference_authority_granted_at_monotonic_s must be finite and non-negative"
+            )
+        else:
+            try:
+                authority_granted_at = float(raw_granted_at)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "reference_authority_granted_at_monotonic_s must be finite and non-negative"
+                ) from exc
+            if not math.isfinite(authority_granted_at) or authority_granted_at < 0:
+                raise ValueError(
+                    "reference_authority_granted_at_monotonic_s must be finite and non-negative"
+                )
+        grant_evidence = (
+            authority_granted_at,
+            authority_granted_tick,
+            authority_dds_sequence,
+        )
+        if actuator_authority != (authority_state == "GRANTED"):
+            raise ValueError(
+                "SONIC actuator authority flag and reference authority state disagree"
+            )
+        if actuator_authority:
+            if (
+                authority_generation is None
+                or authority_source_sequence is None
+                or authority_intent_generation is None
+                or authority_epoch <= 0
+                or any(item is None for item in grant_evidence)
+            ):
+                raise ValueError(
+                    "granted SONIC reference authority lacks correlation evidence"
+                )
+        elif any(item is not None for item in grant_evidence):
+            raise ValueError(
+                "non-granted SONIC reference authority carries stale DDS grant evidence"
+            )
         if support_latched and motion_authorized:
             raise ValueError(
                 "SONIC health response cannot authorize motion while support is latched"
@@ -556,6 +653,16 @@ class SonicHealth:
         if navigation_task_active and nav2_command_zero:
             raise ValueError(
                 "SONIC health response active task must carry a non-zero Nav2 command"
+            )
+        if actuator_authority and (
+            support_latched
+            or support_pending
+            or not motion_authorized
+            or not navigation_task_active
+            or nav2_command_zero
+        ):
+            raise ValueError(
+                "matched reference actuator authority conflicts with the safety snapshot"
             )
         return cls(
             request_id=request_id,
@@ -574,6 +681,15 @@ class SonicHealth:
             navigation_task_active=navigation_task_active,
             motion_authorized=motion_authorized,
             nav2_command_zero=nav2_command_zero,
+            matched_reference_actuator_authority=actuator_authority,
+            reference_authority_state=authority_state,
+            reference_authority_generation=authority_generation,
+            reference_authority_source_sequence=authority_source_sequence,
+            reference_authority_intent_generation=authority_intent_generation,
+            reference_authority_epoch=authority_epoch,
+            reference_authority_granted_at_monotonic_s=authority_granted_at,
+            reference_authority_granted_tick_ms=authority_granted_tick,
+            reference_authority_dds_target_sequence=authority_dds_sequence,
         )
 
 

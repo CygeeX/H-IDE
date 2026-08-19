@@ -22,6 +22,7 @@ from hide_mujoco_sonic.planner_evidence import (
     PlannerReferenceDeadlineExceeded,
     PlannerReferenceEvidenceGate,
 )
+from hide_mujoco_sonic.reference_authority import ReferenceAuthorityState
 from hide_mujoco_sonic.safety import (
     MovementIntent,
     PlantControlClock,
@@ -355,6 +356,8 @@ def bare_driver(clock: Clock) -> SonicDriver:
     driver._lowstate_stall_timeout_s = 1.0
     driver._stop = threading.Event()
     driver._support_lock = threading.RLock()
+    driver._reference_authority = ReferenceAuthorityState()
+    driver._dds_target_sequence = 0
     driver._plant_support_mode = "idle"
     driver._plant_support_stop_pending = False
     driver._plant_support_safety_latched = False

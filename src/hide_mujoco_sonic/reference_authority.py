@@ -98,6 +98,15 @@ class ReferenceAuthorityState:
         )
         previous = self._snapshot
         if (
+            previous.generation == generation
+            and previous.source_sequence == source_sequence
+            and previous.phase != "REVOKED"
+        ):
+            # Replayed/periodic envelopes for the same admitted intent are
+            # idempotent.  They cannot withdraw an installed or already-granted
+            # reference and restart its planner deadline.
+            return previous
+        if (
             previous.generation is not None
             and generation == previous.generation
             and previous.source_sequence is not None
