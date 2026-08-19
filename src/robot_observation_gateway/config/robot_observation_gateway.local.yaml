@@ -4,9 +4,10 @@ identity:
   robot_id: g1-dev
 
 transport:
-  # H-IDE's container keeps the plaintext gRPC listener on loopback; the
-  # workstation integration relay exposes it on this loopback-only port.
-  target: 127.0.0.1:50062
+  # Local development connects directly to the host Qwen/SAM2 Vision ingress.
+  # Port 50062 is reserved for a future explicit relay and must not be selected
+  # unless that relay is actually configured and health-checked.
+  target: 127.0.0.1:50061
   reconnect_initial_ms: 250
   reconnect_max_ms: 5000
   connect_timeout_ms: 5000
