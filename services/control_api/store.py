@@ -3882,6 +3882,13 @@ class SQLiteStore:
                         site_id=site_id,
                         now=now,
                     )
+                    self._bind_resource_owner_locked(
+                        "mission_revision",
+                        str(revision_id),
+                        owner_user_id=owner_user_id,
+                        site_id=site_id,
+                        now=now,
+                    )
                 if autonomy_decision is not None:
                     self._insert_policy_decision_locked(autonomy_decision)
                 if autonomy_grant is not None:
@@ -4185,6 +4192,19 @@ class SQLiteStore:
                             revision_payload.get("createdAt", now),
                         ),
                     )
+                    mission_binding = self._connection.execute(
+                        "SELECT owner_user_id, site_id FROM resource_acl "
+                        "WHERE resource_type = 'mission' AND resource_id = ?",
+                        (mission_id,),
+                    ).fetchone()
+                    if mission_binding is not None:
+                        self._bind_resource_owner_locked(
+                            "mission_revision",
+                            str(revision_payload["revisionId"]),
+                            owner_user_id=str(mission_binding["owner_user_id"]),
+                            site_id=str(mission_binding["site_id"]),
+                            now=now,
+                        )
                 if authorization is not None:
                     authorization_payload = dict(_jsonable(authorization))
                     if authorization_payload.get("missionId") != mission_id:

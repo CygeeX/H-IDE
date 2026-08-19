@@ -124,6 +124,12 @@ def test_mission_owner_acl_and_server_identity_are_not_client_controlled() -> No
         )
         assert mission_binding is not None
         assert mission_binding["ownerUserId"] == alice["userId"]
+        revision_binding = app.state.store.get_resource_owner(
+            "mission_revision", mission["activeRevision"]["revisionId"]
+        )
+        assert revision_binding is not None
+        assert revision_binding["ownerUserId"] == alice["userId"]
+        assert revision_binding["siteId"] == alice["siteId"]
         assert bob_client.get(
             f"/api/v2/missions/{draft['draftId']}"
         ).status_code == 404
@@ -371,6 +377,13 @@ def test_every_physical_replan_requires_human_approval_and_rotates_exact_grant()
         assert second_grant["planRevision"] == second_mission["activeRevision"]["sequence"]
         assert second_grant["subjectUserId"] == user["userId"]
         assert set(second_grant["actionScope"]) == {"navigation.navigate_to_pose"}
+        for revision in second_mission["revisions"]:
+            revision_binding = app.state.store.get_resource_owner(
+                "mission_revision", revision["revisionId"]
+            )
+            assert revision_binding is not None
+            assert revision_binding["ownerUserId"] == user["userId"]
+            assert revision_binding["siteId"] == user["siteId"]
 
 
 def test_concurrent_approval_has_one_winner_and_one_atomic_grant() -> None:
