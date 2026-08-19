@@ -105,8 +105,9 @@ non-semantic integrity manifest.
   `h-ide.sonic-health/v2` probe. In addition to LowState/control-step ages and
   the immutable driver boot ID, it carries typed Plant-support latch/pending,
   static-hold, Nav2-task, motion-authority and zero-command facts. Age-only
-  faults require two consecutive 25 ms probes with the same driver boot ID and
-  fault code while motion is authorized or the gait is not settled at IDLE.
+  faults require two consecutive 25 ms temporal-unhealthy probes with the same
+  driver boot ID while motion is authorized or the gait is not settled at
+  IDLE; alternating LowState/control-step codes share that one streak.
   A fully confirmed `safety_stop + IDLE + static hold + authority revoked +
   zero command + no task` quarantines age-only degradation instead of emitting
   an irreversible motion fault; a fresh probe recovers it, and `control.acquire`

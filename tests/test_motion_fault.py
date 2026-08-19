@@ -495,7 +495,7 @@ def test_terminal_and_boot_change_remain_immediate_in_safe_hold() -> None:
     assert changed.quarantined_cause is None
 
 
-def test_stale_health_gate_requires_same_boot_and_code_twice() -> None:
+def test_stale_health_gate_requires_two_consecutive_temporal_faults() -> None:
     gate = health_fault_gate()
 
     first = observe(gate, parse_health(age=0.111029))
@@ -505,6 +505,10 @@ def test_stale_health_gate_requires_same_boot_and_code_twice() -> None:
     assert first.pending.driver_boot_id == DRIVER_BOOT_ID
     assert first.pending.source == "sonic_driver"
     assert first.pending.code == "PLANT_LOWSTATE_STALE"
+    assert first.pending.first_source == "sonic_driver"
+    assert first.pending.first_code == "PLANT_LOWSTATE_STALE"
+    assert first.pending.latest_source == "sonic_driver"
+    assert first.pending.latest_code == "PLANT_LOWSTATE_STALE"
     assert first.pending.count == 1
     assert first.pending.first_age_s == pytest.approx(0.111029)
     assert first.pending.latest_age_s == pytest.approx(0.111029)
@@ -515,6 +519,8 @@ def test_stale_health_gate_requires_same_boot_and_code_twice() -> None:
     assert second.confirmed_cause.code == "PLANT_LOWSTATE_STALE"
     assert second.pending is not None
     assert second.pending.count == 2
+    assert second.pending.first_code == "PLANT_LOWSTATE_STALE"
+    assert second.pending.latest_code == "PLANT_LOWSTATE_STALE"
     assert second.pending.first_age_s == pytest.approx(0.111029)
     assert second.pending.latest_age_s == pytest.approx(0.136)
 
@@ -534,19 +540,56 @@ def test_stale_health_gate_healthy_probe_resets_pending() -> None:
     assert repeated.pending.count == 1
 
 
-def test_stale_health_gate_different_code_starts_a_new_sequence() -> None:
+def test_stale_health_gate_alternating_codes_share_one_unhealthy_streak() -> None:
     gate = health_fault_gate()
 
     lowstate = observe(gate, parse_health(age=0.111029))
     assert lowstate.pending is not None
-    assert lowstate.pending.code == "PLANT_LOWSTATE_STALE"
+    assert lowstate.pending.first_code == "PLANT_LOWSTATE_STALE"
+    assert lowstate.pending.latest_code == "PLANT_LOWSTATE_STALE"
+    assert lowstate.pending.count == 1
 
     control = observe(gate, parse_health(age=0.020, control_age=0.111029))
-    assert control.confirmed_cause is None
+    assert control.confirmed_cause is not None
+    assert control.confirmed_cause.code == "SONIC_CONTROL_STALE"
     assert control.pending is not None
-    assert control.pending.code == "SONIC_CONTROL_STALE"
-    assert control.pending.count == 1
-    assert control.filtered_transient_count == 1
+    assert control.pending.first_code == "PLANT_LOWSTATE_STALE"
+    assert control.pending.latest_code == "SONIC_CONTROL_STALE"
+    assert control.pending.count == 2
+    assert control.pending.first_age_s == pytest.approx(0.111029)
+    assert control.pending.latest_age_s == pytest.approx(0.111029)
+    assert control.filtered_transient_count == 0
+
+    lowstate_again = observe(gate, parse_health(age=0.136, control_age=0.020))
+    assert lowstate_again.confirmed_cause is not None
+    assert lowstate_again.confirmed_cause.code == "PLANT_LOWSTATE_STALE"
+    assert lowstate_again.pending is not None
+    assert lowstate_again.pending.first_code == "PLANT_LOWSTATE_STALE"
+    assert lowstate_again.pending.latest_code == "PLANT_LOWSTATE_STALE"
+    assert lowstate_again.pending.count == 3
+
+
+def test_safe_hold_quarantine_clears_an_active_temporal_streak() -> None:
+    gate = health_fault_gate()
+
+    active = observe(
+        gate,
+        parse_health(age=0.111029),
+        gait_state=GaitState.WALKING,
+    )
+    assert active.pending is not None
+    assert active.pending.count == 1
+
+    quarantined = observe(
+        gate,
+        safe_hold_health(age=0.020, control_age=0.111029),
+    )
+    assert quarantined.confirmed_cause is None
+    assert quarantined.pending is None
+    assert quarantined.quarantined_cause is not None
+    assert quarantined.quarantined_cause.code == "SONIC_CONTROL_STALE"
+    assert quarantined.settled_safe_hold is True
+    assert quarantined.filtered_transient_count == 1
 
 
 def test_stale_health_gate_driver_boot_change_is_immediate() -> None:

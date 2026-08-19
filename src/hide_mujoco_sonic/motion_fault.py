@@ -589,9 +589,19 @@ class PendingStaleHealth:
     driver_boot_id: UUID
     source: str
     code: str
+    latest_source: str
+    latest_code: str
     count: int
     first_age_s: float
     latest_age_s: float
+
+    @property
+    def first_source(self) -> str:
+        return self.source
+
+    @property
+    def first_code(self) -> str:
+        return self.code
 
 
 @dataclass(frozen=True, slots=True)
@@ -610,10 +620,12 @@ class SonicHealthFaultGate:
     """Confirm age-only health faults without delaying hard fault classes.
 
     A single scheduler spike must not permanently poison a simulator boot.  The
-    two temporal age faults therefore require two consecutive probes with the
-    same driver boot and code.  Terminal/unavailable health and a driver boot
-    change remain immediate.  The immutable :class:`MotionFaultLatch` remains
-    responsible for exactly-once publication and local stop I/O.
+    two temporal age faults therefore share one consecutive-unhealthy streak
+    for the same driver boot.  Switching between LowState and control-step
+    staleness cannot reset the cancellation deadline.  Terminal/unavailable
+    health and a driver boot change remain immediate.  The immutable
+    :class:`MotionFaultLatch` remains responsible for exactly-once publication
+    and local stop I/O.
     """
 
     def __init__(
@@ -740,14 +752,15 @@ class SonicHealthFaultGate:
             )
 
         age = self._age_for_cause(health, cause)
-        identity = (health.driver_boot_id, cause.code)
         previous = self._pending
-        if previous is None or (previous.driver_boot_id, previous.code) != identity:
+        if previous is None or previous.driver_boot_id != health.driver_boot_id:
             self._clear_pending(filtered=previous is not None)
             self._pending = PendingStaleHealth(
                 driver_boot_id=health.driver_boot_id,
                 source=cause.source,
                 code=cause.code,
+                latest_source=cause.source,
+                latest_code=cause.code,
                 count=1,
                 first_age_s=age,
                 latest_age_s=age,
@@ -758,6 +771,8 @@ class SonicHealthFaultGate:
             driver_boot_id=previous.driver_boot_id,
             source=previous.source,
             code=previous.code,
+            latest_source=cause.source,
+            latest_code=cause.code,
             count=previous.count + 1,
             first_age_s=previous.first_age_s,
             latest_age_s=age,
