@@ -10,6 +10,7 @@ from robot_agent.arbitration import ResourceArbiter, ResourceClaimError
 from robot_agent.session import (
     ControlState,
     LeaseError,
+    SafeStopState,
     SessionController,
     SessionStateError,
 )
@@ -274,3 +275,40 @@ async def test_cancelling_safe_hold_latches_fault_and_blocks_reacquire() -> None
             operator_id="operator-7",
             at=NOW + timedelta(seconds=3),
         )
+
+
+@pytest.mark.asyncio
+async def test_authority_revocation_precedes_physical_safe_stop_confirmation() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocking_safe_stop(reason: str) -> None:
+        assert reason == "operator cancel"
+        started.set()
+        await release.wait()
+
+    controller = SessionController(
+        lease_timeout=timedelta(seconds=2),
+        safe_stop=blocking_safe_stop,
+        initial_safe_stop_epoch=4,
+    )
+    session_id = uuid4()
+    await controller.connected(session_id)
+    await controller.acquire(session_id, operator_id="operator-7", at=NOW)
+
+    revoked = await controller.revoke_authority("operator cancel")
+    assert revoked.authority_revoked is True
+    assert revoked.safe_stop_state is SafeStopState.REQUESTED
+    assert revoked.safe_stop_epoch == 5
+    assert revoked.can_acquire is False
+
+    confirmation = asyncio.create_task(
+        controller.ensure_safe_hold("operator cancel", refresh=False)
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+    assert controller.snapshot.safe_stop_state is SafeStopState.REQUESTED
+    release.set()
+    confirmed = await confirmation
+    assert confirmed.safe_stop_state is SafeStopState.CONFIRMED
+    assert confirmed.safe_stop_epoch == 5
+    assert confirmed.can_acquire is True

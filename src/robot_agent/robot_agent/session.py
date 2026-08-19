@@ -15,6 +15,14 @@ class ControlState(str, Enum):
     ACTIVE = "ACTIVE"
 
 
+class SafeStopState(str, Enum):
+    """Truth state for the most recent physical safe-stop boundary."""
+
+    REQUESTED = "requested"
+    CONFIRMED = "confirmed"
+    FAILED = "failed"
+
+
 class SessionStateError(RuntimeError):
     """Raised when an operation is invalid for the controlling session."""
 
@@ -32,6 +40,9 @@ class SessionSnapshot:
     lease_deadline: datetime | None
     reason: str
     can_acquire: bool
+    authority_revoked: bool
+    safe_stop_state: SafeStopState
+    safe_stop_epoch: int
 
 
 SafeStopCallback = Callable[[str], Awaitable[None]]
@@ -46,9 +57,12 @@ class SessionController:
         *,
         lease_timeout: timedelta,
         safe_stop: SafeStopCallback,
+        initial_safe_stop_epoch: int = 0,
     ) -> None:
         if lease_timeout <= timedelta(0):
             raise ValueError("lease_timeout must be positive")
+        if initial_safe_stop_epoch < 0:
+            raise ValueError("initial_safe_stop_epoch must not be negative")
         self._lease_timeout = lease_timeout
         self._safe_stop = safe_stop
         self._lock = asyncio.Lock()
@@ -58,6 +72,12 @@ class SessionController:
         self._lease_sequence: int | None = None
         self._lease_deadline: datetime | None = None
         self._safety_fault: str | None = None
+        # Standalone core users historically start in a confirmed logical hold.
+        # The runtime refreshes this boundary against the physical adapter during
+        # initialize(), using the next durable epoch before it advertises ready.
+        self._authority_revoked = True
+        self._safe_stop_state = SafeStopState.CONFIRMED
+        self._safe_stop_epoch = initial_safe_stop_epoch
         self._reason = "agent startup requires explicit control.acquire"
 
     async def connected(self, session_id: UUID) -> SessionSnapshot:
@@ -93,6 +113,13 @@ class SessionController:
                 raise SessionStateError(f"control blocked: {self._latched_fault_reason()}")
             if self._state is ControlState.ACTIVE:
                 return self.snapshot
+            if (
+                not self._authority_revoked
+                or self._safe_stop_state is not SafeStopState.CONFIRMED
+            ):
+                raise SessionStateError(
+                    "control blocked: the latest physical safe-stop is not confirmed"
+                )
             if before_activate is not None:
                 try:
                     # Keep the session lock across this bounded local arm.  A
@@ -106,6 +133,7 @@ class SessionController:
                     )
                     raise
             self._state = ControlState.ACTIVE
+            self._authority_revoked = False
             self._operator_id = operator_id
             self._lease_sequence = -1
             self._lease_deadline = at + self._lease_timeout
@@ -167,38 +195,89 @@ class SessionController:
             return self.snapshot
 
     async def force_safe_hold(self, reason: str) -> SessionSnapshot:
+        return await self.ensure_safe_hold(reason, refresh=False)
+
+    async def ensure_safe_hold(
+        self,
+        reason: str,
+        *,
+        refresh: bool,
+    ) -> SessionSnapshot:
+        """Revoke authority and confirm one physical safe-stop boundary.
+
+        ``refresh`` is used for startup and other explicit fresh boundaries even
+        when the logical control state is already SAFE_HOLD.
+        """
+
         async with self._lock:
-            if self._state is ControlState.ACTIVE:
-                await self._enter_safe_hold(reason)
-            else:
+            needs_stop = (
+                refresh
+                or self._state is ControlState.ACTIVE
+                or self._safe_stop_state is not SafeStopState.CONFIRMED
+            )
+            if not needs_stop:
                 self._reason = (
                     self._latched_fault_reason() if self._safety_fault is not None else reason
                 )
+                return self.snapshot
+            if self._safe_stop_state is not SafeStopState.REQUESTED:
+                self._begin_safe_stop(reason)
+            await self._confirm_requested_safe_stop(reason)
+            return self.snapshot
+
+    async def revoke_authority(self, reason: str) -> SessionSnapshot:
+        """Immediately revoke command authority without claiming a physical stop."""
+
+        async with self._lock:
+            if self._safe_stop_state is not SafeStopState.REQUESTED:
+                self._begin_safe_stop(reason)
+            else:
+                self._state = ControlState.SAFE_HOLD
+                self._authority_revoked = True
+                self._lease_deadline = None
+                self._reason = reason
             return self.snapshot
 
     async def latch_safety_fault(self, reason: str) -> SessionSnapshot:
         """Block all command dispatch immediately when execution state is uncertain."""
         async with self._lock:
             self._state = ControlState.SAFE_HOLD
+            self._authority_revoked = True
             self._lease_deadline = None
             self._safety_fault = reason[:231]
+            if self._safe_stop_state is not SafeStopState.REQUESTED:
+                self._safe_stop_epoch += 1
+            self._safe_stop_state = SafeStopState.REQUESTED
             self._reason = self._latched_fault_reason()
             return self.snapshot
 
     async def _enter_safe_hold(self, reason: str) -> None:
+        self._begin_safe_stop(reason)
+        await self._confirm_requested_safe_stop(reason)
+
+    def _begin_safe_stop(self, reason: str) -> None:
         self._state = ControlState.SAFE_HOLD
+        self._authority_revoked = True
         self._lease_deadline = None
         self._reason = reason
+        self._safe_stop_epoch += 1
+        self._safe_stop_state = SafeStopState.REQUESTED
+
+    async def _confirm_requested_safe_stop(self, reason: str) -> None:
         try:
             await self._safe_stop(reason)
         except asyncio.CancelledError:
             self._safety_fault = "CancelledError: mandatory safe-stop operation was cancelled"
+            self._safe_stop_state = SafeStopState.FAILED
             self._reason = self._latched_fault_reason()
             raise
         except Exception as exc:
             self._safety_fault = f"{type(exc).__name__}: {exc}"[:231]
+            self._safe_stop_state = SafeStopState.FAILED
             self._reason = self._latched_fault_reason()
             raise
+        self._safe_stop_state = SafeStopState.CONFIRMED
+        self._reason = reason
 
     def _latched_fault_reason(self) -> str:
         assert self._safety_fault is not None
@@ -231,7 +310,15 @@ class SessionController:
             ),
             lease_deadline=self._lease_deadline,
             reason=self._reason,
-            can_acquire=self._session_id is not None and self._safety_fault is None,
+            can_acquire=(
+                self._session_id is not None
+                and self._safety_fault is None
+                and self._authority_revoked
+                and self._safe_stop_state is SafeStopState.CONFIRMED
+            ),
+            authority_revoked=self._authority_revoked,
+            safe_stop_state=self._safe_stop_state,
+            safe_stop_epoch=self._safe_stop_epoch,
         )
 
     @property

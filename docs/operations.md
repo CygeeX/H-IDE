@@ -127,6 +127,10 @@ openssl x509 -in bff-client.crt -outform DER | sha256sum
 ## 故障处置
 
 - `SAFE_STOP_FAILED`：禁止重新授权；先在本地确认安全链路和 ROS safe-stop 服务。
+- `safe_stop_state=requested`：控制权已经撤销但物理确认尚未返回；不得把它展示成
+  “已安全停止”，也不得重新授权。
+- `safe_stop_state=failed`：本 epoch 的物理停止失败；`canAcquire=false`，修复下游
+  readiness 后仍需建立新的、已确认的 safe-stop epoch。
 - `COMMAND_ID_CONFLICT`：BFF 复用了 ID 但修改了载荷；生成新 ID 或恢复原载荷。
 - `ABORTED_AGENT_RESTART`：Agent 重启时命令未到终态；人工确认机器人状态后发送新命令，绝不自动重放。
 - 反复断线：检查证书有效期/SAN、时钟、DDS/CPU 压力与 BFF 500 ms 续租节拍。

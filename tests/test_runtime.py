@@ -20,7 +20,8 @@ from robot_agent.observation import (
     ObservationHealthSample,
     ObservationHealthStatus,
 )
-from robot_agent.protocol import WireMessage, parse_wire_message
+from robot_agent.protocol import CommandCancel, CommandRequest, WireMessage, parse_wire_message
+from robot_agent.ros_adapter import RosActionReadiness
 from robot_agent.runtime import RobotAgentRuntime, RuntimeSafetyError
 from robot_agent.session import ControlState, SessionStateError
 
@@ -120,6 +121,7 @@ class FakeRosAdapter:
         self.control_arm_exception: Exception | None = None
         self.control_arm_delay_s = 0.0
         self.health_exception: Exception | None = None
+        self.safety_endpoints_ready = True
 
     def set_callbacks(
         self,
@@ -147,6 +149,18 @@ class FakeRosAdapter:
     def check_health(self) -> None:
         if self.health_exception is not None:
             raise self.health_exception
+
+    async def safety_endpoint_readiness(
+        self,
+        endpoints: dict[str, SafeStopConfig],
+    ) -> dict[str, RosActionReadiness]:
+        return {
+            name: RosActionReadiness(
+                ready=self.safety_endpoints_ready,
+                reason=None if self.safety_endpoints_ready else "endpoint_unavailable",
+            )
+            for name in endpoints
+        }
 
     async def execute(
         self,
@@ -407,6 +421,29 @@ async def test_latched_session_fault_blocks_control_arm_before_local_release(
     await runtime.shutdown()
 
 
+@pytest.mark.asyncio
+async def test_control_acquire_is_rejected_when_safety_endpoint_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    ros = FakeRosAdapter()
+    runtime = RobotAgentRuntime(runtime_config(tmp_path), ros_adapter=ros)
+    await runtime.initialize()
+    session_id = uuid4()
+    await runtime._session.connected(session_id)
+    runtime._connection_session_id = session_id
+    ros.safety_endpoints_ready = False
+    message = parse_wire_message(
+        inbound("control.acquire", session_id, {"operator_id": "operator-7"}),
+        expected_robot_id="g1-dev",
+    )
+
+    with pytest.raises(SessionStateError, match="safetyEndpoints"):
+        await runtime._route_message(message, session_id)
+    assert runtime._session.state is ControlState.SAFE_HOLD
+    assert (await runtime.diagnostics_snapshot())["controlState"]["canAcquire"] is False
+    await runtime.shutdown()
+
+
 def observation_health(
     *,
     robot_boot_id: str = "boot-1",
@@ -564,6 +601,7 @@ async def test_observation_watchdog_cancellation_failure_forces_safe_stop(
     async def fail_cancel(*_args: Any, **_kwargs: Any) -> bool:
         raise CommandCancellationError(record)
 
+    monkeypatch.setattr(runtime._coordinator, "is_command_active", lambda _command_id: True)
     monkeypatch.setattr(runtime._coordinator, "cancel", fail_cancel)
     initial_safe_stops = ros.safe_stop_reasons
     try:
@@ -1332,6 +1370,14 @@ async def test_back_to_back_request_and_cancel_never_dispatches_command(
         )
     )
 
+    revoked = await next_message(connection)
+    assert revoked.type == "control.status"
+    assert revoked.payload.authority_revoked is True
+    assert revoked.payload.safe_stop_state == "requested"
+    pending = await next_message(connection)
+    assert pending.type == "command.status"
+    assert pending.payload.command_id == command_id
+    assert pending.payload.state == "RECEIVED"
     cancelled = await next_message(connection)
     assert cancelled.type == "command.status"
     assert cancelled.payload.command_id == command_id
@@ -1347,6 +1393,154 @@ async def test_back_to_back_request_and_cancel_never_dispatches_command(
         inbound("session.goodbye", session_id, {"reason": "test complete"})
     )
     await asyncio.wait_for(handler, timeout=2)
+    await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cancel_is_not_terminal_until_physical_safe_stop_confirms(
+    tmp_path: Path,
+) -> None:
+    class BlockingCancelBoundaryAdapter(FakeRosAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.execute_started = asyncio.Event()
+            self.stop_started = asyncio.Event()
+            self.release_stop = asyncio.Event()
+
+        async def execute(
+            self,
+            command_id: UUID,
+            command: CommandConfig,
+            params: dict[str, Any],
+        ) -> ExecutionResult:
+            del command_id, command, params
+            self.execute_started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        async def safe_stop(self, config: SafeStopConfig) -> ExecutionResult:
+            if self.safe_stop_reasons:
+                self.stop_started.set()
+                await self.release_stop.wait()
+            return await super().safe_stop(config)
+
+    ros = BlockingCancelBoundaryAdapter()
+    runtime = RobotAgentRuntime(runtime_config(tmp_path), ros_adapter=ros)
+    await runtime.initialize()
+    session_id = uuid4()
+    await runtime._session.connected(session_id)
+    await runtime._session.acquire(
+        session_id,
+        operator_id="operator-7",
+        at=datetime.now(timezone.utc),
+    )
+    command_id = uuid4()
+    command = parse_wire_message(
+        inbound(
+            "command.request",
+            session_id,
+            {
+                "command_id": str(command_id),
+                "kind": "power.enable",
+                "issued_at": datetime.now(timezone.utc).isoformat(),
+                "ttl_ms": 5000,
+                "params": {"data": True},
+            },
+        ),
+        expected_robot_id="g1-dev",
+    )
+    cancellation = parse_wire_message(
+        inbound(
+            "command.cancel",
+            session_id,
+            {"command_id": str(command_id), "reason": "operator changed intent"},
+        ),
+        expected_robot_id="g1-dev",
+    )
+    assert isinstance(command, CommandRequest)
+    assert isinstance(cancellation, CommandCancel)
+    submission = asyncio.create_task(
+        runtime._coordinator.submit(command, at=datetime.now(timezone.utc))
+    )
+    await asyncio.wait_for(ros.execute_started.wait(), timeout=1)
+    cancelling = asyncio.create_task(runtime._route_message(cancellation, session_id))
+    await asyncio.wait_for(ros.stop_started.wait(), timeout=1)
+
+    pending = runtime._ledger.get(command_id)
+    assert pending.state is CommandState.RUNNING
+    assert command_id in runtime._coordinator.pending_cancel_confirmations
+    assert runtime._session.snapshot.authority_revoked is True
+    assert runtime._session.snapshot.safe_stop_state.value == "requested"
+    assert runtime._ledger.safe_stop_events()[-1].state.value == "requested"
+
+    ros.release_stop.set()
+    await asyncio.wait_for(cancelling, timeout=1)
+    await asyncio.wait_for(submission, timeout=1)
+    terminal = runtime._ledger.get(command_id)
+    assert terminal.state is CommandState.CANCELLED
+    assert "physical safe-stop confirmed at epoch 2" in terminal.detail
+    assert runtime._session.snapshot.safe_stop_state.value == "confirmed"
+    assert runtime._ledger.safe_stop_events()[-1].state.value == "confirmed"
+    await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_failed_physical_safe_stop_blocks_acquire_and_is_diagnostic_truth(
+    tmp_path: Path,
+) -> None:
+    ros = FakeRosAdapter()
+    runtime = RobotAgentRuntime(runtime_config(tmp_path), ros_adapter=ros)
+    await runtime.initialize()
+    session_id = uuid4()
+    await runtime._session.connected(session_id)
+    runtime._connection_session_id = session_id
+    await runtime._session.acquire(
+        session_id,
+        operator_id="operator-7",
+        at=datetime.now(timezone.utc),
+    )
+    ros.safe_stop_succeeded = False
+
+    with pytest.raises(RuntimeSafetyError, match="rejected"):
+        await runtime._session.force_safe_hold("downstream fault")
+
+    diagnostics = await runtime.diagnostics_snapshot()
+    assert diagnostics["controlState"]["canAcquire"] is False
+    assert diagnostics["controlState"]["authorityRevoked"] is True
+    assert diagnostics["controlState"]["safeStopState"] == "failed"
+    assert diagnostics["checks"]["safeStop"]["ready"] is False
+    assert diagnostics["checks"]["safeStop"]["reason"] == "safe_stop_failed"
+    assert runtime._ledger.safe_stop_events()[-1].state.value == "failed"
+    await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_safe_stop_audit_failure_never_skips_the_physical_stop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ros = FakeRosAdapter()
+    runtime = RobotAgentRuntime(runtime_config(tmp_path), ros_adapter=ros)
+    await runtime.initialize()
+    session_id = uuid4()
+    await runtime._session.connected(session_id)
+    await runtime._session.acquire(
+        session_id,
+        operator_id="operator-7",
+        at=datetime.now(timezone.utc),
+    )
+
+    def unavailable_audit(**_kwargs: Any) -> None:
+        raise RuntimeError("disk unavailable")
+
+    monkeypatch.setattr(runtime._ledger, "begin_safe_stop", unavailable_audit)
+    initial_physical_stops = ros.safe_stop_reasons
+    with pytest.raises(RuntimeSafetyError, match="audit request was not durable"):
+        await runtime._session.force_safe_hold("lease expired")
+
+    assert ros.safe_stop_reasons == initial_physical_stops + 1
+    assert runtime._session.snapshot.safe_stop_state.value == "failed"
+    assert runtime._session.snapshot.can_acquire is False
     await runtime.shutdown()
 
 

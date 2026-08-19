@@ -25,6 +25,12 @@
 5. BFF 每 500 ms 发送单调递增的 `lease.renew`；Agent 回 `lease.status`。
 6. 2 秒内没有有效续租、连接断开或本地故障时，Agent 立即 safe-stop 并锁存 `SAFE_HOLD`。
 
+`SAFE_HOLD` 只表示控制权已撤销，不能单独证明机器人已经物理停止。新增的兼容字段
+`authority_revoked`、`safe_stop_state=requested|confirmed|failed` 和单调递增的
+`safe_stop_epoch` 给出真实边界。只有同一 epoch 的本地 safe-stop 成功后才会发布
+`confirmed` 并把取消中的命令写成终态；失败时保持禁止重新授权。旧客户端可以继续读取
+原字段，但安全决策应同时检查这三个字段。
+
 ## 消息族
 
 | 方向 | 类型 | 用途 |
@@ -45,6 +51,8 @@
 | Agent → BFF | `error` | 有界错误码和关联 message ID |
 
 命令终态包括 `SUCCEEDED`、`FAILED`、`CANCELLED`、`REJECTED`、`TIMED_OUT` 和 `ABORTED_AGENT_RESTART`。断线后不会重放旧命令；BFF 可以用相同命令 ID 和完全相同的载荷查询已记录状态。
+safe-stop 请求、确认或失败按 epoch 独立写入同一 SQLite 台账，便于把命令取消终态与
+对应的物理停止凭据关联起来。
 
 完整机器可读定义见 `src/robot_agent/schemas/robot-agent.v1.schema.json`。
 

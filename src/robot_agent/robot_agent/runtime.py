@@ -35,7 +35,13 @@ from robot_agent.coordinator import (
     ExecutionResult,
 )
 from robot_agent.identity import read_robot_boot_id
-from robot_agent.ledger import TERMINAL_STATES, CommandIdConflict, CommandLedger, CommandRecord
+from robot_agent.ledger import (
+    TERMINAL_STATES,
+    CommandIdConflict,
+    CommandLedger,
+    CommandRecord,
+    SafeStopAuditState,
+)
 from robot_agent.observation import (
     ObservationGuard,
     ObservationHealthSample,
@@ -83,6 +89,7 @@ from robot_agent.ros_adapter import (
 from robot_agent.session import (
     ControlState,
     LeaseError,
+    SafeStopState,
     SessionController,
     SessionStateError,
 )
@@ -144,6 +151,11 @@ class RosRuntimeAdapter(Protocol):
         commands: Mapping[str, CommandConfig],
     ) -> dict[str, RosActionReadiness]: ...
 
+    async def safety_endpoint_readiness(
+        self,
+        endpoints: Mapping[str, SafeStopConfig],
+    ) -> dict[str, RosActionReadiness]: ...
+
     async def execute(
         self,
         command_id: UUID,
@@ -195,6 +207,7 @@ class RobotAgentRuntime:
         self._session = SessionController(
             lease_timeout=timedelta(milliseconds=config.session.lease_timeout_ms),
             safe_stop=self._perform_safe_stop,
+            initial_safe_stop_epoch=self._ledger.latest_safe_stop_epoch,
         )
         self._observation_guard = (
             ObservationGuard(
@@ -236,12 +249,6 @@ class RobotAgentRuntime:
         if self._closed:
             raise RuntimeErrorBase("runtime is closed")
         self._event_loop = asyncio.get_running_loop()
-        initialized_at = _now()
-        await asyncio.to_thread(
-            self._ledger.abort_incomplete_after_restart,
-            at=initialized_at,
-        )
-        await self._prune_ledger(at=initialized_at)
         if self._observation_guard is None:
             self._ros.set_callbacks(
                 state_callback=self._on_ros_state,
@@ -264,7 +271,15 @@ class RobotAgentRuntime:
             state_supplier=lambda: self._session.state.value,
         )
         self._ros.start()
-        await self._perform_safe_stop("agent startup")
+        # A new process must establish a fresh physical boundary before old
+        # non-terminal commands are made terminal by restart recovery.
+        await self._session.ensure_safe_hold("agent startup", refresh=True)
+        initialized_at = _now()
+        await asyncio.to_thread(
+            self._ledger.abort_incomplete_after_restart,
+            at=initialized_at,
+        )
+        await self._prune_ledger(at=initialized_at)
         self._initialized = True
         self.ready.set()
 
@@ -488,6 +503,8 @@ class RobotAgentRuntime:
     ) -> str | None:
         if isinstance(message, ControlAcquire):
             try:
+                if self._session.state is not ControlState.ACTIVE:
+                    await self._assert_downstream_ready_for_acquire()
                 await self._session.acquire(
                     session_id,
                     operator_id=message.payload.operator_id,
@@ -558,20 +575,39 @@ class RobotAgentRuntime:
             return None
         if isinstance(message, CommandCancel):
             self._session.assert_can_command(session_id)
+            if not self._coordinator.is_command_active(message.payload.command_id):
+                record = await self._coordinator.record(message.payload.command_id)
+                if record is not None and record.state in TERMINAL_STATES:
+                    await self._enqueue_command_status(record)
+                else:
+                    await self._enqueue_error(
+                        "COMMAND_NOT_ACTIVE",
+                        f"command {message.payload.command_id} is not active",
+                        related_message_id=message.message_id,
+                    )
+                return None
+            cancel_reason = (
+                f"remote operator cancelled command {message.payload.command_id}"
+            )
+            await self._revoke_authority_for_safe_stop(cancel_reason)
             try:
                 cancelled = await self._coordinator.cancel(
                     message.payload.command_id,
                     reason=f"remote_operator: {message.payload.reason}",
                     at=_now(),
+                    defer_terminal_until_safe_stop=True,
                 )
             except CommandCancellationError as exc:
-                await self._enter_safe_hold_after_cancel(str(exc))
+                LOGGER.error("command cancellation was not acknowledged: %s", exc)
+                await self._enter_safe_hold_after_cancel(cancel_reason)
                 return None
             if cancelled:
-                await self._enter_safe_hold_after_cancel(
-                    f"remote operator cancelled command {message.payload.command_id}"
-                )
+                await self._enter_safe_hold_after_cancel(cancel_reason)
             else:
+                # The command may have completed between the active preflight
+                # and cancellation.  Authority was already revoked, so finish
+                # that requested physical boundary before reporting anything.
+                await self._enter_safe_hold_after_cancel(cancel_reason)
                 record = await self._coordinator.record(message.payload.command_id)
                 if record is not None and record.state in TERMINAL_STATES:
                     await self._enqueue_command_status(record)
@@ -649,6 +685,9 @@ class RobotAgentRuntime:
                     state=cast(Any, snapshot.state.value),
                     reason=snapshot.reason,
                     lease_sequence=snapshot.lease_sequence,
+                    authority_revoked=snapshot.authority_revoked,
+                    safe_stop_state=snapshot.safe_stop_state.value,
+                    safe_stop_epoch=snapshot.safe_stop_epoch,
                 ),
             ),
         )
@@ -679,10 +718,18 @@ class RobotAgentRuntime:
             ),
         )
 
-    async def _enqueue_safety(self, code: str, reason: str) -> None:
+    async def _enqueue_safety(
+        self,
+        code: str,
+        reason: str,
+        *,
+        safe_stop_state: SafeStopState | None = None,
+        safe_stop_epoch: int | None = None,
+    ) -> None:
         session_id = self._connection_session_id
         if session_id is None:
             return
+        snapshot = self._session.snapshot
         await self._enqueue(
             OutboundPriority.SAFETY,
             "safety.event",
@@ -698,6 +745,15 @@ class RobotAgentRuntime:
                     state="SAFE_HOLD",
                     reason=reason[:512],
                     latched=True,
+                    authority_revoked=True,
+                    safe_stop_state=(
+                        safe_stop_state or snapshot.safe_stop_state
+                    ).value,
+                    safe_stop_epoch=(
+                        snapshot.safe_stop_epoch
+                        if safe_stop_epoch is None
+                        else safe_stop_epoch
+                    ),
                 ),
             ),
         )
@@ -785,59 +841,170 @@ class RobotAgentRuntime:
         await self._enqueue(priority, message.type, message, coalesce_key=key)
 
     async def _perform_safe_stop(self, reason: str) -> None:
+        snapshot = self._session.snapshot
+        epoch = snapshot.safe_stop_epoch
+        if snapshot.safe_stop_state is not SafeStopState.REQUESTED:
+            # Kept only for direct diagnostic/test invocation. Runtime safety
+            # paths first revoke authority through SessionController.
+            epoch = max(epoch, self._ledger.latest_safe_stop_epoch) + 1
+        audit_error: Exception | None = None
+        try:
+            await asyncio.to_thread(
+                self._ledger.begin_safe_stop,
+                epoch=epoch,
+                reason=reason,
+                at=_now(),
+            )
+        except Exception as exc:
+            # Storage truth is mandatory for reacquire, but stopping the robot
+            # is more urgent than recording why. Continue to the physical path
+            # and fail closed after it has been exercised.
+            audit_error = exc
         if self._detached_safety_tasks:
             detail = "a prior safety operation ignored cancellation and is still running"
-            await self._enqueue_safety("SAFE_STOP_FAILED", f"{reason}: {detail}")
+            await self._record_safe_stop_failure(epoch, reason, detail)
             raise RuntimeSafetyError(detail)
         timeout_seconds = self.config.safety.safe_stop.timeout_ms / 1000.0
         physical_stop = asyncio.create_task(self._ros.safe_stop(self.config.safety.safe_stop))
         preemption = asyncio.create_task(self._coordinator.preempt_all(reason=reason, at=_now()))
-        (result, physical_error), (_, preemption_error) = await asyncio.gather(
-            _capture_bounded_task(
-                physical_stop,
-                timeout=timeout_seconds,
-                description="physical safe stop",
-                detached_tasks=self._detached_safety_tasks,
-            ),
-            _capture_bounded_task(
-                preemption,
-                timeout=_PREEMPTION_TIMEOUT_SECONDS,
-                description="command preemption",
-                detached_tasks=self._detached_safety_tasks,
-            ),
-        )
+        try:
+            (result, physical_error), (_, preemption_error) = await asyncio.gather(
+                _capture_bounded_task(
+                    physical_stop,
+                    timeout=timeout_seconds,
+                    description="physical safe stop",
+                    detached_tasks=self._detached_safety_tasks,
+                ),
+                _capture_bounded_task(
+                    preemption,
+                    timeout=_PREEMPTION_TIMEOUT_SECONDS,
+                    description="command preemption",
+                    detached_tasks=self._detached_safety_tasks,
+                ),
+            )
+        except asyncio.CancelledError:
+            await self._record_safe_stop_failure(
+                epoch,
+                reason,
+                "mandatory safe-stop operation was cancelled",
+            )
+            raise
         if physical_error is not None:
-            await self._enqueue_safety("SAFE_STOP_FAILED", f"{reason}: {physical_error}")
+            await self._record_safe_stop_failure(
+                epoch,
+                reason,
+                str(physical_error),
+            )
             raise RuntimeSafetyError(
                 f"mandatory safe stop failed: {physical_error}"
             ) from physical_error
         assert result is not None
         if not result.succeeded:
-            await self._enqueue_safety(
-                "SAFE_STOP_FAILED",
-                f"{reason}: {result.detail}",
-            )
+            await self._record_safe_stop_failure(epoch, reason, result.detail)
             raise RuntimeSafetyError(f"mandatory safe stop was rejected: {result.detail}")
         if preemption_error is not None:
-            await self._enqueue_safety(
-                "SAFE_STOP_FAILED",
-                f"{reason}: command preemption failed: {preemption_error}",
+            detail = f"command preemption failed: {preemption_error}"
+            await self._record_safe_stop_failure(
+                epoch,
+                reason,
+                detail,
             )
             raise RuntimeSafetyError(
                 f"command preemption failed during mandatory safe stop: {preemption_error}"
             ) from preemption_error
-        await self._enqueue_safety(_safety_code(reason), reason)
+        try:
+            await self._coordinator.confirm_safe_stop(epoch=epoch, at=_now())
+        except Exception as exc:
+            detail = f"cancel terminalization failed: {type(exc).__name__}: {exc}"
+            await self._record_safe_stop_failure(epoch, reason, detail)
+            raise RuntimeSafetyError(detail) from exc
+        if audit_error is not None:
+            detail = (
+                "physical safe-stop confirmed but audit request was not durable: "
+                f"{type(audit_error).__name__}: {audit_error}"
+            )
+            await self._record_safe_stop_failure(epoch, reason, detail)
+            raise RuntimeSafetyError(detail) from audit_error
+        try:
+            await asyncio.to_thread(
+                self._ledger.finish_safe_stop,
+                epoch=epoch,
+                state=SafeStopAuditState.CONFIRMED,
+                detail=result.detail,
+                at=_now(),
+            )
+        except Exception as exc:
+            detail = (
+                "physical safe-stop confirmed but audit completion failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            await self._record_safe_stop_failure(epoch, reason, detail)
+            raise RuntimeSafetyError(detail) from exc
+        await self._enqueue_safety(
+            _safety_code(reason),
+            reason,
+            safe_stop_state=SafeStopState.CONFIRMED,
+            safe_stop_epoch=epoch,
+        )
+
+    async def _record_safe_stop_failure(
+        self,
+        epoch: int,
+        reason: str,
+        detail: str,
+    ) -> None:
+        try:
+            await asyncio.to_thread(
+                self._ledger.finish_safe_stop,
+                epoch=epoch,
+                state=SafeStopAuditState.FAILED,
+                detail=detail,
+                at=_now(),
+            )
+        except Exception as exc:
+            LOGGER.error(
+                "failed to persist safe-stop failure epoch %s: %s",
+                epoch,
+                exc,
+            )
+            detail = f"{detail}; audit failure: {type(exc).__name__}: {exc}"
+        await self._enqueue_safety(
+            "SAFE_STOP_FAILED",
+            f"{reason}: {detail}",
+            safe_stop_state=SafeStopState.FAILED,
+            safe_stop_epoch=epoch,
+        )
 
     async def _enter_safe_hold_after_cancel(self, reason: str) -> None:
         """A cancellation revokes the current control arm until reacquired."""
 
-        if self._session.state is ControlState.ACTIVE:
-            await self._session.force_safe_hold(reason)
-        else:
-            # Cancellation uncertainty is itself a fresh stop boundary even if
-            # the controlling session was already SAFE_HOLD.
-            await self._perform_safe_stop(reason)
-            await self._session.force_safe_hold(reason)
+        try:
+            await self._session.ensure_safe_hold(reason, refresh=True)
+        finally:
+            # A failed physical stop must be visible as failed, never as a
+            # confirmed SAFE_HOLD.  The session has already revoked authority.
+            await self._enqueue_control_status()
+
+    async def _revoke_authority_for_safe_stop(self, reason: str) -> None:
+        revoked = await self._session.revoke_authority(reason)
+        try:
+            await asyncio.to_thread(
+                self._ledger.begin_safe_stop,
+                epoch=revoked.safe_stop_epoch,
+                reason=reason,
+                at=_now(),
+            )
+        except Exception as exc:
+            # Never delay authority revocation or the physical stop for an
+            # audit write. _perform_safe_stop retries and then fails closed
+            # after exercising the physical adapter if storage stays down.
+            LOGGER.error(
+                "failed to persist safe-stop request epoch %s: %s",
+                revoked.safe_stop_epoch,
+                exc,
+            )
+        # Advertise authority revocation immediately, while truthfully
+        # retaining safe_stop_state=requested until the physical boundary.
         await self._enqueue_control_status()
 
     async def _perform_control_arm(self) -> None:
@@ -932,17 +1099,28 @@ class RobotAgentRuntime:
             return
         for binding, detail in guard.stale_bindings(monotonic_now=loop.time()):
             reason = f"observation_watchdog: {detail}"
+            if not self._coordinator.is_command_active(binding.command_id):
+                continue
+            await self._revoke_authority_for_safe_stop(reason)
             try:
                 cancelled = await self._coordinator.cancel(
                     binding.command_id,
                     reason=reason,
                     at=_now(),
+                    defer_terminal_until_safe_stop=True,
                 )
             except CommandCancellationError as exc:
-                await self._enter_safe_hold_after_cancel(str(exc))
+                LOGGER.error("watchdog cancellation was not acknowledged: %s", exc)
+                await self._enter_safe_hold_after_cancel(reason)
             else:
-                if cancelled:
-                    await self._enter_safe_hold_after_cancel(reason)
+                # A race to command completion does not restore authority once
+                # this safety boundary has been requested.
+                if not cancelled:
+                    LOGGER.info(
+                        "watchdog command %s completed while cancellation raced",
+                        binding.command_id,
+                    )
+                await self._enter_safe_hold_after_cancel(reason)
 
     def _schedule_feedback(self, command_id: UUID, feedback: dict[str, Any]) -> None:
         session_id = self._connection_session_id
@@ -1002,6 +1180,21 @@ class RobotAgentRuntime:
         async with self._diagnostics_lock:
             return await self._diagnostics_snapshot_locked()
 
+    async def _assert_downstream_ready_for_acquire(self) -> None:
+        diagnostics = await self.diagnostics_snapshot()
+        blockers = [
+            name
+            for name, check in diagnostics["checks"].items()
+            if name not in {"transportSession", "control", "safeStop"}
+            and bool(check["required"])
+            and not bool(check["ready"])
+        ]
+        if blockers:
+            raise SessionStateError(
+                "control blocked: downstream readiness unavailable: "
+                + ", ".join(sorted(blockers))
+            )
+
     async def _diagnostics_snapshot_locked(self) -> dict[str, Any]:
         probe_lifecycle_ready = self._initialized and not self._closed
         ros_ready = False
@@ -1034,6 +1227,30 @@ class RobotAgentRuntime:
                 nav2_probe_reason = f"nav2_probe_failed:{type(exc).__name__}"
         elif nav2_commands:
             nav2_probe_reason = "ros_executor_unavailable"
+        configured_safety_endpoints = {
+            "safeStop": self.config.safety.safe_stop,
+            **(
+                {}
+                if self.config.safety.control_arm is None
+                else {"controlArm": self.config.safety.control_arm}
+            ),
+        }
+        safety_endpoint_results: dict[str, RosActionReadiness] = {}
+        safety_endpoint_probe_reason: str | None = None
+        if ros_ready:
+            try:
+                safety_endpoint_results = await asyncio.wait_for(
+                    self._ros.safety_endpoint_readiness(configured_safety_endpoints),
+                    timeout=self.config.diagnostics.probe_timeout_ms / 1_000.0,
+                )
+            except asyncio.TimeoutError:
+                safety_endpoint_probe_reason = "safety_endpoint_probe_timed_out"
+            except Exception as exc:
+                safety_endpoint_probe_reason = (
+                    f"safety_endpoint_probe_failed:{type(exc).__name__}"
+                )
+        else:
+            safety_endpoint_probe_reason = "ros_executor_unavailable"
         observed_at = _now()
         monotonic_now = time.monotonic()
         lifecycle_ready = self._initialized and not self._closed
@@ -1056,29 +1273,6 @@ class RobotAgentRuntime:
             and lease_remaining_ms > 0
         )
         active_command_count = len(self._coordinator.active_commands)
-        standby_ready = (
-            transport_ready
-            and not control_active
-            and session_snapshot.can_acquire
-            and active_command_count == 0
-        )
-        active_control_ready = transport_ready and lease_valid
-        control_ready = standby_ready or active_control_ready
-        if not transport_ready:
-            control_reason = "transport_session_unavailable"
-        elif active_command_count and not lease_valid:
-            control_reason = "active_commands_without_valid_lease"
-        elif control_active and not lease_valid:
-            control_reason = "control_lease_expired"
-        elif standby_ready:
-            control_reason = "standby_waiting_for_control_acquire"
-        elif not session_snapshot.can_acquire:
-            control_reason = "control_acquire_blocked"
-        else:
-            control_reason = None
-        control_mode = (
-            "ACTIVE" if active_control_ready else "STANDBY" if standby_ready else "BLOCKED"
-        )
         if ros_ready:
             try:
                 self._ros.check_health()
@@ -1100,6 +1294,20 @@ class RobotAgentRuntime:
         nav2_required = bool(nav2_commands)
         nav2_ready = bool(nav2_actions) and all(
             bool(action["ready"]) for action in nav2_actions.values()
+        )
+        safety_endpoints: dict[str, dict[str, Any]] = {}
+        for name in sorted(configured_safety_endpoints):
+            result = safety_endpoint_results.get(name)
+            safety_endpoints[name] = {
+                "ready": False if result is None else result.ready,
+                "reason": (
+                    result.reason
+                    if result is not None
+                    else safety_endpoint_probe_reason or "safety_endpoint_probe_incomplete"
+                ),
+            }
+        safety_endpoints_ready = bool(safety_endpoints) and all(
+            bool(endpoint["ready"]) for endpoint in safety_endpoints.values()
         )
 
         localization_paths = tuple(
@@ -1166,6 +1374,47 @@ class RobotAgentRuntime:
                 "maxAgeMs": freshness.max_age_ms,
             }
 
+        downstream_ready_for_acquire = (
+            lifecycle_ready
+            and ros_ready
+            and safety_endpoints_ready
+            and (not nav2_required or nav2_ready)
+            and (not localization_required or localization_fresh)
+            and (not observation_required or bool(observation["ready"]))
+        )
+        effective_can_acquire = (
+            transport_ready
+            and session_snapshot.can_acquire
+            and downstream_ready_for_acquire
+        )
+        standby_ready = (
+            not control_active
+            and effective_can_acquire
+            and active_command_count == 0
+        )
+        active_control_ready = transport_ready and lease_valid
+        control_ready = standby_ready or active_control_ready
+        if not transport_ready:
+            control_reason = "transport_session_unavailable"
+        elif active_command_count and not lease_valid:
+            control_reason = "active_commands_without_valid_lease"
+        elif control_active and not lease_valid:
+            control_reason = "control_lease_expired"
+        elif standby_ready:
+            control_reason = "standby_waiting_for_control_acquire"
+        elif not session_snapshot.can_acquire:
+            control_reason = "control_acquire_blocked"
+        elif not downstream_ready_for_acquire:
+            control_reason = "downstream_readiness_unavailable"
+        else:
+            control_reason = None
+        control_mode = (
+            "ACTIVE" if active_control_ready else "STANDBY" if standby_ready else "BLOCKED"
+        )
+        safe_stop_ready = (
+            session_snapshot.safe_stop_state is SafeStopState.CONFIRMED
+        )
+
         checks: dict[str, Any] = {
             "runtime": {
                 "required": True,
@@ -1183,11 +1432,34 @@ class RobotAgentRuntime:
                 "state": session_snapshot.state.value,
                 "mode": control_mode,
                 "active": control_active,
-                "canAcquire": transport_ready and session_snapshot.can_acquire,
+                "canAcquire": effective_can_acquire,
                 "leaseValid": lease_valid,
                 "activeCommandCount": active_command_count,
                 "reason": control_reason,
                 "leaseRemainingMs": _rounded_age(lease_remaining_ms),
+            },
+            "safeStop": {
+                "required": True,
+                "ready": safe_stop_ready,
+                "reason": (
+                    None
+                    if safe_stop_ready
+                    else f"safe_stop_{session_snapshot.safe_stop_state.value}"
+                ),
+                "authorityRevoked": session_snapshot.authority_revoked,
+                "state": session_snapshot.safe_stop_state.value,
+                "epoch": session_snapshot.safe_stop_epoch,
+            },
+            "safetyEndpoints": {
+                "required": True,
+                "ready": safety_endpoints_ready,
+                "reason": (
+                    None
+                    if safety_endpoints_ready
+                    else safety_endpoint_probe_reason
+                    or "one_or_more_safety_endpoints_unavailable"
+                ),
+                "endpoints": safety_endpoints,
             },
             "rosExecutor": {
                 "required": True,
@@ -1241,7 +1513,10 @@ class RobotAgentRuntime:
                 "state": session_snapshot.state.value,
                 "active": control_active,
                 "standby": standby_ready,
-                "canAcquire": transport_ready and session_snapshot.can_acquire,
+                "canAcquire": effective_can_acquire,
+                "authorityRevoked": session_snapshot.authority_revoked,
+                "safeStopState": session_snapshot.safe_stop_state.value,
+                "safeStopEpoch": session_snapshot.safe_stop_epoch,
                 "leaseValid": lease_valid,
                 "leaseRemainingMs": _rounded_age(lease_remaining_ms),
                 "activeCommandCount": active_command_count,

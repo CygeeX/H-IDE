@@ -1104,6 +1104,45 @@ class RosAdapter:
                 )
         return results
 
+    async def safety_endpoint_readiness(
+        self,
+        endpoints: Mapping[str, SafeStopConfig],
+    ) -> dict[str, RosActionReadiness]:
+        """Probe safety services/actions without dispatching a request or goal."""
+
+        self._require_started()
+        results: dict[str, RosActionReadiness] = {}
+        for name, config in sorted(endpoints.items()):
+            try:
+                ready = bool(
+                    await self._run_on_ros_thread(
+                        partial(self._safety_endpoint_is_ready, config)
+                    )
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                results[name] = RosActionReadiness(
+                    ready=False,
+                    reason=f"probe_failed:{type(exc).__name__}",
+                )
+            else:
+                results[name] = RosActionReadiness(
+                    ready=ready,
+                    reason=None if ready else "endpoint_unavailable",
+                )
+        return results
+
+    def _safety_endpoint_is_ready(self, config: SafeStopConfig) -> bool:
+        self._require_owner_thread()
+        if config.adapter == "service":
+            return bool(
+                self._service_client(config.ros_name, config.ros_type).service_is_ready()
+            )
+        return bool(
+            self._action_client(config.ros_name, config.ros_type).server_is_ready()
+        )
+
     def _nav2_action_server_is_ready(self, command: CommandConfig) -> bool:
         self._require_owner_thread()
         return bool(self._action_client(command.ros_name, command.ros_type).server_is_ready())

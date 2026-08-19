@@ -13,6 +13,8 @@ from robot_agent.ledger import (
     CommandNotFound,
     CommandState,
     InvalidTransition,
+    LedgerError,
+    SafeStopAuditState,
 )
 
 NOW = datetime(2026, 8, 7, 13, 0, tzinfo=timezone.utc)
@@ -134,7 +136,7 @@ def test_ledger_enforces_transition_graph_and_durable_pragmas(tmp_path: Path) ->
     connection = sqlite3.connect(path)
     try:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     finally:
         connection.close()
@@ -173,3 +175,56 @@ def test_ledger_prunes_only_terminal_commands_older_than_retention_window(
             ledger.get(old_terminal)
         assert ledger.get(old_incomplete).state is CommandState.RECEIVED
         assert ledger.get(recent_terminal).state is CommandState.SUCCEEDED
+
+
+def test_safe_stop_epochs_are_durable_monotonic_and_auditable(tmp_path: Path) -> None:
+    path = tmp_path / "commands.sqlite3"
+    with CommandLedger(path) as ledger:
+        requested = ledger.begin_safe_stop(epoch=1, reason="agent startup", at=NOW)
+        assert requested.state is SafeStopAuditState.REQUESTED
+        confirmed = ledger.finish_safe_stop(
+            epoch=1,
+            state=SafeStopAuditState.CONFIRMED,
+            detail="plant latched",
+            at=NOW + timedelta(milliseconds=10),
+        )
+        assert confirmed.state is SafeStopAuditState.CONFIRMED
+        ledger.begin_safe_stop(epoch=2, reason="lease expired", at=NOW)
+        failed = ledger.finish_safe_stop(
+            epoch=2,
+            state=SafeStopAuditState.FAILED,
+            detail="service unavailable",
+            at=NOW + timedelta(milliseconds=20),
+        )
+        assert failed.state is SafeStopAuditState.FAILED
+        with pytest.raises(LedgerError, match="already recorded"):
+            ledger.begin_safe_stop(epoch=1, reason="reused", at=NOW)
+
+    with CommandLedger(path) as reopened:
+        assert reopened.latest_safe_stop_epoch == 2
+        assert [event.state for event in reopened.safe_stop_events()] == [
+            SafeStopAuditState.CONFIRMED,
+            SafeStopAuditState.FAILED,
+        ]
+
+
+def test_v1_ledger_migrates_without_losing_command_history(tmp_path: Path) -> None:
+    path = tmp_path / "commands.sqlite3"
+    command_id = uuid4()
+    with CommandLedger(path) as ledger:
+        ledger.register(
+            command_id=command_id,
+            kind="task.execute",
+            payload={"kind": "task.execute", "params": {"order": 5}},
+            session_id=uuid4(),
+            at=NOW,
+        )
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP TABLE safe_stop_events")
+        connection.execute("PRAGMA user_version=1")
+
+    with CommandLedger(path) as migrated:
+        assert migrated.get(command_id).state is CommandState.RECEIVED
+        assert migrated.latest_safe_stop_epoch == 0
+        migrated.begin_safe_stop(epoch=1, reason="migration check", at=NOW)
+        assert migrated.safe_stop_event(1).state is SafeStopAuditState.REQUESTED

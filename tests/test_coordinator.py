@@ -272,7 +272,7 @@ async def test_coordinator_timeout_cancels_adapter_and_releases_resource(
 
 
 @pytest.mark.asyncio
-async def test_safe_stop_preempts_and_terminalizes_active_commands(tmp_path: Path) -> None:
+async def test_safe_stop_defers_terminals_until_physical_confirmation(tmp_path: Path) -> None:
     session, session_id = await active_session()
     executor = ControlledExecutor()
     with CommandLedger(tmp_path / "ledger.sqlite3") as ledger:
@@ -295,7 +295,11 @@ async def test_safe_stop_preempts_and_terminalizes_active_commands(tmp_path: Pat
 
         assert set(preempted) == {item.payload.command_id for item in commands}
         assert set(executor.cancelled) == set(preempted)
-        assert all(record.state is CommandState.CANCELLED for record in records)
+        assert all(record.state is CommandState.RUNNING for record in records)
+        assert coordinator.pending_cancel_confirmations == frozenset(preempted)
+        confirmed = await coordinator.confirm_safe_stop(epoch=7, at=NOW)
+        assert {record.command_id for record in confirmed} == set(preempted)
+        assert all(record.state is CommandState.CANCELLED for record in confirmed)
         assert coordinator.active_commands == frozenset()
 
 
@@ -522,7 +526,10 @@ async def test_safe_stop_preempts_submission_during_initial_ledger_write(
         record = await submission
 
         assert preempted == (command.payload.command_id,)
-        assert record.state is CommandState.CANCELLED
+        assert record.state is CommandState.RECEIVED
+        confirmed = await coordinator.confirm_safe_stop(epoch=8, at=NOW)
+        assert len(confirmed) == 1
+        assert confirmed[0].state is CommandState.CANCELLED
         assert executor.calls == []
 
 

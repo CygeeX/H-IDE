@@ -403,6 +403,11 @@
     "ControlStatusPayload": {
       "additionalProperties": false,
       "properties": {
+        "authority_revoked": {
+          "default": true,
+          "title": "Authority Revoked",
+          "type": "boolean"
+        },
         "lease_sequence": {
           "anyOf": [
             {
@@ -420,6 +425,22 @@
           "maxLength": 256,
           "minLength": 1,
           "title": "Reason",
+          "type": "string"
+        },
+        "safe_stop_epoch": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Safe Stop Epoch",
+          "type": "integer"
+        },
+        "safe_stop_state": {
+          "default": "confirmed",
+          "enum": [
+            "requested",
+            "confirmed",
+            "failed"
+          ],
+          "title": "Safe Stop State",
           "type": "string"
         },
         "state": {
@@ -732,6 +753,11 @@
     "SafetyEventPayload": {
       "additionalProperties": false,
       "properties": {
+        "authority_revoked": {
+          "default": true,
+          "title": "Authority Revoked",
+          "type": "boolean"
+        },
         "code": {
           "maxLength": 128,
           "minLength": 1,
@@ -747,6 +773,22 @@
           "maxLength": 512,
           "minLength": 1,
           "title": "Reason",
+          "type": "string"
+        },
+        "safe_stop_epoch": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Safe Stop Epoch",
+          "type": "integer"
+        },
+        "safe_stop_state": {
+          "default": "confirmed",
+          "enum": [
+            "requested",
+            "confirmed",
+            "failed"
+          ],
+          "title": "Safe Stop State",
           "type": "string"
         },
         "state": {

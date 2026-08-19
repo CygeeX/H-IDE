@@ -27,6 +27,12 @@ class CommandState(str, Enum):
     ABORTED_AGENT_RESTART = "ABORTED_AGENT_RESTART"
 
 
+class SafeStopAuditState(str, Enum):
+    REQUESTED = "requested"
+    CONFIRMED = "confirmed"
+    FAILED = "failed"
+
+
 TERMINAL_STATES = frozenset(
     {
         CommandState.SUCCEEDED,
@@ -41,6 +47,7 @@ TERMINAL_STATES = frozenset(
 _TRANSITIONS: dict[CommandState, frozenset[CommandState]] = {
     CommandState.RECEIVED: frozenset(
         {
+            CommandState.RECEIVED,
             CommandState.RUNNING,
             CommandState.REJECTED,
             CommandState.CANCELLED,
@@ -110,10 +117,20 @@ class TransitionRecord:
     at: datetime
 
 
+@dataclass(frozen=True)
+class SafeStopAuditRecord:
+    epoch: int
+    state: SafeStopAuditState
+    reason: str
+    detail: str
+    requested_at: datetime
+    updated_at: datetime
+
+
 class CommandLedger:
     """Thread-safe durable ledger with an explicit schema migration boundary."""
 
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
 
     def __init__(self, path: str | Path) -> None:
         self._path = Path(path)
@@ -141,45 +158,164 @@ class CommandLedger:
             raise LedgerMigrationError(
                 f"ledger schema {version} is newer than supported {self.SCHEMA_VERSION}"
             )
+        if version == 0:
+            states = ", ".join(f"'{state.value}'" for state in CommandState)
+            with self._connection:
+                self._connection.execute(
+                    f"""
+                    CREATE TABLE commands (
+                        command_id TEXT PRIMARY KEY,
+                        kind TEXT NOT NULL,
+                        payload_hash TEXT NOT NULL,
+                        payload_json TEXT NOT NULL,
+                        state TEXT NOT NULL CHECK (state IN ({states})),
+                        detail TEXT NOT NULL,
+                        result_json TEXT,
+                        session_id TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                self._connection.execute(
+                    f"""
+                    CREATE TABLE command_transitions (
+                        transition_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        command_id TEXT NOT NULL REFERENCES commands(command_id),
+                        from_state TEXT CHECK (from_state IS NULL OR from_state IN ({states})),
+                        to_state TEXT NOT NULL CHECK (to_state IN ({states})),
+                        detail TEXT NOT NULL,
+                        at TEXT NOT NULL
+                    )
+                    """
+                )
+                self._connection.execute(
+                    "CREATE INDEX command_transitions_command_idx "
+                    "ON command_transitions(command_id, transition_id)"
+                )
+                self._create_safe_stop_events_table()
+                self._connection.execute(f"PRAGMA user_version={self.SCHEMA_VERSION}")
+            return
+        if version == 1:
+            with self._connection:
+                self._create_safe_stop_events_table()
+                self._connection.execute(f"PRAGMA user_version={self.SCHEMA_VERSION}")
+            return
         if version == self.SCHEMA_VERSION:
             return
-        if version != 0:
-            raise LedgerMigrationError(f"no migration path from ledger schema {version}")
-        states = ", ".join(f"'{state.value}'" for state in CommandState)
-        with self._connection:
-            self._connection.execute(
-                f"""
-                CREATE TABLE commands (
-                    command_id TEXT PRIMARY KEY,
-                    kind TEXT NOT NULL,
-                    payload_hash TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    state TEXT NOT NULL CHECK (state IN ({states})),
-                    detail TEXT NOT NULL,
-                    result_json TEXT,
-                    session_id TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+        raise LedgerMigrationError(f"no migration path from ledger schema {version}")
+
+    def _create_safe_stop_events_table(self) -> None:
+        states = ", ".join(f"'{state.value}'" for state in SafeStopAuditState)
+        self._connection.execute(
+            f"""
+            CREATE TABLE safe_stop_events (
+                epoch INTEGER PRIMARY KEY CHECK (epoch > 0),
+                state TEXT NOT NULL CHECK (state IN ({states})),
+                reason TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                requested_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+
+    def begin_safe_stop(self, *, epoch: int, reason: str, at: datetime) -> SafeStopAuditRecord:
+        """Durably record authority revocation before physical stop dispatch."""
+
+        if epoch <= 0:
+            raise LedgerError("safe-stop epoch must be positive")
+        timestamp = _aware_iso(at)
+        bounded_reason = reason[:512]
+        with self._lock, self._connection:
+            existing = self._connection.execute(
+                "SELECT * FROM safe_stop_events WHERE epoch = ?", (epoch,)
+            ).fetchone()
+            if existing is not None:
+                record = _row_to_safe_stop_record(existing)
+                if (
+                    record.state is SafeStopAuditState.REQUESTED
+                    and record.reason == bounded_reason
+                ):
+                    return record
+                raise LedgerError(f"safe-stop epoch {epoch} is already recorded")
+            latest = self._connection.execute(
+                "SELECT COALESCE(MAX(epoch), 0) FROM safe_stop_events"
+            ).fetchone()[0]
+            if epoch <= int(latest):
+                raise LedgerError(
+                    f"safe-stop epoch must increase beyond durable epoch {latest}"
                 )
-                """
-            )
             self._connection.execute(
-                f"""
-                CREATE TABLE command_transitions (
-                    transition_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    command_id TEXT NOT NULL REFERENCES commands(command_id),
-                    from_state TEXT CHECK (from_state IS NULL OR from_state IN ({states})),
-                    to_state TEXT NOT NULL CHECK (to_state IN ({states})),
-                    detail TEXT NOT NULL,
-                    at TEXT NOT NULL
+                """
+                INSERT INTO safe_stop_events (
+                    epoch, state, reason, detail, requested_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    epoch,
+                    SafeStopAuditState.REQUESTED.value,
+                    bounded_reason,
+                    "physical safe-stop requested",
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            return self.safe_stop_event(epoch)
+
+    def finish_safe_stop(
+        self,
+        *,
+        epoch: int,
+        state: SafeStopAuditState,
+        detail: str,
+        at: datetime,
+    ) -> SafeStopAuditRecord:
+        if state not in {SafeStopAuditState.CONFIRMED, SafeStopAuditState.FAILED}:
+            raise LedgerError("safe-stop final state must be confirmed or failed")
+        timestamp = _aware_iso(at)
+        with self._lock, self._connection:
+            current = self.safe_stop_event(epoch)
+            if current.state is not SafeStopAuditState.REQUESTED:
+                if current.state is state and current.detail == detail[:1024]:
+                    return current
+                raise LedgerError(
+                    f"safe-stop epoch {epoch} is already {current.state.value}"
                 )
-                """
-            )
             self._connection.execute(
-                "CREATE INDEX command_transitions_command_idx "
-                "ON command_transitions(command_id, transition_id)"
+                """
+                UPDATE safe_stop_events
+                SET state = ?, detail = ?, updated_at = ?
+                WHERE epoch = ?
+                """,
+                (state.value, detail[:1024], timestamp, epoch),
             )
-            self._connection.execute(f"PRAGMA user_version={self.SCHEMA_VERSION}")
+            return self.safe_stop_event(epoch)
+
+    def safe_stop_event(self, epoch: int) -> SafeStopAuditRecord:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM safe_stop_events WHERE epoch = ?", (epoch,)
+            ).fetchone()
+            if row is None:
+                raise LedgerError(f"unknown safe-stop epoch {epoch}")
+            return _row_to_safe_stop_record(row)
+
+    def safe_stop_events(self) -> list[SafeStopAuditRecord]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM safe_stop_events ORDER BY epoch"
+            ).fetchall()
+        return [_row_to_safe_stop_record(row) for row in rows]
+
+    @property
+    def latest_safe_stop_epoch(self) -> int:
+        with self._lock:
+            return int(
+                self._connection.execute(
+                    "SELECT COALESCE(MAX(epoch), 0) FROM safe_stop_events"
+                ).fetchone()[0]
+            )
 
     def register(
         self,
@@ -431,5 +567,16 @@ def _row_to_record(row: sqlite3.Row) -> CommandRecord:
         result=None if row["result_json"] is None else json.loads(row["result_json"]),
         session_id=UUID(row["session_id"]),
         created_at=datetime.fromisoformat(row["created_at"]),
+        updated_at=datetime.fromisoformat(row["updated_at"]),
+    )
+
+
+def _row_to_safe_stop_record(row: sqlite3.Row) -> SafeStopAuditRecord:
+    return SafeStopAuditRecord(
+        epoch=int(row["epoch"]),
+        state=SafeStopAuditState(row["state"]),
+        reason=row["reason"],
+        detail=row["detail"],
+        requested_at=datetime.fromisoformat(row["requested_at"]),
         updated_at=datetime.fromisoformat(row["updated_at"]),
     )

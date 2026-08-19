@@ -95,6 +95,10 @@ class CommandCoordinator:
         self._cancel_reasons: dict[UUID, tuple[str, datetime]] = {}
         self._cancel_failures: set[UUID] = set()
         self._preempting: set[UUID] = set()
+        self._defer_terminal: set[UUID] = set()
+        self._pending_cancel_confirmations: dict[
+            UUID, tuple[CommandState, str]
+        ] = {}
 
     async def submit(self, request: CommandRequest, *, at: datetime) -> CommandRecord:
         """Persist a request first, then execute it at most once."""
@@ -119,6 +123,7 @@ class CommandCoordinator:
             if owns_tracking:
                 self._arbiter.release(payload.command_id)
                 self._cancel_reasons.pop(payload.command_id, None)
+                self._defer_terminal.discard(payload.command_id)
                 if self._tasks.get(payload.command_id) is current_task:
                     del self._tasks[payload.command_id]
                 if self._registration_locks.get(payload.command_id) is registration_lock:
@@ -378,6 +383,13 @@ class CommandCoordinator:
             terminal_state = (
                 CommandState.CANCELLED if cancel_acknowledged else CommandState.FAILED
             )
+            if payload.command_id in self._defer_terminal:
+                return await self._defer_cancellation_terminal(
+                    record,
+                    terminal_state=terminal_state,
+                    detail=detail,
+                    at=transition_at,
+                )
             return await asyncio.to_thread(
                 self._ledger.transition,
                 payload.command_id,
@@ -414,6 +426,13 @@ class CommandCoordinator:
         record = await asyncio.to_thread(self._ledger.get, command_id)
         if record.state in TERMINAL_STATES:
             return record
+        if command_id in self._defer_terminal:
+            return await self._defer_cancellation_terminal(
+                record,
+                terminal_state=CommandState.CANCELLED,
+                detail=reason,
+                at=at,
+            )
         return await asyncio.to_thread(
             self._ledger.transition,
             command_id,
@@ -460,11 +479,20 @@ class CommandCoordinator:
             at=at,
         )
 
-    async def cancel(self, command_id: UUID, *, reason: str, at: datetime) -> bool:
+    async def cancel(
+        self,
+        command_id: UUID,
+        *,
+        reason: str,
+        at: datetime,
+        defer_terminal_until_safe_stop: bool = False,
+    ) -> bool:
         """Cancel one active command without disturbing disjoint resource groups."""
         task = self._tasks.get(command_id)
         if task is None or task.done():
             return False
+        if defer_terminal_until_safe_stop:
+            self._defer_terminal.add(command_id)
         self._cancel_reasons.setdefault(command_id, (reason, at))
         if command_id in self._executing:
             task.cancel()
@@ -491,6 +519,7 @@ class CommandCoordinator:
         )
         command_ids = tuple(dict.fromkeys((*claimed_ids, *pending_ids)))
         self._preempting.update(command_ids)
+        self._defer_terminal.update(command_ids)
         tasks: list[asyncio.Task[Any]] = []
         for command_id in command_ids:
             task = self._tasks.get(command_id)
@@ -513,9 +542,67 @@ class CommandCoordinator:
             )
         return command_ids
 
+    async def confirm_safe_stop(
+        self,
+        *,
+        epoch: int,
+        at: datetime,
+    ) -> tuple[CommandRecord, ...]:
+        """Terminalize cancellations only after the physical stop is confirmed."""
+
+        confirmed: list[CommandRecord] = []
+        for command_id, (terminal_state, detail) in tuple(
+            self._pending_cancel_confirmations.items()
+        ):
+            record = await asyncio.to_thread(self._ledger.get, command_id)
+            if record.state in TERMINAL_STATES:
+                self._pending_cancel_confirmations.pop(command_id, None)
+                continue
+            terminal = await asyncio.to_thread(
+                self._ledger.transition,
+                command_id,
+                terminal_state,
+                detail=f"{detail}; physical safe-stop confirmed at epoch {epoch}",
+                at=at,
+            )
+            self._pending_cancel_confirmations.pop(command_id, None)
+            confirmed.append(terminal)
+            if self._status_callback is not None:
+                await self._status_callback(terminal)
+        return tuple(confirmed)
+
+    async def _defer_cancellation_terminal(
+        self,
+        record: CommandRecord,
+        *,
+        terminal_state: CommandState,
+        detail: str,
+        at: datetime,
+    ) -> CommandRecord:
+        pending = await asyncio.to_thread(
+            self._ledger.transition,
+            record.command_id,
+            record.state,
+            detail=f"{detail}; awaiting physical safe-stop confirmation",
+            at=at,
+        )
+        self._pending_cancel_confirmations[record.command_id] = (
+            terminal_state,
+            detail,
+        )
+        return pending
+
     @property
     def active_commands(self) -> frozenset[UUID]:
         return self._arbiter.active_commands
+
+    @property
+    def pending_cancel_confirmations(self) -> frozenset[UUID]:
+        return frozenset(self._pending_cancel_confirmations)
+
+    def is_command_active(self, command_id: UUID) -> bool:
+        task = self._tasks.get(command_id)
+        return task is not None and not task.done()
 
 
 def _utc_now() -> datetime:

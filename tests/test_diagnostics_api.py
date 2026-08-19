@@ -217,6 +217,7 @@ class DiagnosticRosAdapter:
         self.nav2_ready = True
         self.nav2_error: Exception | None = None
         self.nav2_delay_seconds = 0.0
+        self.safety_endpoints_ready = True
         self.health_calls = 0
         self.health_fail_on_call: int | None = None
         self.started = False
@@ -266,6 +267,18 @@ class DiagnosticRosAdapter:
                 reason=None if self.nav2_ready else "action_server_unavailable",
             )
             for name in commands
+        }
+
+    async def safety_endpoint_readiness(
+        self,
+        endpoints: dict[str, SafeStopConfig],
+    ) -> dict[str, RosActionReadiness]:
+        return {
+            name: RosActionReadiness(
+                ready=self.safety_endpoints_ready,
+                reason=None if self.safety_endpoints_ready else "endpoint_unavailable",
+            )
+            for name in endpoints
         }
 
     async def execute(
@@ -527,6 +540,39 @@ async def test_ros_nav2_readiness_probe_never_dispatches_a_goal(
 
 
 @pytest.mark.asyncio
+async def test_ros_safety_readiness_probe_never_dispatches_a_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    safe_stop = diagnostic_runtime_config(tmp_path).safety.safe_stop
+    adapter = RosAdapter()
+    adapter._started = True
+    adapter._accepting_requests = True
+    adapter._owner_thread_id = threading.get_ident()
+    adapter._thread = SimpleNamespace(is_alive=lambda: True)  # type: ignore[assignment]
+
+    class DiscoveryOnlyServiceClient:
+        discovery_calls = 0
+        request_calls = 0
+
+        def service_is_ready(self) -> bool:
+            self.discovery_calls += 1
+            return True
+
+        def call_async(self, *_: object, **__: object) -> None:
+            self.request_calls += 1
+
+    client = DiscoveryOnlyServiceClient()
+    monkeypatch.setattr(adapter, "_service_client", lambda name, kind: client)
+
+    readiness = await adapter.safety_endpoint_readiness({"safeStop": safe_stop})
+
+    assert readiness["safeStop"].ready is True
+    assert client.discovery_calls == 1
+    assert client.request_calls == 0
+
+
+@pytest.mark.asyncio
 async def test_runtime_diagnostics_fail_closed_on_probe_and_executor_errors(
     tmp_path: Path,
 ) -> None:
@@ -598,11 +644,35 @@ async def test_idle_safe_hold_is_ready_standby_when_control_can_be_acquired(
             "leaseValid": False,
             "leaseRemainingMs": None,
             "activeCommandCount": 0,
+            "authorityRevoked": True,
+            "safeStopState": "confirmed",
+            "safeStopEpoch": 1,
         }
         assert standby["checks"]["control"]["ready"] is True
         assert standby["checks"]["control"]["reason"] == (
             "standby_waiting_for_control_acquire"
         )
+
+        ros.nav2_ready = False
+        downstream_down = await runtime.diagnostics_snapshot()
+        assert downstream_down["controlState"]["canAcquire"] is False
+        assert downstream_down["controlState"]["standby"] is False
+        assert downstream_down["checks"]["control"]["reason"] == (
+            "downstream_readiness_unavailable"
+        )
+        ros.nav2_ready = True
+
+        ros.safety_endpoints_ready = False
+        safety_endpoint_down = await runtime.diagnostics_snapshot()
+        assert safety_endpoint_down["controlState"]["canAcquire"] is False
+        assert safety_endpoint_down["checks"]["safetyEndpoints"]["ready"] is False
+        assert (
+            safety_endpoint_down["checks"]["safetyEndpoints"]["endpoints"]["safeStop"][
+                "reason"
+            ]
+            == "endpoint_unavailable"
+        )
+        ros.safety_endpoints_ready = True
 
         await runtime._session.latch_safety_fault("test safety interlock")
         faulted = await runtime.diagnostics_snapshot()

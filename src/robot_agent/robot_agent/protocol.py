@@ -124,6 +124,11 @@ class ControlStatusPayload(StrictModel):
     state: Literal["UNARMED", "ACTIVE", "SAFE_HOLD"]
     reason: str = Field(min_length=1, max_length=256)
     lease_sequence: int | None = Field(default=None, ge=0)
+    # Additive V1 safety truth.  Defaults keep older recorded/test payloads
+    # parseable while new agents always populate the measured values.
+    authority_revoked: bool = True
+    safe_stop_state: Literal["requested", "confirmed", "failed"] = "confirmed"
+    safe_stop_epoch: int = Field(default=0, ge=0)
 
 
 class ControlStatus(Envelope):
@@ -206,6 +211,9 @@ class SafetyEventPayload(StrictModel):
     state: Literal["UNARMED", "ACTIVE", "SAFE_HOLD"]
     reason: str = Field(min_length=1, max_length=512)
     latched: bool
+    authority_revoked: bool = True
+    safe_stop_state: Literal["requested", "confirmed", "failed"] = "confirmed"
+    safe_stop_epoch: int = Field(default=0, ge=0)
 
 
 class SafetyEvent(Envelope):
