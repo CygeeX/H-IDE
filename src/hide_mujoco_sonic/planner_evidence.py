@@ -22,6 +22,8 @@ from .safety import MovementIntent
 
 
 _MIN_DIRECTIONAL_PROJECTION_M = 1e-4
+_MAX_REFERENCE_PREFIX_REVERSE_M = 0.03
+_REFERENCE_HZ = 50.0
 # The locked planner_sonic.onnx revision 9c0ff22 nominal-context baseline
 # produced 0.004016 rad of root-yaw drift for a zero facing request, while the
 # smallest explicitly verified +/-0.05 rad requests produced
@@ -101,6 +103,11 @@ class PlannerReferenceEvidenceGate:
         self._accepted_request: _RequestEvidence | None = None
         self._predicted_direction: tuple[float, float] | None = None
         self._predicted_projection_m: float | None = None
+        self._predicted_prefix_projections_m: tuple[float, ...] | None = None
+        self._predicted_prefix_min_projection_m: float | None = None
+        self._predicted_prefix_max_projection_m: float | None = None
+        self._predicted_first_positive_frame: int | None = None
+        self._predicted_first_positive_time_s: float | None = None
         self._direction_consistent: bool | None = None
         self._requested_yaw_error_rad: float | None = None
         self._predicted_yaw_delta_rad: float | None = None
@@ -220,6 +227,11 @@ class PlannerReferenceEvidenceGate:
             self._accepted_request = None
             self._predicted_direction = None
             self._predicted_projection_m = None
+            self._predicted_prefix_projections_m = None
+            self._predicted_prefix_min_projection_m = None
+            self._predicted_prefix_max_projection_m = None
+            self._predicted_first_positive_frame = None
+            self._predicted_first_positive_time_s = None
             self._direction_consistent = None
             self._requested_yaw_error_rad = None
             self._predicted_yaw_delta_rad = None
@@ -410,30 +422,74 @@ class PlannerReferenceEvidenceGate:
     def _predicted_root_motion(
         motion: object,
         requested_direction: tuple[float, float] | None,
-    ) -> tuple[tuple[float, float] | None, float | None, bool]:
+    ) -> tuple[
+        tuple[float, float] | None,
+        float | None,
+        tuple[float, ...] | None,
+        float | None,
+        float | None,
+        int | None,
+        float | None,
+        bool,
+    ]:
         try:
             timesteps = int(motion.timesteps)
             if timesteps < 2:
                 raise ValueError("planner motion has fewer than two frames")
-            first = motion.body_positions[0]
-            last = motion.body_positions[timesteps - 1]
-            dx = float(last[0]) - float(first[0])
-            dy = float(last[1]) - float(first[1])
+            positions = tuple(
+                (float(motion.body_positions[index][0]), float(motion.body_positions[index][1]))
+                for index in range(timesteps)
+            )
         except (AttributeError, IndexError, TypeError, ValueError) as exc:
             raise ValueError("planner motion has no usable root trajectory") from exc
-        if not all(math.isfinite(value) for value in (dx, dy)):
+        if not all(
+            math.isfinite(value)
+            for position in positions
+            for value in position
+        ):
             raise ValueError("planner root trajectory must be finite")
+        first_x, first_y = positions[0]
+        dx = positions[-1][0] - first_x
+        dy = positions[-1][1] - first_y
         distance = math.hypot(dx, dy)
         predicted_direction = (
             None if distance <= 1e-12 else (dx / distance, dy / distance)
         )
         if requested_direction is None:
-            return predicted_direction, None, True
-        projection = dx * requested_direction[0] + dy * requested_direction[1]
+            return predicted_direction, None, None, None, None, None, None, True
+        prefix = tuple(
+            (x - first_x) * requested_direction[0]
+            + (y - first_y) * requested_direction[1]
+            for x, y in positions
+        )
+        projection = prefix[-1]
+        prefix_min = min(prefix)
+        prefix_max = max(prefix)
+        first_positive_frame = next(
+            (
+                index
+                for index, value in enumerate(prefix)
+                if value > _MIN_DIRECTIONAL_PROJECTION_M
+            ),
+            None,
+        )
+        first_positive_time_s = (
+            None
+            if first_positive_frame is None
+            else first_positive_frame / _REFERENCE_HZ
+        )
         return (
             predicted_direction,
             projection,
-            projection > _MIN_DIRECTIONAL_PROJECTION_M,
+            prefix,
+            prefix_min,
+            prefix_max,
+            first_positive_frame,
+            first_positive_time_s,
+            (
+                projection > _MIN_DIRECTIONAL_PROJECTION_M
+                and prefix_min >= -_MAX_REFERENCE_PREFIX_REVERSE_M
+            ),
         )
 
     @staticmethod
@@ -564,7 +620,16 @@ class PlannerReferenceEvidenceGate:
                     "planner result cannot be blended at the live reference cursor"
                 )
             try:
-                direction, projection, consistent = self._predicted_root_motion(
+                (
+                    direction,
+                    projection,
+                    prefix_projections,
+                    prefix_min,
+                    prefix_max,
+                    first_positive_frame,
+                    first_positive_time_s,
+                    consistent,
+                ) = self._predicted_root_motion(
                     motion,
                     request.requested_direction,
                 )
@@ -572,13 +637,31 @@ class PlannerReferenceEvidenceGate:
                 if not self._has_current_reference_locked():
                     self._predicted_direction = None
                     self._predicted_projection_m = None
+                    self._predicted_prefix_projections_m = None
+                    self._predicted_prefix_min_projection_m = None
+                    self._predicted_prefix_max_projection_m = None
+                    self._predicted_first_positive_frame = None
+                    self._predicted_first_positive_time_s = None
                     self._direction_consistent = False
                 return self._reject_result_locked(str(exc))
             if not consistent:
                 if not self._has_current_reference_locked():
                     self._predicted_direction = direction
                     self._predicted_projection_m = projection
+                    self._predicted_prefix_projections_m = prefix_projections
+                    self._predicted_prefix_min_projection_m = prefix_min
+                    self._predicted_prefix_max_projection_m = prefix_max
+                    self._predicted_first_positive_frame = first_positive_frame
+                    self._predicted_first_positive_time_s = first_positive_time_s
                     self._direction_consistent = False
+                if (
+                    prefix_min is not None
+                    and prefix_min < -_MAX_REFERENCE_PREFIX_REVERSE_M
+                ):
+                    return self._reject_result_locked(
+                        "planner root prefix exceeds the 0.030m reverse "
+                        "reference boundary"
+                    )
                 return self._reject_result_locked(
                     "planner root projection opposes or does not realize the Nav2 direction"
                 )
@@ -636,6 +719,11 @@ class PlannerReferenceEvidenceGate:
                     )
             self._predicted_direction = direction
             self._predicted_projection_m = projection
+            self._predicted_prefix_projections_m = prefix_projections
+            self._predicted_prefix_min_projection_m = prefix_min
+            self._predicted_prefix_max_projection_m = prefix_max
+            self._predicted_first_positive_frame = first_positive_frame
+            self._predicted_first_positive_time_s = first_positive_time_s
             self._direction_consistent = True
             self._requested_yaw_error_rad = requested_yaw_error
             self._predicted_yaw_delta_rad = predicted_yaw_delta
@@ -713,6 +801,23 @@ class PlannerReferenceEvidenceGate:
                 ),
                 "sonic_planner_predicted_root_projection_m": (
                     self._predicted_projection_m
+                ),
+                "sonic_planner_root_prefix_projections_m": (
+                    None
+                    if self._predicted_prefix_projections_m is None
+                    else list(self._predicted_prefix_projections_m)
+                ),
+                "sonic_planner_root_prefix_min_projection_m": (
+                    self._predicted_prefix_min_projection_m
+                ),
+                "sonic_planner_root_prefix_max_projection_m": (
+                    self._predicted_prefix_max_projection_m
+                ),
+                "sonic_planner_root_first_positive_frame": (
+                    self._predicted_first_positive_frame
+                ),
+                "sonic_planner_root_first_positive_time_s": (
+                    self._predicted_first_positive_time_s
                 ),
                 "sonic_planner_direction_consistent": self._direction_consistent,
                 "sonic_planner_requested_yaw_error_rad": (

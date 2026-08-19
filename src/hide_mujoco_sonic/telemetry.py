@@ -49,6 +49,11 @@ class TelemetryState:
     sonic_planner_predicted_root_direction_x: float | None = None
     sonic_planner_predicted_root_direction_y: float | None = None
     sonic_planner_predicted_root_projection_m: float | None = None
+    sonic_planner_root_prefix_projections_m: list[float] | None = None
+    sonic_planner_root_prefix_min_projection_m: float | None = None
+    sonic_planner_root_prefix_max_projection_m: float | None = None
+    sonic_planner_root_first_positive_frame: int | None = None
+    sonic_planner_root_first_positive_time_s: float | None = None
     sonic_planner_direction_consistent: bool | None = None
     sonic_planner_requested_yaw_error_rad: float | None = None
     sonic_planner_predicted_yaw_delta_rad: float | None = None

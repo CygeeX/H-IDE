@@ -98,6 +98,56 @@ def motion(
     )
 
 
+def prefix_motion(*x_positions: float):
+    positions = tuple((float(x), 0.0, 0.8) for x in x_positions)
+    return SimpleNamespace(
+        timesteps=len(positions),
+        body_positions=positions,
+        body_quaternions=tuple(yaw_quaternion(0.0) for _ in positions),
+    )
+
+
+def test_reference_rejects_reverse_prefix_even_when_full_projection_is_forward() -> None:
+    planner = FakePlanner()
+    gate = PlannerReferenceEvidenceGate()
+    gate.bind(planner, reference_owner=SimpleNamespace(ref_cursor=0))
+    gate.observe_intent(intent(0.0), admitted=True)
+    planner.request_replan(5, FakeMovementState(movement_angle=0.0))
+    planner.result = (prefix_motion(0.0, -0.031, 0.02, 0.20), 15)
+
+    assert planner.try_get_new_motion() is None
+    assert gate.reference_ready is False
+    evidence = gate.telemetry_fields(ref_cursor=0)
+    assert evidence["sonic_planner_predicted_root_projection_m"] == pytest.approx(0.20)
+    assert evidence["sonic_planner_root_prefix_min_projection_m"] == pytest.approx(-0.031)
+    assert evidence["sonic_planner_root_prefix_max_projection_m"] == pytest.approx(0.20)
+    assert evidence["sonic_planner_root_first_positive_frame"] == 2
+    assert evidence["sonic_planner_root_first_positive_time_s"] == pytest.approx(0.04)
+    assert evidence["sonic_planner_root_prefix_projections_m"] == pytest.approx(
+        [0.0, -0.031, 0.02, 0.20]
+    )
+    assert "0.030m reverse" in evidence["sonic_planner_evidence_reason"]
+
+
+def test_reference_persists_prefix_evidence_at_the_reviewed_reverse_boundary() -> None:
+    planner = FakePlanner()
+    gate = PlannerReferenceEvidenceGate()
+    gate.bind(planner, reference_owner=SimpleNamespace(ref_cursor=0))
+    gate.observe_intent(intent(0.0), admitted=True)
+    planner.request_replan(5, FakeMovementState(movement_angle=0.0))
+    accepted = (prefix_motion(0.0, -0.030, 0.001, 0.20), 15)
+    planner.result = accepted
+
+    assert planner.try_get_new_motion() == accepted
+    assert gate.reference_ready is True
+    evidence = gate.telemetry_fields(ref_cursor=0)
+    assert evidence["sonic_planner_root_prefix_min_projection_m"] == pytest.approx(-0.030)
+    assert evidence["sonic_planner_root_prefix_max_projection_m"] == pytest.approx(0.20)
+    assert evidence["sonic_planner_root_first_positive_frame"] == 2
+    assert evidence["sonic_planner_root_first_positive_time_s"] == pytest.approx(0.04)
+    assert evidence["sonic_planner_direction_consistent"] is True
+
+
 def test_stale_planner_generation_never_unlocks_a_new_nav2_intent() -> None:
     planner = FakePlanner()
     gate = PlannerReferenceEvidenceGate()
