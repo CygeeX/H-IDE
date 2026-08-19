@@ -35,6 +35,7 @@ const ROBOT_INTENTS = new Set<ConversationIntent>([
 const GREETING_PATTERN = /^(?:你(?:好|好呀|好啊)|您好|嗨|哈(?:喽|啰|罗)|早上好|上午好|下午好|晚上好|hello|hi|hey)[\s!！,.，。?？~～]*$/iu;
 const THANKS_PATTERN = /^(?:谢谢|多谢|感谢(?:你)?|thanks|thank\s+you)[\s!！,.，。?？~～]*$/iu;
 const GOODBYE_PATTERN = /^(?:再见|拜拜|回头见|bye|goodbye|see\s+you)[\s!！,.，。?？~～]*$/iu;
+const PERSONAL_PREFERENCE_PATTERN = /(?:我(?:很)?(?:喜欢|偏好|习惯)|我的(?:名字|称呼|昵称|偏好|喜好|习惯)|(?:以后)?(?:叫|称呼)我(?:为|做)?|i\s+(?:like|prefer)|my\s+(?:name|nickname|preference)|call\s+me)/iu;
 
 function isChineseLocale(locale: string): boolean {
   return locale.toLowerCase().startsWith("zh");
@@ -67,6 +68,20 @@ function socialFastPath(input: ConversationTurnRequest): ConversationRouterModel
     };
   }
   return undefined;
+}
+
+function personalPreferenceFastPath(
+  input: ConversationTurnRequest,
+): ConversationRouterModelOutput | undefined {
+  const text = input.text.trim();
+  if (!PERSONAL_PREFERENCE_PATTERN.test(text)) return undefined;
+  return {
+    intent: "SOCIAL_CHAT",
+    assistantMessage: isChineseLocale(input.locale)
+      ? "记住了，我会把这作为你的会话偏好；你之后可以随时更正。"
+      : "Got it. I will treat that as your conversation preference, and you can correct it at any time.",
+    clarification: null,
+  };
 }
 
 type ArithmeticToken = number | "+" | "-" | "*" | "/" | "(" | ")";
@@ -235,6 +250,7 @@ const ROUTER_INSTRUCTIONS = [
   "ROBOT_OBSERVE uses current robot sensors but must not translate, rotate, change pose, or perform another physical action.",
   "ROBOT_ACTION is any requested physical robot action, including walking, base rotation, navigation, manipulation, or a sequence containing one.",
   "SCENE_TEACH teaches, names, corrects, or asks to remember a place/object in the current environment.",
+  "A request to remember the user's name, preferred form of address, likes, dislikes, habits, or other personal preferences is SOCIAL_CHAT, never SCENE_TEACH, and does not require a robot.",
   "ADMIN_DEV is developer/admin configuration, diagnostics, protocol, interface, or system-maintenance work; never pretend to have changed the system.",
   "For SOCIAL_CHAT and GENERAL_QA, answer the user naturally and directly in the requested locale.",
   "For robot intents, provide only a short spoken transition. Never claim execution started, succeeded, or completed; never output commands, coordinates, paths, velocities, ROS details, or an executable plan.",
@@ -304,7 +320,9 @@ export class ConversationRouter {
 
   async route(rawInput: unknown, signal: AbortSignal): Promise<ConversationTurnResponse> {
     const input = conversationTurnRequestSchema.parse(rawInput);
-    const fastPath = socialFastPath(input) ?? mathFastPath(input);
+    const fastPath = socialFastPath(input)
+      ?? personalPreferenceFastPath(input)
+      ?? mathFastPath(input);
     if (fastPath) {
       const response = buildResponse(input, fastPath);
       // Fast paths skip both model inference and memory retrieval. The compact

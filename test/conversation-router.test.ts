@@ -61,6 +61,77 @@ describe("Assistant V2 conversation router", () => {
     expect(conversationRouterInternals.evaluateArithmetic("10 / 0")).toBeUndefined();
   });
 
+  it("stores explicit personal preferences as chat without requiring a robot", async () => {
+    const agent = { generate: vi.fn() };
+    const memory = { prepare: vi.fn(), record: vi.fn().mockResolvedValue(undefined) };
+    const result = await new ConversationRouter(agent as never, memory as never).route({
+      conversationId: "conversation-personal-preference",
+      locale: "zh-CN",
+      text: "请记住：我喜欢淡紫色，希望你以后称呼我为小明。",
+    }, signal());
+
+    expect(result).toMatchObject({
+      intent: "SOCIAL_CHAT",
+      needsRobot: false,
+      shouldCreateMission: false,
+    });
+    expect(result.assistantMessage).toContain("会话偏好");
+    expect(agent.generate).not.toHaveBeenCalled();
+    expect(memory.prepare).not.toHaveBeenCalled();
+    expect(memory.record).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not confuse an environmental teaching request with a personal preference", async () => {
+    const agent = {
+      generate: vi.fn().mockResolvedValue({
+        object: {
+          intent: "SCENE_TEACH",
+          assistantMessage: "我会记住这个环境物体。",
+          clarification: null,
+        },
+      }),
+    };
+    const result = await new ConversationRouter(agent as never).route({
+      conversationId: "conversation-scene-teaching",
+      robotId: "g1-sim",
+      locale: "zh-CN",
+      text: "请记住：这里是会议桌。",
+    }, signal());
+
+    expect(agent.generate).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({
+      intent: "SCENE_TEACH",
+      needsRobot: true,
+      shouldCreateMission: false,
+    });
+    expect(result.assistantMessage).toContain("场景教学");
+  });
+
+  it("never lets a broad desire phrase bypass robot-action classification", async () => {
+    const agent = {
+      generate: vi.fn().mockResolvedValue({
+        object: {
+          intent: "ROBOT_ACTION",
+          assistantMessage: "我会直接走。",
+          clarification: null,
+        },
+      }),
+    };
+    const result = await new ConversationRouter(agent as never).route({
+      conversationId: "conversation-action-desire",
+      robotId: "g1-sim",
+      locale: "zh-CN",
+      text: "我希望机器人向前走两米。",
+    }, signal());
+
+    expect(agent.generate).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({
+      intent: "ROBOT_ACTION",
+      needsRobot: true,
+      shouldCreateMission: true,
+    });
+  });
+
   it("keeps mixed greeting/action requests on the model path", async () => {
     const agent = {
       generate: vi.fn().mockResolvedValue({
