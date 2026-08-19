@@ -172,6 +172,27 @@ describe("Mission V2 planning", () => {
     expect(JSON.stringify(draft.nodes)).not.toMatch(/goalPose|cmd_vel|waypoints|rosAction/iu);
   });
 
+  it("rejects approval placeholders disguised as executable skills", async () => {
+    const runtime = {
+      draftMission: vi.fn().mockResolvedValue({
+        objective: brief().objective,
+        nodes: [{
+          ...nodes()[1],
+          nodeId: "plan-approval",
+          purpose: "等待用户确认计划后再执行移动。",
+          intent: { task: "wait_for_confirmation" },
+        }],
+        assumptions: [],
+        warnings: [],
+      }),
+      replanMission: vi.fn(),
+    };
+
+    await expect(
+      new MissionEngine(runtime).createDraft(brief(), new AbortController().signal),
+    ).rejects.toThrow(/approval.*control flow.*skill node/iu);
+  });
+
   it("never promotes Qwen output directly to a world fact", () => {
     expect(() => worldRecordSchema.parse({
       schemaVersion: "h-ide.world-record/2",

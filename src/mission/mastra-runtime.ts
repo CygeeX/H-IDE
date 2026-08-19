@@ -56,6 +56,7 @@ export class MastraMissionRuntime implements MissionPlanningRuntime {
         [
           AUTHORITY_BOUNDARY,
           "Create one reviewable Mission DAG for the user's objective.",
+          "Human approval is outside the DAG and is enforced by H-IDE. Never add a wait, approval, or confirmation node, and never disguise such control flow as a navigation or other executable skill. Return only work that may execute after the draft is approved.",
           "For a visual or landmark target, first add an observation/grounding node when such a skill is allowed, then a semantic navigation node that refers to the grounded target by record/category/description—not by geometry.",
           "Do not add speculative manipulation, dynamic following, exploration, or path-planning skills when they are absent from allowedSkillIds.",
           "Every node riskLevel must be exactly one lowercase token: low, medium, high, or critical, and must exactly match the capability riskLevel for that skill.",
@@ -83,6 +84,7 @@ export class MastraMissionRuntime implements MissionPlanningRuntime {
         [
           AUTHORITY_BOUNDARY,
           "Return a full semantic replacement DAG for the active Mission revision after the supplied trigger.",
+          "Human approval is outside the DAG and is enforced by H-IDE. Never add a wait, approval, or confirmation node, and never disguise such control flow as a navigation or other executable skill.",
           "Do not mutate the active revision in place. Preserve node IDs for unchanged work and use new IDs for semantically changed work.",
           "A new observation may invalidate a target hypothesis, but it cannot bypass verification or directly produce executable geometry.",
           "Prefer another observation or a bounded Nav2 rotation skill when the target is not visible; never invent a moving-head action.",

@@ -80,6 +80,20 @@ function validateNodesAgainstCapabilities(
 ) {
   const catalog = new Map(capabilities.map((item) => [item.skillId, item]));
   for (const node of nodes) {
+    const controlFlowValue = Object.entries(node.intent).find(([key, value]) => {
+      if (typeof value !== "string") return false;
+      if (!["action", "mode", "operation", "state", "status", "task"].includes(key.toLowerCase())) {
+        return false;
+      }
+      const marker = value.trim().toLowerCase().replace(/[\s-]+/gu, "_");
+      return /^(?:await|require|wait)(?:_for)?_(?:approval|confirmation|human|operator|user)$/u.test(marker)
+        || /^(?:approval|confirmation)_(?:pending|required)$/u.test(marker);
+    });
+    if (controlFlowValue) {
+      throw new Error(
+        `mission approval is runtime control flow, not an executable skill node: ${node.nodeId}`,
+      );
+    }
     const capability = catalog.get(node.skillId);
     if (!capability) throw new Error(`mission uses an unpublished capability: ${node.skillId}`);
     if (capability.skillVersion !== node.skillVersion) {
