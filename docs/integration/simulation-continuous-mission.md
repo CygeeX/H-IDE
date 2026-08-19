@@ -38,8 +38,8 @@ scripts/workstation-demo-status.sh
 启动脚本会幂等地管理 H-IDE Docker 服务、Nav2 容器、MuJoCo/SONIC、ROS
 命令与观测桥、仿真 Robot Agent Gateway、`g1-sim` Robot Agent 和 Observation
 Gateway。当前联调配置还会在宿主机 GPU 环境启动真实
-`QwenVlmProvider + qwen3-vl-plus + SAM 2`，CPU 容器中的 Oracle 只保留在隔离端口
-用于故障诊断。运行日志位于
+`Qwen + qwen3-vl-plus + SAM 2`。H-IDE 的 Docker 服务统一通过
+`host.docker.internal:8092` 访问这一进程，不再启动第二个视觉推理容器。运行日志位于
 `${XDG_RUNTIME_DIR:-/tmp}/h-ide-mujoco-demo-$UID`。
 
 ## 网页操作
@@ -63,18 +63,17 @@ Gateway。当前联调配置还会在宿主机 GPU 环境启动真实
 - `原地向左转30度后停止。`（仍由 Nav2 Spin 执行）
 - `观察前方桌子，然后移动到离桌子安全距离的位置。`（用于视觉链，先审核）
 
-## Oracle 与 VLM
+## 纯 VLM 产品边界
 
-- `oracle` 只在仿真中使用 MuJoCo 已知的物体、障碍和根位姿，适合验证通信、
-  坐标、Nav2、连续状态机与安全闸门。它不等于 FoundationPose，也不应用于真机。
-- `qwen` 使用 Qwen VLM 理解 MuJoCo 第一视角语义，再由本地 SAM 2、RGB-D/TF
-  计算候选目标点。
-  VLM 不拥有坐标、路径或执行权。无 DashScope 凭据时服务必须显式降为 fixture，
-  不能把 fixture 结果标成真实 Qwen 验收。
+- Qwen 使用 MuJoCo 第一视角 RGB 理解语义并给出像素框；SAM 2 只能在该框内细化
+  掩码；同步 RGB-D、标定与 TF 才能计算候选目标点。
+- VLM 不拥有坐标、路径或执行权。缺少 DashScope 凭据、SAM 2 checkpoint/GPU 时，
+  宿主机视觉服务必须 readiness 失败，不能回退为另一套语义提供者。
+- MuJoCo 已知标签只允许进入隔离的离线评测，不得进入 Mission、网页选择器、证据
+  提供者字段或 Robot Agent 命令链。
 
-当前网页联调运行真实 `qwen3-vl-plus`；会话必须选择 `Qwen · VLM`，而视觉证据中
-的 `QwenVlmProvider / qwen3-vl-plus / sam2` 才是实际模型权威标识。Oracle 不再作为
-当前视觉验收结果。
+当前网页不再提供视觉提供者选择器。可验收证据的权威标识必须同时为
+`qwen / qwen3-vl-plus / sam2`；协议帧 fixture 只测试传输，不能产生产品语义结论。
 
 ## 已验证结果
 
@@ -116,7 +115,8 @@ Gateway。当前联调配置还会在宿主机 GPU 环境启动真实
 - MuJoCo 的垂直/横滚/俯仰 fall-arrest 是明确标记的仿真安全支撑；它不提供
   水平运动，不能代表真机平衡验收。
 - 办公室场景与障碍目前是静态的，视觉避障和动态人流不在本轮范围内。
-- FoundationPose 暂未进入此仿真主链；后续作为注册物体位姿 specialist 接入。
+- FoundationPose 不在产品注册表、配置、API 或 Mission 路由中；其源码只能保留在
+  H-IDE Vision 的独立实验目录，未来若评估也必须先通过新的产品边界评审。
 
 ## 确定性后端删除门
 

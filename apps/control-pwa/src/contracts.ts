@@ -363,7 +363,6 @@ export interface MissionWorldRecordV2 {
   value: unknown;
   source:
     | "qwen"
-    | "mujoco_oracle"
     | "geometry"
     | "robot_agent"
     | "scene"
@@ -424,7 +423,8 @@ export interface MissionAdvanceResultV2 {
 }
 
 export type SimulationBackend = "deterministic" | "mujoco_sonic" | "gazebo" | "isaac";
-export type SimulationMode = "oracle" | "qwen";
+export type SimulationMode = "qwen";
+export type StoredSimulationMode = SimulationMode | "oracle";
 export type SimulationStatus = "created" | "starting" | "running" | "paused" | "stopped" | "failed";
 export type SimulationNavigationState = "idle" | "moving" | "blocked" | "arrived" | "failed";
 
@@ -450,7 +450,8 @@ export interface SimulationSession {
   localizationEpochId: string;
   missionId?: string | null;
   sceneRef?: { sceneId: string; revision: string | number } | null;
-  mode: SimulationMode;
+  /** The legacy value may only occur while reading an archived session. */
+  mode: StoredSimulationMode;
   status: SimulationStatus;
   releaseState: "simulation_only" | "validated" | "supervised_auto";
   policy: SimulationPolicy;
@@ -519,6 +520,7 @@ export interface SimulationEvent {
 export interface SimulationRecord {
   session: SimulationSession;
   snapshot: SimulationSnapshot;
+  legacyReadOnly?: boolean;
 }
 
 export interface SimulationReceipt {

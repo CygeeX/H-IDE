@@ -270,11 +270,21 @@ class SimulationRuntime:
         return value
 
     @staticmethod
+    def _require_product_session(session: SimulationSession) -> None:
+        if session.mode.value != "qwen":
+            raise SimulationConflict(
+                "historical simulator-truth session is read-only and cannot execute"
+            )
+
+    @staticmethod
     def _result(session: SimulationSession, snapshot: SimulationSnapshot) -> dict[str, Any]:
-        return {
+        result = {
             "session": session.model_dump(mode="json"),
             "snapshot": snapshot.model_dump(mode="json"),
         }
+        if session.mode.value != "qwen":
+            result["legacyReadOnly"] = True
+        return result
 
     def _persist_event(
         self,
@@ -445,6 +455,8 @@ class SimulationRuntime:
 
         with self._lock:
             session, snapshot = self._get(session_id)
+        if session.mode.value != "qwen":
+            return {**self._result(session, snapshot), "live": None}
         if session.backend is not SimulationBackend.MUJOCO_SONIC:
             return {**self._result(session, snapshot), "live": None}
         try:
@@ -639,6 +651,7 @@ class SimulationRuntime:
         mission_id = mission_id.strip()
         with self._lock:
             session, snapshot = self._get(session_id)
+            self._require_product_session(session)
             if session.status in {SimulationStatus.STOPPED, SimulationStatus.FAILED}:
                 raise SimulationConflict("stopped or failed simulation cannot bind a mission")
             if session.missionId and session.missionId != mission_id:
@@ -661,6 +674,7 @@ class SimulationRuntime:
         value = review if isinstance(review, SimulationReview) else SimulationReview.model_validate(review)
         with self._lock:
             session, snapshot = self._get(session_id)
+            self._require_product_session(session)
             if value.missionId and session.missionId and value.missionId != session.missionId:
                 raise SimulationConflict("review mission does not match simulation binding")
             updated = snapshot.model_copy(update={"pendingReview": value, "updatedAt": utc_now()})
@@ -684,6 +698,7 @@ class SimulationRuntime:
 
         with self._lock:
             session, snapshot = self._get(session_id)
+            self._require_product_session(session)
             review = snapshot.pendingReview
             if review is None:
                 return self._result(session, snapshot)
@@ -765,6 +780,7 @@ class SimulationRuntime:
     def start(self, session_id: str) -> dict[str, Any]:
         with self._lock:
             session, snapshot = self._get(session_id)
+            self._require_product_session(session)
             if session.status not in {SimulationStatus.CREATED, SimulationStatus.PAUSED}:
                 raise SimulationConflict(f"simulation cannot start from {session.status.value}")
             if session.backend is SimulationBackend.GAZEBO:
@@ -811,6 +827,7 @@ class SimulationRuntime:
     def reset(self, session_id: str) -> dict[str, Any]:
         with self._lock:
             session, snapshot = self._get(session_id)
+            self._require_product_session(session)
             raw_start = session.metadata.get("startPose")
             if not isinstance(raw_start, Mapping):
                 raise SimulationConflict("simulation start pose is unavailable")
@@ -837,6 +854,7 @@ class SimulationRuntime:
         request = payload if isinstance(payload, NavigationGoalInput) else NavigationGoalInput.model_validate(payload)
         with self._lock:
             session, snapshot = self._get(session_id)
+            self._require_product_session(session)
             if session.status is not SimulationStatus.RUNNING:
                 raise SimulationConflict("simulation must be running before a navigation goal is accepted")
             if snapshot.pendingReview is not None and snapshot.pendingReview.status != "resolved":
@@ -954,6 +972,7 @@ class SimulationRuntime:
         request = payload if isinstance(payload, SimulationStepInput) else SimulationStepInput.model_validate(payload or {})
         with self._lock:
             session, snapshot = self._get(session_id)
+            self._require_product_session(session)
             if session.status is not SimulationStatus.RUNNING:
                 raise SimulationConflict("simulation must be running before stepping")
             goal = snapshot.goalPose
@@ -1036,6 +1055,7 @@ class SimulationRuntime:
         request = payload if isinstance(payload, SimulationEventInput) else SimulationEventInput.model_validate(payload)
         with self._lock:
             session, snapshot = self._get(session_id)
+            self._require_product_session(session)
             event_payload = dict(request.payload)
             next_snapshot = snapshot
             if request.eventType is SimulationEventType.POSE_UPDATED:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from types import SimpleNamespace
 
 import pytest
 
@@ -20,7 +21,7 @@ from packages.mission_core import (
     WorldRecord,
 )
 from services.control_api.store import SQLiteStore
-from services.control_api.mission_service import MissionService
+from services.control_api.mission_service import MissionService, MissionServiceError
 
 
 def _envelope() -> MissionEnvelope:
@@ -43,13 +44,38 @@ def _envelope() -> MissionEnvelope:
             ),
             ModelPin(
                 role="visual_grounder",
-                provider="dashscope",
+                provider="qwen",
                 model="qwen3-vl-plus",
                 promptVersion="grounding-v2",
             ),
         ],
         expiresAt=utc_now() + timedelta(minutes=30),
     )
+
+
+def test_visual_completion_rejects_retired_semantic_provider_before_recording() -> None:
+    service = object.__new__(MissionService)
+    request = SimpleNamespace(
+        requestId="request-pure-vlm-1",
+        missionId="mission-pure-vlm-1",
+        revisionId="revision-pure-vlm-1",
+        nodeId="observe-pure-vlm-1",
+        input={"mode": "scene_description"},
+    )
+    with pytest.raises(MissionServiceError, match=r"Qwen \+ SAM 2"):
+        service._complete_visual_skill(
+            request,
+            {
+                "visualResult": {
+                    "schemaVersion": "h-ide.visual-result/2",
+                    "versions": {
+                        "vlmProvider": "retired-simulator-provider",
+                        "vlmModel": "retired-model",
+                        "segmentationProvider": "sam2",
+                    },
+                }
+            },
+        )
 
 
 def _plan() -> MissionPlanDraft:
@@ -348,6 +374,12 @@ def test_blocked_visual_result_skips_navigation_and_readies_final_report() -> No
                 "nodeId": request.nodeId,
                 "mode": "directional_free_space",
                 "status": "succeeded",
+                "versions": {
+                    "vlmProvider": "qwen",
+                    "vlmModel": "qwen3-vl-plus",
+                    "segmentationProvider": "sam2",
+                    "segmentationModel": "sam2.1_hiera_tiny",
+                },
                 "hypotheses": [],
                 "geometryCandidates": [
                     {

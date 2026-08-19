@@ -491,6 +491,8 @@ class FakeVisualTaskClient:
                 "visualAlgorithmVersion": "rgbd-median-v1",
                 "approachPolicyVersion": "v1",
                 "approachPolicySha256": "c" * 64,
+                "segmentationProvider": "sam2",
+                "segmentationModel": "sam2.1_hiera_tiny",
             },
             "hypotheses": [
                 {

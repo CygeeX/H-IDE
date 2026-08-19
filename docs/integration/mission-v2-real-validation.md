@@ -35,14 +35,19 @@
 SUPERVISOR_MODEL=alibaba-cn/qwen3.8-max
 WORKER_MODEL=alibaba-cn/qwen3.8-max
 STRUCTURING_MODEL=alibaba-cn/qwen3.8-max
-HIDE_VISION_RUNTIME_VLM_PROVIDER=qwen
 HIDE_VISION_VLM_MODEL=qwen3-vl-plus
 HIDE_VISION_SOURCE_MODE=live
+HIDE_VISION_COMPOSE_URL=http://host.docker.internal:8092
+HIDE_VISION_SAM2_DEVICE=cuda
+# HIDE_VISION_SAM2_CHECKPOINT=/absolute/path/to/sam2.1_hiera_tiny.pt
 ROBOT_AGENT_GATEWAY_ENABLED=true
 ROBOT_AGENT_GATEWAY_BACKEND=websocket_inbound
 ```
 
 `DASHSCOPE_API_KEY`、控制 token 和 Gateway token 只写本机未提交的 `.env` 或进程环境。
+视觉服务必须先在宿主机 GPU 环境启动；其 `/healthz` 只有同时报告
+`provider=qwen`、`model=qwen3-vl-plus`、`segmentation.provider=sam2` 且两项
+`available=true`，才可进入真实视觉用例。Docker 内不运行备用视觉推理服务。
 
 ## 验收用例
 

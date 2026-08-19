@@ -6,25 +6,13 @@
 # profile.  The deterministic backend remains available until the MuJoCo
 # acceptance checklist is complete.
 services:
-  h-ide-vision:
-    environment:
-      # The host-side MuJoCo observation gateway reaches this gRPC ingress via
-      # the published loopback port.  Binding only to the container loopback
-      # makes Docker accept then immediately close the connection.
-      HIDE_VISION_GRPC_HOST: ${HIDE_VISION_GRPC_HOST:-0.0.0.0}
-      # This CPU service remains a diagnostic Oracle fixture. The real
-      # simulation VLM runs from the host GPU environment and is reached by
-      # planning/control through HIDE_VISION_COMPOSE_URL.
-      HIDE_VISION_VLM_PROVIDER: ${HIDE_SIMULATION_CONTAINER_VLM_PROVIDER:-mujoco_oracle}
-      HIDE_VISION_SEGMENTATION_PROVIDER: box
-      HIDE_VISION_MUJOCO_ORACLE_URL: ${HIDE_VISION_MUJOCO_ORACLE_URL:-http://host.docker.internal:8794}
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-
   planning-agent:
     environment:
-      HIDE_VISION_VLM_PROVIDER: ${HIDE_SIMULATION_VLM_PROVIDER_LABEL:-MujocoOracleVlmProvider}
-      HIDE_VISION_VLM_MODEL: ${HIDE_SIMULATION_VLM_MODEL:-mujoco-segmentation-oracle-v1}
+      # Simulation RGB-D is grounded by the same host GPU product service as
+      # live observations; simulator truth is not a selectable provider.
+      HIDE_VISION_URL: http://host.docker.internal:8092
+      HIDE_VISION_VLM_PROVIDER: qwen
+      HIDE_VISION_VLM_MODEL: qwen3-vl-plus
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
@@ -39,7 +27,8 @@ services:
       HIDE_MUJOCO_SONIC_TELEMETRY_URL: ${HIDE_MUJOCO_SONIC_TELEMETRY_URL:-http://host.docker.internal:8792}
       HIDE_MUJOCO_SONIC_PLANT_URL: ${HIDE_MUJOCO_SONIC_PLANT_URL:-http://host.docker.internal:8794}
       HIDE_MUJOCO_SONIC_PUBLIC_PLANT_URL: ${HIDE_MUJOCO_SONIC_PUBLIC_PLANT_URL:-http://127.0.0.1:8794}
-      HIDE_MISSION_VISION_PROVIDER: ${HIDE_SIMULATION_VLM_PROVIDER:-mujoco_oracle}
-      HIDE_MISSION_VISION_MODEL: ${HIDE_SIMULATION_VLM_MODEL:-mujoco-segmentation-oracle-v1}
+      HIDE_VISION_URL: http://host.docker.internal:8092
+      HIDE_MISSION_VISION_PROVIDER: qwen
+      HIDE_MISSION_VISION_MODEL: qwen3-vl-plus
     extra_hosts:
       - "host.docker.internal:host-gateway"

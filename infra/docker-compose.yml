@@ -35,20 +35,22 @@ services:
       DASHSCOPE_TTS_VOICE: ${DASHSCOPE_TTS_VOICE:-Cherry}
       FUNASR_WS_URL: ${FUNASR_WS_URL:-}
       VISUAL_MISSION_MODE: ${VISUAL_MISSION_MODE:-observe}
-      HIDE_VISION_URL: ${HIDE_VISION_COMPOSE_URL:-http://h-ide-vision:8092}
+      # The pure-VLM service owns a locked host GPU environment.  Containers
+      # reach that single Qwen + SAM 2 process through the Docker host bridge;
+      # there is no second CPU semantic inference service in this topology.
+      HIDE_VISION_URL: ${HIDE_VISION_COMPOSE_URL:-http://host.docker.internal:8092}
       HIDE_VISION_AGENT_TOKEN: ${HIDE_VISION_AGENT_TOKEN:-dev-agent-token}
       HIDE_VISION_CONTROL_TOKEN: ${HIDE_VISION_CONTROL_TOKEN:-dev-control-token}
       HIDE_VISION_SOURCE_MODE: ${HIDE_VISION_SOURCE_MODE:-synthetic}
       HIDE_VISION_SENSOR_IDS: ${HIDE_VISION_SENSOR_IDS:-head_rgbd}
       HIDE_VISION_TASK_TIMEOUT_SECONDS: ${HIDE_VISION_TASK_TIMEOUT_SECONDS:-130}
-      # Audit pins must describe the providers that are actually running.
-      # Qwen is opt-in together with its credential; the safe development
-      # defaults match the current Mastra/FakeVLM services instead of falsely
-      # labelling fixture evidence as cloud inference.
+      # Audit pins describe the closed product provider boundary.  Protocol
+      # fixtures may still exercise transports in tests, but cannot change
+      # these product labels.
       HIDE_MISSION_TEXT_PROVIDER: ${HIDE_MISSION_TEXT_PROVIDER:-deepseek}
       HIDE_MISSION_TEXT_MODEL: ${HIDE_MISSION_TEXT_MODEL:-deepseek-v4-flash}
-      HIDE_MISSION_VISION_PROVIDER: ${HIDE_MISSION_VISION_PROVIDER:-fake}
-      HIDE_MISSION_VISION_MODEL: ${HIDE_MISSION_VISION_MODEL:-fake-fixture-v1}
+      HIDE_MISSION_VISION_PROVIDER: qwen
+      HIDE_MISSION_VISION_MODEL: qwen3-vl-plus
       ROBOT_AGENT_GATEWAY_ENABLED: ${ROBOT_AGENT_GATEWAY_ENABLED:-false}
       ROBOT_AGENT_GATEWAY_URL: http://robot-agent-gateway:8093
       ROBOT_AGENT_GATEWAY_TOKEN: ${ROBOT_AGENT_GATEWAY_TOKEN:-dev-gateway-token}
@@ -59,6 +61,8 @@ services:
       - "8080"
     volumes:
       - control-data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       postgres:
         condition: service_healthy
@@ -163,12 +167,12 @@ services:
       MASTRA_MEMORY_URL: file:/app/data/memory.db
       A2A_ALLOWED_ORIGINS: ${A2A_ALLOWED_ORIGINS:-}
       A2A_WORKERS_JSON: '${A2A_WORKERS_JSON:-[]}'
-      HIDE_VISION_URL: ${HIDE_VISION_COMPOSE_URL:-http://h-ide-vision:8092}
+      HIDE_VISION_URL: ${HIDE_VISION_COMPOSE_URL:-http://host.docker.internal:8092}
       HIDE_VISION_AGENT_TOKEN: ${HIDE_VISION_AGENT_TOKEN:-dev-agent-token}
       HIDE_VISION_SOURCE_MODE: ${HIDE_VISION_SOURCE_MODE:-synthetic}
       HIDE_VISION_SENSOR_IDS: ${HIDE_VISION_SENSOR_IDS:-head_rgbd}
-      HIDE_VISION_VLM_PROVIDER: ${HIDE_VISION_VLM_PROVIDER:-FakeVlmProvider}
-      HIDE_VISION_VLM_MODEL: ${HIDE_VISION_VLM_MODEL:-fake-fixture-v1}
+      HIDE_VISION_VLM_PROVIDER: qwen
+      HIDE_VISION_VLM_MODEL: qwen3-vl-plus
       HIDE_VISION_PROMPT_VERSION: ${HIDE_VISION_PROMPT_VERSION:-visual-grounding-v1}
       HIDE_VISION_ALGORITHM_VERSION: ${HIDE_VISION_ALGORITHM_VERSION:-rgbd-median-v1}
       HIDE_VISION_APPROACH_POLICY_VERSION: ${HIDE_VISION_APPROACH_POLICY_VERSION:-v1}
@@ -177,6 +181,8 @@ services:
       - "127.0.0.1:${MASTRA_PORT:-4111}:4111"
     volumes:
       - planning-data:/app/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4111/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 10s
@@ -185,55 +191,14 @@ services:
       start_period: 20s
     restart: unless-stopped
 
-  # CPU fixture/API profile. The real SAM 2 GPU profile stays in the host
-  # Python 3.11 environment until NVIDIA container support is accepted.
-  h-ide-vision:
-    build:
-      context: ../../h-ide-vision
-      dockerfile: Dockerfile
-    environment:
-      HIDE_VISION_HOST: 0.0.0.0
-      HIDE_VISION_HTTP_PORT: 8092
-      # The default remains loopback for the in-container fixture.  The local
-      # Robot Agent integration profile overrides this to 0.0.0.0 and publishes
-      # the port on workstation loopback so its observation sidecar can connect.
-      HIDE_VISION_GRPC_HOST: ${HIDE_VISION_GRPC_HOST:-127.0.0.1}
-      HIDE_VISION_GRPC_PORT: 50061
-      HIDE_VISION_DATABASE_PATH: /data/h-ide-vision.sqlite3
-      HIDE_VISION_EVIDENCE_DIR: /data/evidence
-      HIDE_VISION_VLM_PROVIDER: ${HIDE_VISION_RUNTIME_VLM_PROVIDER:-fake}
-      HIDE_VISION_SEGMENTATION_PROVIDER: ${HIDE_VISION_SEGMENTATION_PROVIDER:-box}
-      HIDE_VISION_QWEN_BASE_URL: ${HIDE_VISION_QWEN_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
-      HIDE_VISION_QWEN_MODEL: ${HIDE_VISION_VLM_MODEL:-fake-fixture-v1}
-      HIDE_VISION_STABLE_FRAME_WAIT_SECONDS: ${HIDE_VISION_STABLE_FRAME_WAIT_SECONDS:-1}
-      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
-      HIDE_VISION_AGENT_TOKEN: ${HIDE_VISION_AGENT_TOKEN:-dev-agent-token}
-      HIDE_VISION_CONTROL_TOKEN: ${HIDE_VISION_CONTROL_TOKEN:-dev-control-token}
-      HIDE_VISION_ALLOW_INSECURE_LOOPBACK: "true"
-    expose:
-      - "8092"
-    ports:
-      - "127.0.0.1:${HIDE_VISION_PORT:-8092}:8092"
-      - "127.0.0.1:${HIDE_VISION_GRPC_PORT:-50061}:50061"
-      # Optional loopback relay port used when a host-side Robot Agent must
-      # reach the container's loopback-only plaintext gRPC listener.
-      - "127.0.0.1:${HIDE_VISION_GRPC_PROXY_PORT:-50062}:50062"
-    volumes:
-      - vision-data:/data
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8092/healthz', timeout=2)"]
-      interval: 10s
-      timeout: 3s
-      retries: 6
-      start_period: 15s
-    restart: unless-stopped
-
+  # Developer-only observation protocol fixture.  It sends frames to the
+  # same host GPU vision ingress and never supplies semantics or masks.
   h-ide-vision-fixture:
     profiles: ["visual-fixture"]
     build:
       context: ../../h-ide-vision
       dockerfile: Dockerfile
-    network_mode: "service:h-ide-vision"
+    network_mode: host
     command:
       - python
       - tools/observation_fixture_sender.py
@@ -242,9 +207,6 @@ services:
       - --continuous
       - --interval-seconds
       - "0.4"
-    depends_on:
-      h-ide-vision:
-        condition: service_healthy
     restart: unless-stopped
 
   robot-agent-gateway:
@@ -361,8 +323,8 @@ services:
       HIDE_VISION_TASK_TIMEOUT_SECONDS: ${HIDE_VISION_TASK_TIMEOUT_SECONDS:-130}
       HIDE_MISSION_TEXT_PROVIDER: ${HIDE_MISSION_TEXT_PROVIDER:-dashscope}
       HIDE_MISSION_TEXT_MODEL: ${HIDE_MISSION_TEXT_MODEL:-qwen3.8-max}
-      HIDE_MISSION_VISION_PROVIDER: ${HIDE_MISSION_VISION_PROVIDER:-dashscope}
-      HIDE_MISSION_VISION_MODEL: ${HIDE_MISSION_VISION_MODEL:-qwen3-vl-plus}
+      HIDE_MISSION_VISION_PROVIDER: qwen
+      HIDE_MISSION_VISION_MODEL: qwen3-vl-plus
     network_mode: host
     volumes:
       - control-data:/data
@@ -372,6 +334,8 @@ services:
 volumes:
   control-data:
   planning-data:
+  # Retained so existing evidence volumes are never deleted implicitly.  The
+  # host GPU vision service owns current persistence outside this Compose app.
   vision-data:
   postgres-data:
   redis-data:

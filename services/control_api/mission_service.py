@@ -574,8 +574,8 @@ class MissionService:
             },
             {
                 "role": "visual_grounder",
-                "provider": os.getenv("HIDE_MISSION_VISION_PROVIDER", "dashscope"),
-                "model": os.getenv("HIDE_MISSION_VISION_MODEL", "qwen3-vl-plus"),
+                "provider": "qwen",
+                "model": "qwen3-vl-plus",
                 "promptVersion": os.getenv("HIDE_MISSION_VISION_PROMPT_VERSION", "grounding-v2"),
             },
         ]
@@ -1955,6 +1955,17 @@ class MissionService:
             raise MissionServiceError("H-IDE Vision returned no VisualTask result")
         if visual.get("schemaVersion") != "h-ide.visual-result/2":
             raise MissionServiceError("H-IDE Vision returned an unsupported result schema")
+        versions = visual.get("versions")
+        if (
+            not isinstance(versions, Mapping)
+            or versions.get("vlmProvider") != "qwen"
+            or versions.get("vlmModel") != "qwen3-vl-plus"
+            or versions.get("segmentationProvider") != "sam2"
+            or versions.get("poseModel") not in {None, ""}
+        ):
+            raise MissionServiceError(
+                "H-IDE Vision result is outside the Qwen + SAM 2 product profile"
+            )
         expected_identity = {
             "requestId": request.requestId,
             "missionId": request.missionId,
@@ -1979,9 +1990,9 @@ class MissionService:
             if not isinstance(hypothesis, Mapping):
                 raise MissionServiceError("H-IDE Vision hypothesis is invalid")
             hypothesis_source = hypothesis.get("source")
-            if hypothesis_source not in {"qwen", "mujoco_oracle"}:
+            if hypothesis_source != "qwen":
                 raise MissionServiceError(
-                    "visual hypotheses must come from an approved semantic grounder"
+                    "visual hypotheses must come from the Qwen semantic grounder"
                 )
             self.runtime.record_world(
                 WorldRecord(

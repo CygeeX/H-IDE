@@ -14,9 +14,10 @@ function result(overrides: Partial<MissionVisualResult>): MissionVisualResult {
       capturedAt: "2026-08-19T00:00:00Z",
     },
     versions: {
-      vlmProvider: "MujocoOracleVlmProvider",
-      vlmModel: "mujoco-segmentation-oracle-v1",
+      vlmProvider: "qwen",
+      vlmModel: "qwen3-vl-plus",
       visualAlgorithmVersion: "rgbd-target-v2",
+      segmentationProvider: "sam2",
     },
     hypotheses: [],
     geometryCandidates: [],

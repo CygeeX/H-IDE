@@ -29,6 +29,11 @@ configured.
   cancels the active ActionRuntime / Robot Agent command under the same
   request ID, then terminalizes the Mission. `GET /api/v2/missions` and
   `GET .../{missionId}` expose the durable event, fact and execution record.
+  Product visual results are accepted only when their immutable version block
+  identifies `qwen / qwen3-vl-plus / sam2`, and every semantic hypothesis has
+  `source=qwen`. Retired semantic records remain available through history and
+  evidence reads with `legacyReadOnly=true` and `executionEligible=false`; the
+  runtime never validates them as a new `WorldRecord` or resumes their Mission.
 - `GET /api/v1/robots` and
   `GET /api/v1/robots/{robotId}/capabilities` return the seeded fake robot
   and capability snapshots.

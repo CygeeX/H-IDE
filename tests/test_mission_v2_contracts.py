@@ -97,7 +97,7 @@ def _envelope(**updates) -> MissionEnvelope:
             ),
             ModelPin(
                 role="visual_grounder",
-                provider="dashscope",
+                provider="qwen",
                 model="qwen3-vl-plus",
                 promptVersion="grounding-v2",
             ),
@@ -261,17 +261,10 @@ def test_qwen_output_remains_hypothesis_until_deterministically_verified() -> No
     with pytest.raises(ValidationError, match="cannot be promoted"):
         WorldRecord(**common, kind=WorldRecordKind.FACT, source="qwen")
 
-    oracle_hypothesis = WorldRecord(
-        **{**common, "recordId": "record-oracle-1"},
-        kind=WorldRecordKind.HYPOTHESIS,
-        source="mujoco_oracle",
-    )
-    assert oracle_hypothesis.kind is WorldRecordKind.HYPOTHESIS
-
-    with pytest.raises(ValidationError, match="cannot be promoted"):
+    with pytest.raises(ValidationError, match="Input should be"):
         WorldRecord(
-            **{**common, "recordId": "record-oracle-fact-1"},
-            kind=WorldRecordKind.FACT,
+            **{**common, "recordId": "record-legacy-semantic-1"},
+            kind=WorldRecordKind.HYPOTHESIS,
             source="mujoco_oracle",
         )
 

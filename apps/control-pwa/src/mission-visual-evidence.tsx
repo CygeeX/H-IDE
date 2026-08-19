@@ -9,7 +9,7 @@ interface EvidenceRef {
 
 interface VisualHypothesis {
   hypothesisId: string;
-  source: "qwen" | "mujoco_oracle";
+  source: "qwen";
   label: string;
   pixelBox: [number, number, number, number];
   score: number | null;
@@ -51,9 +51,10 @@ export interface MissionVisualResult {
     capturedAt: string;
   };
   versions: {
-    vlmProvider: string;
-    vlmModel: string;
+    vlmProvider: "qwen";
+    vlmModel: "qwen3-vl-plus";
     visualAlgorithmVersion: string;
+    segmentationProvider: "sam2";
     segmentationModel?: string | null;
   };
   hypotheses: VisualHypothesis[];
@@ -93,7 +94,7 @@ function parseVisualResult(value: unknown): MissionVisualResult | null {
     const item = object(raw);
     const box = item?.pixelBox;
     if (!item || typeof item.hypothesisId !== "string" || typeof item.label !== "string"
-      || !["qwen", "mujoco_oracle"].includes(String(item.source))
+      || item.source !== "qwen"
       || !Array.isArray(box) || box.length !== 4 || !box.every(finite)) return [];
     return [{
       hypothesisId: item.hypothesisId,
@@ -135,7 +136,9 @@ function parseVisualResult(value: unknown): MissionVisualResult | null {
   }) : [];
   if (typeof source.sourceMode !== "string" || typeof source.sourceId !== "string"
     || typeof source.sensorId !== "string" || typeof source.capturedAt !== "string"
-    || typeof versions.vlmProvider !== "string" || typeof versions.vlmModel !== "string"
+    || versions.vlmProvider !== "qwen" || versions.vlmModel !== "qwen3-vl-plus"
+    || versions.segmentationProvider !== "sam2"
+    || (versions.poseModel != null && versions.poseModel !== "")
     || typeof versions.visualAlgorithmVersion !== "string") return null;
   return {
     analysisId: visual.analysisId,
@@ -148,9 +151,10 @@ function parseVisualResult(value: unknown): MissionVisualResult | null {
       capturedAt: source.capturedAt,
     },
     versions: {
-      vlmProvider: versions.vlmProvider,
-      vlmModel: versions.vlmModel,
+      vlmProvider: "qwen",
+      vlmModel: "qwen3-vl-plus",
       visualAlgorithmVersion: versions.visualAlgorithmVersion,
+      segmentationProvider: "sam2",
       segmentationModel: typeof versions.segmentationModel === "string" ? versions.segmentationModel : null,
     },
     hypotheses,

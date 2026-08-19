@@ -106,6 +106,57 @@ def _decode(value: str) -> Any:
     return json.loads(value)
 
 
+def _legacy_world_record_read_projection(value: Any) -> Any:
+    """Expose retired semantic records for audit without making them writable.
+
+    The durable JSON is never rewritten.  New Mission contracts reject the
+    retired source, and these output-only flags make that boundary explicit to
+    recovery/export clients.
+    """
+
+    if not isinstance(value, dict) or value.get("source") != "mujoco_oracle":
+        return value
+    return {**value, "legacyReadOnly": True, "executionEligible": False}
+
+
+def _legacy_skill_result_read_projection(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return value
+    result = value.get("result")
+    if not isinstance(result, dict):
+        return value
+    visual = result.get("visualResult")
+    if not isinstance(visual, dict):
+        return value
+    versions = visual.get("versions")
+    provider = versions.get("vlmProvider") if isinstance(versions, dict) else None
+    hypotheses = visual.get("hypotheses")
+    retired_source = (
+        provider != "qwen"
+        or (isinstance(versions, dict) and versions.get("poseModel") not in {None, ""})
+        or (
+            isinstance(hypotheses, list)
+            and any(
+                isinstance(item, dict) and item.get("source") != "qwen"
+                for item in hypotheses
+            )
+        )
+    )
+    if not retired_source:
+        return value
+    return {
+        **value,
+        "result": {
+            **result,
+            "visualResult": {
+                **visual,
+                "legacyReadOnly": True,
+                "executionEligible": False,
+            },
+        },
+    }
+
+
 class SQLiteStore:
     """A small repository boundary that can be replaced by PostgreSQL later."""
 
@@ -2782,7 +2833,10 @@ class SQLiteStore:
             ),
             "revisions": revisions_payload,
             "events": [_decode(item["payload_json"]) for item in events],
-            "worldRecords": [_decode(item["payload_json"]) for item in world],
+            "worldRecords": [
+                _legacy_world_record_read_projection(_decode(item["payload_json"]))
+                for item in world
+            ],
             "nodeStates": [
                 {
                     "missionId": item["mission_id"],
@@ -2804,7 +2858,11 @@ class SQLiteStore:
                     "status": item["status"],
                     "request": _decode(item["request_json"]),
                     "progress": _decode(item["progress_json"]),
-                    "result": None if item["result_json"] is None else _decode(item["result_json"]),
+                    "result": (
+                        None
+                        if item["result_json"] is None
+                        else _legacy_skill_result_read_projection(_decode(item["result_json"]))
+                    ),
                     "updatedAt": item["updated_at"],
                 }
                 for item in skills

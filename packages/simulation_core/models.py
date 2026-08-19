@@ -33,8 +33,14 @@ class SimulationBackend(str, Enum):
 
 
 class SimulationMode(str, Enum):
-    ORACLE = "oracle"
     QWEN = "qwen"
+
+
+class StoredSimulationMode(str, Enum):
+    """Read schema for durable sessions created before the pure-VLM cutover."""
+
+    QWEN = "qwen"
+    LEGACY_SIMULATOR_TRUTH = "oracle"
 
 
 class SimulationStatus(str, Enum):
@@ -139,7 +145,7 @@ class SimulationSessionCreate(ContractModel):
     localizationEpochId: str | None = None
     missionId: str | None = None
     sceneRef: SceneRef | None = None
-    mode: SimulationMode = SimulationMode.ORACLE
+    mode: SimulationMode = SimulationMode.QWEN
     startPose: PoseMap = Field(
         default_factory=lambda: PoseMap(x=0.0, y=0.0, z=0.0, yaw=0.0, observedAt=utc_now())
     )
@@ -178,7 +184,9 @@ class SimulationSession(ContractModel):
     localizationEpochId: str
     missionId: str | None = None
     sceneRef: SceneRef | None = None
-    mode: SimulationMode
+    # The legacy value remains readable for audit recovery only. New create
+    # requests use ``SimulationMode`` and therefore cannot select it.
+    mode: StoredSimulationMode
     status: SimulationStatus
     releaseState: Literal["simulation_only", "validated", "supervised_auto"] = "simulation_only"
     policy: SimulationPolicy

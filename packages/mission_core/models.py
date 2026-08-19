@@ -490,7 +490,6 @@ class WorldRecord(ContractModel):
     value: Any = Field(validate_default=True)
     source: Literal[
         "qwen",
-        "mujoco_oracle",
         "geometry",
         "robot_agent",
         "scene",
@@ -540,10 +539,7 @@ class WorldRecord(ContractModel):
     def _validity(self):
         if self.validUntil is not None and self.validUntil <= self.observedAt:
             raise ValueError("validUntil must be later than observedAt")
-        if self.kind is WorldRecordKind.FACT and self.source in {
-            "qwen",
-            "mujoco_oracle",
-        }:
+        if self.kind is WorldRecordKind.FACT and self.source == "qwen":
             raise ValueError(
                 "semantic grounding output cannot be promoted directly to a fact"
             )

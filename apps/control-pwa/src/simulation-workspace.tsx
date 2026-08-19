@@ -74,7 +74,7 @@ export function SimulationWorkspace({
   const [records, setRecords] = useState<SimulationRecord[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [events, setEvents] = useState<SimulationEvent[]>([]);
-  const [mode, setMode] = useState<SimulationMode>("oracle");
+  const mode: SimulationMode = "qwen";
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [receipt, setReceipt] = useState<SimulationReceipt | null>(null);
@@ -90,6 +90,7 @@ export function SimulationWorkspace({
     () => records.find((item) => item.session.sessionId === selectedId) ?? null,
     [records, selectedId],
   );
+  const legacyReadOnly = record?.legacyReadOnly === true || record?.session.mode !== "qwen";
 
   const refresh = useCallback(async (id = selectedId) => {
     const list = await apiFetch<SimulationRecord[]>("/api/v2/simulations");
@@ -128,7 +129,7 @@ export function SimulationWorkspace({
   useEffect(() => {
     const sessionId = record?.session.sessionId;
     const sequence = live?.state.sequence;
-    if (!sessionId || record?.session.backend !== "mujoco_sonic" || !sequence) return undefined;
+    if (!sessionId || record?.session.backend !== "mujoco_sonic" || legacyReadOnly || !sequence) return undefined;
     let cancelled = false;
     void apiFetchBlob(`/api/v2/simulations/${encodeURIComponent(sessionId)}/rgb.jpg`)
       .then((blob) => {
@@ -145,23 +146,23 @@ export function SimulationWorkspace({
     return () => {
       cancelled = true;
     };
-  }, [apiFetchBlob, live?.state.sequence, record?.session.backend, record?.session.sessionId]);
+  }, [apiFetchBlob, legacyReadOnly, live?.state.sequence, record?.session.backend, record?.session.sessionId]);
 
   useEffect(() => () => {
     if (liveRgbObjectUrlRef.current) URL.revokeObjectURL(liveRgbObjectUrlRef.current);
   }, []);
 
   useEffect(() => {
-    if (!record || record.session.status !== "running") return undefined;
+    if (!record || legacyReadOnly || record.session.status !== "running") return undefined;
     const timer = window.setInterval(() => {
       void refresh(record.session.sessionId).catch(() => undefined);
     }, 600);
     return () => window.clearInterval(timer);
-  }, [record, refresh]);
+  }, [legacyReadOnly, record, refresh]);
 
   useEffect(() => {
     if (!autoRun) return undefined;
-    if (!record || record.session.status !== "running" || !record.snapshot.goalPose) {
+    if (!record || legacyReadOnly || record.session.status !== "running" || !record.snapshot.goalPose) {
       setAutoRun(false);
       return undefined;
     }
@@ -183,7 +184,7 @@ export function SimulationWorkspace({
       });
     }, 450);
     return () => window.clearInterval(timer);
-  }, [apiFetch, autoRun, record, refresh]);
+  }, [apiFetch, autoRun, legacyReadOnly, record, refresh]);
 
   const run = async (operation: () => Promise<{ snapshot?: unknown; receipt?: SimulationReceipt } | SimulationRecord>) => {
     setBusy(true);
@@ -283,12 +284,7 @@ export function SimulationWorkspace({
     {error ? <div className="simulation-error" role="alert">{error}<button type="button" onClick={() => setError("")}>关闭</button></div> : null}
 
       <div className="simulation-toolbar">
-      <label>视觉模式
-        <select value={mode} onChange={(event) => setMode(event.target.value as SimulationMode)} disabled={busy}>
-          <option value="oracle">Oracle · 确定性</option>
-          <option value="qwen">Qwen · VLM（后端配置后启用）</option>
-        </select>
-      </label>
+      <div className="simulation-product-mode"><small>视觉语义</small><strong>Qwen3-VL + SAM 2</strong></div>
       <label>执行后端
         <select value={backend} onChange={(event) => setBackend(event.target.value as SimulationBackend)} disabled={busy}>
           <option value="mujoco_sonic">MuJoCo + SONIC · ROS/Nav2</option>
@@ -299,14 +295,14 @@ export function SimulationWorkspace({
       <span className={`simulation-backend-badge ${backendStatus.find((item) => item.backend === "mujoco_sonic")?.available ? "ready" : "pending"}`}>{backendStatus.length ? (backendStatus.find((item) => item.backend === "mujoco_sonic")?.available ? "MuJoCo + SONIC 就绪" : "MuJoCo + SONIC 未就绪") : "后端检查中"}</span>
       <select className="simulation-session-select" value={selectedId ?? ""} onChange={(event) => { setSelectedId(event.target.value || null); void refresh(event.target.value || undefined); }} aria-label="选择仿真会话">
         <option value="">选择会话</option>
-        {records.map((item) => <option key={item.session.sessionId} value={item.session.sessionId}>{item.session.sessionId.slice(0, 16)} · {statusText[item.session.status]}</option>)}
+        {records.map((item) => <option key={item.session.sessionId} value={item.session.sessionId}>{item.session.sessionId.slice(0, 16)} · {item.legacyReadOnly || item.session.mode !== "qwen" ? "历史只读" : statusText[item.session.status]}</option>)}
       </select>
     </div>
 
     {!record ? <div className="simulation-empty"><strong>还没有仿真会话</strong><span>创建会话后可以在浏览器中观察机器人移动、障碍事件和连续规划状态。</span></div> : <>
       <div className="simulation-grid">
         <section className="simulation-map-card">
-          <div className="simulation-card-header"><div><strong>办公楼层 / map</strong><small>{record.session.backend} · {record.session.mode.toUpperCase()} · {record.session.missionId ? `Mission ${record.session.missionId}` : "未绑定 Mission"}</small></div><span className={`simulation-status ${record.session.status}`}>{statusText[record.session.status]}</span></div>
+          <div className="simulation-card-header"><div><strong>办公楼层 / map</strong><small>{record.session.backend} · {legacyReadOnly ? "历史只读" : "QWEN + SAM2"} · {record.session.missionId ? `Mission ${record.session.missionId}` : "未绑定 Mission"}</small></div><span className={`simulation-status ${record.session.status}`}>{statusText[record.session.status]}</span></div>
           <svg className="simulation-map" viewBox="0 0 100 66.6667" role="img" aria-label="办公楼层仿真地图">
             <rect x="0" y="0" width="100" height="66.6667" className="sim-floor" />
             <line x1="0" y1={((4 - 1.15) / 8) * 66.6667} x2="100" y2={((4 - 1.15) / 8) * 66.6667} className="sim-wall" />
@@ -331,14 +327,15 @@ export function SimulationWorkspace({
 
         <section className="simulation-control-card">
           <div className="simulation-card-header"><div><strong>控制与事件注入</strong><small>{record.session.backend === "mujoco_sonic" ? "真实 Robot Agent/Nav2 回执 · 无物理执行器" : "只产生 simulated receipt"}</small></div><span className={`simulation-nav-state ${record.snapshot.navigationState}`}>{record.snapshot.navigationState}</span></div>
-          <div className="simulation-action-row"><button type="button" onClick={() => action("start")} disabled={busy || record.session.status === "running"}>启动</button><button type="button" onClick={() => action("pause")} disabled={busy || record.session.status !== "running"}>暂停</button><button type="button" onClick={() => action("reset")} disabled={busy}>重置</button><button type="button" onClick={() => action("stop")} disabled={busy || record.session.status === "stopped"}>停止</button></div>
-          <div className="simulation-action-group"><strong>{record.session.backend === "mujoco_sonic" ? "发送 Robot Agent → Nav2 目标" : "发送模拟 Nav2 目标"}</strong><div className="simulation-action-row">{record.snapshot.landmarks.slice(0, 2).map((landmark) => <button key={landmark.landmarkId} type="button" onClick={() => navigateTo(landmark.landmarkId)} disabled={busy || autoRun || record.session.status !== "running"}>去{landmark.label}</button>)}{record.session.backend !== "mujoco_sonic" ? <><button type="button" onClick={step} disabled={busy || autoRun || record.session.status !== "running" || !record.snapshot.goalPose}>推进 0.25m</button><button type="button" onClick={() => setAutoRun((current) => !current)} disabled={busy || record.session.status !== "running" || !record.snapshot.goalPose}>{autoRun ? "停止连续推进" : "连续推进"}</button></> : null}</div></div>
-          <div className="simulation-action-group"><strong>故障注入</strong><div className="simulation-action-row"><button type="button" onClick={() => inject("navigation.blocked")} disabled={busy}>模拟阻塞</button><button type="button" onClick={() => inject("vision.target_lost")} disabled={busy}>模拟目标丢失</button></div></div>
+          {legacyReadOnly ? <div className="simulation-review resolved" role="status"><strong>历史会话仅供审计</strong><span>该记录不会连接视觉服务、Robot Agent 或 Nav2，也不能恢复执行。</span></div> : null}
+          <div className="simulation-action-row"><button type="button" onClick={() => action("start")} disabled={busy || legacyReadOnly || record.session.status === "running"}>启动</button><button type="button" onClick={() => action("pause")} disabled={busy || record.session.status !== "running"}>暂停</button><button type="button" onClick={() => action("reset")} disabled={busy || legacyReadOnly}>重置</button><button type="button" onClick={() => action("stop")} disabled={busy || record.session.status === "stopped"}>停止</button></div>
+          <div className="simulation-action-group"><strong>{record.session.backend === "mujoco_sonic" ? "发送 Robot Agent → Nav2 目标" : "发送模拟 Nav2 目标"}</strong><div className="simulation-action-row">{record.snapshot.landmarks.slice(0, 2).map((landmark) => <button key={landmark.landmarkId} type="button" onClick={() => navigateTo(landmark.landmarkId)} disabled={busy || legacyReadOnly || autoRun || record.session.status !== "running"}>去{landmark.label}</button>)}{record.session.backend !== "mujoco_sonic" ? <><button type="button" onClick={step} disabled={busy || legacyReadOnly || autoRun || record.session.status !== "running" || !record.snapshot.goalPose}>推进 0.25m</button><button type="button" onClick={() => setAutoRun((current) => !current)} disabled={busy || legacyReadOnly || record.session.status !== "running" || !record.snapshot.goalPose}>{autoRun ? "停止连续推进" : "连续推进"}</button></> : null}</div></div>
+          <div className="simulation-action-group"><strong>故障注入</strong><div className="simulation-action-row"><button type="button" onClick={() => inject("navigation.blocked")} disabled={busy || legacyReadOnly}>模拟阻塞</button><button type="button" onClick={() => inject("vision.target_lost")} disabled={busy || legacyReadOnly}>模拟目标丢失</button></div></div>
           {record.snapshot.pendingReview ? <div className={`simulation-review ${record.snapshot.pendingReview.status}`} role="status">
             <strong>{record.snapshot.pendingReview.status === "error" ? "审核桥接异常" : "需要人工审核"}</strong>
             <span>{record.snapshot.pendingReview.detail}</span>
             {record.snapshot.pendingReview.revisionId ? <small>PlanRevision · {record.snapshot.pendingReview.revisionId}</small> : <small>尚未生成可执行修订；不会发送任何物理命令</small>}
-            {record.snapshot.pendingReview.missionId ? <button type="button" onClick={syncReview} disabled={busy}>同步 Mission 审核状态</button> : null}
+            {record.snapshot.pendingReview.missionId ? <button type="button" onClick={syncReview} disabled={busy || legacyReadOnly}>同步 Mission 审核状态</button> : null}
           </div> : null}
           <dl className="simulation-metrics"><div><dt>当前位置</dt><dd>{(effectivePose?.x ?? 0).toFixed(2)}, {(effectivePose?.y ?? 0).toFixed(2)}</dd></div><div><dt>轨迹点</dt><dd>{record.snapshot.trajectory.length}</dd></div><div><dt>事件序号</dt><dd>#{record.snapshot.lastEventSequence}</dd></div><div><dt>授权策略</dt><dd>{record.session.policy.manualRevisionApproval ? "每次修订人工确认" : "受控自动"}</dd></div></dl>
           {liveTelemetry ? <div className="simulation-live-metrics">
