@@ -268,7 +268,13 @@ class JointFaultTraceBuffer:
         return target
 
 
-def serve_telemetry(store: TelemetryStore, host: str, port: int) -> ThreadingHTTPServer:
+def serve_telemetry(
+    store: TelemetryStore,
+    host: str,
+    port: int,
+    *,
+    docker_observation_host: str | None = None,
+) -> tuple[ThreadingHTTPServer, ...]:
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):  # noqa: N802
             if self.path not in {"/healthz", "/telemetry"}:
@@ -291,6 +297,28 @@ def serve_telemetry(store: TelemetryStore, host: str, port: int) -> ThreadingHTT
         def log_message(self, *_args):
             return
 
-    server = ThreadingHTTPServer((host, port), Handler)
-    threading.Thread(target=server.serve_forever, daemon=True, name="telemetry-http").start()
-    return server
+    hosts = [host]
+    if docker_observation_host is not None:
+        if docker_observation_host == host:
+            raise ValueError("Docker observation host must differ from telemetry loopback")
+        hosts.append(docker_observation_host)
+
+    # Bind every socket before starting a serving thread. If the Docker bridge
+    # listener cannot be established, SONIC must fail startup rather than leave
+    # an apparently healthy loopback-only telemetry service behind.
+    servers: list[ThreadingHTTPServer] = []
+    try:
+        for bind_host in hosts:
+            servers.append(ThreadingHTTPServer((bind_host, port), Handler))
+    except Exception:
+        for server in servers:
+            server.server_close()
+        raise
+    for index, server in enumerate(servers):
+        suffix = "loopback" if index == 0 else "docker-readonly"
+        threading.Thread(
+            target=server.serve_forever,
+            daemon=True,
+            name=f"telemetry-http-{suffix}",
+        ).start()
+    return tuple(servers)

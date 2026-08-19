@@ -40,8 +40,9 @@ camera_hz: 30
 # Publish faster than the workstation's 5 Hz accepted stream so one delayed
 # MuJoCo render/poll does not create an observation watchdog gap.
 observation_hz: 10
-# Must match Robot Observation Gateway's stream.jpeg_quality so the simulation
-# Oracle can index the exact post-gateway JPEG bytes.
+# Keep browser preview and RGB-D evidence bandwidth bounded while preserving
+# enough visual detail for the product VLM. No simulator-truth annotations are
+# generated or exposed by the plant.
 observation_jpeg_quality: 85
 # RTX/CUDA is available on the workstation; keeping SONIC on the GPU leaves
 # enough CPU time for MuJoCo's 250 Hz physics and the ROS bridge.

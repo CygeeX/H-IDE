@@ -10,8 +10,6 @@ same capture atomically into the Robot Agent ROS contract.
 from __future__ import annotations
 
 import argparse
-from collections import OrderedDict
-import hashlib
 import json
 import math
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -21,24 +19,12 @@ import sys
 import threading
 import time
 from typing import Iterable
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
 import numpy as np
 
 from .config import SimConfig
 from .frames import BodyTwist, read_mujoco_local_body_twist
-
-
-SEMANTIC_GEOMS: dict[str, tuple[str, tuple[str, ...]]] = {
-    "meeting_table": ("会议桌", ("桌子", "会议桌", "table", "meeting table")),
-    "desk_anchor": ("办公桌", ("桌子", "办公桌", "desk", "office desk")),
-    "meeting_screen": ("显示器", ("显示器", "屏幕", "monitor", "screen", "display")),
-    "coffee_cup": ("杯子", ("杯子", "咖啡杯", "cup", "coffee cup")),
-    "water_dispenser": ("饮水机", ("饮水机", "water dispenser")),
-    "coffee_machine": ("咖啡机", ("咖啡机", "coffee machine")),
-    "kitchen_counter": ("厨房操作台", ("厨房", "操作台", "kitchen", "counter")),
-    "column_obstacle": ("立柱", ("立柱", "柱子", "column")),
-}
 
 
 class PlantPhysicsFault(RuntimeError):
@@ -235,9 +221,7 @@ class PlantFrameStore:
         self._rgb = b""
         self._depth = b""
         self._depth_renderer = None
-        self._segmentation_renderer = None
-        self._oracle_frames: OrderedDict[str, dict[str, object]] = OrderedDict()
-        self._server: ThreadingHTTPServer | None = None
+        self._servers: list[ThreadingHTTPServer] = []
 
     def capture(self, render_cache: dict[str, object]) -> None:
         import cv2
@@ -283,7 +267,11 @@ class PlantFrameStore:
         if rgb is None:
             return
         image = np.asarray(rgb, dtype=np.uint8)
-        ok, encoded = cv2.imencode(".jpg", cv2.cvtColor(image, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 85])
+        ok, encoded = cv2.imencode(
+            ".jpg",
+            cv2.cvtColor(image, cv2.COLOR_RGB2BGR),
+            [cv2.IMWRITE_JPEG_QUALITY, self.config.observation_jpeg_quality],
+        )
         if not ok:
             return
         if self._depth_renderer is None:
@@ -293,16 +281,6 @@ class PlantFrameStore:
         depth_m = np.asarray(self._depth_renderer.render(), dtype=np.float32)
         self._depth_renderer.disable_depth_rendering()
         depth = np.clip(depth_m * 1000.0, 0, 65535).astype("<u2")
-        if self._segmentation_renderer is None:
-            self._segmentation_renderer = mujoco.Renderer(
-                self.model, height=480, width=640
-            )
-            self._segmentation_renderer.enable_segmentation_rendering()
-        self._segmentation_renderer.update_scene(self.data, camera="head_camera")
-        segmentation = np.asarray(
-            self._segmentation_renderer.render(), dtype=np.int32
-        )
-        annotations = self._oracle_annotations(segmentation, cv2, mujoco, np)
         pose = [float(value) for value in root_pose]
         camera_id = mujoco.mj_name2id(
             self.model,
@@ -338,28 +316,6 @@ class PlantFrameStore:
             "cy": 240.0,
         }
         rgb_body = encoded.tobytes()
-        rgb_sha256 = hashlib.sha256(rgb_body).hexdigest()
-        # The ROS bridge transports raw RGB and Robot Observation Gateway then
-        # encodes it at its configured JPEG quality. Reproduce that one bounded
-        # round trip here so the Oracle can bind either the plant preview JPEG
-        # or the exact JPEG that H-IDE Vision actually receives. This is not a
-        # perceptual/nearest-frame lookup: both keys remain cryptographic hashes
-        # of bytes derived from this same atomic capture.
-        gateway_bgr = cv2.imdecode(
-            np.frombuffer(rgb_body, dtype=np.uint8),
-            cv2.IMREAD_COLOR,
-        )
-        gateway_ok, gateway_encoded = cv2.imencode(
-            ".jpg",
-            gateway_bgr,
-            [
-                int(cv2.IMWRITE_JPEG_QUALITY),
-                self.config.observation_jpeg_quality,
-            ],
-        )
-        if not gateway_ok:
-            return
-        gateway_rgb_sha256 = hashlib.sha256(gateway_encoded.tobytes()).hexdigest()
         with self._lock:
             self._sequence += 1
             self._captured_at_ns = time.time_ns()
@@ -369,72 +325,6 @@ class PlantFrameStore:
             self._intrinsics = intrinsics
             self._rgb = rgb_body
             self._depth = depth.tobytes()
-            oracle_frame = {
-                "schemaVersion": "h-ide.mujoco-oracle/1",
-                "robotId": self.config.robot_id,
-                "sourceMode": "synthetic",
-                "sourceId": f"mujoco:unitree-g1:{self.config.robot_id}",
-                "sequence": self._sequence,
-                "capturedAtUnixNs": self._captured_at_ns,
-                "sourceRgbSha256": rgb_sha256,
-                "width": 640,
-                "height": 480,
-                "annotations": annotations,
-            }
-            for digest in {rgb_sha256, gateway_rgb_sha256}:
-                self._oracle_frames[digest] = {
-                    **oracle_frame,
-                    "rgbSha256": digest,
-                }
-            # Two exact digest aliases per 30 Hz frame retain about ten seconds.
-            # Visual analysis always
-            # requests an exact RGB digest, so a delayed service call can never
-            # silently bind annotations from a newer frame.
-            while len(self._oracle_frames) > 600:
-                self._oracle_frames.popitem(last=False)
-
-    def _oracle_annotations(
-        self, segmentation, cv2, mujoco, np
-    ) -> list[dict[str, object]]:
-        annotations: list[dict[str, object]] = []
-        geom_type = int(mujoco.mjtObj.mjOBJ_GEOM)
-        for geom_name, (label, aliases) in SEMANTIC_GEOMS.items():
-            geom_id = mujoco.mj_name2id(
-                self.model, mujoco.mjtObj.mjOBJ_GEOM, geom_name
-            )
-            if geom_id < 0:
-                continue
-            mask = (segmentation[:, :, 0] == geom_id) & (
-                segmentation[:, :, 1] == geom_type
-            )
-            component_count, components, stats, _centroids = (
-                cv2.connectedComponentsWithStats(
-                    mask.astype(np.uint8),
-                    connectivity=8,
-                )
-            )
-            if component_count <= 1:
-                continue
-            largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-            ys, xs = np.nonzero(components == largest)
-            if len(xs) < 9:
-                continue
-            annotations.append(
-                {
-                    "annotationId": f"geom-{geom_id}",
-                    "geomName": geom_name,
-                    "label": label,
-                    "aliases": list(aliases),
-                    "pixelBox": [
-                        int(xs.min()),
-                        int(ys.min()),
-                        int(xs.max()) + 1,
-                        int(ys.max()) + 1,
-                    ],
-                    "pixelCount": int(len(xs)),
-                }
-            )
-        return annotations
 
     def state(self) -> dict[str, object]:
         with self._lock:
@@ -473,111 +363,133 @@ class PlantFrameStore:
                 "depth": {"width": 640, "height": 480, "encoding": "z16_le", "scaleMetersPerUnit": 0.001},
             }
 
-    def serve(self, host: str, port: int) -> None:
+    def serve(
+        self,
+        host: str,
+        port: int,
+        *,
+        docker_observation_host: str | None = None,
+    ) -> None:
         store = self
 
-        class Handler(BaseHTTPRequestHandler):
-            def do_GET(self):  # noqa: N802
-                parsed = urlparse(self.path)
-                if parsed.path in {"/healthz", "/state"}:
-                    payload = store.state()
-                    if parsed.path == "/healthz":
-                        payload = {
-                            "backend": "mujoco_sonic",
-                            **payload,
-                        }
-                    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-                    content_type = "application/json"
-                elif parsed.path == "/rgb.jpg":
-                    with store._lock:
-                        body = store._rgb
-                    content_type = "image/jpeg"
-                elif parsed.path == "/depth.raw":
-                    with store._lock:
-                        body = store._depth
-                    content_type = "application/octet-stream"
-                elif parsed.path == "/oracle.json":
-                    requested = parse_qs(parsed.query).get("rgbSha256", [""])[0]
-                    if len(requested) != 64:
-                        self.send_error(422, "rgbSha256 is required")
+        def handler_type(*, read_only: bool):
+            class Handler(BaseHTTPRequestHandler):
+                def do_GET(self):  # noqa: N802
+                    parsed = urlparse(self.path)
+                    if parsed.path in {"/healthz", "/state"}:
+                        payload = store.state()
+                        if parsed.path == "/healthz":
+                            payload = {
+                                "backend": "mujoco_sonic",
+                                **payload,
+                            }
+                        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+                        content_type = "application/json"
+                    elif parsed.path == "/rgb.jpg":
+                        with store._lock:
+                            body = store._rgb
+                        content_type = "image/jpeg"
+                    elif parsed.path == "/depth.raw":
+                        with store._lock:
+                            body = store._depth
+                        content_type = "application/octet-stream"
+                    else:
+                        self.send_error(404)
                         return
-                    with store._lock:
-                        payload = store._oracle_frames.get(requested)
-                    if payload is None:
-                        self.send_error(404, "oracle frame is no longer available")
+                    if not body:
+                        self.send_error(503, "capture not ready")
                         return
-                    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-                    content_type = "application/json"
-                else:
-                    self.send_error(404)
-                    return
-                if not body:
-                    self.send_error(503, "capture not ready")
-                    return
-                status_code = (
-                    503
-                    if parsed.path == "/healthz" and payload.get("status") == "failed"
-                    else 200
-                )
-                self.send_response(status_code)
-                self.send_header("Content-Type", content_type)
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Cache-Control", "no-store")
-                self.end_headers()
-                try:
+                    status_code = (
+                        503
+                        if parsed.path == "/healthz" and payload.get("status") == "failed"
+                        else 200
+                    )
+                    self.send_response(status_code)
+                    self.send_header("Content-Type", content_type)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    try:
+                        self.wfile.write(body)
+                    except (BrokenPipeError, ConnectionResetError):
+                        # Pollers use short deadlines; abandoning a late response
+                        # must not produce a simulator traceback or affect capture.
+                        return
+
+                def do_POST(self):  # noqa: N802
+                    if read_only:
+                        self.send_response(405)
+                        self.send_header("Allow", "GET")
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
+                    parsed = urlparse(self.path)
+                    if parsed.path != "/support":
+                        self.send_error(404)
+                        return
+                    if self.client_address[0] not in {"127.0.0.1", "::1"}:
+                        self.send_error(403, "support control is loopback-only")
+                        return
+                    try:
+                        length = int(self.headers.get("Content-Length", "0"))
+                        if length <= 0 or length > 1024:
+                            raise ValueError("bounded JSON body is required")
+                        payload = json.loads(self.rfile.read(length))
+                        if not isinstance(payload, dict):
+                            raise ValueError("support request must be an object")
+                        store.support.set_mode(str(payload.get("mode", "")))
+                        body = json.dumps(
+                            store.support.state(),
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    except (ValueError, json.JSONDecodeError) as exc:
+                        self.send_error(422, str(exc))
+                        return
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
                     self.wfile.write(body)
-                except (BrokenPipeError, ConnectionResetError):
-                    # Pollers use short deadlines; abandoning a late response
-                    # must not produce a simulator traceback or affect capture.
+
+                def log_message(self, *_args):
                     return
 
-            def do_POST(self):  # noqa: N802
-                parsed = urlparse(self.path)
-                if parsed.path != "/support":
-                    self.send_error(404)
-                    return
-                if self.client_address[0] not in {"127.0.0.1", "::1"}:
-                    self.send_error(403, "support control is loopback-only")
-                    return
-                try:
-                    length = int(self.headers.get("Content-Length", "0"))
-                    if length <= 0 or length > 1024:
-                        raise ValueError("bounded JSON body is required")
-                    payload = json.loads(self.rfile.read(length))
-                    if not isinstance(payload, dict):
-                        raise ValueError("support request must be an object")
-                    store.support.set_mode(str(payload.get("mode", "")))
-                    body = json.dumps(
-                        store.support.state(),
-                        separators=(",", ":"),
-                    ).encode("utf-8")
-                except (ValueError, json.JSONDecodeError) as exc:
-                    self.send_error(422, str(exc))
-                    return
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Cache-Control", "no-store")
-                self.end_headers()
-                self.wfile.write(body)
+            return Handler
 
-            def log_message(self, *_args):
-                return
-
-        self._server = ThreadingHTTPServer((host, port), Handler)
-        threading.Thread(target=self._server.serve_forever, daemon=True, name="mujoco-observation-http").start()
+        listeners = [(host, False, "loopback")]
+        if docker_observation_host is not None:
+            if docker_observation_host == host:
+                raise ValueError("Docker observation host must differ from plant loopback")
+            listeners.append((docker_observation_host, True, "docker-readonly"))
+        servers: list[tuple[ThreadingHTTPServer, str]] = []
+        try:
+            for bind_host, read_only, label in listeners:
+                server = ThreadingHTTPServer(
+                    (bind_host, port),
+                    handler_type(read_only=read_only),
+                )
+                servers.append((server, label))
+        except Exception:
+            for server, _label in servers:
+                server.server_close()
+            raise
+        self._servers = [server for server, _label in servers]
+        for server, label in servers:
+            threading.Thread(
+                target=server.serve_forever,
+                daemon=True,
+                name=f"mujoco-observation-http-{label}",
+            ).start()
 
     def close(self) -> None:
-        if self._server is not None:
-            self._server.shutdown()
+        for server in self._servers:
+            server.shutdown()
+            server.server_close()
+        self._servers.clear()
         if self._depth_renderer is not None:
             try:
                 self._depth_renderer.close()
-            except Exception:
-                pass
-        if self._segmentation_renderer is not None:
-            try:
-                self._segmentation_renderer.close()
             except Exception:
                 pass
 
@@ -777,7 +689,11 @@ def run_plant(config: SimConfig) -> int:
             simulator.sim_env.mj_data,
             support_controller,
         )
-        frames.serve(config.plant_bind_host, config.plant_port)
+        frames.serve(
+            config.plant_bind_host,
+            config.plant_port,
+            docker_observation_host=config.docker_observation_bind_host,
+        )
         original_render = simulator.sim_env.update_render_caches
 
         def capture_render():

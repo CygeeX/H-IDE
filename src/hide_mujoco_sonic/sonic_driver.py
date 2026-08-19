@@ -22,6 +22,7 @@ from typing import Any
 from urllib import request
 
 from .config import SimConfig
+from .network import require_loopback_bind_host
 from .safety import (
     CmdVelGuard,
     NavigationArmGuard,
@@ -41,6 +42,24 @@ from .telemetry import (
 from .transport import parse_lines
 
 logger = logging.getLogger(__name__)
+
+
+def _bind_command_server(host: str, port: int):
+    """Create the ROS-bridge command socket with loopback defense in depth."""
+
+    import socket
+
+    bind_host = require_loopback_bind_host(host, field="command_bind_host")
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind((bind_host, port))
+        server.listen(4)
+        server.settimeout(0.2)
+    except Exception:
+        server.close()
+        raise
+    return server
 
 
 class _WarmupPlannerIsolation:
@@ -1306,17 +1325,17 @@ class SonicDriver:
 
 def run_driver(config: SimConfig) -> None:
     telemetry = TelemetryStore(TelemetryState(robot_id=config.robot_id, ros_domain_id=config.ros_domain_id))
-    serve_telemetry(telemetry, config.telemetry_bind_host, config.telemetry_port)
+    serve_telemetry(
+        telemetry,
+        config.telemetry_bind_host,
+        config.telemetry_port,
+        docker_observation_host=config.docker_observation_bind_host,
+    )
     driver = SonicDriver(config, telemetry)
 
     # A tiny localhost TCP command server.  ROS bridge is the only intended
     # client; it sends one JSON object per line and never receives actuator data.
-    import socket
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((config.command_bind_host, config.command_port))
-    server.listen(4)
-    server.settimeout(0.2)
+    server = _bind_command_server(config.command_bind_host, config.command_port)
 
     def accept_loop():
         while not driver._stop.is_set():

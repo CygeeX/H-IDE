@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+from .network import require_loopback_bind_host, resolve_docker_observation_bind_host
 
 
 @dataclass(frozen=True)
@@ -29,6 +32,7 @@ class SimConfig:
     command_host: str
     command_bind_host: str
     command_port: int
+    docker_observation_bind_host: str | None
     max_linear_mps: float
     min_walk_command_mps: float
     max_angular_rps: float
@@ -132,6 +136,21 @@ class SimConfig:
         observation_jpeg_quality = int(raw.get("observation_jpeg_quality", 85))
         if not 1 <= observation_jpeg_quality <= 100:
             raise ValueError("observation_jpeg_quality must be between 1 and 100")
+        telemetry_bind_host = require_loopback_bind_host(
+            str(raw.get("telemetry_bind_host", "127.0.0.1")),
+            field="telemetry_bind_host",
+        )
+        plant_bind_host = require_loopback_bind_host(
+            str(raw.get("plant_bind_host", "127.0.0.1")),
+            field="plant_bind_host",
+        )
+        command_bind_host = require_loopback_bind_host(
+            str(raw.get("command_bind_host", "127.0.0.1")),
+            field="command_bind_host",
+        )
+        docker_observation_bind_host = resolve_docker_observation_bind_host(
+            os.getenv("HIDE_DOCKER_OBSERVATION_BIND_HOST")
+        )
         return cls(
             schema_version=str(raw["schema_version"]),
             robot_id=str(raw["robot_id"]),
@@ -146,13 +165,14 @@ class SimConfig:
             lowstate_topic=str(raw["lowstate_topic"]),
             lowcmd_topic=str(raw["lowcmd_topic"]),
             telemetry_host=str(raw["telemetry_host"]),
-            telemetry_bind_host=str(raw.get("telemetry_bind_host", "127.0.0.1")),
+            telemetry_bind_host=telemetry_bind_host,
             telemetry_port=int(raw["telemetry_port"]),
             plant_port=int(raw["plant_port"]),
-            plant_bind_host=str(raw.get("plant_bind_host", "127.0.0.1")),
+            plant_bind_host=plant_bind_host,
             command_host=str(raw["command_host"]),
-            command_bind_host=str(raw.get("command_bind_host", "127.0.0.1")),
+            command_bind_host=command_bind_host,
             command_port=int(raw["command_port"]),
+            docker_observation_bind_host=docker_observation_bind_host,
             max_linear_mps=float(raw["max_linear_mps"]),
             min_walk_command_mps=float(raw["min_walk_command_mps"]),
             max_angular_rps=float(raw["max_angular_rps"]),

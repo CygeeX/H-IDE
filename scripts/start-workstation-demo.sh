@@ -17,6 +17,7 @@ HIDE_DEMO_ROBOT_CONFIG="${HIDE_DEMO_ROBOT_ROOT}/src/robot_agent/config/robot_age
 HIDE_DEMO_OBSERVATION_CONFIG="${HIDE_DEMO_ROBOT_ROOT}/src/robot_observation_gateway/config/robot_observation_gateway.mujoco.yaml"
 HIDE_DEMO_CYCLONE='<CycloneDDS><Domain><General><Interfaces><NetworkInterface name="lo"/></Interfaces><AllowMulticast>true</AllowMulticast></General></Domain></CycloneDDS>'
 HIDE_DEMO_SYSTEMD_PREFIX="h-ide-mujoco-demo"
+HIDE_DOCKER_OBSERVATION_BIND_REQUEST="${HIDE_DOCKER_OBSERVATION_BIND_HOST:-auto}"
 
 # Codex/CI terminal scopes reap their complete process group when the command
 # finishes, including children started through nohup.  Put every long-lived
@@ -40,6 +41,18 @@ for required in \
     exit 2
   fi
 done
+
+# Resolve Docker's current host-gateway instead of assuming a fixed subnet. The
+# resolver also proves that the address belongs to Docker's local default
+# bridge. Both plant and SONIC independently repeat this validation when they
+# load SimConfig, so a changed daemon/network cannot silently widen the bind.
+HIDE_DOCKER_OBSERVATION_BIND_HOST="$(
+  "${HIDE_DEMO_SIM_ROOT}/.venv/bin/python" \
+    -m hide_mujoco_sonic.network \
+    --requested "${HIDE_DOCKER_OBSERVATION_BIND_REQUEST}"
+)"
+: "${HIDE_DOCKER_OBSERVATION_BIND_HOST:?Docker observation gateway resolution returned empty}"
+export HIDE_DOCKER_OBSERVATION_BIND_HOST
 
 mkdir -p "${HIDE_DEMO_RUN_ROOT}"
 
@@ -118,6 +131,7 @@ start_process() {
     --setenv="HIDE_DEMO_OBSERVATION_CONFIG=${HIDE_DEMO_OBSERVATION_CONFIG}" \
     --setenv="HIDE_DEMO_CYCLONE=${HIDE_DEMO_CYCLONE}" \
     --setenv="HIDE_DEMO_GATEWAY_TOKEN=${HIDE_DEMO_GATEWAY_TOKEN}" \
+    --setenv="HIDE_DOCKER_OBSERVATION_BIND_HOST=${HIDE_DOCKER_OBSERVATION_BIND_HOST}" \
     /bin/bash -lc "${command}" >/dev/null
 
   for _ in {1..30}; do
@@ -271,10 +285,10 @@ else
   "${compose[@]}" up -d
 fi
 
-# The Compose image intentionally remains the CPU Oracle fixture. A pinned
-# host GPU service owns the real simulation RGB-D ingress and Qwen/SAM 2 path.
-# The Docker fixture is published on alternate ports by .env, while containers
-# reach this host process through host.docker.internal:8092.
+# A pinned host GPU service owns the only simulation RGB-D ingress and
+# Qwen/SAM 2 path. The default Compose profile contains no competing Vision
+# inference container; containers reach this product service through
+# host.docker.internal:8092.
 mkdir -p "${HIDE_DEMO_VISION_ROOT}/var/evidence" "${HIDE_DEMO_VISION_ROOT}/var/models"
 start_process \
   h-ide-vision-qwen \
