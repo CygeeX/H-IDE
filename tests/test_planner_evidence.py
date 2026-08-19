@@ -206,6 +206,7 @@ def test_static_joint_handoff_ratio_remains_zero_until_reference_is_ready() -> N
         now=1.2,
     )
     assert admitted.handoff_ratio == 0.0
+    assert admitted.targets == (1.0, 2.0)
     blended = handoff.decide(
         motion_active=True,
         reference_ready=True,
@@ -214,3 +215,4 @@ def test_static_joint_handoff_ratio_remains_zero_until_reference_is_ready() -> N
         now=1.4,
     )
     assert blended.handoff_ratio == pytest.approx(0.5)
+    assert blended.targets == pytest.approx((2.0, 3.0))

@@ -740,7 +740,13 @@ class StaticJointHandoff:
             return JointCommandDecision(self._hold, True, False, 0.0)
 
         if not self._active:
-            self._hold = measured_values
+            # Preserve the exact actuator target that was already holding the
+            # robot while the asynchronous planner was preparing this
+            # reference.  Re-anchoring to the measured joint angles here would
+            # erase the small PD preload that balances gravity and create a
+            # target discontinuity on the first motion-authorized frame.
+            if self._hold is None:
+                self._hold = measured_values
             self._motion_started_at = current
             self._active = True
         assert self._hold is not None and self._motion_started_at is not None

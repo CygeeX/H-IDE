@@ -297,12 +297,12 @@ def test_static_joint_handoff_holds_idle_then_blends_policy():
 
     now[0] = 2.0
     start = handoff.decide(motion_active=True, measured=[1.1, 2.1], policy=[3.0, 4.0])
-    assert start.targets == pytest.approx((1.1, 2.1))
+    assert start.targets == pytest.approx((1.0, 2.0))
     assert start.motion_handoff_active is True
     now[0] = 2.5
     blend = handoff.decide(motion_active=True, measured=[1.2, 2.2], policy=[3.0, 4.0])
     assert blend.handoff_ratio == pytest.approx(0.5)
-    assert blend.targets == pytest.approx((2.05, 3.05))
+    assert blend.targets == pytest.approx((2.0, 3.0))
     now[0] = 2.8
     active = handoff.decide(motion_active=True, measured=[1.3, 2.3], policy=[3.0, 4.0])
     assert active.targets == pytest.approx((3.0, 4.0))
@@ -339,6 +339,16 @@ def test_static_joint_handoff_freezes_published_preload_without_reanchoring():
         policy=[9.0, 9.0],
     )
     assert held.targets == pytest.approx((1.10, 1.90))
+
+    started = handoff.decide(
+        motion_active=True,
+        reference_ready=True,
+        measured=[0.90, 2.10],
+        policy=[1.50, 1.50],
+        now=10.0,
+    )
+    assert started.handoff_ratio == 0.0
+    assert started.targets == pytest.approx((1.10, 1.90))
 
 
 def test_cmd_vel_is_bounded_and_converted_to_slow_walk():

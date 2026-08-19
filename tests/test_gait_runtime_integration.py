@@ -525,6 +525,21 @@ def test_gait_fault_freezes_last_published_targets_and_latches_plant(
     assert frozen and all(targets == published for targets in frozen)
 
 
+def test_new_planner_generation_freezes_the_exact_actuator_boundary() -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    published = tuple(0.01 * index for index in range(29))
+    frozen: list[tuple[float, ...]] = []
+    driver._last_published_targets = published
+    driver._joint_handoff = SimpleNamespace(
+        freeze=lambda targets: frozen.append(tuple(targets)),
+    )
+
+    assert driver._freeze_planner_handoff_boundary() is True
+    assert frozen == [published]
+    assert driver._safe_hold_targets is None
+
+
 def test_driver_requires_startup_qualification_before_accepting_motion() -> None:
     clock = Clock()
     adapter, _ = runtime(clock)

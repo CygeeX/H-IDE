@@ -855,6 +855,24 @@ class SonicDriver:
             self._joint_handoff.freeze(targets)
             return True
 
+    def _freeze_planner_handoff_boundary(self) -> bool:
+        """Start a new planner generation from the last actuator target.
+
+        A matching SONIC reference can arrive asynchronously after Nav2 has
+        changed its intent.  Until then, and on the first admitted reference
+        frame, the handoff must retain the exact target that most recently
+        crossed DDS rather than re-anchor to the measured joint angles.
+        Unlike a physical stop this does not latch ``_safe_hold_targets`` or
+        revoke motion authority; it only establishes the blend boundary.
+        """
+
+        with self._support_lock:
+            targets = self._last_published_targets
+            if targets is None:
+                return False
+            self._joint_handoff.freeze(targets)
+            return True
+
     def _publish_frozen_hold(self, lowstate) -> None:
         with self._support_lock:
             targets = self._safe_hold_targets or self._last_published_targets
@@ -1214,6 +1232,8 @@ class SonicDriver:
         # clock as the policy cursor, handoff blend, and arm slew guard.  Wall
         # time remains valid only for ingress freshness/watchdog decisions.
         admitted = self._intent_gate.admit(intent, now=simulation_now_s)
+        if admitted and intent.mode != "IDLE":
+            self._freeze_planner_handoff_boundary()
         self._planner_evidence.observe_intent(intent, admitted=admitted)
         starting_motion = intent.mode != "IDLE" and (previous is None or previous.mode == "IDLE")
         if intent.mode == "IDLE":
