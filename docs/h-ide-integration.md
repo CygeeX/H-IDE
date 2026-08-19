@@ -83,6 +83,10 @@ H-IDE Mission V2 内部可能使用可读的 `skill-...` 请求 ID。工作站 G
 - watchdog：运行中 boot/session/epoch 改变或 750 ms 没有新 accepted sequence 时，
   只取消标记为 `requires_observation` 的导航 Goal。
 - cancellation：Nav2 未确认取消时进入 `FAILED / CANCEL_NOT_ACKNOWLEDGED` 并 safe-stop。
+- MuJoCo normal safe-stop：仿真 profile 显式使用 4000 ms deadline，以覆盖 SONIC 最长
+  2.5 s 的 measured-stationary ACK，并给 Plant/driver 确认与 ROS 调度保留有界余量；
+  local/production profile 仍保持 1000 ms。调用前先撤销 authority，若 4000 ms 到期仍
+  按 `safe_stop_state=failed` fail-closed，禁止重新授权。
 - PCD：`sceneRef`/`scene_version` 可用于额外审计，但不是必填执行条件。
 - transport：Robot Agent 继续主动连接工作站；URI、robot ID 和 TLS 均来自配置，当前
   robot ID 为 `g1-dev`。

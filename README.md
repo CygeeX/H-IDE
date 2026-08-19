@@ -143,6 +143,7 @@ WebSocket/ROS 2/SQLite 链路并带有 `soak` marker，详见[验证说明](docs
 ## 配置与协议
 
 - 本地可运行配置：[robot_agent.local.yaml](src/robot_agent/config/robot_agent.local.yaml)
+- MuJoCo 仿真配置：[robot_agent.mujoco.yaml](src/robot_agent/config/robot_agent.mujoco.yaml)
 - 生产 mTLS 模板：[robot_agent.production.example.yaml](src/robot_agent/config/robot_agent.production.example.yaml)
 - 协议说明：[protocol-v1.md](docs/protocol-v1.md)
 - 运维与部署：[operations.md](docs/operations.md)

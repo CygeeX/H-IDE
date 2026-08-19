@@ -25,6 +25,10 @@ from robot_agent.systemd_notify import notify, watchdog_interval
 
 WORKSPACE = Path(__file__).resolve().parents[1]
 LOCAL_CONFIG = WORKSPACE / "src/robot_agent/config/robot_agent.local.yaml"
+MUJOCO_CONFIG = WORKSPACE / "src/robot_agent/config/robot_agent.mujoco.yaml"
+PRODUCTION_CONFIG = (
+    WORKSPACE / "src/robot_agent/config/robot_agent.production.example.yaml"
+)
 
 
 def test_local_example_config_and_cli_validation(capsys: pytest.CaptureFixture[str]) -> None:
@@ -37,6 +41,22 @@ def test_local_example_config_and_cli_validation(capsys: pytest.CaptureFixture[s
     assert output["valid"] is True
     assert output["robot_id"] == "g1-dev"
     assert output["capabilities_digest"].startswith("sha256:")
+
+
+def test_mujoco_safe_stop_deadline_is_conservative_and_profile_scoped() -> None:
+    local = load_config(LOCAL_CONFIG)
+    mujoco = load_config(MUJOCO_CONFIG)
+    production = yaml.safe_load(PRODUCTION_CONFIG.read_text(encoding="utf-8"))
+
+    # SONIC's measured stationary acknowledgement can consume 2.5 s.  The
+    # simulator profile reserves bounded time for the subsequent Plant/driver
+    # confirmations without weakening the live-robot templates.
+    assert mujoco.safety.safe_stop.timeout_ms == 4_000
+    assert mujoco.safety.safe_stop.timeout_ms >= 3_500
+    assert local.safety.safe_stop.timeout_ms == 1_000
+    assert production["safety"]["safe_stop"]["timeout_ms"] == 1_000
+    assert mujoco.safety.control_arm is not None
+    assert mujoco.safety.control_arm.timeout_ms == 1_000
 
 
 def test_doctor_is_read_only_and_reports_ros_types(capsys: pytest.CaptureFixture[str]) -> None:
@@ -111,12 +131,9 @@ def test_checked_in_schemas_are_current_and_production_template_is_structural() 
     rendered_config_schema = json.loads(config_file.read_text(encoding="utf-8"))
     assert rendered_config_schema == config_json_schema()
 
-    production = yaml.safe_load(
-        (WORKSPACE / "src/robot_agent/config/robot_agent.production.example.yaml").read_text(
-            encoding="utf-8"
-        )
-    )
-    Draft202012Validator(rendered_config_schema).validate(production)
+    validator = Draft202012Validator(rendered_config_schema)
+    for profile in (LOCAL_CONFIG, MUJOCO_CONFIG, PRODUCTION_CONFIG):
+        validator.validate(yaml.safe_load(profile.read_text(encoding="utf-8")))
 
 
 def test_systemd_service_starts_inside_the_humble_environment() -> None:

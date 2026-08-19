@@ -50,7 +50,10 @@ safety:
     ros_name: /robot/safe_stop
     ros_type: std_srvs/srv/Trigger
     request: {}
-    timeout_ms: 1000
+    # SONIC may spend up to 2.5 s reaching its measured stationary boundary.
+    # Keep a simulation-only margin for ROS scheduling plus Plant/driver
+    # confirmation; expiry still fails closed and never restores authority.
+    timeout_ms: 4000
   # The MuJoCo Plant keeps safety_stop latched.  A remote control.acquire is
   # the sole external authorization that may ask the ROS bridge for a newer
   # generation and a fresh stationary IDLE arm.
