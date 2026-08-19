@@ -36,6 +36,7 @@ const GREETING_PATTERN = /^(?:你(?:好|好呀|好啊)|您好|嗨|哈(?:喽|啰|
 const THANKS_PATTERN = /^(?:谢谢|多谢|感谢(?:你)?|thanks|thank\s+you)[\s!！,.，。?？~～]*$/iu;
 const GOODBYE_PATTERN = /^(?:再见|拜拜|回头见|bye|goodbye|see\s+you)[\s!！,.，。?？~～]*$/iu;
 const PERSONAL_PREFERENCE_PATTERN = /(?:我(?:很)?(?:喜欢|偏好|习惯)|我的(?:名字|称呼|昵称|偏好|喜好|习惯)|(?:以后)?(?:叫|称呼)我(?:为|做)?|i\s+(?:like|prefer)|my\s+(?:name|nickname|preference)|call\s+me)/iu;
+const ROBOT_REQUEST_CUE_PATTERN = /(?:机器人|向前|后退|转身|旋转|移动|导航|走(?:到|去|两|几|\d)|抓取|拿起|放下|打开|关闭|观察|robot|walk|move|turn|rotate|navigate|grab|pick\s+up|put\s+down)/iu;
 
 function isChineseLocale(locale: string): boolean {
   return locale.toLowerCase().startsWith("zh");
@@ -74,7 +75,10 @@ function personalPreferenceFastPath(
   input: ConversationTurnRequest,
 ): ConversationRouterModelOutput | undefined {
   const text = input.text.trim();
-  if (!PERSONAL_PREFERENCE_PATTERN.test(text)) return undefined;
+  if (
+    !PERSONAL_PREFERENCE_PATTERN.test(text)
+    || ROBOT_REQUEST_CUE_PATTERN.test(text)
+  ) return undefined;
   return {
     intent: "SOCIAL_CHAT",
     assistantMessage: isChineseLocale(input.locale)

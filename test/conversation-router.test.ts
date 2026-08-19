@@ -132,6 +132,31 @@ describe("Assistant V2 conversation router", () => {
     });
   });
 
+  it("keeps mixed preference and robot-action text on the policy-backed model path", async () => {
+    const agent = {
+      generate: vi.fn().mockResolvedValue({
+        object: {
+          intent: "ROBOT_ACTION",
+          assistantMessage: "我会直接执行。",
+          clarification: null,
+        },
+      }),
+    };
+    const result = await new ConversationRouter(agent as never).route({
+      conversationId: "conversation-preference-and-action",
+      robotId: "g1-sim",
+      locale: "zh-CN",
+      text: "我喜欢淡紫色，现在让机器人向前走两米。",
+    }, signal());
+
+    expect(agent.generate).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({
+      intent: "ROBOT_ACTION",
+      needsRobot: true,
+      shouldCreateMission: true,
+    });
+  });
+
   it("keeps mixed greeting/action requests on the model path", async () => {
     const agent = {
       generate: vi.fn().mockResolvedValue({
