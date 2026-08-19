@@ -14,10 +14,14 @@ from pydantic import (
     JsonValue,
     TypeAdapter,
     ValidationError,
+    model_validator,
 )
 
 MAX_TEXT_FRAME_BYTES = 65_536
 LOGICAL_COMMAND_PATTERN = r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$"
+_SAFE_STOP_TRUTH_FIELDS = frozenset(
+    {"authority_revoked", "safe_stop_state", "safe_stop_epoch"}
+)
 
 
 class FrameValidationError(ValueError):
@@ -28,6 +32,38 @@ class StrictModel(BaseModel):
     """Protocol model that never accepts undeclared fields or type coercion."""
 
     model_config = ConfigDict(extra="forbid", strict=True)
+
+
+def _validate_safe_stop_truth(
+    *,
+    state: str,
+    authority_revoked: bool | None,
+    safe_stop_state: str | None,
+    safe_stop_epoch: int | None,
+    supplied_fields: set[str],
+) -> None:
+    """Validate one optional, atomic physical safe-stop truth tuple."""
+
+    supplied_truth_fields = supplied_fields.intersection(_SAFE_STOP_TRUTH_FIELDS)
+    if not supplied_truth_fields:
+        return
+    if supplied_truth_fields != _SAFE_STOP_TRUTH_FIELDS or any(
+        value is None
+        for value in (authority_revoked, safe_stop_state, safe_stop_epoch)
+    ):
+        raise ValueError(
+            "authority_revoked, safe_stop_state, and safe_stop_epoch "
+            "must be provided together"
+        )
+    if state == "ACTIVE":
+        if authority_revoked or safe_stop_state != "confirmed":
+            raise ValueError(
+                "ACTIVE requires authority_revoked=false and "
+                "safe_stop_state=confirmed"
+            )
+        return
+    if not authority_revoked:
+        raise ValueError("inactive control state requires authority_revoked=true")
 
 
 class Envelope(StrictModel):
@@ -124,11 +160,33 @@ class ControlStatusPayload(StrictModel):
     state: Literal["UNARMED", "ACTIVE", "SAFE_HOLD"]
     reason: str = Field(min_length=1, max_length=256)
     lease_sequence: int | None = Field(default=None, ge=0)
-    # Additive V1 safety truth.  Defaults keep older recorded/test payloads
-    # parseable while new agents always populate the measured values.
-    authority_revoked: bool = True
-    safe_stop_state: Literal["requested", "confirmed", "failed"] = "confirmed"
-    safe_stop_epoch: int = Field(default=0, ge=0)
+    # Additive V1 safety truth is atomic. Legacy three-field payloads retain no
+    # implied physical-stop claim when parsed and serialized again; the runtime
+    # explicitly supplies all three measured fields.
+    authority_revoked: bool | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    safe_stop_state: Literal["requested", "confirmed", "failed"] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    safe_stop_epoch: int | None = Field(
+        default=None,
+        ge=0,
+        exclude_if=lambda value: value is None,
+    )
+
+    @model_validator(mode="after")
+    def validate_safe_stop_truth(self) -> ControlStatusPayload:
+        _validate_safe_stop_truth(
+            state=self.state,
+            authority_revoked=self.authority_revoked,
+            safe_stop_state=self.safe_stop_state,
+            safe_stop_epoch=self.safe_stop_epoch,
+            supplied_fields=self.model_fields_set,
+        )
+        return self
 
 
 class ControlStatus(Envelope):
@@ -211,9 +269,30 @@ class SafetyEventPayload(StrictModel):
     state: Literal["UNARMED", "ACTIVE", "SAFE_HOLD"]
     reason: str = Field(min_length=1, max_length=512)
     latched: bool
-    authority_revoked: bool = True
-    safe_stop_state: Literal["requested", "confirmed", "failed"] = "confirmed"
-    safe_stop_epoch: int = Field(default=0, ge=0)
+    authority_revoked: bool | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    safe_stop_state: Literal["requested", "confirmed", "failed"] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    safe_stop_epoch: int | None = Field(
+        default=None,
+        ge=0,
+        exclude_if=lambda value: value is None,
+    )
+
+    @model_validator(mode="after")
+    def validate_safe_stop_truth(self) -> SafetyEventPayload:
+        _validate_safe_stop_truth(
+            state=self.state,
+            authority_revoked=self.authority_revoked,
+            safe_stop_state=self.safe_stop_state,
+            safe_stop_epoch=self.safe_stop_epoch,
+            supplied_fields=self.model_fields_set,
+        )
+        return self
 
 
 class SafetyEvent(Envelope):

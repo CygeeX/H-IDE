@@ -404,9 +404,16 @@
       "additionalProperties": false,
       "properties": {
         "authority_revoked": {
-          "default": true,
-          "title": "Authority Revoked",
-          "type": "boolean"
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Authority Revoked"
         },
         "lease_sequence": {
           "anyOf": [
@@ -428,20 +435,34 @@
           "type": "string"
         },
         "safe_stop_epoch": {
-          "default": 0,
-          "minimum": 0,
-          "title": "Safe Stop Epoch",
-          "type": "integer"
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Safe Stop Epoch"
         },
         "safe_stop_state": {
-          "default": "confirmed",
-          "enum": [
-            "requested",
-            "confirmed",
-            "failed"
+          "anyOf": [
+            {
+              "enum": [
+                "requested",
+                "confirmed",
+                "failed"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
           ],
-          "title": "Safe Stop State",
-          "type": "string"
+          "default": null,
+          "title": "Safe Stop State"
         },
         "state": {
           "enum": [
@@ -754,9 +775,16 @@
       "additionalProperties": false,
       "properties": {
         "authority_revoked": {
-          "default": true,
-          "title": "Authority Revoked",
-          "type": "boolean"
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Authority Revoked"
         },
         "code": {
           "maxLength": 128,
@@ -776,20 +804,34 @@
           "type": "string"
         },
         "safe_stop_epoch": {
-          "default": 0,
-          "minimum": 0,
-          "title": "Safe Stop Epoch",
-          "type": "integer"
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Safe Stop Epoch"
         },
         "safe_stop_state": {
-          "default": "confirmed",
-          "enum": [
-            "requested",
-            "confirmed",
-            "failed"
+          "anyOf": [
+            {
+              "enum": [
+                "requested",
+                "confirmed",
+                "failed"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
           ],
-          "title": "Safe Stop State",
-          "type": "string"
+          "default": null,
+          "title": "Safe Stop State"
         },
         "state": {
           "enum": [

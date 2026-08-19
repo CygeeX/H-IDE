@@ -10,6 +10,7 @@ from robot_agent.protocol import (
     FrameValidationError,
     parse_wire_message,
     protocol_json_schema,
+    serialize_wire_message,
 )
 
 NOW = datetime(2026, 8, 7, 12, 0, tzinfo=timezone.utc)
@@ -130,3 +131,151 @@ def test_protocol_schema_is_versioned_and_closed() -> None:
     assert schema["title"] == "robot-agent.v1"
     assert schema["$id"].endswith("/robot-agent.v1.schema.json")
     assert "discriminator" in schema
+
+
+@pytest.mark.parametrize(
+    ("message_type", "payload"),
+    [
+        (
+            "control.status",
+            {"state": "ACTIVE", "reason": "control acquired", "lease_sequence": 0},
+        ),
+        (
+            "safety.event",
+            {
+                "code": "LEASE_EXPIRED",
+                "state": "SAFE_HOLD",
+                "reason": "lease renewal timed out",
+                "latched": True,
+            },
+        ),
+    ],
+)
+def test_legacy_safe_stop_payload_does_not_gain_implied_truth_on_round_trip(
+    message_type: str,
+    payload: dict[str, object],
+) -> None:
+    parsed = parse_wire_message(
+        json.dumps(envelope(message_type, payload)),
+        expected_robot_id="g1-dev",
+        received_at=NOW,
+    )
+
+    serialized = json.loads(serialize_wire_message(parsed))
+
+    assert serialized["payload"] == payload
+
+
+@pytest.mark.parametrize(
+    ("message_type", "payload"),
+    [
+        (
+            "control.status",
+            {
+                "state": "ACTIVE",
+                "reason": "control acquired",
+                "lease_sequence": 0,
+                "authority_revoked": False,
+                "safe_stop_state": "confirmed",
+                "safe_stop_epoch": 7,
+            },
+        ),
+        (
+            "safety.event",
+            {
+                "code": "SAFE_STOP_FAILED",
+                "state": "SAFE_HOLD",
+                "reason": "physical stop failed",
+                "latched": True,
+                "authority_revoked": True,
+                "safe_stop_state": "failed",
+                "safe_stop_epoch": 8,
+            },
+        ),
+    ],
+)
+def test_explicit_safe_stop_truth_is_preserved_on_round_trip(
+    message_type: str,
+    payload: dict[str, object],
+) -> None:
+    parsed = parse_wire_message(
+        json.dumps(envelope(message_type, payload)),
+        expected_robot_id="g1-dev",
+        received_at=NOW,
+    )
+
+    serialized = json.loads(serialize_wire_message(parsed))
+
+    assert serialized["payload"] == payload
+
+
+@pytest.mark.parametrize(
+    ("message_type", "payload"),
+    [
+        (
+            "control.status",
+            {
+                "state": "ACTIVE",
+                "reason": "partial truth",
+                "lease_sequence": 0,
+                "authority_revoked": False,
+            },
+        ),
+        (
+            "control.status",
+            {
+                "state": "ACTIVE",
+                "reason": "contradictory authority",
+                "lease_sequence": 0,
+                "authority_revoked": True,
+                "safe_stop_state": "confirmed",
+                "safe_stop_epoch": 7,
+            },
+        ),
+        (
+            "control.status",
+            {
+                "state": "SAFE_HOLD",
+                "reason": "contradictory authority",
+                "lease_sequence": None,
+                "authority_revoked": False,
+                "safe_stop_state": "confirmed",
+                "safe_stop_epoch": 7,
+            },
+        ),
+        (
+            "safety.event",
+            {
+                "code": "LEASE_EXPIRED",
+                "state": "ACTIVE",
+                "reason": "contradictory stop state",
+                "latched": True,
+                "authority_revoked": False,
+                "safe_stop_state": "requested",
+                "safe_stop_epoch": 8,
+            },
+        ),
+        (
+            "safety.event",
+            {
+                "code": "LEASE_EXPIRED",
+                "state": "SAFE_HOLD",
+                "reason": "explicit null truth",
+                "latched": True,
+                "authority_revoked": None,
+                "safe_stop_state": None,
+                "safe_stop_epoch": None,
+            },
+        ),
+    ],
+)
+def test_safe_stop_truth_rejects_partial_or_contradictory_values(
+    message_type: str,
+    payload: dict[str, object],
+) -> None:
+    with pytest.raises(FrameValidationError):
+        parse_wire_message(
+            json.dumps(envelope(message_type, payload)),
+            expected_robot_id="g1-dev",
+            received_at=NOW,
+        )
