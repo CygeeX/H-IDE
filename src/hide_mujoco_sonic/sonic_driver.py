@@ -127,11 +127,13 @@ class SonicIntentIngress:
         self.sequence = 0
         self.armed = False
         self.support_stop_generation: int | None = None
+        self.staged_control_arm_generation: int | None = None
 
     def revoke(self) -> None:
         """Drop motion authority without manufacturing a new generation."""
 
         self.armed = False
+        self.staged_control_arm_generation = None
 
     def latch_support_stop(self) -> int:
         """Record the generation stopped by an externally confirmed Plant latch."""
@@ -144,6 +146,7 @@ class SonicIntentIngress:
                 self.support_stop_generation, stopped
             )
         self.armed = False
+        self.staged_control_arm_generation = None
         return self.support_stop_generation
 
     def confirm_support_rearm(self, generation: int) -> None:
@@ -155,6 +158,29 @@ class SonicIntentIngress:
         ):
             raise ValueError("support rearm confirmation does not match the armed generation")
         self.support_stop_generation = None
+
+    def commit_staged_support_rearm(self, generation: int) -> None:
+        """Atomically publish authority only after Plant and health commit.
+
+        A control-arm envelope is first validated with ``defer_control_arm`` so
+        the Plant may be asked to release only to IDLE without making motion
+        authority observable.  The driver calls this method under its support
+        lock after the post-rearm freshness check has also succeeded.
+        """
+
+        if (
+            self.staged_control_arm_generation != generation
+            or self.support_stop_generation is None
+            or generation <= self.support_stop_generation
+            or generation != self.generation
+            or self.armed
+        ):
+            raise ValueError(
+                "staged support rearm does not match the validated generation"
+            )
+        self.armed = True
+        self.support_stop_generation = None
+        self.staged_control_arm_generation = None
 
     @staticmethod
     def _integer(value: object, *, minimum: int) -> int:
@@ -172,7 +198,14 @@ class SonicIntentIngress:
             raise ValueError(f"intent {name} must be finite")
         return value
 
-    def accept(self, payload: dict[str, Any]) -> IngressDecision:
+    def accept(
+        self,
+        payload: dict[str, Any],
+        *,
+        defer_control_arm: bool = False,
+    ) -> IngressDecision:
+        if not isinstance(defer_control_arm, bool):
+            raise TypeError("defer_control_arm must be a boolean")
         if payload.get("type") != "sonic_intent":
             raise ValueError("motion input must use the sonic_intent contract")
         if payload.get("schema_version") != "h-ide.sonic-intent/v1":
@@ -221,6 +254,7 @@ class SonicIntentIngress:
             self.generation = generation
             self.sequence = 0
             self.armed = False
+            self.staged_control_arm_generation = None
         if sequence <= self.sequence:
             return IngressDecision(
                 "ignore", generation, sequence, state, reason="out-of-order intent ignored"
@@ -249,7 +283,12 @@ class SonicIntentIngress:
                     arm_candidate = False
                     reason = "control rearm requires a strictly newer generation"
             was_armed = self.armed
-            self.armed = arm_candidate
+            if defer_control_arm and control_arm and arm_candidate:
+                self.armed = False
+                self.staged_control_arm_generation = generation
+            else:
+                self.armed = arm_candidate
+                self.staged_control_arm_generation = None
             return IngressDecision(
                 "stop",
                 generation,
@@ -262,6 +301,8 @@ class SonicIntentIngress:
 
         if control_arm:
             raise ValueError("control_arm cannot carry motion")
+
+        self.staged_control_arm_generation = None
 
         if not self.armed:
             return IngressDecision(
@@ -1061,8 +1102,64 @@ class SonicDriver:
         self._latch_plant_support_stop(reason=reason)
         return True
 
-    def _rearm_plant_support(self, generation: int) -> bool:
-        """Confirm one explicit control.acquire rearm, only back to IDLE."""
+    def _require_fresh_control_arm_health_locked(self, *, phase: str) -> None:
+        """Fail closed on one lock-consistent control-arm health snapshot.
+
+        The caller owns both ``_control_condition`` and ``_support_lock``.  The
+        first check is immediately before ingress validation can change its
+        generation/sequence state.  The second check happens after Plant has
+        replied ``idle`` but before SONIC publishes either that mode or motion
+        authority, so a failed check can only return to the stronger latch.
+        """
+
+        label = str(phase).strip() or "control arm"
+        if self._fault_latched.is_set():
+            raise RuntimeError(f"{label}: SONIC terminal fault is latched")
+        if self._stop.is_set():
+            raise RuntimeError(f"{label}: SONIC is stopping")
+        if not self._motion_ready.is_set():
+            raise RuntimeError(f"{label}: SONIC is not motion-ready")
+
+        checked_at = self._wall_clock()
+        ages = (
+            (
+                "LowState",
+                self._last_lowstate_wall_s,
+                float(self.config.plant_lowstate_stale_s),
+            ),
+            (
+                "control step",
+                self._last_control_step_wall_s,
+                float(self.config.sonic_control_step_stale_s),
+            ),
+        )
+        for source, observed_at, threshold_s in ages:
+            if observed_at is None:
+                raise RuntimeError(f"{label}: {source} freshness is unavailable")
+            age_s = max(0.0, checked_at - observed_at)
+            if age_s > threshold_s:
+                raise RuntimeError(
+                    f"{label}: {source} age {age_s:.6f}s exceeds "
+                    f"the {threshold_s:.6f}s safety bound"
+                )
+
+        safe_hold = (
+            self._plant_support_mode == "safety_stop"
+            and self._plant_support_safety_latched
+            and not self._plant_support_stop_pending
+            and self._static_hold_active
+            and not self._navigation_task_active
+            and not self._intent_ingress.armed
+            and self.guard.command_zero
+        )
+        if not safe_hold:
+            raise RuntimeError(
+                f"{label}: control acquisition requires a confirmed settled "
+                "safety hold"
+            )
+
+    def _request_staged_plant_support_rearm(self, generation: int) -> bool:
+        """Ask Plant for IDLE while SONIC authority remains uncommitted."""
 
         with self._support_lock:
             stopped_generation = self._plant_support_stop_generation
@@ -1072,7 +1169,9 @@ class SonicDriver:
                 or stopped_generation is None
                 or generation <= stopped_generation
                 or generation != self._intent_ingress.generation
-                or not self._intent_ingress.armed
+                or self._intent_ingress.armed
+                or self._intent_ingress.staged_control_arm_generation
+                != generation
             ):
                 self.telemetry.update(
                     plant_support_mode="safety_stop",
@@ -1081,12 +1180,12 @@ class SonicDriver:
                     plant_support_safety_latched=True,
                     last_error=(
                         "plant safety_stop rearm rejected without a strictly "
-                        "newer armed generation"
+                        "newer staged generation"
                     ),
                 )
                 return False
         try:
-            state = rearm_plant_support(
+            rearm_plant_support(
                 "127.0.0.1",
                 self.config.plant_port,
                 generation,
@@ -1097,22 +1196,45 @@ class SonicDriver:
                 reason=f"MuJoCo support rearm failed: {exc}"
             )
             return False
+
+        # Do not publish Plant's IDLE acknowledgement yet.  The command server
+        # is serialized, the ingress remains unauthorized, and the local latch
+        # keeps the 50 Hz thread in static hold until the post-rearm health gate
+        # commits both facts together.
         with self._support_lock:
-            try:
-                self._intent_ingress.confirm_support_rearm(generation)
-            except ValueError as exc:
-                # The Plant has moved only to IDLE, never locomotion.  Relatch
-                # immediately if the ingress generation changed during the
-                # request; a failed relatch is surfaced as unavailable/faulted
-                # rather than treating the stale release as motion authority.
-                self._ensure_plant_support_stopped(
-                    reason=f"Plant rearm raced ingress: {exc}"
-                )
-                return False
-            self._plant_support_mode = str(state["mode"])
-            self._plant_support_stop_pending = False
-            self._plant_support_safety_latched = False
-            self._plant_support_stop_generation = None
+            transition_unchanged = (
+                self._plant_support_safety_latched
+                and not self._plant_support_stop_pending
+                and self._plant_support_stop_generation == stopped_generation
+                and self._intent_ingress.generation == generation
+                and not self._intent_ingress.armed
+                and self._intent_ingress.staged_control_arm_generation
+                == generation
+            )
+        if transition_unchanged:
+            return True
+        self._ensure_plant_support_stopped(
+            reason="Plant rearm raced a stronger stop or ingress transition"
+        )
+        return False
+
+    def _commit_staged_plant_support_rearm_locked(self, generation: int) -> None:
+        """Commit the already checked IDLE release and authority together."""
+
+        if (
+            not self._plant_support_safety_latched
+            or self._plant_support_stop_pending
+            or self._plant_support_mode != "safety_stop"
+            or self._plant_support_stop_generation is None
+        ):
+            raise RuntimeError("Plant safety hold changed before rearm commit")
+        self._intent_ingress.commit_staged_support_rearm(generation)
+        self._plant_support_mode = "idle"
+        self._plant_support_stop_pending = False
+        self._plant_support_safety_latched = False
+        self._plant_support_stop_generation = None
+
+    def _publish_committed_plant_rearm(self, generation: int) -> None:
         self._arm_guard.reset()
         self.telemetry.update(
             nav2_state="idle",
@@ -1126,7 +1248,6 @@ class SonicDriver:
             plant_support_rearm_generation=generation,
             last_error=None,
         )
-        return True
 
     def _set_plant_support_mode(self, mode: str) -> bool:
         """Switch only MuJoCo's confirmed fall-arrest profile over loopback."""
@@ -1896,8 +2017,23 @@ class SonicDriver:
             return None
         control_arm = payload.get("control_arm", False)
         try:
-            with self._support_lock:
-                decision = self._intent_ingress.accept(payload)
+            if control_arm:
+                # Timestamp and support predicates are sampled under their two
+                # owner locks, and ingress is staged in that same critical
+                # section.  No generation/sequence mutation can precede this
+                # fresh, complete safe-hold gate.
+                with self._control_condition:
+                    with self._support_lock:
+                        self._require_fresh_control_arm_health_locked(
+                            phase="control arm precheck"
+                        )
+                        decision = self._intent_ingress.accept(
+                            payload,
+                            defer_control_arm=True,
+                        )
+            else:
+                with self._support_lock:
+                    decision = self._intent_ingress.accept(payload)
         except (KeyError, TypeError, ValueError) as exc:
             self._freeze_last_published_hold()
             self.guard.stop(source="invalid_gait_intent")
@@ -1920,13 +2056,34 @@ class SonicDriver:
             self.guard.observe_heading(decision.heading_yaw)
         if control_arm:
             if not decision.arm_acknowledged or decision.generation is None:
+                with self._support_lock:
+                    self._intent_ingress.revoke()
                 raise ValueError(
                     "control_arm did not produce a fresh stationary IDLE acknowledgement"
                 )
-            if not self._rearm_plant_support(decision.generation):
+            if not self._request_staged_plant_support_rearm(decision.generation):
                 with self._support_lock:
                     self._intent_ingress.revoke()
                 raise RuntimeError("explicit Plant support rearm failed")
+            try:
+                with self._control_condition:
+                    with self._support_lock:
+                        self._require_fresh_control_arm_health_locked(
+                            phase="control arm post-rearm check"
+                        )
+                        self._commit_staged_plant_support_rearm_locked(
+                            decision.generation
+                        )
+            except Exception as exc:
+                with self._support_lock:
+                    self._intent_ingress.revoke()
+                self._ensure_plant_support_stopped(
+                    reason=f"control arm post-rearm health failed: {exc}"
+                )
+                raise RuntimeError(
+                    f"control arm post-rearm health failed: {exc}"
+                ) from exc
+            self._publish_committed_plant_rearm(decision.generation)
             return {
                 "ok": True,
                 "mode": "idle",

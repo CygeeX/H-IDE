@@ -320,7 +320,12 @@ class FakeTelemetry:
 
 def bare_driver(clock: Clock) -> SonicDriver:
     driver = SonicDriver.__new__(SonicDriver)
-    driver.config = SimpleNamespace(plant_port=8794, robot_id="g1-sim")
+    driver.config = SimpleNamespace(
+        plant_port=8794,
+        robot_id="g1-sim",
+        plant_lowstate_stale_s=0.10,
+        sonic_control_step_stale_s=0.10,
+    )
     driver._driver_boot_id = UUID("30000000-0000-4000-8000-000000000003")
     driver.guard = FakeGuard()
     driver.telemetry = FakeTelemetry()
@@ -345,8 +350,8 @@ def bare_driver(clock: Clock) -> SonicDriver:
     driver._pending_control_sample = None
     driver._wall_clock = clock
     driver._control_clock_armed_at_wall_s = None
-    driver._last_lowstate_wall_s = None
-    driver._last_control_step_wall_s = None
+    driver._last_lowstate_wall_s = clock.value
+    driver._last_control_step_wall_s = clock.value
     driver._lowstate_stall_timeout_s = 1.0
     driver._stop = threading.Event()
     driver._support_lock = threading.RLock()
@@ -1267,6 +1272,145 @@ def test_driver_support_notification_stays_latched_until_control_arm(
     assert driver.guard.accepted == [(0.20, 0.0, 0.0, "nav2")]
 
 
+def test_control_arm_rechecks_freshness_after_an_earlier_probe(
+    monkeypatch,
+) -> None:
+    clock = Clock()
+    adapter, _ = runtime(clock)
+    driver = bare_driver(clock)
+    driver.accept_json(
+        _intent_payload(adapter.tick(now=clock.value), measured_heading_yaw=0.0)
+    )
+    driver.accept_json(
+        {
+            "type": "plant_support_state",
+            "schema_version": "h-ide.plant-support-state/v1",
+            "source": "robot_agent_safe_stop",
+            "mode": "safety_stop",
+            "reason": "agent startup",
+        }
+    )
+    probe = sonic_health_probe(
+        robot_id="g1-sim",
+        producer_boot_id=UUID("20000000-0000-4000-8000-000000000002"),
+        request_id=UUID("60000000-0000-4000-8000-000000000006"),
+    )
+    health = driver.accept_json(probe)
+    assert health is not None
+    assert health["last_lowstate_age_s"] == pytest.approx(0.0)
+    assert health["last_control_step_age_s"] == pytest.approx(0.0)
+
+    called = False
+
+    def unexpected_rearm(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("stale control arm must not reach Plant rearm")
+
+    monkeypatch.setattr(
+        "hide_mujoco_sonic.sonic_driver.rearm_plant_support",
+        unexpected_rearm,
+    )
+    ingress_before = (
+        driver._intent_ingress.generation,
+        driver._intent_ingress.sequence,
+        driver._intent_ingress.armed,
+        driver._intent_ingress.staged_control_arm_generation,
+    )
+    clock.value += 0.11
+    adapter.advance_generation(2, now=clock.value)
+    adapter.ingest_observation(
+        observation(clock, generation=2), now=clock.value
+    )
+    adapter.arm(2, now=clock.value)
+    payload = _intent_payload(
+        adapter.tick(now=clock.value), measured_heading_yaw=0.0
+    )
+    payload["control_arm"] = True
+
+    with pytest.raises(RuntimeError, match="LowState age"):
+        driver.accept_json(payload)
+
+    assert called is False
+    assert (
+        driver._intent_ingress.generation,
+        driver._intent_ingress.sequence,
+        driver._intent_ingress.armed,
+        driver._intent_ingress.staged_control_arm_generation,
+    ) == ingress_before
+    assert driver._plant_support_mode == "safety_stop"
+    assert driver._plant_support_safety_latched is True
+
+
+def test_control_arm_rechecks_freshness_after_plant_rearm(
+    monkeypatch,
+) -> None:
+    clock = Clock()
+    adapter, _ = runtime(clock)
+    driver = bare_driver(clock)
+    driver.accept_json(
+        _intent_payload(adapter.tick(now=clock.value), measured_heading_yaw=0.0)
+    )
+    driver.accept_json(
+        {
+            "type": "plant_support_state",
+            "schema_version": "h-ide.plant-support-state/v1",
+            "source": "robot_agent_safe_stop",
+            "mode": "safety_stop",
+            "reason": "agent startup",
+        }
+    )
+    clock.value += 0.01
+    adapter.advance_generation(2, now=clock.value)
+    adapter.ingest_observation(
+        observation(clock, generation=2), now=clock.value
+    )
+    adapter.arm(2, now=clock.value)
+    payload = _intent_payload(
+        adapter.tick(now=clock.value), measured_heading_yaw=0.0
+    )
+    payload["control_arm"] = True
+    rearm_calls: list[int] = []
+    support_calls: list[str] = []
+
+    def delayed_rearm(_host, _port, generation, **_kwargs):
+        rearm_calls.append(generation)
+        assert driver._intent_ingress.armed is False
+        assert driver._intent_ingress.staged_control_arm_generation == generation
+        clock.value += 0.11
+        return {
+            "mode": "idle",
+            "lastRearmGeneration": generation,
+            "safetyStopLatched": False,
+        }
+
+    def confirm_stop(_host, _port, mode, **_kwargs):
+        support_calls.append(mode)
+        return {"mode": mode}
+
+    monkeypatch.setattr(
+        "hide_mujoco_sonic.sonic_driver.rearm_plant_support",
+        delayed_rearm,
+    )
+    monkeypatch.setattr(
+        "hide_mujoco_sonic.sonic_driver.set_plant_support",
+        confirm_stop,
+    )
+
+    with pytest.raises(RuntimeError, match="post-rearm health failed.*LowState age"):
+        driver.accept_json(payload)
+
+    assert rearm_calls == [2]
+    assert support_calls == ["safety_stop"]
+    assert driver._intent_ingress.armed is False
+    assert driver._intent_ingress.staged_control_arm_generation is None
+    assert driver._intent_ingress.support_stop_generation == 2
+    assert driver._plant_support_mode == "safety_stop"
+    assert driver._plant_support_safety_latched is True
+    assert driver._plant_support_stop_pending is False
+    assert driver.guard.accepted == []
+
+
 def test_safe_stop_pending_blocks_a_racing_control_arm(monkeypatch) -> None:
     clock = Clock()
     adapter, _ = runtime(clock)
@@ -1307,7 +1451,7 @@ def test_safe_stop_pending_blocks_a_racing_control_arm(monkeypatch) -> None:
         adapter.tick(now=clock.value), measured_heading_yaw=0.0
     )
     payload["control_arm"] = True
-    with pytest.raises(RuntimeError, match="rearm failed"):
+    with pytest.raises(RuntimeError, match="confirmed settled safety hold"):
         driver.accept_json(payload)
     assert called is False
     assert driver.guard.accepted == []
