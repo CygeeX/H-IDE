@@ -256,16 +256,30 @@ def test_docker_plant_listener_serves_live_rgb_but_rejects_support_write() -> No
         ] == 1
         assert "oracle" not in json.dumps(state).lower()
         assert "segmentation" not in json.dumps(state).lower()
-        status, _headers, body = _request("127.0.0.2", port, "GET", "/rgb.jpg")
-        assert status == 200
-        assert body == jpeg
-        status, _headers, body = _request("127.0.0.2", port, "GET", "/depth.raw")
-        assert status == 200
-        assert body == b"\x01\x00\x02\x00"
-        exact = f"boot={producer_boot_id}&sequence=1"
-        status, headers, body = _request(
-            "127.0.0.2", port, "GET", f"/rgb.jpg?{exact}"
+        # Image routes must use their selected immutable frame directly.  A
+        # full state/diagnostics projection can be arbitrarily slow and is not
+        # part of the RGB/depth response path.
+        state_method = store.state
+        store.state = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("image GET constructed full Plant state")
         )
+        try:
+            status, _headers, body = _request(
+                "127.0.0.2", port, "GET", "/rgb.jpg"
+            )
+            assert status == 200
+            assert body == jpeg
+            status, _headers, body = _request(
+                "127.0.0.2", port, "GET", "/depth.raw"
+            )
+            assert status == 200
+            assert body == b"\x01\x00\x02\x00"
+            exact = f"boot={producer_boot_id}&sequence=1"
+            status, headers, body = _request(
+                "127.0.0.2", port, "GET", f"/rgb.jpg?{exact}"
+            )
+        finally:
+            store.state = state_method
         assert status == 200
         assert body == jpeg
         assert headers["X-Hide-Capture-Boot-Id"] == producer_boot_id

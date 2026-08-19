@@ -10,6 +10,7 @@ same capture atomically into the Robot Agent ROS contract.
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass, replace
 import json
 import math
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -44,6 +45,30 @@ class PlantPhysicsFault(RuntimeError):
     """A latched MuJoCo fault that requires an explicit process restart."""
 
 
+@dataclass(frozen=True, slots=True)
+class _SupportCommandState:
+    mode: str
+    updated_at: float
+    safety_stop_epoch: int
+    last_rearm_generation: int
+
+
+@dataclass(frozen=True, slots=True)
+class _SupportPhysicsState:
+    fault: str | None
+    fault_updated_at: float
+    last_simulation_time: float | None
+    safety_stop_epoch_floor: int
+
+
+@dataclass(frozen=True, slots=True)
+class _FrameWindow:
+    """One atomically published, immutable HTTP capture generation."""
+
+    latest: RenderedFrame | None
+    previous: RenderedFrame | None
+
+
 class PlantSupportController:
     """Simulation-only fall-arrest state, never a navigation actuator.
 
@@ -56,18 +81,39 @@ class PlantSupportController:
     MODES = frozenset({"startup", "idle", "locomotion", "safety_stop"})
 
     def __init__(self) -> None:
-        self._mode = "startup"
-        self._updated_at = time.time()
-        self._fault: str | None = None
-        self._last_simulation_time: float | None = None
-        self._last_rearm_generation = -1
-        self._safety_stop_epoch = 0
-        self._lock = threading.RLock()
+        if sys.implementation.name != "cpython":
+            raise RuntimeError("lock-free Plant support snapshots require CPython")
+        gil_enabled = getattr(sys, "_is_gil_enabled", None)
+        if callable(gil_enabled) and not gil_enabled():
+            raise RuntimeError("lock-free Plant support snapshots require the GIL")
+        now = time.time()
+        self._command_state = _SupportCommandState(
+            mode="startup",
+            updated_at=now,
+            safety_stop_epoch=0,
+            last_rearm_generation=-1,
+        )
+        self._physics_state = _SupportPhysicsState(
+            fault=None,
+            fault_updated_at=now,
+            last_simulation_time=None,
+            safety_stop_epoch_floor=0,
+        )
+        # Only HTTP/background command writers use this lock.  Physics reads
+        # immutable state references and publishes its own immutable state, so
+        # an arbitrarily slow request can never delay mj_step/LowState.
+        self._write_lock = threading.Lock()
 
     @property
     def mode(self) -> str:
-        with self._lock:
-            return self._mode
+        command = self._command_state
+        if self._physics_state.fault is not None:
+            return "safety_stop"
+        return command.mode
+
+    @property
+    def physics_fault(self) -> str | None:
+        return self._physics_state.fault
 
     def set_mode(self, mode: str) -> str:
         value = str(mode)
@@ -75,20 +121,31 @@ class PlantSupportController:
             raise ValueError(
                 f"support mode must be one of {', '.join(sorted(self.MODES))}"
             )
-        with self._lock:
-            if self._fault is not None and value != "safety_stop":
+        with self._write_lock:
+            physics = self._physics_state
+            command = self._command_state
+            effective_mode = "safety_stop" if physics.fault is not None else command.mode
+            if physics.fault is not None and value != "safety_stop":
                 raise ValueError(
-                    f"plant physics fault is latched: {self._fault}"
+                    f"plant physics fault is latched: {physics.fault}"
                 )
-            if self._mode == "safety_stop" and value != "safety_stop":
+            if effective_mode == "safety_stop" and value != "safety_stop":
                 raise ValueError(
                     "plant safety_stop is latched; explicit control rearm is required"
                 )
-            if value == "safety_stop" and self._mode != "safety_stop":
-                self._safety_stop_epoch += 1
-            self._mode = value
-            self._updated_at = time.time()
-            return self._mode
+            epoch = max(
+                command.safety_stop_epoch,
+                physics.safety_stop_epoch_floor,
+            )
+            if value == "safety_stop" and effective_mode != "safety_stop":
+                epoch += 1
+            self._command_state = replace(
+                command,
+                mode=value,
+                updated_at=time.time(),
+                safety_stop_epoch=epoch,
+            )
+            return self.mode
 
     def rearm(self, generation: int) -> str:
         """Release a non-fault safety latch to IDLE for one newer authority.
@@ -107,42 +164,65 @@ class PlantSupportController:
             or generation <= 0
         ):
             raise ValueError("rearm generation must be a positive integer")
-        with self._lock:
-            if self._fault is not None:
+        with self._write_lock:
+            physics = self._physics_state
+            command = self._command_state
+            if physics.fault is not None:
                 raise ValueError(
-                    f"plant physics fault is latched: {self._fault}"
+                    f"plant physics fault is latched: {physics.fault}"
                 )
-            if self._mode != "safety_stop":
+            if command.mode != "safety_stop":
                 raise ValueError("plant rearm requires a latched safety_stop")
-            if generation <= self._last_rearm_generation:
+            if generation <= command.last_rearm_generation:
                 raise ValueError(
                     "plant rearm generation must be strictly newer than the last release"
                 )
-            self._mode = "idle"
-            self._last_rearm_generation = generation
-            self._updated_at = time.time()
-            return self._mode
+            self._command_state = replace(
+                command,
+                mode="idle",
+                updated_at=time.time(),
+                safety_stop_epoch=max(
+                    command.safety_stop_epoch,
+                    physics.safety_stop_epoch_floor,
+                ),
+                last_rearm_generation=generation,
+            )
+            return self.mode
 
     def finish_startup(self) -> str:
-        with self._lock:
-            if self._fault is None and self._mode == "startup":
-                self._mode = "idle"
-                self._updated_at = time.time()
-            return self._mode
+        with self._write_lock:
+            command = self._command_state
+            if self._physics_state.fault is None and command.mode == "startup":
+                self._command_state = replace(
+                    command,
+                    mode="idle",
+                    updated_at=time.time(),
+                )
+            return self.mode
 
     def latch_fault(self, reason: str) -> bool:
         detail = str(reason).strip()
         if not detail:
             raise ValueError("plant physics fault requires a reason")
-        with self._lock:
-            newly_latched = self._fault is None
-            if newly_latched:
-                self._fault = detail
-            if self._mode != "safety_stop":
-                self._safety_stop_epoch += 1
-            self._mode = "safety_stop"
-            self._updated_at = time.time()
-            return newly_latched
+        physics = self._physics_state
+        if physics.fault is not None:
+            return False
+        command = self._command_state
+        current_epoch = max(
+            command.safety_stop_epoch,
+            physics.safety_stop_epoch_floor,
+        )
+        # A new physics fault is a distinct stop authority even when an HTTP
+        # safety_stop/rearm races this lock-free publisher.  Advancing the
+        # floor unconditionally prevents a concurrent rearm from hiding it.
+        current_epoch += 1
+        self._physics_state = replace(
+            physics,
+            fault=detail,
+            fault_updated_at=time.time(),
+            safety_stop_epoch_floor=current_epoch,
+        )
+        return True
 
     def observe_simulation_time(self, value: float) -> bool:
         """Latch an unrecoverable fault when MuJoCo implicitly resets time."""
@@ -150,14 +230,20 @@ class PlantSupportController:
         current = float(value)
         if not math.isfinite(current) or current < 0:
             return self.latch_fault("MuJoCo simulation time is invalid")
-        with self._lock:
-            previous = self._last_simulation_time
-            self._last_simulation_time = current
+        # The authoritative simulator thread is the sole writer of physics
+        # state.  HTTP request threads only publish command state under their
+        # separate lock, so this copy-on-write update cannot wait for HTTP.
+        physics = self._physics_state
+        previous = physics.last_simulation_time
         if previous is not None and current + 1e-6 < previous:
             return self.latch_fault(
                 "MuJoCo physics time rolled back after numerical instability "
                 f"({previous:.6f}s -> {current:.6f}s)"
             )
+        self._physics_state = replace(
+            physics,
+            last_simulation_time=current,
+        )
         return False
 
     def fail(self, reason: str) -> None:
@@ -170,28 +256,32 @@ class PlantSupportController:
         """
 
         self.latch_fault(reason)
-        state = self.state()
-        raise PlantPhysicsFault(str(state["fault"]))
+        raise PlantPhysicsFault(str(self._physics_state.fault))
 
     def require_healthy(self) -> None:
-        state = self.state()
-        if state["fault"] is not None:
-            raise PlantPhysicsFault(str(state["fault"]))
+        fault = self._physics_state.fault
+        if fault is not None:
+            raise PlantPhysicsFault(str(fault))
 
     def state(self) -> dict[str, object]:
-        with self._lock:
-            return {
-                "mode": self._mode,
-                "updatedAt": self._updated_at,
-                "fault": self._fault,
-                "safetyStopLatched": self._mode == "safety_stop",
-                "safetyStopEpoch": self._safety_stop_epoch,
-                "lastRearmGeneration": (
-                    None
-                    if self._last_rearm_generation < 0
-                    else self._last_rearm_generation
-                ),
-            }
+        # Both references are immutable and are replaced atomically under the
+        # CPython GIL.  This projection never acquires the HTTP writer lock.
+        command = self._command_state
+        physics = self._physics_state
+        fault = physics.fault
+        mode = "safety_stop" if fault is not None else command.mode
+        generation = command.last_rearm_generation
+        return {
+            "mode": mode,
+            "updatedAt": max(command.updated_at, physics.fault_updated_at),
+            "fault": fault,
+            "safetyStopLatched": mode == "safety_stop",
+            "safetyStopEpoch": max(
+                command.safety_stop_epoch,
+                physics.safety_stop_epoch_floor,
+            ),
+            "lastRearmGeneration": None if generation < 0 else generation,
+        }
 
 
 def stabilized_support_wrench(
@@ -330,6 +420,13 @@ def configure_tracking_viewer(mujoco, model, viewer, scene: RuntimeScene) -> Non
 class PlantPhysicsMonitor:
     """Authority-thread checks that never depend on rendering availability."""
 
+    _WARNING_NAMES = (
+        "mjWARN_BADQPOS",
+        "mjWARN_BADQVEL",
+        "mjWARN_BADQACC",
+        "mjWARN_BADCTRL",
+    )
+
     def __init__(self, config: SimConfig, mujoco_api, model, data, support) -> None:
         self.config = config
         self.mujoco = mujoco_api
@@ -345,11 +442,38 @@ class PlantPhysicsMonitor:
         )
         if self.root_body_id < 0:
             raise RuntimeError("pinned G1 model does not define pelvis")
+        self._warning_counts = self._read_warning_counts()
+
+    def _read_warning_counts(self) -> dict[str, int]:
+        return {
+            name.removeprefix("mjWARN_"): int(
+                self.data.warning[
+                    int(getattr(self.mujoco.mjtWarning, name))
+                ].number
+            )
+            for name in self._WARNING_NAMES
+        }
 
     def observe(self) -> None:
         self.support.observe_simulation_time(float(self.data.time))
         self.support.require_healthy()
-        arrays = (self.data.qpos, self.data.qvel, self.data.act)
+        warning_counts = self._read_warning_counts()
+        for name, current in warning_counts.items():
+            previous = self._warning_counts[name]
+            if current > previous:
+                self.support.fail(
+                    f"MuJoCo {name} warning count increased "
+                    f"({previous} -> {current})"
+                )
+        self._warning_counts = warning_counts
+        arrays = (
+            self.data.qpos,
+            self.data.qvel,
+            self.data.qacc,
+            self.data.ctrl,
+            self.data.act,
+            self.data.actuator_force,
+        )
         if not all(np.all(np.isfinite(values)) for values in arrays):
             self.support.fail("MuJoCo physics state contains non-finite values")
         root_pose = np.asarray(self.data.qpos[:7], dtype=float)
@@ -388,9 +512,12 @@ class PlantFrameStore:
         self.config = config
         self.support = support
         self.runtime_diagnostics = runtime_diagnostics
-        self._lock = threading.RLock()
-        self._latest: RenderedFrame | None = None
-        self._previous: RenderedFrame | None = None
+        # The collector is the sole writer.  HTTP readers load one immutable
+        # window reference without touching this commit-only lock, so a slow
+        # response can neither block a commit nor observe a torn latest/previous
+        # pair.
+        self._commit_lock = threading.Lock()
+        self._window = _FrameWindow(latest=None, previous=None)
         self._worker_status_provider = worker_status_provider
         self._viewer_status_provider = viewer_status_provider
         self._servers: list[ThreadingHTTPServer] = []
@@ -445,16 +572,18 @@ class PlantFrameStore:
             for value in timings.values()
         ):
             raise ValueError("rendered frame timing is invalid")
-        with self._lock:
-            latest = self._latest
+        with self._commit_lock:
+            window = self._window
+            latest = window.latest
+            previous = window.previous
             if latest is not None:
                 if latest.producer_boot_id == frame.producer_boot_id:
                     if frame.sequence <= latest.sequence:
                         raise ValueError("rendered frame sequence did not increase")
-                    self._previous = latest
+                    previous = latest
                 else:
-                    self._previous = None
-            self._latest = frame
+                    previous = None
+            self._window = _FrameWindow(latest=frame, previous=previous)
 
     def _worker_status(self) -> dict[str, object]:
         provider = self._worker_status_provider
@@ -501,33 +630,29 @@ class PlantFrameStore:
         now_ns: int | None = None,
     ) -> tuple[str, float | None, dict[str, object]]:
         worker = self._worker_status()
+        age_ns = None
+        age_ms = None
+        if frame is not None:
+            age_ns = (
+                (time.time_ns() if now_ns is None else int(now_ns))
+                - frame.captured_at_unix_ns
+            )
+            age_ms = age_ns / 1_000_000.0
+            if age_ns < 0:
+                return "failed", age_ms, worker
         if worker.get("status") == "failed":
             status = "failed"
         elif worker.get("status") != "running" or frame is None:
             status = "starting"
         else:
-            age_ms = max(
-                0.0,
-                ((time.time_ns() if now_ns is None else int(now_ns)) - frame.captured_at_unix_ns)
-                / 1_000_000.0,
-            )
-            status = "stale" if age_ms > MAX_CAPTURE_AGE_NS / 1_000_000.0 else "running"
+            assert age_ns is not None
+            status = "stale" if age_ns > MAX_CAPTURE_AGE_NS else "running"
             return status, age_ms, worker
-        age_ms = (
-            None
-            if frame is None
-            else max(
-                0.0,
-                ((time.time_ns() if now_ns is None else int(now_ns)) - frame.captured_at_unix_ns)
-                / 1_000_000.0,
-            )
-        )
         return status, age_ms, worker
 
     def state(self, frame: RenderedFrame | None = None) -> dict[str, object]:
         if frame is None:
-            with self._lock:
-                frame = self._latest
+            frame = self._window.latest
         support_state = self.support.state()
         observation_status, capture_age_ms, worker_status = self._observation_status(frame)
         physics_status = "failed" if support_state["fault"] is not None else "running"
@@ -601,10 +726,16 @@ class PlantFrameStore:
             },
         }
 
+    def _image_status(self, frame: RenderedFrame) -> str:
+        if self.support.physics_fault is not None:
+            return "failed"
+        status, _age_ms, _worker = self._observation_status(frame)
+        return status
+
     def _select_frame(self, query: str) -> tuple[RenderedFrame | None, bool]:
+        window = self._window
         if not query:
-            with self._lock:
-                return self._latest, False
+            return window.latest, False
         values = parse_qs(query, keep_blank_values=True, strict_parsing=True)
         if set(values) != {"boot", "sequence"} or any(len(items) != 1 for items in values.values()):
             raise ValueError("boot and sequence must be supplied exactly once")
@@ -616,14 +747,13 @@ class PlantFrameStore:
             raise ValueError("capture identity is invalid") from exc
         if sequence <= 0:
             raise ValueError("capture sequence must be positive")
-        with self._lock:
-            for candidate in (self._latest, self._previous):
-                if (
-                    candidate is not None
-                    and candidate.producer_boot_id == boot
-                    and candidate.sequence == sequence
-                ):
-                    return candidate, True
+        for candidate in (window.latest, window.previous):
+            if (
+                candidate is not None
+                and candidate.producer_boot_id == boot
+                and candidate.sequence == sequence
+            ):
+                return candidate, True
         return None, True
 
     def serve(
@@ -667,7 +797,7 @@ class PlantFrameStore:
                         if frame is None:
                             self.send_error(503, "capture not ready")
                             return
-                        if store.state(frame)["status"] != "running":
+                        if store._image_status(frame) != "running":
                             self.send_error(503, "capture is stale or worker failed")
                             return
                         body = frame.rgb_jpeg
@@ -676,7 +806,7 @@ class PlantFrameStore:
                         if frame is None:
                             self.send_error(503, "capture not ready")
                             return
-                        if store.state(frame)["status"] != "running":
+                        if store._image_status(frame) != "running":
                             self.send_error(503, "capture is stale or worker failed")
                             return
                         body = frame.depth_z16_le

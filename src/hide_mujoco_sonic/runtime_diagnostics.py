@@ -269,7 +269,13 @@ class _DurationProbe:
 
 
 class PlantRuntimeDiagnostics:
-    """Attribute authority-loop stalls without executing render work there."""
+    """Attribute authority-loop stalls without executing render work there.
+
+    ``observe_*`` has exactly one writer: the authoritative simulator thread.
+    It publishes immutable dictionary generations with one CPython reference
+    swap.  HTTP readers copy only the published generation and never touch the
+    live probes or a lock used by the authority.
+    """
 
     _STAGES = (
         "simStep",
@@ -288,7 +294,10 @@ class PlantRuntimeDiagnostics:
         if not math.isfinite(threshold) or threshold <= 0:
             raise ValueError("stall_threshold_s must be finite and positive")
         self.stall_threshold_s = threshold
-        self._lock = threading.RLock()
+        # HTTP readers may serialize their own defensive copies, but the
+        # authority writer never touches this lock.  Published dictionaries
+        # are never mutated after the atomic reference swap below.
+        self._snapshot_reader_lock = threading.Lock()
         self._last_loop_start_s: float | None = None
         self._loop_gap = _DurationProbe(threshold_s=threshold)
         self._stages = {
@@ -297,14 +306,13 @@ class PlantRuntimeDiagnostics:
         self._last_slow_stage: str | None = None
         self._last_slow_duration_s: float | None = None
         self._last_slow_at_unix_ns: int | None = None
+        self._published_snapshot = self._build_snapshot()
 
     def observe_loop_start(self, at_s: float, *, unix_ns: int) -> None:
         current = float(at_s)
-        with self._lock:
-            previous = self._last_loop_start_s
-            self._last_loop_start_s = current
-            if previous is None:
-                return
+        previous = self._last_loop_start_s
+        self._last_loop_start_s = current
+        if previous is not None:
             slow = self._loop_gap.observe(current - previous, unix_ns=unix_ns)
             if slow:
                 self._remember_slow(
@@ -312,6 +320,7 @@ class PlantRuntimeDiagnostics:
                     current - previous,
                     unix_ns,
                 )
+        self._publish_loop_snapshot()
 
     def observe_stage(
         self,
@@ -322,25 +331,63 @@ class PlantRuntimeDiagnostics:
     ) -> None:
         if stage not in self._stages:
             raise ValueError(f"unknown plant timing stage: {stage}")
-        with self._lock:
-            if self._stages[stage].observe(duration_s, unix_ns=unix_ns):
-                self._remember_slow(stage, duration_s, unix_ns)
+        if self._stages[stage].observe(duration_s, unix_ns=unix_ns):
+            self._remember_slow(stage, duration_s, unix_ns)
+        self._publish_stage_snapshot(stage)
 
     def _remember_slow(self, stage: str, duration_s: float, unix_ns: int) -> None:
         self._last_slow_stage = stage
         self._last_slow_duration_s = max(0.0, float(duration_s))
         self._last_slow_at_unix_ns = int(unix_ns)
 
+    def _build_snapshot(self) -> dict[str, Any]:
+        return {
+            "stallThresholdS": self.stall_threshold_s,
+            "simLoopGap": self._loop_gap.snapshot(),
+            "stages": {
+                name: probe.snapshot()
+                for name, probe in self._stages.items()
+            },
+            "lastSlowStage": self._last_slow_stage,
+            "lastSlowDurationS": self._last_slow_duration_s,
+            "lastSlowAtUnixNs": self._last_slow_at_unix_ns,
+        }
+
+    def _published_common(self, current: dict[str, Any]) -> dict[str, Any]:
+        return {
+            **current,
+            "lastSlowStage": self._last_slow_stage,
+            "lastSlowDurationS": self._last_slow_duration_s,
+            "lastSlowAtUnixNs": self._last_slow_at_unix_ns,
+        }
+
+    def _publish_loop_snapshot(self) -> None:
+        current = self._published_snapshot
+        self._published_snapshot = {
+            **self._published_common(current),
+            "simLoopGap": self._loop_gap.snapshot(),
+        }
+
+    def _publish_stage_snapshot(self, stage: str) -> None:
+        current = self._published_snapshot
+        stages = dict(current["stages"])
+        stages[stage] = self._stages[stage].snapshot()
+        self._published_snapshot = {
+            **self._published_common(current),
+            "stages": stages,
+        }
+
     def snapshot(self) -> dict[str, Any]:
-        with self._lock:
+        with self._snapshot_reader_lock:
+            published = self._published_snapshot
             return {
-                "stallThresholdS": self.stall_threshold_s,
-                "simLoopGap": self._loop_gap.snapshot(),
+                "stallThresholdS": published["stallThresholdS"],
+                "simLoopGap": dict(published["simLoopGap"]),
                 "stages": {
-                    name: probe.snapshot()
-                    for name, probe in self._stages.items()
+                    name: dict(value)
+                    for name, value in published["stages"].items()
                 },
-                "lastSlowStage": self._last_slow_stage,
-                "lastSlowDurationS": self._last_slow_duration_s,
-                "lastSlowAtUnixNs": self._last_slow_at_unix_ns,
+                "lastSlowStage": published["lastSlowStage"],
+                "lastSlowDurationS": published["lastSlowDurationS"],
+                "lastSlowAtUnixNs": published["lastSlowAtUnixNs"],
             }

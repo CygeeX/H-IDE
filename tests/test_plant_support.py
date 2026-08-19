@@ -1,4 +1,8 @@
+from concurrent.futures import ThreadPoolExecutor
 import math
+import sys
+import threading
+import time
 
 import pytest
 import numpy as np
@@ -23,6 +27,13 @@ def test_support_controller_rejects_unknown_mode():
     with pytest.raises(ValueError, match="support mode"):
         support.set_mode("teleport")
     assert support.state()["mode"] == "startup"
+
+
+def test_support_controller_rejects_free_threaded_python(monkeypatch) -> None:
+    monkeypatch.setattr(sys, "_is_gil_enabled", lambda: False, raising=False)
+
+    with pytest.raises(RuntimeError, match="require the GIL"):
+        PlantSupportController()
 
 
 def test_support_controller_latches_physics_time_rollback_until_restart():
@@ -77,6 +88,77 @@ def test_physics_fault_cannot_be_rearmed_online() -> None:
     with pytest.raises(ValueError, match="physics fault is latched"):
         support.rearm(1)
     assert support.state()["mode"] == "safety_stop"
+
+
+def test_physics_hot_path_never_waits_for_http_command_writer() -> None:
+    support = PlantSupportController()
+    support.finish_startup()
+    support.observe_simulation_time(1.0)
+    lock_held = threading.Event()
+    release_lock = threading.Event()
+
+    def hold_http_writer_lock() -> None:
+        with support._write_lock:
+            lock_held.set()
+            assert release_lock.wait(2.0)
+
+    holder = threading.Thread(target=hold_http_writer_lock, daemon=True)
+    holder.start()
+    assert lock_held.wait(1.0)
+
+    def exercise_physics_reads() -> int:
+        started_ns = time.perf_counter_ns()
+        for index in range(100):
+            assert support.mode == "idle"
+            assert support.state()["mode"] == "idle"
+            assert support.observe_simulation_time(1.001 + index * 0.001) is False
+            support.require_healthy()
+        return time.perf_counter_ns() - started_ns
+
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        elapsed_ns = executor.submit(exercise_physics_reads).result(timeout=1.0)
+        # This is a millisecond-scale regression ceiling for 400 hot-path
+        # operations, measured inside the already-scheduled worker thread.
+        assert elapsed_ns < 20_000_000
+    finally:
+        release_lock.set()
+        executor.shutdown(wait=True)
+        holder.join(timeout=1.0)
+    assert not holder.is_alive()
+
+
+def test_physics_fault_latch_never_waits_for_http_and_advances_stop_epoch() -> None:
+    support = PlantSupportController()
+    support.finish_startup()
+    support.set_mode("safety_stop")
+    assert support.rearm(1) == "idle"
+    epoch_before = int(support.state()["safetyStopEpoch"])
+    lock_held = threading.Event()
+    release_lock = threading.Event()
+
+    def hold_http_writer_lock() -> None:
+        with support._write_lock:
+            lock_held.set()
+            assert release_lock.wait(2.0)
+
+    holder = threading.Thread(target=hold_http_writer_lock, daemon=True)
+    holder.start()
+    assert lock_held.wait(1.0)
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        assert executor.submit(support.latch_fault, "injected fault").result(
+            timeout=1.0
+        ) is True
+    finally:
+        release_lock.set()
+        executor.shutdown(wait=True)
+        holder.join(timeout=1.0)
+
+    state = support.state()
+    assert state["fault"] == "injected fault"
+    assert state["mode"] == "safety_stop"
+    assert state["safetyStopEpoch"] == epoch_before + 1
 
 
 def test_locomotion_keeps_vertical_roll_and_pitch_fall_arrest() -> None:

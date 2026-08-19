@@ -42,6 +42,8 @@ MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 
 _PLANT_STAGES = (
     "simStep",
+    "snapshotPublish",
+    "viewerSnapshotPublish",
     "viewerSync",
     "rgbRender",
     "jpegEncode",
@@ -49,6 +51,7 @@ _PLANT_STAGES = (
     "capturePostprocess",
     "renderCaptureTotal",
 )
+_PLANT_WORKERS = ("observationWorker", "viewerWorker")
 _SONIC_GAP_PREFIXES = (
     "lowstate_callback",
     "control_publish",
@@ -562,6 +565,286 @@ class RuntimeCounterTracker:
         }
 
 
+class PlantWorkerIdentityTracker:
+    """Keep render-worker health, process identity and failure evidence stable."""
+
+    def __init__(self) -> None:
+        self.baseline: dict[str, dict[str, Any]] = {}
+        self.latest: dict[str, dict[str, Any]] = {}
+
+    @staticmethod
+    def _worker_pid(value: Any, field: str) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{field} is not a positive integer")
+        return value
+
+    @staticmethod
+    def _worker_boot_id(value: Any, field: str) -> str:
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"{field} is not a UUID")
+        try:
+            uuid.UUID(value)
+        except (AttributeError, ValueError) as exc:
+            raise ValueError(f"{field} is not a UUID") from exc
+        return value
+
+    @staticmethod
+    def _failure_snapshot(
+        value: Mapping[str, Any],
+        field: str,
+        errors: list[str],
+    ) -> dict[str, Any]:
+        try:
+            failure_count = _counter(
+                value.get("failureCount"), f"{field}.failureCount"
+            )
+        except ValueError as exc:
+            errors.append(str(exc))
+            failure_count = value.get("failureCount")
+        failure_at = value.get("lastFailureAtUnixNs")
+        if failure_at is not None and (
+            isinstance(failure_at, bool)
+            or not isinstance(failure_at, int)
+            or failure_at <= 0
+        ):
+            errors.append(
+                f"{field}.lastFailureAtUnixNs must be null or a positive integer"
+            )
+        last_error = value.get("lastError")
+        if last_error is not None and (
+            not isinstance(last_error, str) or not last_error.strip()
+        ):
+            errors.append(f"{field}.lastError is not null or a non-empty string")
+        return {
+            "failureCount": failure_count,
+            "lastFailureAtUnixNs": failure_at,
+            "lastError": last_error,
+        }
+
+    @classmethod
+    def _enabled_snapshot(
+        cls,
+        name: str,
+        value: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], list[str], list[str]]:
+        health_errors: list[str] = []
+        identity_errors: list[str] = []
+        if value.get("status") != "running":
+            health_errors.append(
+                f"plant.{name}.status={value.get('status')!r}, expected 'running'"
+            )
+        if value.get("ready") is not True:
+            health_errors.append(f"plant.{name}.ready is not true")
+        if value.get("alive") is not True:
+            health_errors.append(f"plant.{name}.alive is not true")
+        if value.get("exitCode") is not None:
+            health_errors.append(f"plant.{name}.exitCode is not null")
+        try:
+            worker_pid: Any = cls._worker_pid(
+                value.get("workerPid"), f"plant.{name}.workerPid"
+            )
+        except ValueError as exc:
+            identity_errors.append(str(exc))
+            worker_pid = value.get("workerPid")
+        try:
+            worker_boot_id: Any = cls._worker_boot_id(
+                value.get("workerBootId"), f"plant.{name}.workerBootId"
+            )
+        except ValueError as exc:
+            identity_errors.append(str(exc))
+            worker_boot_id = value.get("workerBootId")
+        failure = cls._failure_snapshot(value, f"plant.{name}", health_errors)
+        if name == "viewerWorker":
+            if value.get("authorityFeedbackEnabled") is not False:
+                health_errors.append(
+                    "plant.viewerWorker.authorityFeedbackEnabled is not false"
+                )
+            if value.get("keyCallbackRegistered") is not False:
+                health_errors.append(
+                    "plant.viewerWorker.keyCallbackRegistered is not false"
+                )
+        return (
+            {
+                "mode": "enabled",
+                "identity": {
+                    "workerPid": worker_pid,
+                    "workerBootId": worker_boot_id,
+                },
+                "failure": failure,
+                "health": {
+                    "status": value.get("status"),
+                    "ready": value.get("ready"),
+                    "alive": value.get("alive"),
+                    "exitCode": value.get("exitCode"),
+                },
+            },
+            health_errors,
+            identity_errors,
+        )
+
+    @classmethod
+    def _disabled_viewer_snapshot(
+        cls,
+        value: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], list[str], list[str]]:
+        health_errors: list[str] = []
+        identity_errors: list[str] = []
+        for field in ("ready", "alive"):
+            if value.get(field) not in (None, False):
+                health_errors.append(
+                    f"plant.viewerWorker.{field} must be absent or false when disabled"
+                )
+        if value.get("exitCode") is not None:
+            health_errors.append(
+                "plant.viewerWorker.exitCode must be null when disabled"
+            )
+        if value.get("authorityFeedbackEnabled") is not False:
+            health_errors.append(
+                "plant.viewerWorker.authorityFeedbackEnabled is not false"
+            )
+        if value.get("keyCallbackRegistered") is not False:
+            health_errors.append(
+                "plant.viewerWorker.keyCallbackRegistered is not false"
+            )
+        for field in ("workerPid", "workerBootId"):
+            if value.get(field) is not None:
+                identity_errors.append(
+                    f"plant.viewerWorker.{field} must be null when disabled"
+                )
+        failure_count = value.get("failureCount", 0)
+        if failure_count != 0 or isinstance(failure_count, bool):
+            health_errors.append(
+                "plant.viewerWorker.failureCount must be absent or zero when disabled"
+            )
+        for field in ("lastFailureAtUnixNs", "lastError"):
+            if value.get(field) is not None:
+                health_errors.append(
+                    f"plant.viewerWorker.{field} must be null when disabled"
+                )
+        return (
+            {
+                "mode": "disabled",
+                "identity": {"workerPid": None, "workerBootId": None},
+                "failure": {
+                    "failureCount": 0,
+                    "lastFailureAtUnixNs": None,
+                    "lastError": None,
+                },
+                "health": {
+                    "status": "disabled",
+                    "ready": value.get("ready"),
+                    "alive": value.get("alive"),
+                    "exitCode": value.get("exitCode"),
+                },
+            },
+            health_errors,
+            identity_errors,
+        )
+
+    def observe(
+        self,
+        plant: Mapping[str, Any],
+        *,
+        authority_pid: int | None,
+    ) -> dict[str, Any]:
+        workers: dict[str, dict[str, Any]] = {}
+        health_errors: list[str] = []
+        identity_errors: list[str] = []
+        identity_changes: dict[str, dict[str, Any]] = {}
+        failure_changes: dict[str, dict[str, Any]] = {}
+        first_snapshot = not self.baseline
+
+        for name in _PLANT_WORKERS:
+            raw = plant.get(name)
+            worker_health: list[str] = []
+            worker_identity: list[str] = []
+            if not isinstance(raw, Mapping):
+                health_errors.append(f"plant.{name} is not an object")
+                snapshot = {
+                    "mode": "invalid",
+                    "identity": {"workerPid": None, "workerBootId": None},
+                    "failure": {
+                        "failureCount": None,
+                        "lastFailureAtUnixNs": None,
+                        "lastError": None,
+                    },
+                    "health": {"status": None},
+                }
+            elif name == "viewerWorker" and raw.get("status") == "disabled":
+                snapshot, worker_health, worker_identity = (
+                    self._disabled_viewer_snapshot(raw)
+                )
+                health_errors.extend(worker_health)
+                identity_errors.extend(worker_identity)
+            else:
+                snapshot, worker_health, worker_identity = self._enabled_snapshot(
+                    name, raw
+                )
+                health_errors.extend(worker_health)
+                identity_errors.extend(worker_identity)
+
+            baseline = self.baseline.get(name)
+            if baseline is None:
+                self.baseline[name] = snapshot
+            else:
+                baseline_identity = {
+                    "mode": baseline["mode"],
+                    **baseline["identity"],
+                }
+                current_identity = {
+                    "mode": snapshot["mode"],
+                    **snapshot["identity"],
+                }
+                if current_identity != baseline_identity:
+                    identity_changes[name] = {
+                        "baseline": baseline_identity,
+                        "current": current_identity,
+                    }
+                if snapshot["failure"] != baseline["failure"]:
+                    failure_changes[name] = {
+                        "baseline": baseline["failure"],
+                        "current": snapshot["failure"],
+                    }
+            self.latest[name] = snapshot
+            workers[name] = {
+                **snapshot,
+                "healthErrors": worker_health,
+                "identityErrors": worker_identity,
+            }
+
+        observation_identity = workers["observationWorker"]["identity"]
+        viewer_identity = workers["viewerWorker"]["identity"]
+        observation_pid = observation_identity.get("workerPid")
+        viewer_pid = viewer_identity.get("workerPid")
+        observation_boot_id = observation_identity.get("workerBootId")
+        viewer_boot_id = viewer_identity.get("workerBootId")
+        if authority_pid is not None and observation_pid == authority_pid:
+            identity_errors.append(
+                "plant.observationWorker.workerPid equals the authoritative Plant PID"
+            )
+        if authority_pid is not None and viewer_pid == authority_pid:
+            identity_errors.append(
+                "plant.viewerWorker.workerPid equals the authoritative Plant PID"
+            )
+        if viewer_pid is not None and viewer_pid == observation_pid:
+            identity_errors.append(
+                "Plant observation and viewer workers report the same PID"
+            )
+        if viewer_boot_id is not None and viewer_boot_id == observation_boot_id:
+            identity_errors.append(
+                "Plant observation and viewer workers report the same boot ID"
+            )
+
+        return {
+            "baseline": first_snapshot,
+            "workers": workers,
+            "healthErrors": health_errors,
+            "identityErrors": identity_errors,
+            "identityChanges": identity_changes,
+            "failureChanges": failure_changes,
+        }
+
+
 class IdleSoakEvaluator:
     """Combine the existing physical evaluator with soak-only invariants."""
 
@@ -571,6 +854,7 @@ class IdleSoakEvaluator:
             self.limits.acceptance_limits()
         )
         self.runtime = RuntimeCounterTracker()
+        self.workers = PlantWorkerIdentityTracker()
         self.failures: dict[str, Failure] = {}
         self.first_observed_s: float | None = None
         self.last_observed_s: float | None = None
@@ -808,6 +1092,61 @@ class IdleSoakEvaluator:
             "deltasFromBaseline": dict(self.runtime.stall_deltas),
         }
         lower_body: dict[str, float] = {}
+        worker_derived: dict[str, Any] = {
+            "baseline": False,
+            "workers": {},
+            "healthErrors": [],
+            "identityErrors": [],
+            "identityChanges": {},
+            "failureChanges": {},
+        }
+        if plant is not None:
+            authority_pid: int | None = None
+            authority_process = process_snapshot.get("mujoco-plant")
+            if isinstance(authority_process, Mapping):
+                candidate_pid = authority_process.get("pid")
+                if (
+                    isinstance(candidate_pid, int)
+                    and not isinstance(candidate_pid, bool)
+                    and candidate_pid > 0
+                ):
+                    authority_pid = candidate_pid
+            worker_derived = self.workers.observe(
+                plant,
+                authority_pid=authority_pid,
+            )
+            if worker_derived["healthErrors"]:
+                self._fail(
+                    "PLANT_WORKER_HEALTH_INVALID",
+                    "; ".join(worker_derived["healthErrors"]),
+                    observed_s,
+                )
+            if worker_derived["identityErrors"]:
+                self._fail(
+                    "PLANT_WORKER_IDENTITY_INVALID",
+                    "; ".join(worker_derived["identityErrors"]),
+                    observed_s,
+                )
+            if worker_derived["identityChanges"]:
+                self._fail(
+                    "PLANT_WORKER_IDENTITY_CHANGED",
+                    json.dumps(
+                        worker_derived["identityChanges"],
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                    observed_s,
+                )
+            if worker_derived["failureChanges"]:
+                self._fail(
+                    "PLANT_WORKER_FAILURE_CHANGED",
+                    json.dumps(
+                        worker_derived["failureChanges"],
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                    observed_s,
+                )
         if plant is None or sonic is None:
             self.motion.observe_error(
                 "Plant or SONIC sample unavailable", observed_s=observed_s
@@ -873,6 +1212,7 @@ class IdleSoakEvaluator:
             "motion": motion_derived,
             "lowerBody": lower_body,
             "runtime": runtime_derived,
+            "plantWorkers": worker_derived,
             "robotAgent": robot_agent_derived,
             "processIdentityChanged": process_changed,
         }
@@ -925,6 +1265,8 @@ class IdleSoakEvaluator:
             "runtimeCounterDeltas": dict(self.runtime.stall_deltas),
             "processBaseline": self._process_baseline,
             "processFinal": self._process_latest,
+            "plantWorkerBaseline": dict(self.workers.baseline),
+            "plantWorkerFinal": dict(self.workers.latest),
             "motionAcceptance": motion_result,
             "failures": reported_failures,
         }
@@ -938,11 +1280,16 @@ def _compact_payloads(batch: EndpointBatch) -> dict[str, Any]:
     result: dict[str, Any] = {
         "plant": {
             "status": plant.get("status"),
+            "physicsStatus": plant.get("physicsStatus"),
+            "observationStatus": plant.get("observationStatus"),
+            "producerBootId": plant.get("producerBootId"),
             "sequence": plant.get("sequence"),
             "capturedAtUnixNs": plant.get("capturedAtUnixNs"),
             "pose": plant.get("pose"),
             "rootVelocity": plant.get("rootVelocity"),
             "support": support,
+            "observationWorker": plant.get("observationWorker"),
+            "viewerWorker": plant.get("viewerWorker"),
         },
         "sonic": {
             key: sonic.get(key)
@@ -1100,6 +1447,13 @@ def run_soak(
             or derived["runtime"].get("counterRollbacks")
         )
         process_event = bool(derived.get("processIdentityChanged"))
+        worker_evidence = derived.get("plantWorkers", {})
+        worker_event = bool(
+            worker_evidence.get("healthErrors")
+            or worker_evidence.get("identityErrors")
+            or worker_evidence.get("identityChanges")
+            or worker_evidence.get("failureChanges")
+        )
         failure_event = bool(
             batch.errors
             or tuple(process_errors)
@@ -1109,13 +1463,19 @@ def run_soak(
             )
         )
         if not first and not final and (
-            runtime_event or process_event or failure_event or observed >= next_raw
+            runtime_event
+            or process_event
+            or worker_event
+            or failure_event
+            or observed >= next_raw
         ):
             event_kind = (
                 "runtime_event"
                 if runtime_event
                 else "process_event"
                 if process_event
+                else "worker_event"
+                if worker_event
                 else "failure_event"
                 if failure_event
                 else "raw_checkpoint"

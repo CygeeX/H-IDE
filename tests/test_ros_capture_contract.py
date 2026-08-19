@@ -7,6 +7,7 @@ import pytest
 import requests
 
 import hide_mujoco_sonic.ros_observation_bridge as bridge_module
+from hide_mujoco_sonic.frames import PoseDifferenceDiagnostic, PoseDifferenceResult
 from hide_mujoco_sonic.ros_observation_bridge import (
     MAX_CAPTURE_AGE_NS,
     CaptureContractError,
@@ -157,6 +158,33 @@ def test_sequence_is_strict_within_boot_and_resets_only_on_boot_change() -> None
     assert is_new_capture(
         CaptureIdentity(BOOT_B, 1, 2_000_000_000), BOOT_A, previous_sequence
     )
+
+
+def test_pose_difference_anchor_resets_when_capture_worker_boot_changes() -> None:
+    bridge = _uninitialized_bridge()
+    bridge._last_producer_boot_id = BOOT_A
+    bridge._pose_difference_diagnostic = PoseDifferenceDiagnostic()
+    bridge._last_pose_difference = PoseDifferenceResult("initialized")
+    quaternion = (1.0, 0.0, 0.0, 0.0)
+    bridge._observe_pose_difference(
+        CaptureIdentity(BOOT_A, 1, 1_000_000_000),
+        (0.0, 0.0, 0.0),
+        quaternion,
+    )
+    bridge._observe_pose_difference(
+        CaptureIdentity(BOOT_A, 2, 2_000_000_000),
+        (1.0, 0.0, 0.0),
+        quaternion,
+    )
+    assert bridge._last_pose_difference.status == "valid"
+
+    bridge._observe_pose_difference(
+        CaptureIdentity(BOOT_B, 1, 500_000_000),
+        (100.0, 0.0, 0.0),
+        quaternion,
+    )
+
+    assert bridge._last_pose_difference.status == "initialized"
 
 
 def test_capture_age_gate_includes_exact_500ms_boundary() -> None:

@@ -25,6 +25,43 @@ FIXTURE_CASES = json.loads(
         encoding="utf-8"
     )
 )
+OBSERVATION_WORKER_BOOT_ID = "22222222-2222-4222-8222-222222222222"
+VIEWER_WORKER_BOOT_ID = "33333333-3333-4333-8333-333333333333"
+
+
+def _healthy_worker(*, pid: int, boot_id: str, viewer: bool = False) -> dict:
+    value = {
+        "status": "running",
+        "ready": True,
+        "alive": True,
+        "exitCode": None,
+        "workerPid": pid,
+        "workerBootId": boot_id,
+        "failureCount": 0,
+        "lastFailureAtUnixNs": None,
+        "lastError": None,
+    }
+    if viewer:
+        value.update(
+            {
+                "authorityFeedbackEnabled": False,
+                "keyCallbackRegistered": False,
+            }
+        )
+    return value
+
+
+def _disabled_viewer() -> dict:
+    return {
+        "status": "disabled",
+        "workerPid": None,
+        "workerBootId": None,
+        "failureCount": 0,
+        "lastFailureAtUnixNs": None,
+        "lastError": None,
+        "authorityFeedbackEnabled": False,
+        "keyCallbackRegistered": False,
+    }
 
 
 def _plant(
@@ -49,12 +86,20 @@ def _plant(
     }
     return {
         "status": "running",
-        "schemaVersion": "h-ide.mujoco-capture/1",
+        "physicsStatus": "running",
+        "observationStatus": "running",
+        "schemaVersion": "h-ide.mujoco-capture/2",
         "robotId": "g1-sim",
         "sourceId": "mujoco:unitree-g1:g1-sim",
         "localizationEpochId": "g1-sim-map-epoch-1",
         "sequence": 1000 + index,
         "capturedAtUnixNs": int(timestamp * 1_000_000_000),
+        "producerBootId": "11111111-1111-4111-8111-111111111111",
+        "observationWorker": _healthy_worker(
+            pid=201,
+            boot_id=OBSERVATION_WORKER_BOOT_ID,
+        ),
+        "viewerWorker": _disabled_viewer(),
         "pose": {
             "x": 0.0,
             "y": 0.0,
@@ -332,6 +377,194 @@ def test_baseline_nonzero_counters_do_not_block_a_clean_soak() -> None:
     assert result["movementReleaseAllowed"] is True
     assert result["quarantineExercised"] is False
     assert set(result["runtimeCounterDeltas"].values()) == {0}
+    assert result["plantWorkerBaseline"]["observationWorker"]["identity"] == {
+        "workerPid": 201,
+        "workerBootId": OBSERVATION_WORKER_BOOT_ID,
+    }
+    assert result["plantWorkerFinal"]["viewerWorker"]["mode"] == "disabled"
+
+
+def test_worker_identities_and_failure_evidence_remain_stable() -> None:
+    evaluator = idle_soak.IdleSoakEvaluator()
+    baseline = _observe(evaluator, _batch(0), 0)
+    sample = _observe(evaluator, _batch(1), 1)
+
+    result = evaluator.finalize()
+
+    assert baseline["plantWorkers"]["baseline"] is True
+    assert sample["plantWorkers"]["baseline"] is False
+    assert sample["plantWorkers"]["identityChanges"] == {}
+    assert sample["plantWorkers"]["failureChanges"] == {}
+    assert result["safeHoldSafetyPass"] is True
+
+
+def test_observation_worker_identity_change_is_a_hard_failure_with_evidence() -> None:
+    evaluator = idle_soak.IdleSoakEvaluator()
+    _observe(evaluator, _batch(0), 0)
+    changed = _batch(1)
+    changed.payloads["plant"]["observationWorker"].update(
+        {
+            "workerPid": 301,
+            "workerBootId": "44444444-4444-4444-8444-444444444444",
+        }
+    )
+
+    derived = _observe(evaluator, changed, 1)
+    result = evaluator.finalize()
+
+    evidence = derived["plantWorkers"]["identityChanges"]["observationWorker"]
+    assert evidence["baseline"]["workerPid"] == 201
+    assert evidence["current"]["workerPid"] == 301
+    failure = next(
+        failure
+        for failure in result["failures"]
+        if failure["code"] == "PLANT_WORKER_IDENTITY_CHANGED"
+    )
+    assert '"baseline"' in failure["detail"]
+    assert '"current"' in failure["detail"]
+    assert result["safeHoldSafetyPass"] is False
+
+
+def test_observation_worker_failure_change_is_a_hard_failure_with_evidence() -> None:
+    evaluator = idle_soak.IdleSoakEvaluator()
+    _observe(evaluator, _batch(0), 0)
+    changed = _batch(1)
+    changed.payloads["plant"]["observationWorker"].update(
+        {
+            "failureCount": 1,
+            "lastFailureAtUnixNs": 1_800_000_001_000_000_000,
+            "lastError": "jpeg encoder failed once",
+        }
+    )
+
+    derived = _observe(evaluator, changed, 1)
+    result = evaluator.finalize()
+
+    evidence = derived["plantWorkers"]["failureChanges"]["observationWorker"]
+    assert evidence["baseline"]["failureCount"] == 0
+    assert evidence["current"]["failureCount"] == 1
+    failure = next(
+        failure
+        for failure in result["failures"]
+        if failure["code"] == "PLANT_WORKER_FAILURE_CHANGED"
+    )
+    assert "jpeg encoder failed once" in failure["detail"]
+    assert result["safeHoldSafetyPass"] is False
+
+
+def test_enabled_viewer_identity_and_failure_changes_are_preserved_as_evidence() -> None:
+    evaluator = idle_soak.IdleSoakEvaluator()
+    first = _batch(0)
+    second = _batch(1)
+    first.payloads["plant"]["viewerWorker"] = _healthy_worker(
+        pid=202,
+        boot_id=VIEWER_WORKER_BOOT_ID,
+        viewer=True,
+    )
+    second.payloads["plant"]["viewerWorker"] = _healthy_worker(
+        pid=302,
+        boot_id="55555555-5555-4555-8555-555555555555",
+        viewer=True,
+    )
+    second.payloads["plant"]["viewerWorker"].update(
+        {
+            "failureCount": 1,
+            "lastFailureAtUnixNs": 1_800_000_001_000_000_000,
+            "lastError": "viewer context was recreated",
+        }
+    )
+    _observe(evaluator, first, 0)
+
+    derived = _observe(evaluator, second, 1)
+    result = evaluator.finalize()
+
+    assert "viewerWorker" in derived["plantWorkers"]["identityChanges"]
+    assert "viewerWorker" in derived["plantWorkers"]["failureChanges"]
+    codes = {failure["code"] for failure in result["failures"]}
+    assert codes >= {
+        "PLANT_WORKER_IDENTITY_CHANGED",
+        "PLANT_WORKER_FAILURE_CHANGED",
+    }
+    details = " ".join(failure["detail"] for failure in result["failures"])
+    assert "viewer context was recreated" in details
+
+
+def test_enabled_viewer_is_stable_and_cannot_share_the_plant_pid() -> None:
+    evaluator = idle_soak.IdleSoakEvaluator()
+    first = _batch(0)
+    second = _batch(1)
+    for batch in (first, second):
+        batch.payloads["plant"]["viewerWorker"] = _healthy_worker(
+            pid=202,
+            boot_id=VIEWER_WORKER_BOOT_ID,
+            viewer=True,
+        )
+    _observe(evaluator, first, 0)
+    derived = _observe(evaluator, second, 1)
+
+    result = evaluator.finalize()
+
+    viewer = derived["plantWorkers"]["workers"]["viewerWorker"]
+    assert viewer["mode"] == "enabled"
+    assert viewer["identity"]["workerPid"] == 202
+    assert result["safeHoldSafetyPass"] is True
+
+    invalid = idle_soak.IdleSoakEvaluator()
+    wrong = _batch(0)
+    wrong.payloads["plant"]["viewerWorker"] = _healthy_worker(
+        pid=PROCESSES["mujoco-plant"]["pid"],
+        boot_id=VIEWER_WORKER_BOOT_ID,
+        viewer=True,
+    )
+    _observe(invalid, wrong, 0)
+    _observe(invalid, wrong, 1)
+    invalid_result = invalid.finalize()
+    assert {failure["code"] for failure in invalid_result["failures"]} >= {
+        "PLANT_WORKER_IDENTITY_INVALID"
+    }
+
+
+def test_disabled_viewer_rejects_phantom_identity_or_failure() -> None:
+    evaluator = idle_soak.IdleSoakEvaluator()
+    first = _batch(0)
+    first.payloads["plant"]["viewerWorker"].update(
+        {
+            "workerPid": 202,
+            "failureCount": 1,
+            "lastError": "worker should not exist",
+        }
+    )
+    _observe(evaluator, first, 0)
+    _observe(evaluator, _batch(1), 1)
+
+    result = evaluator.finalize()
+
+    codes = {failure["code"] for failure in result["failures"]}
+    assert codes >= {
+        "PLANT_WORKER_HEALTH_INVALID",
+        "PLANT_WORKER_IDENTITY_INVALID",
+    }
+    details = " ".join(failure["detail"] for failure in result["failures"])
+    assert "viewerWorker.workerPid" in details
+    assert "viewerWorker.failureCount" in details
+
+
+@pytest.mark.parametrize("stage", ["snapshotPublish", "viewerSnapshotPublish"])
+def test_new_snapshot_publish_stages_are_tracked(stage: str) -> None:
+    evaluator = idle_soak.IdleSoakEvaluator()
+    _observe(evaluator, _batch(0), 0)
+    _observe(
+        evaluator,
+        _batch(1, plant_stage=stage, plant_delta=1),
+        1,
+    )
+
+    result = evaluator.finalize()
+
+    assert result["runtimeCounterDeltas"][
+        f"plant.stages.{stage}.overThresholdCount"
+    ] == 1
+    assert result["movementReleaseAllowed"] is False
 
 
 @pytest.mark.parametrize("case", FIXTURE_CASES, ids=lambda case: case["name"])
@@ -607,6 +840,27 @@ class _FakeSampler:
         return batch
 
 
+class _WorkerDriftSampler:
+    def __init__(self) -> None:
+        self.calls: list[bool] = []
+
+    def sample(self, *, include_robot_agent: bool) -> idle_soak.EndpointBatch:
+        index = len(self.calls)
+        self.calls.append(include_robot_agent)
+        batch = _batch(index)
+        if index == 1:
+            batch.payloads["plant"]["observationWorker"].update(
+                {
+                    "workerPid": 301,
+                    "workerBootId": "66666666-6666-4666-8666-666666666666",
+                }
+            )
+        if not include_robot_agent:
+            batch.payloads.pop("robotAgent")
+            batch.latency_ms.pop("robotAgent")
+        return batch
+
+
 class _FakeProcessProbe:
     def snapshot(self):
         return PROCESSES, ()
@@ -655,6 +909,40 @@ def test_short_run_preserves_rates_and_writes_raw_runtime_event() -> None:
     event = next(value for value in writer.values if value["kind"] == "runtime_event")
     assert set(event["payloads"]) == {"plant", "sonic"}
     assert event["derived"]["runtime"]["stallEvent"] is True
+    for kind in ("baseline", "sample", "final_checkpoint"):
+        record = next(value for value in writer.values if value["kind"] == kind)
+        plant = (
+            record["payloads"]["plant"]
+            if kind != "sample"
+            else record["plant"]
+        )
+        assert plant["observationWorker"]["workerPid"] == 201
+        assert plant["viewerWorker"]["status"] == "disabled"
+        assert record["derived"]["plantWorkers"]["failureChanges"] == {}
+
+
+def test_short_run_writes_full_worker_drift_evidence() -> None:
+    clock = _FakeClock()
+    writer = _MemoryWriter()
+
+    result = idle_soak.run_soak(
+        sampler=_WorkerDriftSampler(),
+        evaluator=idle_soak.IdleSoakEvaluator(),
+        writer=writer,
+        process_probe=_FakeProcessProbe(),
+        log_scanner=_FakeLogScanner(),
+        duration_s=0.6,
+        session_id="session-worker-drift",
+        clock=clock,
+        sleeper=clock.sleep,
+    )
+
+    event = next(value for value in writer.values if value["kind"] == "worker_event")
+    evidence = event["derived"]["plantWorkers"]["identityChanges"]
+    assert evidence["observationWorker"]["baseline"]["workerPid"] == 201
+    assert evidence["observationWorker"]["current"]["workerPid"] == 301
+    assert event["payloads"]["plant"]["observationWorker"]["workerPid"] == 301
+    assert result["safeHoldSafetyPass"] is False
 
 
 def test_documented_defaults_are_2hz_5s_10s_and_605s() -> None:
@@ -662,3 +950,5 @@ def test_documented_defaults_are_2hz_5s_10s_and_605s() -> None:
     assert idle_soak.ROBOT_AGENT_INTERVAL_S == 5.0
     assert idle_soak.RAW_CHECKPOINT_INTERVAL_S == 10.0
     assert idle_soak.DEFAULT_DURATION_S == 605.0
+    assert "snapshotPublish" in idle_soak._PLANT_STAGES
+    assert "viewerSnapshotPublish" in idle_soak._PLANT_STAGES

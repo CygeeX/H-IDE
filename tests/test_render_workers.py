@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import inspect
 import multiprocessing
 from pathlib import Path
@@ -25,7 +26,13 @@ from hide_mujoco_sonic.render_workers import (
     RenderedFrame,
     RenderWorkerConfig,
     RgbdRenderWorker,
+    PassiveViewerWorker,
+    ViewerWorkerConfig,
+    _SharedWorkerStats,
+    _clear_shared_error,
     _encode_rgb_jpeg,
+    _initialize_worker_identity,
+    _set_shared_error,
     _viewer_worker_main,
 )
 
@@ -39,6 +46,21 @@ MINIMAL_XML = """
       <camera name="head_camera" pos="0.2 0 0.2"/>
     </body>
   </worldbody>
+</mujoco>
+"""
+ACTUATED_XML = """
+<mujoco>
+  <worldbody>
+    <body name="pelvis" pos="0 0 0.8">
+      <freejoint/>
+      <geom type="sphere" size="0.1" mass="1"/>
+      <body name="link" pos="0 0 -0.2">
+        <joint name="hinge" type="hinge" axis="0 1 0"/>
+        <geom type="capsule" size="0.03" fromto="0 0 0 0 0 -0.2" mass="0.1"/>
+      </body>
+    </body>
+  </worldbody>
+  <actuator><motor joint="hinge"/></actuator>
 </mujoco>
 """
 ROOT = Path(__file__).resolve().parents[1]
@@ -102,6 +124,20 @@ def _stubborn_worker(
     stats.ready.value = 1
     while True:
         time.sleep(0.1)
+
+
+def _healthy_viewer_identity_worker(
+    _mailbox,
+    _shape,
+    _config,
+    stop_event,
+    stats,
+) -> None:
+    _initialize_worker_identity(stats)
+    stats.ready.value = 1
+    stats.last_success_at_ns.value = time.time_ns()
+    stats.last_success_sequence.value = 1
+    stop_event.wait(10.0)
 
 
 def _frame(sequence: int, *, captured_at_ns: int, boot: str) -> RenderedFrame:
@@ -262,6 +298,101 @@ def test_parent_physics_monitor_latches_nonfinite_state_without_rendering() -> N
     assert support.state()["fault"] == "MuJoCo physics state contains non-finite values"
 
 
+def test_parent_physics_monitor_catches_warning_after_mj_step_self_heals() -> None:
+    mujoco, model, data = _model_data()
+    support = PlantSupportController()
+    support.finish_startup()
+    monitor = PlantPhysicsMonitor(
+        SimpleNamespace(
+            runtime_scene=SimpleNamespace(
+                bounds_min=(-1.0, -1.0, 0.0),
+                bounds_max=(1.0, 1.0, 2.0),
+            )
+        ),
+        mujoco,
+        model,
+        data,
+        support,
+    )
+    warning_index = int(mujoco.mjtWarning.mjWARN_BADQPOS)
+    warning_before = int(data.warning[warning_index].number)
+    data.qpos[0] = float("nan")
+
+    mujoco.mj_step(model, data)
+
+    assert np.all(np.isfinite(data.qpos))
+    assert np.all(np.isfinite(data.qvel))
+    assert np.all(np.isfinite(data.qacc))
+    assert int(data.warning[warning_index].number) == warning_before + 1
+    with pytest.raises(PlantPhysicsFault, match="BADQPOS warning count increased"):
+        monitor.observe()
+
+
+@pytest.mark.parametrize(
+    "warning_name",
+    ["mjWARN_BADQPOS", "mjWARN_BADQVEL", "mjWARN_BADQACC", "mjWARN_BADCTRL"],
+)
+def test_parent_physics_monitor_baselines_and_detects_every_bad_warning(
+    warning_name: str,
+) -> None:
+    mujoco, model, data = _model_data()
+    warning_index = int(getattr(mujoco.mjtWarning, warning_name))
+    data.warning[warning_index].number = 7
+    support = PlantSupportController()
+    support.finish_startup()
+    monitor = PlantPhysicsMonitor(
+        SimpleNamespace(
+            runtime_scene=SimpleNamespace(
+                bounds_min=(-1.0, -1.0, 0.0),
+                bounds_max=(1.0, 1.0, 2.0),
+            )
+        ),
+        mujoco,
+        model,
+        data,
+        support,
+    )
+    monitor.observe()
+    data.time += 0.004
+    data.warning[warning_index].number = 8
+
+    warning_label = warning_name.removeprefix("mjWARN_")
+    with pytest.raises(
+        PlantPhysicsFault,
+        match=rf"{warning_label} warning count increased \(7 -> 8\)",
+    ):
+        monitor.observe()
+
+
+@pytest.mark.parametrize("field", ["qacc", "ctrl", "actuator_force"])
+def test_parent_physics_monitor_rejects_each_nonfinite_dynamic_array(
+    field: str,
+) -> None:
+    mujoco = pytest.importorskip("mujoco")
+    model = mujoco.MjModel.from_xml_string(ACTUATED_XML)
+    data = mujoco.MjData(model)
+    data.qpos[:7] = (0.0, 0.0, 0.8, 1.0, 0.0, 0.0, 0.0)
+    mujoco.mj_forward(model, data)
+    support = PlantSupportController()
+    support.finish_startup()
+    monitor = PlantPhysicsMonitor(
+        SimpleNamespace(
+            runtime_scene=SimpleNamespace(
+                bounds_min=(-1.0, -1.0, 0.0),
+                bounds_max=(1.0, 1.0, 2.0),
+            )
+        ),
+        mujoco,
+        model,
+        data,
+        support,
+    )
+    getattr(data, field)[0] = float("nan")
+
+    with pytest.raises(PlantPhysicsFault, match="non-finite"):
+        monitor.observe()
+
+
 def test_jpeg_failure_is_an_explicit_worker_error(monkeypatch) -> None:
     cv2 = pytest.importorskip("cv2")
     monkeypatch.setattr(cv2, "imencode", lambda *_args, **_kwargs: (False, None))
@@ -317,6 +448,9 @@ def test_gl_initialization_failure_is_confined_to_worker_process() -> None:
     failed_status = worker.status()
     assert failed_status["status"] == "failed"
     assert failed_status["lastError"]
+    assert failed_status["failureCount"] == 1
+    assert failed_status["workerPid"] == worker._process.pid
+    uuid.UUID(str(failed_status["workerBootId"]))
     assert mailbox.try_publish(
         mujoco, model, data, captured_at_unix_ns=time.time_ns()
     ) == 1
@@ -378,8 +512,55 @@ def test_office_v2_worker_reloads_verified_scene_and_emits_one_atomic_rgbd() -> 
             "totalMs",
             "queueAgeAtStartMs",
         }
+        status = worker.status()
+        assert status["status"] == "running"
+        assert status["workerPid"] == worker._process.pid
+        uuid.UUID(str(status["workerBootId"]))
     finally:
         worker.close(timeout_s=5.0)
+
+
+def test_viewer_status_exposes_child_identity_and_failure_counters() -> None:
+    mujoco, model, _data = _model_data()
+    context = multiprocessing.get_context("spawn")
+    shape = MujocoStateShape.from_model(mujoco, model)
+    worker = PassiveViewerWorker(
+        mailbox=LatestStateMailbox(shape, context=context),
+        shape=shape,
+        config=ViewerWorkerConfig(
+            "missing",
+            "missing",
+            "explicit_process_restart",
+            0.0,
+            0.0,
+        ),
+        context=context,
+        target=_healthy_viewer_identity_worker,
+    )
+    worker.start()
+    try:
+        deadline = time.monotonic() + 5.0
+        while not worker.status()["ready"] and time.monotonic() < deadline:
+            time.sleep(0.01)
+        status = worker.status()
+        assert status["status"] == "running"
+        assert status["workerPid"] == worker._process.pid
+        uuid.UUID(str(status["workerBootId"]))
+        assert status["failureCount"] == 0
+        assert status["lastFailureAtUnixNs"] is None
+    finally:
+        worker.close(timeout_s=1.0)
+
+
+def test_successful_worker_recovery_clears_shared_last_error() -> None:
+    context = multiprocessing.get_context("spawn")
+    stats = _SharedWorkerStats(context)
+    _set_shared_error(stats, "transient JPEG failure")
+    assert stats.last_error.value == b"transient JPEG failure"
+
+    _clear_shared_error(stats)
+
+    assert stats.last_error.value == b""
 
 
 def test_worker_shutdown_is_bounded_and_idempotent() -> None:
@@ -454,9 +635,59 @@ def test_frame_store_retains_only_latest_and_previous_and_uses_source_age() -> N
     assert status == "stale"
     assert age_ms == pytest.approx(500.000001)
 
+    status, age_ms, _worker = store._observation_status(
+        latest,
+        now_ns=latest.captured_at_unix_ns - 1,  # type: ignore[union-attr]
+    )
+    assert status == "failed"
+    assert age_ms == pytest.approx(-0.000001)
+
+
+def test_frame_store_http_reads_do_not_wait_for_commit_and_see_one_window() -> None:
+    support = PlantSupportController()
+    support.finish_startup()
+    store = PlantFrameStore(
+        SimpleNamespace(robot_id="g1", localization_epoch_id="epoch"),
+        support,
+        worker_status_provider=lambda: {"status": "running", "alive": True},
+    )
+    boot = str(uuid.uuid4())
+    captured_at_ns = time.time_ns()
+    first = _frame(1, captured_at_ns=captured_at_ns, boot=boot)
+    second = _frame(2, captured_at_ns=captured_at_ns + 1, boot=boot)
+    store.commit(first)
+    original_window = store._window
+    store._commit_lock.acquire()
+    executor = ThreadPoolExecutor(max_workers=2)
+    try:
+        read_future = executor.submit(
+            lambda: (
+                store._select_frame("")[0],
+                store.state()["sequence"],
+            )
+        )
+        selected, state_sequence = read_future.result(timeout=1.0)
+        assert selected is first
+        assert state_sequence == 1
+
+        commit_future = executor.submit(store.commit, second)
+        assert not commit_future.done()
+    finally:
+        store._commit_lock.release()
+        executor.shutdown(wait=True)
+
+    assert store._window is not original_window
+    assert original_window.latest is first
+    assert original_window.previous is None
+    assert store._window.latest is second
+    assert store._window.previous is first
+
 
 def test_viewer_worker_has_no_physics_step_or_input_callback_authority() -> None:
     source = inspect.getsource(_viewer_worker_main)
     assert "mj_step(" not in source
     assert "key_callback=" not in source
     assert "launch_passive(model, data)" in source
+    assert 'os.environ.pop("MUJOCO_GL", None)' in source
+    assert 'os.environ["MUJOCO_GL"] = config.gl_backend' in source
+    assert "viewer.close()" in source

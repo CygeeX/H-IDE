@@ -137,6 +137,49 @@ def test_offline_acceptance_fixtures(case: dict[str, object]) -> None:
     assert actual_codes.issuperset(case.get("expected_failure_codes", []))
 
 
+@pytest.mark.parametrize(
+    "schema_version",
+    ["h-ide.mujoco-capture/1", "h-ide.mujoco-capture/2"],
+)
+def test_supported_plant_capture_schemas_keep_strict_physical_evaluation(
+    schema_version: str,
+) -> None:
+    evaluator = MotionAcceptanceEvaluator(AcceptanceLimits(phase="idle"))
+    for index, observed_s in enumerate((0.0, 0.2)):
+        plant, sonic = _payloads(
+            {
+                "t": observed_s,
+                "state": "safe_hold",
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.78,
+                "yaw": 0.0,
+            },
+            index,
+        )
+        plant["schemaVersion"] = schema_version
+        evaluator.observe(plant, sonic, observed_s=observed_s)
+
+    assert evaluator.finalize()["pass"] is True
+
+
+def test_unknown_plant_capture_schema_remains_rejected() -> None:
+    plant, sonic = _payloads(
+        {"t": 0.0, "state": "safe_hold", "x": 0.0, "y": 0.0, "z": 0.78, "yaw": 0.0},
+        0,
+    )
+    plant["schemaVersion"] = "h-ide.mujoco-capture/3"
+    evaluator = MotionAcceptanceEvaluator(AcceptanceLimits(phase="idle"))
+
+    evaluator.observe(plant, sonic, observed_s=0.0)
+    result = evaluator.finalize()
+
+    schema_failure = next(
+        failure for failure in result["failures"] if failure["code"] == "SCHEMA_INVALID"
+    )
+    assert "h-ide.mujoco-capture/3" in schema_failure["detail"]
+
+
 def test_nonfinite_source_value_fails_and_can_still_be_recorded_safely() -> None:
     plant, sonic = _payloads(
         {"t": 0.0, "state": "safe_hold", "x": 0.0, "y": 0.0, "z": 0.78, "yaw": 0.0},

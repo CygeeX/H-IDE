@@ -26,6 +26,12 @@ import uuid
 
 
 SCHEMA_VERSION = "h-ide.motion-acceptance-monitor/1"
+SUPPORTED_PLANT_SCHEMA_VERSIONS = frozenset(
+    {
+        "h-ide.mujoco-capture/1",
+        "h-ide.mujoco-capture/2",
+    }
+)
 _RESET_FAULT_MARKERS = (
     "teleport",
     "rolled back",
@@ -426,7 +432,7 @@ class MotionAcceptanceEvaluator:
                 "running Plant sequence and capture time must be positive",
                 observed_s,
             )
-        if plant.get("schemaVersion") != "h-ide.mujoco-capture/1":
+        if plant.get("schemaVersion") not in SUPPORTED_PLANT_SCHEMA_VERSIONS:
             self._fail(
                 "SCHEMA_INVALID",
                 f"unsupported Plant schemaVersion {plant.get('schemaVersion')!r}",

@@ -200,6 +200,7 @@ class ViewerWorkerConfig:
     spawn_x: float
     spawn_y: float
     viewer_period_s: float = 0.02
+    gl_backend: str = "glfw"
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,6 +235,20 @@ def _set_shared_error(stats, message: str) -> str:
     with stats.last_error.get_lock():
         stats.last_error.value = encoded
     return bounded
+
+
+def _clear_shared_error(stats) -> None:
+    with stats.last_error.get_lock():
+        stats.last_error.value = b""
+
+
+def _initialize_worker_identity(stats) -> None:
+    import os
+
+    worker_boot_id = str(uuid.uuid4()).encode("ascii")
+    stats.worker_pid.value = os.getpid()
+    with stats.worker_boot_id.get_lock():
+        stats.worker_boot_id.value = worker_boot_id
 
 
 def configure_head_camera(mujoco_api, model) -> int:
@@ -459,8 +474,10 @@ def _rgbd_worker_main(
     # the only process allowed to create the offscreen Renderer.
     import os
 
+    _initialize_worker_identity(stats)
     os.environ["MUJOCO_GL"] = config.gl_backend
     renderer = None
+    fatal_failure_counted = False
     try:
         mujoco_api, _runtime_scene, model = _load_verified_model(
             config,
@@ -504,6 +521,7 @@ def _rgbd_worker_main(
                     config=config,
                 )
                 consecutive_failures = 0
+                _clear_shared_error(stats)
                 stats.last_success_at_ns.value = frame.rendered_at_unix_ns
                 stats.last_success_sequence.value = frame.sequence
                 _put_latest(result_queue, frame)
@@ -526,6 +544,7 @@ def _rgbd_worker_main(
                     ),
                 )
                 if fatal:
+                    fatal_failure_counted = True
                     raise RuntimeError(
                         "RGB-D worker failed three consecutive frames: "
                         f"{type(exc).__name__}: {exc}"
@@ -533,6 +552,8 @@ def _rgbd_worker_main(
     except BaseException as exc:
         failure_at = time.time_ns()
         stats.fatal.value = 1
+        if not fatal_failure_counted:
+            stats.failure_count.value = int(stats.failure_count.value) + 1
         stats.last_failure_at_ns.value = failure_at
         message = _set_shared_error(
             stats,
@@ -564,7 +585,14 @@ def _viewer_worker_main(
     """Own a passive viewer with no key callback and no authority feedback."""
 
     viewer = None
+    model = None
+    data = None
     try:
+        import os
+
+        _initialize_worker_identity(stats)
+        os.environ.pop("MUJOCO_GL", None)
+        os.environ["MUJOCO_GL"] = config.gl_backend
         mujoco_api, runtime_scene, model = _load_verified_model(
             config,
             expected_shape,
@@ -614,9 +642,13 @@ def _viewer_worker_main(
                 stats.last_success_sequence.value = snapshot.sequence
             viewer.sync(state_only=True)
             stop_event.wait(config.viewer_period_s)
+        if not stop_event.is_set():
+            raise RuntimeError("passive viewer closed unexpectedly")
     except BaseException as exc:
+        failure_at = time.time_ns()
         stats.fatal.value = 1
-        stats.last_failure_at_ns.value = time.time_ns()
+        stats.failure_count.value = int(stats.failure_count.value) + 1
+        stats.last_failure_at_ns.value = failure_at
         _set_shared_error(stats, f"{type(exc).__name__}: {exc}")
     finally:
         if viewer is not None:
@@ -624,6 +656,10 @@ def _viewer_worker_main(
                 viewer.close()
             except Exception:
                 pass
+        # Keep all GL/model/data finalization in the child that created it.
+        viewer = None
+        data = None
+        model = None
 
 
 class _SharedWorkerStats:
@@ -635,6 +671,8 @@ class _SharedWorkerStats:
         self.last_success_at_ns = context.Value("Q", 0, lock=False)
         self.last_success_sequence = context.Value("Q", 0, lock=False)
         self.last_error = context.Array("c", 513, lock=True)
+        self.worker_pid = context.Value("q", 0, lock=False)
+        self.worker_boot_id = context.Array("c", 37, lock=True)
 
 
 class RgbdRenderWorker:
@@ -729,6 +767,8 @@ class RgbdRenderWorker:
                 "utf-8",
                 errors="replace",
             )
+        with self._stats.worker_boot_id.get_lock():
+            worker_boot_id = self._stats.worker_boot_id.value.decode("ascii")
         if fatal or (last_failure_at > last_success_at):
             status = "failed"
         elif last_success_at:
@@ -740,6 +780,8 @@ class RgbdRenderWorker:
             "ready": bool(self._stats.ready.value),
             "alive": alive,
             "exitCode": exitcode,
+            "workerPid": int(self._stats.worker_pid.value) or None,
+            "workerBootId": worker_boot_id or None,
             "lastSuccessSequence": int(self._stats.last_success_sequence.value),
             "lastSuccessAtUnixNs": last_success_at,
             "failureCount": int(self._stats.failure_count.value),
@@ -804,6 +846,8 @@ class PassiveViewerWorker:
                 "utf-8",
                 errors="replace",
             )
+        with self._stats.worker_boot_id.get_lock():
+            worker_boot_id = self._stats.worker_boot_id.value.decode("ascii")
         return {
             "status": (
                 "failed"
@@ -817,7 +861,14 @@ class PassiveViewerWorker:
             "ready": bool(self._stats.ready.value),
             "alive": alive,
             "exitCode": self._process.exitcode,
+            "workerPid": int(self._stats.worker_pid.value) or None,
+            "workerBootId": worker_boot_id or None,
             "lastSuccessSequence": int(self._stats.last_success_sequence.value),
+            "lastSuccessAtUnixNs": int(self._stats.last_success_at_ns.value),
+            "failureCount": int(self._stats.failure_count.value),
+            "lastFailureAtUnixNs": (
+                int(self._stats.last_failure_at_ns.value) or None
+            ),
             "mailboxPublishedCount": self.mailbox.published_count,
             "mailboxDroppedCount": self.mailbox.dropped_count,
             "authorityFeedbackEnabled": False,

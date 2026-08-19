@@ -249,6 +249,26 @@ class MujocoObservationBridge:
         message.angular.y = twist.wy
         message.angular.z = twist.wz
 
+    def _observe_pose_difference(
+        self,
+        capture: CaptureIdentity,
+        position: tuple[float, float, float],
+        quaternion: tuple[float, float, float, float],
+    ) -> None:
+        """Keep diagnostic finite differences inside one producer boot."""
+
+        if (
+            self._last_producer_boot_id is not None
+            and capture.producer_boot_id != self._last_producer_boot_id
+        ):
+            self._pose_difference_diagnostic = PoseDifferenceDiagnostic()
+            self._last_pose_difference = PoseDifferenceResult("initialized")
+        self._last_pose_difference = self._pose_difference_diagnostic.observe(
+            capture.captured_at_unix_ns,
+            position,
+            quaternion,
+        )
+
     def poll(self):
         import requests
 
@@ -325,14 +345,6 @@ class MujocoObservationBridge:
         except ValueError as exc:
             self.node.get_logger().error(str(exc))
             return
-        # Pose differencing is intentionally diagnostic-only.  It can reveal
-        # a producer/frame regression, but never replaces the authoritative
-        # local mj_objectVelocity result in the ROS message.
-        self._last_pose_difference = self._pose_difference_diagnostic.observe(
-            captured_at_ns,
-            (x, y, z),
-            (qw, qx, qy, qz),
-        )
         raw_camera_pose = state.get("cameraPose")
         if not isinstance(raw_camera_pose, dict):
             self.node.get_logger().error("MuJoCo state does not contain cameraPose")
@@ -366,6 +378,14 @@ class MujocoObservationBridge:
         except CaptureContractError as exc:
             self.node.get_logger().warning(f"MuJoCo capture unavailable: {exc}")
             return
+        # Pose differencing is diagnostic-only and starts a new anchor when
+        # the capture producer restarts.  Run it after all admission checks so
+        # a rejected capture cannot contaminate a later accepted generation.
+        self._observe_pose_difference(
+            capture,
+            (x, y, z),
+            (qw, qx, qy, qz),
+        )
         pose = self.PoseWithCovarianceStamped()
         pose.header.stamp, pose.header.frame_id = stamp, "map"
         pose.pose.pose.position.x, pose.pose.pose.position.y, pose.pose.pose.position.z = x, y, z

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+import time
+
 import pytest
 
 from hide_mujoco_sonic.runtime_diagnostics import (
@@ -236,6 +239,53 @@ def test_plant_runtime_diagnostics_attributes_slow_loop_stage():
 
     with pytest.raises(ValueError, match="unknown plant timing stage"):
         diagnostics.observe_stage("jpegMaybe", 0.2, unix_ns=2_000_000_000)
+
+
+def test_plant_authority_publisher_never_waits_for_http_snapshot_reader() -> None:
+    diagnostics = PlantRuntimeDiagnostics(stall_threshold_s=0.1)
+    diagnostics._snapshot_reader_lock.acquire()
+
+    def publish_authority_evidence() -> int:
+        started_ns = time.perf_counter_ns()
+        for index in range(100):
+            at_s = 1.0 + index * 0.004
+            diagnostics.observe_loop_start(at_s, unix_ns=1_000_000_000 + index)
+            diagnostics.observe_stage(
+                "simStep",
+                0.004,
+                unix_ns=1_000_000_000 + index,
+            )
+        return time.perf_counter_ns() - started_ns
+
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        elapsed_ns = executor.submit(publish_authority_evidence).result(timeout=1.0)
+        assert elapsed_ns < 20_000_000
+    finally:
+        diagnostics._snapshot_reader_lock.release()
+        executor.shutdown(wait=True)
+
+    state = diagnostics.snapshot()
+    assert state["simLoopGap"]["lastS"] == pytest.approx(0.004)
+    assert state["stages"]["simStep"]["lastS"] == pytest.approx(0.004)
+
+
+def test_plant_published_diagnostics_are_immutable_across_generations() -> None:
+    diagnostics = PlantRuntimeDiagnostics(stall_threshold_s=0.1)
+    original_generation = diagnostics._published_snapshot
+    diagnostics.observe_stage("snapshotPublish", 0.02, unix_ns=123)
+
+    assert original_generation["stages"]["snapshotPublish"]["lastS"] is None
+    assert diagnostics._published_snapshot is not original_generation
+    caller_copy = diagnostics.snapshot()
+    caller_copy["simLoopGap"]["maxS"] = 999.0
+    caller_copy["stages"]["snapshotPublish"]["maxS"] = 999.0
+
+    unchanged = diagnostics.snapshot()
+    assert unchanged["simLoopGap"]["maxS"] == 0.0
+    assert unchanged["stages"]["snapshotPublish"]["maxS"] == pytest.approx(
+        0.02
+    )
 
 
 @pytest.mark.parametrize("value", [0.0, -1.0, float("nan"), float("inf")])
