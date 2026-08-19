@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from hmac import compare_digest
 from typing import Any, Callable
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 
 from packages.simulation_core import (
     NavigationGoalInput,
@@ -15,32 +14,18 @@ from packages.simulation_core import (
     SimulationRuntime,
     SimulationStepInput,
 )
+from .auth import Scope, require_scope
 
 
 def create_simulation_router(
     runtime: SimulationRuntime,
-    token: str,
+    token: str | None = None,
     *,
     review_resolver: Callable[[str, str | None], Any] | None = None,
 ) -> APIRouter:
+    del token
     router = APIRouter(prefix="/api/v2", tags=["simulation"])
-
-    def require_auth(request: Request) -> None:
-        raw = request.headers.get("authorization")
-        scheme, separator, value = raw.partition(" ") if isinstance(raw, str) else ("", "", "")
-        if not (
-            separator
-            and scheme.casefold() == "bearer"
-            and value
-            and compare_digest(value, token)
-        ):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="authentication required",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-
-    dependencies = [Depends(require_auth)]
+    dependencies = [Depends(require_scope(Scope.SIMULATIONS_MANAGE))]
 
     def invoke(operation):
         try:

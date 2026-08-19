@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from hmac import compare_digest
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import ValidationError
 
 from packages.mission_core import MissionConflict, MissionNotFound
@@ -13,27 +12,16 @@ from packages.mission_core import MissionConflict, MissionNotFound
 from .mission_client import MissionPlanningUnavailable
 from .mission_service import MissionService, MissionServiceError
 from .visual_task_client import VisualTaskUnavailable
+from .auth import Scope, require_scope
 
 
-def create_mission_router(service: MissionService, token: str) -> APIRouter:
+def create_mission_router(service: MissionService, token: str | None = None) -> APIRouter:
+    # ``token`` is retained in the factory signature for embedded callers;
+    # authentication now comes from the app-scoped AuthService so browser
+    # sessions and the explicit legacy developer Bearer identity share policy.
+    del token
     router = APIRouter(prefix="/api/v2", tags=["mission-v2"])
-
-    def require_auth(request: Request) -> None:
-        raw = request.headers.get("authorization")
-        scheme, separator, value = raw.partition(" ") if isinstance(raw, str) else ("", "", "")
-        if not (
-            separator
-            and scheme.casefold() == "bearer"
-            and value
-            and compare_digest(value, token)
-        ):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="authentication required",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-
-    dependencies = [Depends(require_auth)]
+    dependencies = [Depends(require_scope(Scope.MISSIONS_USE))]
 
     def invoke(operation):
         try:

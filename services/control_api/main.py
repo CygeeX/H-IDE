@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
-from hmac import compare_digest
 import math
 import os
 from pathlib import Path
@@ -78,6 +77,16 @@ from packages.simulation_core import (
 from services.robot_agent_gateway import RobotAgentGatewayHttpDriver
 
 from .assistant_service import AssistantNotFound, AssistantService
+from .auth import (
+    AuthService,
+    AuthorizationDenied,
+    Principal,
+    Scope,
+    SESSION_COOKIE,
+    create_auth_router,
+    require_resource_access,
+    require_scope,
+)
 from .planning_client import PlanningClient, planning_client_from_env
 from .mission_client import (
     MissionPlanningClient,
@@ -142,13 +151,6 @@ def _mapping_json(record: MappingRecord) -> dict[str, Any]:
         "targetId": record.target_id,
         "probe": probe,
     }
-
-
-def _parse_bearer(value: str | None, expected: str) -> bool:
-    if not isinstance(value, str):
-        return False
-    scheme, separator, token = value.partition(" ")
-    return bool(separator and scheme.lower() == "bearer" and token and compare_digest(token, expected))
 
 
 def _environment_flag(name: str, *, default: bool = False) -> bool:
@@ -854,6 +856,8 @@ def create_app(
     # silently fall back to an ephemeral in-memory repository.
     resolved_db_path = db_path if db_path is not None else (os.getenv("CONTROL_DB_PATH") or ":memory:")
     store = SQLiteStore(resolved_db_path)
+    auth_service = AuthService(store, legacy_bearer_token=token)
+    auth_service.bootstrap_admin_from_env()
     simulation = simulation_runtime or SimulationRuntime(
         db_path=(
             simulation_db_path
@@ -1173,6 +1177,7 @@ def create_app(
     )
     app.state.control = context
     app.state.store = store
+    app.state.auth = auth_service
     app.state.simulation = simulation
     app.state.runtime = context.runtime
     app.state.registry = context.registry
@@ -1192,6 +1197,7 @@ def create_app(
             os.getenv("VISUAL_MISSION_COMMAND_POLL_SECONDS", "0.25")
         ),
     )
+    app.include_router(create_auth_router(auth_service))
 
     robot_agent_refresh_lock = threading.RLock()
 
@@ -1857,9 +1863,101 @@ def create_app(
     app.router.add_event_handler("shutdown", assistant_service.close)
     app.router.add_event_handler("shutdown", simulation.close)
 
-    def require_auth(request: Request) -> None:
-        if not _parse_bearer(request.headers.get("authorization"), token):
-            raise HTTPException(status_code=401, detail="authentication required", headers={"WWW-Authenticate": "Bearer"})
+    # Scope dependencies are defined once and reused by route decorators. The
+    # static deployment token maps only to a legacy DEVELOPER principal; a
+    # browser-provided role flag never participates in these decisions.
+    require_robots_read = require_scope(Scope.ROBOTS_READ)
+    require_assistant = require_scope(Scope.ASSISTANT_USE)
+    require_speech = require_scope(Scope.SPEECH_USE)
+    require_commands = require_scope(Scope.COMMANDS_MANAGE)
+    require_mappings = require_scope(Scope.MAPPINGS_MANAGE)
+    require_events = require_scope(Scope.EVENTS_READ)
+
+    def bind_principal_resource(
+        principal: Principal,
+        resource_type: str,
+        resource_id: str,
+    ) -> None:
+        if principal.is_legacy:
+            return
+        context.store.bind_resource_owner(
+            resource_type,
+            resource_id,
+            owner_user_id=principal.user_id,
+            site_id=principal.site_id,
+        )
+
+    def assistant_resource_visible(
+        principal: Principal,
+        resource_type: str,
+        resource_id: str,
+    ) -> bool:
+        binding = context.store.get_resource_owner(resource_type, resource_id)
+        try:
+            auth_service.policy.require(
+                principal,
+                Scope.ASSISTANT_USE,
+                owner_user_id=None if binding is None else str(binding["ownerUserId"]),
+                site_id=None if binding is None else str(binding["siteId"]),
+                resource_is_bound=binding is not None,
+            )
+            return True
+        except AuthorizationDenied:
+            return False
+
+    def require_conversation_resource(
+        request: Request,
+        principal: Principal,
+        conversation_id: str,
+    ) -> None:
+        require_resource_access(
+            request,
+            principal,
+            Scope.ASSISTANT_USE,
+            resource_type="assistant_conversation",
+            resource_id=conversation_id,
+        )
+
+    def require_turn_resource(
+        request: Request,
+        principal: Principal,
+        task_id: str,
+    ) -> None:
+        turn = context.store.get_assistant_turn(task_id)
+        if turn is None:
+            raise HTTPException(status_code=404, detail="assistant turn not found")
+        require_conversation_resource(request, principal, str(turn["conversationId"]))
+
+    def require_draft_resource(
+        request: Request,
+        principal: Principal,
+        draft_id: str,
+    ) -> None:
+        metadata = context.store.get_assistant_draft_review(draft_id)
+        if metadata is not None:
+            require_conversation_resource(
+                request,
+                principal,
+                str(metadata["conversationId"]),
+            )
+            return
+        require_resource_access(
+            request,
+            principal,
+            Scope.ASSISTANT_USE,
+            resource_type="assistant_draft",
+            resource_id=draft_id,
+        )
+
+    def require_visual_mission_resource(
+        request: Request,
+        principal: Principal,
+        mission_id: str,
+    ) -> None:
+        mission = context.store.get_visual_mission(mission_id)
+        if mission is None:
+            raise HTTPException(status_code=404, detail="visual mission not found")
+        require_draft_resource(request, principal, str(mission["draftId"]))
 
     def get_context(request: Request) -> _ControlContext:
         return request.app.state.control
@@ -2013,14 +2111,14 @@ def create_app(
             kwargs["expected_probes"] = expected_probes
         context.store.save_mapping_batch(records, active=active, **kwargs)
 
-    @app.get("/api/v1/robots", dependencies=[Depends(require_auth)])
+    @app.get("/api/v1/robots", dependencies=[Depends(require_robots_read)])
     def list_robots(context: _ControlContext = Depends(get_context)):
         refresh_robot_agent_snapshot()
         if simulation_gateway_driver is not None:
             refresh_robot_agent_snapshot(simulation_robot_id)
         return context.store.list_robots()
 
-    @app.get("/api/v1/robots/{robot_id}/capabilities", dependencies=[Depends(require_auth)])
+    @app.get("/api/v1/robots/{robot_id}/capabilities", dependencies=[Depends(require_robots_read)])
     def get_capabilities(robot_id: str, context: _ControlContext = Depends(get_context)):
         refresh_robot_agent_snapshot(robot_id)
         value = context.store.get_capabilities(robot_id)
@@ -2028,26 +2126,45 @@ def create_app(
             raise HTTPException(status_code=404, detail="robot capabilities not found")
         return value
 
-    @app.get("/api/v1/assistant/conversations", dependencies=[Depends(require_auth)])
+    @app.get("/api/v1/assistant/conversations", dependencies=[Depends(require_assistant)])
     def list_assistant_conversations(
+        principal: Principal = Depends(require_assistant),
         service: AssistantService = Depends(get_assistant_service),
     ):
-        return service.list_conversations()
+        return [
+            conversation
+            for conversation in service.list_conversations()
+            if assistant_resource_visible(
+                principal,
+                "assistant_conversation",
+                str(conversation["conversationId"]),
+            )
+        ]
 
     @app.post(
         "/api/v1/assistant/conversations",
-        dependencies=[Depends(require_auth)],
+        dependencies=[Depends(require_assistant)],
         status_code=201,
     )
     def create_assistant_conversation(
         body: dict[str, Any],
+        principal: Principal = Depends(require_assistant),
         service: AssistantService = Depends(get_assistant_service),
     ):
         try:
-            robot_id = body.get("robotId")
+            payload = dict(body)
+            if not principal.is_legacy:
+                payload["requestedBy"] = principal.user_id
+            robot_id = payload.get("robotId")
             if isinstance(robot_id, str):
                 refresh_robot_agent_snapshot(robot_id)
-            return service.create_conversation(body)
+            conversation = service.create_conversation(payload)
+            bind_principal_resource(
+                principal,
+                "assistant_conversation",
+                str(conversation["conversationId"]),
+            )
+            return conversation
         except AssistantNotFound as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
@@ -2055,28 +2172,34 @@ def create_app(
 
     @app.get(
         "/api/v1/assistant/conversations/{conversation_id}",
-        dependencies=[Depends(require_auth)],
+        dependencies=[Depends(require_assistant)],
     )
     def get_assistant_conversation(
         conversation_id: str,
+        request: Request,
+        principal: Principal = Depends(require_assistant),
         service: AssistantService = Depends(get_assistant_service),
     ):
         try:
+            require_conversation_resource(request, principal, conversation_id)
             return service.get_conversation(conversation_id)
         except AssistantNotFound as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post(
         "/api/v1/assistant/conversations/{conversation_id}/messages",
-        dependencies=[Depends(require_auth)],
+        dependencies=[Depends(require_assistant)],
         status_code=202,
     )
     def submit_assistant_message(
         conversation_id: str,
         body: dict[str, Any],
+        request: Request,
+        principal: Principal = Depends(require_assistant),
         service: AssistantService = Depends(get_assistant_service),
     ):
         try:
+            require_conversation_resource(request, principal, conversation_id)
             conversation = service.store.get_assistant_conversation(conversation_id)
             if isinstance(conversation, Mapping) and isinstance(conversation.get("robotId"), str):
                 refresh_robot_agent_snapshot(conversation["robotId"])
@@ -2092,39 +2215,48 @@ def create_app(
         except (ValidationError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    @app.get("/api/v1/assistant/turns/{task_id}", dependencies=[Depends(require_auth)])
+    @app.get("/api/v1/assistant/turns/{task_id}", dependencies=[Depends(require_assistant)])
     def get_assistant_turn(
         task_id: str,
+        request: Request,
+        principal: Principal = Depends(require_assistant),
         service: AssistantService = Depends(get_assistant_service),
     ):
         try:
+            require_turn_resource(request, principal, task_id)
             return service.get_turn(task_id)
         except AssistantNotFound as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post(
         "/api/v1/assistant/turns/{task_id}/cancel",
-        dependencies=[Depends(require_auth)],
+        dependencies=[Depends(require_assistant)],
     )
     def cancel_assistant_turn(
         task_id: str,
+        request: Request,
+        principal: Principal = Depends(require_assistant),
         service: AssistantService = Depends(get_assistant_service),
     ):
         try:
+            require_turn_resource(request, principal, task_id)
             return service.cancel_turn(task_id)
         except AssistantNotFound as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post(
         "/api/v1/assistant/drafts/{draft_id}/reject",
-        dependencies=[Depends(require_auth)],
+        dependencies=[Depends(require_assistant)],
     )
     def reject_assistant_draft(
         draft_id: str,
+        request: Request,
         body: dict[str, Any] | None = None,
+        principal: Principal = Depends(require_assistant),
         service: AssistantService = Depends(get_assistant_service),
     ):
         try:
+            require_draft_resource(request, principal, draft_id)
             return service.reject_draft(draft_id, body or {})
         except AssistantNotFound as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -2135,15 +2267,18 @@ def create_app(
 
     @app.post(
         "/api/v1/assistant/drafts/{draft_id}/revise",
-        dependencies=[Depends(require_auth)],
+        dependencies=[Depends(require_assistant)],
         status_code=202,
     )
     def revise_assistant_draft(
         draft_id: str,
         body: dict[str, Any],
+        request: Request,
+        principal: Principal = Depends(require_assistant),
         service: AssistantService = Depends(get_assistant_service),
     ):
         try:
+            require_draft_resource(request, principal, draft_id)
             return service.revise_draft(draft_id, body)
         except AssistantNotFound as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -2156,7 +2291,7 @@ def create_app(
         except (ValidationError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    @app.post("/api/v1/speech/transcriptions", dependencies=[Depends(require_auth)])
+    @app.post("/api/v1/speech/transcriptions", dependencies=[Depends(require_speech)])
     async def create_speech_transcription(
         request: Request,
         file: UploadFile = File(...),
@@ -2196,7 +2331,7 @@ def create_app(
             filename=filename,
         )
 
-    @app.post("/api/v1/commands", dependencies=[Depends(require_auth)])
+    @app.post("/api/v1/commands", dependencies=[Depends(require_commands)])
     def submit_command(body: dict[str, Any], context: _ControlContext = Depends(get_context)):
         requested_source = body.get("source")
         if requested_source is not None and str(requested_source).lower() != CommandSource.MANUAL.value:
@@ -2266,11 +2401,11 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return _receipt_json(receipt)
 
-    @app.get("/api/v1/commands", dependencies=[Depends(require_auth)])
+    @app.get("/api/v1/commands", dependencies=[Depends(require_commands)])
     def list_commands(context: _ControlContext = Depends(get_context)):
         return context.store.list_commands()
 
-    @app.get("/api/v1/commands/{command_id}", dependencies=[Depends(require_auth)])
+    @app.get("/api/v1/commands/{command_id}", dependencies=[Depends(require_commands)])
     def get_command(command_id: str, context: _ControlContext = Depends(get_context)):
         if command_id in context.runtime._inflight:
             try:
@@ -2286,7 +2421,7 @@ def create_app(
             raise HTTPException(status_code=404, detail="command not found")
         return receipt
 
-    @app.post("/api/v1/commands/{command_id}/cancel", dependencies=[Depends(require_auth)])
+    @app.post("/api/v1/commands/{command_id}/cancel", dependencies=[Depends(require_commands)])
     def cancel_command(command_id: str, context: _ControlContext = Depends(get_context)):
         persisted_record = context.store.get_command_record(command_id)
         if persisted_record is None:
@@ -2319,7 +2454,7 @@ def create_app(
             context.store.save_command(record, receipt)
         return _receipt_json(receipt)
 
-    @app.post("/api/v1/mappings/drafts", dependencies=[Depends(require_auth)])
+    @app.post("/api/v1/mappings/drafts", dependencies=[Depends(require_mappings)])
     def create_mapping_draft(body: dict[str, Any], context: _ControlContext = Depends(get_context)):
         # Parsing is side-effect free; registry insertion and durable save are
         # deliberately enclosed by the same mutation lock as lifecycle
@@ -2358,7 +2493,7 @@ def create_app(
                 context.registry.restore_state(snapshot)
                 raise HTTPException(status_code=503, detail="mapping persistence failed; draft was not committed") from exc
 
-    @app.get("/api/v1/mappings", dependencies=[Depends(require_auth)])
+    @app.get("/api/v1/mappings", dependencies=[Depends(require_mappings)])
     def list_mappings(context: _ControlContext = Depends(get_context)):
         return [
             row
@@ -2367,7 +2502,7 @@ def create_app(
             and row["mapping"].get("transport") in context.adapters
         ]
 
-    @app.get("/api/v1/mappings/active/{command_key}", dependencies=[Depends(require_auth)])
+    @app.get("/api/v1/mappings/active/{command_key}", dependencies=[Depends(require_mappings)])
     def get_active_mapping(command_key: str, context: _ControlContext = Depends(get_context)):
         return _plain(context.mapping(command_key))
 
@@ -2431,11 +2566,11 @@ def create_app(
 
         return route
 
-    app.add_api_route("/api/v1/mappings/{mapping_id}/{version}/validate", lifecycle_action("validate"), methods=["POST"], dependencies=[Depends(require_auth)])
-    app.add_api_route("/api/v1/mappings/{mapping_id}/{version}/probe", lifecycle_action("probe"), methods=["POST"], dependencies=[Depends(require_auth)])
-    app.add_api_route("/api/v1/mappings/{mapping_id}/{version}/activate", lifecycle_action("activate"), methods=["POST"], dependencies=[Depends(require_auth)])
+    app.add_api_route("/api/v1/mappings/{mapping_id}/{version}/validate", lifecycle_action("validate"), methods=["POST"], dependencies=[Depends(require_mappings)])
+    app.add_api_route("/api/v1/mappings/{mapping_id}/{version}/probe", lifecycle_action("probe"), methods=["POST"], dependencies=[Depends(require_mappings)])
+    app.add_api_route("/api/v1/mappings/{mapping_id}/{version}/activate", lifecycle_action("activate"), methods=["POST"], dependencies=[Depends(require_mappings)])
 
-    @app.post("/api/v1/mappings/{command_key}/rollback", dependencies=[Depends(require_auth)])
+    @app.post("/api/v1/mappings/{command_key}/rollback", dependencies=[Depends(require_mappings)])
     def rollback_mapping(command_key: str, body: dict[str, Any] | None = None, context: _ControlContext = Depends(get_context)):
         version = None if not body else body.get("version")
         with mapping_mutation_lock:
@@ -2465,8 +2600,12 @@ def create_app(
                 context.registry.restore_state(snapshot)
                 raise HTTPException(status_code=503, detail="mapping persistence failed; transition was not committed") from exc
 
-    @app.post("/api/v1/assistant/drafts", dependencies=[Depends(require_auth)])
-    def create_assistant_draft(body: dict[str, Any], context: _ControlContext = Depends(get_context)):
+    @app.post("/api/v1/assistant/drafts", dependencies=[Depends(require_assistant)])
+    def create_assistant_draft(
+        body: dict[str, Any],
+        principal: Principal = Depends(require_assistant),
+        context: _ControlContext = Depends(get_context),
+    ):
         draft_id = body.get("draftId", body.get("draft_id")) or body.get("planId", body.get("plan_id")) or _new_id("draft")
         plan_data = dict(body)
         plan_data.pop("draftId", None)
@@ -2479,10 +2618,17 @@ def create_app(
             raise AssertionError("unreachable")
         if not context.store.save_assistant_draft(draft_id, _plain(plan), status="draft"):
             raise HTTPException(status_code=409, detail="assistant draft already exists")
+        bind_principal_resource(principal, "assistant_draft", str(draft_id))
         return {"draftId": draft_id, "status": "draft", "plan": _plain(plan)}
 
-    @app.get("/api/v1/assistant/drafts/{draft_id}", dependencies=[Depends(require_auth)])
-    def get_assistant_draft(draft_id: str, context: _ControlContext = Depends(get_context)):
+    @app.get("/api/v1/assistant/drafts/{draft_id}", dependencies=[Depends(require_assistant)])
+    def get_assistant_draft(
+        draft_id: str,
+        request: Request,
+        principal: Principal = Depends(require_assistant),
+        context: _ControlContext = Depends(get_context),
+    ):
+        require_draft_resource(request, principal, draft_id)
         draft = context.store.get_assistant_draft(draft_id)
         if draft is None:
             raise HTTPException(status_code=404, detail="assistant draft not found")
@@ -2492,8 +2638,15 @@ def create_app(
             draft["revisionOfDraftId"] = metadata["revisionOfDraftId"]
         return draft
 
-    @app.post("/api/v1/assistant/drafts/{draft_id}/confirm", dependencies=[Depends(require_auth)])
-    def confirm_assistant_draft(draft_id: str, body: dict[str, Any] | None = None, context: _ControlContext = Depends(get_context)):
+    @app.post("/api/v1/assistant/drafts/{draft_id}/confirm", dependencies=[Depends(require_assistant)])
+    def confirm_assistant_draft(
+        draft_id: str,
+        request: Request,
+        body: dict[str, Any] | None = None,
+        principal: Principal = Depends(require_assistant),
+        context: _ControlContext = Depends(get_context),
+    ):
+        require_draft_resource(request, principal, draft_id)
         if body and body.get("confirmed") is False:
             raise HTTPException(status_code=400, detail="confirmation is required")
         stored = context.store.get_assistant_draft(draft_id)
@@ -2760,22 +2913,28 @@ def create_app(
             status = "partial" if execution["steps"] else "failed"
             raise terminal_failure(status, f"assistant confirmation failed: {exc}") from exc
 
-    @app.get("/api/v1/visual-missions/{mission_id}", dependencies=[Depends(require_auth)])
+    @app.get("/api/v1/visual-missions/{mission_id}", dependencies=[Depends(require_assistant)])
     def get_visual_mission(
         mission_id: str,
+        request: Request,
+        principal: Principal = Depends(require_assistant),
         runtime: VisualMissionRuntime = Depends(get_visual_runtime),
     ):
+        require_visual_mission_resource(request, principal, mission_id)
         mission = runtime.get(mission_id)
         if mission is None:
             raise HTTPException(status_code=404, detail="visual mission not found")
         return mission
 
-    @app.post("/api/v1/visual-missions/{mission_id}/run", dependencies=[Depends(require_auth)])
+    @app.post("/api/v1/visual-missions/{mission_id}/run", dependencies=[Depends(require_assistant)])
     def run_visual_mission(
         mission_id: str,
+        request: Request,
+        principal: Principal = Depends(require_assistant),
         runtime: VisualMissionRuntime = Depends(get_visual_runtime),
     ):
         try:
+            require_visual_mission_resource(request, principal, mission_id)
             mission = runtime.get(mission_id)
             if mission is None:
                 raise ValueError("visual mission not found")
@@ -2827,40 +2986,49 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    @app.post("/api/v1/visual-missions/{mission_id}/cancel", dependencies=[Depends(require_auth)])
+    @app.post("/api/v1/visual-missions/{mission_id}/cancel", dependencies=[Depends(require_assistant)])
     def cancel_visual_mission(
         mission_id: str,
+        request: Request,
+        principal: Principal = Depends(require_assistant),
         runtime: VisualMissionRuntime = Depends(get_visual_runtime),
     ):
         try:
+            require_visual_mission_resource(request, principal, mission_id)
             return runtime.cancel(mission_id)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post(
         "/api/v1/visual-missions/{mission_id}/candidates/{candidate_id}",
-        dependencies=[Depends(require_auth)],
+        dependencies=[Depends(require_assistant)],
     )
     def select_visual_mission_candidate(
         mission_id: str,
         candidate_id: str,
+        request: Request,
+        principal: Principal = Depends(require_assistant),
         runtime: VisualMissionRuntime = Depends(get_visual_runtime),
     ):
         try:
+            require_visual_mission_resource(request, principal, mission_id)
             return runtime.select_candidate(mission_id, candidate_id)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.get(
         "/api/v1/visual-missions/{mission_id}/evidence/{sha256}",
-        dependencies=[Depends(require_auth)],
+        dependencies=[Depends(require_assistant)],
         response_class=Response,
     )
     def get_visual_mission_evidence(
         mission_id: str,
         sha256: str,
+        request: Request,
+        principal: Principal = Depends(require_assistant),
         runtime: VisualMissionRuntime = Depends(get_visual_runtime),
     ) -> Response:
+        require_visual_mission_resource(request, principal, mission_id)
         mission = runtime.get(mission_id)
         if mission is None:
             raise HTTPException(status_code=404, detail="visual mission not found")
@@ -2888,19 +3056,29 @@ def create_app(
 
     # Singular aliases keep clients that model a single assistant draft or
     # mapping draft compatible without duplicating execution logic.
-    app.add_api_route("/api/v1/mappings", create_mapping_draft, methods=["POST"], dependencies=[Depends(require_auth)], include_in_schema=False)
-    app.add_api_route("/api/v1/assistant/draft", create_assistant_draft, methods=["POST"], dependencies=[Depends(require_auth)], include_in_schema=False)
-    app.add_api_route("/api/v1/assistant/draft/{draft_id}", get_assistant_draft, methods=["GET"], dependencies=[Depends(require_auth)], include_in_schema=False)
-    app.add_api_route("/api/v1/assistant/draft/{draft_id}/confirm", confirm_assistant_draft, methods=["POST"], dependencies=[Depends(require_auth)], include_in_schema=False)
+    app.add_api_route("/api/v1/mappings", create_mapping_draft, methods=["POST"], dependencies=[Depends(require_mappings)], include_in_schema=False)
+    app.add_api_route("/api/v1/assistant/draft", create_assistant_draft, methods=["POST"], dependencies=[Depends(require_assistant)], include_in_schema=False)
+    app.add_api_route("/api/v1/assistant/draft/{draft_id}", get_assistant_draft, methods=["GET"], dependencies=[Depends(require_assistant)], include_in_schema=False)
+    app.add_api_route("/api/v1/assistant/draft/{draft_id}/confirm", confirm_assistant_draft, methods=["POST"], dependencies=[Depends(require_assistant)], include_in_schema=False)
 
-    @app.get("/api/v1/events", dependencies=[Depends(require_auth)])
+    @app.get("/api/v1/events", dependencies=[Depends(require_events)])
     def list_events(after: int = 0, context: _ControlContext = Depends(get_context)):
         return context.store.list_events(after_id=after)
 
     @app.websocket("/api/v1/events")
     async def events_websocket(websocket: WebSocket):
         query_token = websocket.query_params.get("token")
-        if not (_parse_bearer(websocket.headers.get("authorization"), token) or (query_token is not None and compare_digest(query_token, token))):
+        try:
+            principal = auth_service.authenticate_websocket(
+                authorization=websocket.headers.get("authorization"),
+                session_token=websocket.cookies.get(SESSION_COOKIE),
+                # Query credentials remain supported only for the legacy
+                # developer token. Browser session secrets are never accepted
+                # in URLs where logs and referrers can capture them.
+                legacy_query_token=query_token,
+            )
+            auth_service.policy.require(principal, Scope.EVENTS_READ)
+        except AuthorizationDenied:
             await websocket.close(code=4401)
             return
         await websocket.accept()

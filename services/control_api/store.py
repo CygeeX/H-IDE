@@ -367,7 +367,143 @@ class SQLiteStore:
                 "ON assistant_turns(conversation_id) WHERE status IN ('queued', 'running')"
             )
             self._backfill_mapping_pointers()
+            self._apply_schema_migrations()
             self._connection.commit()
+
+    def _apply_schema_migrations(self) -> None:
+        """Apply explicit, expand-only schema migrations.
+
+        The original control-plane schema predates a migration ledger and is
+        still created above with ``CREATE TABLE IF NOT EXISTS`` for backwards
+        compatibility.  Assistant V2 additions are deliberately kept in
+        numbered transactions: an existing database is never rebuilt and a
+        partially-applied migration cannot be recorded as successful.
+        """
+
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                applied_at TEXT NOT NULL
+            )
+            """
+        )
+        migrations: tuple[tuple[int, str, tuple[str, ...]], ...] = (
+            (
+                1,
+                "assistant_v2_auth_rbac",
+                (
+                    """
+                    CREATE TABLE IF NOT EXISTS users (
+                        user_id TEXT PRIMARY KEY,
+                        username TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                        display_name TEXT NOT NULL,
+                        password_hash TEXT NOT NULL,
+                        role TEXT NOT NULL CHECK(role IN ('USER', 'DEVELOPER', 'ADMIN')),
+                        site_id TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'active'
+                            CHECK(status IN ('active', 'disabled')),
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                    """,
+                    """
+                    CREATE TABLE IF NOT EXISTS sessions (
+                        session_id TEXT PRIMARY KEY,
+                        user_id TEXT NOT NULL,
+                        token_hash TEXT NOT NULL UNIQUE,
+                        csrf_token_hash TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        expires_at TEXT NOT NULL,
+                        last_seen_at TEXT NOT NULL,
+                        revoked_at TEXT,
+                        user_agent_hash TEXT,
+                        FOREIGN KEY(user_id) REFERENCES users(user_id)
+                    )
+                    """,
+                    """
+                    CREATE TABLE IF NOT EXISTS login_audits (
+                        login_audit_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id TEXT,
+                        username TEXT NOT NULL,
+                        outcome TEXT NOT NULL,
+                        remote_address TEXT,
+                        user_agent_hash TEXT,
+                        detail_json TEXT NOT NULL DEFAULT '{}',
+                        occurred_at TEXT NOT NULL,
+                        FOREIGN KEY(user_id) REFERENCES users(user_id)
+                    )
+                    """,
+                    """
+                    CREATE TABLE IF NOT EXISTS resource_acl (
+                        resource_type TEXT NOT NULL,
+                        resource_id TEXT NOT NULL,
+                        owner_user_id TEXT NOT NULL,
+                        site_id TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        PRIMARY KEY(resource_type, resource_id),
+                        FOREIGN KEY(owner_user_id) REFERENCES users(user_id)
+                    )
+                    """,
+                    """
+                    CREATE INDEX IF NOT EXISTS users_site_role_idx
+                        ON users(site_id, role, status)
+                    """,
+                    """
+                    CREATE INDEX IF NOT EXISTS sessions_user_active_idx
+                        ON sessions(user_id, expires_at, revoked_at)
+                    """,
+                    """
+                    CREATE INDEX IF NOT EXISTS login_audits_user_time_idx
+                        ON login_audits(user_id, occurred_at)
+                    """,
+                    """
+                    CREATE INDEX IF NOT EXISTS login_audits_username_time_idx
+                        ON login_audits(username, occurred_at)
+                    """,
+                    """
+                    CREATE INDEX IF NOT EXISTS resource_acl_owner_idx
+                        ON resource_acl(owner_user_id, resource_type, updated_at)
+                    """,
+                    """
+                    CREATE INDEX IF NOT EXISTS resource_acl_site_idx
+                        ON resource_acl(site_id, resource_type, updated_at)
+                    """,
+                ),
+            ),
+        )
+        for version, name, statements in migrations:
+            applied = self._connection.execute(
+                "SELECT name FROM schema_migrations WHERE version = ?",
+                (version,),
+            ).fetchone()
+            if applied is not None:
+                if str(applied["name"]) != name:
+                    raise RuntimeError(
+                        f"schema migration {version} name mismatch: "
+                        f"stored={applied['name']!r}, expected={name!r}"
+                    )
+                continue
+            # _initialize is serialized and the surrounding connection has no
+            # pending write at this point.  A SAVEPOINT keeps DDL and the
+            # ledger row atomic without committing unrelated initialization.
+            savepoint = f"schema_migration_{version}"
+            self._connection.execute(f"SAVEPOINT {savepoint}")
+            try:
+                for statement in statements:
+                    self._connection.execute(statement)
+                self._connection.execute(
+                    "INSERT INTO schema_migrations(version, name, applied_at) "
+                    "VALUES (?, ?, ?)",
+                    (version, name, self._now()),
+                )
+                self._connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+            except Exception:
+                self._connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                self._connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+                raise
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
         columns = {
@@ -1007,6 +1143,315 @@ class SQLiteStore:
             payload.setdefault("createdAt", row["created_at"])
             result.append(payload)
         return result
+
+    def schema_migrations(self) -> list[dict[str, Any]]:
+        """Return the durable migration ledger for diagnostics and tests."""
+
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT version, name, applied_at FROM schema_migrations ORDER BY version"
+            ).fetchall()
+        return [
+            {
+                "version": int(row["version"]),
+                "name": str(row["name"]),
+                "appliedAt": str(row["applied_at"]),
+            }
+            for row in rows
+        ]
+
+    @staticmethod
+    def _user_record(row: sqlite3.Row, *, include_password: bool = False) -> dict[str, Any]:
+        value = {
+            "userId": str(row["user_id"]),
+            "username": str(row["username"]),
+            "displayName": str(row["display_name"]),
+            "role": str(row["role"]),
+            "siteId": str(row["site_id"]),
+            "status": str(row["status"]),
+            "createdAt": str(row["created_at"]),
+            "updatedAt": str(row["updated_at"]),
+        }
+        if include_password:
+            value["passwordHash"] = str(row["password_hash"])
+        return value
+
+    def create_user(
+        self,
+        *,
+        user_id: str,
+        username: str,
+        display_name: str,
+        password_hash: str,
+        role: str,
+        site_id: str,
+    ) -> dict[str, Any]:
+        now = self._now()
+        with self._lock:
+            try:
+                self._connection.execute(
+                    "INSERT INTO users(user_id, username, display_name, password_hash, role, "
+                    "site_id, status, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)",
+                    (
+                        user_id,
+                        username,
+                        display_name,
+                        password_hash,
+                        role,
+                        site_id,
+                        now,
+                        now,
+                    ),
+                )
+                self._connection.commit()
+            except sqlite3.IntegrityError as exc:
+                self._connection.rollback()
+                raise ValueError("username is already registered") from exc
+        created = self.get_user(user_id)
+        if created is None:
+            raise RuntimeError("created user disappeared")
+        return created
+
+    def get_user(self, user_id: str, *, include_password: bool = False) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM users WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+        return None if row is None else self._user_record(row, include_password=include_password)
+
+    def get_user_by_username(
+        self,
+        username: str,
+        *,
+        include_password: bool = False,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM users WHERE username = ? COLLATE NOCASE",
+                (username,),
+            ).fetchone()
+        return None if row is None else self._user_record(row, include_password=include_password)
+
+    def list_users(self, *, limit: int = 200) -> list[dict[str, Any]]:
+        bounded = max(1, min(int(limit), 1_000))
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM users ORDER BY username COLLATE NOCASE LIMIT ?",
+                (bounded,),
+            ).fetchall()
+        return [self._user_record(row) for row in rows]
+
+    def count_users(self) -> int:
+        with self._lock:
+            row = self._connection.execute("SELECT COUNT(*) AS count FROM users").fetchone()
+        return int(row["count"])
+
+    def update_user_access(
+        self,
+        user_id: str,
+        *,
+        role: str | None = None,
+        status: str | None = None,
+        site_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        assignments: list[str] = []
+        values: list[Any] = []
+        if role is not None:
+            assignments.append("role = ?")
+            values.append(role)
+        if status is not None:
+            assignments.append("status = ?")
+            values.append(status)
+        if site_id is not None:
+            assignments.append("site_id = ?")
+            values.append(site_id)
+        if not assignments:
+            return self.get_user(user_id)
+        assignments.append("updated_at = ?")
+        values.append(self._now())
+        values.append(user_id)
+        with self._lock:
+            cursor = self._connection.execute(
+                f"UPDATE users SET {', '.join(assignments)} WHERE user_id = ?",
+                values,
+            )
+            self._connection.commit()
+        return None if cursor.rowcount != 1 else self.get_user(user_id)
+
+    def create_session(
+        self,
+        *,
+        session_id: str,
+        user_id: str,
+        token_hash: str,
+        csrf_token_hash: str,
+        expires_at: str,
+        user_agent_hash: str | None,
+    ) -> None:
+        now = self._now()
+        with self._lock:
+            self._connection.execute(
+                "INSERT INTO sessions(session_id, user_id, token_hash, csrf_token_hash, "
+                "created_at, expires_at, last_seen_at, revoked_at, user_agent_hash) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)",
+                (
+                    session_id,
+                    user_id,
+                    token_hash,
+                    csrf_token_hash,
+                    now,
+                    expires_at,
+                    now,
+                    user_agent_hash,
+                ),
+            )
+            self._connection.commit()
+
+    def get_session_by_token_hash(self, token_hash: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT s.*, u.username, u.display_name, u.role, u.site_id, u.status "
+                "FROM sessions AS s JOIN users AS u ON u.user_id = s.user_id "
+                "WHERE s.token_hash = ?",
+                (token_hash,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "sessionId": str(row["session_id"]),
+            "userId": str(row["user_id"]),
+            "tokenHash": str(row["token_hash"]),
+            "csrfTokenHash": str(row["csrf_token_hash"]),
+            "createdAt": str(row["created_at"]),
+            "expiresAt": str(row["expires_at"]),
+            "lastSeenAt": str(row["last_seen_at"]),
+            "revokedAt": row["revoked_at"],
+            "userAgentHash": row["user_agent_hash"],
+            "username": str(row["username"]),
+            "displayName": str(row["display_name"]),
+            "role": str(row["role"]),
+            "siteId": str(row["site_id"]),
+            "userStatus": str(row["status"]),
+        }
+
+    def touch_session(self, session_id: str, *, observed_at: str | None = None) -> None:
+        with self._lock:
+            self._connection.execute(
+                "UPDATE sessions SET last_seen_at = ? WHERE session_id = ? AND revoked_at IS NULL",
+                (observed_at or self._now(), session_id),
+            )
+            self._connection.commit()
+
+    def revoke_session(self, session_id: str) -> bool:
+        with self._lock:
+            cursor = self._connection.execute(
+                "UPDATE sessions SET revoked_at = COALESCE(revoked_at, ?) WHERE session_id = ?",
+                (self._now(), session_id),
+            )
+            self._connection.commit()
+        return cursor.rowcount == 1
+
+    def record_login_audit(
+        self,
+        *,
+        username: str,
+        outcome: str,
+        user_id: str | None = None,
+        remote_address: str | None = None,
+        user_agent_hash: str | None = None,
+        detail: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        occurred_at = self._now()
+        with self._lock:
+            cursor = self._connection.execute(
+                "INSERT INTO login_audits(user_id, username, outcome, remote_address, "
+                "user_agent_hash, detail_json, occurred_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    user_id,
+                    username,
+                    outcome,
+                    remote_address,
+                    user_agent_hash,
+                    _encode(dict(detail or {})),
+                    occurred_at,
+                ),
+            )
+            self._connection.commit()
+            audit_id = int(cursor.lastrowid)
+        return {
+            "loginAuditId": audit_id,
+            "userId": user_id,
+            "username": username,
+            "outcome": outcome,
+            "occurredAt": occurred_at,
+        }
+
+    def list_login_audits(self, *, limit: int = 200) -> list[dict[str, Any]]:
+        bounded = max(1, min(int(limit), 1_000))
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM login_audits ORDER BY login_audit_id DESC LIMIT ?",
+                (bounded,),
+            ).fetchall()
+        return [
+            {
+                "loginAuditId": int(row["login_audit_id"]),
+                "userId": row["user_id"],
+                "username": str(row["username"]),
+                "outcome": str(row["outcome"]),
+                "remoteAddress": row["remote_address"],
+                "userAgentHash": row["user_agent_hash"],
+                "detail": _decode(row["detail_json"]),
+                "occurredAt": str(row["occurred_at"]),
+            }
+            for row in rows
+        ]
+
+    def bind_resource_owner(
+        self,
+        resource_type: str,
+        resource_id: str,
+        *,
+        owner_user_id: str,
+        site_id: str,
+    ) -> dict[str, Any]:
+        now = self._now()
+        with self._lock:
+            self._connection.execute(
+                "INSERT INTO resource_acl(resource_type, resource_id, owner_user_id, site_id, "
+                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(resource_type, resource_id) DO UPDATE SET "
+                "owner_user_id=excluded.owner_user_id, site_id=excluded.site_id, "
+                "updated_at=excluded.updated_at",
+                (resource_type, resource_id, owner_user_id, site_id, now, now),
+            )
+            self._connection.commit()
+        return {
+            "resourceType": resource_type,
+            "resourceId": resource_id,
+            "ownerUserId": owner_user_id,
+            "siteId": site_id,
+            "updatedAt": now,
+        }
+
+    def get_resource_owner(self, resource_type: str, resource_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM resource_acl WHERE resource_type = ? AND resource_id = ?",
+                (resource_type, resource_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "resourceType": str(row["resource_type"]),
+            "resourceId": str(row["resource_id"]),
+            "ownerUserId": str(row["owner_user_id"]),
+            "siteId": str(row["site_id"]),
+            "createdAt": str(row["created_at"]),
+            "updatedAt": str(row["updated_at"]),
+        }
 
     def create_assistant_conversation(
         self,
