@@ -27,6 +27,8 @@
 .diag-hero { position: relative; overflow: hidden; padding: clamp(18px, 3vw, 28px); display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: 18px; border: 1px solid var(--diag-line); border-radius: 18px; background: linear-gradient(135deg, #fffdf9, #f5eef7); box-shadow: 0 15px 45px rgba(78, 56, 91, .07); }
 .diag-hero::after { content: ""; position: absolute; width: 230px; height: 230px; top: -150px; right: 12%; border-radius: 50%; background: rgba(171, 141, 192, .12); pointer-events: none; }
 .diag-hero.degraded { border-color: #e6c5ca; background: linear-gradient(135deg, #fffdf9, #fff2f3); }
+.diag-hero.standby { border-color: #e4cfaa; background: linear-gradient(135deg, #fffdf9, #fff7e9); }
+.diag-hero.active { border-color: #bfd9ca; background: linear-gradient(135deg, #fffdf9, #edf7f1); }
 .diag-kicker, .diag-component-card header span, .diag-detail-grid header span { color: #9177a4; font-size: 8px; font-weight: 800; letter-spacing: .11em; }
 .diag-hero h2 { margin: 7px 0 7px; font-size: clamp(22px, 3vw, 32px); font-weight: 650; letter-spacing: -.035em; }
 .diag-hero > div > p { margin: 0; color: var(--diag-muted); font-size: 11px; }
@@ -34,8 +36,13 @@
 .diag-overall { height: 34px; padding: 0 12px; display: inline-flex; align-items: center; gap: 7px; border-radius: 8px; font-size: 10px; font-weight: 800; letter-spacing: .06em; }
 .diag-overall i, .diag-badge i { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
 .diag-overall.ready { color: var(--diag-green); background: var(--diag-green-soft); }
+.diag-overall.active { color: var(--diag-green); background: var(--diag-green-soft); }
+.diag-overall.standby { color: var(--diag-amber); background: var(--diag-amber-soft); }
 .diag-overall.degraded { color: var(--diag-red); background: var(--diag-red-soft); }
 .diag-readiness-contract { grid-column: 1 / -1; margin: 2px 0 0 !important; padding: 10px 12px; border: 1px solid #e6d8c0; border-radius: 9px; color: #765728 !important; background: #fff8eb; line-height: 1.55; }
+.diag-hold-reason, .diag-summary-fault { grid-column: 1 / -1; margin: 0 !important; padding: 9px 11px; display: flex; gap: 8px; border-radius: 9px; font-size: 9px !important; overflow-wrap: anywhere; }
+.diag-hold-reason { color: var(--diag-amber) !important; border: 1px solid #e4cfaa; background: var(--diag-amber-soft); }
+.diag-summary-fault { color: var(--diag-red) !important; border: 1px solid #e9c1c7; background: var(--diag-red-soft); }
 .diag-stale-warning { padding: 10px 12px; display: flex; gap: 8px; border: 1px solid #e9c1c7; border-radius: 9px; color: var(--diag-red); background: var(--diag-red-soft); font-size: 10px; }
 
 .diag-context-bar { min-width: 0; padding: 10px 12px; display: flex; flex-wrap: wrap; gap: 8px; border: 1px solid var(--diag-line); border-radius: 12px; background: var(--diag-card); }
@@ -47,6 +54,7 @@
 .diag-chain { padding: 10px; display: flex; align-items: center; gap: 7px; overflow-x: auto; border: 1px solid var(--diag-line); border-radius: 12px; background: rgba(255, 253, 249, .72); scrollbar-width: thin; }
 .diag-chain > span { min-height: 29px; padding: 0 10px; display: inline-flex; align-items: center; flex: 0 0 auto; border: 1px solid; border-radius: 7px; font-size: 9px; font-weight: 700; }
 .diag-chain > span.ready { color: var(--diag-green); border-color: #c9dfd2; background: var(--diag-green-soft); }
+.diag-chain > span.standby { color: var(--diag-amber); border-color: #e4cfaa; background: var(--diag-amber-soft); }
 .diag-chain > span.failed { color: var(--diag-red); border-color: #ebc7cc; background: var(--diag-red-soft); }
 .diag-chain > i { color: #aa9caf; font-size: 12px; font-style: normal; }
 
@@ -54,10 +62,12 @@
 .diag-component-card { min-width: 0; padding: 14px; border: 1px solid var(--diag-line); border-radius: 14px; background: var(--diag-card); box-shadow: 0 8px 26px rgba(76, 55, 87, .045); }
 .diag-component-card.tone-failed { border-color: #e6b7be; box-shadow: 0 8px 28px rgba(150, 56, 69, .08); }
 .diag-component-card.tone-degraded { border-color: #e4cfaa; }
+.diag-component-card.tone-standby { border-color: #e4cfaa; box-shadow: 0 8px 28px rgba(138, 100, 43, .06); }
 .diag-component-card > header, .diag-detail-grid section > header, .diag-evidence > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
 .diag-component-card h3, .diag-detail-grid h3 { margin: 4px 0 0; color: var(--diag-ink); font-size: 14px; }
 .diag-badge { min-height: 23px; padding: 0 7px; display: inline-flex; align-items: center; gap: 5px; flex: 0 0 auto; border-radius: 6px; font-size: 8px; font-weight: 750; letter-spacing: 0; }
 .diag-badge.ready { color: var(--diag-green); background: var(--diag-green-soft); }
+.diag-badge.standby { color: var(--diag-amber); background: var(--diag-amber-soft); }
 .diag-badge.degraded { color: var(--diag-amber); background: var(--diag-amber-soft); }
 .diag-badge.failed { color: var(--diag-red); background: var(--diag-red-soft); }
 .diag-badge.unknown { color: #7c7082; background: #f0eaef; }

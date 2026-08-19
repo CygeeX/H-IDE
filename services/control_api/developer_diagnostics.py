@@ -68,6 +68,35 @@ def _mapping(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
 
+def _finite_number_field(value: Mapping[str, Any], key: str) -> float | None:
+    """Read a required finite diagnostic number without display rounding."""
+
+    if key not in value or isinstance(value[key], bool):
+        return None
+    try:
+        number = float(value[key])
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _integer_field(value: Mapping[str, Any], key: str) -> int | None:
+    raw = value.get(key)
+    return raw if isinstance(raw, int) and not isinstance(raw, bool) else None
+
+
+def _nullable_text_field(value: Mapping[str, Any], key: str) -> tuple[bool, str | None]:
+    """Distinguish an explicit JSON null from an absent or invalid field."""
+
+    if key not in value:
+        return False, None
+    raw = value[key]
+    if raw is None:
+        return True, None
+    projected = _text(raw)
+    return projected is not None, projected
+
+
 @dataclass(frozen=True, slots=True)
 class ProbeResult:
     status_code: int | None
@@ -293,7 +322,8 @@ class DeveloperDiagnosticsService:
             not robot_payload
             or _text(robot_payload.get("robotId"), fallback=selected_robot_id) == selected_robot_id
         )
-        robot_ready = bool(_boolean(robot_payload.get("ready")) and robot_identity_matches)
+        robot_ready_value = _boolean(robot_payload.get("ready"))
+        robot_ready = bool(robot_ready_value and robot_identity_matches)
         checks = _mapping(robot_payload.get("checks"))
         transport = _mapping(checks.get("transportSession"))
         control = _mapping(checks.get("control"))
@@ -302,9 +332,21 @@ class DeveloperDiagnosticsService:
         observation = _mapping(checks.get("observation"))
         ros_executor = _mapping(checks.get("rosExecutor"))
         command_readiness = _mapping(robot_payload.get("commandReadiness"))
+        robot_control_state = _mapping(robot_payload.get("controlState"))
+        safe_stop = _mapping(checks.get("safeStop"))
+        robot_state = _text(robot_control_state.get("state"))
+        robot_active = _boolean(robot_control_state.get("active"))
+        robot_standby = _boolean(robot_control_state.get("standby"))
+        robot_can_acquire = _boolean(robot_control_state.get("canAcquire"))
+        robot_authority_revoked = _boolean(robot_control_state.get("authorityRevoked"))
+        robot_safe_stop_state = _text(robot_control_state.get("safeStopState"))
+        robot_safe_stop_epoch = _integer_field(robot_control_state, "safeStopEpoch")
+        robot_lease_valid = _boolean(robot_control_state.get("leaseValid"))
+        robot_active_command_count = _integer_field(robot_control_state, "activeCommandCount")
         gateway_robot = _mapping(gateway_health.payload.get("robotAgent"))
         gateway_alive = gateway_health.responded and (gateway_health.status_code or 500) < 500
-        gateway_connected = bool(_boolean(gateway_robot.get("connected")))
+        gateway_connected_value = _boolean(gateway_robot.get("connected"))
+        gateway_connected = bool(gateway_connected_value)
         gateway_identity_matches = (
             not gateway_robot
             or _text(gateway_robot.get("robotId"), fallback=selected_robot_id) == selected_robot_id
@@ -327,21 +369,52 @@ class DeveloperDiagnosticsService:
         rgb = _mapping(plant_payload.get("rgb"))
         depth = _mapping(plant_payload.get("depth"))
         plant_support = _mapping(plant_payload.get("support"))
-        plant_safety_stop_latched = bool(_boolean(plant_support.get("safetyStopLatched")))
-        plant_fault = _text(plant_support.get("fault"))
+        plant_safety_stop_latched_value = _boolean(plant_support.get("safetyStopLatched"))
+        plant_safety_stop_latched = bool(plant_safety_stop_latched_value)
+        plant_fault_known, plant_fault = _nullable_text_field(plant_support, "fault")
         plant_alive = plant.responded and (plant.status_code or 500) < 500
-        plant_ready = bool(
-            plant_alive
-            and _text(plant_payload.get("status")) == "running"
-            and (plant_sequence or 0) > 0
-            and not plant_safety_stop_latched
-            and not plant_fault
+        plant_status = _text(plant_payload.get("status"))
+        plant_support_mode = _text(plant_support.get("mode"))
+        sonic_status = _text(sonic.payload.get("status"))
+        sonic_motion_ready_value = _boolean(sonic.payload.get("motion_ready"))
+        sonic_motion_ready = bool(sonic_motion_ready_value)
+        sonic_last_error_known, sonic_last_error = _nullable_text_field(
+            sonic.payload, "last_error"
         )
-        sonic_status = _text(sonic.payload.get("status"), fallback="unavailable")
-        sonic_motion_ready = bool(_boolean(sonic.payload.get("motion_ready")))
-        sonic_fault = _text(sonic.payload.get("last_error"))
         sonic_alive = sonic.responded and (sonic.status_code or 500) < 500
-        sonic_ready = bool(sonic_alive and sonic_status == "running" and sonic_motion_ready and not sonic_fault)
+        sonic_mode = _text(sonic.payload.get("sonic_mode"))
+        sonic_nav2_state = _text(sonic.payload.get("nav2_state"))
+        sonic_control_clock = _text(sonic.payload.get("control_clock_status"))
+        sonic_static_hold = _boolean(sonic.payload.get("static_hold_active"))
+        sonic_navigation_task_active = _boolean(sonic.payload.get("navigation_task_active"))
+        sonic_stop_pending = _boolean(sonic.payload.get("plant_support_stop_pending"))
+        sonic_support_mode = _text(sonic.payload.get("plant_support_mode"))
+        sonic_support_latched = _boolean(sonic.payload.get("plant_support_safety_latched"))
+        sonic_cmd = tuple(
+            _finite_number_field(sonic.payload, field)
+            for field in ("last_cmd_vx", "last_cmd_vy", "last_cmd_wz")
+        )
+        sonic_command_zero = (
+            None
+            if any(value is None for value in sonic_cmd)
+            else all(abs(value or 0.0) <= 1e-9 for value in sonic_cmd)
+        )
+        raw_trace_count = sonic.payload.get("fault_trace_sample_count")
+        sonic_trace_count = (
+            raw_trace_count
+            if isinstance(raw_trace_count, int)
+            and not isinstance(raw_trace_count, bool)
+            and raw_trace_count >= 0
+            else None
+        )
+        sonic_trace_path_known, sonic_trace_path = _nullable_text_field(
+            sonic.payload, "fault_trace_path"
+        )
+        sonic_trace_present = (
+            None
+            if sonic_trace_count is None or not sonic_trace_path_known
+            else bool(sonic_trace_count > 0 or sonic_trace_path)
+        )
 
         # The configured diagnostic target belongs to exactly one workstation
         # site. Even an administrator or legacy bearer receives visual
@@ -364,30 +437,319 @@ class DeveloperDiagnosticsService:
                 "evidenceCount": _integer(raw_latest_visual.get("evidenceCount")) or 0,
                 "evidenceKinds": evidence_kinds,
             }
-        required_ready = [
-            agent_ready_value,
-            vision_ready,
-            gateway_ready,
-            robot_ready,
-            bool(_boolean(nav2.get("ready"))),
-            sonic_ready,
-            plant_ready,
+        # Readiness and authorization are independent. A confirmed SAFE_HOLD is
+        # a healthy, deliberately unauthorized state, not a physical fault. It
+        # is accepted only when every layer reports the same stop boundary.
+        nav2_ready_value = _boolean(nav2.get("ready"))
+        command_ready_value = _boolean(command_readiness.get("ready"))
+        control_ready_value = _boolean(control.get("ready"))
+        safe_stop_ready_value = _boolean(safe_stop.get("ready"))
+        safe_stop_authority_revoked = _boolean(safe_stop.get("authorityRevoked"))
+        safe_stop_state = _text(safe_stop.get("state"))
+        safe_stop_epoch = _integer_field(safe_stop, "epoch")
+        control_active_command_count = _integer_field(control, "activeCommandCount")
+
+        safe_stop_consistent = bool(
+            safe_stop_ready_value is True
+            and safe_stop_authority_revoked is robot_authority_revoked
+            and safe_stop_state == robot_safe_stop_state
+            and safe_stop_epoch is not None
+            and safe_stop_epoch == robot_safe_stop_epoch
+        )
+        robot_standby_exact = bool(
+            robot_ready
+            and command_ready_value is True
+            and _text(command_readiness.get("mode")) == "STANDBY"
+            and control_ready_value is True
+            and _text(control.get("state")) == "SAFE_HOLD"
+            and _text(control.get("mode")) == "STANDBY"
+            and control_active_command_count == 0
+            and robot_state == "SAFE_HOLD"
+            and robot_active is False
+            and robot_standby is True
+            and robot_can_acquire is True
+            and robot_authority_revoked is True
+            and robot_safe_stop_state == "confirmed"
+            and robot_safe_stop_epoch is not None
+            and robot_safe_stop_epoch >= 0
+            and robot_lease_valid is False
+            and robot_active_command_count == 0
+            and safe_stop_consistent
+        )
+        robot_active_exact = bool(
+            robot_ready
+            and command_ready_value is True
+            and _text(command_readiness.get("mode")) == "ACTIVE"
+            and control_ready_value is True
+            and _text(control.get("state")) == "ACTIVE"
+            and _text(control.get("mode")) == "ACTIVE"
+            and control_active_command_count == robot_active_command_count
+            and robot_state == "ACTIVE"
+            and robot_active is True
+            and robot_standby is False
+            and robot_authority_revoked is False
+            and robot_safe_stop_state == "confirmed"
+            and robot_safe_stop_epoch is not None
+            and robot_safe_stop_epoch >= 0
+            and robot_lease_valid is True
+            and robot_active_command_count is not None
+            and robot_active_command_count >= 0
+            and safe_stop_consistent
+        )
+
+        sonic_common_observable = bool(
+            sonic_alive
+            and sonic_status == "running"
+            and sonic_motion_ready_value is True
+            and sonic_control_clock == "simulation_time_50hz_motion_ready"
+            and sonic_last_error_known
+            and sonic_stop_pending is False
+            and sonic_trace_present is False
+        )
+        sonic_standby_exact = bool(
+            sonic_common_observable
+            and sonic_mode == "IDLE"
+            and sonic_nav2_state == "safety_stop"
+            and sonic_static_hold is True
+            and sonic_command_zero is True
+            and sonic_navigation_task_active is False
+            and sonic_support_mode == "safety_stop"
+            and sonic_support_latched is True
+        )
+        sonic_authorized_idle_exact = bool(
+            sonic_common_observable
+            and sonic_last_error is None
+            and sonic_mode == "IDLE"
+            and sonic_nav2_state == "idle"
+            and sonic_static_hold is True
+            and sonic_command_zero is True
+            and sonic_navigation_task_active is False
+            and sonic_support_mode == "idle"
+            and sonic_support_latched is False
+        )
+        sonic_active_exact = bool(
+            sonic_common_observable
+            and sonic_last_error is None
+            and sonic_mode == "SLOW_WALK"
+            and sonic_nav2_state == "commanding"
+            and sonic_static_hold is False
+            and sonic_command_zero is not None
+            and sonic_navigation_task_active is True
+            and sonic_support_mode == "locomotion"
+            and sonic_support_latched is False
+        )
+        plant_common_healthy = bool(
+            plant_alive
+            and plant_status == "running"
+            and (plant_sequence or 0) > 0
+            and plant_fault_known
+            and plant_fault is None
+        )
+        plant_standby_exact = bool(
+            plant_common_healthy
+            and plant_support_mode == "safety_stop"
+            and plant_safety_stop_latched_value is True
+        )
+        plant_authorized_idle_exact = bool(
+            plant_common_healthy
+            and plant_support_mode == "idle"
+            and plant_safety_stop_latched_value is False
+        )
+        plant_active_exact = bool(
+            plant_common_healthy
+            and plant_support_mode == "locomotion"
+            and plant_safety_stop_latched_value is False
+        )
+
+        base_dependencies_healthy = bool(
+            agent_ready_value
+            and vision_ready
+            and gateway_ready
+            and robot_identity_matches
+            and nav2_ready_value is True
+        )
+        standby_exact = bool(
+            base_dependencies_healthy
+            and robot_standby_exact
+            and sonic_standby_exact
+            and plant_standby_exact
+        )
+        authorized_idle_exact = bool(
+            base_dependencies_healthy
+            and robot_active_exact
+            and robot_active_command_count == 0
+            and sonic_authorized_idle_exact
+            and plant_authorized_idle_exact
+        )
+        authorized_active_exact = bool(
+            base_dependencies_healthy
+            and robot_active_exact
+            and (robot_active_command_count or 0) > 0
+            and (
+                (sonic_active_exact and plant_active_exact)
+                or (sonic_authorized_idle_exact and plant_authorized_idle_exact)
+            )
+        )
+
+        explicit_physical_faults = [
+            robot_safe_stop_state == "failed",
+            safe_stop_state == "failed",
+            sonic_trace_present is True,
+            sonic_status == "failed",
+            sonic_control_clock == "fault",
+            plant_fault is not None,
+            plant_status == "failed",
         ]
-        overall_ready = all(required_ready)
+        physical_fault = any(explicit_physical_faults)
+        required_probes = (
+            agent_health,
+            agent_ready,
+            vision_health,
+            robot_health,
+            robot_diagnostics,
+            gateway_health,
+            sonic,
+            plant,
+        )
+        probe_unknown = any(
+            not probe.responded or _probe_error(probe) is not None
+            for probe in required_probes
+        )
+        schema_unknown = any(
+            value is None
+            for value in (
+                robot_ready_value,
+                gateway_connected_value,
+                command_ready_value,
+                control_ready_value,
+                robot_active,
+                robot_standby,
+                robot_can_acquire,
+                robot_authority_revoked,
+                robot_safe_stop_state,
+                robot_safe_stop_epoch,
+                robot_lease_valid,
+                robot_active_command_count,
+                safe_stop_ready_value,
+                safe_stop_authority_revoked,
+                safe_stop_state,
+                safe_stop_epoch,
+                nav2_ready_value,
+                sonic_status,
+                sonic_motion_ready_value,
+                sonic_mode,
+                sonic_nav2_state,
+                sonic_control_clock,
+                sonic_static_hold,
+                sonic_navigation_task_active,
+                sonic_stop_pending,
+                sonic_support_mode,
+                sonic_support_latched,
+                sonic_command_zero,
+                sonic_trace_present,
+                plant_status,
+                plant_support_mode,
+                plant_safety_stop_latched_value,
+            )
+        ) or not sonic_last_error_known or not plant_fault_known
+
+        if physical_fault:
+            classification = "physical_fault"
+        elif standby_exact:
+            classification = "authorization_hold"
+        elif authorized_idle_exact:
+            classification = "ready"
+        elif authorized_active_exact:
+            classification = "active"
+        elif probe_unknown or schema_unknown:
+            classification = "unknown"
+        else:
+            classification = "degraded"
+
+        overall_ready = classification in {"authorization_hold", "ready", "active"}
+        authorization_required = classification == "authorization_hold"
+        motion_authorized = classification in {"ready", "active"}
+        hold_reason = (
+            sonic_last_error or _text(control.get("reason"))
+            if robot_state == "SAFE_HOLD" or robot_standby is True
+            else None
+        )
+        physical_fault_reason = next(
+            (
+                reason
+                for reason in (
+                    plant_fault,
+                    "Robot Agent physical safe-stop failed"
+                    if robot_safe_stop_state == "failed" or safe_stop_state == "failed"
+                    else None,
+                    "SONIC recorded a physical fault trace"
+                    if sonic_trace_present is True
+                    else None,
+                    "SONIC runtime reported failed" if sonic_status == "failed" else None,
+                    "SONIC control clock reported fault"
+                    if sonic_control_clock == "fault"
+                    else None,
+                    "MuJoCo Plant reported failed" if plant_status == "failed" else None,
+                )
+                if reason is not None
+            ),
+            None,
+        )
+        summary_status = {
+            "authorization_hold": "standby",
+            "ready": "ready",
+            "active": "active",
+        }.get(classification, "degraded")
+        summary_detail = {
+            "authorization_hold": "Physical safe-stop is confirmed; execution requires explicit authorization",
+            "ready": "Execution dependencies are healthy and motion is authorized",
+            "active": "Execution dependencies are healthy and a command is active",
+            "physical_fault": "A physical execution fault or fault trace is present",
+            "unknown": "One or more required diagnostic values are unknown",
+            "degraded": "Execution state is contradictory or a required dependency is not ready",
+        }[classification]
+
+        sonic_ready = bool(
+            (robot_standby_exact and sonic_standby_exact)
+            or (
+                robot_active_exact
+                and robot_active_command_count == 0
+                and sonic_authorized_idle_exact
+            )
+            or (
+                robot_active_exact
+                and (robot_active_command_count or 0) > 0
+                and (sonic_active_exact or sonic_authorized_idle_exact)
+            )
+        )
+        plant_ready = bool(
+            (robot_standby_exact and plant_standby_exact)
+            or (
+                robot_active_exact
+                and robot_active_command_count == 0
+                and plant_authorized_idle_exact
+            )
+            or (
+                robot_active_exact
+                and (robot_active_command_count or 0) > 0
+                and (plant_active_exact or plant_authorized_idle_exact)
+            )
+        )
 
         return {
             "schemaVersion": "h-ide.developer-diagnostics/1",
             "observedAt": _utc_now(),
             "target": {"robotId": selected_robot_id, "kind": target_kind},
             "summary": {
-                "status": "ready" if overall_ready else "degraded",
+                "status": summary_status,
+                "classification": classification,
                 "ready": overall_ready,
+                "authorizationRequired": authorization_required,
+                "motionAuthorized": motion_authorized,
+                "holdReason": hold_reason,
+                "fault": physical_fault_reason,
                 "processAliveIsNotReadiness": True,
-                "detail": (
-                    "All required execution dependencies report ready"
-                    if overall_ready
-                    else "One or more required execution dependencies are not ready"
-                ),
+                "detail": summary_detail,
             },
             "release": {
                 key: _text(value, fallback="unknown")
@@ -438,6 +800,7 @@ class DeveloperDiagnosticsService:
                     "configured": selected_robot_url is not None,
                     "alive": robot_health.responded and (robot_health.status_code or 500) < 500,
                     "ready": robot_ready,
+                    "standby": robot_standby_exact,
                     "identityMatches": robot_identity_matches,
                     "latencyMs": robot_diagnostics.latency_ms,
                     "commandReadiness": {
@@ -453,11 +816,23 @@ class DeveloperDiagnosticsService:
                         "ready": bool(_boolean(control.get("ready"))),
                         "state": _text(control.get("state")),
                         "mode": _text(control.get("mode")),
-                        "standby": bool(_boolean(_mapping(robot_payload.get("controlState")).get("standby"))),
-                        "leaseValid": bool(_boolean(control.get("leaseValid"))),
+                        "active": robot_active,
+                        "standby": robot_standby,
+                        "canAcquire": robot_can_acquire,
+                        "authorityRevoked": robot_authority_revoked,
+                        "safeStopState": robot_safe_stop_state,
+                        "safeStopEpoch": robot_safe_stop_epoch,
+                        "leaseValid": robot_lease_valid,
                         "leaseRemainingMs": _number(control.get("leaseRemainingMs")),
-                        "activeCommandCount": _integer(control.get("activeCommandCount")),
+                        "activeCommandCount": robot_active_command_count,
                         "reason": _text(control.get("reason")),
+                    },
+                    "safeStop": {
+                        "ready": safe_stop_ready_value,
+                        "authorityRevoked": safe_stop_authority_revoked,
+                        "state": safe_stop_state,
+                        "epoch": safe_stop_epoch,
+                        "consistent": safe_stop_consistent,
                     },
                     "error": _probe_error(robot_diagnostics),
                 },
@@ -494,11 +869,26 @@ class DeveloperDiagnosticsService:
                     "configured": urls["sonic"] is not None,
                     "alive": sonic_alive,
                     "ready": sonic_ready,
+                    "standby": robot_standby_exact and sonic_standby_exact,
                     "motionReady": sonic_motion_ready,
-                    "mode": _text(sonic.payload.get("sonic_mode")),
-                    "nav2State": _text(sonic.payload.get("nav2_state")),
-                    "controlClock": _text(sonic.payload.get("control_clock_status")),
-                    "fault": sonic_fault,
+                    "mode": sonic_mode,
+                    "nav2State": sonic_nav2_state,
+                    "controlClock": sonic_control_clock,
+                    "staticHoldActive": sonic_static_hold,
+                    "commandZero": sonic_command_zero,
+                    "navigationTaskActive": sonic_navigation_task_active,
+                    "stopPending": sonic_stop_pending,
+                    "supportMode": sonic_support_mode,
+                    "supportSafetyLatched": sonic_support_latched,
+                    "faultTracePresent": sonic_trace_present,
+                    "faultTraceSampleCount": sonic_trace_count,
+                    "lastErrorKnown": sonic_last_error_known,
+                    "lastError": sonic_last_error,
+                    "fault": (
+                        sonic_last_error
+                        if classification != "authorization_hold" and sonic_last_error
+                        else None
+                    ),
                     "latencyMs": sonic.latency_ms,
                     "error": _probe_error(sonic),
                 },
@@ -506,7 +896,8 @@ class DeveloperDiagnosticsService:
                     "configured": urls["plant"] is not None,
                     "alive": plant_alive,
                     "ready": plant_ready,
-                    "status": _text(plant_payload.get("status")),
+                    "standby": robot_standby_exact and plant_standby_exact,
+                    "status": plant_status,
                     "captureSequence": plant_sequence,
                     "rgbReady": bool(
                         (plant_sequence or 0) > 0
@@ -520,8 +911,9 @@ class DeveloperDiagnosticsService:
                     ),
                     "rgbFrames": _integer(sonic.payload.get("rgb_frames")),
                     "depthFrames": _integer(sonic.payload.get("depth_frames")),
-                    "supportMode": _text(plant_support.get("mode")),
+                    "supportMode": plant_support_mode,
                     "safetyStopLatched": plant_safety_stop_latched,
+                    "faultKnown": plant_fault_known,
                     "fault": plant_fault,
                     "latencyMs": plant.latency_ms,
                     "error": _probe_error(plant),

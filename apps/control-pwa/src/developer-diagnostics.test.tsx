@@ -12,7 +12,12 @@ function snapshot() {
     target: { robotId: "g1-sim", kind: "simulation" as const },
     summary: {
       status: "degraded" as const,
+      classification: "physical_fault" as const,
       ready: false,
+      authorizationRequired: false,
+      motionAuthorized: false,
+      holdReason: null,
+      fault: "gait tracking envelope exceeded",
       processAliveIsNotReadiness: true as const,
       detail: "One or more required execution dependencies are not ready",
     },
@@ -130,17 +135,121 @@ function snapshot() {
 }
 
 
+function standbySnapshot() {
+  const base = snapshot();
+  return {
+    ...base,
+    summary: {
+      status: "standby" as const,
+      classification: "authorization_hold" as const,
+      ready: true,
+      authorizationRequired: true,
+      motionAuthorized: false,
+      holdReason: "plant safety_stop requires explicit control.acquire rearm",
+      fault: null,
+      processAliveIsNotReadiness: true as const,
+      detail: "Physical safe-stop is confirmed; execution requires explicit authorization",
+    },
+    components: {
+      ...base.components,
+      robotAgent: {
+        ...base.components.robotAgent,
+        ready: true,
+        standby: true,
+        commandReadiness: { ready: true, mode: "STANDBY", reason: null },
+        control: {
+          ready: true,
+          state: "SAFE_HOLD",
+          mode: "STANDBY",
+          active: false,
+          standby: true,
+          canAcquire: true,
+          authorityRevoked: true,
+          safeStopState: "confirmed",
+          safeStopEpoch: 7,
+          leaseValid: false,
+          leaseRemainingMs: null,
+          activeCommandCount: 0,
+          reason: "standby_waiting_for_control_acquire",
+        },
+        safeStop: {
+          ready: true,
+          authorityRevoked: true,
+          state: "confirmed",
+          epoch: 7,
+          consistent: true,
+        },
+      },
+      nav2: {
+        ...base.components.nav2,
+        ready: true,
+        reason: null,
+        actions: {
+          "navigation.navigate_to_pose": { ready: true, reason: null },
+          "navigation.rotate": { ready: true, reason: null },
+        },
+      },
+      sonic: {
+        ...base.components.sonic,
+        ready: true,
+        standby: true,
+        motionReady: true,
+        mode: "IDLE",
+        nav2State: "safety_stop",
+        controlClock: "simulation_time_50hz_motion_ready",
+        staticHoldActive: true,
+        commandZero: true,
+        navigationTaskActive: false,
+        stopPending: false,
+        supportMode: "safety_stop",
+        supportSafetyLatched: true,
+        faultTracePresent: false,
+        faultTraceSampleCount: 0,
+        lastErrorKnown: true,
+        lastError: "plant safety_stop requires explicit control.acquire rearm",
+        fault: null,
+      },
+      plant: {
+        ...base.components.plant,
+        ready: true,
+        standby: true,
+        status: "running",
+        supportMode: "safety_stop",
+        safetyStopLatched: true,
+        faultKnown: true,
+        fault: null,
+      },
+    },
+  };
+}
+
+
 describe("DeveloperDiagnostics", () => {
+  it("renders confirmed SAFE_HOLD as healthy authorization standby", async () => {
+    const apiFetch = vi.fn().mockResolvedValue(standbySnapshot());
+    render(<DeveloperDiagnostics apiFetch={apiFetch} robotId="g1-sim" pollIntervalMs={60_000} />);
+
+    expect(await screen.findByText("安全待命，执行前需授权")).toBeInTheDocument();
+    expect(screen.getAllByText("STANDBY").length).toBeGreaterThan(0);
+    expect(screen.getByText("plant safety_stop requires explicit control.acquire rearm")).toBeInTheDocument();
+    expect(screen.getAllByText("standby_waiting_for_control_acquire").length).toBeGreaterThan(0);
+    expect(screen.getByText("已撤销")).toBeInTheDocument();
+    expect(screen.getByText("全零")).toBeInTheDocument();
+    expect(screen.getByText("已锁存")).toBeInTheDocument();
+    expect(screen.queryByText("Plant latched fault")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /授权|获取控制|执行|移动/ })).not.toBeInTheDocument();
+  });
+
   it("renders precise readiness failures and only calls the authenticated BFF", async () => {
     const apiFetch = vi.fn().mockResolvedValue(snapshot());
     render(<DeveloperDiagnostics apiFetch={apiFetch} robotId="g1-sim" pollIntervalMs={60_000} />);
 
-    expect(await screen.findByText("执行链路存在阻塞")).toBeInTheDocument();
+    expect(await screen.findByText("检测到物理执行故障")).toBeInTheDocument();
     expect(apiFetch).toHaveBeenCalledWith("/api/v2/developer/diagnostics?robotId=g1-sim");
     expect(screen.getByText("required_dependency_unavailable")).toBeInTheDocument();
     expect(screen.getByText("active_commands_without_valid_lease")).toBeInTheDocument();
     expect(screen.getByText("action_server_missing")).toBeInTheDocument();
-    expect(screen.getByText("gait tracking envelope exceeded")).toBeInTheDocument();
+    expect(screen.getAllByText("gait tracking envelope exceeded").length).toBeGreaterThan(0);
     expect(screen.getByText("MuJoCo physics time rolled back")).toBeInTheDocument();
     expect(screen.getByText("qwen / qwen3-vl-plus")).toBeInTheDocument();
     expect(screen.getByText("1320 ms")).toBeInTheDocument();
@@ -156,7 +265,7 @@ describe("DeveloperDiagnostics", () => {
       .mockResolvedValueOnce(snapshot())
       .mockRejectedValueOnce(new Error("diagnostics timeout"));
     render(<DeveloperDiagnostics apiFetch={apiFetch} robotId="g1-sim" pollIntervalMs={60_000} />);
-    expect(await screen.findByText("执行链路存在阻塞")).toBeInTheDocument();
+    expect(await screen.findByText("检测到物理执行故障")).toBeInTheDocument();
 
     screen.getByRole("button", { name: "刷新只读状态" }).click();
     await waitFor(() => expect(screen.getByText("刷新失败，当前显示上一份快照")).toBeInTheDocument());

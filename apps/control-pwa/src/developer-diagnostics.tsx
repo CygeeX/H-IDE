@@ -5,17 +5,25 @@ type Availability = {
   configured?: boolean;
   alive?: boolean;
   ready?: boolean;
+  standby?: boolean;
   error?: string | null;
   latencyMs?: number | null;
 };
+
+type DiagnosticClassification = "physical_fault" | "authorization_hold" | "ready" | "active" | "unknown" | "degraded";
 
 type DiagnosticSnapshot = {
   schemaVersion: "h-ide.developer-diagnostics/1";
   observedAt: string;
   target: { robotId: string; kind: "simulation" | "physical" };
   summary: {
-    status: "ready" | "degraded";
+    status: "standby" | "ready" | "active" | "degraded";
+    classification: DiagnosticClassification;
     ready: boolean;
+    authorizationRequired: boolean;
+    motionAuthorized: boolean;
+    holdReason?: string | null;
+    fault?: string | null;
     processAliveIsNotReadiness: true;
     detail: string;
   };
@@ -59,11 +67,23 @@ type DiagnosticSnapshot = {
         ready?: boolean;
         state?: string | null;
         mode?: string | null;
+        active?: boolean | null;
         standby?: boolean;
+        canAcquire?: boolean | null;
+        authorityRevoked?: boolean | null;
+        safeStopState?: string | null;
+        safeStopEpoch?: number | null;
         leaseValid?: boolean;
         leaseRemainingMs?: number | null;
         activeCommandCount?: number | null;
         reason?: string | null;
+      };
+      safeStop?: {
+        ready?: boolean | null;
+        authorityRevoked?: boolean | null;
+        state?: string | null;
+        epoch?: number | null;
+        consistent?: boolean;
       };
     };
     nav2: Availability & {
@@ -94,6 +114,16 @@ type DiagnosticSnapshot = {
       mode?: string | null;
       nav2State?: string | null;
       controlClock?: string | null;
+      staticHoldActive?: boolean | null;
+      commandZero?: boolean | null;
+      navigationTaskActive?: boolean | null;
+      stopPending?: boolean | null;
+      supportMode?: string | null;
+      supportSafetyLatched?: boolean | null;
+      faultTracePresent?: boolean | null;
+      faultTraceSampleCount?: number | null;
+      lastErrorKnown?: boolean;
+      lastError?: string | null;
       fault?: string | null;
     };
     plant: Availability & {
@@ -105,6 +135,7 @@ type DiagnosticSnapshot = {
       depthFrames?: number | null;
       supportMode?: string | null;
       safetyStopLatched?: boolean;
+      faultKnown?: boolean;
       fault?: string | null;
     };
   };
@@ -120,8 +151,9 @@ function ms(value: number | null | undefined): string {
   return typeof value === "number" && Number.isFinite(value) ? `${Math.round(value)} ms` : "未报告";
 }
 
-function availabilityTone(value: Availability): "ready" | "degraded" | "failed" | "unknown" {
+function availabilityTone(value: Availability): "ready" | "standby" | "degraded" | "failed" | "unknown" {
   if (value.configured === false) return "unknown";
+  if (value.ready && value.standby) return "standby";
   if (value.ready) return "ready";
   if (value.alive) return "degraded";
   return "failed";
@@ -145,7 +177,7 @@ function ComponentCard({ title, subtitle, value, children }: {
   const tone = availabilityTone(value);
   return <article className={`diag-component-card tone-${tone}`}>
     <header><div><span>{subtitle}</span><h3>{title}</h3></div><span className={`diag-badge ${tone}`}><i />{
-      tone === "ready" ? "就绪" : tone === "degraded" ? "存活 / 未就绪" : tone === "failed" ? "不可用" : "未配置"
+      tone === "ready" ? "就绪" : tone === "standby" ? "安全待命" : tone === "degraded" ? "存活 / 未就绪" : tone === "failed" ? "不可用" : "未配置"
     }</span></header>
     <div className="diag-process-line"><span>进程响应</span><b className={value.alive ? "ok" : "bad"}>{value.alive ? "ALIVE" : "NO RESPONSE"}</b>{value.latencyMs != null ? <small>{ms(value.latencyMs)}</small> : null}</div>
     {value.error ? <p className="diag-fault"><strong>故障</strong>{value.error}</p> : null}
@@ -189,12 +221,39 @@ export function DeveloperDiagnostics({
   const vision = components.vision;
   const lastAnalysis = vision.latestAnalysis;
   const actions = Object.entries(components.nav2.actions ?? {});
+  const authorizationHold = snapshot.summary.classification === "authorization_hold";
+  const physicalFault = snapshot.summary.classification === "physical_fault";
+  const heroTitle = authorizationHold
+    ? "安全待命，执行前需授权"
+    : snapshot.summary.classification === "active"
+      ? "机器人正在执行"
+      : snapshot.summary.classification === "ready"
+        ? "执行链路已授权"
+        : physicalFault
+          ? "检测到物理执行故障"
+          : snapshot.summary.classification === "unknown"
+            ? "执行状态存在未知项"
+            : "执行链路存在阻塞";
+  const heroDescription = authorizationHold
+    ? "物理安全停止已经逐层确认；当前没有运动权限，也没有活动命令。"
+    : snapshot.summary.ready
+      ? "所有必需组件都报告了相互一致的健康状态。"
+      : "至少一个必需组件未知、故障或相互矛盾，请查看下方红色项目。";
+  const overallLabel = authorizationHold
+    ? "STANDBY"
+    : snapshot.summary.classification === "active"
+      ? "ACTIVE"
+      : snapshot.summary.ready
+        ? "READY"
+        : "DEGRADED";
 
   return <section className="developer-diagnostics" aria-label="开发者系统诊断">
-    <header className={`diag-hero ${snapshot.summary.ready ? "ready" : "degraded"}`}>
-      <div><span className="diag-kicker">READ-ONLY SYSTEM DIAGNOSTICS</span><h2>{snapshot.summary.ready ? "执行链路已就绪" : "执行链路存在阻塞"}</h2><p>{snapshot.summary.ready ? "所有必需组件都明确报告 ready。" : "至少一个必需组件仍未达到可执行条件，请查看下方红色故障。"}</p></div>
-      <div className="diag-hero-actions"><span className={`diag-overall ${snapshot.summary.status}`}><i />{snapshot.summary.ready ? "READY" : "DEGRADED"}</span><button type="button" onClick={() => void refresh()} disabled={loading}>{loading ? "刷新中…" : "刷新只读状态"}</button></div>
-      <p className="diag-readiness-contract"><strong>重要：</strong>process alive ≠ ready。进程能响应 HTTP，不代表 transport、控制租约、Nav2、视觉、SONIC 或 Plant 已可执行。</p>
+    <header className={`diag-hero ${snapshot.summary.status}`}>
+      <div><span className="diag-kicker">READ-ONLY SYSTEM DIAGNOSTICS</span><h2>{heroTitle}</h2><p>{heroDescription}</p></div>
+      <div className="diag-hero-actions"><span className={`diag-overall ${snapshot.summary.status}`}><i />{overallLabel}</span><button type="button" onClick={() => void refresh()} disabled={loading}>{loading ? "刷新中…" : "刷新只读状态"}</button></div>
+      <p className="diag-readiness-contract"><strong>重要：</strong>process alive ≠ ready，ready ≠ 已获运动权限。当前授权：{snapshot.summary.motionAuthorized ? "已授权" : "未授权"}；{snapshot.summary.authorizationRequired ? "执行前必须走既有授权流程。" : "授权状态以任务运行时为准。"}</p>
+      {authorizationHold && snapshot.summary.holdReason ? <p className="diag-hold-reason"><strong>待命原因</strong>{snapshot.summary.holdReason}</p> : null}
+      {physicalFault && snapshot.summary.fault ? <p className="diag-summary-fault"><strong>物理故障</strong>{snapshot.summary.fault}</p> : null}
     </header>
 
     {error ? <div className="diag-stale-warning" role="alert"><strong>刷新失败，当前显示上一份快照</strong>{error}</div> : null}
@@ -213,10 +272,10 @@ export function DeveloperDiagnostics({
       <span className={components.agent.ready ? "ready" : "failed"}>Agent</span><i>→</i>
       <span className={components.vision.ready ? "ready" : "failed"}>Vision</span><i>→</i>
       <span className={components.gateway.ready ? "ready" : "failed"}>Gateway</span><i>→</i>
-      <span className={components.robotAgent.ready ? "ready" : "failed"}>Robot Agent</span><i>→</i>
+      <span className={components.robotAgent.standby ? "standby" : components.robotAgent.ready ? "ready" : "failed"}>Robot Agent</span><i>→</i>
       <span className={components.nav2.ready ? "ready" : "failed"}>Nav2</span><i>→</i>
-      <span className={components.sonic.ready ? "ready" : "failed"}>SONIC</span><i>→</i>
-      <span className={components.plant.ready ? "ready" : "failed"}>MuJoCo</span>
+      <span className={components.sonic.standby ? "standby" : components.sonic.ready ? "ready" : "failed"}>SONIC</span><i>→</i>
+      <span className={components.plant.standby ? "standby" : components.plant.ready ? "ready" : "failed"}>MuJoCo</span>
     </div>
 
     <div className="diag-component-grid">
@@ -239,9 +298,10 @@ export function DeveloperDiagnostics({
       </ComponentCard>
 
       <ComponentCard title="Robot Agent" subtitle="TRANSPORT / SESSION / LEASE" value={components.robotAgent}>
-        <dl className="diag-facts"><Fact label="Command gate" value={components.robotAgent.commandReadiness?.ready ? "ready" : components.robotAgent.commandReadiness?.mode ?? "未就绪"} bad={!components.robotAgent.commandReadiness?.ready} /><Fact label="Transport session" value={components.robotAgent.transport?.ready ? "ready" : components.robotAgent.transport?.reason ?? "未就绪"} bad={!components.robotAgent.transport?.ready} /><Fact label="控制模式" value={control?.mode ?? "未知"} bad={!control?.ready} /><Fact label="Lease" value={control?.leaseValid ? `有效 · ${ms(control.leaseRemainingMs)}` : control?.standby ? "待命，接单时获取" : "无效"} bad={!control?.leaseValid && !control?.standby} /><Fact label="活动命令" value={String(control?.activeCommandCount ?? 0)} /></dl>
+        <dl className="diag-facts"><Fact label="Command gate" value={components.robotAgent.commandReadiness?.ready ? "ready" : components.robotAgent.commandReadiness?.mode ?? "未就绪"} bad={!components.robotAgent.commandReadiness?.ready} /><Fact label="Transport session" value={components.robotAgent.transport?.ready ? "ready" : components.robotAgent.transport?.reason ?? "未就绪"} bad={!components.robotAgent.transport?.ready} /><Fact label="控制模式" value={control?.mode ?? "未知"} bad={!control?.ready} /><Fact label="Lease" value={control?.leaseValid ? `有效 · ${ms(control.leaseRemainingMs)}` : control?.standby ? "待命，接单时获取" : "无效"} bad={!control?.leaseValid && !control?.standby} /><Fact label="活动命令" value={control?.activeCommandCount == null ? "未知" : String(control.activeCommandCount)} bad={control?.activeCommandCount == null || (components.robotAgent.standby && control.activeCommandCount !== 0)} /><Fact label="命令权限" value={control?.authorityRevoked == null ? "未知" : control.authorityRevoked ? "已撤销" : "已授予"} bad={control?.authorityRevoked == null || (components.robotAgent.standby ? control.authorityRevoked !== true : snapshot.summary.motionAuthorized && control.authorityRevoked !== false)} /><Fact label="物理安全停止" value={control?.safeStopState ?? "未知"} bad={control?.safeStopState !== "confirmed"} /><Fact label="Stop epoch" value={control?.safeStopEpoch == null ? "未知" : String(control.safeStopEpoch)} bad={control?.safeStopEpoch == null} /></dl>
+        {components.robotAgent.safeStop?.consistent === false ? <p className="diag-fault"><strong>状态矛盾</strong>Robot Agent 顶层状态与 safeStop 检查不一致。</p> : null}
         {components.robotAgent.commandReadiness?.reason && components.robotAgent.commandReadiness.reason !== control?.reason ? <p className="diag-fault"><strong>Command gate</strong>{components.robotAgent.commandReadiness.reason}</p> : null}
-        {control?.reason ? <p className={`diag-inline-state ${control.ready ? "ok" : control.standby ? "standby" : "bad"}`}>{control.reason}</p> : null}
+        {control?.reason ? <p className={`diag-inline-state ${control.standby ? "standby" : control.ready ? "ok" : "bad"}`}>{control.reason}</p> : null}
       </ComponentCard>
 
       <ComponentCard title="Nav2 Action" subtitle="ONLY BASE MOTION OWNER" value={components.nav2}>
@@ -249,13 +309,15 @@ export function DeveloperDiagnostics({
       </ComponentCard>
 
       <ComponentCard title="SONIC Controller" subtitle="GAIT RUNTIME" value={components.sonic}>
-        <dl className="diag-facts"><Fact label="motion_ready" value={components.sonic.motionReady ? "true" : "false"} bad={!components.sonic.motionReady} /><Fact label="模式" value={components.sonic.mode ?? "未知"} /><Fact label="Nav2 状态" value={components.sonic.nav2State ?? "未知"} /><Fact label="控制时钟" value={components.sonic.controlClock ?? "未报告"} bad={!components.sonic.controlClock?.includes("motion_ready")} /></dl>
+        <dl className="diag-facts"><Fact label="motion_ready" value={components.sonic.motionReady ? "true" : "false"} bad={!components.sonic.motionReady} /><Fact label="模式" value={components.sonic.mode ?? "未知"} bad={components.sonic.standby && components.sonic.mode !== "IDLE"} /><Fact label="Nav2 状态" value={components.sonic.nav2State ?? "未知"} bad={components.sonic.standby && components.sonic.nav2State !== "safety_stop"} /><Fact label="控制时钟" value={components.sonic.controlClock ?? "未报告"} bad={components.sonic.controlClock !== "simulation_time_50hz_motion_ready"} /><Fact label="静态保持" value={components.sonic.staticHoldActive == null ? "未知" : components.sonic.staticHoldActive ? "active" : "inactive"} bad={components.sonic.standby && components.sonic.staticHoldActive !== true} /><Fact label="速度命令" value={components.sonic.commandZero == null ? "未知" : components.sonic.commandZero ? "全零" : "非零"} bad={components.sonic.commandZero == null || (components.sonic.standby && !components.sonic.commandZero)} /><Fact label="导航任务" value={components.sonic.navigationTaskActive == null ? "未知" : components.sonic.navigationTaskActive ? "active" : "none"} bad={components.sonic.navigationTaskActive == null || (components.sonic.standby && components.sonic.navigationTaskActive)} /><Fact label="Stop pending" value={components.sonic.stopPending == null ? "未知" : components.sonic.stopPending ? "pending" : "false"} bad={components.sonic.stopPending !== false} /><Fact label="Fault trace" value={components.sonic.faultTracePresent == null ? "未知" : components.sonic.faultTracePresent ? `${components.sonic.faultTraceSampleCount ?? "?"} samples` : "none"} bad={components.sonic.faultTracePresent !== false} /></dl>
+        {components.sonic.lastErrorKnown === false ? <p className="diag-fault"><strong>未知状态</strong>SONIC 未明确报告 last_error。</p> : null}
         {components.sonic.fault ? <p className="diag-fault"><strong>SONIC fault</strong>{components.sonic.fault}</p> : null}
       </ComponentCard>
 
       <ComponentCard title="MuJoCo Plant" subtitle="SIMULATION / RGB-D" value={components.plant}>
-        <dl className="diag-facts"><Fact label="Plant" value={components.plant.status ?? "未知"} bad={!components.plant.ready} /><Fact label="支撑模式" value={components.plant.supportMode ?? "未报告"} bad={Boolean(components.plant.safetyStopLatched)} /><Fact label="RGB" value={components.plant.rgbReady ? `ready · ${components.plant.rgbFrames ?? "?"} 帧` : "未就绪"} bad={!components.plant.rgbReady} /><Fact label="Depth" value={components.plant.depthReady ? `ready · ${components.plant.depthFrames ?? "?"} 帧` : "未就绪"} bad={!components.plant.depthReady} /></dl>
-        {components.plant.safetyStopLatched || components.plant.fault ? <p className="diag-fault"><strong>Plant latched fault</strong>{components.plant.fault ?? "safety stop is latched"}</p> : null}
+        <dl className="diag-facts"><Fact label="Plant" value={components.plant.status ?? "未知"} bad={!components.plant.ready} /><Fact label="支撑模式" value={components.plant.supportMode ?? "未报告"} bad={components.plant.standby ? components.plant.supportMode !== "safety_stop" : !components.plant.supportMode} /><Fact label="安全停止锁存" value={components.plant.safetyStopLatched == null ? "未知" : components.plant.safetyStopLatched ? "已锁存" : "未锁存"} bad={components.plant.safetyStopLatched == null || (components.plant.standby ? !components.plant.safetyStopLatched : components.plant.safetyStopLatched)} /><Fact label="RGB" value={components.plant.rgbReady ? `ready · ${components.plant.rgbFrames ?? "?"} 帧` : "未就绪"} bad={!components.plant.rgbReady} /><Fact label="Depth" value={components.plant.depthReady ? `ready · ${components.plant.depthFrames ?? "?"} 帧` : "未就绪"} bad={!components.plant.depthReady} /></dl>
+        {components.plant.faultKnown === false ? <p className="diag-fault"><strong>未知状态</strong>Plant 未明确报告 fault。</p> : null}
+        {components.plant.fault || (components.plant.safetyStopLatched && !components.plant.standby) ? <p className="diag-fault"><strong>Plant latched fault</strong>{components.plant.fault ?? "未授权状态以外出现 safety stop latch"}</p> : null}
       </ComponentCard>
     </div>
 
