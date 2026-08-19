@@ -88,6 +88,14 @@ def _payloads(sample: dict[str, object], index: int) -> tuple[dict, dict]:
         "last_cmd_wz": angular_speed if active else 0.0,
         "navigation_task_active": active,
         "static_hold_active": bool(sample.get("static_hold_active", not active)),
+        "motion_handoff_active": active,
+        "motion_handoff_ratio": 1.0 if active else 0.0,
+        "sonic_planner_reference_ready": active,
+        "sonic_planner_required_pending": False,
+        "plant_support_mode": support_mode,
+        "plant_support_requested_mode": support_mode,
+        "plant_support_confirmed_mode": support_mode,
+        "plant_support_stop_pending": False,
         "plant_support_safety_latched": safe_hold,
         "fault_trace_path": "/tmp/sonic-fault-trace.json" if fault_trace_count else None,
         "fault_trace_sample_count": fault_trace_count,
@@ -143,6 +151,95 @@ def test_nonfinite_source_value_fails_and_can_still_be_recorded_safely() -> None
     assert result["pass"] is False
     assert {failure["code"] for failure in result["failures"]}.issuperset(
         {"NONFINITE_TELEMETRY", "SCHEMA_INVALID"}
+    )
+
+
+@pytest.mark.parametrize(
+    "hold_reason",
+    [
+        "Robot Agent requested simulation safe-stop",
+        "plant safety_stop requires explicit control.acquire rearm",
+        "operator authorization is required before motion",
+    ],
+)
+def test_idle_safe_hold_uses_structure_not_reason_allowlist(hold_reason: str) -> None:
+    plant, sonic = _payloads(
+        {"t": 0.0, "state": "safe_hold", "x": 0.0, "y": 0.0, "z": 0.78, "yaw": 0.0},
+        0,
+    )
+    sonic["last_error"] = hold_reason
+    evaluator = MotionAcceptanceEvaluator(AcceptanceLimits(phase="idle"))
+
+    derived = evaluator.observe(plant, sonic, observed_s=0.0)
+    evaluator.observe(plant, sonic, observed_s=0.2)
+    result = evaluator.finalize()
+
+    assert derived["healthy_settled_safe_hold"] is True
+    assert derived["hold_reason"] == hold_reason
+    assert result["pass"] is True
+    assert result["holdReason"] == hold_reason
+
+
+@pytest.mark.parametrize(
+    ("mutations", "expected_codes"),
+    [
+        (
+            {"last_cmd_vx": 0.1},
+            {"UNEXPECTED_MOTION_INTENT", "SAFE_HOLD_STATE_CONTRADICTION"},
+        ),
+        (
+            {"navigation_task_active": True},
+            {"UNEXPECTED_MOTION_INTENT", "SAFE_HOLD_STATE_CONTRADICTION"},
+        ),
+        (
+            {"fault_trace_path": "/tmp/fault.json", "fault_trace_sample_count": 1},
+            {"SONIC_FAULT_TRACE", "SAFE_HOLD_STATE_CONTRADICTION"},
+        ),
+        (
+            {"status": "failed"},
+            {"SONIC_NOT_RUNNING", "SAFE_HOLD_STATE_CONTRADICTION"},
+        ),
+        (
+            {"plant_support_confirmed_mode": "idle"},
+            {"SAFE_HOLD_STATE_CONTRADICTION"},
+        ),
+    ],
+)
+def test_safe_hold_reason_cannot_mask_structural_faults(
+    mutations: dict[str, object],
+    expected_codes: set[str],
+) -> None:
+    plant, sonic = _payloads(
+        {"t": 0.0, "state": "safe_hold", "x": 0.0, "y": 0.0, "z": 0.78, "yaw": 0.0},
+        0,
+    )
+    sonic["last_error"] = "Robot Agent requested simulation safe-stop"
+    sonic.update(mutations)
+    evaluator = MotionAcceptanceEvaluator(AcceptanceLimits(phase="idle"))
+
+    evaluator.observe(plant, sonic, observed_s=0.0)
+    result = evaluator.finalize()
+
+    assert result["pass"] is False
+    assert {failure["code"] for failure in result["failures"]}.issuperset(
+        expected_codes
+    )
+
+
+def test_safe_hold_reset_clue_is_rejected_even_when_structure_is_healthy() -> None:
+    plant, sonic = _payloads(
+        {"t": 0.0, "state": "safe_hold", "x": 0.0, "y": 0.0, "z": 0.78, "yaw": 0.0},
+        0,
+    )
+    sonic["last_error"] = "implicit reset was attempted"
+    evaluator = MotionAcceptanceEvaluator(AcceptanceLimits(phase="idle"))
+
+    evaluator.observe(plant, sonic, observed_s=0.0)
+    result = evaluator.finalize()
+
+    assert result["pass"] is False
+    assert {failure["code"] for failure in result["failures"]}.issuperset(
+        {"RESET_OR_NUMERICAL_FAULT_CLUE"}
     )
 
 

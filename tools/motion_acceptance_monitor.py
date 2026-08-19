@@ -284,6 +284,7 @@ class MotionAcceptanceEvaluator:
         self.physical_motion_seen = False
         self.progress_reached_s: float | None = None
         self.settled_after_motion = False
+        self.hold_reason: str | None = None
         self.previous_counters: dict[str, float] = {}
         self.source_identity: tuple[Any, ...] | None = None
         self.maxima: dict[str, float] = {
@@ -383,6 +384,14 @@ class MotionAcceptanceEvaluator:
             "sonic_mode",
             "navigation_task_active",
             "static_hold_active",
+            "motion_handoff_active",
+            "motion_handoff_ratio",
+            "sonic_planner_reference_ready",
+            "sonic_planner_required_pending",
+            "plant_support_mode",
+            "plant_support_requested_mode",
+            "plant_support_confirmed_mode",
+            "plant_support_stop_pending",
             "plant_support_safety_latched",
             "fault_trace_path",
             "fault_trace_sample_count",
@@ -615,6 +624,15 @@ class MotionAcceptanceEvaluator:
             sonic.get("fault_trace_path") in {None, ""}
             and sonic.get("fault_trace_sample_count") in {None, 0}
         )
+        try:
+            motion_handoff_ratio = _finite_number(sonic, "motion_handoff_ratio")
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            motion_handoff_ratio = math.inf
+            self._fail(
+                "SCHEMA_INVALID",
+                f"motion handoff telemetry is invalid: {exc}",
+                observed_s,
+            )
         healthy_settled_safe_hold = (
             safe_hold
             and support_latched is True
@@ -626,20 +644,33 @@ class MotionAcceptanceEvaluator:
             == "simulation_time_50hz_motion_ready"
             and sonic_mode == "IDLE"
             and sonic.get("static_hold_active") is True
+            and sonic.get("motion_handoff_active") is False
+            and abs(motion_handoff_ratio) <= self.limits.command_epsilon
             and command_zero
             and sonic.get("navigation_task_active") is False
+            and sonic.get("sonic_planner_reference_ready") is False
+            and sonic.get("sonic_planner_required_pending") is False
+            and sonic.get("plant_support_mode") == "safety_stop"
+            and sonic.get("plant_support_requested_mode") == "safety_stop"
+            and sonic.get("plant_support_confirmed_mode") == "safety_stop"
+            and sonic.get("plant_support_stop_pending") is False
             and no_fault_trace
         )
+        if support_mode == "safety_stop" and not healthy_settled_safe_hold:
+            self._fail(
+                "SAFE_HOLD_STATE_CONTRADICTION",
+                "Plant safety_stop was not matched by a complete settled SONIC SAFE_HOLD",
+                observed_s,
+            )
         last_error = sonic.get("last_error")
         if last_error not in {None, ""}:
             normalized = str(last_error).lower()
-            canonical_safe_hold_reason = (
-                "requires explicit control.acquire rearm" in normalized
-            )
-            allowed_safe_hold_reason = (
-                healthy_settled_safe_hold and canonical_safe_hold_reason
-            )
-            if not allowed_safe_hold_reason:
+            if healthy_settled_safe_hold:
+                # SAFE_HOLD health is established by the complete physical and
+                # control structure above.  The human-readable reason is
+                # evidence, never an allowlist that can override that truth.
+                self.hold_reason = str(last_error)
+            else:
                 self._fail("SONIC_LAST_ERROR", f"SONIC last_error: {last_error}", observed_s)
             if any(marker in normalized for marker in _RESET_FAULT_MARKERS):
                 self._fail(
@@ -687,6 +718,7 @@ class MotionAcceptanceEvaluator:
             angular_speed_rps=angular_speed,
             safe_hold=safe_hold,
             healthy_settled_safe_hold=healthy_settled_safe_hold,
+            hold_reason=str(last_error) if healthy_settled_safe_hold and last_error else None,
         )
 
         if self.limits.phase == "idle":
@@ -942,6 +974,7 @@ class MotionAcceptanceEvaluator:
                 else self.progress_reached_s - self.first_observed_s
             ),
             "settledAfterMotion": self.settled_after_motion,
+            "holdReason": self.hold_reason,
             "finalUnwrappedYawRad": self.unwrapped_yaw,
             "maxima": dict(self.maxima),
             "failures": failures,
