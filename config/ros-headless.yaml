@@ -1,0 +1,64 @@
+schema_version: h-ide.mujoco-sonic-config/1
+robot_id: g1-sim
+robot_profile: unitree_g1_29dof
+localization_epoch_id: g1-sim-map-epoch-1
+ros_domain_id: 232
+interface: lo
+cmd_vel_topic: /cmd_vel
+odom_topic: /odom
+localization_topic: /localization/pose
+nav_path_topic: /plan
+lowstate_topic: rt/lowstate
+lowcmd_topic: rt/lowcmd
+telemetry_host: 127.0.0.1
+telemetry_port: 8792
+plant_port: 8794
+command_host: 127.0.0.1
+command_port: 8793
+max_linear_mps: 0.25
+min_walk_command_mps: 0.10
+max_angular_rps: 0.25
+max_facing_lead_rad: 0.15
+# DWB may mix a small angular correction into forward motion.  Bound that
+# correction tightly; larger heading changes must arrive as a Nav2 Spin.
+max_translation_facing_offset_rad: 0.05
+max_translation_heading_error_rad: 0.25
+translation_heading_violation_s: 0.25
+# A G1 turns by changing its support feet, so raw pelvis x/y is not stationary.
+# Keep its center inside the 0.35 m Nav2 footprint while rejecting sustained
+# translation or a yaw response opposite to Nav2's Spin command.
+max_spin_reverse_rad: 0.05
+max_spin_translation_m: 0.30
+spin_translation_violation_s: 0.50
+command_timeout_s: 0.25
+# Keep the current measured posture while SONIC's async planner prepares the
+# first walking clip, then blend into policy control instead of snapping.
+motion_handoff_warmup_s: 0.35
+motion_handoff_blend_s: 0.40
+control_hz: 50
+camera_hz: 30
+# Publish faster than the workstation's 5 Hz accepted stream so one delayed
+# MuJoCo render/poll does not create an observation watchdog gap.
+observation_hz: 10
+# Must match Robot Observation Gateway's stream.jpeg_quality so the simulation
+# Oracle can index the exact post-gateway JPEG bytes.
+observation_jpeg_quality: 85
+# RTX/CUDA is available on the workstation; keeping SONIC on the GPU leaves
+# enough CPU time for MuJoCo's 250 Hz physics and the ROS bridge.
+force_cpu: false
+# Keep the native MuJoCo viewer visible for local operator validation while
+# offscreen RGB-D continues feeding H-IDE Vision.
+onscreen: true
+offscreen: true
+# Keep the simulation-only vertical/attitude support engaged for the complete
+# workstation demonstration.  A value of 0 means never release it; it does not
+# provide horizontal motion and does not replace SONIC/lowcmd control.
+startup_support_s: 0.0
+# Model/controller resynchronization is slower than a normal cold start. Keep
+# the root over its initial footprint until the new static hold is established;
+# horizontal support is removed before any navigation acceptance begins.
+startup_horizontal_support_s: 15.0
+model_scene: /home/phi/learn-projects/h-ide-mujoco-sonic/models/unitree-g1-mujoco/assets/h_ide_office_29dof.xml
+sonic_model_repo: nvidia/GEAR-SONIC
+sonic_model_revision: main
+lerobot_commit: be49454734c8526340fbd997c374aaa1eb9e83cb

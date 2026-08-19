@@ -1,0 +1,1127 @@
+"""The only allowed conversion from Nav2 velocity to SONIC intent."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import math
+import time
+from collections.abc import Sequence
+
+
+@dataclass(frozen=True)
+class CmdVel:
+    vx: float
+    vy: float
+    wz: float
+    received_at: float
+    source: str = "nav2"
+
+
+@dataclass(frozen=True)
+class MovementIntent:
+    mode: str
+    speed_mps: float
+    movement_angle_rad: float
+    facing_angle_rad: float
+    has_movement: bool
+    stale: bool
+    source: str = "nav2"
+
+
+class PlantTickGuard:
+    """Detect a restarted MuJoCo publisher from Unitree ``LowState.tick``.
+
+    The simulator publishes elapsed milliseconds in the unsigned tick field.
+    A small backwards step may be a delayed DDS sample, while a large rollback
+    means that the authoritative physics process restarted and every SONIC
+    history/heading anchor is invalid.
+    """
+
+    def __init__(self, *, rollback_threshold_ms: int = 1_000) -> None:
+        if isinstance(rollback_threshold_ms, bool) or rollback_threshold_ms <= 0:
+            raise ValueError("rollback threshold must be a positive integer")
+        self.rollback_threshold_ms = int(rollback_threshold_ms)
+        self.last_tick: int | None = None
+        self.restart_count = 0
+
+    def observe(self, tick: int) -> bool:
+        if isinstance(tick, bool) or not isinstance(tick, int) or not 0 <= tick <= 0xFFFFFFFF:
+            raise ValueError("plant tick must be an unsigned 32-bit integer")
+        previous = self.last_tick
+        restarted = previous is not None and tick + self.rollback_threshold_ms < previous
+        if restarted:
+            self.restart_count += 1
+            self.last_tick = tick
+            return True
+        if previous is None or tick >= previous:
+            self.last_tick = tick
+        return False
+
+
+class MotionDirectionGuard:
+    """Latch a stop when measured travel contradicts Nav2's linear command.
+
+    ``/cmd_vel`` is expressed in the robot base frame, while localization is in
+    the map frame.  This guard rotates the commanded direction by the measured
+    yaw, anchors it at the beginning of a sufficiently straight motion segment,
+    and compares it with the actual map displacement.  It deliberately ignores
+    in-place turns and small humanoid foot-placement transients.
+
+    The guard does not create motion or a replacement planner.  It only rejects
+    downstream forwarding after a clearly opposite displacement and therefore
+    remains subordinate to Nav2's navigation authority.
+    """
+
+    def __init__(
+        self,
+        *,
+        min_linear_mps: float = 0.10,
+        max_angular_rps: float = 0.20,
+        min_travel_m: float = 0.06,
+        max_reverse_m: float = 0.04,
+        direction_change_rad: float = math.radians(45.0),
+        clear_zero_s: float = 0.50,
+        clock=time.monotonic,
+    ) -> None:
+        positive = (
+            min_linear_mps,
+            max_angular_rps,
+            min_travel_m,
+            max_reverse_m,
+            direction_change_rad,
+            clear_zero_s,
+        )
+        if not all(math.isfinite(float(value)) and value > 0 for value in positive):
+            raise ValueError("motion direction guard limits must be finite and positive")
+        self.min_linear_mps = float(min_linear_mps)
+        self.max_angular_rps = float(max_angular_rps)
+        self.min_travel_m = float(min_travel_m)
+        self.max_reverse_m = float(max_reverse_m)
+        self.direction_change_rad = float(direction_change_rad)
+        self.clear_zero_s = float(clear_zero_s)
+        self._clock = clock
+        self._pose: tuple[float, float, float] | None = None
+        self._anchor: tuple[float, float] | None = None
+        self._expected: tuple[float, float] | None = None
+        self._zero_since: float | None = None
+        self.latched = False
+        self.reason: str | None = None
+
+    def observe_pose(self, x: float, y: float, yaw: float) -> bool:
+        values = tuple(float(value) for value in (x, y, yaw))
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("localization pose must be finite")
+        self._pose = values
+        if self.latched or self._anchor is None or self._expected is None:
+            return False
+
+        dx = values[0] - self._anchor[0]
+        dy = values[1] - self._anchor[1]
+        travel = math.hypot(dx, dy)
+        projection = dx * self._expected[0] + dy * self._expected[1]
+        if travel < self.min_travel_m or projection > -self.max_reverse_m:
+            return False
+
+        self.latched = True
+        self.reason = (
+            "measured base motion opposes Nav2 command "
+            f"(travel={travel:.3f}m, reverse_projection={-projection:.3f}m)"
+        )
+        self._zero_since = None
+        return True
+
+    def accept_command(self, vx: float, vy: float, wz: float) -> bool:
+        values = tuple(float(value) for value in (vx, vy, wz))
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("velocity command must be finite")
+        now = float(self._clock())
+        linear = math.hypot(values[0], values[1])
+        is_zero = linear < 1e-6 and abs(values[2]) < 1e-6
+
+        if self.latched:
+            if not is_zero:
+                self._zero_since = None
+                return False
+            if self._zero_since is None:
+                self._zero_since = now
+                return False
+            if now - self._zero_since < self.clear_zero_s:
+                return False
+            self.clear()
+            return True
+
+        self._zero_since = None
+        if self._pose is None:
+            self._anchor = None
+            self._expected = None
+            return True
+        if linear < self.min_linear_mps or abs(values[2]) > self.max_angular_rps:
+            # A Nav2 controller commonly inserts a turn while following one
+            # global goal.  Keep an existing straight-motion anchor through
+            # that transient; clearing it here lets an opposite displacement
+            # erase the only evidence that motion changed direction.  Do not
+            # create a new anchor for a turn or a sub-threshold command.
+            return True
+
+        local_x = values[0] / linear
+        local_y = values[1] / linear
+        cos_yaw = math.cos(self._pose[2])
+        sin_yaw = math.sin(self._pose[2])
+        expected = (
+            cos_yaw * local_x - sin_yaw * local_y,
+            sin_yaw * local_x + cos_yaw * local_y,
+        )
+        if self._expected is not None:
+            dot = max(-1.0, min(1.0, expected[0] * self._expected[0] + expected[1] * self._expected[1]))
+            if math.acos(dot) <= self.direction_change_rad:
+                return True
+        self._anchor = (self._pose[0], self._pose[1])
+        self._expected = expected
+        return True
+
+    def clear(self) -> None:
+        self.latched = False
+        self.reason = None
+        self._anchor = None
+        self._expected = None
+        self._zero_since = None
+
+
+class GoalProgressGuard:
+    """Fail closed when localization moves materially away from Nav2's goal.
+
+    This guard consumes the endpoint of Nav2's global ``Path`` and an
+    independently published map pose.  It is not a planner and does not judge
+    small detours: only a conservative regression beyond a configured distance
+    latches the downstream SONIC stop interlock.
+    """
+
+    def __init__(
+        self,
+        *,
+        min_progress_m: float = 0.05,
+        max_regression_m: float = 0.15,
+        goal_change_m: float = 0.10,
+        clear_zero_s: float = 0.50,
+        clock=time.monotonic,
+    ) -> None:
+        limits = (min_progress_m, max_regression_m, goal_change_m, clear_zero_s)
+        if not all(math.isfinite(float(value)) and value > 0 for value in limits):
+            raise ValueError("goal progress guard limits must be finite and positive")
+        self.min_progress_m = float(min_progress_m)
+        self.max_regression_m = float(max_regression_m)
+        self.goal_change_m = float(goal_change_m)
+        self.clear_zero_s = float(clear_zero_s)
+        self._clock = clock
+        self._goal: tuple[float, float] | None = None
+        self._pose: tuple[float, float] | None = None
+        self._initial_distance: float | None = None
+        self._best_distance: float | None = None
+        self._zero_since: float | None = None
+        self.latched = False
+        self.reason: str | None = None
+
+    @property
+    def goal(self) -> tuple[float, float] | None:
+        return self._goal
+
+    def observe_goal(self, x: float, y: float) -> bool:
+        goal = (float(x), float(y))
+        if not all(math.isfinite(value) for value in goal):
+            raise ValueError("Nav2 path goal must be finite")
+        if self._goal is not None and math.dist(goal, self._goal) <= self.goal_change_m:
+            return False
+        self._goal = goal
+        self._reset_progress()
+        if self._pose is not None:
+            distance = math.dist(self._pose, goal)
+            self._initial_distance = distance
+            self._best_distance = distance
+        return True
+
+    def observe_pose(self, x: float, y: float) -> bool:
+        pose = (float(x), float(y))
+        if not all(math.isfinite(value) for value in pose):
+            raise ValueError("localization pose must be finite")
+        self._pose = pose
+        if self.latched or self._goal is None:
+            return False
+
+        distance = math.dist(pose, self._goal)
+        if self._initial_distance is None or self._best_distance is None:
+            self._initial_distance = distance
+            self._best_distance = distance
+            return False
+        self._best_distance = min(self._best_distance, distance)
+        improved = self._initial_distance - self._best_distance
+        baseline = self._best_distance if improved >= self.min_progress_m else self._initial_distance
+        regression = distance - baseline
+        if regression <= self.max_regression_m:
+            return False
+
+        self.latched = True
+        self.reason = (
+            "measured base motion regresses from Nav2 goal "
+            f"(distance={distance:.3f}m, baseline={baseline:.3f}m, regression={regression:.3f}m)"
+        )
+        self._zero_since = None
+        return True
+
+    def accept_command(self, vx: float, vy: float, wz: float) -> bool:
+        values = tuple(float(value) for value in (vx, vy, wz))
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("velocity command must be finite")
+        if not self.latched:
+            self._zero_since = None
+            return True
+
+        now = float(self._clock())
+        is_zero = all(abs(value) < 1e-6 for value in values)
+        if not is_zero:
+            self._zero_since = None
+            return False
+        if self._zero_since is None:
+            self._zero_since = now
+            return False
+        if now - self._zero_since < self.clear_zero_s:
+            return False
+        self.clear()
+        return True
+
+    def clear(self) -> None:
+        self.latched = False
+        self.reason = None
+        self._zero_since = None
+        self._reset_progress()
+
+    def _reset_progress(self) -> None:
+        self._initial_distance = None
+        self._best_distance = None
+
+
+class TranslationHeadingGuard:
+    """Fail closed when measured yaw diverges from Nav2 during translation."""
+
+    def __init__(
+        self,
+        *,
+        min_linear_mps: float = 0.10,
+        max_heading_error_rad: float = 0.25,
+        max_expected_delta_rad: float = 0.05,
+        violation_s: float = 0.25,
+        clear_zero_s: float = 0.50,
+        clock=time.monotonic,
+    ) -> None:
+        limits = (
+            min_linear_mps,
+            max_heading_error_rad,
+            max_expected_delta_rad,
+            violation_s,
+            clear_zero_s,
+        )
+        if not all(math.isfinite(float(value)) and value > 0 for value in limits):
+            raise ValueError("translation heading guard limits must be finite and positive")
+        self.min_linear_mps = float(min_linear_mps)
+        self.max_heading_error_rad = float(max_heading_error_rad)
+        self.max_expected_delta_rad = float(max_expected_delta_rad)
+        self.violation_s = float(violation_s)
+        self.clear_zero_s = float(clear_zero_s)
+        self._clock = clock
+        self._latest_yaw: float | None = None
+        self._anchor_yaw: float | None = None
+        self._expected_delta = 0.0
+        self._last_command_at: float | None = None
+        self._active = False
+        self._violation_since: float | None = None
+        self._zero_since: float | None = None
+        self.latched = False
+        self.reason: str | None = None
+
+    def observe_pose(self, yaw: float) -> bool:
+        value = float(yaw)
+        if not math.isfinite(value):
+            raise ValueError("translation heading pose must be finite")
+        self._latest_yaw = self._wrap_angle(value)
+        if self.latched or not self._active:
+            return False
+        if self._anchor_yaw is None:
+            self._anchor_yaw = self._latest_yaw
+            self._expected_delta = 0.0
+            self._violation_since = None
+            return False
+        measured_delta = self._wrap_angle(self._latest_yaw - self._anchor_yaw)
+        error = abs(self._wrap_angle(measured_delta - self._expected_delta))
+        now = float(self._clock())
+        if error <= self.max_heading_error_rad:
+            self._violation_since = None
+            return False
+        if self._violation_since is None:
+            self._violation_since = now
+            return False
+        if now - self._violation_since < self.violation_s:
+            return False
+        self.latched = True
+        self.reason = (
+            "measured translation heading diverges from Nav2 command "
+            f"(error={error:.3f}rad, duration={self.violation_s:.2f}s)"
+        )
+        self._zero_since = None
+        return True
+
+    def accept_command(self, vx: float, vy: float, wz: float) -> bool:
+        values = tuple(float(value) for value in (vx, vy, wz))
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("translation heading velocity command must be finite")
+        now = float(self._clock())
+        linear = math.hypot(values[0], values[1])
+        is_zero = linear < 1e-6 and abs(values[2]) < 1e-6
+        if self.latched:
+            if not is_zero:
+                self._zero_since = None
+                return False
+            if self._zero_since is None:
+                self._zero_since = now
+                return False
+            if now - self._zero_since < self.clear_zero_s:
+                return False
+            self.clear()
+            return True
+
+        self._zero_since = None
+        if linear >= self.min_linear_mps:
+            if not self._active:
+                self._active = True
+                self._anchor_yaw = self._latest_yaw
+                self._expected_delta = 0.0
+                self._violation_since = None
+            elif self._last_command_at is not None:
+                dt = max(0.0, min(0.5, now - self._last_command_at))
+                integrated = self._wrap_angle(
+                    self._expected_delta + values[2] * dt
+                )
+                # The downstream CmdVelGuard intentionally constrains mixed
+                # translation/rotation corrections to this same bounded band.
+                # Comparing measured yaw with an unbounded integral of raw DWB
+                # ``wz`` creates a false interlock even though SONIC was never
+                # authorized to realize that accumulated turn.
+                self._expected_delta = max(
+                    -self.max_expected_delta_rad,
+                    min(self.max_expected_delta_rad, integrated),
+                )
+            self._last_command_at = now
+        else:
+            self._reset_tracking()
+        return True
+
+    def clear(self) -> None:
+        self.latched = False
+        self.reason = None
+        self._zero_since = None
+        self._reset_tracking()
+
+    def _reset_tracking(self) -> None:
+        self._active = False
+        self._anchor_yaw = None
+        self._expected_delta = 0.0
+        self._last_command_at = None
+        self._violation_since = None
+
+    @staticmethod
+    def _wrap_angle(value: float) -> float:
+        return (float(value) + math.pi) % (2.0 * math.pi) - math.pi
+
+
+class RotationDirectionGuard:
+    """Fail closed when a Nav2 Spin turns backward or translates too far."""
+
+    def __init__(
+        self,
+        *,
+        min_angular_rps: float = 0.08,
+        max_linear_mps: float = 0.05,
+        max_reverse_rad: float = 0.05,
+        max_translation_m: float = 0.15,
+        translation_violation_s: float = 0.50,
+        clear_zero_s: float = 0.50,
+        clock=time.monotonic,
+    ) -> None:
+        limits = (
+            min_angular_rps,
+            max_linear_mps,
+            max_reverse_rad,
+            max_translation_m,
+            translation_violation_s,
+            clear_zero_s,
+        )
+        if not all(math.isfinite(float(value)) and value > 0 for value in limits):
+            raise ValueError("rotation direction guard limits must be finite and positive")
+        self.min_angular_rps = float(min_angular_rps)
+        self.max_linear_mps = float(max_linear_mps)
+        self.max_reverse_rad = float(max_reverse_rad)
+        self.max_translation_m = float(max_translation_m)
+        self.translation_violation_s = float(translation_violation_s)
+        self.clear_zero_s = float(clear_zero_s)
+        self._clock = clock
+        self._pose: tuple[float, float, float] | None = None
+        self._anchor: tuple[float, float, float] | None = None
+        self._previous_yaw: float | None = None
+        self._cumulative_yaw = 0.0
+        self._sign = 0.0
+        self._translation_violation_since: float | None = None
+        self._zero_since: float | None = None
+        self.latched = False
+        self.reason: str | None = None
+
+    def observe_pose(self, x: float, y: float, yaw: float) -> bool:
+        pose = tuple(float(value) for value in (x, y, yaw))
+        if not all(math.isfinite(value) for value in pose):
+            raise ValueError("rotation localization pose must be finite")
+        self._pose = pose
+        if self.latched or self._anchor is None or not self._sign:
+            return False
+        # Integrate adjacent wrapped samples instead of wrapping the complete
+        # anchor-to-current delta.  A valid +pi Spin necessarily crosses the
+        # +pi/-pi representation boundary; wrapping the full displacement made
+        # +3.49 rad look like -2.79 rad and falsely latched a reverse-spin stop.
+        if self._previous_yaw is None:
+            self._previous_yaw = pose[2]
+        else:
+            self._cumulative_yaw += self._wrap_angle(pose[2] - self._previous_yaw)
+            self._previous_yaw = pose[2]
+        signed_progress = self._sign * self._cumulative_yaw
+        translation = math.hypot(pose[0] - self._anchor[0], pose[1] - self._anchor[1])
+        if signed_progress < -self.max_reverse_rad:
+            self._latch(
+                "measured base yaw opposes Nav2 Spin "
+                f"(reverse={-signed_progress:.3f}rad)"
+            )
+            return True
+        if translation <= self.max_translation_m:
+            self._translation_violation_since = None
+        elif self._translation_violation_since is None:
+            self._translation_violation_since = float(self._clock())
+        elif float(self._clock()) - self._translation_violation_since >= self.translation_violation_s:
+            self._latch(
+                "in-place Nav2 Spin persistently exceeded translation envelope "
+                f"(translation={translation:.3f}m, duration={self.translation_violation_s:.2f}s)"
+            )
+            return True
+        return False
+
+    def accept_command(self, vx: float, vy: float, wz: float) -> bool:
+        values = tuple(float(value) for value in (vx, vy, wz))
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("rotation velocity command must be finite")
+        now = float(self._clock())
+        linear = math.hypot(values[0], values[1])
+        is_zero = linear < 1e-6 and abs(values[2]) < 1e-6
+        if self.latched:
+            if not is_zero:
+                self._zero_since = None
+                return False
+            if self._zero_since is None:
+                self._zero_since = now
+                return False
+            if now - self._zero_since < self.clear_zero_s:
+                return False
+            self.clear()
+            return True
+
+        self._zero_since = None
+        pure_rotation = linear <= self.max_linear_mps and abs(values[2]) >= self.min_angular_rps
+        if pure_rotation and self._pose is not None:
+            sign = math.copysign(1.0, values[2])
+            if self._anchor is None or sign != self._sign:
+                self._anchor = self._pose
+                self._previous_yaw = self._pose[2]
+                self._cumulative_yaw = 0.0
+                self._sign = sign
+                self._translation_violation_since = None
+        elif is_zero:
+            self._anchor = None
+            self._previous_yaw = None
+            self._cumulative_yaw = 0.0
+            self._sign = 0.0
+            self._translation_violation_since = None
+        else:
+            self._anchor = None
+            self._previous_yaw = None
+            self._cumulative_yaw = 0.0
+            self._sign = 0.0
+            self._translation_violation_since = None
+        return True
+
+    def _latch(self, reason: str) -> None:
+        self.latched = True
+        self.reason = reason
+        self._zero_since = None
+
+    def clear(self) -> None:
+        self.latched = False
+        self.reason = None
+        self._anchor = None
+        self._previous_yaw = None
+        self._cumulative_yaw = 0.0
+        self._sign = 0.0
+        self._translation_violation_since = None
+        self._zero_since = None
+
+    @staticmethod
+    def _wrap_angle(value: float) -> float:
+        return (float(value) + math.pi) % (2.0 * math.pi) - math.pi
+
+
+@dataclass(frozen=True)
+class JointCommandDecision:
+    targets: tuple[float, ...]
+    static_hold_active: bool
+    motion_handoff_active: bool
+    handoff_ratio: float
+
+
+class StaticJointHandoff:
+    """Hold measured joints at rest and blend safely into SONIC locomotion.
+
+    SONIC's learned ``IDLE`` clip is a posture transition, not a zero-motion
+    actuator command.  The simulation bridge therefore latches measured joints
+    whenever Nav2 is idle, while still allowing the neural controller to update
+    internally. SONIC's learned IDLE clip is not a zero-displacement brake, so
+    every Nav2 zero/cancel immediately latches the measured posture. On the next
+    Nav2 command the handoff gives the asynchronous planner a short warm-up and
+    blends from the held pose into policy targets.
+    """
+
+    def __init__(
+        self,
+        *,
+        joint_count: int = 29,
+        warmup_s: float = 0.35,
+        blend_s: float = 0.40,
+        clock=time.monotonic,
+    ) -> None:
+        if isinstance(joint_count, bool) or int(joint_count) <= 0:
+            raise ValueError("joint_count must be a positive integer")
+        if not math.isfinite(float(warmup_s)) or float(warmup_s) < 0:
+            raise ValueError("warmup_s must be finite and non-negative")
+        if not math.isfinite(float(blend_s)) or float(blend_s) <= 0:
+            raise ValueError("blend_s must be finite and positive")
+        self.joint_count = int(joint_count)
+        self.warmup_s = float(warmup_s)
+        self.blend_s = float(blend_s)
+        self._clock = clock
+        self._hold: tuple[float, ...] | None = None
+        self._motion_started_at: float | None = None
+        self._active = False
+
+    def decide(
+        self,
+        *,
+        motion_active: bool,
+        measured: Sequence[float],
+        policy: Sequence[float],
+        now: float | None = None,
+    ) -> JointCommandDecision:
+        measured_values = self._validate(measured, "measured")
+        policy_values = self._validate(policy, "policy")
+        current = float(self._clock() if now is None else now)
+        if not math.isfinite(current):
+            raise ValueError("handoff time must be finite")
+
+        if not motion_active:
+            if self._active or self._hold is None:
+                self._hold = measured_values
+            self._active = False
+            self._motion_started_at = None
+            return JointCommandDecision(self._hold, True, False, 0.0)
+
+        if not self._active:
+            self._hold = measured_values
+            self._motion_started_at = current
+            self._active = True
+        assert self._hold is not None and self._motion_started_at is not None
+        elapsed = max(0.0, current - self._motion_started_at)
+        ratio = min(1.0, max(0.0, (elapsed - self.warmup_s) / self.blend_s))
+        targets = tuple(
+            held * (1.0 - ratio) + planned * ratio
+            for held, planned in zip(self._hold, policy_values, strict=True)
+        )
+        return JointCommandDecision(targets, False, ratio < 1.0, ratio)
+
+    def reset(self) -> None:
+        self._hold = None
+        self._motion_started_at = None
+        self._active = False
+
+    def _validate(self, values: Sequence[float], label: str) -> tuple[float, ...]:
+        result = tuple(float(value) for value in values)
+        if len(result) != self.joint_count:
+            raise ValueError(f"{label} joint vector must contain {self.joint_count} values")
+        if not all(math.isfinite(value) for value in result):
+            raise ValueError(f"{label} joint vector must be finite")
+        return result
+
+
+class ReplanIntentGate:
+    """Latch Nav2 intent so an asynchronous SONIC planner is not flooded.
+
+    Nav2 publishes continuously and makes tiny command corrections.  SONIC's
+    planner, in contrast, produces motion clips asynchronously; requesting a
+    new clip for every 50 Hz sample lets stale results overtake newer intent.
+    Start/stop transitions remain immediate, while in-motion updates are
+    admitted only when both meaningful and sufficiently spaced.
+    """
+
+    def __init__(
+        self,
+        *,
+        min_update_interval_s: float = 0.35,
+        min_speed_delta_mps: float = 0.05,
+        min_angle_delta_rad: float = 0.15,
+        clock=time.monotonic,
+    ) -> None:
+        limits = (min_update_interval_s, min_speed_delta_mps, min_angle_delta_rad)
+        if not all(math.isfinite(float(value)) and value > 0 for value in limits):
+            raise ValueError("replan gate limits must be finite and positive")
+        self.min_update_interval_s = float(min_update_interval_s)
+        self.min_speed_delta_mps = float(min_speed_delta_mps)
+        self.min_angle_delta_rad = float(min_angle_delta_rad)
+        self._clock = clock
+        self._last: MovementIntent | None = None
+        self._last_at = 0.0
+
+    @property
+    def last(self) -> MovementIntent | None:
+        return self._last
+
+    def admit(self, intent: MovementIntent, *, now: float | None = None) -> bool:
+        current = self._clock() if now is None else float(now)
+        if not math.isfinite(current):
+            raise ValueError("replan gate time must be finite")
+        if self._last is None:
+            return self._remember(intent, current)
+
+        # Safety transitions never wait for the planner debounce window.
+        if (
+            intent.mode != self._last.mode
+            or intent.has_movement != self._last.has_movement
+            or intent.stale != self._last.stale
+        ):
+            return self._remember(intent, current)
+        if current - self._last_at < self.min_update_interval_s:
+            return False
+
+        changed = (
+            abs(intent.speed_mps - self._last.speed_mps) >= self.min_speed_delta_mps
+            or self._angular_distance(intent.movement_angle_rad, self._last.movement_angle_rad)
+            >= self.min_angle_delta_rad
+            or self._angular_distance(intent.facing_angle_rad, self._last.facing_angle_rad)
+            >= self.min_angle_delta_rad
+        )
+        return self._remember(intent, current) if changed else False
+
+    def _remember(self, intent: MovementIntent, current: float) -> bool:
+        self._last = intent
+        self._last_at = current
+        return True
+
+    @staticmethod
+    def _angular_distance(left: float, right: float) -> float:
+        return abs((left - right + math.pi) % (2 * math.pi) - math.pi)
+
+
+class BodyStabilityGuard:
+    """Latch motion when measured roll/pitch shows an incipient fall.
+
+    This guard consumes localization only.  It cannot create an actuator
+    command; the ROS bridge uses its latch solely to reject further Nav2
+    velocity and engage the simulation emergency damping profile.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_tilt_rad: float = 0.30,
+        violation_s: float = 0.05,
+        recovery_s: float = 0.75,
+        clock=time.monotonic,
+    ) -> None:
+        values = (max_tilt_rad, violation_s, recovery_s)
+        if not all(math.isfinite(float(value)) and float(value) > 0 for value in values):
+            raise ValueError("body stability limits must be finite and positive")
+        if float(max_tilt_rad) >= math.pi / 2:
+            raise ValueError("body stability tilt limit must be below pi/2")
+        self.max_tilt_rad = float(max_tilt_rad)
+        self.violation_s = float(violation_s)
+        self.recovery_s = float(recovery_s)
+        self._clock = clock
+        self.latched = False
+        self.reason: str | None = None
+        self._violation_since: float | None = None
+        self._stable_since: float | None = None
+        self._zero_since: float | None = None
+
+    def observe(self, roll: float, pitch: float, *, now: float | None = None) -> bool:
+        values = (float(roll), float(pitch))
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("body orientation must be finite")
+        current = float(self._clock() if now is None else now)
+        tilt = max(abs(values[0]), abs(values[1]))
+        tripped = False
+        if tilt > self.max_tilt_rad:
+            self._stable_since = None
+            if self._violation_since is None:
+                self._violation_since = current
+            if not self.latched and current - self._violation_since >= self.violation_s:
+                self.latched = True
+                self.reason = (
+                    "measured G1 body tilt exceeded safety envelope "
+                    f"({tilt:.3f} rad > {self.max_tilt_rad:.3f} rad)"
+                )
+                tripped = True
+        else:
+            self._violation_since = None
+            if self.latched:
+                if self._stable_since is None:
+                    self._stable_since = current
+        return tripped
+
+    def admit_command(
+        self,
+        vx: float,
+        vy: float,
+        wz: float,
+        *,
+        now: float | None = None,
+    ) -> bool:
+        values = (float(vx), float(vy), float(wz))
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("body stability command must be finite")
+        if not self.latched:
+            return True
+        current = float(self._clock() if now is None else now)
+        nonzero = any(abs(value) > 1e-6 for value in values)
+        if nonzero:
+            self._zero_since = None
+            return False
+        if self._zero_since is None:
+            self._zero_since = current
+        if (
+            self._stable_since is not None
+            and current - max(self._stable_since, self._zero_since) >= self.recovery_s
+        ):
+            self.clear()
+        return True
+
+    def clear(self) -> None:
+        self.latched = False
+        self.reason = None
+        self._violation_since = None
+        self._stable_since = None
+        self._zero_since = None
+
+
+class CmdVelGuard:
+    """Clamp, smooth and expire Nav2 commands before they reach SONIC.
+
+    The class contains no ROS or MuJoCo imports, making it independently
+    testable and keeping the actuator boundary auditable.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_linear_mps: float = 0.25,
+        min_walk_command_mps: float = 0.10,
+        max_angular_rps: float = 0.5,
+        max_facing_lead_rad: float = 0.05,
+        max_translation_facing_offset_rad: float = 0.05,
+        timeout_s: float = 0.25,
+        smoothing_alpha: float = 0.35,
+        clock=time.monotonic,
+    ) -> None:
+        if (
+            max_linear_mps <= 0
+            or max_angular_rps <= 0
+            or max_facing_lead_rad <= 0
+            or max_translation_facing_offset_rad <= 0
+            or timeout_s <= 0
+        ):
+            raise ValueError("guard limits must be positive")
+        if max_translation_facing_offset_rad > max_facing_lead_rad:
+            raise ValueError(
+                "max_translation_facing_offset_rad must not exceed max_facing_lead_rad"
+            )
+        if not 0 < min_walk_command_mps < max_linear_mps:
+            raise ValueError("min_walk_command_mps must be in (0, max_linear_mps)")
+        if not 0 < smoothing_alpha <= 1:
+            raise ValueError("smoothing_alpha must be in (0, 1]")
+        self.max_linear_mps = float(max_linear_mps)
+        self.min_walk_command_mps = float(min_walk_command_mps)
+        self.max_angular_rps = float(max_angular_rps)
+        self.max_facing_lead_rad = float(max_facing_lead_rad)
+        self.max_translation_facing_offset_rad = float(
+            max_translation_facing_offset_rad
+        )
+        self.timeout_s = float(timeout_s)
+        self.smoothing_alpha = float(smoothing_alpha)
+        self._clock = clock
+        self._last = CmdVel(0.0, 0.0, 0.0, 0.0, source="boot")
+        self._vx = 0.0
+        self._vy = 0.0
+        self._wz = 0.0
+        self._facing = 0.0
+        self._measured_heading: float | None = None
+        self._heading_anchor: float | None = None
+        self._action_facing_origin = 0.0
+        self._turn_sign = 0.0
+
+    @property
+    def last_received_at(self) -> float | None:
+        """Monotonic timestamp of the first accepted command, if any."""
+        return None if self._last.source == "boot" else self._last.received_at
+
+    @property
+    def measured_heading(self) -> float | None:
+        return self._measured_heading
+
+    def observe_heading(self, yaw: float) -> None:
+        """Anchor SONIC's global facing frame to measured ``map→base`` yaw.
+
+        Nav2 publishes angular velocity, not an absolute facing target.  Purely
+        integrating that velocity lets the learned planner's facing frame drift
+        without bound whenever the humanoid cannot immediately realize a turn.
+        The measured heading remains observation-only: it cannot create motion,
+        and a new facing target is still advanced solely by Nav2's ``wz``.
+        """
+
+        value = float(yaw)
+        if not math.isfinite(value):
+            raise ValueError("measured heading must be finite")
+        self._measured_heading = self._wrap_angle(value)
+
+    def accept(self, vx: float, vy: float, wz: float, *, source: str = "nav2", received_at: float | None = None) -> CmdVel:
+        values = (float(vx), float(vy), float(wz))
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("cmd_vel values must be finite")
+        norm = math.hypot(values[0], values[1])
+        scale = min(1.0, self.max_linear_mps / norm) if norm else 1.0
+        target = CmdVel(
+            values[0] * scale,
+            values[1] * scale,
+            max(-self.max_angular_rps, min(self.max_angular_rps, values[2])),
+            self._clock() if received_at is None else float(received_at),
+            source=source,
+        )
+        starting = self._is_nonzero(target) and not self._is_nonzero(self._last)
+        if starting:
+            # SONIC's movement/facing vectors live in the controller frame
+            # accumulated since this controller was initialized.  Preserve that
+            # canonical heading across Nav2 actions: the async planner's context
+            # still contains the preceding motion heading even when the physical
+            # decoder is re-anchored to the latest measured IMU pose.
+            self._heading_anchor = self._measured_heading
+            self._action_facing_origin = self._facing
+            self._turn_sign = 0.0
+            # SONIC plans asynchronously.  Starting a pure Spin from the first
+            # smoothed ~milliradian increment creates a near-static plan which
+            # can arrive after a newer turning plan and pull the body back.  A
+            # bounded look-ahead target gives the very first plan a meaningful
+            # turn while the direction and continued progression still come
+            # exclusively from Nav2's angular velocity.
+            if math.hypot(target.vx, target.vy) < self.min_walk_command_mps and abs(target.wz) >= 0.05:
+                self._turn_sign = math.copysign(1.0, target.wz)
+                self._facing = self._wrap_angle(
+                    self._action_facing_origin
+                    + self._turn_sign * self.max_facing_lead_rad
+                )
+        self._last = target
+        return target
+
+    def stop(self, *, source: str = "watchdog") -> CmdVel:
+        return self.accept(0.0, 0.0, 0.0, source=source)
+
+    def intent(self, now: float | None = None, dt: float = 0.02) -> MovementIntent:
+        current = self._clock() if now is None else float(now)
+        stale = current - self._last.received_at > self.timeout_s
+        target = CmdVel(0.0, 0.0, 0.0, self._last.received_at, source="watchdog") if stale else self._last
+        # A zero from Nav2 is a safety/terminal transition, not another noisy
+        # velocity sample.  Applying the normal low-pass tail here kept SONIC
+        # in SLOW_WALK after Nav2 had already completed or cancelled Spin.
+        alpha = 1.0 if stale or not self._is_nonzero(target) else self.smoothing_alpha
+        self._vx += (target.vx - self._vx) * alpha
+        self._vy += (target.vy - self._vy) * alpha
+        self._wz += (target.wz - self._wz) * alpha
+        integrated_facing = self._wrap_angle(self._facing + self._wz * max(0.0, float(dt)))
+        speed = math.hypot(self._vx, self._vy)
+        moving = speed >= self.min_walk_command_mps and not stale
+        rotating = abs(self._wz) >= 0.05 and not stale
+        if moving and not self._turn_sign:
+            # Mixed vx/wz from DWB is a small path-following correction, not
+            # permission to turn the humanoid arbitrarily while translating.
+            # Following measured yaw here formed a positive feedback loop:
+            # gait drift became the next SONIC facing target.  Keep the target
+            # in a tight band around the action's reviewed starting heading;
+            # larger orientation changes are performed by Nav2's pure Spin.
+            relative = self._wrap_angle(
+                integrated_facing - self._action_facing_origin
+            )
+            relative = max(
+                -self.max_translation_facing_offset_rad,
+                min(self.max_translation_facing_offset_rad, relative),
+            )
+            integrated_facing = self._wrap_angle(
+                self._action_facing_origin + relative
+            )
+        elif rotating and self._measured_heading is not None and self._heading_anchor is not None:
+            measured_progress = self._wrap_angle(self._measured_heading - self._heading_anchor)
+            relative_integrated = self._wrap_angle(
+                integrated_facing - self._action_facing_origin
+            )
+            if self._turn_sign:
+                signed_progress = max(0.0, self._turn_sign * measured_progress)
+                signed_target = max(
+                    self.max_facing_lead_rad,
+                    self._turn_sign * relative_integrated,
+                )
+                signed_target = min(signed_target, signed_progress + self.max_facing_lead_rad)
+                integrated_facing = self._wrap_angle(
+                    self._action_facing_origin + self._turn_sign * signed_target
+                )
+            else:
+                lead = self._wrap_angle(relative_integrated - measured_progress)
+                lead = max(-self.max_facing_lead_rad, min(self.max_facing_lead_rad, lead))
+                integrated_facing = self._wrap_angle(
+                    self._action_facing_origin + measured_progress + lead
+                )
+        self._facing = integrated_facing
+        # SONIC SLOW_WALK cannot faithfully execute Nav2's arbitrarily small
+        # terminal velocities: the model clamps them to at least 0.2 m/s.
+        # Stop below this command deadband instead of repeatedly overshooting
+        # the reviewed goal pose.
+        # Nav2 Twist linear velocity is expressed in ``base_link``.  SONIC's
+        # movement angle is expressed in the controller's heading frame (the
+        # same convention used by its joystick adapter), so a base-forward
+        # command after a turn must follow the accumulated facing angle rather
+        # than remain pinned to the original world +X direction.
+        angle = self._facing + math.atan2(self._vy, self._vx) if moving else self._facing
+        return MovementIntent(
+            # SONIC represents an in-place facing change as a slow-walk plan
+            # with a zero movement vector.  This is still initiated solely by
+            # Nav2's angular cmd_vel and never bypasses the navigation owner.
+            mode="SLOW_WALK" if moving or rotating else "IDLE",
+            speed_mps=min(speed, self.max_linear_mps),
+            movement_angle_rad=angle,
+            facing_angle_rad=self._facing,
+            has_movement=moving,
+            stale=stale,
+            source=target.source,
+        )
+
+    @staticmethod
+    def _is_nonzero(command: CmdVel) -> bool:
+        return any(abs(value) > 1e-6 for value in (command.vx, command.vy, command.wz))
+
+    @staticmethod
+    def _wrap_angle(value: float) -> float:
+        return (float(value) + math.pi) % (2.0 * math.pi) - math.pi
+
+
+@dataclass(frozen=True)
+class JointGuardResult:
+    targets: tuple[float, ...]
+    constrained_joints: int
+    max_step_rad: float
+
+
+class NavigationArmGuard:
+    """Keep SONIC arm targets inside the navigation-only safety envelope.
+
+    SONIC is a whole-body policy, so even a Nav2 walking command can produce
+    targets for all fourteen arm joints.  H-IDE's current simulation profile
+    has no manipulation capability; large upper-body excursions are therefore
+    neither required nor safe.  This guard preserves a small counter-swing,
+    while bounding absolute travel and per-tick slew after policy inference.
+
+    It deliberately runs *after* SONIC and before ``rt/lowcmd``.  The lower
+    body and waist remain untouched, and this guard cannot create motion on its
+    own.
+    """
+
+    def __init__(
+        self,
+        nominal: Sequence[float],
+        *,
+        max_deviation_rad: Sequence[float],
+        max_velocity_rps: Sequence[float],
+    ) -> None:
+        self.nominal = tuple(float(value) for value in nominal)
+        self.max_deviation_rad = tuple(float(value) for value in max_deviation_rad)
+        self.max_velocity_rps = tuple(float(value) for value in max_velocity_rps)
+        if not self.nominal:
+            raise ValueError("arm guard requires at least one joint")
+        if not (
+            len(self.nominal) == len(self.max_deviation_rad) == len(self.max_velocity_rps)
+        ):
+            raise ValueError("arm guard vectors must have matching lengths")
+        if not all(math.isfinite(value) for value in self.nominal):
+            raise ValueError("arm nominal targets must be finite")
+        if not all(math.isfinite(value) and value > 0 for value in self.max_deviation_rad):
+            raise ValueError("arm deviations must be finite and positive")
+        if not all(math.isfinite(value) and value > 0 for value in self.max_velocity_rps):
+            raise ValueError("arm velocity limits must be finite and positive")
+        self._last: tuple[float, ...] | None = None
+
+    def apply(
+        self,
+        targets: Sequence[float],
+        *,
+        dt: float,
+        measured: Sequence[float] | None = None,
+    ) -> JointGuardResult:
+        if len(targets) != len(self.nominal):
+            raise ValueError("arm target vector has an unexpected length")
+        if measured is not None and len(measured) != len(self.nominal):
+            raise ValueError("measured arm vector has an unexpected length")
+        if not math.isfinite(float(dt)) or dt <= 0:
+            raise ValueError("arm guard dt must be finite and positive")
+
+        if self._last is None:
+            initial = measured if measured is not None else self.nominal
+            anchor = tuple(
+                self._clamp_to_envelope(float(value), index)
+                if math.isfinite(float(value))
+                else self.nominal[index]
+                for index, value in enumerate(initial)
+            )
+        else:
+            anchor = self._last
+
+        guarded: list[float] = []
+        constrained = 0
+        max_step = 0.0
+        for index, raw_value in enumerate(targets):
+            raw = float(raw_value)
+            if not math.isfinite(raw):
+                raw = self.nominal[index]
+                constrained += 1
+            bounded = self._clamp_to_envelope(raw, index)
+            if not math.isclose(bounded, raw, rel_tol=0.0, abs_tol=1e-9):
+                constrained += 1
+            allowed_step = self.max_velocity_rps[index] * float(dt)
+            delta = bounded - anchor[index]
+            step = max(-allowed_step, min(allowed_step, delta))
+            if not math.isclose(step, delta, rel_tol=0.0, abs_tol=1e-9):
+                constrained += 1
+            guarded.append(anchor[index] + step)
+            max_step = max(max_step, abs(step))
+
+        self._last = tuple(guarded)
+        return JointGuardResult(self._last, min(constrained, len(self.nominal)), max_step)
+
+    def reset(self) -> None:
+        self._last = None
+
+    def _clamp_to_envelope(self, value: float, index: int) -> float:
+        center = self.nominal[index]
+        radius = self.max_deviation_rad[index]
+        return max(center - radius, min(center + radius, value))
