@@ -19,8 +19,8 @@ import os
 from pathlib import Path
 import threading
 import time
-from typing import Any
-from uuid import uuid4
+from typing import Any, Mapping
+from uuid import UUID, uuid4
 
 from .config import SimConfig
 from .motion_fault import (
@@ -28,6 +28,15 @@ from .motion_fault import (
     validate_sonic_health_request,
 )
 from .network import require_loopback_bind_host
+from .normal_stop import NormalStopSnapshot, NormalStopState
+from .normal_stop_wire import (
+    NormalStopBeginRequest,
+    NormalStopWireError,
+    canonical_normal_stop_json,
+    normal_stop_response,
+    parse_normal_stop_request,
+    parse_normal_stop_response,
+)
 from .planner_evidence import (
     PlannerReferenceDeadlineExceeded,
     PlannerReferenceEvidenceGate,
@@ -58,6 +67,46 @@ from .transport import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+_NORMAL_STOP_INTENT_FIELDS = frozenset(
+    {
+        "type",
+        "schema_version",
+        "sequence",
+        "generation",
+        "generated_at_s",
+        "state",
+        "mode",
+        "velocity_x_mps",
+        "velocity_y_mps",
+        "linear_speed_mps",
+        "movement_angle_rad",
+        "yaw_rate_rps",
+        "facing_delta_rad",
+        "motion_enabled",
+        "stop_requested",
+        "stop_acknowledged",
+        "head_yaw_rad",
+        "head_pitch_rad",
+        "source",
+        "reason",
+    }
+)
+_NORMAL_STOP_ZERO_FIELDS = (
+    "velocity_x_mps",
+    "velocity_y_mps",
+    "linear_speed_mps",
+    "movement_angle_rad",
+    "yaw_rate_rps",
+    "facing_delta_rad",
+    "head_yaw_rad",
+    "head_pitch_rad",
+)
+
+
+class _NormalStopBoundaryError(RuntimeError):
+    """A local actuator/reference stop boundary could not be established."""
 
 
 def _bind_command_server(host: str, port: int):
@@ -410,6 +459,17 @@ class SonicDriver:
         self._last_published_targets: tuple[float, ...] | None = None
         self._safe_hold_targets: tuple[float, ...] | None = None
         self._support_lock = threading.RLock()
+        self._normal_stop = NormalStopState()
+        self._normal_stop_bridge_boot_id: UUID | None = None
+        self._normal_stop_seen_bridge_boot_ids: set[UUID] = set()
+        self._normal_stop_plant_safety_stop_epoch: int | None = None
+        self._normal_stop_last_confirmed_plant_epoch = 0
+        self._normal_stop_begin_intent: bytes | None = None
+        self._normal_stop_seen_request_ids: set[UUID] = set()
+        self._normal_stop_replays: dict[
+            UUID,
+            tuple[bytes, dict[str, object]],
+        ] = {}
         self._reference_authority = ReferenceAuthorityState()
         self._reference_source_identity: tuple[int, int] | None = None
         self._reference_request_pending = False
@@ -1551,11 +1611,23 @@ class SonicDriver:
             last_error=None,
         )
 
+    def _support_transition_token_locked(self) -> tuple[int, int | None]:
+        """Correlate support I/O with the stop epoch and ingress generation."""
+
+        normal_stop = getattr(self, "_normal_stop", None)
+        stop_epoch = (
+            normal_stop.snapshot.stop_epoch
+            if isinstance(normal_stop, NormalStopState)
+            else 0
+        )
+        return stop_epoch, self._intent_ingress.generation
+
     def _set_plant_support_mode(self, mode: str) -> bool:
         """Switch only MuJoCo's confirmed fall-arrest profile over loopback."""
 
         self.telemetry.update(plant_support_requested_mode=mode)
         with self._support_lock:
+            transition_token = self._support_transition_token_locked()
             if (
                 self._plant_support_stop_pending
                 or self._plant_support_safety_latched
@@ -1593,6 +1665,22 @@ class SonicDriver:
                     ),
                 )
                 return False
+            normal_stop = getattr(self, "_normal_stop", None)
+            normal_stop_phase = (
+                normal_stop.snapshot.phase
+                if isinstance(normal_stop, NormalStopState)
+                else "NONE"
+            )
+            if normal_stop_phase in {
+                "BRAKING",
+                "STATIONARY_ACK",
+                "PLANT_CONFIRMED",
+                "FAILED",
+            }:
+                # Braking needs ordinary support until measured stationarity.
+                # Never let a new control-loop request reach Plant while the
+                # correlated stop owns this boundary.
+                return mode == "idle"
             if mode == self._plant_support_mode:
                 return True
         try:
@@ -1603,28 +1691,56 @@ class SonicDriver:
                 timeout=0.20,
             )
         except Exception as exc:
-            self.telemetry.update(
-                plant_support_mode="unavailable",
-                plant_support_confirmed_mode="unavailable",
-                last_error=f"MuJoCo support transition failed: {exc}",
-            )
-            return False
-        confirmed_mode = str(state.get("mode", ""))
-        if confirmed_mode != mode:
-            self.telemetry.update(
-                plant_support_mode="unavailable",
-                plant_support_confirmed_mode="unavailable",
-                last_error=(
-                    "MuJoCo support transition returned an unexpected confirmed mode"
-                ),
-            )
+            with self._support_lock:
+                if transition_token != self._support_transition_token_locked():
+                    return False
+                self.telemetry.update(
+                    plant_support_mode="unavailable",
+                    plant_support_confirmed_mode="unavailable",
+                    last_error=f"MuJoCo support transition failed: {exc}",
+                )
             return False
         with self._support_lock:
+            if transition_token != self._support_transition_token_locked():
+                # A normal-stop begin or generation change won while this HTTP
+                # call was in flight.  Drop the obsolete response locally.  In
+                # particular, do not use the legacy pending-stop strengthening
+                # path, which would touch Plant before stationary evidence.
+                return False
+        confirmed_mode = str(state.get("mode", ""))
+        if confirmed_mode != mode:
+            with self._support_lock:
+                if transition_token != self._support_transition_token_locked():
+                    return False
+                self.telemetry.update(
+                    plant_support_mode="unavailable",
+                    plant_support_confirmed_mode="unavailable",
+                    last_error=(
+                        "MuJoCo support transition returned an unexpected "
+                        "confirmed mode"
+                    ),
+                )
+            return False
+        with self._support_lock:
+            if transition_token != self._support_transition_token_locked():
+                return False
             stop_raced_transition = (
                 self._plant_support_stop_pending
                 or self._plant_support_safety_latched
             )
             stop_already_confirmed = self._plant_support_safety_latched
+            if not stop_raced_transition:
+                # Token validation, safety flags, local mode, and health-facing
+                # telemetry are one support-lock commit.  A normal stop cannot
+                # enter between the last validation and this write.
+                self._plant_support_mode = confirmed_mode
+                self.telemetry.update(
+                    plant_support_mode=confirmed_mode,
+                    plant_support_confirmed_mode=confirmed_mode,
+                    plant_support_stop_pending=False,
+                    plant_support_safety_latched=False,
+                )
+                return True
         if stop_raced_transition:
             # Never let a slower idle/locomotion response erase a stronger
             # stop accepted on the command thread while this request was in
@@ -1635,15 +1751,7 @@ class SonicDriver:
                     reason="Plant safety-stop raced a support transition"
                 )
             return mode != "locomotion"
-        with self._support_lock:
-            self._plant_support_mode = confirmed_mode
-        self.telemetry.update(
-            plant_support_mode=confirmed_mode,
-            plant_support_confirmed_mode=confirmed_mode,
-            plant_support_stop_pending=False,
-            plant_support_safety_latched=False,
-        )
-        return True
+        raise AssertionError("unreachable Plant support transition state")
 
     def _planner_reference_cursor(self) -> int | None:
         controller = getattr(self, "_controller", None)
@@ -2584,7 +2692,345 @@ class SonicDriver:
             with condition:
                 condition.notify_all()
 
+    def _ensure_normal_stop_runtime_locked(self) -> NormalStopState:
+        """Initialize normal-stop fields for lightweight/offline driver shells."""
+
+        state = getattr(self, "_normal_stop", None)
+        if state is None:
+            state = NormalStopState()
+            self._normal_stop = state
+        if not isinstance(state, NormalStopState):
+            raise RuntimeError("normal-stop state is invalid")
+        if not hasattr(self, "_normal_stop_bridge_boot_id"):
+            self._normal_stop_bridge_boot_id = None
+        if not hasattr(self, "_normal_stop_seen_bridge_boot_ids"):
+            self._normal_stop_seen_bridge_boot_ids = set()
+        if not hasattr(self, "_normal_stop_plant_safety_stop_epoch"):
+            self._normal_stop_plant_safety_stop_epoch = None
+        if not hasattr(self, "_normal_stop_last_confirmed_plant_epoch"):
+            self._normal_stop_last_confirmed_plant_epoch = 0
+        if not hasattr(self, "_normal_stop_begin_intent"):
+            self._normal_stop_begin_intent = None
+        if not hasattr(self, "_normal_stop_seen_request_ids"):
+            self._normal_stop_seen_request_ids = set()
+        if not hasattr(self, "_normal_stop_replays"):
+            self._normal_stop_replays = {}
+        return state
+
+    @staticmethod
+    def _validate_normal_stop_intent(
+        value: Mapping[str, object],
+        *,
+        expected_state: str,
+        expected_stop_acknowledged: bool,
+    ) -> tuple[dict[str, object], int, int]:
+        """Validate an exact, zero gait envelope before ingress can mutate."""
+
+        if not isinstance(value, Mapping):
+            raise NormalStopWireError("normal-stop intent must be an object")
+        fields = set(value)
+        allowed = (
+            _NORMAL_STOP_INTENT_FIELDS,
+            _NORMAL_STOP_INTENT_FIELDS | {"measured_heading_yaw"},
+        )
+        if fields not in allowed:
+            raise NormalStopWireError("normal-stop intent fields do not match v1")
+        intent = dict(value)
+        if (
+            intent.get("type") != "sonic_intent"
+            or intent.get("schema_version") != "h-ide.sonic-intent/v1"
+            or intent.get("source") != "nav2"
+            or intent.get("state") != expected_state
+            or intent.get("mode") != "IDLE"
+            or intent.get("motion_enabled") is not False
+            or intent.get("stop_requested") is not True
+            or intent.get("stop_acknowledged") is not expected_stop_acknowledged
+        ):
+            raise NormalStopWireError(
+                f"normal-stop intent is not an exact {expected_state} stop"
+            )
+        generation = intent.get("generation")
+        sequence = intent.get("sequence")
+        if (
+            isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 0
+        ):
+            raise NormalStopWireError("normal-stop intent generation is invalid")
+        if (
+            isinstance(sequence, bool)
+            or not isinstance(sequence, int)
+            or sequence < 1
+        ):
+            raise NormalStopWireError("normal-stop intent sequence is invalid")
+        generated_at = intent.get("generated_at_s")
+        if (
+            isinstance(generated_at, bool)
+            or not isinstance(generated_at, (int, float))
+            or not math.isfinite(float(generated_at))
+            or float(generated_at) < 0.0
+        ):
+            raise NormalStopWireError("normal-stop intent timestamp is invalid")
+        reason = intent.get("reason")
+        if reason is not None and (
+            not isinstance(reason, str)
+            or len(reason) > 512
+            or "\x00" in reason
+        ):
+            raise NormalStopWireError("normal-stop intent reason is invalid")
+        for name in _NORMAL_STOP_ZERO_FIELDS:
+            raw = intent.get(name)
+            if (
+                isinstance(raw, bool)
+                or not isinstance(raw, (int, float))
+                or not math.isfinite(float(raw))
+                or float(raw) != 0.0
+            ):
+                raise NormalStopWireError(
+                    f"normal-stop intent {name} must be exactly zero"
+                )
+        if "measured_heading_yaw" in intent:
+            measured = intent["measured_heading_yaw"]
+            if (
+                isinstance(measured, bool)
+                or not isinstance(measured, (int, float))
+                or not math.isfinite(float(measured))
+            ):
+                raise NormalStopWireError(
+                    "normal-stop measured heading must be finite"
+                )
+        return intent, generation, sequence
+
+    def _normal_stop_replay_locked(
+        self,
+        *,
+        request_id: UUID,
+        canonical_request: bytes,
+    ) -> dict[str, object] | None:
+        replay = self._normal_stop_replays.get(request_id)
+        if replay is not None:
+            previous_request, previous_response = replay
+            if previous_request != canonical_request:
+                raise NormalStopWireError(
+                    "normal-stop request_id was reused with another payload"
+                )
+            return copy.deepcopy(previous_response)
+        if request_id in self._normal_stop_seen_request_ids:
+            raise NormalStopWireError("normal-stop request_id belongs to an older transaction")
+        return None
+
+    def _record_normal_stop_replay_locked(
+        self,
+        *,
+        request_id: UUID,
+        canonical_request: bytes,
+        response: dict[str, object],
+    ) -> dict[str, object]:
+        self._normal_stop_seen_request_ids.add(request_id)
+        self._normal_stop_replays[request_id] = (
+            canonical_request,
+            copy.deepcopy(response),
+        )
+        return copy.deepcopy(response)
+
+    def _normal_stop_response_locked(
+        self,
+        *,
+        request_id: UUID,
+        snapshot: NormalStopSnapshot,
+        plant_epoch: int | None,
+        expected_phases: frozenset[str],
+    ) -> dict[str, object]:
+        response = normal_stop_response(
+            request_id=request_id,
+            ok=snapshot.phase != "FAILED",
+            robot_id=self.config.robot_id,
+            driver_boot_id=self._driver_boot_id,
+            snapshot=snapshot,
+            plant_safety_stop_epoch=plant_epoch,
+        )
+        identity = snapshot.identity
+        assert identity is not None
+        parse_normal_stop_response(
+            response,
+            expected_request_id=request_id,
+            expected_robot_id=self.config.robot_id,
+            expected_driver_boot_id=self._driver_boot_id,
+            expected_identity=identity,
+            expected_control_generation=identity.control_generation,
+            expected_gait_source_sequence=identity.gait_source_sequence,
+            expected_phases=expected_phases,
+        )
+        return response
+
+    def _handle_normal_stop_begin(
+        self,
+        payload: Mapping[str, object],
+    ) -> dict[str, object]:
+        canonical_request = canonical_normal_stop_json(payload)
+        request = parse_normal_stop_request(
+            payload,
+            expected_robot_id=self.config.robot_id,
+        )
+        if not isinstance(request, NormalStopBeginRequest):
+            raise NormalStopWireError("normal-stop begin request type is invalid")
+        intent, generation, sequence = self._validate_normal_stop_intent(
+            request.intent,
+            expected_state="STOPPING",
+            expected_stop_acknowledged=False,
+        )
+        intent_signature = canonical_normal_stop_json(intent)
+        try:
+            with self._support_lock:
+                state = self._ensure_normal_stop_runtime_locked()
+                current = state.snapshot
+                active_bridge_boot = self._normal_stop_bridge_boot_id
+                if self._fault_latched.is_set():
+                    raise RuntimeError(
+                        "SONIC terminal fault cannot enter normal stop"
+                    )
+                if self._stop.is_set():
+                    raise RuntimeError("SONIC shutdown cannot enter normal stop")
+                if (
+                    current.phase != "NONE"
+                    and request.bridge_boot_id != active_bridge_boot
+                    and request.bridge_boot_id
+                    in self._normal_stop_seen_bridge_boot_ids
+                ):
+                    raise NormalStopWireError(
+                        "normal-stop begin belongs to an older bridge boot"
+                    )
+                replay = self._normal_stop_replay_locked(
+                    request_id=request.request_id,
+                    canonical_request=canonical_request,
+                )
+                if replay is not None:
+                    return replay
+
+                same_association = (
+                    current.control_generation == generation
+                    and current.gait_source_sequence == sequence
+                )
+                if active_bridge_boot is None:
+                    if current.phase != "NONE":
+                        raise RuntimeError(
+                            "normal-stop bridge binding is missing"
+                        )
+                    allow_sequence_reset = False
+                elif request.bridge_boot_id == active_bridge_boot:
+                    allow_sequence_reset = False
+                else:
+                    if current.phase != "DRIVER_CONFIRMED":
+                        raise NormalStopWireError(
+                            "bridge boot changed during an active normal stop"
+                        )
+                    assert current.control_generation is not None
+                    if generation <= current.control_generation:
+                        raise NormalStopWireError(
+                            "new bridge boot requires a newer control generation"
+                        )
+                    allow_sequence_reset = True
+
+                if same_association:
+                    if (
+                        request.bridge_boot_id != active_bridge_boot
+                        or current.phase != "BRAKING"
+                        or intent_signature != self._normal_stop_begin_intent
+                    ):
+                        raise NormalStopWireError(
+                            "normal-stop begin retry does not match the braking request"
+                        )
+                    snapshot = state.begin(
+                        control_generation=generation,
+                        gait_source_sequence=sequence,
+                    )
+                else:
+                    if current.phase == "FAILED":
+                        raise NormalStopWireError(
+                            "normal-stop failure requires a driver restart"
+                        )
+                    if current.phase in {
+                        "BRAKING",
+                        "STATIONARY_ACK",
+                        "PLANT_CONFIRMED",
+                    }:
+                        raise NormalStopWireError(
+                            "another normal-stop transaction is active"
+                        )
+                    if current.phase == "DRIVER_CONFIRMED":
+                        assert current.control_generation is not None
+                        assert current.gait_source_sequence is not None
+                        if generation <= current.control_generation:
+                            raise NormalStopWireError(
+                                "normal stop requires a newer control generation"
+                            )
+                        if (
+                            sequence <= current.gait_source_sequence
+                            and not allow_sequence_reset
+                        ):
+                            raise NormalStopWireError(
+                                "same bridge boot requires a newer gait source sequence"
+                            )
+                    decision = self._intent_ingress.accept(intent)
+                    if (
+                        decision.action != "stop"
+                        or decision.state != "STOPPING"
+                        or decision.generation != generation
+                        or decision.sequence != sequence
+                    ):
+                        raise NormalStopWireError(
+                            "normal-stop begin intent was not admitted exactly"
+                        )
+                    self._intent_ingress.revoke()
+                    try:
+                        self._stop_navigation_at_boundary(
+                            source="normal_stop_begin",
+                            publish_telemetry=False,
+                        )
+                    except Exception as exc:
+                        raise _NormalStopBoundaryError(str(exc)) from exc
+                    self._static_hold_active = True
+                    with self._terminal_fault_lock:
+                        if self._fault_latched.is_set():
+                            raise RuntimeError(
+                                "SONIC terminal fault won normal-stop begin"
+                            )
+                        snapshot = state.begin(
+                            control_generation=generation,
+                            gait_source_sequence=sequence,
+                            allow_source_sequence_reset=allow_sequence_reset,
+                        )
+                    self._normal_stop_replays.clear()
+                    self._normal_stop_bridge_boot_id = request.bridge_boot_id
+                    self._normal_stop_seen_bridge_boot_ids.add(
+                        request.bridge_boot_id
+                    )
+                    self._normal_stop_plant_safety_stop_epoch = None
+                    self._normal_stop_begin_intent = intent_signature
+
+                response = self._normal_stop_response_locked(
+                    request_id=request.request_id,
+                    snapshot=snapshot,
+                    plant_epoch=None,
+                    expected_phases=frozenset({"BRAKING"}),
+                )
+                return self._record_normal_stop_replay_locked(
+                    request_id=request.request_id,
+                    canonical_request=canonical_request,
+                    response=response,
+                )
+        except _NormalStopBoundaryError as exc:
+            self._latch_terminal_fault(
+                f"normal-stop actuator boundary fault: {exc}",
+                boundary_already_stopped=True,
+            )
+            raise RuntimeError(
+                f"normal-stop actuator boundary fault: {exc}"
+            ) from exc
+
     def accept_json(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        if payload.get("type") == "normal_stop_begin":
+            return self._handle_normal_stop_begin(payload)
         if payload.get("type") == "sonic_health_probe":
             request_id, _producer_boot_id = validate_sonic_health_request(
                 payload,
