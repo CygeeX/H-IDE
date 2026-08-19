@@ -1,7 +1,9 @@
+import { createHash } from "node:crypto";
 import { z } from "zod";
 
 const idSchema = z.string().trim().min(1).max(160);
 const messageSchema = z.string().trim().min(1).max(8_000);
+const memoryTextSchema = z.string().trim().min(1).max(12_000);
 
 export const conversationIntentSchema = z.enum([
   "SOCIAL_CHAT",
@@ -20,6 +22,77 @@ export const conversationHistoryMessageSchema = z
   .strict();
 
 /**
+ * This context is assembled by the authenticated H-IDE server, never by the
+ * browser.  `CONVERSATIONAL_ONLY` is deliberately part of the wire contract:
+ * summaries and snippets may resolve discourse and preferences, but are not
+ * scene, localization, perception, or safety facts.
+ */
+export const conversationDurableSummarySchema = z
+  .object({
+    summaryId: idSchema,
+    revision: z.number().int().nonnegative(),
+    text: memoryTextSchema,
+    coveredThroughTurn: z.number().int().nonnegative(),
+    generatedAt: z.string().datetime({ offset: true }),
+    method: z.enum(["SERVER_COMPACTION", "OPERATOR_APPROVED"]),
+    contentSha256: z.string().regex(/^[0-9a-f]{64}$/),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    const digest = createHash("sha256").update(value.text, "utf8").digest("hex");
+    if (digest !== value.contentSha256) {
+      context.addIssue({
+        code: "custom",
+        path: ["contentSha256"],
+        message: "durable summary digest does not match its text",
+      });
+    }
+  });
+
+export const conversationMemorySnippetSchema = z
+  .object({
+    memoryId: idSchema,
+    kind: z.enum([
+      "USER_PREFERENCE",
+      "CONVERSATION_FACT",
+      "PRIOR_DECISION",
+      "ONGOING_TOPIC",
+      "CONVERSATION_EXCERPT",
+    ]),
+    text: z.string().trim().min(1).max(2_000),
+    recordedAt: z.string().datetime({ offset: true }),
+    sourceTurn: z.number().int().nonnegative().optional(),
+    relevanceScore: z.number().min(0).max(1).optional(),
+  })
+  .strict();
+
+export const conversationMemoryContextSchema = z
+  .object({
+    schemaVersion: z.literal("h-ide.conversation-memory-context/1"),
+    providedBy: z.literal("H_IDE_SERVER"),
+    authority: z.literal("CONVERSATIONAL_ONLY"),
+    /** Stable authenticated H-IDE principal/tenant scope, not a browser ID. */
+    resourceId: idSchema,
+    revision: z.number().int().nonnegative(),
+    durableSummary: conversationDurableSummarySchema.nullable().optional(),
+    relevantMemories: z.array(conversationMemorySnippetSchema).max(8).default([]),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    const totalSnippetCharacters = value.relevantMemories.reduce(
+      (total, memory) => total + memory.text.length,
+      0,
+    );
+    if (totalSnippetCharacters > 12_000) {
+      context.addIssue({
+        code: "custom",
+        path: ["relevantMemories"],
+        message: "relevant memory snippets exceed the 12000 character budget",
+      });
+    }
+  });
+
+/**
  * Browser-facing conversation state is reduced by H-IDE before crossing the
  * internal boundary.  The router receives only a bounded recent window plus
  * an optional server-produced summary; neither is treated as an instruction.
@@ -32,9 +105,24 @@ export const conversationTurnRequestSchema = z
     locale: z.string().trim().min(2).max(35).default("zh-CN"),
     text: messageSchema,
     history: z.array(conversationHistoryMessageSchema).max(20).default([]),
+    /** @deprecated Prefer memoryContext.durableSummary. */
     summary: z.string().trim().min(1).max(12_000).nullable().optional(),
+    memoryContext: conversationMemoryContextSchema.nullable().optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((value, context) => {
+    const recentHistoryCharacters = value.history.reduce(
+      (total, message) => total + message.content.length,
+      0,
+    );
+    if (recentHistoryCharacters > 40_000) {
+      context.addIssue({
+        code: "custom",
+        path: ["history"],
+        message: "recent conversation history exceeds the 40000 character budget",
+      });
+    }
+  });
 
 /**
  * Provider-facing schema.  Keep the root a plain object and avoid z.record so
@@ -92,6 +180,10 @@ export const conversationTurnResponseSchema = z
   });
 
 export type ConversationIntent = z.infer<typeof conversationIntentSchema>;
+export type ConversationHistoryMessage = z.infer<typeof conversationHistoryMessageSchema>;
+export type ConversationDurableSummary = z.infer<typeof conversationDurableSummarySchema>;
+export type ConversationMemorySnippet = z.infer<typeof conversationMemorySnippetSchema>;
+export type ConversationMemoryContext = z.infer<typeof conversationMemoryContextSchema>;
 export type ConversationTurnRequest = z.infer<typeof conversationTurnRequestSchema>;
 export type ConversationRouterModelOutput = z.infer<typeof conversationRouterModelOutputSchema>;
 export type ConversationTurnResponse = z.infer<typeof conversationTurnResponseSchema>;

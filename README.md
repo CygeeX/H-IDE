@@ -11,6 +11,13 @@ Assistant V2 另有一个前置对话路由边界。它先区分普通聊天、�
 本服务仍没有执行权限。明显问候和有界四则运算走本地快速路径，其余请求交给
 同一个 Mastra/Qwen provider，并以低温、关闭 thinking 的结构化输出分类。
 
+长程对话使用同一 `MASTRA_MEMORY_URL` 存储逐轮原始消息、可审计摘要和相关记忆
+选择记录。模型每轮只看到最近 20 条消息、有界 durable summary 和最多 8 条相关
+记忆。记忆以 `CONVERSATIONAL_ONLY` 不可信数据块进入模型，能帮助延续话题和解析
+语义指代，但不能作为坐标、障碍、可见性、可达性或安全事实；物理 grounding 仍只
+属于 Mission V2、typed SceneMemory、当前视觉/定位和 Robot Agent/Nav2。服务不会
+使用 Mastra 的自动 system-memory 注入，也不会删除压缩前的原始消息。
+
 ```text
 H-IDE TaskRequest + frozen context
                 │ internal bearer HTTP

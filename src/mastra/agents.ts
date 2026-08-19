@@ -9,6 +9,7 @@ import { MissionEngine } from "../mission/engine.js";
 import { MastraMissionRuntime } from "../mission/mastra-runtime.js";
 import { spatialResolverTool } from "./tools/spatial.js";
 import { ConversationRouter } from "../conversation/router.js";
+import { MastraConversationMemory } from "../conversation/memory.js";
 
 export function createAgentSystem(config: AppConfig) {
   const memoryStore = new LibSQLStore({
@@ -133,6 +134,9 @@ export function createAgentSystem(config: AppConfig) {
     memoryStore,
     planner: new PlanningEngine(runtime),
     missionPlanner: new MissionEngine(new MastraMissionRuntime(missionExecutiveAgent)),
-    conversationRouter: new ConversationRouter(conversationRouterAgent),
+    conversationRouter: new ConversationRouter(
+      conversationRouterAgent,
+      new MastraConversationMemory(memory),
+    ),
   };
 }
