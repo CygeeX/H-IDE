@@ -1,8 +1,9 @@
 """Small, fail-closed client for the independent MuJoCo+SONIC runtime.
 
-The simulator is deliberately deployed outside H-IDE.  This module only
-reads its loopback health/state endpoints; it never publishes ``/cmd_vel`` or
-writes joint state.  Navigation authority remains Robot Agent + Nav2.
+The simulator is deliberately deployed outside H-IDE. This module only reads
+its observation endpoints (loopback for a host process, a Docker host-gateway
+listener for ``control-api``); it never publishes ``/cmd_vel`` or writes joint
+state. Navigation authority remains Robot Agent + Nav2.
 """
 
 from __future__ import annotations

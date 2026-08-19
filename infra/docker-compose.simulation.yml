@@ -1,6 +1,8 @@
 # Optional overlay for the H-IDE-owned simulation profiles.  The MuJoCo/SONIC
 # processes and the isolated ROS 2 Robot Agent stay on the host; this overlay
-# gives the control API an explicit loopback bridge into that stack.
+# gives control-api an explicit read-only observation path through Docker's
+# host-gateway. The simulator binds that path only on Docker's validated bridge
+# address; command authority remains host-loopback Robot Agent + Nav2.
 # Use it together with the base file:
 #   docker compose -f infra/docker-compose.yml -f infra/docker-compose.simulation.yml up
 # profile.  The deterministic backend remains available until the MuJoCo
@@ -24,6 +26,8 @@ services:
       SIMULATION_ROBOT_AGENT_GATEWAY_URL: ${SIMULATION_ROBOT_AGENT_GATEWAY_URL:-http://host.docker.internal:8094}
       SIMULATION_ROBOT_AGENT_GATEWAY_TOKEN: ${SIMULATION_ROBOT_AGENT_GATEWAY_TOKEN:-dev-sim-gateway-token}
       SIMULATION_ROBOT_AGENT_ID: ${SIMULATION_ROBOT_AGENT_ID:-g1-sim}
+      # Server-side GET-only health/telemetry/RGB-D transport. Neither URL is
+      # a command surface; browser-facing media remains the loopback URL below.
       HIDE_MUJOCO_SONIC_TELEMETRY_URL: ${HIDE_MUJOCO_SONIC_TELEMETRY_URL:-http://host.docker.internal:8792}
       HIDE_MUJOCO_SONIC_PLANT_URL: ${HIDE_MUJOCO_SONIC_PLANT_URL:-http://host.docker.internal:8794}
       HIDE_MUJOCO_SONIC_PUBLIC_PLANT_URL: ${HIDE_MUJOCO_SONIC_PUBLIC_PLANT_URL:-http://127.0.0.1:8794}
