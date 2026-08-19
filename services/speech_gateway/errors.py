@@ -99,6 +99,16 @@ class AudioBackpressure(SpeechGatewayError):
         )
 
 
+class TranscriptPersistenceFailed(SpeechGatewayError):
+    def __init__(self) -> None:
+        super().__init__(
+            "TRANSCRIPT_PERSISTENCE_FAILED",
+            "The final transcript could not be issued safely",
+            retryable=True,
+            close_code=1011,
+        )
+
+
 class TTSUnavailable(SpeechGatewayError):
     def __init__(
         self,

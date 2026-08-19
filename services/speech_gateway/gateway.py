@@ -100,6 +100,8 @@ class GatewaySession:
         self._finish_watch_task: asyncio.Task[None] | None = None
         self._tts_task: asyncio.Task[None] | None = None
         self._terminal_lock = asyncio.Lock()
+        self._utterance_sequence = 0
+        self._active_utterance_id: str | None = None
         self._finishing = False
         self._terminal = False
         self._closed = False
@@ -249,8 +251,9 @@ class GatewaySession:
 
     def _map_provider_event(self, provider_event: ProviderEvent) -> SpeechEvent:
         payload: dict[str, Any] = {"sessionId": self.session_id}
-        if provider_event.utterance_id is not None:
-            payload["utteranceId"] = provider_event.utterance_id
+        utterance_id = self._utterance_id(provider_event)
+        if utterance_id is not None:
+            payload["utteranceId"] = utterance_id
         if provider_event.text is not None:
             payload["text"] = provider_event.text
         if provider_event.confirmed_text is not None:
@@ -261,7 +264,31 @@ class GatewaySession:
             payload["emotion"] = provider_event.emotion
         if provider_event.offset_ms is not None:
             payload["offsetMs"] = provider_event.offset_ms
+        if provider_event.kind == "speech.ended":
+            self._active_utterance_id = None
         return event(provider_event.kind, **payload)
+
+    def _utterance_id(self, provider_event: ProviderEvent) -> str | None:
+        if provider_event.kind not in {
+            "speech.started",
+            "speech.ended",
+            "transcript.partial",
+            "transcript.final",
+        }:
+            return None
+        if provider_event.kind == "speech.started":
+            self._active_utterance_id = provider_event.utterance_id or self._new_utterance_id()
+            return self._active_utterance_id
+        if provider_event.utterance_id:
+            self._active_utterance_id = provider_event.utterance_id
+            return provider_event.utterance_id
+        if self._active_utterance_id is None:
+            self._active_utterance_id = self._new_utterance_id()
+        return self._active_utterance_id
+
+    def _new_utterance_id(self) -> str:
+        self._utterance_sequence += 1
+        return f"{self.session_id}-utterance-{self._utterance_sequence}"
 
     async def _watch_finish_timeout(self) -> None:
         try:

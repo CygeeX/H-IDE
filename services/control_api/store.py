@@ -623,6 +623,30 @@ class SQLiteStore:
                     """,
                 ),
             ),
+            (
+                5,
+                "assistant_v2_owned_speech_transcriptions",
+                (
+                    "ALTER TABLE speech_transcriptions ADD COLUMN owner_user_id TEXT",
+                    "ALTER TABLE speech_transcriptions ADD COLUMN site_id TEXT",
+                    "ALTER TABLE speech_transcriptions ADD COLUMN auth_session_id TEXT",
+                    "ALTER TABLE speech_transcriptions ADD COLUMN speech_session_id TEXT",
+                    "ALTER TABLE speech_transcriptions ADD COLUMN utterance_id TEXT",
+                    "ALTER TABLE speech_transcriptions ADD COLUMN source TEXT NOT NULL "
+                    "DEFAULT 'legacy_unbound'",
+                    """
+                    CREATE UNIQUE INDEX speech_transcriptions_stream_utterance_uq
+                        ON speech_transcriptions(speech_session_id, utterance_id)
+                        WHERE source = 'streaming_asr'
+                            AND speech_session_id IS NOT NULL
+                            AND utterance_id IS NOT NULL
+                    """,
+                    """
+                    CREATE INDEX speech_transcriptions_owner_site_idx
+                        ON speech_transcriptions(owner_user_id, site_id, created_at)
+                    """,
+                ),
+            ),
         )
         for version, name, statements in migrations:
             applied = self._connection.execute(
@@ -2530,28 +2554,133 @@ class SQLiteStore:
         language: str | None,
         locale: str,
         filename: str,
+        owner_user_id: str | None = None,
+        site_id: str | None = None,
+        auth_session_id: str | None = None,
+        source: str = "batch_wav",
     ) -> dict[str, Any]:
         created_at = self._now()
         with self._lock:
             self._connection.execute(
                 "INSERT INTO speech_transcriptions("
-                "transcription_id, text, language, locale, filename, created_at"
-                ") VALUES (?, ?, ?, ?, ?, ?)",
-                (transcription_id, text, language, locale, filename, created_at),
+                "transcription_id, text, language, locale, filename, created_at, "
+                "owner_user_id, site_id, auth_session_id, speech_session_id, "
+                "utterance_id, source"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)",
+                (
+                    transcription_id,
+                    text,
+                    language,
+                    locale,
+                    filename,
+                    created_at,
+                    owner_user_id,
+                    site_id,
+                    auth_session_id,
+                    source,
+                ),
             )
             self._connection.commit()
-        return {
-            "transcriptionId": transcription_id,
-            "text": text,
-            "language": language,
-            "locale": locale,
-            "createdAt": created_at,
+        result = self.get_transcription(transcription_id)
+        assert result is not None
+        return result
+
+    def save_streaming_transcription(
+        self,
+        *,
+        text: str,
+        language: str | None,
+        locale: str,
+        owner_user_id: str,
+        site_id: str,
+        auth_session_id: str | None,
+        speech_session_id: str,
+        utterance_id: str,
+    ) -> dict[str, Any]:
+        """Persist a server-issued ASR final exactly once per utterance.
+
+        The browser supplies none of these identity fields. A repeated provider
+        final returns the original transcription ID, while a changed text or
+        principal for the same server session/utterance fails closed.
+        """
+
+        values = {
+            "text": str(text).strip(),
+            "locale": str(locale).strip(),
+            "owner_user_id": str(owner_user_id).strip(),
+            "site_id": str(site_id).strip(),
+            "speech_session_id": str(speech_session_id).strip(),
+            "utterance_id": str(utterance_id).strip(),
         }
+        if any(not value for value in values.values()):
+            raise ValueError("streaming transcription identity is incomplete")
+        transcription_id = f"transcription-{uuid.uuid4().hex}"
+        created_at = self._now()
+        with self._lock:
+            try:
+                self._connection.execute(
+                    "INSERT INTO speech_transcriptions("
+                    "transcription_id, text, language, locale, filename, created_at, "
+                    "owner_user_id, site_id, auth_session_id, speech_session_id, "
+                    "utterance_id, source"
+                    ") VALUES (?, ?, ?, ?, 'speech-stream.v2', ?, ?, ?, ?, ?, ?, "
+                    "'streaming_asr') ON CONFLICT(speech_session_id, utterance_id) "
+                    "WHERE source = 'streaming_asr' AND speech_session_id IS NOT NULL "
+                    "AND utterance_id IS NOT NULL DO NOTHING",
+                    (
+                        transcription_id,
+                        values["text"],
+                        language,
+                        values["locale"],
+                        created_at,
+                        values["owner_user_id"],
+                        values["site_id"],
+                        auth_session_id,
+                        values["speech_session_id"],
+                        values["utterance_id"],
+                    ),
+                )
+                row = self._connection.execute(
+                    "SELECT * FROM speech_transcriptions WHERE speech_session_id = ? "
+                    "AND utterance_id = ? AND source = 'streaming_asr'",
+                    (values["speech_session_id"], values["utterance_id"]),
+                ).fetchone()
+                if row is None:
+                    raise RuntimeError("streaming transcription persistence failed")
+                expected = (
+                    values["text"],
+                    language,
+                    values["locale"],
+                    values["owner_user_id"],
+                    values["site_id"],
+                    auth_session_id,
+                )
+                actual = (
+                    str(row["text"]),
+                    row["language"],
+                    str(row["locale"]),
+                    row["owner_user_id"],
+                    row["site_id"],
+                    row["auth_session_id"],
+                )
+                if actual != expected:
+                    raise ValueError(
+                        "streaming transcription identity conflicts with persisted final"
+                    )
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+        result = self.get_transcription(str(row["transcription_id"]))
+        assert result is not None
+        return result
 
     def get_transcription(self, transcription_id: str) -> dict[str, Any] | None:
         with self._lock:
             row = self._connection.execute(
-                "SELECT transcription_id, text, language, locale, filename, created_at "
+                "SELECT transcription_id, text, language, locale, filename, created_at, "
+                "owner_user_id, site_id, auth_session_id, speech_session_id, "
+                "utterance_id, source "
                 "FROM speech_transcriptions WHERE transcription_id = ?",
                 (transcription_id,),
             ).fetchone()
@@ -2564,6 +2693,12 @@ class SQLiteStore:
             "locale": row["locale"],
             "filename": row["filename"],
             "createdAt": row["created_at"],
+            "ownerUserId": row["owner_user_id"],
+            "siteId": row["site_id"],
+            "authSessionId": row["auth_session_id"],
+            "speechSessionId": row["speech_session_id"],
+            "utteranceId": row["utterance_id"],
+            "source": row["source"],
         }
 
     def save_assistant_draft(self, draft_id: str, payload: Mapping[str, Any], *, status: str = "draft") -> bool:

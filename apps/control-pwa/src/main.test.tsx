@@ -24,13 +24,13 @@ vi.mock("./streaming-speech", () => ({
     private callbacks: {
       onPhase?: (phase: string) => void;
       onPartial?: (event: { text: string }) => void;
-      onFinal?: (event: { text: string; utteranceId: string }) => void;
+      onFinal?: (event: { text: string; utteranceId: string; transcriptionId: string }) => void;
       onMetrics?: (metrics: { framesSent: number; audioMsSent: number }) => void;
     };
     constructor(options: { callbacks?: {
       onPhase?: (phase: string) => void;
       onPartial?: (event: { text: string }) => void;
-      onFinal?: (event: { text: string; utteranceId: string }) => void;
+      onFinal?: (event: { text: string; utteranceId: string; transcriptionId: string }) => void;
       onMetrics?: (metrics: { framesSent: number; audioMsSent: number }) => void;
     } }) {
       this.callbacks = options.callbacks ?? {};
@@ -41,7 +41,11 @@ vi.mock("./streaming-speech", () => ({
       this.callbacks.onPartial?.({ text: "临时识别文本" });
     }
     async finish() {
-      this.callbacks.onFinal?.({ text: "语音要求机器人向前移动", utteranceId: "utterance-ui" });
+      this.callbacks.onFinal?.({
+        text: "语音要求机器人向前移动",
+        utteranceId: "utterance-ui",
+        transcriptionId: "transcription-stream-ui",
+      });
       this.callbacks.onPhase?.("closed");
     }
     async cancel() { this.callbacks.onPhase?.("closed"); }
@@ -719,6 +723,12 @@ describe("control console", () => {
     expect(await screen.findByRole("region", { name: "Mission V2 计划审核" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "按住确认并执行" })).not.toBeDisabled();
     expect(vi.mocked(fetch).mock.calls.some(([input]) => String(input).includes("/speech/transcriptions"))).toBe(false);
+    const voiceMessage = vi.mocked(fetch).mock.calls.find(([input]) =>
+      String(input).includes("/assistant/conversations/conversation-ui/messages"));
+    expect(JSON.parse(String(voiceMessage?.[1]?.body))).toMatchObject({
+      modality: "voice",
+      transcriptionId: "transcription-stream-ui",
+    });
     expect(vi.mocked(fetch).mock.calls.some(([input]) => String(input).endsWith("/api/v2/missions/drafts/mission-ui/approve"))).toBe(false);
   });
 

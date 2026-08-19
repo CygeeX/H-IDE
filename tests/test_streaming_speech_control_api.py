@@ -18,23 +18,25 @@ PCM_20_MS = b"\x00\x00" * 320
 
 
 class StubASRSession:
-    def __init__(self) -> None:
+    def __init__(self, *, final_count: int = 1) -> None:
         self.events: asyncio.Queue[ProviderEvent] = asyncio.Queue()
         self.frames: list[bytes] = []
         self.closed = False
+        self.final_count = final_count
 
     async def send_audio(self, frame: bytes) -> None:
         self.frames.append(frame)
 
     async def finish(self) -> None:
-        self.events.put_nowait(
-            ProviderEvent(
-                "transcript.final",
-                utterance_id="utterance-1",
-                text="你好",
-                confirmed_text="你好",
+        for _ in range(self.final_count):
+            self.events.put_nowait(
+                ProviderEvent(
+                    "transcript.final",
+                    utterance_id="utterance-1",
+                    text="你好",
+                    confirmed_text="你好",
+                )
             )
-        )
         self.events.put_nowait(ProviderEvent("session.finished"))
 
     async def receive_event(self) -> ProviderEvent:
@@ -47,12 +49,13 @@ class StubASRSession:
 class StubASRProvider:
     name = "test-realtime-asr"
 
-    def __init__(self) -> None:
+    def __init__(self, *, final_count: int = 1) -> None:
         self.sessions: list[StubASRSession] = []
+        self.final_count = final_count
 
     async def open(self, config: AudioStreamConfig) -> StubASRSession:
         assert config.sample_rate_hz == 16_000
-        session = StubASRSession()
+        session = StubASRSession(final_count=self.final_count)
         self.sessions.append(session)
         return session
 
@@ -91,8 +94,8 @@ class StubTTSProvider:
         return {"provider": self.name, "available": True, "model": "test-tts"}
 
 
-def gateway() -> tuple[StreamingSpeechGateway, StubASRProvider, StubTTSProvider]:
-    asr = StubASRProvider()
+def gateway(*, final_count: int = 1) -> tuple[StreamingSpeechGateway, StubASRProvider, StubTTSProvider]:
+    asr = StubASRProvider(final_count=final_count)
     tts = StubTTSProvider()
     return StreamingSpeechGateway(asr, tts_provider=tts), asr, tts
 
@@ -134,6 +137,15 @@ def test_control_api_mounts_cookie_csrf_and_bearer_speech_websocket() -> None:
             final = socket.receive_json()
             assert final["type"] == "transcript.final"
             assert final["text"] == "你好"
+            assert final["transcriptionId"].startswith("transcription-")
+            stored = app.state.store.get_transcription(final["transcriptionId"])
+            assert stored is not None
+            assert stored["text"] == "你好"
+            assert stored["ownerUserId"] is not None
+            assert stored["siteId"] == "default"
+            assert stored["speechSessionId"] == final["sessionId"]
+            assert stored["utteranceId"] == "utterance-1"
+            assert stored["source"] == "streaming_asr"
 
         # Explicit Bearer callers do not use browser CSRF, but credentials in
         # a URL are refused even if they match the legacy deployment token.
@@ -156,6 +168,78 @@ def test_control_api_mounts_cookie_csrf_and_bearer_speech_websocket() -> None:
 
     assert asr.sessions[0].frames == [PCM_20_MS]
     assert all(session.closed for session in asr.sessions)
+
+
+def test_streaming_final_is_idempotent_and_cannot_be_reused_by_another_user() -> None:
+    realtime, _, _ = gateway(final_count=2)
+    app = create_app(auth_token=TOKEN, streaming_speech_gateway=realtime)
+    with TestClient(app) as client:
+        alice_csrf = register_and_login(client)
+        with client.websocket_connect(
+            "/api/v2/speech/stream", subprotocols=["speech-stream.v2"]
+        ) as socket:
+            socket.send_json(
+                {"type": "session.start", "locale": "zh-CN", "csrfToken": alice_csrf}
+            )
+            assert socket.receive_json()["type"] == "session.started"
+            socket.send_json({"type": "session.finish"})
+            first = socket.receive_json()
+            second = socket.receive_json()
+            assert first["type"] == second["type"] == "transcript.final"
+            assert first["transcriptionId"] == second["transcriptionId"]
+
+        count = app.state.store._connection.execute(
+            "SELECT COUNT(*) AS count FROM speech_transcriptions "
+            "WHERE speech_session_id = ? AND utterance_id = ?",
+            (first["sessionId"], first["utteranceId"]),
+        ).fetchone()["count"]
+        assert count == 1
+
+        alice_conversation = client.post(
+            "/api/v1/assistant/conversations",
+            headers={"X-CSRF-Token": alice_csrf},
+            json={"locale": "zh-CN", "robotId": "robot-1"},
+        )
+        assert alice_conversation.status_code == 201
+        accepted = client.post(
+            f"/api/v1/assistant/conversations/{alice_conversation.json()['conversationId']}/messages",
+            headers={"X-CSRF-Token": alice_csrf},
+            json={
+                "text": first["text"],
+                "modality": "voice",
+                "transcriptionId": first["transcriptionId"],
+            },
+        )
+        assert accepted.status_code == 202, accepted.text
+
+        logout = client.post("/api/v1/auth/logout", headers={"X-CSRF-Token": alice_csrf})
+        assert logout.status_code == 204
+        registered = client.post(
+            "/api/v1/auth/register",
+            json={"username": "speech-user-bob", "password": PASSWORD},
+        )
+        assert registered.status_code == 201, registered.text
+        login = client.post(
+            "/api/v1/auth/login",
+            json={"username": "speech-user-bob", "password": PASSWORD},
+        )
+        bob_csrf = login.json()["csrfToken"]
+        bob_conversation = client.post(
+            "/api/v1/assistant/conversations",
+            headers={"X-CSRF-Token": bob_csrf},
+            json={"locale": "zh-CN", "robotId": "robot-1"},
+        )
+        stolen = client.post(
+            f"/api/v1/assistant/conversations/{bob_conversation.json()['conversationId']}/messages",
+            headers={"X-CSRF-Token": bob_csrf},
+            json={
+                "text": first["text"],
+                "modality": "voice",
+                "transcriptionId": first["transcriptionId"],
+            },
+        )
+        assert stolen.status_code == 422
+        assert "not issued for this caller" in stolen.json()["detail"]
 
 
 def test_control_api_speech_health_and_tts_are_authenticated_and_stream_real_bytes() -> None:

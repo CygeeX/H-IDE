@@ -708,6 +708,13 @@ def test_voice_task_requires_a_saved_transcription_and_uses_the_reviewed_text():
         create_app(auth_token=TOKEN, planning_client=planning, speech_client=speech)
     )
     conversation = create_conversation(client)
+    missing_id = client.post(
+        f"/api/v1/assistant/conversations/{conversation['conversationId']}/messages",
+        headers=auth(),
+        json={"text": "没有签发凭证的语音", "modality": "voice"},
+    )
+    assert missing_id.status_code == 422
+    assert "require transcriptionId" in missing_id.json()["detail"]
     missing = client.post(
         f"/api/v1/assistant/conversations/{conversation['conversationId']}/messages",
         headers=auth(),

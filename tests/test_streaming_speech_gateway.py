@@ -256,6 +256,74 @@ def test_missing_key_fails_closed_without_opening_transport():
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize(
+    ("region", "expected"),
+    [
+        (
+            "cn-beijing",
+            "wss://dashscope.aliyuncs.com/api-ws/v1/realtime?model=qwen3-asr-flash-realtime",
+        ),
+        (
+            "ap-southeast-1",
+            "wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime?model=qwen3-asr-flash-realtime",
+        ),
+    ],
+)
+def test_dashscope_ordinary_api_key_uses_official_regional_endpoint(
+    region: str,
+    expected: str,
+):
+    provider = DashScopeRealtimeProvider.from_env(
+        {"DASHSCOPE_API_KEY": "server-only-secret", "DASHSCOPE_REGION": region}
+    )
+    assert isinstance(provider, DashScopeRealtimeProvider)
+    assert provider._config.endpoint_url == expected
+    assert "server-only-secret" not in repr(provider)
+
+
+def test_dashscope_explicit_and_workspace_endpoints_take_priority():
+    explicit = DashScopeRealtimeProvider.from_env(
+        {
+            "DASHSCOPE_API_KEY": "server-only-secret",
+            "DASHSCOPE_REGION": "unknown-region",
+            "DASHSCOPE_WORKSPACE_ID": "ignored-workspace",
+            "DASHSCOPE_ASR_WS_URL": "wss://approved.example/api-ws/v1/realtime?old=1",
+            "DASHSCOPE_ASR_MODEL": "approved-model",
+        }
+    )
+    assert isinstance(explicit, DashScopeRealtimeProvider)
+    assert explicit._config.endpoint_url == (
+        "wss://approved.example/api-ws/v1/realtime?old=1&model=approved-model"
+    )
+
+    workspace = DashScopeRealtimeProvider.from_env(
+        {
+            "DASHSCOPE_API_KEY": "server-only-secret",
+            "DASHSCOPE_REGION": "cn-beijing",
+            "DASHSCOPE_WORKSPACE_ID": "workspace-123",
+        }
+    )
+    assert isinstance(workspace, DashScopeRealtimeProvider)
+    assert workspace._config.endpoint_url.startswith(
+        "wss://workspace-123.cn-beijing.maas.aliyuncs.com/api-ws/v1/realtime?"
+    )
+
+
+def test_dashscope_unknown_region_without_override_fails_closed():
+    async def scenario() -> None:
+        provider = DashScopeRealtimeProvider.from_env(
+            {
+                "DASHSCOPE_API_KEY": "server-only-secret",
+                "DASHSCOPE_REGION": "unknown-region",
+            }
+        )
+        with pytest.raises(ProviderUnavailable, match="region or endpoint"):
+            await provider.open(AudioStreamConfig())
+        assert "server-only-secret" not in repr(provider)
+
+    asyncio.run(scenario())
+
+
 def test_audio_queue_backpressure_never_drops_a_frame_silently():
     async def scenario() -> None:
         provider_session = FakeASRSession()

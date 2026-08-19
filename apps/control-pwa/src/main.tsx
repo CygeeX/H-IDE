@@ -1568,9 +1568,16 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
                 // around, the ConversationGateway / PlanDraft boundary.
                 setVoiceUi((current) => ({ ...current, partial: text }));
               },
-              onFinal: ({ text, utteranceId }) => {
+              onFinal: ({ text, utteranceId, transcriptionId: issuedTranscriptionId }) => {
                 const finalKey = `${sessionKey}:${utteranceId || text}`;
                 if (finalTranscriptRef.current.has(finalKey)) return;
+                if (!issuedTranscriptionId?.trim()) {
+                  setError("流式语音最终转写缺少服务端签发的 transcriptionId，未提交消息");
+                  setRecording(false);
+                  setVoiceBusy(false);
+                  void session.cancel();
+                  return;
+                }
                 finalTranscriptRef.current.add(finalKey);
                 setRecording(false);
                 setVoiceBusy(true);
@@ -1578,8 +1585,8 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
                 setNotice("语音已识别并直接发送给 H-IDE；机器人行动仍受 PlanDraft 审核约束");
                 void session.finish().catch((reason) => setError(friendlyError(reason)));
                 void (missionRecord?.snapshot.status === "needs_input"
-                  ? sendMissionMessage(text, "voice", null)
-                  : sendAssistantMessage(text, "voice", null))
+                  ? sendMissionMessage(text, "voice", issuedTranscriptionId)
+                  : sendAssistantMessage(text, "voice", issuedTranscriptionId))
                   .finally(() => {
                     setVoiceBusy(false);
                     setVoiceUi((current) => ({ ...current, partial: "" }));

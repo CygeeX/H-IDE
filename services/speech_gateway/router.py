@@ -11,12 +11,15 @@ from typing import Any, Awaitable, Callable, Literal, Mapping
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from .contracts import AudioStreamConfig, ClientCommand, event
-from .errors import InvalidClientMessage, SpeechGatewayError
+from .errors import InvalidClientMessage, SpeechGatewayError, TranscriptPersistenceFailed
 from .gateway import GatewaySession, StreamingSpeechGateway
 
 
 SpeechAuthorizer = Callable[
-    [WebSocket, Mapping[str, Any]], Awaitable[None] | None
+    [WebSocket, Mapping[str, Any]], Awaitable[Any] | Any
+]
+FinalTranscriptIssuer = Callable[
+    [Mapping[str, Any], Any], Awaitable[Mapping[str, Any]] | Mapping[str, Any]
 ]
 
 
@@ -24,6 +27,7 @@ def create_speech_router(
     gateway: StreamingSpeechGateway,
     *,
     authorize: SpeechAuthorizer,
+    issue_final_transcript: FinalTranscriptIssuer | None = None,
     path: str = "/v2/speech/stream",
     initial_message_timeout_seconds: float = 5.0,
 ) -> APIRouter:
@@ -38,6 +42,7 @@ def create_speech_router(
             subprotocol="speech-stream.v2" if "speech-stream.v2" in offered else None
         )
         session: GatewaySession | None = None
+        authorization_context: Any = None
         try:
             initial = await asyncio.wait_for(
                 websocket.receive(), timeout=initial_message_timeout_seconds
@@ -45,7 +50,9 @@ def create_speech_router(
             payload = _json_message(initial)
             result = authorize(websocket, payload)
             if inspect.isawaitable(result):
-                await result
+                authorization_context = await result
+            else:
+                authorization_context = result
             config = AudioStreamConfig.from_start_message(payload)
             session = await gateway.start(config)
         except asyncio.TimeoutError:
@@ -66,7 +73,14 @@ def create_speech_router(
             return
 
         reader = asyncio.create_task(_read_browser(websocket, session))
-        writer = asyncio.create_task(_write_browser(websocket, session))
+        writer = asyncio.create_task(
+            _write_browser(
+                websocket,
+                session,
+                authorization_context=authorization_context,
+                issue_final_transcript=issue_final_transcript,
+            )
+        )
         try:
             done, _ = await asyncio.wait(
                 {reader, writer}, return_when=asyncio.FIRST_COMPLETED
@@ -133,13 +147,39 @@ async def _read_browser(
         return "disconnect"
 
 
-async def _write_browser(websocket: WebSocket, session: GatewaySession) -> None:
+async def _write_browser(
+    websocket: WebSocket,
+    session: GatewaySession,
+    *,
+    authorization_context: Any,
+    issue_final_transcript: FinalTranscriptIssuer | None,
+) -> None:
     while True:
         item = await session.next_event()
         if item is None:
             await _safe_close(websocket, 1000)
             return
-        await websocket.send_json(item.as_dict())
+        payload = item.as_dict()
+        if payload.get("type") == "transcript.final" and issue_final_transcript is not None:
+            try:
+                issued = issue_final_transcript(payload, authorization_context)
+                if inspect.isawaitable(issued):
+                    issued = await issued
+                transcription_id = issued.get("transcriptionId") if isinstance(issued, Mapping) else None
+                if not isinstance(transcription_id, str) or not transcription_id.strip():
+                    raise TranscriptPersistenceFailed()
+                payload = {**payload, "transcriptionId": transcription_id.strip()}
+            except SpeechGatewayError as exc:
+                await _send_error(websocket, exc)
+                await _safe_close(websocket, exc.close_code)
+                return
+            except Exception as exc:
+                error_value = TranscriptPersistenceFailed()
+                error_value.__cause__ = exc
+                await _send_error(websocket, error_value)
+                await _safe_close(websocket, error_value.close_code)
+                return
+        await websocket.send_json(payload)
 
 
 def _json_message(message: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -171,4 +211,4 @@ async def _safe_close(websocket: WebSocket, code: int) -> None:
         await websocket.close(code=code)
 
 
-__all__ = ["SpeechAuthorizer", "create_speech_router"]
+__all__ = ["FinalTranscriptIssuer", "SpeechAuthorizer", "create_speech_router"]

@@ -173,6 +173,10 @@ class AssistantService:
         body: Mapping[str, Any],
         *,
         revision_of_draft_id: str | None = None,
+        caller_user_id: str | None = None,
+        caller_site_id: str | None = None,
+        caller_role: str | None = None,
+        caller_is_legacy: bool = False,
     ) -> dict[str, Any]:
         conversation = self.store.get_assistant_conversation(conversation_id)
         if conversation is None:
@@ -190,8 +194,32 @@ class AssistantService:
         if modality == "voice":
             if not isinstance(transcription_id, str):
                 raise ValueError("voice messages require transcriptionId")
-            if self.store.get_transcription(transcription_id) is None:
+            transcription = self.store.get_transcription(transcription_id)
+            if transcription is None:
                 raise ValueError("voice message transcriptionId was not issued by this control plane")
+            if not caller_is_legacy:
+                owner_user_id = transcription.get("ownerUserId")
+                site_id = transcription.get("siteId")
+                role = str(caller_role or "").upper()
+                caller_bound = bool(caller_user_id and caller_site_id and role)
+                resource_bound = isinstance(owner_user_id, str) and isinstance(site_id, str)
+                allowed = (
+                    caller_bound
+                    and resource_bound
+                    and (
+                        role == "ADMIN"
+                        or (
+                            site_id == caller_site_id
+                            and (role == "DEVELOPER" or owner_user_id == caller_user_id)
+                        )
+                    )
+                )
+                if not allowed:
+                    # Do not reveal whether the identifier belongs to another
+                    # user/site or predates authenticated ownership metadata.
+                    raise ValueError(
+                        "voice message transcriptionId was not issued for this caller"
+                    )
         elif transcription_id is not None:
             raise ValueError("transcriptionId is only valid for voice messages")
         text = body.get("text")

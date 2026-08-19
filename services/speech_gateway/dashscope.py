@@ -66,18 +66,23 @@ def _dashscope_endpoint(values: Mapping[str, str]) -> str | None:
     explicit = values.get("DASHSCOPE_ASR_WS_URL", "").strip()
     if explicit:
         return explicit
-    workspace = values.get("DASHSCOPE_WORKSPACE_ID", "").strip()
-    if not workspace or re.fullmatch(r"[A-Za-z0-9-]+", workspace) is None:
-        return None
     region = values.get("DASHSCOPE_REGION", "cn-beijing").strip().lower()
-    domains = {
+    workspace_domains = {
         "cn-beijing": "cn-beijing.maas.aliyuncs.com",
         "ap-southeast-1": "ap-southeast-1.maas.aliyuncs.com",
     }
-    suffix = domains.get(region)
-    if suffix is None:
+    public_endpoints = {
+        "cn-beijing": "wss://dashscope.aliyuncs.com/api-ws/v1/realtime",
+        "ap-southeast-1": "wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime",
+    }
+    if region not in workspace_domains:
         return None
-    return f"wss://{workspace}.{suffix}/api-ws/v1/realtime"
+    workspace = values.get("DASHSCOPE_WORKSPACE_ID", "").strip()
+    if workspace:
+        if re.fullmatch(r"[A-Za-z0-9-]+", workspace) is None:
+            return None
+        return f"wss://{workspace}.{workspace_domains[region]}/api-ws/v1/realtime"
+    return public_endpoints[region]
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,7 +134,7 @@ class DashScopeRealtimeProvider:
             return UnavailableASRProvider("DASHSCOPE_API_KEY is not configured")
         if not endpoint:
             return UnavailableASRProvider(
-                "DASHSCOPE_ASR_WS_URL or DASHSCOPE_WORKSPACE_ID is not configured"
+                "DashScope ASR region or endpoint configuration is invalid"
             )
         model = values.get(
             "DASHSCOPE_ASR_MODEL", "qwen3-asr-flash-realtime"

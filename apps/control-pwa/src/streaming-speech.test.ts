@@ -90,7 +90,7 @@ describe("streaming browser speech", () => {
 
   it("sends CSRF in session.start then only contract-sized binary audio", async () => {
     const sent: unknown[] = [];
-    let socketMessage: ((event: MessageEvent) => void) | null = null;
+    const onFinal = vi.fn();
     class FakeSocket {
       static OPEN = 1;
       readyState = FakeSocket.OPEN;
@@ -112,9 +112,19 @@ describe("streaming browser speech", () => {
             })));
           }
           if (command.type === "session.finish") {
-            queueMicrotask(() => this.onmessage?.(new MessageEvent("message", {
-              data: JSON.stringify({ type: "session.finished" }),
-            })));
+            queueMicrotask(() => {
+              this.onmessage?.(new MessageEvent("message", {
+                data: JSON.stringify({
+                  type: "transcript.final",
+                  text: "你好",
+                  utteranceId: "utterance-browser",
+                  transcriptionId: "transcription-server-issued",
+                }),
+              }));
+              this.onmessage?.(new MessageEvent("message", {
+                data: JSON.stringify({ type: "session.finished" }),
+              }));
+            });
           }
         }
       }
@@ -149,9 +159,9 @@ describe("streaming browser speech", () => {
     const session = new BrowserStreamingSpeechSession({
       url: "wss://workstation.local/api/v2/speech/stream",
       csrfToken: "csrf-browser-only",
+      callbacks: { onFinal },
       socketFactory: () => {
         const socket = new FakeSocket();
-        socketMessage = socket.onmessage;
         return socket as unknown as WebSocket;
       },
       audioContextFactory: () => context as unknown as AudioContext,
@@ -172,7 +182,11 @@ describe("streaming browser speech", () => {
     });
     expect(sent.filter((item) => item instanceof ArrayBuffer)).toHaveLength(5);
     expect(sent.filter((item) => item instanceof ArrayBuffer).every((item) => (item as ArrayBuffer).byteLength === 1_280)).toBe(true);
+    expect(onFinal).toHaveBeenCalledWith(expect.objectContaining({
+      text: "你好",
+      utteranceId: "utterance-browser",
+      transcriptionId: "transcription-server-issued",
+    }));
     expect(stop).toHaveBeenCalledOnce();
-    expect(socketMessage).toBeNull();
   });
 });

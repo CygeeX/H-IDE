@@ -20,6 +20,7 @@ export interface StreamingTranscriptEvent {
   text: string;
   confirmedText?: string;
   utteranceId?: string;
+  transcriptionId?: string;
 }
 
 export interface StreamingSpeechCallbacks {
@@ -35,6 +36,7 @@ interface SpeechServerEvent {
   text?: string;
   confirmedText?: string;
   utteranceId?: string;
+  transcriptionId?: string;
   message?: string;
   fatal?: boolean;
 }
@@ -334,6 +336,7 @@ export class BrowserStreamingSpeechSession {
         text: event.text.trim(),
         confirmedText: event.confirmedText,
         utteranceId: event.utteranceId,
+        transcriptionId: event.transcriptionId,
       });
     }
     if (event.type === "error") {

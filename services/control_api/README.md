@@ -103,10 +103,15 @@ configured.
 - `POST /api/v1/speech/transcriptions` accepts at most 60 seconds / 10 MiB of
   16 kHz mono 16-bit PCM WAV and delegates transcription to the configured
   local whisper.cpp endpoint. Transcription never submits a task by itself.
+  The returned server-issued record is bound to the authenticated owner/site;
+  a different user cannot reuse its identifier in a voice message.
 - `WS /api/v2/speech/stream` accepts 20-60 ms PCM16 frames and returns server-VAD
   partial/final transcripts. Cookie clients echo the CSRF cookie value in
   `session.start`; Bearer credentials and session tokens are never accepted in
-  query strings.
+  query strings. Before each final event is released to the browser, Control API
+  durably issues an owner/session/utterance-bound `transcriptionId`. Duplicate
+  provider finals for one utterance return the same identifier. A persistence
+  failure closes the stream without exposing an unsigned final.
 - `POST /api/v2/speech/tts` streams 24 kHz mono PCM16 from the configured real
   provider. `/api/v2/speech/healthz` and `/api/v2/speech/readyz` expose
   authenticated ASR/TTS capability state without exposing provider keys.

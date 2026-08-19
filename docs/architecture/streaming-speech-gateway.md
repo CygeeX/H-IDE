@@ -52,10 +52,16 @@ Cookie session echoes its CSRF value only in the first `session.start` JSON
 message, before any binary audio is accepted.
 
 `transcript.partial` is transient UI state shown above the composer. It never
-changes the composer value and is never submitted. Each deduplicated
-`transcript.final` is sent as voice modality through the normal Assistant V2
-ConversationGateway. Thus social chat remains chat, while robot action still
-produces a reviewable PlanDraft/Mission and cannot skip confirmation policy.
+changes the composer value and is never submitted. Before a final leaves the
+Control API, it is persisted under the authenticated owner/site, authentication
+session, server speech session, and utterance identity; the event receives the
+server-issued `transcriptionId`. Repeated provider finals for that utterance are
+idempotent. Each deduplicated `transcript.final` is then sent as voice modality
+through the normal Assistant V2 ConversationGateway with that identifier.
+Thus social chat remains chat, while robot action still produces a reviewable
+PlanDraft/Mission and cannot skip confirmation policy. The Assistant service
+rejects missing, unbound, cross-site, and cross-user transcription identifiers;
+the legacy deployment Bearer remains an explicit compatibility principal.
 
 Voice replies are opt-in. The user gesture that enables them unlocks the
 `AudioContext` for iOS/Android, and the PWA requests 24 kHz PCM one sentence at

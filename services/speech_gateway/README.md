@@ -62,10 +62,18 @@ reported as unavailable; the gateway never emits placeholder/silent audio.
 
 ```text
 DASHSCOPE_API_KEY=...
-DASHSCOPE_WORKSPACE_ID=...        # or the complete DASHSCOPE_ASR_WS_URL
 DASHSCOPE_REGION=cn-beijing       # or ap-southeast-1
+DASHSCOPE_WORKSPACE_ID=           # optional workspace-scoped deployment
+DASHSCOPE_ASR_WS_URL=             # optional complete endpoint override
 DASHSCOPE_ASR_MODEL=qwen3-asr-flash-realtime
 ```
+
+With no explicit endpoint or workspace, ordinary API keys use the official
+regional realtime endpoint: `wss://dashscope.aliyuncs.com/api-ws/v1/realtime`
+for Beijing and `wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime` for
+Singapore. A complete `DASHSCOPE_ASR_WS_URL` has highest priority, followed by
+the workspace-scoped domain. The model query is normalized by the provider in
+all three cases. Unknown regions and malformed workspace IDs fail closed.
 
 The key is read from the process environment, excluded from object
 representations, never sent to the browser, and never written by this module.

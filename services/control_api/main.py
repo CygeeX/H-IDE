@@ -2042,7 +2042,7 @@ def create_app(
     async def authorize_realtime_speech(
         websocket: WebSocket,
         start: Mapping[str, Any],
-    ) -> None:
+    ) -> dict[str, Any]:
         # Credentials in query strings leak through access logs, browser
         # history, and copied URLs.  Cookie sessions and explicit Bearer
         # headers are the only accepted authentication carriers here.
@@ -2072,11 +2072,49 @@ def create_app(
             auth_service.policy.require(principal, Scope.SPEECH_USE)
         except AuthorizationDenied as exc:
             raise SpeechAuthorizationDenied() from exc
+        config = AudioStreamConfig.from_start_message(start)
+        return {"principal": principal, "locale": config.locale}
+
+    async def issue_realtime_transcription(
+        event: Mapping[str, Any],
+        authorization_context: Any,
+    ) -> Mapping[str, Any]:
+        if not isinstance(authorization_context, Mapping):
+            raise RuntimeError("speech authorization context is unavailable")
+        principal = authorization_context.get("principal")
+        locale = authorization_context.get("locale")
+        if not isinstance(principal, Principal) or not isinstance(locale, str):
+            raise RuntimeError("speech authorization context is invalid")
+        text = event.get("text")
+        speech_session_id = event.get("sessionId")
+        utterance_id = event.get("utteranceId")
+        if not all(
+            isinstance(value, str) and value.strip()
+            for value in (text, speech_session_id, utterance_id)
+        ):
+            raise RuntimeError("final transcript identity is incomplete")
+        record = await run_in_threadpool(
+            context.store.save_streaming_transcription,
+            text=text.strip(),
+            language=(
+                event.get("language")
+                if isinstance(event.get("language"), str)
+                else None
+            ),
+            locale=locale,
+            owner_user_id=principal.user_id,
+            site_id=principal.site_id,
+            auth_session_id=principal.session_id,
+            speech_session_id=speech_session_id.strip(),
+            utterance_id=utterance_id.strip(),
+        )
+        return {"transcriptionId": record["transcriptionId"]}
 
     app.include_router(
         create_speech_router(
             realtime_speech,
             authorize=authorize_realtime_speech,
+            issue_final_transcript=issue_realtime_transcription,
             path="/api/v2/speech/stream",
         )
     )
@@ -2535,7 +2573,14 @@ def create_app(
                 and isinstance(conversation.get("robotId"), str)
             ):
                 refresh_robot_agent_snapshot(conversation["robotId"])
-            return service.submit_message(conversation_id, body)
+            return service.submit_message(
+                conversation_id,
+                body,
+                caller_user_id=principal.user_id,
+                caller_site_id=principal.site_id,
+                caller_role=principal.role.value,
+                caller_is_legacy=principal.is_legacy,
+            )
         except AssistantNotFound as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except AssistantTurnConflict as exc:
@@ -2699,6 +2744,7 @@ def create_app(
         request: Request,
         file: UploadFile = File(...),
         locale: str = Form("zh-CN"),
+        principal: Principal = Depends(require_speech),
         context: _ControlContext = Depends(get_context),
     ):
         filename = file.filename or "command.wav"
@@ -2732,6 +2778,10 @@ def create_app(
             language=result.get("language") if isinstance(result, Mapping) else None,
             locale=locale,
             filename=filename,
+            owner_user_id=principal.user_id,
+            site_id=principal.site_id,
+            auth_session_id=principal.session_id,
+            source="batch_wav",
         )
 
     @app.post("/api/v1/commands", dependencies=[Depends(require_commands)])
