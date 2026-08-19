@@ -166,6 +166,42 @@ wait_for_qwen_vision() {
   return 1
 }
 
+wait_for_sonic_motion_ready() {
+  local timeout_seconds="${1:-120}"
+  local deadline=$((SECONDS + timeout_seconds))
+  local telemetry=""
+  while (( SECONDS < deadline )); do
+    telemetry="$(curl -fsS --max-time 3 http://127.0.0.1:8792/telemetry 2>/dev/null || true)"
+    if [[ -n "${telemetry}" ]] && printf '%s' "${telemetry}" \
+      | "${HIDE_DEMO_SIM_ROOT}/.venv/bin/python" -c '
+import json
+import sys
+
+try:
+    value = json.load(sys.stdin)
+except (json.JSONDecodeError, TypeError):
+    raise SystemExit(1)
+
+ready = (
+    value.get("status") == "running"
+    and value.get("motion_ready") is True
+    and value.get("control_clock_status") == "simulation_time_50hz_motion_ready"
+    and value.get("last_error") is None
+)
+raise SystemExit(0 if ready else 1)
+'; then
+      printf '%-28s ready\n' 'SONIC 50 Hz motion gate'
+      return 0
+    fi
+    sleep 1
+  done
+  printf 'SONIC did not qualify its simulation-time motion gate within %ss\n' "${timeout_seconds}" >&2
+  if [[ -n "${telemetry}" ]]; then
+    printf '%s\n' "${telemetry}" >&2
+  fi
+  return 1
+}
+
 demo_ros_command() {
   bash -lc '
     source /opt/ros/jazzy/setup.bash
@@ -322,6 +358,11 @@ start_process \
   'source /opt/ros/jazzy/setup.bash; export ROS_DOMAIN_ID=232 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp CYCLONEDDS_URI="$HIDE_DEMO_CYCLONE"; export PYTHONPATH="$HIDE_DEMO_SIM_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"; exec /usr/bin/python3 -u -m hide_mujoco_sonic safe-stop-service --config "$HIDE_DEMO_CONFIG"'
 
 wait_for_http 'MuJoCo plant + RGB-D' 'http://127.0.0.1:8794/healthz' 60
+# A listening telemetry port only proves that the Python process exists.  Keep
+# Nav2 and Robot Agent offline until the full controller path has warmed, the
+# IDLE consumer has sustained the authoritative 50 Hz simulation cadence, and
+# the driver explicitly opens its motion gate.
+wait_for_sonic_motion_ready 120
 wait_for_simulation_tf 60
 
 if [[ "${nav2_needs_start}" == "true" ]]; then
