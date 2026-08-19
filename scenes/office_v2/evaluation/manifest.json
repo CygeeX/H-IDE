@@ -1950,7 +1950,7 @@
     }
   ],
   "scene_id": "office_v2",
-  "scene_source_sha256": "65d5c2a209f1f99f9a3f9236694560b7ceed601de0f556bbeceddae525602a2a",
+  "scene_source_sha256": "2d29641a9db85cbd1eb10d3159d901627a2c2728f033318c3be8f3493b0a50c9",
   "schema_version": "h-ide.office-v2-evaluation/1",
   "semantic_tests": [
     {
@@ -2009,6 +2009,7 @@
   "spawns": [
     {
       "clearance_radius": 0.55,
+      "default": true,
       "id": "robot_spawn_west",
       "pose": [
         -6.45,
@@ -2473,9 +2474,9 @@
       "id": "target_open_office_desk",
       "object_id": "open_office_desk_01",
       "pose": [
-        -5.75,
-        3.2,
-        1.5708
+        -6.6,
+        3.6,
+        0.8903
       ],
       "tolerance": 0.45
     },
@@ -2493,7 +2494,7 @@
       "id": "target_focus_desk",
       "object_id": "focus_desk",
       "pose": [
-        1.65,
+        1.75,
         -4.6,
         3.14159
       ],

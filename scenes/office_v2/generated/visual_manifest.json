@@ -2,11 +2,15 @@
   "bundles": {
     "mjcf_include": {
       "path": "generated/mujoco/office_v2.include.xml",
-      "sha256": "e02cad2da68bca4358fac9e0ca954a5045638a2b185e286c4955abd989e031eb"
+      "sha256": "9b46337d85e8c64244dfe4873ef2841a48788edad636cf32324168a65c2bd69d"
     },
     "mjcf_preview": {
       "path": "generated/mujoco/office_v2.preview.xml",
       "sha256": "e7634ab9931a1b26d70c823b582c0bd15f41f8557f33f7b1982f9d32412abced"
+    },
+    "mjcf_runtime": {
+      "path": "generated/mujoco/office_v2.runtime.xml",
+      "sha256": "6f0b23717b725262ab1aa6196e9c7e9bf8a16c5906453f475bb124175d189211"
     },
     "nav2_pgm": {
       "path": "generated/nav2/office_v2.pgm",
@@ -14,7 +18,11 @@
     },
     "nav2_yaml": {
       "path": "generated/nav2/office_v2.yaml",
-      "sha256": "846529ec704635c43328bdc432b5e28145b5ca02ccfd67937c53247a4285cea9"
+      "sha256": "c2ec60651efa38b74784ca55a0e62da6511f264f54350787a83ed475ec23a7e5"
+    },
+    "runtime_manifest": {
+      "path": "generated/runtime_manifest.json",
+      "sha256": "ff1bfe0111485728a4890db221cf46ef76193acb5e359ad36cf9d81ccba80dc0"
     }
   },
   "contains_semantic_ground_truth": false,
@@ -24,7 +32,7 @@
     "structures": 16,
     "visual_geoms": 155
   },
-  "generator_version": "office-v2-generator/1",
+  "generator_version": "office-v2-generator/2",
   "render_assets": [
     {
       "path": "generated/mujoco/textures/tex_01.png",
@@ -62,14 +70,16 @@
   "runtime_boundary": {
     "allowed": [
       "generated/mujoco/office_v2.include.xml",
+      "generated/mujoco/office_v2.runtime.xml",
       "generated/mujoco/textures/*.png",
       "generated/nav2/office_v2.yaml",
       "generated/nav2/office_v2.pgm",
+      "generated/runtime_manifest.json",
       "generated/visual_manifest.json"
     ],
     "evaluation_manifest_must_not_be_mounted": true
   },
   "scene_id": "office_v2",
-  "scene_source_sha256": "65d5c2a209f1f99f9a3f9236694560b7ceed601de0f556bbeceddae525602a2a",
+  "scene_source_sha256": "2d29641a9db85cbd1eb10d3159d901627a2c2728f033318c3be8f3493b0a50c9",
   "schema_version": "h-ide.office-v2-visual/1"
 }

@@ -26,7 +26,7 @@ def generate_launch_description():
     ]
     return LaunchDescription([
         DeclareLaunchArgument("params_file", default_value="/opt/h-ide-nav2/nav2_params.yaml"),
-        DeclareLaunchArgument("map", default_value="/opt/h-ide-nav2/maps/office_floor.yaml"),
+        DeclareLaunchArgument("map", default_value="/opt/h-ide-nav2/maps/office_v2.yaml"),
         DeclareLaunchArgument("autostart", default_value="true"),
         DeclareLaunchArgument("use_sim_time", default_value="false"),
         Node(

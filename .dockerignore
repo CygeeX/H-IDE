@@ -1,0 +1,24 @@
+# The only first-party image is the isolated Nav2 runtime. Keep its build
+# context explicit: this repository also contains multi-gigabyte vendored
+# sources and model artifacts that must never be uploaded to the Docker daemon.
+**
+
+!.dockerignore
+!docker/
+!docker/nav2/
+!docker/nav2/Dockerfile
+!docker/nav2/controller_server_tf_fail_closed.patch
+!docker/nav2/nav2_entrypoint.sh
+!docker/nav2/nav2_params.yaml
+!docker/nav2/nav2_sim_launch.py
+!docker/nav2/verify_office_v2_bundle.py
+
+# Runtime-only Office V2 navigation artifacts. scene.yaml and the privileged
+# evaluation manifest are deliberately excluded from the image context.
+!scenes/
+!scenes/office_v2/
+!scenes/office_v2/generated/
+!scenes/office_v2/generated/nav2/
+!scenes/office_v2/generated/nav2/office_v2.pgm
+!scenes/office_v2/generated/nav2/office_v2.yaml
+!scenes/office_v2/generated/runtime_manifest.json

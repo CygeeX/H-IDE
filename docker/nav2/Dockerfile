@@ -1,4 +1,5 @@
 ARG NAV2_SOURCE_REVISION=6be3614013ec586051b86c97b919b293281490fe
+ARG OFFICE_V2_SOURCE_SHA256
 
 FROM ros:jazzy-ros-base AS nav2-controller-builder
 
@@ -20,7 +21,7 @@ RUN apt-get update \
 RUN git clone --depth 1 --branch 1.3.12 --single-branch \
       https://github.com/ros-navigation/navigation2.git /opt/navigation2 \
     && test "$(git -C /opt/navigation2 rev-parse HEAD)" = "${NAV2_SOURCE_REVISION}"
-COPY controller_server_tf_fail_closed.patch /opt/h-ide-nav2-patches/controller_server_tf_fail_closed.patch
+COPY docker/nav2/controller_server_tf_fail_closed.patch /opt/h-ide-nav2-patches/controller_server_tf_fail_closed.patch
 RUN git -C /opt/navigation2 apply --check /opt/h-ide-nav2-patches/controller_server_tf_fail_closed.patch \
     && git -C /opt/navigation2 apply /opt/h-ide-nav2-patches/controller_server_tf_fail_closed.patch \
     && . /opt/ros/jazzy/setup.sh \
@@ -53,12 +54,27 @@ RUN apt-get update \
       ros-jazzy-rmw-cyclonedds-cpp \
     && rm -rf /var/lib/apt/lists/*
 
-COPY nav2_params.yaml /opt/h-ide-nav2/nav2_params.yaml
-COPY office_floor.yaml /opt/h-ide-nav2/maps/office_floor.yaml
-COPY office_floor.pgm /opt/h-ide-nav2/maps/office_floor.pgm
-COPY nav2_sim_launch.py /opt/h-ide-nav2/nav2_sim_launch.py
-COPY nav2_entrypoint.sh /opt/h-ide-nav2/nav2_entrypoint.sh
+ARG OFFICE_V2_SOURCE_SHA256
+COPY docker/nav2/nav2_params.yaml /opt/h-ide-nav2/nav2_params.yaml
+COPY scenes/office_v2/generated/nav2/office_v2.yaml /opt/h-ide-nav2/maps/office_v2.yaml
+COPY scenes/office_v2/generated/nav2/office_v2.pgm /opt/h-ide-nav2/maps/office_v2.pgm
+COPY scenes/office_v2/generated/runtime_manifest.json /opt/h-ide-nav2/office_v2.runtime.json
+COPY docker/nav2/nav2_sim_launch.py /opt/h-ide-nav2/nav2_sim_launch.py
+COPY docker/nav2/nav2_entrypoint.sh /opt/h-ide-nav2/nav2_entrypoint.sh
+COPY docker/nav2/verify_office_v2_bundle.py /opt/h-ide-nav2/verify_office_v2_bundle.py
 COPY --from=nav2-controller-builder /opt/h-ide-nav2-overlay /opt/h-ide-nav2-overlay
+
+# The host launcher first proves that all generated artifacts are a clean build
+# of scene.yaml. Repeat the content-addressed half of that contract inside the
+# image so a stale or substituted map cannot reach Nav2 through Docker caching.
+RUN python3 /opt/h-ide-nav2/verify_office_v2_bundle.py \
+      --manifest /opt/h-ide-nav2/office_v2.runtime.json \
+      --map-yaml /opt/h-ide-nav2/maps/office_v2.yaml \
+      --map-image /opt/h-ide-nav2/maps/office_v2.pgm \
+      --expected-source-sha256 "${OFFICE_V2_SOURCE_SHA256}"
+
+LABEL org.h-ide.scene.id="office_v2" \
+      org.h-ide.scene.source-sha256="${OFFICE_V2_SOURCE_SHA256}"
 
 ENTRYPOINT ["/opt/h-ide-nav2/nav2_entrypoint.sh"]
 CMD ["ros2", "launch", "/opt/h-ide-nav2/nav2_sim_launch.py"]

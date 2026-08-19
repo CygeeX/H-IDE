@@ -299,15 +299,40 @@ start_process \
 wait_for_qwen_vision 120
 
 nav2_image="h-ide-nav2-sim:jazzy"
+# Office V2's MuJoCo collision model and Nav2 occupancy map are generated from
+# one scene.yaml. Refuse to build or reuse a navigation image unless every
+# committed runtime artifact exactly matches a clean deterministic build.
+"${HIDE_DEMO_SIM_ROOT}/.venv/bin/python" \
+  "${HIDE_DEMO_SIM_ROOT}/tools/build_scene.py" --check
+office_v2_runtime_manifest="${HIDE_DEMO_SIM_ROOT}/scenes/office_v2/generated/runtime_manifest.json"
+office_v2_source_sha256="$(
+  "${HIDE_DEMO_SIM_ROOT}/.venv/bin/python" -c \
+    'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["scene_source_sha256"])' \
+    "${office_v2_runtime_manifest}"
+)"
+if [[ ! "${office_v2_source_sha256}" =~ ^[0-9a-f]{64}$ ]]; then
+  printf 'Office V2 runtime manifest has an invalid scene source SHA-256\n' >&2
+  exit 1
+fi
 # Re-run the build on every launch. Docker's layer cache makes an unchanged
 # context cheap, while a tag-exists check would silently keep an old controller
 # after a fail-closed Nav2 patch or parameter update.
 docker build \
   -t "${nav2_image}" \
+  --build-arg "OFFICE_V2_SOURCE_SHA256=${office_v2_source_sha256}" \
   -f "${HIDE_DEMO_SIM_ROOT}/docker/nav2/Dockerfile" \
-  "${HIDE_DEMO_SIM_ROOT}/docker/nav2"
+  "${HIDE_DEMO_SIM_ROOT}"
 nav2_image_id="$(docker image inspect "${nav2_image}" --format '{{.Id}}')"
 test -n "${nav2_image_id:?}"
+nav2_image_scene_sha256="$(
+  docker image inspect "${nav2_image}" \
+    --format '{{ index .Config.Labels "org.h-ide.scene.source-sha256" }}'
+)"
+if [[ "${nav2_image_scene_sha256}" != "${office_v2_source_sha256}" ]]; then
+  printf 'Nav2 image Office V2 source hash mismatch: expected %s, got %s\n' \
+    "${office_v2_source_sha256}" "${nav2_image_scene_sha256}" >&2
+  exit 1
+fi
 nav2_container_recreate=false
 if docker container inspect h-ide-nav2-sim >/dev/null 2>&1; then
   nav2_container_image_id="$(docker container inspect h-ide-nav2-sim --format '{{.Image}}')"

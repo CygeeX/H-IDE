@@ -25,6 +25,7 @@ import numpy as np
 
 from .config import SimConfig
 from .frames import BodyTwist, read_mujoco_local_body_twist
+from .scene_runtime import RuntimeScene
 
 
 class PlantPhysicsFault(RuntimeError):
@@ -198,6 +199,72 @@ def stabilized_support_wrench(
     return wrench
 
 
+def apply_process_start_spawn(data, model, scene: RuntimeScene) -> None:
+    """Apply the manifest spawn exactly once during plant construction.
+
+    This helper only initializes the newly-created ``MjData``. It is not used
+    by any runtime fault/recovery path, preserving the explicit-restart reset
+    contract.
+    """
+
+    if int(model.nq) < 7 or int(model.nv) < 6:
+        raise RuntimeError("Office V2 runtime model must have a floating root")
+    half_yaw = float(scene.spawn_yaw) / 2.0
+    data.qpos[:3] = np.asarray(
+        [scene.spawn_x, scene.spawn_y, float(model.qpos0[2])],
+        dtype=float,
+    )
+    data.qpos[3:7] = np.asarray(
+        [math.cos(half_yaw), 0.0, 0.0, math.sin(half_yaw)],
+        dtype=float,
+    )
+    data.qvel[:] = 0.0
+
+
+def configure_head_camera(mujoco, model) -> int:
+    """Make the articulated G1 camera look level along the base +X axis."""
+
+    camera_id = mujoco.mj_name2id(
+        model,
+        mujoco.mjtObj.mjOBJ_CAMERA,
+        "head_camera",
+    )
+    if camera_id < 0:
+        raise RuntimeError("pinned G1 model does not define head_camera")
+    camera_rotation = np.asarray(
+        [
+            0.0, 0.0, -1.0,
+            -1.0, 0.0, 0.0,
+            0.0, 1.0, 0.0,
+        ],
+        dtype=float,
+    )
+    mujoco.mju_mat2Quat(model.cam_quat[camera_id], camera_rotation)
+    model.cam_fovy[camera_id] = 75.0
+    return int(camera_id)
+
+
+def configure_tracking_viewer(mujoco, model, viewer, scene: RuntimeScene) -> None:
+    """Start the operator viewer close to the spawned robot and track it."""
+
+    if viewer is None:
+        return
+    pelvis_id = int(
+        mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "pelvis")
+    )
+    if pelvis_id < 0:
+        raise RuntimeError("pinned G1 model does not define pelvis")
+    viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+    viewer.cam.trackbodyid = pelvis_id
+    viewer.cam.azimuth = 135.0
+    viewer.cam.elevation = -22.0
+    viewer.cam.distance = 3.8
+    viewer.cam.lookat = np.asarray(
+        [scene.spawn_x, scene.spawn_y, float(model.qpos0[2])],
+        dtype=float,
+    )
+
+
 class PlantFrameStore:
     def __init__(
         self,
@@ -257,7 +324,13 @@ class PlantFrameStore:
         except ValueError as exc:
             self.support.fail(f"MuJoCo root velocity is invalid: {exc}")
         x, y, z = (float(value) for value in root_pose[:3])
-        if abs(x) > 6.5 or abs(y) > 4.5 or not 0.20 <= z <= 1.50:
+        bounds_min = self.config.runtime_scene.bounds_min
+        bounds_max = self.config.runtime_scene.bounds_max
+        if not (
+            bounds_min[0] <= x <= bounds_max[0]
+            and bounds_min[1] <= y <= bounds_max[1]
+            and 0.20 <= z <= 1.50
+        ):
             self.support.fail(
                 "MuJoCo root pose left the validated office envelope "
                 f"(x={x:.3f}, y={y:.3f}, z={z:.3f})"
@@ -495,13 +568,18 @@ class PlantFrameStore:
 
 
 def run_plant(config: SimConfig) -> int:
-    root = config.model_scene.parent.parent
-    sys.path.insert(0, str(root))
+    repository_root = Path(__file__).resolve().parents[2]
+    simulator_root = repository_root / "models" / "unitree-g1-mujoco"
+    if not (simulator_root / "sim" / "simulator_factory.py").is_file():
+        raise RuntimeError(f"pinned Unitree simulator is missing: {simulator_root}")
+    sys.path.insert(0, str(simulator_root))
     from sim.simulator_factory import SimulatorFactory, init_channel
 
     model_config = {
         "ROBOT_TYPE": "g1_29dof",
-        "ROBOT_SCENE": config.model_scene.relative_to(root).as_posix(),
+        # ``Path / absolute`` in the pinned simulator preserves the verified
+        # absolute path loaded from runtime_manifest.json.
+        "ROBOT_SCENE": str(config.model_scene),
         "DOMAIN_ID": config.ros_domain_id,
         "INTERFACE": config.interface,
         "SIMULATOR": "mujoco",
@@ -587,21 +665,12 @@ def run_plant(config: SimConfig) -> int:
     # validation useless.  Keep the camera rigidly attached to the torso but
     # orient it level along the robot's +X (forward) axis.  Local camera X is
     # robot -Y (image right) and local camera Y is robot +Z (image up).
-    camera_id = mujoco.mj_name2id(sim_env.mj_model, mujoco.mjtObj.mjOBJ_CAMERA, "head_camera")
-    if camera_id < 0:
-        raise RuntimeError("pinned G1 model does not define head_camera")
-    camera_rotation = np.asarray(
-        [
-            0.0, 0.0, -1.0,
-            -1.0, 0.0, 0.0,
-            0.0, 1.0, 0.0,
-        ],
-        dtype=float,
+    configure_head_camera(mujoco, sim_env.mj_model)
+    apply_process_start_spawn(
+        sim_env.mj_data,
+        sim_env.mj_model,
+        config.runtime_scene,
     )
-    mujoco.mju_mat2Quat(sim_env.mj_model.cam_quat[camera_id], camera_rotation)
-    sim_env.mj_model.cam_fovy[camera_id] = 75.0
-    sim_env.mj_data.qpos[:3] = np.asarray([0.0, 0.0, float(sim_env.mj_model.qpos0[2])], dtype=float)
-    sim_env.mj_data.qpos[3:7] = [1.0, 0.0, 0.0, 0.0]
     # ``body_joint_index`` follows the XML/Unitree lowstate deploy order
     # (left leg, right leg, waist, arms). Initialize from the same official
     # grouped standing pose used by the Unitree command interface. SONIC remains
@@ -615,6 +684,12 @@ def run_plant(config: SimConfig) -> int:
         sim_env.mj_data.qpos[int(joint_id) + 6] = float(DEFAULT_ANGLES_MUJOCO[i])
     sim_env.mj_data.qvel[:] = 0.0
     mujoco.mj_forward(sim_env.mj_model, sim_env.mj_data)
+    configure_tracking_viewer(
+        mujoco,
+        sim_env.mj_model,
+        getattr(sim_env, "viewer", None),
+        config.runtime_scene,
+    )
     if support_band is not None:
         # Upstream defaults target world z=1 with very stiff gains, which
         # visibly hoists the pelvis and makes contacting feet propel the robot
@@ -623,7 +698,11 @@ def run_plant(config: SimConfig) -> int:
         # wrapper above still zeros every horizontal force and yaw torque.
         attached = int(sim_env.band_attached_link)
         support_band.point = np.asarray(
-            [0.0, 0.0, float(sim_env.mj_data.xpos[attached][2])],
+            [
+                config.runtime_scene.spawn_x,
+                config.runtime_scene.spawn_y,
+                float(sim_env.mj_data.xpos[attached][2]),
+            ],
             dtype=float,
         )
         support_band.length = 0.0

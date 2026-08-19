@@ -6,14 +6,16 @@ description: >-
   navigation. This file is the only content manifest: MuJoCo visuals and
   collision proxies, the Nav2 map, and isolated evaluation truth are all
   generated from it.
-generator_version: office-v2-generator/1
+generator_version: office-v2-generator/2
 
 runtime_boundary:
   product_may_read:
     - generated/mujoco/office_v2.include.xml
+    - generated/mujoco/office_v2.runtime.xml
     - generated/mujoco/textures/*.png
     - generated/nav2/office_v2.yaml
     - generated/nav2/office_v2.pgm
+    - generated/runtime_manifest.json
     - generated/visual_manifest.json
   evaluation_only:
     - evaluation/manifest.json
@@ -27,7 +29,7 @@ provenance:
     author: H-IDE contributors
     license: CC0-1.0
     source_url: generated://tools/build_scene.py
-    source_revision: office-v2-generator/1
+    source_revision: office-v2-generator/2
     attribution: H-IDE Office V2 procedural textures and signs
   third_party_assets: []
   design_references:
@@ -61,6 +63,13 @@ map:
   occupied_thresh: 0.65
   free_thresh: 0.196
   mode: trinary
+
+navigation:
+  # These values are also asserted against the Nav2 local/global costmap
+  # configuration. They define the minimum full-body clearance required by
+  # every generated navigation target.
+  robot_radius_m: 0.35
+  footprint_padding_m: 0.02
 
 render:
   floor_material: commercial_carpet
@@ -355,7 +364,7 @@ objects:
     semantic: {class: waste_bin, labels: [垃圾桶, waste bin], aliases: [垃圾箱, bin]}
 
 spawns:
-  - {id: robot_spawn_west, pose: [-6.45, 0.0, 0.0], clearance_radius: 0.55}
+  - {id: robot_spawn_west, pose: [-6.45, 0.0, 0.0], clearance_radius: 0.55, default: true}
   - {id: robot_spawn_east, pose: [6.10, -0.35, 3.14159], clearance_radius: 0.55}
 
 targets:
@@ -363,9 +372,9 @@ targets:
   - {id: target_meeting_display, object_id: meeting_display, pose: [0.70, 4.70, 1.5708], tolerance: 0.45}
   - {id: target_water_dispenser, object_id: water_dispenser, pose: [3.62, 3.48, 1.5708], tolerance: 0.45}
   - {id: target_coffee_machine, object_id: coffee_machine, pose: [5.05, 4.15, 1.5708], tolerance: 0.45}
-  - {id: target_open_office_desk, object_id: open_office_desk_01, pose: [-5.75, 3.20, 1.5708], tolerance: 0.45}
+  - {id: target_open_office_desk, object_id: open_office_desk_01, pose: [-6.60, 3.60, 0.8903], tolerance: 0.45}
   - {id: target_reception, object_id: reception_desk, pose: [-4.55, -2.10, -1.5708], tolerance: 0.45}
-  - {id: target_focus_desk, object_id: focus_desk, pose: [1.65, -4.60, 3.14159], tolerance: 0.45}
+  - {id: target_focus_desk, object_id: focus_desk, pose: [1.75, -4.60, 3.14159], tolerance: 0.45}
   - {id: target_corridor_east, object_id: corridor_plant, pose: [6.10, 0.0, 0.0], tolerance: 0.35}
 
 semantic_tests:

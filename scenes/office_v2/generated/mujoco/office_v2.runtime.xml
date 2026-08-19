@@ -1,0 +1,6 @@
+<mujoco model="H-IDE G1 Office V2 runtime">
+  <option timestep="0.004" gravity="0 0 -9.81"/>
+  <include file="../../../../models/unitree-g1-mujoco/assets/g1_29dof_no_hand.xml"/>
+  <compiler angle="radian" meshdir="../../../../models/unitree-g1-mujoco/assets/meshes"/>
+  <include file="office_v2.include.xml"/>
+</mujoco>

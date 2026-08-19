@@ -32,6 +32,27 @@ about 865 MB of SONIC weights.  Set `SONIC_FORCE_CPU=1` when checking the
 contracts on a host without a compatible CUDA runtime.  CPU mode is suitable
 for contract tests, not for a smooth 50 Hz demonstration.
 
+## Office V2 scene contract
+
+`scenes/office_v2/scene.yaml` is the sole authored office inventory. Run
+`python tools/build_scene.py` after changing it; the MuJoCo include/runtime
+model, textures, Nav2 PGM/YAML and their integrity manifests are generated
+together. `python tools/build_scene.py --check` is read-only and fails when a
+committed artifact has drifted.
+
+The plant loads `generated/runtime_manifest.json` before constructing MuJoCo.
+It verifies the runtime MJCF, office collision include, render textures and
+Nav2 map hashes, then uses the manifest's west-corridor spawn
+(`x=-6.45, y=0, yaw=0`) only while creating a new process. A physics fault
+never invokes an in-process reset or teleport. The native viewer tracks this
+spawned G1; the head camera continues to publish RGB-D.
+
+Privileged labels, targets and complete object/spawn inventories exist only in
+`scenes/office_v2/evaluation/manifest.json`. That file and `scene.yaml` are
+excluded from the Nav2 Docker context and are never exposed by the plant,
+H-IDE or Vision runtime. Nav2 receives only the generated occupancy map and a
+non-semantic integrity manifest.
+
 ## Safety and isolation
 
 * Use `ROS_DOMAIN_ID=232` for every simulation process.  The real Robot Agent

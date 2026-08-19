@@ -1,0 +1,94 @@
+{
+  "bounds": {
+    "max": [
+      8.0,
+      6.0,
+      3.0
+    ],
+    "min": [
+      -8.0,
+      -6.0,
+      0.0
+    ]
+  },
+  "collision_contract_sha256": "cda5508f7404334e7fcd33f8921a8081b30d7c03b24abfeabebdfce7fab9c313",
+  "content_class": "runtime_geometry",
+  "default_spawn": {
+    "clearance_radius_m": 0.55,
+    "x": -6.45,
+    "y": 0.0,
+    "yaw": 0.0
+  },
+  "generator_version": "office-v2-generator/2",
+  "map": {
+    "frame_id": "map",
+    "height_cells": 240,
+    "image": {
+      "path": "nav2/office_v2.pgm",
+      "sha256": "47b2ddd54d9f0aa2a220d5b79afcee367cbaa7a57068e4809189f24ab207360d"
+    },
+    "origin": [
+      -8.0,
+      -6.0,
+      0.0
+    ],
+    "resolution": 0.05,
+    "size": [
+      16.0,
+      12.0
+    ],
+    "width_cells": 320,
+    "yaml": {
+      "path": "nav2/office_v2.yaml",
+      "sha256": "c2ec60651efa38b74784ca55a0e62da6511f264f54350787a83ed475ec23a7e5"
+    }
+  },
+  "model": {
+    "office_include": {
+      "path": "mujoco/office_v2.include.xml",
+      "sha256": "9b46337d85e8c64244dfe4873ef2841a48788edad636cf32324168a65c2bd69d"
+    },
+    "render_assets": [
+      {
+        "path": "mujoco/textures/tex_01.png",
+        "sha256": "bcd3025e9b33a32db4ffb3c3e15ec4684f0053c215e3ac9b155290914f01062d"
+      },
+      {
+        "path": "mujoco/textures/tex_02.png",
+        "sha256": "a0e9402be6d6cf7c0a8e668917ccc8f39a8549928be4f0cdeb2c9983e61e9efc"
+      },
+      {
+        "path": "mujoco/textures/tex_03.png",
+        "sha256": "77f6b1ec4077f3f7ebb7cb94d995c10be843c473323fbee67d59f8d7084a8c91"
+      },
+      {
+        "path": "mujoco/textures/tex_04.png",
+        "sha256": "cc29905bfc685c8bf7e6d1714b822075c61a841976e14510a85201a1fdad91dc"
+      },
+      {
+        "path": "mujoco/textures/tex_05.png",
+        "sha256": "27cc4c2c9f75881f2a779760caa4cf88a4e8b3e7a5c562ee569b04a8cdbb38d0"
+      },
+      {
+        "path": "mujoco/textures/tex_06.png",
+        "sha256": "98eb4aaee92f1d058ad3635047b238b0babdfbe7335d1e58d28341d0be57be19"
+      },
+      {
+        "path": "mujoco/textures/tex_07.png",
+        "sha256": "2b1c301e894b47835c5c7d89748c375fdf5f53cff3391d1f8688d2b89f748172"
+      },
+      {
+        "path": "mujoco/textures/tex_08.png",
+        "sha256": "70d955589546de91208573f380ce36956af81ee4a15ccddf8206c75ee9f092e2"
+      }
+    ],
+    "scene": {
+      "path": "mujoco/office_v2.runtime.xml",
+      "sha256": "6f0b23717b725262ab1aa6196e9c7e9bf8a16c5906453f475bb124175d189211"
+    }
+  },
+  "reset_policy": "explicit_process_restart",
+  "scene_id": "office_v2",
+  "scene_source_sha256": "2d29641a9db85cbd1eb10d3159d901627a2c2728f033318c3be8f3493b0a50c9",
+  "schema_version": "h-ide.office-v2-runtime/1"
+}

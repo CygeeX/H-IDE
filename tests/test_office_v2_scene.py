@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import os
+import shutil
 import subprocess
 import sys
+from types import SimpleNamespace
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -11,6 +15,12 @@ import pytest
 import yaml
 
 from tools.build_scene import BuildPaths, build_scene
+from hide_mujoco_sonic.config import SimConfig
+from hide_mujoco_sonic.plant import (
+    apply_process_start_spawn,
+    configure_tracking_viewer,
+)
+from hide_mujoco_sonic.scene_runtime import load_runtime_scene
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -78,7 +88,9 @@ def test_build_is_idempotent_and_matches_committed_outputs(tmp_path: Path) -> No
     assert first == second
     assert first_bytes == second_bytes
     assert paths.generated.joinpath("mujoco/office_v2.include.xml").read_bytes() == GENERATED.joinpath("mujoco/office_v2.include.xml").read_bytes()
+    assert paths.generated.joinpath("mujoco/office_v2.runtime.xml").read_bytes() == GENERATED.joinpath("mujoco/office_v2.runtime.xml").read_bytes()
     assert paths.generated.joinpath("nav2/office_v2.pgm").read_bytes() == GENERATED.joinpath("nav2/office_v2.pgm").read_bytes()
+    assert paths.generated.joinpath("runtime_manifest.json").read_bytes() == GENERATED.joinpath("runtime_manifest.json").read_bytes()
     assert paths.evaluation.joinpath("manifest.json").read_bytes() == EVALUATION.read_bytes()
 
 
@@ -97,6 +109,21 @@ def test_collision_manifest_nav2_map_and_navigation_points_agree() -> None:
     for item in evaluation["spawns"] + evaluation["targets"]:
         x, y, _yaw = item["pose"]
         assert _cell(scene, width, height, pixels, x, y) == free, item["id"]
+        required = max(
+            float(item.get("clearance_radius", 0.0)),
+            float(scene["navigation"]["robot_radius_m"])
+            + float(scene["navigation"]["footprint_padding_m"]),
+        )
+        resolution = float(scene["map"]["resolution"])
+        origin_x, origin_y, _ = scene["map"]["origin"]
+        for row in range(height):
+            cell_y = origin_y + (height - row - 0.5) * resolution
+            if abs(cell_y - y) > required:
+                continue
+            for column in range(width):
+                cell_x = origin_x + (column + 0.5) * resolution
+                if math.hypot(cell_x - x, cell_y - y) <= required:
+                    assert pixels[row * width + column] == free, item["id"]
 
 
 def test_every_static_entry_generates_visual_and_matching_collision_contract() -> None:
@@ -136,6 +163,41 @@ def test_product_manifest_contains_no_privileged_semantic_answers() -> None:
     assert evaluation["access"] == "OFFLINE_EVALUATOR_ONLY_DO_NOT_MOUNT_IN_PRODUCT"
     assert evaluation["semantic_tests"]
 
+    runtime = json.loads((GENERATED / "runtime_manifest.json").read_text(encoding="utf-8"))
+    runtime_serialized = json.dumps(runtime, sort_keys=True)
+    for forbidden_key in (
+        '"semantic"',
+        '"evaluation"',
+        '"oracle"',
+        '"targets"',
+        '"spawns"',
+        '"labels"',
+        '"objects"',
+        '"rooms"',
+    ):
+        assert forbidden_key not in runtime_serialized
+    assert runtime["reset_policy"] == "explicit_process_restart"
+    assert runtime["model"]["scene"]["sha256"] == _sha(
+        GENERATED / runtime["model"]["scene"]["path"]
+    )
+    assert runtime["model"]["office_include"]["sha256"] == _sha(
+        GENERATED / runtime["model"]["office_include"]["path"]
+    )
+    assert runtime["model"]["render_assets"]
+    for asset in runtime["model"]["render_assets"]:
+        assert asset["sha256"] == _sha(GENERATED / asset["path"])
+    generated_mjcf = (
+        GENERATED / "mujoco" / "office_v2.include.xml"
+    ).read_text(encoding="utf-8")
+    assert "<site" not in generated_mjcf
+    assert "_zone" not in generated_mjcf
+    for retired_shortcut in (
+        "kitchen_landmark",
+        "meeting_room_landmark",
+        "desk_landmark",
+    ):
+        assert retired_shortcut not in generated_mjcf
+
 
 def test_checksum_and_asset_license_inventory_are_complete() -> None:
     checksum_lines = (GENERATED / "SHA256SUMS").read_text(encoding="utf-8").splitlines()
@@ -162,3 +224,191 @@ def test_generated_preview_loads_with_mujoco() -> None:
     assert model.ngeom > len(scene["objects"]) * 2
     assert model.ntex == 1 + len(scene["textures"])
     assert model.ncam == len(scene["render"]["cameras"])
+
+
+def _standing_runtime_model():
+    mujoco = pytest.importorskip("mujoco")
+    from lerobot.robots.unitree_g1.controllers.sonic_pipeline import (
+        DEFAULT_ANGLES_MUJOCO,
+    )
+
+    runtime = load_runtime_scene(GENERATED / "runtime_manifest.json")
+    model = mujoco.MjModel.from_xml_path(str(runtime.model_scene))
+    data = mujoco.MjData(model)
+    apply_process_start_spawn(data, model, runtime)
+    joint_ids = []
+    for index in range(model.njnt):
+        name = model.joint(index).name or ""
+        if any(
+            part in name
+            for part in ("hip", "knee", "ankle", "waist", "shoulder", "elbow", "wrist")
+        ):
+            joint_ids.append(index)
+    assert len(joint_ids) == len(DEFAULT_ANGLES_MUJOCO) == 29
+    for index, joint_id in enumerate(joint_ids):
+        data.qpos[joint_id + 6] = float(DEFAULT_ANGLES_MUJOCO[index])
+    mujoco.mj_forward(model, data)
+    return mujoco, runtime, model, data
+
+
+def test_runtime_bundle_loads_g1_at_the_verified_noncolliding_spawn() -> None:
+    mujoco, runtime, model, data = _standing_runtime_model()
+    assert tuple(data.qpos[:2]) == pytest.approx((runtime.spawn_x, runtime.spawn_y))
+    assert tuple(data.qpos[3:7]) == pytest.approx(
+        (
+            math.cos(runtime.spawn_yaw / 2.0),
+            0.0,
+            0.0,
+            math.sin(runtime.spawn_yaw / 2.0),
+        )
+    )
+    assert runtime.spawn_clearance_radius_m >= 0.55
+    assert model.ncam >= 2
+    assert mujoco.mj_name2id(
+        model, mujoco.mjtObj.mjOBJ_CAMERA, "head_camera"
+    ) >= 0
+
+    forbidden_contacts = []
+    for contact in data.contact:
+        names = {
+            mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, int(contact.geom1)) or "",
+            mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, int(contact.geom2)) or "",
+        }
+        static = {
+            name
+            for name in names
+            if name.startswith("office_structure_")
+            or name.startswith("office_fixture_")
+        }
+        if static:
+            forbidden_contacts.append(sorted(names))
+    assert forbidden_contacts == []
+
+    viewer = SimpleNamespace(cam=SimpleNamespace())
+    configure_tracking_viewer(mujoco, model, viewer, runtime)
+    assert viewer.cam.type == mujoco.mjtCamera.mjCAMERA_TRACKING
+    assert viewer.cam.trackbodyid == mujoco.mj_name2id(
+        model, mujoco.mjtObj.mjOBJ_BODY, "pelvis"
+    )
+    assert tuple(viewer.cam.lookat[:2]) == pytest.approx(
+        (runtime.spawn_x, runtime.spawn_y)
+    )
+
+
+def test_runtime_head_and_overview_cameras_render_nonblack_rgb() -> None:
+    # MuJoCo selects its GL implementation when it is first imported. Run the
+    # render probe in a fresh EGL process so this test remains authoritative on
+    # headless CI even when another test imported MuJoCo without MUJOCO_GL.
+    script = f"""
+import json
+import mujoco
+import numpy as np
+from lerobot.robots.unitree_g1.controllers.sonic_pipeline import DEFAULT_ANGLES_MUJOCO
+from hide_mujoco_sonic.plant import apply_process_start_spawn, configure_head_camera
+from hide_mujoco_sonic.scene_runtime import load_runtime_scene
+
+runtime = load_runtime_scene({str(GENERATED / 'runtime_manifest.json')!r})
+model = mujoco.MjModel.from_xml_path(str(runtime.model_scene))
+data = mujoco.MjData(model)
+apply_process_start_spawn(data, model, runtime)
+joint_ids = []
+for index in range(model.njnt):
+    name = model.joint(index).name or ''
+    if any(part in name for part in ('hip', 'knee', 'ankle', 'waist', 'shoulder', 'elbow', 'wrist')):
+        joint_ids.append(index)
+for index, joint_id in enumerate(joint_ids):
+    data.qpos[joint_id + 6] = float(DEFAULT_ANGLES_MUJOCO[index])
+configure_head_camera(mujoco, model)
+mujoco.mj_forward(model, data)
+renderer = mujoco.Renderer(model, height=240, width=320)
+result = {{}}
+try:
+    for camera in ('head_camera', 'office_v2_camera_001'):
+        renderer.update_scene(data, camera=camera)
+        image = renderer.render()
+        result[camera] = [list(image.shape), float(image.mean()), float(image.std())]
+    renderer.enable_depth_rendering()
+    renderer.update_scene(data, camera='head_camera')
+    depth = renderer.render()
+    finite = depth[np.isfinite(depth)]
+    result['head_camera_depth'] = [
+        list(depth.shape),
+        float(finite.size / depth.size),
+        float(finite.min()),
+        float(finite.max()),
+        float(finite.std()),
+    ]
+finally:
+    renderer.close()
+print(json.dumps(result))
+"""
+    env = dict(os.environ)
+    env["MUJOCO_GL"] = "egl"
+    env["PYTHONPATH"] = os.pathsep.join(
+        filter(None, (str(ROOT / "src"), env.get("PYTHONPATH", "")))
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=ROOT,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    measurements = json.loads(result.stdout.strip().splitlines()[-1])
+    for camera in ("head_camera", "office_v2_camera_001"):
+        shape, mean, stddev = measurements[camera]
+        assert shape == [240, 320, 3]
+        assert mean > 2.0, camera
+        assert stddev > 3.0, camera
+    depth_shape, finite_fraction, minimum, maximum, stddev = measurements[
+        "head_camera_depth"
+    ]
+    assert depth_shape == [240, 320]
+    assert finite_fraction > 0.95
+    assert 0.0 < minimum < maximum
+    assert stddev > 0.01
+
+
+def test_runtime_loader_hashes_every_included_office_asset_and_fails_closed(
+    tmp_path: Path,
+) -> None:
+    copied = tmp_path / "generated"
+    shutil.copytree(GENERATED, copied)
+    runtime = load_runtime_scene(copied / "runtime_manifest.json")
+    assert runtime.model_office_include.name == "office_v2.include.xml"
+    assert len(runtime.model_render_assets) == 8
+
+    runtime.model_office_include.write_text(
+        runtime.model_office_include.read_text(encoding="utf-8") + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="model.office_include SHA-256 mismatch"):
+        load_runtime_scene(copied / "runtime_manifest.json")
+
+    shutil.rmtree(copied)
+    shutil.copytree(GENERATED, copied)
+    manifest_path = copied / "runtime_manifest.json"
+    value = json.loads(manifest_path.read_text(encoding="utf-8"))
+    value["oracle"] = {"enabled": False}
+    manifest_path.write_text(json.dumps(value), encoding="utf-8")
+    with pytest.raises(ValueError, match="privileged key.*oracle"):
+        load_runtime_scene(manifest_path)
+
+
+def test_supported_configs_all_select_the_same_verified_office_v2_bundle() -> None:
+    expected_model = (GENERATED / "mujoco" / "office_v2.runtime.xml").resolve()
+    expected_manifest = (GENERATED / "runtime_manifest.json").resolve()
+    for name in ("sim.yaml", "headless.yaml", "ros-headless.yaml"):
+        config = SimConfig.from_file(ROOT / "config" / name)
+        assert config.model_scene == expected_model
+        assert config.scene_runtime_manifest == expected_manifest
+        assert config.runtime_scene.spawn_x == pytest.approx(-6.45)
+        assert config.runtime_scene.spawn_y == pytest.approx(0.0)
+        assert config.reset_policy == "explicit_process_restart"
+    for name in ("sim.yaml", "headless.yaml", "ros-headless.yaml"):
+        assert "h_ide_office_29dof.xml" not in (
+            ROOT / "config" / name
+        ).read_text(encoding="utf-8")

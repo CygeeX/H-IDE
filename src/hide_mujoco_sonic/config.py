@@ -8,6 +8,7 @@ from typing import Any
 import yaml
 
 from .network import require_loopback_bind_host, resolve_docker_observation_bind_host
+from .scene_runtime import RuntimeScene, load_runtime_scene
 
 
 @dataclass(frozen=True)
@@ -57,6 +58,8 @@ class SimConfig:
     startup_horizontal_support_s: float
     reset_policy: str
     model_scene: Path
+    scene_runtime_manifest: Path
+    runtime_scene: RuntimeScene
     sonic_model_profile: str
     sonic_model_lock: Path
     sonic_model_repo: str
@@ -80,6 +83,7 @@ class SimConfig:
             "command_timeout_s", "motion_handoff_warmup_s", "motion_handoff_blend_s",
             "control_hz", "camera_hz", "observation_hz",
             "force_cpu", "onscreen", "offscreen", "startup_support_s", "startup_horizontal_support_s", "model_scene",
+            "scene_runtime_manifest",
             "reset_policy",
             "sonic_model_profile", "sonic_model_lock", "sonic_model_repo",
             "sonic_model_revision", "lerobot_commit",
@@ -151,6 +155,13 @@ class SimConfig:
         docker_observation_bind_host = resolve_docker_observation_bind_host(
             os.getenv("HIDE_DOCKER_OBSERVATION_BIND_HOST")
         )
+        model_scene = Path(str(raw["model_scene"])).expanduser().resolve()
+        scene_runtime_manifest = Path(str(raw["scene_runtime_manifest"])).expanduser().resolve()
+        runtime_scene = load_runtime_scene(
+            scene_runtime_manifest,
+            configured_model_scene=model_scene,
+            configured_reset_policy=str(raw["reset_policy"]),
+        )
         return cls(
             schema_version=str(raw["schema_version"]),
             robot_id=str(raw["robot_id"]),
@@ -202,7 +213,9 @@ class SimConfig:
             startup_support_s=float(raw["startup_support_s"]),
             startup_horizontal_support_s=float(raw["startup_horizontal_support_s"]),
             reset_policy=str(raw["reset_policy"]),
-            model_scene=Path(str(raw["model_scene"])),
+            model_scene=model_scene,
+            scene_runtime_manifest=scene_runtime_manifest,
+            runtime_scene=runtime_scene,
             sonic_model_profile=str(raw["sonic_model_profile"]),
             sonic_model_lock=Path(str(raw["sonic_model_lock"])),
             sonic_model_repo=str(raw["sonic_model_repo"]),

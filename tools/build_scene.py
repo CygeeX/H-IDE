@@ -33,7 +33,7 @@ from typing import Any, Iterable, Mapping, Sequence
 import yaml
 
 
-BUILD_VERSION = "office-v2-generator/1"
+BUILD_VERSION = "office-v2-generator/2"
 SCHEMA_VERSION = "h-ide.office-scene/2"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SCENE = REPO_ROOT / "scenes" / "office_v2" / "scene.yaml"
@@ -137,6 +137,15 @@ def _validate_scene(scene: Mapping[str, Any]) -> None:
     resolution = float(scene["map"]["resolution"])
     if resolution <= 0 or any(abs(round(axis / resolution) - axis / resolution) > 1e-7 for axis in size):
         raise SceneBuildError("map dimensions must be an integer multiple of resolution")
+    navigation = scene.get("navigation")
+    if not isinstance(navigation, Mapping):
+        raise SceneBuildError("navigation must be an object")
+    robot_radius = float(navigation.get("robot_radius_m", 0))
+    footprint_padding = float(navigation.get("footprint_padding_m", -1))
+    if not math.isfinite(robot_radius) or robot_radius <= 0:
+        raise SceneBuildError("navigation.robot_radius_m must be positive")
+    if not math.isfinite(footprint_padding) or footprint_padding < 0:
+        raise SceneBuildError("navigation.footprint_padding_m must be non-negative")
 
     material_ids = set(scene["materials"])
     texture_ids = {item["id"] for item in scene["textures"]}
@@ -200,8 +209,13 @@ def _validate_scene(scene: Mapping[str, Any]) -> None:
         if target["object_id"] not in object_ids:
             raise SceneBuildError(f"target {target['id']} references an unknown object")
         _numbers(target["pose"], 3, f"targets.{target['id']}.pose")
+    default_spawns = [spawn for spawn in scene["spawns"] if spawn.get("default") is True]
+    if len(default_spawns) != 1:
+        raise SceneBuildError("exactly one spawn must be the product runtime default")
     for spawn in scene["spawns"]:
         _numbers(spawn["pose"], 3, f"spawns.{spawn['id']}.pose")
+        if float(spawn.get("clearance_radius", 0)) <= 0:
+            raise SceneBuildError(f"spawn {spawn['id']} clearance_radius must be positive")
     for test in scene["semantic_tests"]:
         if not set(test["expected_object_ids"]).issubset(object_ids):
             raise SceneBuildError(f"semantic test {test['id']} references an unknown object")
@@ -547,8 +561,8 @@ class MjcfBuilder:
         self.geom(2, "office_v2_floor", geom_type="plane", pos=[0, 0, 0], size=[8, 6, 0.05], material=render["floor_material"], collision=False)
         # The visible floor is also the physical support surface.
         self.lines[-1] = self.lines[-1].replace('contype="0" conaffinity="0" group="2"', 'contype="1" conaffinity="1" group="2" friction="0.9 0.02 0.001" condim="3"')
-        for light in render["lights"]:
-            self.add(2, f'<light name="office_v2_{light["id"]}" pos="{_vec(light["position"])}" diffuse="{_vec(light["diffuse"])}" specular="0.08 0.08 0.08" castshadow="true"/>')
+        for index, light in enumerate(render["lights"], start=1):
+            self.add(2, f'<light name="office_v2_light_{index:03d}" pos="{_vec(light["position"])}" diffuse="{_vec(light["diffuse"])}" specular="0.08 0.08 0.08" castshadow="true"/>')
 
         for index, structure in enumerate(self.scene["structures"], start=1):
             prefix = f"office_structure_{index:03d}"
@@ -592,9 +606,9 @@ class MjcfBuilder:
                 "visual_geoms": visual_names,
             })
 
-        for camera in render["cameras"]:
+        for index, camera in enumerate(render["cameras"], start=1):
             axes = _look_at_xyaxes(camera["position"], camera["look_at"])
-            self.add(2, f'<camera name="office_v2_{camera["id"]}" pos="{_vec(camera["position"])}" xyaxes="{_vec(axes)}"/>')
+            self.add(2, f'<camera name="office_v2_camera_{index:03d}" pos="{_vec(camera["position"])}" xyaxes="{_vec(axes)}"/>')
         self.add(1, "</worldbody>")
         self.add(0, "</mujocoinclude>")
         return "\n".join(self.lines) + "\n", self.object_mappings
@@ -627,6 +641,21 @@ def _inside_geometry(x: float, y: float, item: Mapping[str, Any]) -> bool:
     local_x = math.cos(yaw) * dx + math.sin(yaw) * dy
     local_y = -math.sin(yaw) * dx + math.cos(yaw) * dy
     return abs(local_x) <= float(item["size"][0]) / 2 and abs(local_y) <= float(item["size"][1]) / 2
+
+
+def _distance_to_geometry(x: float, y: float, item: Mapping[str, Any]) -> float:
+    """Return exact planar clearance from a point to one collision proxy."""
+
+    dx = x - float(item["center"][0])
+    dy = y - float(item["center"][1])
+    if item["shape"] == "circle":
+        return max(0.0, math.hypot(dx, dy) - float(item["radius"]))
+    yaw = float(item["yaw"])
+    local_x = math.cos(yaw) * dx + math.sin(yaw) * dy
+    local_y = -math.sin(yaw) * dx + math.cos(yaw) * dy
+    outside_x = max(0.0, abs(local_x) - float(item["size"][0]) / 2)
+    outside_y = max(0.0, abs(local_y) - float(item["size"][1]) / 2)
+    return math.hypot(outside_x, outside_y)
 
 
 def _build_pgm(scene: Mapping[str, Any]) -> tuple[bytes, int, int, list[dict[str, Any]]]:
@@ -662,11 +691,25 @@ def _cell_value(pgm: bytes, width: int, height: int, scene: Mapping[str, Any], x
 
 def _ensure_navigation_points_are_free(scene: Mapping[str, Any], pgm: bytes, width: int, height: int) -> None:
     occupied = int(scene["map"]["occupied_value"])
+    geometry = _map_geometry(scene)
+    body_clearance = float(scene["navigation"]["robot_radius_m"]) + float(
+        scene["navigation"]["footprint_padding_m"]
+    )
     for group in ("spawns", "targets"):
         for item in scene[group]:
             x, y, _yaw = [float(axis) for axis in item["pose"]]
             if _cell_value(pgm, width, height, scene, x, y) == occupied:
                 raise SceneBuildError(f"{group[:-1]} {item['id']} lies in an occupied map cell")
+            required = max(
+                body_clearance,
+                float(item.get("clearance_radius", 0.0)),
+            )
+            nearest = min(_distance_to_geometry(x, y, obstacle) for obstacle in geometry)
+            if nearest + 1e-9 < required:
+                raise SceneBuildError(
+                    f"{group[:-1]} {item['id']} has only {nearest:.3f} m collision "
+                    f"clearance; {required:.3f} m is required"
+                )
 
 
 def _asset_label(texture_id: str) -> str:
@@ -677,8 +720,10 @@ def _output_inventory(paths: BuildPaths, texture_ids: Sequence[str]) -> list[tup
     inventory = [
         ("scenes/office_v2/generated/mujoco/office_v2.include.xml", paths.generated / "mujoco" / "office_v2.include.xml"),
         ("scenes/office_v2/generated/mujoco/office_v2.preview.xml", paths.generated / "mujoco" / "office_v2.preview.xml"),
+        ("scenes/office_v2/generated/mujoco/office_v2.runtime.xml", paths.generated / "mujoco" / "office_v2.runtime.xml"),
         ("scenes/office_v2/generated/nav2/office_v2.pgm", paths.generated / "nav2" / "office_v2.pgm"),
         ("scenes/office_v2/generated/nav2/office_v2.yaml", paths.generated / "nav2" / "office_v2.yaml"),
+        ("scenes/office_v2/generated/runtime_manifest.json", paths.generated / "runtime_manifest.json"),
         ("scenes/office_v2/generated/visual_manifest.json", paths.generated / "visual_manifest.json"),
         ("scenes/office_v2/evaluation/manifest.json", paths.evaluation / "manifest.json"),
         ("assets/office_v2/ASSET_LICENSES.json", paths.assets.parent / "ASSET_LICENSES.json"),
@@ -712,6 +757,19 @@ def build_scene(paths: BuildPaths | None = None) -> dict[str, str]:
     )
     preview_path = paths.generated / "mujoco" / "office_v2.preview.xml"
     _write_text(preview_path, preview)
+    # The pinned G1 model remains a separately reviewed robot asset. The
+    # generated top-level MJCF composes it with the Office V2 include without
+    # copying robot XML or evaluator-only semantic data into the scene bundle.
+    runtime = (
+        '<mujoco model="H-IDE G1 Office V2 runtime">\n'
+        '  <option timestep="0.004" gravity="0 0 -9.81"/>\n'
+        '  <include file="../../../../models/unitree-g1-mujoco/assets/g1_29dof_no_hand.xml"/>\n'
+        '  <compiler angle="radian" meshdir="../../../../models/unitree-g1-mujoco/assets/meshes"/>\n'
+        '  <include file="office_v2.include.xml"/>\n'
+        '</mujoco>\n'
+    )
+    runtime_mjcf_path = paths.generated / "mujoco" / "office_v2.runtime.xml"
+    _write_text(runtime_mjcf_path, runtime)
 
     pgm, map_width, map_height, map_geometry = _build_pgm(scene)
     _ensure_navigation_points_are_free(scene, pgm, map_width, map_height)
@@ -791,6 +849,60 @@ def build_scene(paths: BuildPaths | None = None) -> dict[str, str]:
     license_path = paths.assets.parent / "ASSET_LICENSES.json"
     _write_text(license_path, _canonical_json(asset_licenses))
 
+    default_spawn = next(item for item in scene["spawns"] if item.get("default") is True)
+    spawn_x, spawn_y, spawn_yaw = (float(value) for value in default_spawn["pose"])
+    collision_contract_sha256 = _sha256_bytes(
+        json.dumps(map_geometry, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+    runtime_manifest = {
+        "schema_version": "h-ide.office-v2-runtime/1",
+        "scene_id": scene["scene_id"],
+        "scene_source_sha256": source_sha,
+        "generator_version": BUILD_VERSION,
+        "content_class": "runtime_geometry",
+        "reset_policy": "explicit_process_restart",
+        "model": {
+            "scene": {
+                "path": "mujoco/office_v2.runtime.xml",
+                "sha256": _sha256_path(runtime_mjcf_path),
+            },
+            "office_include": {
+                "path": "mujoco/office_v2.include.xml",
+                "sha256": _sha256_path(include_path),
+            },
+            "render_assets": [
+                {
+                    "path": f"mujoco/textures/{texture['id']}.png",
+                    "sha256": texture_hashes[texture["id"]],
+                }
+                for texture in scene["textures"]
+            ],
+        },
+        "map": {
+            "frame_id": map_spec["frame_id"],
+            "resolution": float(map_spec["resolution"]),
+            "origin": [float(value) for value in map_spec["origin"]],
+            "size": [float(value) for value in map_spec["size"]],
+            "width_cells": map_width,
+            "height_cells": map_height,
+            "yaml": {"path": "nav2/office_v2.yaml", "sha256": _sha256_path(yaml_path)},
+            "image": {"path": "nav2/office_v2.pgm", "sha256": _sha256_path(pgm_path)},
+        },
+        "bounds": {
+            "min": [float(value) for value in scene["bounds"]["min"]],
+            "max": [float(value) for value in scene["bounds"]["max"]],
+        },
+        "default_spawn": {
+            "x": spawn_x,
+            "y": spawn_y,
+            "yaw": spawn_yaw,
+            "clearance_radius_m": float(default_spawn["clearance_radius"]),
+        },
+        "collision_contract_sha256": collision_contract_sha256,
+    }
+    runtime_manifest_path = paths.generated / "runtime_manifest.json"
+    _write_text(runtime_manifest_path, _canonical_json(runtime_manifest))
+
     visual_manifest = {
         "schema_version": "h-ide.office-v2-visual/1",
         "scene_id": scene["scene_id"],
@@ -804,8 +916,10 @@ def build_scene(paths: BuildPaths | None = None) -> dict[str, str]:
         "bundles": {
             "mjcf_include": {"path": "generated/mujoco/office_v2.include.xml", "sha256": _sha256_path(include_path)},
             "mjcf_preview": {"path": "generated/mujoco/office_v2.preview.xml", "sha256": _sha256_path(preview_path)},
+            "mjcf_runtime": {"path": "generated/mujoco/office_v2.runtime.xml", "sha256": _sha256_path(runtime_mjcf_path)},
             "nav2_pgm": {"path": "generated/nav2/office_v2.pgm", "sha256": _sha256_path(pgm_path)},
             "nav2_yaml": {"path": "generated/nav2/office_v2.yaml", "sha256": _sha256_path(yaml_path)},
+            "runtime_manifest": {"path": "generated/runtime_manifest.json", "sha256": _sha256_path(runtime_manifest_path)},
         },
         "render_assets": [
             {"path": f"generated/mujoco/textures/{texture['id']}.png", "sha256": texture_hashes[texture["id"]]}
