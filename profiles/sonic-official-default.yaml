@@ -1,0 +1,40 @@
+schema_version: h-ide.sonic-profile/1
+id: sonic-official-default
+display_name: NVIDIA SONIC official default
+status: model_bundle_complete
+activation: blocked
+bundle_integrity: complete
+runtime_executable: false
+
+source:
+  repository: /home/phi/learn-projects/systemed_study/GR00T-WholeBodyControl
+  revision: c374bae5b9039cd0ee71377e654d11ce1bc69e1d
+model:
+  repository: nvidia/GEAR-SONIC
+  revision: 9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2
+  variant: default
+  planner: planner_sonic.onnx
+  encoder: model_encoder.onnx
+  decoder: model_decoder.onnx
+observation_config:
+  kind: official_yaml
+  filename: >-
+    ~/.cache/huggingface/hub/models--nvidia--GEAR-SONIC/snapshots/9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2/observation_config.yaml
+  future_reference_step: 5
+  encoder_input_dimension: 1762
+  decoder_input_dimension: 994
+  token_dimension: 64
+  action_dimension: 29
+controller:
+  kind: official_cpp_onnx
+  entrypoint: gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/src/g1_deploy_onnx_ref.cpp
+
+runtime_blockers:
+  - The official C++ deployment controller has not been built locally.
+  - The official controller has not been connected to the H-IDE Nav2/SONIC adapter.
+  - Repeated motion acceptance has not passed.
+availability_note: >-
+  The fixed-revision model bundle is complete and can be integrity-checked, but
+  it is not an executable runtime profile.  Model presence must never make this
+  profile selectable for motion.
+lock_profile: sonic-official-default

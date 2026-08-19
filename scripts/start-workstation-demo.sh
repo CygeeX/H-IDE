@@ -43,6 +43,14 @@ done
 
 mkdir -p "${HIDE_DEMO_RUN_ROOT}"
 
+# The controller and its observation contract are one indivisible model bundle.
+# Refuse to start any motion-capable process when the config, source revision,
+# or cached model bytes differ from the reviewed lock.
+"${HIDE_DEMO_SIM_ROOT}/.venv/bin/python" \
+  "${HIDE_DEMO_SIM_ROOT}/tools/verify_model_lock.py" \
+  --lock "${HIDE_DEMO_SIM_ROOT}/config/sonic-models.lock.json" \
+  --config "${HIDE_DEMO_CONFIG}"
+
 env_value() {
   local key="$1"
   local fallback="$2"
@@ -241,11 +249,22 @@ start_process \
 wait_for_qwen_vision 120
 
 nav2_image="h-ide-nav2-sim:jazzy"
-if ! docker image inspect "${nav2_image}" >/dev/null 2>&1; then
-  docker build \
-    -t "${nav2_image}" \
-    -f "${HIDE_DEMO_SIM_ROOT}/docker/nav2/Dockerfile" \
-    "${HIDE_DEMO_SIM_ROOT}/docker/nav2"
+# Re-run the build on every launch. Docker's layer cache makes an unchanged
+# context cheap, while a tag-exists check would silently keep an old controller
+# after a fail-closed Nav2 patch or parameter update.
+docker build \
+  -t "${nav2_image}" \
+  -f "${HIDE_DEMO_SIM_ROOT}/docker/nav2/Dockerfile" \
+  "${HIDE_DEMO_SIM_ROOT}/docker/nav2"
+nav2_image_id="$(docker image inspect "${nav2_image}" --format '{{.Id}}')"
+test -n "${nav2_image_id:?}"
+nav2_container_recreate=false
+if docker container inspect h-ide-nav2-sim >/dev/null 2>&1; then
+  nav2_container_image_id="$(docker container inspect h-ide-nav2-sim --format '{{.Image}}')"
+  test -n "${nav2_container_image_id:?}"
+  if [[ "${nav2_container_image_id}" != "${nav2_image_id}" ]]; then
+    nav2_container_recreate=true
+  fi
 fi
 # Nav2's lifecycle manager only makes one autostart attempt.  Keep it stopped
 # until the simulation publishes map -> base_link; otherwise a cold start can
@@ -253,12 +272,23 @@ fi
 nav2_needs_start=true
 if docker container inspect h-ide-nav2-sim >/dev/null 2>&1 \
   && [[ "$(docker inspect h-ide-nav2-sim --format '{{.State.Running}}')" == "true" ]]; then
-  if nav2_lifecycle_active; then
+  if [[ "${nav2_container_recreate}" == "true" ]]; then
+    docker stop --timeout 10 h-ide-nav2-sim >/dev/null
+  elif nav2_lifecycle_active; then
     nav2_needs_start=false
     printf '%-28s already active\n' nav2
   else
-    docker stop --time 10 h-ide-nav2-sim >/dev/null
+    docker stop --timeout 10 h-ide-nav2-sim >/dev/null
   fi
+fi
+if [[ "${nav2_container_recreate}" == "true" ]]; then
+  if [[ "$(docker container inspect h-ide-nav2-sim --format '{{.State.Running}}')" == "true" ]]; then
+    printf 'refusing to replace the Nav2 container while it is still running\n' >&2
+    exit 1
+  fi
+  # The container is a stateless process wrapper: maps/parameters live in the
+  # image and no user data or volumes are attached.
+  docker container rm h-ide-nav2-sim >/dev/null
 fi
 
 start_process \

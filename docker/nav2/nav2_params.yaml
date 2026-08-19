@@ -57,6 +57,8 @@ controller_server:
     FollowPath:
       plugin: "dwb_core::DWBLocalPlanner"
       debug_trajectory_details: false
+      # Preserve a zero-linear sample for Nav2-owned in-place rotation. The
+      # separate min_speed_xy below rejects non-zero differential-drive creep.
       min_vel_x: 0.0
       # Match H-IDE MissionEnvelope.maximumSpeedMps. The NavigateToPose action
       # has no per-goal speed field, so this controller limit is the enforcing
@@ -64,10 +66,10 @@ controller_server:
       max_vel_x: 0.20
       min_vel_y: 0.0
       max_vel_y: 0.0
-      max_vel_theta: 0.5
-      min_speed_xy: 0.0
+      max_vel_theta: 0.25
+      min_speed_xy: 0.10
       max_speed_xy: 0.20
-      min_speed_theta: 0.0
+      min_speed_theta: 0.05
       acc_lim_x: 0.5
       acc_lim_y: 0.0
       acc_lim_theta: 1.0

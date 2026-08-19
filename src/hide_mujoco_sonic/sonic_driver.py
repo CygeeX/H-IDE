@@ -8,7 +8,7 @@ topics, which keeps the simulation boundary close to the real Unitree stack.
 from __future__ import annotations
 
 import argparse
-import gc
+from dataclasses import dataclass
 import logging
 import math
 import os
@@ -40,6 +40,153 @@ from .transport import parse_lines
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True, slots=True)
+class IngressDecision:
+    """Validated bridge command before any SONIC/model-specific mapping."""
+
+    action: str
+    generation: int | None
+    sequence: int | None
+    state: str
+    vx: float = 0.0
+    vy: float = 0.0
+    wz: float = 0.0
+    heading_yaw: float | None = None
+    reason: str | None = None
+
+
+class SonicIntentIngress:
+    """Fail-closed generation/sequence gate for gait-adapter wire intents.
+
+    A newly observed bridge lifecycle is held at stop until it sends a measured
+    ``IDLE`` acknowledgement.  The ROS bridge only emits that acknowledgement
+    after its GaitAdapter has received a fresh, stationary ``base_link`` odom
+    sample.  A driver never infers or auto-rearms this state itself.
+    """
+
+    _MOTION_STATES = frozenset({"STARTING", "WALKING", "TURNING"})
+    _STOP_STATES = frozenset({"DISARMED", "STOPPING", "FAULT"})
+
+    def __init__(self, *, clock=time.monotonic, max_age_s: float = 0.50) -> None:
+        if not math.isfinite(float(max_age_s)) or max_age_s <= 0:
+            raise ValueError("intent max age must be finite and positive")
+        self._clock = clock
+        self.max_age_s = float(max_age_s)
+        self.generation: int | None = None
+        self.sequence = 0
+        self.armed = False
+
+    @staticmethod
+    def _integer(value: object, *, minimum: int) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+            raise ValueError("intent generation/sequence must be a positive integer")
+        return value
+
+    @staticmethod
+    def _finite(payload: dict[str, Any], name: str) -> float:
+        try:
+            value = float(payload[name])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"intent {name} must be finite") from exc
+        if not math.isfinite(value):
+            raise ValueError(f"intent {name} must be finite")
+        return value
+
+    def accept(self, payload: dict[str, Any]) -> IngressDecision:
+        if payload.get("type") != "sonic_intent":
+            raise ValueError("motion input must use the sonic_intent contract")
+        if payload.get("schema_version") != "h-ide.sonic-intent/v1":
+            raise ValueError("unsupported sonic intent schema")
+        if payload.get("source") != "nav2":
+            raise ValueError("only Nav2 gait intents are accepted")
+
+        generation = self._integer(payload.get("generation"), minimum=0)
+        sequence = self._integer(payload.get("sequence"), minimum=1)
+        generated_at = self._finite(payload, "generated_at_s")
+        now = float(self._clock())
+        if generated_at > now + 0.10 or now - generated_at > self.max_age_s:
+            raise ValueError("sonic intent is stale or from the future")
+
+        state = str(payload.get("state", ""))
+        if state not in self._MOTION_STATES | self._STOP_STATES | {"IDLE"}:
+            raise ValueError("unsupported gait adapter state")
+        motion_enabled = payload.get("motion_enabled")
+        stop_requested = payload.get("stop_requested")
+        stop_acknowledged = payload.get("stop_acknowledged")
+        if not all(
+            isinstance(value, bool)
+            for value in (motion_enabled, stop_requested, stop_acknowledged)
+        ):
+            raise ValueError("intent safety flags must be booleans")
+        if payload.get("mode") not in {"IDLE", "SLOW_WALK"}:
+            raise ValueError("unsupported SONIC mode")
+
+        head_yaw = self._finite(payload, "head_yaw_rad")
+        head_pitch = self._finite(payload, "head_pitch_rad")
+        if abs(head_yaw) > 1e-9 or abs(head_pitch) > 1e-9:
+            raise ValueError("navigation profile requires fixed zero head targets")
+
+        heading: float | None = None
+        if payload.get("measured_heading_yaw") is not None:
+            heading = self._finite(payload, "measured_heading_yaw")
+
+        if self.generation is not None and generation < self.generation:
+            return IngressDecision(
+                "ignore", generation, sequence, state, reason="old bridge generation ignored"
+            )
+        if generation != self.generation:
+            self.generation = generation
+            self.sequence = 0
+            self.armed = False
+        if sequence <= self.sequence:
+            return IngressDecision(
+                "ignore", generation, sequence, state, reason="out-of-order intent ignored"
+            )
+        self.sequence = sequence
+
+        # Stop authority is evaluated before reading any motion values.  Even a
+        # malformed non-zero tail on a stop envelope can therefore never reach
+        # CmdVelGuard or the learned model.
+        if stop_requested or not motion_enabled:
+            self.armed = (
+                state == "IDLE"
+                and not stop_requested
+                and bool(stop_acknowledged)
+            )
+            return IngressDecision(
+                "stop",
+                generation,
+                sequence,
+                state,
+                heading_yaw=heading,
+                reason=(str(payload["reason"]) if payload.get("reason") else None),
+            )
+
+        if not self.armed:
+            return IngressDecision(
+                "stop",
+                generation,
+                sequence,
+                state,
+                heading_yaw=heading,
+                reason="motion rejected until fresh stationary IDLE acknowledgement",
+            )
+        if state not in self._MOTION_STATES or payload.get("mode") != "SLOW_WALK":
+            raise ValueError("motion-enabled intent has an invalid gait state")
+
+        vx = self._finite(payload, "velocity_x_mps")
+        vy = self._finite(payload, "velocity_y_mps")
+        wz = self._finite(payload, "yaw_rate_rps")
+        linear = self._finite(payload, "linear_speed_mps")
+        if abs(linear - math.hypot(vx, vy)) > 1e-6:
+            raise ValueError("intent linear speed does not match its velocity vector")
+        if not any(abs(value) > 1e-6 for value in (vx, vy, wz)):
+            raise ValueError("motion-enabled intent contains no Nav2 motion")
+        return IngressDecision(
+            "motion", generation, sequence, state, vx, vy, wz, heading
+        )
+
+
 class SonicDriver:
     def __init__(self, config: SimConfig, telemetry: TelemetryStore):
         self.config = config
@@ -68,7 +215,9 @@ class SonicDriver:
         self._fault_latched = threading.Event()
         self._terminal_fault_reason: str | None = None
         self._tick_guard = PlantTickGuard()
-        self._motion_armed = True
+        self._intent_ingress = SonicIntentIngress(
+            max_age_s=max(0.50, config.command_timeout_s * 2.0)
+        )
         self._navigation_task_active = False
         self._input_buffer = b""
         self._last_intent_signature: tuple[bool, float, float, float] | None = None
@@ -723,7 +872,7 @@ class SonicDriver:
             return
         if payload.get("type") == "stop":
             self.guard.stop(source="bridge_stop")
-            self._motion_armed = True
+            self._intent_ingress.armed = False
             self._navigation_task_active = False
             reason = payload.get("reason")
             self.telemetry.update(
@@ -735,36 +884,48 @@ class SonicDriver:
                 last_error=str(reason) if reason else None,
             )
             return
-        if payload.get("type") != "cmd_vel":
-            raise ValueError("unsupported command type")
-        vx = float(payload.get("vx", 0.0))
-        vy = float(payload.get("vy", 0.0))
-        wz = float(payload.get("wz", 0.0))
-        if payload.get("heading_yaw") is not None:
-            self.guard.observe_heading(float(payload["heading_yaw"]))
-        nonzero = any(abs(value) > 1e-6 for value in (vx, vy, wz))
-        if nonzero and not self._motion_armed:
-            self.guard.stop(source="plant_restart_interlock")
+        try:
+            decision = self._intent_ingress.accept(payload)
+        except (KeyError, TypeError, ValueError) as exc:
+            self.guard.stop(source="invalid_gait_intent")
+            self._navigation_task_active = False
             self.telemetry.update(
-                nav2_state="restart_hold",
-                last_cmd_vx=vx,
-                last_cmd_vy=vy,
-                last_cmd_wz=wz,
-                last_error="non-zero Nav2 command rejected until an idle/stop command is observed",
+                nav2_state="safety_stop",
+                navigation_task_active=False,
+                last_cmd_vx=0.0,
+                last_cmd_vy=0.0,
+                last_cmd_wz=0.0,
+                last_error=f"invalid gait intent: {exc}",
+            )
+            raise
+        if decision.action == "ignore":
+            return
+        if decision.heading_yaw is not None:
+            self.guard.observe_heading(decision.heading_yaw)
+        if decision.action == "stop":
+            # Stop/motion_enabled authority is obeyed before any values enter
+            # CmdVelGuard or the SONIC model mapping.
+            self.guard.stop(source="gait_adapter")
+            self._navigation_task_active = False
+            self.telemetry.update(
+                nav2_state=("idle" if decision.state == "IDLE" else "safety_stop"),
+                navigation_task_active=False,
+                last_cmd_vx=0.0,
+                last_cmd_vy=0.0,
+                last_cmd_wz=0.0,
+                last_error=decision.reason,
             )
             return
-        if not nonzero:
-            self._motion_armed = True
-        elif not self._navigation_task_active:
+        if not self._navigation_task_active:
             self.telemetry.reset_navigation_task_peaks()
             self._navigation_task_active = True
             self.telemetry.update(navigation_task_active=True)
-        self.guard.accept(vx, vy, wz, source=str(payload.get("source", "nav2")))
+        self.guard.accept(decision.vx, decision.vy, decision.wz, source="nav2")
         self.telemetry.update(
-            nav2_state="commanding" if nonzero else "idle",
-            last_cmd_vx=vx,
-            last_cmd_vy=vy,
-            last_cmd_wz=wz,
+            nav2_state="commanding",
+            last_cmd_vx=decision.vx,
+            last_cmd_vy=decision.vy,
+            last_cmd_wz=decision.wz,
             last_error=None,
         )
 

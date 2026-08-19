@@ -1,0 +1,35 @@
+schema_version: h-ide.sonic-profile/1
+id: sonic-python-experimental
+display_name: SONIC default weights with experimental LeRobot Python runtime
+status: available
+activation: evaluation_only
+bundle_integrity: complete
+runtime_executable: true
+motion_accepted: false
+
+source:
+  repository: vendor/lerobot
+  revision: b32c6b81ca45ddd93696d0587a970ce65560943f
+model:
+  repository: nvidia/GEAR-SONIC
+  revision: 9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2
+  variant: default
+  planner: planner_sonic.onnx
+  encoder: model_encoder.onnx
+  decoder: model_decoder.onnx
+observation_config:
+  kind: embedded_python_contract
+  source: vendor/lerobot/src/lerobot/robots/unitree_g1/controllers/sonic_pipeline.py
+  encoder_dimension: 1762
+  decoder_dimension: 994
+  future_reference_step: 5
+controller:
+  kind: experimental_python_onnx_port
+  source: vendor/lerobot/src/lerobot/robots/unitree_g1/controllers/sonic_whole_body.py
+  runtime_class: lerobot.robots.unitree_g1.controllers.sonic_whole_body.SonicWholeBodyController
+
+constraints:
+  - Never pair this embedded observation contract with sonic_v1_1 weights.
+  - Passing integrity checks does not satisfy locomotion acceptance.
+  - Production activation remains empty until repeated motion tests pass.
+lock_profile: sonic-python-experimental

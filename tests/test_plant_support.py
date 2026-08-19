@@ -3,7 +3,11 @@ import math
 import pytest
 import numpy as np
 
-from hide_mujoco_sonic.plant import PlantSupportController, stabilized_support_wrench
+from hide_mujoco_sonic.plant import (
+    PlantPhysicsFault,
+    PlantSupportController,
+    stabilized_support_wrench,
+)
 
 
 def test_support_controller_finishes_startup_without_overriding_locomotion():
@@ -30,6 +34,18 @@ def test_support_controller_latches_physics_time_rollback_until_restart():
     assert support.set_mode("safety_stop") == "safety_stop"
     with pytest.raises(ValueError, match="physics fault is latched"):
         support.set_mode("locomotion")
+
+
+def test_support_controller_fault_terminates_instead_of_resetting() -> None:
+    support = PlantSupportController()
+
+    with pytest.raises(PlantPhysicsFault, match="numerical instability"):
+        support.fail("numerical instability")
+
+    assert support.state()["mode"] == "safety_stop"
+    assert support.state()["fault"] == "numerical instability"
+    with pytest.raises(PlantPhysicsFault, match="numerical instability"):
+        support.require_healthy()
 
 
 def test_locomotion_keeps_vertical_roll_and_pitch_fall_arrest() -> None:

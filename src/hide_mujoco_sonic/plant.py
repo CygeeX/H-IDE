@@ -26,6 +26,7 @@ from urllib.parse import parse_qs, urlparse
 import numpy as np
 
 from .config import SimConfig
+from .frames import BodyTwist, read_mujoco_local_body_twist
 
 
 SEMANTIC_GEOMS: dict[str, tuple[str, tuple[str, ...]]] = {
@@ -38,6 +39,10 @@ SEMANTIC_GEOMS: dict[str, tuple[str, tuple[str, ...]]] = {
     "kitchen_counter": ("厨房操作台", ("厨房", "操作台", "kitchen", "counter")),
     "column_obstacle": ("立柱", ("立柱", "柱子", "column")),
 }
+
+
+class PlantPhysicsFault(RuntimeError):
+    """A latched MuJoCo fault that requires an explicit process restart."""
 
 
 class PlantSupportController:
@@ -112,6 +117,24 @@ class PlantSupportController:
                 f"({previous:.6f}s -> {current:.6f}s)"
             )
         return False
+
+    def fail(self, reason: str) -> None:
+        """Latch one immutable fault and terminate the acceptance plant.
+
+        Keeping the process alive after invalid physics lets downstream
+        components consume an old pose and can make a later implicit reset look
+        like continuous motion. The strict H-IDE profile therefore exits and
+        requires an operator-visible restart.
+        """
+
+        self.latch_fault(reason)
+        state = self.state()
+        raise PlantPhysicsFault(str(state["fault"]))
+
+    def require_healthy(self) -> None:
+        state = self.state()
+        if state["fault"] is not None:
+            raise PlantPhysicsFault(str(state["fault"]))
 
     def state(self) -> dict[str, object]:
         with self._lock:
@@ -205,7 +228,8 @@ class PlantFrameStore:
         self._sequence = 0
         self._captured_at_ns = 0
         self._pose = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
-        self._root_velocity = [0.0] * 6
+        self._root_velocity = BodyTwist.zero()
+        self._root_body_id: int | None = None
         self._camera_pose = [0.2, 0.0, 1.15, 1.0, 0.0, 0.0, 0.0]
         self._intrinsics = {"fx": 312.77, "fy": 312.77, "cx": 320.0, "cy": 240.0}
         self._rgb = b""
@@ -220,24 +244,40 @@ class PlantFrameStore:
         import mujoco
         import numpy as np
 
-        if self.support.observe_simulation_time(float(self.data.time)):
-            return
-        support_state = self.support.state()
-        if support_state["fault"] is not None:
-            return
+        self.support.observe_simulation_time(float(self.data.time))
+        self.support.require_healthy()
 
         root_pose = np.asarray(self.data.qpos[:7], dtype=float)
-        root_velocity = np.asarray(self.data.qvel[:6], dtype=float)
-        if not np.all(np.isfinite(root_pose)) or not np.all(np.isfinite(root_velocity)):
-            self.support.latch_fault("MuJoCo root state contains non-finite values")
-            return
+        if not np.all(np.isfinite(root_pose)):
+            self.support.fail("MuJoCo root pose contains non-finite values")
+        if self._root_body_id is None:
+            self._root_body_id = int(
+                mujoco.mj_name2id(
+                    self.model,
+                    mujoco.mjtObj.mjOBJ_BODY,
+                    "pelvis",
+                )
+            )
+            if self._root_body_id < 0:
+                raise RuntimeError("pinned G1 model does not define pelvis")
+        try:
+            # mj_objectVelocity returns angular:linear. Request the local
+            # orientation so the resulting ROS twist is genuinely expressed
+            # in base_link rather than in the MuJoCo world frame.
+            root_velocity = read_mujoco_local_body_twist(
+                mujoco,
+                self.model,
+                self.data,
+                self._root_body_id,
+            )
+        except ValueError as exc:
+            self.support.fail(f"MuJoCo root velocity is invalid: {exc}")
         x, y, z = (float(value) for value in root_pose[:3])
         if abs(x) > 6.5 or abs(y) > 4.5 or not 0.20 <= z <= 1.50:
-            self.support.latch_fault(
+            self.support.fail(
                 "MuJoCo root pose left the validated office envelope "
                 f"(x={x:.3f}, y={y:.3f}, z={z:.3f})"
             )
-            return
 
         rgb = render_cache.get("head_camera_image")
         if rgb is None:
@@ -264,7 +304,6 @@ class PlantFrameStore:
         )
         annotations = self._oracle_annotations(segmentation, cv2, mujoco, np)
         pose = [float(value) for value in root_pose]
-        root_velocity = [float(value) for value in root_velocity]
         camera_id = mujoco.mj_name2id(
             self.model,
             mujoco.mjtObj.mjOBJ_CAMERA,
@@ -400,7 +439,6 @@ class PlantFrameStore:
     def state(self) -> dict[str, object]:
         with self._lock:
             x, y, z, qw, qx, qy, qz = self._pose
-            vx, vy, vz, wx, wy, wz = self._root_velocity
             camera_x, camera_y, camera_z, camera_qw, camera_qx, camera_qy, camera_qz = (
                 self._camera_pose
             )
@@ -419,16 +457,7 @@ class PlantFrameStore:
                 "sequence": self._sequence,
                 "capturedAtUnixNs": self._captured_at_ns,
                 "pose": {"x": x, "y": y, "z": z, "qw": qw, "qx": qx, "qy": qy, "qz": qz},
-                "rootVelocity": {
-                    "vx": vx,
-                    "vy": vy,
-                    "vz": vz,
-                    "wx": wx,
-                    "wy": wy,
-                    "wz": wz,
-                    "linearSpeedMps": math.sqrt(vx * vx + vy * vy),
-                    "angularSpeedRps": math.sqrt(wx * wx + wy * wy + wz * wz),
-                },
+                "rootVelocity": self._root_velocity.capture_state(),
                 "support": support_state,
                 "cameraPose": {
                     "x": camera_x,
@@ -581,6 +610,9 @@ def run_plant(config: SimConfig) -> int:
         "MP_START_METHOD": "spawn",
         "USE_SENSOR": False,
         "PRINT_SCENE_INFORMATION": False,
+        # Never hide a fall/numerical fault behind an in-process teleport.
+        # A new spawn is permitted only by explicitly restarting the plant.
+        "RESET_POLICY": config.reset_policy,
         "NUM_MOTORS": 29,
         "NUM_JOINTS": 29,
         # SONIC is the 29-DoF body controller.  The hand-containing scene is

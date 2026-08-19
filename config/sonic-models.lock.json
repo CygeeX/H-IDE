@@ -1,0 +1,305 @@
+{
+  "schema_version": "h-ide.sonic-model-lock/1",
+  "repository_revision_at_audit": "5719726d7dc1b4f72fb970627bb262ea62384263",
+  "model_repository": {
+    "repo_id": "nvidia/GEAR-SONIC",
+    "revision": "9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2",
+    "cache_root": "~/.cache/huggingface/hub/models--nvidia--GEAR-SONIC"
+  },
+  "source_repositories": {
+    "lerobot-python": {
+      "path": "vendor/lerobot",
+      "revision": "b32c6b81ca45ddd93696d0587a970ce65560943f"
+    },
+    "nvidia-groot-wbc": {
+      "path": "/home/phi/learn-projects/systemed_study/GR00T-WholeBodyControl",
+      "revision": "c374bae5b9039cd0ee71377e654d11ce1bc69e1d"
+    }
+  },
+  "audited_runtime": {
+    "config": {
+      "path": "config/ros-headless.yaml",
+      "size": 2794,
+      "sha256": "6b11dda1a80e2d63e2520adbcf6a025afef851577fd20bdb0d9cf520a3ff772f"
+    },
+    "declared_model_revision": "main",
+    "declared_lerobot_revision": "be49454734c8526340fbd997c374aaa1eb9e83cb",
+    "observed_lerobot_revision": "b32c6b81ca45ddd93696d0587a970ce65560943f",
+    "lock_safe": false,
+    "reason": "The runtime config uses a floating model revision and its declared LeRobot revision differs from the nested repository HEAD."
+  },
+  "profiles": {
+    "sonic-official-default": {
+      "availability": "unavailable",
+      "availability_reason": "The fixed-revision model bundle is complete, but the official C++ controller is not built or connected to the H-IDE Nav2/SONIC adapter.",
+      "bundle_integrity": "complete",
+      "runtime_executable": false,
+      "runtime_blockers": [
+        "official C++ controller binary is not built",
+        "official controller is not integrated with the H-IDE Nav2/SONIC adapter",
+        "motion acceptance has not passed"
+      ],
+      "model_variant": "default",
+      "model_revision": "9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2",
+      "repositories": [
+        "nvidia-groot-wbc"
+      ],
+      "controller": {
+        "kind": "official-cpp-onnx",
+        "source_repository": "nvidia-groot-wbc",
+        "files": [
+          "official-controller-entrypoint",
+          "official-observation-parser"
+        ],
+        "built_binary_present": false
+      },
+      "observation_config": {
+        "kind": "official-yaml",
+        "files": [
+          "official-default-observation-config"
+        ],
+        "future_reference_step": 5,
+        "encoder_input_dimension": 1762,
+        "decoder_input_dimension": 994,
+        "token_dimension": 64,
+        "action_dimension": 29
+      },
+      "files": [
+        {
+          "id": "default-planner",
+          "role": "planner",
+          "path": "~/.cache/huggingface/hub/models--nvidia--GEAR-SONIC/snapshots/9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2/planner_sonic.onnx",
+          "present": true,
+          "size": 773952989,
+          "sha256": "39b553e197f62f077975ba38512bc04781a3fc37c2af7c6756e04629f760edea"
+        },
+        {
+          "id": "default-encoder",
+          "role": "encoder",
+          "path": "~/.cache/huggingface/hub/models--nvidia--GEAR-SONIC/snapshots/9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2/model_encoder.onnx",
+          "present": true,
+          "size": 50100513,
+          "sha256": "013ab0287236aa2721e13f1e936d699db982302d0de0bfcdae76d5c3245362d3"
+        },
+        {
+          "id": "default-decoder",
+          "role": "decoder",
+          "path": "~/.cache/huggingface/hub/models--nvidia--GEAR-SONIC/snapshots/9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2/model_decoder.onnx",
+          "present": true,
+          "size": 40900688,
+          "sha256": "c7241a123eaa36b5d64bad19540efde93cac1ad443bd4572fd12ca99898118ed"
+        },
+        {
+          "id": "official-default-observation-config",
+          "role": "observation_config",
+          "path": "~/.cache/huggingface/hub/models--nvidia--GEAR-SONIC/snapshots/9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2/observation_config.yaml",
+          "present": true,
+          "size": 2336,
+          "sha256": "466d05947c78af6c76388adfb86e3a2a77b2a1d921a64883ed3d085ebf58de1b"
+        },
+        {
+          "id": "official-controller-entrypoint",
+          "role": "controller",
+          "path": "/home/phi/learn-projects/systemed_study/GR00T-WholeBodyControl/gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/src/g1_deploy_onnx_ref.cpp",
+          "present": true,
+          "size": 226066,
+          "sha256": "adcd05aa6abdde2f849ac3cfef6971f629a6972b680d78fb959b7eb5d8649f33"
+        },
+        {
+          "id": "official-observation-parser",
+          "role": "controller",
+          "path": "/home/phi/learn-projects/systemed_study/GR00T-WholeBodyControl/gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/include/observation_config.hpp",
+          "present": true,
+          "size": 21830,
+          "sha256": "8085f7dcdd0f265001ab18663ace0353e7f07bfa2fa5f6c005b9c0c8e9c5c9d6"
+        },
+        {
+          "id": "official-default-profile",
+          "role": "profile_manifest",
+          "path": "profiles/sonic-official-default.yaml",
+          "present": true,
+          "size": 1471,
+          "sha256": "47ac407b06b4e8fb95422113e505e4a635412d04d5eb4af53cb3770ab5fb35b3"
+        }
+      ]
+    },
+    "sonic-official-v1_1": {
+      "availability": "unavailable",
+      "availability_reason": "The fixed-revision v1.1 model bundle is complete, but its matching controller build and H-IDE Nav2/SONIC adapter integration are absent.",
+      "bundle_integrity": "complete",
+      "runtime_executable": false,
+      "runtime_blockers": [
+        "official C++ controller binary is not built",
+        "v1.1 controller contract is not integrated with the H-IDE Nav2/SONIC adapter",
+        "motion acceptance has not passed"
+      ],
+      "model_variant": "sonic_v1_1",
+      "model_revision": "9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2",
+      "repositories": [
+        "nvidia-groot-wbc"
+      ],
+      "controller": {
+        "kind": "official-cpp-onnx",
+        "source_repository": "nvidia-groot-wbc",
+        "files": [
+          "v1_1-controller-entrypoint",
+          "v1_1-observation-parser"
+        ],
+        "built_binary_present": false
+      },
+      "observation_config": {
+        "kind": "official-yaml",
+        "files": [
+          "v1_1-observation-config"
+        ],
+        "future_reference_step": 5,
+        "heading_normalized": true,
+        "encoder_input_dimension": 1751,
+        "decoder_input_dimension": 994,
+        "token_dimension": 64,
+        "action_dimension": 29
+      },
+      "files": [
+        {
+          "id": "v1_1-planner",
+          "role": "planner",
+          "path": "~/.cache/huggingface/hub/models--nvidia--GEAR-SONIC/snapshots/9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2/planner_sonic.onnx",
+          "source_revision": "9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2",
+          "present": true,
+          "size": 773952989,
+          "sha256": "39b553e197f62f077975ba38512bc04781a3fc37c2af7c6756e04629f760edea"
+        },
+        {
+          "id": "v1_1-encoder",
+          "role": "encoder",
+          "path": "~/.cache/huggingface/hub/models--nvidia--GEAR-SONIC/snapshots/9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2/sonic_v1_1/model_encoder.onnx",
+          "present": true,
+          "size": 50117796,
+          "sha256": "fb97de22819b2057b41459802128d91723d91a25f0ad73e7bfc41a9cf8365bae"
+        },
+        {
+          "id": "v1_1-decoder",
+          "role": "decoder",
+          "path": "~/.cache/huggingface/hub/models--nvidia--GEAR-SONIC/snapshots/9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2/sonic_v1_1/model_decoder.onnx",
+          "present": true,
+          "size": 149778638,
+          "sha256": "34bae8570d4a4421a5391a5c2befd745d4a02d182ec539e5f9da44c091c67509"
+        },
+        {
+          "id": "v1_1-observation-config",
+          "role": "observation_config",
+          "path": "~/.cache/huggingface/hub/models--nvidia--GEAR-SONIC/snapshots/9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2/sonic_v1_1/observation_config.yaml",
+          "present": true,
+          "size": 2475,
+          "sha256": "4a67713b310932e50aca81f19188c8d76013148e98b15c8b5bbea995f12e59f0"
+        },
+        {
+          "id": "v1_1-controller-entrypoint",
+          "role": "controller",
+          "path": "/home/phi/learn-projects/systemed_study/GR00T-WholeBodyControl/gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/src/g1_deploy_onnx_ref.cpp",
+          "present": true,
+          "size": 226066,
+          "sha256": "adcd05aa6abdde2f849ac3cfef6971f629a6972b680d78fb959b7eb5d8649f33"
+        },
+        {
+          "id": "v1_1-observation-parser",
+          "role": "controller",
+          "path": "/home/phi/learn-projects/systemed_study/GR00T-WholeBodyControl/gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/include/observation_config.hpp",
+          "present": true,
+          "size": 21830,
+          "sha256": "8085f7dcdd0f265001ab18663ace0353e7f07bfa2fa5f6c005b9c0c8e9c5c9d6"
+        },
+        {
+          "id": "v1_1-profile",
+          "role": "profile_manifest",
+          "path": "profiles/sonic-official-v1_1.yaml",
+          "present": true,
+          "size": 1468,
+          "sha256": "bc91d73883eab3897f40e0bbe714febe2ccbaed2378a2607656b94c28fcd8a7e"
+        }
+      ]
+    },
+    "sonic-python-experimental": {
+      "availability": "available",
+      "availability_reason": "All three default SONIC ONNX files and the exact Python controller/embedded observation contract are present and hash locked.",
+      "activation": "evaluation_only",
+      "bundle_integrity": "complete",
+      "runtime_executable": true,
+      "motion_accepted": false,
+      "model_variant": "default",
+      "model_revision": "9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2",
+      "repositories": [
+        "lerobot-python"
+      ],
+      "controller": {
+        "kind": "experimental-python-onnx-port",
+        "source_repository": "lerobot-python",
+        "files": [
+          "python-controller",
+          "python-pipeline"
+        ],
+        "runtime_class": "lerobot.robots.unitree_g1.controllers.sonic_whole_body.SonicWholeBodyController"
+      },
+      "observation_config": {
+        "kind": "embedded-python-contract",
+        "files": [
+          "python-pipeline"
+        ],
+        "encoder_dimension": 1762,
+        "decoder_dimension": 994,
+        "future_reference_step": 5,
+        "warning": "This is not a substitute for NVIDIA's official observation_config.yaml and must not be paired with sonic_v1_1 weights."
+      },
+      "files": [
+        {
+          "id": "python-planner",
+          "role": "planner",
+          "path": "~/.cache/huggingface/hub/models--nvidia--GEAR-SONIC/snapshots/9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2/planner_sonic.onnx",
+          "present": true,
+          "size": 773952989,
+          "sha256": "39b553e197f62f077975ba38512bc04781a3fc37c2af7c6756e04629f760edea"
+        },
+        {
+          "id": "python-encoder",
+          "role": "encoder",
+          "path": "~/.cache/huggingface/hub/models--nvidia--GEAR-SONIC/snapshots/9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2/model_encoder.onnx",
+          "present": true,
+          "size": 50100513,
+          "sha256": "013ab0287236aa2721e13f1e936d699db982302d0de0bfcdae76d5c3245362d3"
+        },
+        {
+          "id": "python-decoder",
+          "role": "decoder",
+          "path": "~/.cache/huggingface/hub/models--nvidia--GEAR-SONIC/snapshots/9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2/model_decoder.onnx",
+          "present": true,
+          "size": 40900688,
+          "sha256": "c7241a123eaa36b5d64bad19540efde93cac1ad443bd4572fd12ca99898118ed"
+        },
+        {
+          "id": "python-controller",
+          "role": "controller",
+          "path": "vendor/lerobot/src/lerobot/robots/unitree_g1/controllers/sonic_whole_body.py",
+          "present": true,
+          "size": 31982,
+          "sha256": "360f08d33c56f1ef0cff2effe32d69bd0456e8c282c4bada25c59e79a87f9179"
+        },
+        {
+          "id": "python-pipeline",
+          "role": "observation_config",
+          "path": "vendor/lerobot/src/lerobot/robots/unitree_g1/controllers/sonic_pipeline.py",
+          "present": true,
+          "size": 56200,
+          "sha256": "db3c859a8f9f0bb9eab32a0723ea64490842528daa4a6c2d9b076a11376a0ab8"
+        },
+        {
+          "id": "python-profile",
+          "role": "profile_manifest",
+          "path": "profiles/sonic-python-experimental.yaml",
+          "present": true,
+          "size": 1280,
+          "sha256": "3174e41748ea4b694910c614376e6ee379ab8893732cbb55b8e37888b67f7737"
+        }
+      ]
+    }
+  }
+}

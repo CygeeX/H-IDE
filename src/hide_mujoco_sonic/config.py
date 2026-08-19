@@ -51,7 +51,10 @@ class SimConfig:
     offscreen: bool
     startup_support_s: float
     startup_horizontal_support_s: float
+    reset_policy: str
     model_scene: Path
+    sonic_model_profile: str
+    sonic_model_lock: Path
     sonic_model_repo: str
     sonic_model_revision: str
     lerobot_commit: str
@@ -73,7 +76,9 @@ class SimConfig:
             "command_timeout_s", "motion_handoff_warmup_s", "motion_handoff_blend_s",
             "control_hz", "camera_hz", "observation_hz",
             "force_cpu", "onscreen", "offscreen", "startup_support_s", "startup_horizontal_support_s", "model_scene",
-            "sonic_model_repo", "sonic_model_revision", "lerobot_commit",
+            "reset_policy",
+            "sonic_model_profile", "sonic_model_lock", "sonic_model_repo",
+            "sonic_model_revision", "lerobot_commit",
         }
         missing = sorted(required - raw.keys())
         if missing:
@@ -110,6 +115,20 @@ class SimConfig:
             raise ValueError("spin_translation_violation_s must be in (0, 2]")
         if float(raw["startup_horizontal_support_s"]) < 0:
             raise ValueError("startup_horizontal_support_s must be non-negative")
+        if raw["reset_policy"] != "explicit_process_restart":
+            raise ValueError(
+                "H-IDE simulation reset_policy must be explicit_process_restart"
+            )
+        if not str(raw["sonic_model_profile"]).strip():
+            raise ValueError("sonic_model_profile must not be empty")
+        if not str(raw["sonic_model_lock"]).strip():
+            raise ValueError("sonic_model_lock must not be empty")
+        model_revision = str(raw["sonic_model_revision"])
+        if len(model_revision) != 40 or any(ch not in "0123456789abcdef" for ch in model_revision):
+            raise ValueError("sonic_model_revision must be a full lowercase Git revision")
+        lerobot_commit = str(raw["lerobot_commit"])
+        if len(lerobot_commit) != 40 or any(ch not in "0123456789abcdef" for ch in lerobot_commit):
+            raise ValueError("lerobot_commit must be a full lowercase Git revision")
         observation_jpeg_quality = int(raw.get("observation_jpeg_quality", 85))
         if not 1 <= observation_jpeg_quality <= 100:
             raise ValueError("observation_jpeg_quality must be between 1 and 100")
@@ -127,12 +146,12 @@ class SimConfig:
             lowstate_topic=str(raw["lowstate_topic"]),
             lowcmd_topic=str(raw["lowcmd_topic"]),
             telemetry_host=str(raw["telemetry_host"]),
-            telemetry_bind_host=str(raw.get("telemetry_bind_host", "0.0.0.0")),
+            telemetry_bind_host=str(raw.get("telemetry_bind_host", "127.0.0.1")),
             telemetry_port=int(raw["telemetry_port"]),
             plant_port=int(raw["plant_port"]),
-            plant_bind_host=str(raw.get("plant_bind_host", "0.0.0.0")),
+            plant_bind_host=str(raw.get("plant_bind_host", "127.0.0.1")),
             command_host=str(raw["command_host"]),
-            command_bind_host=str(raw.get("command_bind_host", "0.0.0.0")),
+            command_bind_host=str(raw.get("command_bind_host", "127.0.0.1")),
             command_port=int(raw["command_port"]),
             max_linear_mps=float(raw["max_linear_mps"]),
             min_walk_command_mps=float(raw["min_walk_command_mps"]),
@@ -162,8 +181,11 @@ class SimConfig:
             offscreen=bool(raw["offscreen"]),
             startup_support_s=float(raw["startup_support_s"]),
             startup_horizontal_support_s=float(raw["startup_horizontal_support_s"]),
+            reset_policy=str(raw["reset_policy"]),
             model_scene=Path(str(raw["model_scene"])),
+            sonic_model_profile=str(raw["sonic_model_profile"]),
+            sonic_model_lock=Path(str(raw["sonic_model_lock"])),
             sonic_model_repo=str(raw["sonic_model_repo"]),
-            sonic_model_revision=str(raw["sonic_model_revision"]),
-            lerobot_commit=str(raw["lerobot_commit"]),
+            sonic_model_revision=model_revision,
+            lerobot_commit=lerobot_commit,
         )

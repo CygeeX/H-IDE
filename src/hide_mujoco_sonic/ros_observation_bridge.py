@@ -10,6 +10,7 @@ import time
 from typing import Iterable
 
 from .config import SimConfig
+from .frames import BodyTwist, PoseDifferenceDiagnostic, PoseDifferenceResult
 
 
 class MujocoObservationBridge:
@@ -42,7 +43,8 @@ class MujocoObservationBridge:
         self.tf = TransformBroadcaster(self.node)
         self._last_sequence = 0
         self._last_captured_at_ns = 0
-        self._last_pose_sample: tuple[int, float, float] | None = None
+        self._pose_difference_diagnostic = PoseDifferenceDiagnostic()
+        self._last_pose_difference = PoseDifferenceResult("initialized")
         self._poll_count = 0
         self._base_url = f"http://{config.telemetry_host}:{config.plant_port}"
         epoch = String(); epoch.data = config.localization_epoch_id; self.epoch_pub.publish(epoch)
@@ -111,6 +113,17 @@ class MujocoObservationBridge:
         value.nanosec = int(unix_ns % 1_000_000_000)
         return value
 
+    @staticmethod
+    def _assign_twist(message, twist: BodyTwist) -> None:
+        """Populate all six ROS Twist axes from one base_link contract."""
+
+        message.linear.x = twist.vx
+        message.linear.y = twist.vy
+        message.linear.z = twist.vz
+        message.angular.x = twist.wx
+        message.angular.y = twist.wy
+        message.angular.z = twist.wz
+
     def poll(self):
         import cv2
         import numpy as np
@@ -156,6 +169,25 @@ class MujocoObservationBridge:
             self.node.get_logger().error("MuJoCo pose contains non-finite values")
             return
         x, y, z, qw, qx, qy, qz = values
+        raw_root_velocity = state.get("rootVelocity")
+        if not isinstance(raw_root_velocity, dict):
+            self.node.get_logger().error(
+                "MuJoCo state does not contain rootVelocity"
+            )
+            return
+        try:
+            root_velocity = BodyTwist.from_capture_state(raw_root_velocity)
+        except ValueError as exc:
+            self.node.get_logger().error(str(exc))
+            return
+        # Pose differencing is intentionally diagnostic-only.  It can reveal
+        # a producer/frame regression, but never replaces the authoritative
+        # local mj_objectVelocity result in the ROS message.
+        self._last_pose_difference = self._pose_difference_diagnostic.observe(
+            captured_at_ns,
+            (x, y, z),
+            (qw, qx, qy, qz),
+        )
         raw_camera_pose = state.get("cameraPose")
         if not isinstance(raw_camera_pose, dict):
             self.node.get_logger().error("MuJoCo state does not contain cameraPose")
@@ -229,12 +261,7 @@ class MujocoObservationBridge:
         odom.pose.covariance = [0.0] * 36
         odom.pose.covariance[0] = odom.pose.covariance[7] = odom.pose.covariance[14] = 1e-5
         odom.pose.covariance[35] = 1e-5
-        if self._last_pose_sample is not None:
-            last_ns, last_x, last_y = self._last_pose_sample
-            dt = max(1e-3, (captured_at_ns - last_ns) / 1e9)
-            odom.twist.twist.linear.x = (x - last_x) / dt
-            odom.twist.twist.linear.y = (y - last_y) / dt
-        self._last_pose_sample = (captured_at_ns, x, y)
+        self._assign_twist(odom.twist.twist, root_velocity)
         self.odom_pub.publish(odom)
 
         def camera_info():
@@ -275,10 +302,22 @@ class MujocoObservationBridge:
         self._last_captured_at_ns = captured_at_ns
         self._poll_count += 1
         if self._poll_count % 10 == 0:
+            velocity_diagnostic = "fd_status=" + self._last_pose_difference.status
+            if self._last_pose_difference.body_linear_velocity is not None:
+                fd_vx, fd_vy, fd_vz = (
+                    self._last_pose_difference.body_linear_velocity
+                )
+                velocity_error = math.sqrt(
+                    (fd_vx - root_velocity.vx) ** 2
+                    + (fd_vy - root_velocity.vy) ** 2
+                    + (fd_vz - root_velocity.vz) ** 2
+                )
+                velocity_diagnostic += f" fd_error_mps={velocity_error:.3f}"
             self.node.get_logger().info(
                 f"published synthetic RGB-D sequence={sequence} "
                 f"poll_ms={(time.perf_counter() - poll_started) * 1000.0:.1f} "
-                f"capture_age_ms={(time.time_ns() - captured_at_ns) / 1_000_000.0:.1f}"
+                f"capture_age_ms={(time.time_ns() - captured_at_ns) / 1_000_000.0:.1f} "
+                f"{velocity_diagnostic}"
             )
 
 
