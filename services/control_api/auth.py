@@ -541,6 +541,9 @@ class AuthService:
         authorization: str | None,
         session_token: str | None,
         legacy_query_token: str | None = None,
+        csrf_cookie: str | None = None,
+        csrf_token: str | None = None,
+        require_csrf: bool = False,
     ) -> Principal:
         if authorization is not None:
             scheme, separator, supplied = authorization.partition(" ")
@@ -557,7 +560,22 @@ class AuthService:
             self.legacy_bearer_token,
         ):
             return self._legacy_principal()
-        principal, _ = self._authenticate_session(session_token or "")
+        principal, session = self._authenticate_session(session_token or "")
+        if require_csrf:
+            cookie_value = csrf_cookie or ""
+            supplied_value = csrf_token or ""
+            if (
+                not cookie_value
+                or not supplied_value
+                or len(cookie_value) > 512
+                or len(supplied_value) > 512
+                or not hmac.compare_digest(cookie_value, supplied_value)
+                or not hmac.compare_digest(
+                    self._secret_hash(cookie_value),
+                    str(session["csrfTokenHash"]),
+                )
+            ):
+                raise CSRFValidationFailed("CSRF validation failed")
         return principal
 
 

@@ -106,6 +106,16 @@ class DashScopeRealtimeProvider:
         self._config = config
         self._transport_factory = transport_factory or WebsocketsTransportFactory()
 
+    def capability(self) -> Mapping[str, Any]:
+        return {
+            "provider": self.name,
+            "model": self._config.model,
+            "available": True,
+            "encoding": "pcm_s16le",
+            "sampleRateHz": 16_000,
+            "serverVad": True,
+        }
+
     @classmethod
     def from_env(
         cls,

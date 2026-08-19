@@ -85,6 +85,13 @@ configured.
 - `POST /api/v1/speech/transcriptions` accepts at most 60 seconds / 10 MiB of
   16 kHz mono 16-bit PCM WAV and delegates transcription to the configured
   local whisper.cpp endpoint. Transcription never submits a task by itself.
+- `WS /api/v2/speech/stream` accepts 20-60 ms PCM16 frames and returns server-VAD
+  partial/final transcripts. Cookie clients echo the CSRF cookie value in
+  `session.start`; Bearer credentials and session tokens are never accepted in
+  query strings.
+- `POST /api/v2/speech/tts` streams 24 kHz mono PCM16 from the configured real
+  provider. `/api/v2/speech/healthz` and `/api/v2/speech/readyz` expose
+  authenticated ASR/TTS capability state without exposing provider keys.
 - `GET /api/v1/events` reads persisted runtime events.  The websocket at the
   same path replays stored events and polls for new ones; disconnects stop the
   polling task without retaining a subscription.

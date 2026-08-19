@@ -20,6 +20,7 @@ from services.speech_gateway.errors import (
     ProviderDisconnected,
     ProviderTimeout,
     ProviderUnavailable,
+    TTSUnavailable,
 )
 from services.speech_gateway.funasr import FunASRRealtimeProvider
 from services.speech_gateway.gateway import StreamingSpeechGateway
@@ -27,8 +28,13 @@ from services.speech_gateway.providers import (
     ProviderEvent,
     TTSChunk,
     asr_provider_from_env,
+    tts_provider_from_env,
 )
 from services.speech_gateway.router import create_speech_router
+from services.speech_gateway.tts import (
+    DashScopeRealtimeTTSConfig,
+    DashScopeRealtimeTTSProvider,
+)
 
 
 PCM_20_MS = b"\x00\x00" * 320
@@ -403,6 +409,121 @@ def test_tts_chunk_contract_and_disabled_state_are_honest():
 
     asyncio.run(enabled())
     asyncio.run(disabled())
+
+
+def test_dashscope_tts_uses_official_commit_delta_finish_lifecycle():
+    async def scenario() -> None:
+        transport = FakeTransport(
+            [
+                {"type": "session.created"},
+                {"type": "session.updated"},
+                {"type": "input_text_buffer.committed"},
+                {"type": "response.created"},
+                {"type": "response.audio.delta", "delta": "AQI="},
+                {"type": "response.audio.done"},
+                {"type": "response.done", "response": {"status": "completed"}},
+                {"type": "session.finished"},
+            ]
+        )
+        factory = FakeTransportFactory(transport)
+        config = DashScopeRealtimeTTSConfig(
+            api_key="secret-key-must-not-leak",
+            endpoint_url=(
+                "wss://dashscope.aliyuncs.com/api-ws/v1/realtime"
+                "?model=qwen3-tts-flash-realtime"
+            ),
+            voice="Cherry",
+        )
+        assert "secret-key-must-not-leak" not in repr(config)
+        provider = DashScopeRealtimeTTSProvider(config, transport_factory=factory)
+        stream = await provider.synthesize("你好", locale="zh-CN")
+        chunks = [chunk async for chunk in stream.chunks()]
+        await stream.close()
+
+        assert [chunk.audio for chunk in chunks] == [b"\x01\x02"]
+        assert chunks[0].sample_rate_hz == 24_000
+        assert [item["type"] for item in transport.sent_json] == [
+            "session.update",
+            "input_text_buffer.append",
+            "input_text_buffer.commit",
+            "session.finish",
+        ]
+        assert transport.sent_json[0]["session"] == {
+            "voice": "Cherry",
+            "mode": "commit",
+            "language_type": "Chinese",
+            "response_format": "pcm",
+            "sample_rate": 24_000,
+        }
+        assert transport.sent_json[1]["text"] == "你好"
+        assert factory.calls[0]["headers"] == {
+            "Authorization": "Bearer secret-key-must-not-leak"
+        }
+        assert transport.closed is True
+
+    asyncio.run(scenario())
+
+
+def test_dashscope_tts_close_interrupts_and_model_permission_is_visible():
+    class PermissionDenied(Exception):
+        status_code = 403
+
+    class RejectingFactory:
+        async def connect(self, *args, **kwargs):
+            del args, kwargs
+            raise PermissionDenied()
+
+    async def scenario() -> None:
+        transport = FakeTransport(
+            [{"type": "session.created"}, {"type": "session.updated"}]
+        )
+        provider = DashScopeRealtimeTTSProvider(
+            DashScopeRealtimeTTSConfig(
+                api_key="secret",
+                endpoint_url="wss://dashscope.aliyuncs.com/api-ws/v1/realtime?model=qwen",
+            ),
+            transport_factory=FakeTransportFactory(transport),
+        )
+        stream = await provider.synthesize("请停止", locale="zh-CN")
+        await stream.close()
+        assert transport.sent_json[-1]["type"] == "session.finish"
+        assert transport.closed is True
+
+        rejected = DashScopeRealtimeTTSProvider(
+            DashScopeRealtimeTTSConfig(
+                api_key="secret",
+                endpoint_url="wss://dashscope.aliyuncs.com/api-ws/v1/realtime?model=qwen",
+            ),
+            transport_factory=RejectingFactory(),
+        )
+        with pytest.raises(TTSUnavailable, match="cannot use the TTS model"):
+            await rejected.synthesize("你好", locale="zh-CN")
+        assert rejected.capability()["available"] is False
+
+    asyncio.run(scenario())
+
+
+def test_tts_environment_selection_requires_real_configuration():
+    missing = tts_provider_from_env(
+        {
+            "SPEECH_TTS_PROVIDER": "dashscope",
+            "DASHSCOPE_TTS_MODEL": "qwen3-tts-flash-realtime",
+        }
+    )
+    assert missing.name == "unavailable"
+    configured = tts_provider_from_env(
+        {
+            "SPEECH_TTS_PROVIDER": "dashscope",
+            "DASHSCOPE_API_KEY": "server-only-secret",
+            "DASHSCOPE_REGION": "cn-beijing",
+            "DASHSCOPE_TTS_MODEL": "qwen3-tts-flash-realtime",
+            "DASHSCOPE_TTS_VOICE": "Cherry",
+        }
+    )
+    assert configured.name == "dashscope-qwen-tts-realtime"
+    capability = configured.capability()
+    assert capability["model"] == "qwen3-tts-flash-realtime"
+    assert "server-only-secret" not in repr(configured)
 
 
 def test_funasr_is_explicit_and_maps_two_pass_output():

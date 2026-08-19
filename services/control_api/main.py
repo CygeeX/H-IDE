@@ -19,7 +19,7 @@ import uuid
 from typing import Any, Mapping
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 from starlette.concurrency import run_in_threadpool
@@ -75,6 +75,20 @@ from packages.simulation_core import (
     SimulationSnapshot,
 )
 from services.robot_agent_gateway import RobotAgentGatewayHttpDriver
+from services.speech_gateway import (
+    AudioStreamConfig,
+    StreamingSpeechGateway,
+    asr_provider_from_env,
+    create_speech_router,
+    provider_capability,
+    tts_provider_from_env,
+)
+from services.speech_gateway.errors import (
+    InvalidClientMessage,
+    SpeechAuthenticationRequired,
+    SpeechAuthorizationDenied,
+    SpeechGatewayError,
+)
 
 from .assistant_service import AssistantNotFound, AssistantService
 from .conversation_client import (
@@ -86,6 +100,8 @@ from .conversation_gateway import ConversationGateway
 from .auth import (
     AuthService,
     AuthorizationDenied,
+    CSRFValidationFailed,
+    CSRF_COOKIE,
     Principal,
     Scope,
     SESSION_COOKIE,
@@ -812,6 +828,7 @@ def create_app(
     conversation_client: ConversationClient | None = None,
     mission_planning_client: MissionPlanningClient | None = None,
     speech_client: SpeechClient | None = None,
+    streaming_speech_gateway: StreamingSpeechGateway | None = None,
     scene_context_client: SceneContextClient | None = None,
     assistant_draft_ttl_seconds: float | None = None,
     vision_client: VisionClient | None = None,
@@ -1165,6 +1182,10 @@ def create_app(
 
     simulation.set_event_sink(bridge_simulation_event)
     speech_adapter = speech_client or speech_client_from_env()
+    realtime_speech = streaming_speech_gateway or StreamingSpeechGateway(
+        asr_provider_from_env(),
+        tts_provider=tts_provider_from_env(),
+    )
     visual_task_adapter = visual_task_client or visual_task_client_from_env()
     evidence_reader = getattr(visual_task_adapter, "get_evidence", None)
     if callable(evidence_reader):
@@ -1207,6 +1228,7 @@ def create_app(
     app.state.mission_runtime = mission_runtime
     app.state.mission = mission_service
     app.state.speech = speech_adapter
+    app.state.realtime_speech = realtime_speech
     app.state.visual_mission = VisualMissionRuntime(
         store=store,
         action_runtime=context.runtime,
@@ -1970,6 +1992,124 @@ def create_app(
     require_mappings = require_scope(Scope.MAPPINGS_MANAGE)
     require_events = require_scope(Scope.EVENTS_READ)
 
+    async def authorize_realtime_speech(
+        websocket: WebSocket,
+        start: Mapping[str, Any],
+    ) -> None:
+        # Credentials in query strings leak through access logs, browser
+        # history, and copied URLs.  Cookie sessions and explicit Bearer
+        # headers are the only accepted authentication carriers here.
+        if any(
+            key.casefold() in {"token", "access_token", "authorization"}
+            for key in websocket.query_params.keys()
+        ):
+            raise InvalidClientMessage("Speech credentials must not be sent in the URL")
+        try:
+            principal = auth_service.authenticate_websocket(
+                authorization=websocket.headers.get("authorization"),
+                session_token=websocket.cookies.get(SESSION_COOKIE),
+                legacy_query_token=None,
+                csrf_cookie=websocket.cookies.get(CSRF_COOKIE),
+                csrf_token=(
+                    start.get("csrfToken")
+                    if isinstance(start.get("csrfToken"), str)
+                    else None
+                ),
+                require_csrf=True,
+            )
+        except CSRFValidationFailed as exc:
+            raise SpeechAuthorizationDenied() from exc
+        except AuthorizationDenied as exc:
+            raise SpeechAuthenticationRequired() from exc
+        try:
+            auth_service.policy.require(principal, Scope.SPEECH_USE)
+        except AuthorizationDenied as exc:
+            raise SpeechAuthorizationDenied() from exc
+
+    app.include_router(
+        create_speech_router(
+            realtime_speech,
+            authorize=authorize_realtime_speech,
+            path="/api/v2/speech/stream",
+        )
+    )
+
+    def realtime_speech_capabilities() -> dict[str, Any]:
+        asr = provider_capability(realtime_speech.asr_provider)
+        tts = provider_capability(realtime_speech.tts_provider)
+        available = bool(asr.get("available")) and bool(tts.get("available"))
+        return {
+            "status": "ready" if available else "unavailable",
+            "protocol": "speech-stream.v2",
+            "asr": asr,
+            "tts": tts,
+        }
+
+    @app.get(
+        "/api/v2/speech/healthz",
+        dependencies=[Depends(require_speech)],
+    )
+    def realtime_speech_health() -> dict[str, Any]:
+        capabilities = realtime_speech_capabilities()
+        return {**capabilities, "status": "ok"}
+
+    @app.get(
+        "/api/v2/speech/readyz",
+        dependencies=[Depends(require_speech)],
+    )
+    def realtime_speech_readiness() -> Response:
+        capabilities = realtime_speech_capabilities()
+        return JSONResponse(
+            capabilities,
+            status_code=200 if capabilities["status"] == "ready" else 503,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.post(
+        "/api/v2/speech/tts",
+        dependencies=[Depends(require_speech)],
+        response_class=StreamingResponse,
+    )
+    async def stream_voice_reply(body: dict[str, Any]) -> StreamingResponse:
+        text = body.get("text")
+        if not isinstance(text, str) or not text.strip() or len(text.strip()) > 4_000:
+            raise HTTPException(status_code=422, detail="text must contain 1-4000 characters")
+        locale = body.get("locale", "zh-CN")
+        try:
+            speech_config = AudioStreamConfig.from_start_message(
+                {"type": "session.start", "locale": locale}
+            )
+            stream = await realtime_speech.tts_provider.synthesize(
+                text.strip(), locale=speech_config.locale
+            )
+        except (InvalidClientMessage, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except SpeechGatewayError as exc:
+            status_code = 503 if exc.code == "TTS_UNAVAILABLE" else 502
+            if exc.code == "TTS_TIMEOUT":
+                status_code = 504
+            raise HTTPException(status_code=status_code, detail=exc.message) from exc
+
+        async def audio_chunks():
+            try:
+                async for chunk in stream.chunks():
+                    yield chunk.audio
+            finally:
+                await stream.close()
+
+        return StreamingResponse(
+            audio_chunks(),
+            media_type="application/octet-stream",
+            headers={
+                "Cache-Control": "private, no-store, max-age=0",
+                "X-Content-Type-Options": "nosniff",
+                "X-Speech-Stream-Id": stream.stream_id,
+                "X-Speech-Audio-Encoding": "pcm_s16le",
+                "X-Speech-Sample-Rate-Hz": "24000",
+                "X-Speech-Channels": "1",
+            },
+        )
+
     def bind_principal_resource(
         principal: Principal,
         resource_type: str,
@@ -2298,7 +2438,11 @@ def create_app(
         try:
             require_conversation_resource(request, principal, conversation_id)
             conversation = service.store.get_assistant_conversation(conversation_id)
-            if isinstance(conversation, Mapping) and isinstance(conversation.get("robotId"), str):
+            if (
+                service.conversation_gateway is None
+                and isinstance(conversation, Mapping)
+                and isinstance(conversation.get("robotId"), str)
+            ):
                 refresh_robot_agent_snapshot(conversation["robotId"])
             return service.submit_message(conversation_id, body)
         except AssistantNotFound as exc:

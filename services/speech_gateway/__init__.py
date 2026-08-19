@@ -14,8 +14,11 @@ from .providers import (
     StreamingTTSProvider,
     UnavailableASRProvider,
     asr_provider_from_env,
+    provider_capability,
+    tts_provider_from_env,
 )
 from .router import create_speech_router
+from .tts import DashScopeRealtimeTTSProvider
 
 __all__ = [
     "ASRProvider",
@@ -27,7 +30,10 @@ __all__ = [
     "SpeechEvent",
     "StreamingSpeechGateway",
     "StreamingTTSProvider",
+    "DashScopeRealtimeTTSProvider",
     "UnavailableASRProvider",
     "asr_provider_from_env",
     "create_speech_router",
+    "provider_capability",
+    "tts_provider_from_env",
 ]

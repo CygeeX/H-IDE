@@ -66,6 +66,24 @@ class InvalidClientMessage(SpeechGatewayError):
         super().__init__("INVALID_CLIENT_MESSAGE", message, close_code=1008)
 
 
+class SpeechAuthenticationRequired(SpeechGatewayError):
+    def __init__(self) -> None:
+        super().__init__(
+            "SPEECH_AUTHENTICATION_REQUIRED",
+            "Authentication is required for speech streaming",
+            close_code=4401,
+        )
+
+
+class SpeechAuthorizationDenied(SpeechGatewayError):
+    def __init__(self) -> None:
+        super().__init__(
+            "SPEECH_AUTHORIZATION_DENIED",
+            "Speech streaming is not permitted",
+            close_code=4403,
+        )
+
+
 class InvalidAudioFrame(SpeechGatewayError):
     def __init__(self, message: str) -> None:
         super().__init__("INVALID_AUDIO_FRAME", message, close_code=1008)
@@ -82,10 +100,43 @@ class AudioBackpressure(SpeechGatewayError):
 
 
 class TTSUnavailable(SpeechGatewayError):
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        message: str = "Streaming voice replies are not configured",
+    ) -> None:
         super().__init__(
             "TTS_UNAVAILABLE",
-            "Streaming voice replies are not configured",
+            message,
             retryable=False,
-            close_code=1000,
+            close_code=1013,
+        )
+
+
+class TTSDisconnected(SpeechGatewayError):
+    def __init__(self) -> None:
+        super().__init__(
+            "TTS_DISCONNECTED",
+            "Voice synthesis connection was interrupted",
+            retryable=True,
+            close_code=1011,
+        )
+
+
+class TTSTimeout(SpeechGatewayError):
+    def __init__(self, phase: str) -> None:
+        super().__init__(
+            "TTS_TIMEOUT",
+            f"Voice synthesis timed out during {phase}",
+            retryable=True,
+            close_code=1011,
+        )
+
+
+class TTSRejected(SpeechGatewayError):
+    def __init__(self) -> None:
+        super().__init__(
+            "TTS_REJECTED",
+            "Voice synthesis rejected the request",
+            retryable=False,
+            close_code=1008,
         )

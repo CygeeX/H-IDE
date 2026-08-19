@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
-from typing import AsyncIterator, Literal, Mapping, Protocol
+from typing import Any, AsyncIterator, Literal, Mapping, Protocol
 
 from .contracts import AudioStreamConfig
 from .errors import ProviderUnavailable, TTSUnavailable
@@ -57,6 +57,13 @@ class UnavailableASRProvider:
         del config
         raise ProviderUnavailable(self.reason)
 
+    def capability(self) -> Mapping[str, Any]:
+        return {
+            "provider": self.name,
+            "available": False,
+            "reason": self.reason,
+        }
+
 
 @dataclass(frozen=True, slots=True)
 class TTSChunk:
@@ -90,6 +97,30 @@ class DisabledTTSProvider:
         del text, locale
         raise TTSUnavailable()
 
+    def capability(self) -> Mapping[str, Any]:
+        return {
+            "provider": self.name,
+            "available": False,
+            "reason": "Streaming voice replies are not configured",
+        }
+
+
+def provider_capability(provider: object) -> dict[str, Any]:
+    """Return a key-safe, provider-neutral readiness snapshot.
+
+    Providers may expose a richer ``capability`` method.  The fallback only
+    reports their public name and configuration state; object representations
+    and provider exception strings are intentionally never serialized.
+    """
+
+    probe = getattr(provider, "capability", None)
+    if callable(probe):
+        payload = probe()
+        if isinstance(payload, Mapping):
+            return {str(key): value for key, value in payload.items()}
+    name = str(getattr(provider, "name", "unavailable"))
+    return {"provider": name, "available": name != "unavailable"}
+
 
 def asr_provider_from_env(
     environ: Mapping[str, str] | None = None,
@@ -121,14 +152,36 @@ def asr_provider_from_env(
     return UnavailableASRProvider("Configured speech recognition provider is unsupported")
 
 
+def tts_provider_from_env(
+    environ: Mapping[str, str] | None = None,
+    *,
+    transport_factory: RealtimeTransportFactory | None = None,
+) -> StreamingTTSProvider:
+    """Select TTS explicitly and never fabricate audio or silently fall back."""
+
+    values = os.environ if environ is None else environ
+    backend = values.get("SPEECH_TTS_PROVIDER", "dashscope").strip().lower()
+    if backend == "dashscope":
+        from .tts import DashScopeRealtimeTTSProvider
+
+        return DashScopeRealtimeTTSProvider.from_env(
+            values, transport_factory=transport_factory
+        )
+    if backend in {"", "disabled", "unavailable", "none"}:
+        return DisabledTTSProvider()
+    return DisabledTTSProvider()
+
+
 __all__ = [
     "ASRProvider",
     "ASRSession",
     "DisabledTTSProvider",
     "ProviderEvent",
+    "provider_capability",
     "StreamingTTSProvider",
     "TTSChunk",
     "TTSStream",
     "UnavailableASRProvider",
     "asr_provider_from_env",
+    "tts_provider_from_env",
 ]

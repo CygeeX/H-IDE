@@ -7,7 +7,7 @@ buffer, or POST complete WAV files.
 ## Browser protocol (`speech-stream.v2`)
 
 Mount `create_speech_router(...)` behind Control API authentication and connect
-to `/v2/speech/stream` with the optional `speech-stream.v2` WebSocket
+to `/api/v2/speech/stream` with the optional `speech-stream.v2` WebSocket
 subprotocol. The injected authorizer is mandatory; this package does not invent
 an authentication policy.
 
@@ -16,6 +16,7 @@ The browser first sends:
 ```json
 {
   "type": "session.start",
+  "csrfToken": "the hide_csrf cookie value",
   "locale": "zh-CN",
   "audio": {
     "encoding": "pcm_s16le",
@@ -25,6 +26,10 @@ The browser first sends:
   "serverVad": true
 }
 ```
+
+Cookie sessions must echo the double-submit CSRF value in this first message.
+The legacy operator Bearer identity may instead use the `Authorization` header.
+No session, bearer, or provider token is accepted in a query string.
 
 It then sends raw binary PCM frames. Each frame must contain 20–60 ms of mono,
 signed 16-bit little-endian audio at 16 kHz (640–1920 bytes). There is no WAV
@@ -44,10 +49,12 @@ Server event types are:
 - `error` with stable `code`, `retryable`, `fatal`, and `scope`
 - `tts.started`, ordered `tts.audio.chunk`, and `tts.ended`
 
-`tts.audio.chunk.audio` is base64 only because it is a server JSON event. TTS is
-currently `unavailable` by default. A request produces a non-fatal
-`TTS_UNAVAILABLE` error; the gateway never emits placeholder/silent audio and
-does not claim a synthesizer is running.
+`tts.audio.chunk.audio` is base64 only because it is a server JSON event. The
+authenticated `POST /api/v2/speech/tts` endpoint exposes the same provider as a
+raw chunked PCM16 response. `GET /api/v2/speech/healthz` always reports the
+configured capabilities; `GET /api/v2/speech/readyz` returns 503 unless both
+ASR and TTS are configured. A missing key or rejected TTS model permission is
+reported as unavailable; the gateway never emits placeholder/silent audio.
 
 ## ASR providers
 
@@ -84,6 +91,24 @@ Useful bounded-runtime settings are `SPEECH_OPEN_TIMEOUT_SECONDS`,
 `SPEECH_CONFIGURE_TIMEOUT_SECONDS`, `SPEECH_SEND_TIMEOUT_SECONDS`,
 `SPEECH_EVENT_TIMEOUT_SECONDS`, and `SPEECH_CLOSE_TIMEOUT_SECONDS`.
 
+## TTS provider
+
+`SPEECH_TTS_PROVIDER=dashscope` selects Qwen-TTS-Realtime. It uses the same
+server-side `DASHSCOPE_API_KEY` and these non-secret settings:
+
+```text
+DASHSCOPE_REGION=cn-beijing
+DASHSCOPE_TTS_MODEL=qwen3-tts-flash-realtime
+DASHSCOPE_TTS_VOICE=Cherry
+DASHSCOPE_TTS_WS_URL=              # optional complete wss:// override
+```
+
+Each reply uses an independent upstream session in `commit` mode, appends the
+text, commits it, and forwards `response.audio.delta` chunks as 24 kHz mono
+PCM16. Browser cancellation closes that session and releases the provider
+connection. Provider handshake failures never switch to a fake or silent
+synthesizer.
+
 ## Backpressure and lifecycle
 
 The gateway queues at most 24 browser frames by default (at most 46,080 PCM
@@ -100,3 +125,6 @@ Protocol references:
 - [Alibaba Cloud Qwen-ASR-Realtime client events](https://help.aliyun.com/en/model-studio/qwen-asr-realtime-client-events)
 - [Alibaba Cloud Qwen-ASR-Realtime server events](https://help.aliyun.com/en/model-studio/qwen-asr-realtime-server-events)
 - [FunASR WebSocket protocol](https://github.com/modelscope/FunASR/blob/main/runtime/docs/websocket_protocol_zh.md)
+- [Alibaba Cloud Qwen-TTS-Realtime WebSocket flow](https://help.aliyun.com/en/model-studio/interactive-process-of-qwen-tts-realtime-synthesis)
+- [Alibaba Cloud Qwen-TTS-Realtime client events](https://help.aliyun.com/en/model-studio/qwen-tts-realtime-client-events)
+- [Alibaba Cloud Qwen-TTS-Realtime server events](https://help.aliyun.com/en/model-studio/qwen-tts-realtime-server-events)
