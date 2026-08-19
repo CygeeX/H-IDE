@@ -25,12 +25,6 @@ import uuid
 
 
 SCHEMA_VERSION = "h-ide.motion-acceptance-monitor/1"
-_SAFE_HOLD_MARKERS = (
-    "requires explicit control.acquire rearm",
-    "safe_hold",
-    "safe hold",
-    "plant safety_stop is latched",
-)
 _RESET_FAULT_MARKERS = (
     "teleport",
     "rolled back",
@@ -384,9 +378,11 @@ class MotionAcceptanceEvaluator:
         required_sonic_fields = {
             "status",
             "motion_ready",
+            "control_clock_status",
             "nav2_state",
             "sonic_mode",
             "navigation_task_active",
+            "static_hold_active",
             "plant_support_safety_latched",
             "fault_trace_path",
             "fault_trace_sample_count",
@@ -572,7 +568,13 @@ class MotionAcceptanceEvaluator:
         )
 
         command_values: list[float] = []
-        for key in ("last_cmd_vx", "last_cmd_vy", "last_cmd_wz", "sonic_speed_mps"):
+        for key in (
+            "last_cmd_vx",
+            "last_cmd_vy",
+            "last_cmd_wz",
+            "sonic_speed_mps",
+            "sonic_policy_speed_mps",
+        ):
             try:
                 command_values.append(abs(_finite_number(sonic, key)))
             except (KeyError, TypeError, ValueError, OverflowError) as exc:
@@ -606,15 +608,38 @@ class MotionAcceptanceEvaluator:
             and nav2_state == "safety_stop"
             and sonic.get("plant_support_safety_latched") is True
         )
+        command_zero = all(
+            value <= self.limits.command_epsilon for value in command_values
+        )
+        no_fault_trace = (
+            sonic.get("fault_trace_path") in {None, ""}
+            and sonic.get("fault_trace_sample_count") in {None, 0}
+        )
+        healthy_settled_safe_hold = (
+            safe_hold
+            and support_latched is True
+            and fault in {None, ""}
+            and plant.get("status") == "running"
+            and sonic.get("status") == "running"
+            and sonic.get("motion_ready") is True
+            and sonic.get("control_clock_status")
+            == "simulation_time_50hz_motion_ready"
+            and sonic_mode == "IDLE"
+            and sonic.get("static_hold_active") is True
+            and command_zero
+            and sonic.get("navigation_task_active") is False
+            and no_fault_trace
+        )
         last_error = sonic.get("last_error")
         if last_error not in {None, ""}:
             normalized = str(last_error).lower()
-            pre_motion_safe_hold = (
-                not self.physical_motion_seen
-                and safe_hold
-                and any(marker in normalized for marker in _SAFE_HOLD_MARKERS)
+            canonical_safe_hold_reason = (
+                "requires explicit control.acquire rearm" in normalized
             )
-            if not pre_motion_safe_hold:
+            allowed_safe_hold_reason = (
+                healthy_settled_safe_hold and canonical_safe_hold_reason
+            )
+            if not allowed_safe_hold_reason:
                 self._fail("SONIC_LAST_ERROR", f"SONIC last_error: {last_error}", observed_s)
             if any(marker in normalized for marker in _RESET_FAULT_MARKERS):
                 self._fail(
@@ -623,10 +648,15 @@ class MotionAcceptanceEvaluator:
                     observed_s,
                 )
 
-        if self.physical_motion_seen and safe_hold:
+        if (
+            self.physical_motion_seen
+            and safe_hold
+            and not healthy_settled_safe_hold
+        ):
             self._fail(
                 "SAFE_HOLD_AFTER_MOTION",
-                "Plant/SONIC returned to SAFE_HOLD after physical motion began",
+                "Plant/SONIC returned to a contradictory or unhealthy SAFE_HOLD "
+                "after physical motion began",
                 observed_s,
             )
         if self.physical_motion_seen and intent_active and support_mode != "locomotion":
@@ -656,6 +686,7 @@ class MotionAcceptanceEvaluator:
             linear_speed_mps=linear_speed,
             angular_speed_rps=angular_speed,
             safe_hold=safe_hold,
+            healthy_settled_safe_hold=healthy_settled_safe_hold,
         )
 
         if self.limits.phase == "idle":
@@ -672,7 +703,10 @@ class MotionAcceptanceEvaluator:
             and angular_speed is not None
             and linear_speed <= self.limits.command_epsilon
             and angular_speed <= self.limits.command_epsilon
-            and support_mode == "idle"
+            and (
+                support_mode == "idle"
+                or healthy_settled_safe_hold
+            )
         ):
             self.settled_after_motion = True
         elif self.physical_motion_seen and intent_active:
