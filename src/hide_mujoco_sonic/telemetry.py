@@ -59,6 +59,14 @@ class TelemetryState:
     sonic_planner_predicted_yaw_delta_rad: float | None = None
     sonic_planner_yaw_consistent: bool | None = None
     sonic_planner_evidence_reason: str = "no Nav2 motion intent"
+    sonic_reference_authority_state: str = "REVOKED"
+    sonic_reference_authority_generation: int | None = None
+    sonic_reference_authority_source_sequence: int | None = None
+    sonic_reference_authority_intent_generation: int | None = None
+    sonic_reference_authority_epoch: int = 0
+    sonic_reference_actuator_authority: bool = False
+    sonic_reference_authority_dds_target_sequence: int | None = None
+    sonic_execution_feedback_pending: bool = False
     last_cmd_vx: float = 0.0
     last_cmd_vy: float = 0.0
     last_cmd_wz: float = 0.0
@@ -115,6 +123,9 @@ class TelemetryState:
     fault_trace_path: str | None = None
     fault_trace_sample_count: int = 0
     fault_joint_names: list[str] = field(default_factory=list)
+    terminal_boundary_error: str | None = None
+    plant_terminal_halt_confirmed: bool | None = None
+    plant_terminal_halt_error: str | None = None
     last_error: str | None = None
     updated_at: float = field(default_factory=time.time)
 

@@ -26,6 +26,7 @@ from hide_mujoco_sonic.motion_fault import (
     sonic_health_probe,
 )
 from hide_mujoco_sonic.planner_evidence import (
+    PlannerAuthorityEvidence,
     PlannerReferenceDeadlineExceeded,
     PlannerReferenceEvidenceGate,
 )
@@ -33,6 +34,7 @@ from hide_mujoco_sonic.reference_authority import ReferenceAuthorityState
 from hide_mujoco_sonic.safety import (
     MovementIntent,
     PlantControlClock,
+    PlantControlStep,
     PlantTickGuard,
     ReplanIntentGate,
     StaticJointHandoff,
@@ -451,6 +453,8 @@ def bare_driver(clock: Clock) -> SonicDriver:
     driver.telemetry = FakeTelemetry()
     driver._intent_ingress = SonicIntentIngress(clock=clock, max_age_s=0.5)
     driver._fault_latched = threading.Event()
+    driver._terminal_fault_lock = threading.Lock()
+    driver._terminal_plant_halt_attempted = False
     driver._terminal_fault_reason = None
     driver._navigation_task_active = False
     driver._lowstate = None
@@ -476,6 +480,9 @@ def bare_driver(clock: Clock) -> SonicDriver:
     driver._stop = threading.Event()
     driver._support_lock = threading.RLock()
     driver._reference_authority = ReferenceAuthorityState()
+    driver._reference_source_identity = None
+    driver._reference_request_pending = False
+    driver._vendor_revoke_pending = False
     driver._dds_target_sequence = 0
     driver._plant_support_mode = "idle"
     driver._plant_support_stop_pending = False
@@ -537,6 +544,26 @@ def test_sonic_health_probe_is_strict_read_only_and_reports_terminal_fault() -> 
     assert driver.telemetry.values == telemetry_before
     assert (driver.guard.accepted, driver.guard.stops) == guard_before
 
+    driver._reference_authority.require(generation=7, source_sequence=3)
+    driver._reference_authority.mark_installed(
+        generation=7,
+        source_sequence=3,
+        planner_intent_generation=2,
+        reference_epoch=4,
+    )
+    driver._reference_authority.prime(
+        generation=7,
+        source_sequence=3,
+        reference_epoch=4,
+    )
+    driver._reference_authority.grant(
+        generation=7,
+        source_sequence=3,
+        reference_epoch=4,
+        granted_at_monotonic_s=clock.value,
+        granted_at_tick_ms=1_020,
+        dds_target_sequence=8,
+    )
     driver._terminal_fault_reason = "MuJoCo plant tick rolled back"
     driver._fault_latched.set()
     terminal_response = driver.accept_json(probe)
@@ -550,6 +577,11 @@ def test_sonic_health_probe_is_strict_read_only_and_reports_terminal_fault() -> 
     assert terminal.terminal_fault is True
     assert terminal.motion_ready is False
     assert terminal.reason == "MuJoCo plant tick rolled back"
+    assert terminal.matched_reference_actuator_authority is False
+    assert terminal.reference_authority_state == "REVOKED"
+    assert terminal.reference_authority_granted_at_monotonic_s is None
+    assert terminal.reference_authority_granted_tick_ms is None
+    assert terminal.reference_authority_dds_target_sequence is None
     assert observed_health_probes == [clock.value, clock.value]
     assert driver.telemetry.values == telemetry_before
     assert (driver.guard.accepted, driver.guard.stops) == guard_before
@@ -634,6 +666,149 @@ def test_driver_obeys_stop_before_model_guard_mapping() -> None:
     assert driver.guard.stops[-1] == "gait_adapter"
 
 
+def test_legacy_stop_atomically_revokes_ingress_before_racing_motion_accept() -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    revoke_entered = threading.Event()
+    release_revoke = threading.Event()
+    motion_complete = threading.Event()
+    events: list[str] = []
+
+    class BlockingIngress:
+        revoked = False
+
+        def revoke(self) -> None:
+            events.append("revoke_entered")
+            revoke_entered.set()
+            assert release_revoke.wait(timeout=2.0)
+            self.revoked = True
+            events.append("revoke_complete")
+
+        def accept(self, _payload):
+            events.append("motion_accept")
+            if self.revoked:
+                return SimpleNamespace(
+                    action="stop",
+                    state="IDLE",
+                    reason="ingress revoked",
+                    heading_yaw=None,
+                )
+            return SimpleNamespace(
+                action="motion",
+                state="STARTING",
+                reason=None,
+                heading_yaw=None,
+                generation=1,
+                sequence=1,
+                vx=0.2,
+                vy=0.0,
+                wz=0.0,
+            )
+
+    driver._intent_ingress = BlockingIngress()
+    stop_errors: list[Exception] = []
+    motion_errors: list[Exception] = []
+
+    def legacy_stop() -> None:
+        try:
+            driver.accept_json({"type": "stop"})
+        except Exception as exc:
+            stop_errors.append(exc)
+
+    def racing_motion() -> None:
+        try:
+            driver.accept_json({"type": "sonic_intent"})
+        except Exception as exc:
+            motion_errors.append(exc)
+        finally:
+            motion_complete.set()
+
+    stop_thread = threading.Thread(target=legacy_stop)
+    motion_thread = threading.Thread(target=racing_motion)
+    stop_thread.start()
+    assert revoke_entered.wait(timeout=2.0)
+    motion_thread.start()
+    assert motion_complete.wait(timeout=0.05) is False
+    release_revoke.set()
+    stop_thread.join(timeout=2.0)
+    motion_thread.join(timeout=2.0)
+
+    assert stop_errors == []
+    assert motion_errors == []
+    assert events == ["revoke_entered", "revoke_complete", "motion_accept"]
+    assert driver.guard.accepted == []
+    assert driver._navigation_task_active is False
+    assert driver._reference_authority.snapshot.phase == "REVOKED"
+
+
+def test_parsed_motion_cannot_replay_after_legacy_stop_wins_final_boundary() -> None:
+    clock = Clock()
+    adapter, _ = runtime(clock)
+    driver = bare_driver(clock)
+    driver.accept_json(
+        _intent_payload(adapter.tick(now=clock.value), measured_heading_yaw=0.0)
+    )
+    ready_entered = threading.Event()
+    release_ready = threading.Event()
+
+    class BlockingMotionReady:
+        @staticmethod
+        def is_set() -> bool:
+            ready_entered.set()
+            assert release_ready.wait(timeout=2.0)
+            return True
+
+        @staticmethod
+        def clear() -> None:
+            return None
+
+    driver._motion_ready = BlockingMotionReady()
+    clock.value += 0.01
+    motion = adapter.ingest_twist(twist(clock, vx=0.20), now=clock.value)
+    motion_payload = _intent_payload(motion, measured_heading_yaw=0.0)
+    motion_errors: list[Exception] = []
+
+    def accept_motion() -> None:
+        try:
+            driver.accept_json(motion_payload)
+        except Exception as exc:
+            motion_errors.append(exc)
+
+    motion_thread = threading.Thread(target=accept_motion)
+    motion_thread.start()
+    assert ready_entered.wait(timeout=2.0)
+    driver.accept_json({"type": "stop"})
+    release_ready.set()
+    motion_thread.join(timeout=2.0)
+
+    assert motion_errors == []
+    assert driver.guard.accepted == []
+    assert driver._intent_ingress.armed is False
+    assert driver._navigation_task_active is False
+    assert driver._reference_authority.snapshot.phase == "REVOKED"
+
+
+def test_driver_keeps_first_starting_sequence_across_repeated_bridge_envelopes() -> None:
+    clock = Clock()
+    adapter, _ = runtime(clock)
+    driver = bare_driver(clock)
+    driver.accept_json(
+        _intent_payload(adapter.tick(now=clock.value), measured_heading_yaw=0.0)
+    )
+
+    clock.value += 0.01
+    admitted = adapter.ingest_twist(twist(clock, vx=0.20), now=clock.value)
+    driver.accept_json(_intent_payload(admitted, measured_heading_yaw=0.0))
+    first_identity = (int(admitted.generation), admitted.sequence)
+    assert driver._reference_source_identity == first_identity
+
+    clock.value += 0.01
+    repeated = adapter.tick(now=clock.value)
+    assert repeated.sequence > admitted.sequence
+    driver.accept_json(_intent_payload(repeated, measured_heading_yaw=0.0))
+    assert driver._reference_source_identity == first_identity
+
+
 def test_gait_fault_freezes_target_and_latches_terminal_without_recoverable_support(
     monkeypatch,
 ) -> None:
@@ -647,6 +822,7 @@ def test_gait_fault_freezes_target_and_latches_terminal_without_recoverable_supp
         freeze=lambda targets: frozen.append(tuple(targets)),
     )
     support_calls: list[str] = []
+    terminal_halts: list[str] = []
 
     def confirm_support(_host, _port, mode, **_kwargs):
         support_calls.append(mode)
@@ -655,6 +831,13 @@ def test_gait_fault_freezes_target_and_latches_terminal_without_recoverable_supp
     monkeypatch.setattr(
         "hide_mujoco_sonic.sonic_driver.set_plant_support",
         confirm_support,
+    )
+    monkeypatch.setattr(
+        "hide_mujoco_sonic.sonic_driver.latch_plant_physics_fault",
+        lambda _host, _port, reason, **_kwargs: (
+            terminal_halts.append(reason)
+            or {"mode": "safety_stop", "safetyStopLatched": True, "fault": reason}
+        ),
     )
     driver.accept_json(
         _intent_payload(adapter.tick(now=clock.value), measured_heading_yaw=0.0)
@@ -680,6 +863,7 @@ def test_gait_fault_freezes_target_and_latches_terminal_without_recoverable_supp
 
     assert fault.state == "FAULT"
     assert support_calls == []
+    assert terminal_halts == [fault.reason]
     assert driver._fault_latched.is_set()
     assert driver._terminal_fault_reason == fault.reason
     assert driver._plant_support_safety_latched is False
@@ -687,6 +871,78 @@ def test_gait_fault_freezes_target_and_latches_terminal_without_recoverable_supp
     assert driver.telemetry.values["nav2_state"] == "fault_latched"
     assert driver._safe_hold_targets == published
     assert frozen and all(targets == published for targets in frozen)
+
+
+def test_terminal_fault_halts_plant_before_trace_even_if_vendor_revoke_fails(
+    monkeypatch,
+) -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    driver._intent_gate = ReplanIntentGate()
+    driver._kp = tuple(20.0 for _ in range(29))
+    driver._kd = tuple(1.0 for _ in range(29))
+    events: list[str] = []
+    recoverable_support_calls: list[str] = []
+    vendor_revoke_calls: list[dict[str, object]] = []
+
+    class BrokenController:
+        execution_feedback_pending = False
+
+        @staticmethod
+        def revoke_reference_authority(**kwargs) -> None:
+            vendor_revoke_calls.append(dict(kwargs))
+
+    class SlowTrace:
+        joint_names = ("joint",)
+
+        @staticmethod
+        def snapshot(**_kwargs):
+            events.append("trace_snapshot")
+            return {"sample_count": 0}
+
+        @staticmethod
+        def persist(_path, _payload):
+            events.append("trace_persist")
+            return "/tmp/terminal-trace.json"
+
+    driver._controller = BrokenController()
+    driver._joint_handoff = SimpleNamespace(
+        freeze=lambda _targets: (_ for _ in ()).throw(
+            RuntimeError("injected boundary freeze failure")
+        )
+    )
+    driver._fault_trace = SlowTrace()
+    driver._fault_trace_path = "/tmp/terminal-trace.json"
+    monkeypatch.setattr(
+        "hide_mujoco_sonic.sonic_driver.set_plant_support",
+        lambda _host, _port, mode, **_kwargs: (
+            recoverable_support_calls.append(mode) or {"mode": mode}
+        ),
+    )
+    monkeypatch.setattr(
+        "hide_mujoco_sonic.sonic_driver.latch_plant_physics_fault",
+        lambda _host, _port, _reason, **_kwargs: (
+            events.append("plant_halt")
+            or {"mode": "safety_stop", "safetyStopLatched": True}
+        ),
+    )
+
+    driver._latch_terminal_fault("SONIC runtime fault: injected verifier failure")
+    driver._latch_terminal_fault("duplicate terminal callback")
+
+    assert driver._fault_latched.is_set()
+    assert driver._reference_authority.snapshot.phase == "REVOKED"
+    assert events == ["plant_halt", "trace_snapshot", "trace_persist"]
+    assert recoverable_support_calls == []
+    assert vendor_revoke_calls == []
+    assert driver._vendor_revoke_pending is True
+    assert driver.telemetry.values["plant_terminal_halt_confirmed"] is True
+    assert driver.telemetry.values["terminal_boundary_error"] == (
+        "injected boundary freeze failure"
+    )
+    assert driver.telemetry.values["sonic_reference_authority_state"] == "REVOKED"
+    assert driver.telemetry.values["sonic_reference_actuator_authority"] is False
+    assert driver.telemetry.values["sonic_execution_feedback_pending"] is False
 
 
 def test_new_planner_generation_freezes_the_exact_actuator_boundary() -> None:
@@ -710,10 +966,11 @@ def _publishing_driver(clock: Clock):
 
     class Publisher:
         @staticmethod
-        def Write(message) -> None:
+        def Write(message) -> bool:
             writes.append(
                 tuple(float(message.motor_cmd[index].q) for index in range(29))
             )
+            return True
 
     driver._msg = SimpleNamespace(
         mode_machine=0,
@@ -786,6 +1043,188 @@ class _AsyncPlanner:
         return result
 
 
+class _TransactionalEvidence:
+    def __init__(self) -> None:
+        self.intent_generation = 0
+        self.intent_signature: str | None = None
+        self.accepted_request_generation = 0
+        self.ready = False
+
+    def observe_intent(self, intent, *, admitted, simulation_now_s=None) -> None:
+        if not admitted:
+            return
+        if intent.mode == "IDLE":
+            self.revoke("IDLE")
+            return
+        self.intent_generation += 1
+        self.intent_signature = f"intent-{self.intent_generation}"
+        self.ready = False
+
+    def accept_current(self) -> None:
+        self.accepted_request_generation += 1
+        self.ready = True
+
+    def revoke(self, _reason) -> None:
+        self.ready = False
+
+    @property
+    def reference_ready(self) -> bool:
+        return self.ready
+
+    @property
+    def authority_evidence(self) -> PlannerAuthorityEvidence:
+        return PlannerAuthorityEvidence(
+            reference_ready=self.ready,
+            intent_generation=(
+                self.intent_generation if self.intent_generation else None
+            ),
+            intent_signature=self.intent_signature,
+            accepted_request_generation=(
+                self.accepted_request_generation if self.ready else None
+            ),
+            accepted_intent_generation=(
+                self.intent_generation if self.ready else None
+            ),
+            accepted_intent_signature=(
+                self.intent_signature if self.ready else None
+            ),
+        )
+
+    def enforce_required_deadline(self, *, simulation_now_s) -> None:
+        assert math.isfinite(simulation_now_s)
+
+    def telemetry_fields(self, *, ref_cursor):
+        return {
+            "sonic_planner_reference_ready": self.ready,
+            "sonic_reference_cursor": ref_cursor,
+        }
+
+    def trace_fields(self, *, ref_cursor):
+        return self.telemetry_fields(ref_cursor=ref_cursor)
+
+
+class _TransactionalController:
+    def __init__(self, evidence: _TransactionalEvidence, target) -> None:
+        self.initialized = True
+        self.reference_install_epoch = 1
+        self.matching_reference_installed = True
+        self.execution_feedback_pending = False
+        self.reference_authority = False
+        self.install_ready = False
+        self.refresh_ready = False
+        self.request_calls = 0
+        self.poll_calls = 0
+        self.acquire_calls = []
+        self.run_calls = 0
+        self.commits = []
+        self.revoke_calls: list[tuple[bool, bool]] = []
+        self._candidate_identity = None
+        self._target = tuple(float(value) for value in target)
+        self._evidence = evidence
+
+        def set_reference_authority(
+            *,
+            actuator_authority,
+            matching_reference_ready,
+        ) -> None:
+            self.reference_authority = bool(
+                actuator_authority and matching_reference_ready
+            )
+
+        self.controller = SimpleNamespace(
+            ref_cursor=0,
+            reinit_heading=False,
+            delta_heading=0.0,
+            playing=True,
+            set_reference_authority=set_reference_authority,
+        )
+        self.ms = SimpleNamespace(
+            mode=0,
+            speed=-1.0,
+            movement_angle=0.0,
+            facing_angle=0.0,
+            has_movement=False,
+            needs_replan=False,
+        )
+
+    def request_reference(self, _lowstate) -> None:
+        assert self.execution_feedback_pending is False
+        self.request_calls += 1
+        self.matching_reference_installed = False
+        self.reference_authority = False
+
+    def poll_reference(self) -> bool:
+        assert self.execution_feedback_pending is False
+        self.poll_calls += 1
+        if not self.install_ready:
+            return False
+        self.install_ready = False
+        self.reference_install_epoch += 1
+        self.matching_reference_installed = True
+        self._evidence.accept_current()
+        return True
+
+    def acquire_reference(
+        self,
+        _lowstate,
+        *,
+        executed_target,
+        expected_install_epoch,
+    ) -> None:
+        assert expected_install_epoch == self.reference_install_epoch
+        self.acquire_calls.append(tuple(float(value) for value in executed_target))
+        self.reference_authority = True
+        self.controller.playing = True
+        self.controller.ref_cursor = 0
+
+    def run_step(self, _action, _lowstate):
+        assert self.reference_authority is True
+        assert self.execution_feedback_pending is False
+        if self.refresh_ready:
+            self.refresh_ready = False
+            self.reference_install_epoch += 1
+            self._evidence.accept_current()
+        self.run_calls += 1
+        self.execution_feedback_pending = True
+        self._candidate_identity = (
+            self.reference_install_epoch,
+            self.controller.ref_cursor,
+        )
+        return {
+            f"joint_{index}.q": target
+            for index, target in enumerate(self._target)
+        }
+
+    def record_executed_target(self, target) -> None:
+        if not self.execution_feedback_pending:
+            raise RuntimeError("no pending candidate")
+        if self._candidate_identity != (
+            self.reference_install_epoch,
+            self.controller.ref_cursor,
+        ):
+            raise RuntimeError("candidate epoch/cursor mismatch")
+        self.commits.append(tuple(float(value) for value in target))
+        self.execution_feedback_pending = False
+        if self.controller.playing and self.reference_authority:
+            self.controller.ref_cursor += 1
+
+    def revoke_reference_authority(
+        self,
+        *,
+        discard_reference=True,
+        discard_pending_execution=False,
+    ) -> None:
+        self.revoke_calls.append(
+            (bool(discard_reference), bool(discard_pending_execution))
+        )
+        self.reference_authority = False
+        if discard_reference:
+            self.matching_reference_installed = False
+        if discard_pending_execution:
+            self.execution_feedback_pending = False
+            self._candidate_identity = None
+
+
 def _planner_motion(dx: float, dy: float = 0.0):
     return SimpleNamespace(
         timesteps=3,
@@ -806,6 +1245,1235 @@ def _movement_intent(angle_rad: float) -> MovementIntent:
         has_movement=True,
         stale=False,
     )
+
+
+def test_reference_execution_is_transactional_across_grant_refresh_and_stop_race() -> None:
+    from lerobot.robots.unitree_g1.controllers.sonic_pipeline import DEFAULT_ANGLES
+
+    clock = Clock()
+    driver, writes = _publishing_driver(clock)
+    boundary = tuple(float(value) for value in DEFAULT_ANGLES)
+    target = tuple(value + 0.01 for value in boundary)
+    lowstate = _lowstate(boundary)
+    driver._last_published_targets = boundary
+    driver._joint_handoff.freeze(boundary)
+    driver._arm_guard.anchor(boundary[15:29])
+    driver._reference_source_identity = (42, 7)
+    driver._navigation_task_active = True
+    driver._intent_gate = ReplanIntentGate()
+    driver._decoder_facing_rad = None
+    driver._pending_decoder_heading_delta_rad = 0.0
+    driver._last_intent_signature = None
+
+    class IntentGuard:
+        last_received_at = clock.value
+
+        @staticmethod
+        def intent(**_kwargs):
+            return _movement_intent(0.0)
+
+        @staticmethod
+        def stop(*, source="watchdog"):
+            del source
+
+    driver.guard = IntentGuard()
+    evidence = _TransactionalEvidence()
+    controller = _TransactionalController(evidence, target)
+    driver._planner_evidence = evidence
+    driver._controller = controller
+
+    intent = driver._apply_intent(0.02, simulation_now_s=1.0)
+    assert intent.mode == "SLOW_WALK"
+    assert driver._reference_authority.snapshot.phase == "REQUIRED"
+    assert driver._reference_authority.snapshot.source_sequence == 7
+    assert controller.request_calls == controller.run_calls == 0
+
+    # Planning-only wait requests/polls but never decodes or advances history.
+    assert driver._progress_reference_transaction(lowstate) is False
+    assert controller.request_calls == 1
+    assert controller.poll_calls == 1
+    assert controller.run_calls == 0
+    assert controller.controller.ref_cursor == 0
+    driver._publish_position_hold(boundary)
+    assert controller.commits == []
+
+    # A matched installation is rebased from the exact last DDS target and is
+    # PRIMED, not health-visible actuator authority, until its own first write.
+    controller.install_ready = True
+    assert driver._progress_reference_transaction(lowstate) is True
+    primed = driver._reference_authority.snapshot
+    assert primed.phase == "PRIMED"
+    assert primed.reference_epoch == 2
+    assert primed.actuator_authority is False
+    assert controller.acquire_calls == [boundary]
+    driver._run_policy_candidate(lowstate)
+    first = driver._joint_handoff.decide(
+        motion_active=True,
+        reference_ready=driver._reference_authority.executable,
+        measured=boundary,
+        policy=target,
+        now=1.02,
+    )
+    published = driver._publish(
+        _action(driver, first.targets),
+        lowstate,
+        control_dt_s=0.02,
+        control_tick_ms=1_020,
+        constrain_arms=False,
+    )
+    granted = driver._reference_authority.snapshot
+    assert published == pytest.approx(target)
+    assert controller.commits[-1] == pytest.approx(target)
+    assert controller.controller.ref_cursor == 1
+    assert granted.phase == "GRANTED"
+    assert granted.reference_epoch == 2
+    assert granted.dds_target_sequence == 2
+
+    # A periodic result is installed before decode. The old epoch loses health
+    # authority atomically, and only the new epoch's successful DDS write grants.
+    controller.refresh_ready = True
+    driver._run_policy_candidate(lowstate)
+    assert controller.reference_install_epoch == 3
+    refreshed = driver._reference_authority.snapshot
+    assert refreshed.phase == "PRIMED"
+    assert refreshed.reference_epoch == 3
+    assert refreshed.actuator_authority is False
+    driver._publish(
+        _action(driver, target),
+        lowstate,
+        control_dt_s=0.02,
+        control_tick_ms=1_040,
+        constrain_arms=False,
+    )
+    assert driver._reference_authority.snapshot.phase == "GRANTED"
+    assert driver._reference_authority.snapshot.reference_epoch == 3
+    assert controller.controller.ref_cursor == 2
+
+    # Stop wins after decode. The frozen target, not the discarded candidate,
+    # is committed to executed history and revoked authority blocks cursor motion.
+    driver._run_policy_candidate(lowstate)
+    candidate_cursor = controller.controller.ref_cursor
+    assert driver._freeze_last_published_hold() is True
+    frozen = driver._safe_hold_targets
+    assert frozen is not None
+    driver._publish_position_hold(tuple(value - 0.5 for value in boundary))
+    assert controller.commits[-1] == pytest.approx(frozen)
+    assert controller.controller.ref_cursor == candidate_cursor
+    assert driver._reference_authority.snapshot.phase == "REVOKED"
+    assert writes[-1] == pytest.approx(frozen)
+
+
+def test_health_keeps_last_dds_grant_while_refresh_decode_is_inflight() -> None:
+    from lerobot.robots.unitree_g1.controllers.sonic_pipeline import DEFAULT_ANGLES
+
+    clock = Clock()
+    driver, _writes = _publishing_driver(clock)
+    boundary = tuple(float(value) for value in DEFAULT_ANGLES)
+    lowstate = _lowstate(boundary)
+    evidence = _TransactionalEvidence()
+    evidence.intent_generation = 1
+    evidence.intent_signature = "intent-1"
+    evidence.accept_current()
+    refresh_installed = threading.Event()
+    release_decode = threading.Event()
+
+    class BlockingRefreshController(_TransactionalController):
+        def run_step(self, action, observed_lowstate):
+            result = super().run_step(action, observed_lowstate)
+            refresh_installed.set()
+            assert release_decode.wait(timeout=2.0)
+            return result
+
+    controller = BlockingRefreshController(evidence, boundary)
+    controller.reference_install_epoch = 2
+    controller.reference_authority = True
+    controller.refresh_ready = True
+    driver._controller = controller
+    driver._planner_evidence = evidence
+    driver._reference_authority.require(generation=4, source_sequence=2)
+    driver._reference_authority.mark_installed(
+        generation=4,
+        source_sequence=2,
+        planner_intent_generation=1,
+        reference_epoch=2,
+    )
+    driver._reference_authority.prime(
+        generation=4,
+        source_sequence=2,
+        reference_epoch=2,
+    )
+    driver._reference_authority.grant(
+        generation=4,
+        source_sequence=2,
+        reference_epoch=2,
+        granted_at_monotonic_s=clock.value,
+        granted_at_tick_ms=1_000,
+        dds_target_sequence=1,
+    )
+    decode_errors: list[Exception] = []
+    probe_result: list[dict[str, object]] = []
+    probe_complete = threading.Event()
+
+    def decode() -> None:
+        try:
+            driver._run_policy_candidate(lowstate)
+        except Exception as exc:
+            decode_errors.append(exc)
+
+    probe = sonic_health_probe(
+        robot_id="g1-sim",
+        producer_boot_id=UUID("20000000-0000-4000-8000-000000000002"),
+        request_id=UUID("40000000-0000-4000-8000-000000000004"),
+    )
+
+    def read_health() -> None:
+        response = driver.accept_json(probe)
+        assert response is not None
+        probe_result.append(response)
+        probe_complete.set()
+
+    decode_thread = threading.Thread(target=decode)
+    probe_thread = threading.Thread(target=read_health)
+    decode_thread.start()
+    assert refresh_installed.wait(timeout=2.0)
+    assert controller.reference_install_epoch == 3
+    probe_thread.start()
+    assert probe_complete.wait(timeout=0.50) is True
+    assert probe_result[0]["reference_authority_state"] == "GRANTED"
+    assert probe_result[0]["reference_authority_epoch"] == 2
+    assert probe_result[0]["matched_reference_actuator_authority"] is True
+    release_decode.set()
+    decode_thread.join(timeout=2.0)
+    probe_thread.join(timeout=2.0)
+
+    assert decode_errors == []
+    assert len(probe_result) == 1
+    assert driver._reference_authority.snapshot.phase == "PRIMED"
+    assert driver._reference_authority.snapshot.reference_epoch == 3
+
+
+def test_stop_before_policy_run_consumes_deferred_revoke_and_skips_decode() -> None:
+    from lerobot.robots.unitree_g1.controllers.sonic_pipeline import DEFAULT_ANGLES
+
+    clock = Clock()
+    driver, _writes = _publishing_driver(clock)
+    boundary = tuple(float(value) for value in DEFAULT_ANGLES)
+    evidence = _TransactionalEvidence()
+    evidence.intent_generation = 1
+    evidence.intent_signature = "intent-1"
+    evidence.accept_current()
+    controller = _TransactionalController(evidence, boundary)
+    controller.reference_install_epoch = 2
+    controller.reference_authority = True
+    driver._controller = controller
+    driver._planner_evidence = evidence
+    driver._intent_gate = ReplanIntentGate()
+    driver._navigation_task_active = True
+    driver._last_published_targets = boundary
+    driver._reference_authority.require(generation=4, source_sequence=2)
+    driver._reference_authority.mark_installed(
+        generation=4,
+        source_sequence=2,
+        planner_intent_generation=1,
+        reference_epoch=2,
+    )
+    driver._reference_authority.prime(
+        generation=4,
+        source_sequence=2,
+        reference_epoch=2,
+    )
+    driver._reference_authority.grant(
+        generation=4,
+        source_sequence=2,
+        reference_epoch=2,
+        granted_at_monotonic_s=clock.value,
+        granted_at_tick_ms=1_000,
+        dds_target_sequence=1,
+    )
+
+    driver._stop_navigation_at_boundary(source="bridge_stop")
+    assert driver._reference_authority.snapshot.phase == "REVOKED"
+    assert driver._vendor_revoke_pending is True
+    assert controller.revoke_calls == []
+
+    assert driver._run_policy_candidate(_lowstate(boundary)) == {}
+    assert controller.run_calls == 0
+    assert controller.revoke_calls == [(True, False)]
+    assert driver._vendor_revoke_pending is False
+
+
+def test_terminal_halt_does_not_wait_for_support_or_inflight_decode(
+    monkeypatch,
+) -> None:
+    from lerobot.robots.unitree_g1.controllers.sonic_pipeline import DEFAULT_ANGLES
+
+    clock = Clock()
+    driver, writes = _publishing_driver(clock)
+    boundary = tuple(float(value) for value in DEFAULT_ANGLES)
+    target = tuple(value + 0.02 for value in boundary)
+    lowstate = _lowstate(boundary)
+    evidence = _TransactionalEvidence()
+    evidence.intent_generation = 1
+    evidence.intent_signature = "intent-1"
+    evidence.accept_current()
+    decode_entered = threading.Event()
+    release_decode = threading.Event()
+
+    class BlockingController(_TransactionalController):
+        def run_step(self, action, observed_lowstate):
+            result = super().run_step(action, observed_lowstate)
+            decode_entered.set()
+            assert release_decode.wait(timeout=2.0)
+            return result
+
+    controller = BlockingController(evidence, target)
+    controller.reference_install_epoch = 2
+    controller.reference_authority = True
+    driver._controller = controller
+    driver._planner_evidence = evidence
+    driver._intent_gate = ReplanIntentGate()
+    driver._navigation_task_active = True
+    driver._last_published_targets = boundary
+    driver._fault_trace = None
+    driver._reference_authority.require(generation=4, source_sequence=2)
+    driver._reference_authority.mark_installed(
+        generation=4,
+        source_sequence=2,
+        planner_intent_generation=1,
+        reference_epoch=2,
+    )
+    driver._reference_authority.prime(
+        generation=4,
+        source_sequence=2,
+        reference_epoch=2,
+    )
+    driver._reference_authority.grant(
+        generation=4,
+        source_sequence=2,
+        reference_epoch=2,
+        granted_at_monotonic_s=clock.value,
+        granted_at_tick_ms=1_000,
+        dds_target_sequence=1,
+    )
+    plant_entered = threading.Event()
+    release_plant = threading.Event()
+    plant_calls: list[str] = []
+
+    def blocking_plant_halt(_host, _port, reason, **_kwargs):
+        plant_calls.append(reason)
+        plant_entered.set()
+        assert release_plant.wait(timeout=2.0)
+        return {"mode": "safety_stop", "safetyStopLatched": True}
+
+    monkeypatch.setattr(
+        "hide_mujoco_sonic.sonic_driver.latch_plant_physics_fault",
+        blocking_plant_halt,
+    )
+    decode_results: list[dict[str, object]] = []
+    decode_errors: list[Exception] = []
+    terminal_errors: list[Exception] = []
+
+    def decode() -> None:
+        try:
+            decode_results.append(driver._run_policy_candidate(lowstate))
+        except Exception as exc:
+            decode_errors.append(exc)
+
+    def terminal() -> None:
+        try:
+            driver._latch_terminal_fault("injected inflight runtime fault")
+        except Exception as exc:
+            terminal_errors.append(exc)
+
+    decode_thread = threading.Thread(target=decode)
+    terminal_thread = threading.Thread(target=terminal)
+    decode_thread.start()
+    assert decode_entered.wait(timeout=2.0)
+
+    # Force the opportunistic local boundary to miss.  The terminal claim and
+    # Plant request must still cross while this lock and ONNX are both blocked.
+    driver._support_lock.acquire()
+    try:
+        terminal_thread.start()
+        assert plant_entered.wait(timeout=0.50)
+        assert driver._fault_latched.is_set()
+        assert terminal_thread.is_alive()
+    finally:
+        driver._support_lock.release()
+
+    # Plant HTTP remains blocked.  Returning inference must observe the fault,
+    # revoke at its safe point, and discard the policy result before any DDS.
+    release_decode.set()
+    decode_thread.join(timeout=2.0)
+    assert not decode_thread.is_alive()
+    assert decode_errors == []
+    assert decode_results == [{}]
+    assert writes == []
+    assert driver._reference_authority.snapshot.phase == "REVOKED"
+    assert controller.revoke_calls == [(True, False)]
+    assert controller.controller.ref_cursor == 0
+    assert controller.execution_feedback_pending is True
+
+    # The only allowed DDS after the late candidate is the exact frozen
+    # actuator boundary.  Revoked vendor authority records history but not a
+    # reference cursor step.
+    driver._publish_position_hold(target)
+    assert writes == [pytest.approx(boundary)]
+    assert controller.commits == [pytest.approx(boundary)]
+    assert controller.controller.ref_cursor == 0
+    assert controller.execution_feedback_pending is False
+    assert driver._last_published_targets == pytest.approx(boundary)
+
+    release_plant.set()
+    terminal_thread.join(timeout=2.0)
+    assert not terminal_thread.is_alive()
+    assert terminal_errors == []
+    assert plant_calls == ["injected inflight runtime fault"]
+
+
+@pytest.mark.parametrize("publish_path", ["policy", "position_hold"])
+def test_terminal_claim_before_final_write_replaces_target_with_boundary(
+    monkeypatch,
+    publish_path: str,
+) -> None:
+    from lerobot.robots.unitree_g1.controllers.sonic_pipeline import DEFAULT_ANGLES
+
+    clock = Clock()
+    driver, writes = _publishing_driver(clock)
+    boundary = tuple(float(value) for value in DEFAULT_ANGLES)
+    proposed = tuple(value + 0.025 for value in boundary)
+    lowstate = _lowstate(boundary)
+    evidence = _TransactionalEvidence()
+    evidence.intent_generation = 1
+    evidence.intent_signature = "intent-1"
+    evidence.accept_current()
+    controller = _TransactionalController(evidence, proposed)
+    controller.reference_install_epoch = 2
+    controller.reference_authority = True
+    controller.run_step({}, lowstate)
+    driver._controller = controller
+    driver._planner_evidence = evidence
+    driver._intent_gate = ReplanIntentGate()
+    driver._navigation_task_active = True
+    driver._last_published_targets = boundary
+    driver._fault_trace = None
+    driver._reference_authority.require(generation=9, source_sequence=3)
+    driver._reference_authority.mark_installed(
+        generation=9,
+        source_sequence=3,
+        planner_intent_generation=1,
+        reference_epoch=2,
+    )
+    driver._reference_authority.prime(
+        generation=9,
+        source_sequence=3,
+        reference_epoch=2,
+    )
+    crc_entered = threading.Event()
+    release_crc = threading.Event()
+    crc_calls = 0
+
+    def blocking_crc(_message) -> int:
+        nonlocal crc_calls
+        crc_calls += 1
+        if crc_calls == 1:
+            crc_entered.set()
+            assert release_crc.wait(timeout=2.0)
+        return 0
+
+    driver._crc = SimpleNamespace(Crc=blocking_crc)
+    plant_entered = threading.Event()
+    release_plant = threading.Event()
+
+    def blocking_plant_halt(*_args, **_kwargs):
+        plant_entered.set()
+        assert release_plant.wait(timeout=2.0)
+        return {"mode": "safety_stop", "safetyStopLatched": True}
+
+    monkeypatch.setattr(
+        "hide_mujoco_sonic.sonic_driver.latch_plant_physics_fault",
+        blocking_plant_halt,
+    )
+    publish_results: list[object] = []
+    publish_errors: list[Exception] = []
+    terminal_errors: list[Exception] = []
+
+    def publish() -> None:
+        try:
+            if publish_path == "policy":
+                result = driver._publish(
+                    _action(driver, proposed),
+                    lowstate,
+                    control_dt_s=0.02,
+                    control_tick_ms=1_020,
+                    constrain_arms=False,
+                )
+            else:
+                result = driver._publish_position_hold(proposed)
+            publish_results.append(result)
+        except Exception as exc:
+            publish_errors.append(exc)
+
+    def terminal() -> None:
+        try:
+            driver._latch_terminal_fault("fault before final DDS check")
+        except Exception as exc:
+            terminal_errors.append(exc)
+
+    publish_thread = threading.Thread(target=publish)
+    terminal_thread = threading.Thread(target=terminal)
+    publish_thread.start()
+    assert crc_entered.wait(timeout=2.0)
+    terminal_thread.start()
+    assert plant_entered.wait(timeout=0.50)
+    assert driver._fault_latched.is_set()
+    release_crc.set()
+    publish_thread.join(timeout=2.0)
+    assert not publish_thread.is_alive()
+
+    assert publish_errors == []
+    assert writes == [pytest.approx(boundary)]
+    assert controller.commits == [pytest.approx(boundary)]
+    assert controller.controller.ref_cursor == 0
+    assert controller.execution_feedback_pending is False
+    assert driver._last_published_targets == pytest.approx(boundary)
+    assert driver._safe_hold_targets == pytest.approx(boundary)
+    assert driver._reference_authority.snapshot.phase == "REVOKED"
+    if publish_path == "policy":
+        assert publish_results == [pytest.approx(boundary)]
+    else:
+        assert publish_results == [None]
+
+    release_plant.set()
+    terminal_thread.join(timeout=2.0)
+    assert not terminal_thread.is_alive()
+    assert terminal_errors == []
+
+
+def test_terminal_claim_after_successful_write_records_actual_without_grant(
+    monkeypatch,
+) -> None:
+    from lerobot.robots.unitree_g1.controllers.sonic_pipeline import DEFAULT_ANGLES
+
+    clock = Clock()
+    driver, writes = _publishing_driver(clock)
+    boundary = tuple(float(value) for value in DEFAULT_ANGLES)
+    actual = tuple(value + 0.03 for value in boundary)
+    lowstate = _lowstate(boundary)
+    evidence = _TransactionalEvidence()
+    evidence.intent_generation = 1
+    evidence.intent_signature = "intent-1"
+    evidence.accept_current()
+    controller = _TransactionalController(evidence, actual)
+    controller.reference_install_epoch = 2
+    controller.reference_authority = True
+    controller.run_step({}, lowstate)
+    driver._controller = controller
+    driver._planner_evidence = evidence
+    driver._intent_gate = ReplanIntentGate()
+    driver._navigation_task_active = True
+    driver._last_published_targets = boundary
+    driver._fault_trace = None
+    driver._reference_authority.require(generation=9, source_sequence=3)
+    driver._reference_authority.mark_installed(
+        generation=9,
+        source_sequence=3,
+        planner_intent_generation=1,
+        reference_epoch=2,
+    )
+    driver._reference_authority.prime(
+        generation=9,
+        source_sequence=3,
+        reference_epoch=2,
+    )
+    write_crossed = threading.Event()
+    plant_called = threading.Event()
+
+    class BarrierPublisher:
+        @staticmethod
+        def Write(message) -> bool:
+            writes.append(
+                tuple(
+                    float(message.motor_cmd[index].q)
+                    for index in range(29)
+                )
+            )
+            write_crossed.set()
+            assert driver._fault_latched.wait(timeout=2.0)
+            return True
+
+    driver._publisher = BarrierPublisher()
+    monkeypatch.setattr(
+        "hide_mujoco_sonic.sonic_driver.latch_plant_physics_fault",
+        lambda _host, _port, _reason, **_kwargs: (
+            plant_called.set()
+            or {"mode": "safety_stop", "safetyStopLatched": True}
+        ),
+    )
+    publish_results: list[tuple[float, ...]] = []
+    publish_errors: list[Exception] = []
+    terminal_errors: list[Exception] = []
+
+    def publish() -> None:
+        try:
+            publish_results.append(
+                driver._publish(
+                    _action(driver, actual),
+                    lowstate,
+                    control_dt_s=0.02,
+                    control_tick_ms=1_020,
+                    constrain_arms=False,
+                )
+            )
+        except Exception as exc:
+            publish_errors.append(exc)
+
+    def terminal() -> None:
+        try:
+            driver._latch_terminal_fault("fault after DDS crossed")
+        except Exception as exc:
+            terminal_errors.append(exc)
+
+    publish_thread = threading.Thread(target=publish)
+    terminal_thread = threading.Thread(target=terminal)
+    publish_thread.start()
+    assert write_crossed.wait(timeout=2.0)
+    terminal_thread.start()
+    assert plant_called.wait(timeout=0.50)
+    publish_thread.join(timeout=2.0)
+    terminal_thread.join(timeout=2.0)
+
+    assert not publish_thread.is_alive()
+    assert not terminal_thread.is_alive()
+    assert publish_errors == []
+    assert terminal_errors == []
+    assert publish_results == [pytest.approx(actual)]
+    assert writes == [pytest.approx(actual)]
+    assert driver._last_published_targets == pytest.approx(actual)
+    assert driver._safe_hold_targets == pytest.approx(actual)
+    assert driver._dds_target_sequence == 1
+    assert controller.commits == [pytest.approx(actual)]
+    assert controller.controller.ref_cursor == 0
+    assert controller.execution_feedback_pending is False
+    assert controller.revoke_calls == [(True, False)]
+    authority = driver._reference_authority.snapshot
+    assert authority.phase == "REVOKED"
+    assert authority.actuator_authority is False
+    assert authority.dds_target_sequence is None
+
+
+def test_post_write_revoke_failure_still_records_actual_with_cursor_interlock(
+    monkeypatch,
+) -> None:
+    from lerobot.robots.unitree_g1.controllers.sonic_pipeline import DEFAULT_ANGLES
+
+    clock = Clock()
+    driver, writes = _publishing_driver(clock)
+    boundary = tuple(float(value) for value in DEFAULT_ANGLES)
+    actual = tuple(value + 0.04 for value in boundary)
+    lowstate = _lowstate(boundary)
+    evidence = _TransactionalEvidence()
+    evidence.intent_generation = 1
+    evidence.intent_signature = "intent-1"
+    evidence.accept_current()
+
+    class BrokenRevokeController(_TransactionalController):
+        def __init__(self, planner_evidence, target) -> None:
+            super().__init__(planner_evidence, target)
+            self.revoke_attempts = 0
+
+        def revoke_reference_authority(
+            self,
+            *,
+            discard_reference=True,
+            discard_pending_execution=False,
+        ) -> None:
+            self.revoke_calls.append(
+                (bool(discard_reference), bool(discard_pending_execution))
+            )
+            self.revoke_attempts += 1
+            if self.revoke_attempts == 1:
+                raise RuntimeError("injected vendor wrapper revoke failure")
+            super().revoke_reference_authority(
+                discard_reference=discard_reference,
+                discard_pending_execution=discard_pending_execution,
+            )
+
+    controller = BrokenRevokeController(evidence, actual)
+    controller.reference_install_epoch = 2
+    controller.reference_authority = True
+    controller.run_step({}, lowstate)
+    driver._controller = controller
+    driver._planner_evidence = evidence
+    driver._intent_gate = ReplanIntentGate()
+    driver._navigation_task_active = True
+    driver._last_published_targets = boundary
+    driver._fault_trace = None
+    driver._reference_authority.require(generation=9, source_sequence=3)
+    driver._reference_authority.mark_installed(
+        generation=9,
+        source_sequence=3,
+        planner_intent_generation=1,
+        reference_epoch=2,
+    )
+    driver._reference_authority.prime(
+        generation=9,
+        source_sequence=3,
+        reference_epoch=2,
+    )
+    write_crossed = threading.Event()
+
+    class BarrierPublisher:
+        @staticmethod
+        def Write(message) -> bool:
+            writes.append(
+                tuple(
+                    float(message.motor_cmd[index].q)
+                    for index in range(29)
+                )
+            )
+            write_crossed.set()
+            assert driver._fault_latched.wait(timeout=2.0)
+            return True
+
+    driver._publisher = BarrierPublisher()
+    monkeypatch.setattr(
+        "hide_mujoco_sonic.sonic_driver.latch_plant_physics_fault",
+        lambda *_args, **_kwargs: {
+            "mode": "safety_stop",
+            "safetyStopLatched": True,
+        },
+    )
+    publish_errors: list[Exception] = []
+
+    def publish() -> None:
+        try:
+            driver._publish(
+                _action(driver, actual),
+                lowstate,
+                control_dt_s=0.02,
+                control_tick_ms=1_020,
+                constrain_arms=False,
+            )
+        except Exception as exc:
+            publish_errors.append(exc)
+
+    publish_thread = threading.Thread(target=publish)
+    terminal_thread = threading.Thread(
+        target=lambda: driver._latch_terminal_fault(
+            "fault before broken revoke"
+        )
+    )
+    publish_thread.start()
+    assert write_crossed.wait(timeout=2.0)
+    terminal_thread.start()
+    publish_thread.join(timeout=2.0)
+    terminal_thread.join(timeout=2.0)
+
+    assert not publish_thread.is_alive()
+    assert not terminal_thread.is_alive()
+    assert len(publish_errors) == 1
+    assert str(publish_errors[0]) == "injected vendor wrapper revoke failure"
+    assert controller.controller.playing is False
+    assert controller.reference_authority is False
+    assert controller.commits == [pytest.approx(actual)]
+    assert controller.controller.ref_cursor == 0
+    assert controller.execution_feedback_pending is False
+    assert driver._last_published_targets == pytest.approx(actual)
+    assert driver._safe_hold_targets == pytest.approx(actual)
+    assert driver._reference_authority.snapshot.phase == "REVOKED"
+
+    # Once the wrapper recovers, the next terminal hold repeats the actual DDS
+    # boundary rather than jumping back to the pre-fault target.
+    driver._publisher = SimpleNamespace(
+        Write=lambda message: (
+            writes.append(
+                tuple(
+                    float(message.motor_cmd[index].q)
+                    for index in range(29)
+                )
+            )
+            or True
+        )
+    )
+    driver._publish_position_hold(boundary)
+    assert writes[-1] == pytest.approx(actual)
+    assert driver._last_published_targets == pytest.approx(actual)
+    assert driver._safe_hold_targets == pytest.approx(actual)
+    assert controller.controller.ref_cursor == 0
+
+
+def test_failed_dds_write_never_commits_or_grants_policy_or_hold_feedback() -> None:
+    from lerobot.robots.unitree_g1.controllers.sonic_pipeline import DEFAULT_ANGLES
+
+    clock = Clock()
+    driver, _writes = _publishing_driver(clock)
+    boundary = tuple(float(value) for value in DEFAULT_ANGLES)
+    target = tuple(value + 0.01 for value in boundary)
+    lowstate = _lowstate(boundary)
+    evidence = _TransactionalEvidence()
+    evidence.intent_generation = 1
+    evidence.intent_signature = "intent-1"
+    evidence.accept_current()
+    controller = _TransactionalController(evidence, target)
+    controller.reference_install_epoch = 2
+    controller.reference_authority = True
+    controller.run_step({}, lowstate)
+    driver._controller = controller
+    driver._planner_evidence = evidence
+    driver._last_published_targets = boundary
+    driver._reference_authority.require(generation=9, source_sequence=3)
+    driver._reference_authority.mark_installed(
+        generation=9,
+        source_sequence=3,
+        planner_intent_generation=1,
+        reference_epoch=2,
+    )
+    driver._reference_authority.prime(
+        generation=9,
+        source_sequence=3,
+        reference_epoch=2,
+    )
+    driver._publisher = SimpleNamespace(Write=lambda _message: False)
+
+    with pytest.raises(RuntimeError, match="policy-target write failed"):
+        driver._publish(
+            _action(driver, target),
+            lowstate,
+            control_dt_s=0.02,
+            control_tick_ms=1_020,
+            constrain_arms=False,
+        )
+
+    assert driver._last_published_targets == boundary
+    assert driver._dds_target_sequence == 0
+    assert controller.execution_feedback_pending is True
+    assert controller.commits == []
+    assert controller.controller.ref_cursor == 0
+    assert driver._reference_authority.snapshot.phase == "PRIMED"
+
+    # The stop-race hold path is governed by the same successful-Write rule.
+    driver._reference_authority.revoke("stop won")
+    driver._safe_hold_targets = boundary
+    with pytest.raises(RuntimeError, match="position-hold write failed"):
+        driver._publish_position_hold(target)
+    assert driver._last_published_targets == boundary
+    assert driver._dds_target_sequence == 0
+    assert controller.execution_feedback_pending is True
+    assert controller.commits == []
+    assert controller.controller.ref_cursor == 0
+
+
+def test_outer_publish_preserves_real_vendor_candidate_epoch_cursor_proof() -> None:
+    from lerobot.robots.unitree_g1.controllers.sonic_pipeline import DEFAULT_ANGLES
+    from lerobot.robots.unitree_g1.controllers.sonic_whole_body import (
+        SonicRuntime,
+        SonicWholeBodyController,
+    )
+
+    class Pipeline:
+        execution_feedback_pending = False
+        reference_authority = True
+
+        def __init__(self, cursor: int) -> None:
+            self.ref_cursor = cursor
+            self.record_calls: list[tuple[float, ...]] = []
+            self.advance_calls = 0
+
+        def record_executed_target(self, target):
+            committed = tuple(float(value) for value in target)
+            self.record_calls.append(committed)
+            return committed
+
+        def advance_cursor(self) -> None:
+            self.advance_calls += 1
+            self.ref_cursor += 1
+
+    def controller_for(*, pending_epoch: int, pending_cursor: int, epoch: int, cursor: int):
+        pipeline = Pipeline(cursor)
+        runtime = SonicRuntime.__new__(SonicRuntime)
+        runtime.controller = pipeline
+        runtime._policy_step_pending = True
+        runtime._pending_reference_install_epoch = pending_epoch
+        runtime._pending_ref_cursor = pending_cursor
+        runtime._reference_install_epoch = epoch
+        controller = SonicWholeBodyController.__new__(SonicWholeBodyController)
+        controller._runtime = runtime
+        controller.controller = pipeline
+        return controller, runtime, pipeline
+
+    clock = Clock()
+    boundary = tuple(float(value) for value in DEFAULT_ANGLES)
+
+    stale_driver, stale_writes = _publishing_driver(clock)
+    stale, stale_runtime, stale_pipeline = controller_for(
+        pending_epoch=2,
+        pending_cursor=61,
+        epoch=3,
+        cursor=0,
+    )
+    stale_driver._controller = stale
+    with pytest.raises(RuntimeError, match="epoch/cursor"):
+        stale_driver._publish_position_hold(boundary)
+    assert len(stale_writes) == 1
+    assert stale_pipeline.record_calls == []
+    assert stale_pipeline.advance_calls == 0
+    assert stale_pipeline.ref_cursor == 0
+    assert stale_runtime.execution_feedback_pending is True
+
+    matched_driver, matched_writes = _publishing_driver(clock)
+    matched, matched_runtime, matched_pipeline = controller_for(
+        pending_epoch=3,
+        pending_cursor=0,
+        epoch=3,
+        cursor=0,
+    )
+    matched_driver._controller = matched
+    matched_driver._publish_position_hold(boundary)
+    assert len(matched_writes) == 1
+    assert matched_pipeline.record_calls == [pytest.approx(boundary)]
+    assert matched_pipeline.advance_calls == 1
+    assert matched_pipeline.ref_cursor == 1
+    assert matched_runtime.execution_feedback_pending is False
+
+
+def test_stop_serializes_against_preplan_intent_and_cannot_be_resurrected() -> None:
+    from lerobot.robots.unitree_g1.controllers.sonic_pipeline import DEFAULT_ANGLES
+
+    clock = Clock()
+    driver, _writes = _publishing_driver(clock)
+    boundary = tuple(float(value) for value in DEFAULT_ANGLES)
+    driver._last_published_targets = boundary
+    driver._reference_source_identity = (42, 7)
+    driver._navigation_task_active = True
+    driver._decoder_facing_rad = None
+    driver._pending_decoder_heading_delta_rad = 0.0
+    driver._last_intent_signature = None
+    evidence = _TransactionalEvidence()
+    controller = _TransactionalController(evidence, boundary)
+    driver._planner_evidence = evidence
+    driver._controller = controller
+    gate_entered = threading.Event()
+    release_gate = threading.Event()
+    stop_complete = threading.Event()
+    inner_gate = ReplanIntentGate()
+
+    class BlockingGate:
+        @property
+        def last(self):
+            return inner_gate.last
+
+        @staticmethod
+        def admit(intent, *, now):
+            gate_entered.set()
+            assert release_gate.wait(timeout=2.0)
+            return inner_gate.admit(intent, now=now)
+
+        @staticmethod
+        def reset() -> None:
+            inner_gate.reset()
+
+    class IntentGuard:
+        last_received_at = clock.value
+
+        @staticmethod
+        def intent(**_kwargs):
+            return _movement_intent(0.0)
+
+        @staticmethod
+        def stop(*, source="watchdog"):
+            del source
+
+    driver._intent_gate = BlockingGate()
+    driver.guard = IntentGuard()
+    control_errors: list[Exception] = []
+    stop_errors: list[Exception] = []
+
+    def apply_control() -> None:
+        try:
+            driver._apply_intent(0.02, simulation_now_s=1.0)
+        except Exception as exc:
+            control_errors.append(exc)
+
+    def apply_stop() -> None:
+        try:
+            driver._stop_navigation_at_boundary(source="bridge_stop")
+        except Exception as exc:
+            stop_errors.append(exc)
+        finally:
+            stop_complete.set()
+
+    control_thread = threading.Thread(target=apply_control)
+    stop_thread = threading.Thread(target=apply_stop)
+    control_thread.start()
+    assert gate_entered.wait(timeout=2.0)
+    stop_thread.start()
+    assert stop_complete.wait(timeout=0.05) is False
+    release_gate.set()
+    control_thread.join(timeout=2.0)
+    stop_thread.join(timeout=2.0)
+
+    assert not control_thread.is_alive()
+    assert not stop_thread.is_alive()
+    assert control_errors == []
+    assert stop_errors == []
+    assert driver._reference_authority.snapshot.phase == "REVOKED"
+    assert driver._reference_request_pending is False
+    assert driver._navigation_task_active is False
+    assert driver._safe_hold_targets == boundary
+    assert inner_gate.last is None
+    assert controller.request_calls == controller.run_calls == 0
+
+
+def test_ingress_accepted_stop_revokes_before_control_can_cross_boundary() -> None:
+    from lerobot.robots.unitree_g1.controllers.sonic_pipeline import DEFAULT_ANGLES
+
+    clock = Clock()
+    driver, _writes = _publishing_driver(clock)
+    boundary = tuple(float(value) for value in DEFAULT_ANGLES)
+    driver._last_published_targets = boundary
+    driver._reference_source_identity = (42, 7)
+    driver._navigation_task_active = True
+    driver._intent_gate = ReplanIntentGate()
+    driver._intent_gate.admit(_movement_intent(0.0), now=0.5)
+    driver._decoder_facing_rad = None
+    driver._pending_decoder_heading_delta_rad = 0.0
+    driver._last_intent_signature = None
+    evidence = _TransactionalEvidence()
+    controller = _TransactionalController(evidence, boundary)
+    driver._planner_evidence = evidence
+    driver._controller = controller
+    ingress_entered = threading.Event()
+    release_ingress = threading.Event()
+    control_complete = threading.Event()
+
+    class BlockingIngress:
+        @staticmethod
+        def accept(_payload):
+            ingress_entered.set()
+            assert release_ingress.wait(timeout=2.0)
+            return SimpleNamespace(
+                action="stop",
+                state="IDLE",
+                reason="cancelled",
+                heading_yaw=None,
+            )
+
+    class IntentGuard:
+        last_received_at = clock.value
+        moving = True
+
+        def intent(self, **_kwargs):
+            return _movement_intent(0.0) if self.moving else MovementIntent(
+                mode="IDLE",
+                speed_mps=0.0,
+                movement_angle_rad=0.0,
+                facing_angle_rad=0.0,
+                has_movement=False,
+                stale=False,
+            )
+
+        def stop(self, *, source="watchdog") -> None:
+            del source
+            self.moving = False
+
+    driver._intent_ingress = BlockingIngress()
+    driver.guard = IntentGuard()
+    accept_errors: list[Exception] = []
+    control_errors: list[Exception] = []
+
+    def accept_stop() -> None:
+        try:
+            driver.accept_json({"type": "sonic_intent"})
+        except Exception as exc:
+            accept_errors.append(exc)
+
+    def apply_control() -> None:
+        try:
+            driver._apply_intent(0.02, simulation_now_s=1.0)
+        except Exception as exc:
+            control_errors.append(exc)
+        finally:
+            control_complete.set()
+
+    accept_thread = threading.Thread(target=accept_stop)
+    control_thread = threading.Thread(target=apply_control)
+    accept_thread.start()
+    assert ingress_entered.wait(timeout=2.0)
+    control_thread.start()
+    assert control_complete.wait(timeout=0.05) is False
+    release_ingress.set()
+    accept_thread.join(timeout=2.0)
+    control_thread.join(timeout=2.0)
+
+    assert accept_errors == []
+    assert control_errors == []
+    assert driver._reference_authority.snapshot.phase == "REVOKED"
+    assert driver._reference_request_pending is False
+    assert driver._navigation_task_active is False
+    assert driver._safe_hold_targets == boundary
+    assert controller.request_calls == controller.run_calls == 0
+
+
+def test_new_generation_same_motion_is_replanned_without_an_idle_control_tick() -> None:
+    from lerobot.robots.unitree_g1.controllers.sonic_pipeline import DEFAULT_ANGLES
+
+    clock = Clock()
+    driver, _writes = _publishing_driver(clock)
+    boundary = tuple(float(value) for value in DEFAULT_ANGLES)
+    driver._last_published_targets = boundary
+    driver._intent_gate = ReplanIntentGate()
+    driver._decoder_facing_rad = None
+    driver._pending_decoder_heading_delta_rad = 0.0
+    driver._last_intent_signature = None
+    evidence = _TransactionalEvidence()
+    controller = _TransactionalController(evidence, boundary)
+    driver._planner_evidence = evidence
+    driver._controller = controller
+
+    class TaskGuard:
+        last_received_at = clock.value
+        moving = True
+
+        def intent(self, **_kwargs):
+            return _movement_intent(0.0) if self.moving else MovementIntent(
+                mode="IDLE",
+                speed_mps=0.0,
+                movement_angle_rad=0.0,
+                facing_angle_rad=0.0,
+                has_movement=False,
+                stale=False,
+            )
+
+        def stop(self, *, source="watchdog") -> None:
+            del source
+            self.moving = False
+
+    guard = TaskGuard()
+    driver.guard = guard
+    driver._reference_source_identity = (10, 4)
+    driver._navigation_task_active = True
+    driver._apply_intent(0.02, simulation_now_s=1.0)
+    assert driver._reference_authority.snapshot.phase == "REQUIRED"
+    assert driver._reference_authority.snapshot.generation == 10
+
+    driver._stop_navigation_at_boundary(source="bridge_stop")
+    assert driver._intent_gate.last is None
+    guard.moving = True
+    driver._reference_source_identity = (11, 1)
+    driver._navigation_task_active = True
+    driver._apply_intent(0.02, simulation_now_s=1.02)
+
+    required = driver._reference_authority.snapshot
+    assert required.phase == "REQUIRED"
+    assert (required.generation, required.source_sequence) == (11, 1)
+    assert driver._reference_request_pending is True
+    assert controller.request_calls == controller.run_calls == 0
+
+
+def test_arm_verifier_runtime_fault_halts_plant_without_normal_safety_stop(
+    monkeypatch,
+) -> None:
+    from lerobot.robots.unitree_g1.controllers.sonic_pipeline import DEFAULT_ANGLES
+
+    clock = Clock()
+    driver, writes = _publishing_driver(clock)
+    boundary = tuple(float(value) for value in DEFAULT_ANGLES)
+    invalid = list(boundary)
+    invalid[15] += 3.0
+    invalid = tuple(invalid)
+    lowstate = _lowstate(boundary)
+    driver._last_published_targets = boundary
+    driver._arm_guard.anchor(boundary[15:29])
+    driver._fault_trace = None
+    driver._startup_qualifying = False
+    driver._pending_decoder_heading_delta_rad = 0.0
+    support_modes: list[str] = []
+    terminal_halts: list[str] = []
+
+    class RuntimeController:
+        execution_feedback_pending = False
+        reference_install_epoch = 1
+        matching_reference_installed = True
+
+        def __init__(self) -> None:
+            self.ms = SimpleNamespace(speed=0.2)
+            self.controller = SimpleNamespace(
+                ref_cursor=0,
+                delta_heading=0.0,
+            )
+            self.shutdown_called = False
+
+        @staticmethod
+        def run_step(_action, _lowstate):
+            return _action_for_invalid
+
+        @staticmethod
+        def revoke_reference_authority(**_kwargs) -> None:
+            return None
+
+        def shutdown(self) -> None:
+            self.shutdown_called = True
+
+    _action_for_invalid = _action(driver, invalid)
+    controller = RuntimeController()
+    driver._controller = controller
+    driver._reference_authority.require(generation=1, source_sequence=1)
+    driver._reference_authority.mark_installed(
+        generation=1,
+        source_sequence=1,
+        planner_intent_generation=1,
+        reference_epoch=1,
+    )
+    driver._reference_authority.prime(
+        generation=1,
+        source_sequence=1,
+        reference_epoch=1,
+    )
+    driver._reference_authority.grant(
+        generation=1,
+        source_sequence=1,
+        reference_epoch=1,
+        granted_at_monotonic_s=clock.value,
+        granted_at_tick_ms=1_000,
+        dds_target_sequence=1,
+    )
+    driver._prepare_idle_startup = lambda: None
+    samples = [(lowstate, PlantControlStep(tick_ms=1_020, dt_s=0.02), 0)]
+    driver._next_control_sample = lambda: samples.pop(0)
+    driver._apply_intent = lambda *_args, **_kwargs: _movement_intent(0.0)
+    driver._progress_reference_transaction = lambda _lowstate: True
+    driver._prime_periodic_reference_refresh = lambda: None
+    driver._joint_handoff = SimpleNamespace(
+        decide=lambda **kwargs: SimpleNamespace(
+            targets=tuple(kwargs["policy"]),
+            static_hold_active=False,
+            handoff_ratio=1.0,
+            motion_handoff_active=False,
+        ),
+        freeze=lambda _targets: None,
+    )
+    driver._set_plant_support_mode = lambda mode: (
+        support_modes.append(mode) or True
+    )
+    monkeypatch.setattr(
+        "hide_mujoco_sonic.sonic_driver.latch_plant_physics_fault",
+        lambda _host, _port, reason, **_kwargs: (
+            terminal_halts.append(reason)
+            or {"mode": "safety_stop", "safetyStopLatched": True}
+        ),
+    )
+
+    driver.run()
+
+    assert driver._fault_latched.is_set()
+    assert "arm policy target" in str(driver._terminal_fault_reason)
+    assert terminal_halts == [driver._terminal_fault_reason]
+    assert "safety_stop" not in support_modes
+    assert support_modes == ["locomotion"]
+    assert len(writes) == 1
+    assert writes[0] == pytest.approx(boundary)
+    assert controller.shutdown_called is True
 
 
 def test_actual_29dof_dds_targets_are_continuous_at_start_replan_and_stop() -> None:

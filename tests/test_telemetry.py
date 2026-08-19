@@ -65,6 +65,31 @@ def test_regular_update_keeps_its_isolated_snapshot_return_value():
     assert store.get().plant_tick == 18
 
 
+def test_reference_transaction_and_terminal_fields_are_strict_schema_members():
+    store = TelemetryStore(TelemetryState(robot_id="g1-sim"))
+
+    updated = store.update(
+        sonic_reference_authority_state="GRANTED",
+        sonic_reference_authority_generation=8,
+        sonic_reference_authority_source_sequence=13,
+        sonic_reference_authority_intent_generation=5,
+        sonic_reference_authority_epoch=3,
+        sonic_reference_actuator_authority=True,
+        sonic_reference_authority_dds_target_sequence=21,
+        sonic_execution_feedback_pending=True,
+        terminal_boundary_error="vendor revoke failed",
+        plant_terminal_halt_confirmed=False,
+        plant_terminal_halt_error="timeout",
+    )
+
+    assert updated.sonic_reference_authority_state == "GRANTED"
+    assert updated.sonic_reference_authority_epoch == 3
+    assert updated.sonic_reference_actuator_authority is True
+    assert updated.sonic_execution_feedback_pending is True
+    assert updated.plant_terminal_halt_confirmed is False
+    assert updated.plant_terminal_halt_error == "timeout"
+
+
 def test_snapshot_json_adds_runtime_diagnostics_without_mutating_state():
     store = TelemetryStore(TelemetryState(robot_id="g1-sim"))
     store.set_runtime_diagnostics_provider(

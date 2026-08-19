@@ -801,6 +801,12 @@ class ReplanIntentGate:
     def last(self) -> MovementIntent | None:
         return self._last
 
+    def reset(self) -> None:
+        """Forget the prior task at an authoritative actuator stop boundary."""
+
+        self._last = None
+        self._last_at = 0.0
+
     def admit(self, intent: MovementIntent, *, now: float | None = None) -> bool:
         current = self._clock() if now is None else float(now)
         if not math.isfinite(current):
