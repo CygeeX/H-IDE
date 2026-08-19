@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 import json
 import math
 from pathlib import Path
+import re
 import sys
 import time
 from typing import Any
@@ -35,6 +36,7 @@ _RESET_FAULT_MARKERS = (
     "implicit reset",
     "physics time is invalid",
 )
+_MOTION_FAULT_REASON = re.compile(r"^[a-z][a-z0-9_]*/[A-Z][A-Z0-9_]*:")
 
 
 @dataclass(frozen=True, slots=True)
@@ -665,7 +667,10 @@ class MotionAcceptanceEvaluator:
         last_error = sonic.get("last_error")
         if last_error not in {None, ""}:
             normalized = str(last_error).lower()
-            if healthy_settled_safe_hold:
+            structured_motion_fault = bool(
+                _MOTION_FAULT_REASON.match(str(last_error).strip())
+            )
+            if healthy_settled_safe_hold and not structured_motion_fault:
                 # SAFE_HOLD health is established by the complete physical and
                 # control structure above.  The human-readable reason is
                 # evidence, never an allowlist that can override that truth.

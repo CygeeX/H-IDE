@@ -194,6 +194,7 @@ wait_for_sonic_motion_ready() {
     if [[ -n "${telemetry}" ]] && printf '%s' "${telemetry}" \
       | "${HIDE_DEMO_SIM_ROOT}/.venv/bin/python" -c '
 import json
+import re
 import sys
 
 try:
@@ -201,11 +202,38 @@ try:
 except (json.JSONDecodeError, TypeError):
     raise SystemExit(1)
 
-ready = (
+base_ready = (
     value.get("status") == "running"
     and value.get("motion_ready") is True
     and value.get("control_clock_status") == "simulation_time_50hz_motion_ready"
-    and value.get("last_error") is None
+)
+last_error = value.get("last_error")
+structured_motion_fault = bool(
+    last_error
+    and re.match(r"^[a-z][a-z0-9_]*/[A-Z][A-Z0-9_]*:", str(last_error).strip())
+)
+settled_safe_hold = (
+    value.get("nav2_state") == "safety_stop"
+    and value.get("sonic_mode") == "IDLE"
+    and value.get("static_hold_active") is True
+    and value.get("motion_handoff_active") is False
+    and abs(float(value.get("motion_handoff_ratio", 1.0))) <= 1e-9
+    and value.get("navigation_task_active") is False
+    and all(abs(float(value.get(name, 1.0))) <= 1e-9 for name in (
+        "last_cmd_vx", "last_cmd_vy", "last_cmd_wz"
+    ))
+    and value.get("sonic_planner_reference_ready") is False
+    and value.get("sonic_planner_required_pending") is False
+    and value.get("plant_support_mode") == "safety_stop"
+    and value.get("plant_support_requested_mode") == "safety_stop"
+    and value.get("plant_support_confirmed_mode") == "safety_stop"
+    and value.get("plant_support_stop_pending") is False
+    and value.get("plant_support_safety_latched") is True
+    and value.get("fault_trace_path") in {None, ""}
+    and value.get("fault_trace_sample_count") in {None, 0}
+)
+ready = base_ready and not structured_motion_fault and (
+    last_error in {None, ""} or settled_safe_hold
 )
 raise SystemExit(0 if ready else 1)
 '; then

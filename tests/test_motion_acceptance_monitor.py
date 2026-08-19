@@ -243,6 +243,26 @@ def test_safe_hold_reset_clue_is_rejected_even_when_structure_is_healthy() -> No
     )
 
 
+def test_safe_hold_structured_motion_fault_is_never_treated_as_hold_reason() -> None:
+    plant, sonic = _payloads(
+        {"t": 0.0, "state": "safe_hold", "x": 0.0, "y": 0.0, "z": 0.78, "yaw": 0.0},
+        0,
+    )
+    sonic["last_error"] = (
+        "sonic_driver/SONIC_CONTROL_STALE: control step exceeded the safety bound"
+    )
+    evaluator = MotionAcceptanceEvaluator(AcceptanceLimits(phase="idle"))
+
+    evaluator.observe(plant, sonic, observed_s=0.0)
+    result = evaluator.finalize()
+
+    assert result["pass"] is False
+    assert result["holdReason"] is None
+    assert {failure["code"] for failure in result["failures"]}.issuperset(
+        {"SONIC_LAST_ERROR"}
+    )
+
+
 class _Response:
     status = 200
 
