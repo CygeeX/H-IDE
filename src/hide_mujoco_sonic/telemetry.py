@@ -36,6 +36,11 @@ class TelemetryState:
     control_clock_status: str = "waiting"
     controller_warmup_complete: bool = False
     controller_warmup_wall_s: float | None = None
+    controller_warmup_state_unchanged: bool = False
+    startup_qualification_required_steps: int = 0
+    startup_qualification_consecutive_steps: int = 0
+    startup_qualification_dropped_samples: int = 0
+    motion_ready: bool = False
     controller_resync_count: int = 0
     static_hold_active: bool = True
     motion_handoff_active: bool = False

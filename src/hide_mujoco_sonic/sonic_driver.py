@@ -8,7 +8,10 @@ topics, which keeps the simulation boundary close to the real Unitree stack.
 from __future__ import annotations
 
 import argparse
+from collections import deque
+import copy
 from dataclasses import dataclass
+import hashlib
 import logging
 import math
 import os
@@ -38,6 +41,24 @@ from .telemetry import (
 from .transport import parse_lines
 
 logger = logging.getLogger(__name__)
+
+
+class _WarmupPlannerIsolation:
+    """Planner boundary used by the sacrificial full-controller warm-up.
+
+    A startup warm-up must exercise the exact ``run_step`` Python/ORT path, but
+    it must never consume a real async planner result or enqueue a request that
+    could later affect the live controller.  The first SONIC step is not
+    expected to request a replan; raising here makes that invariant explicit.
+    """
+
+    @staticmethod
+    def request_replan(_cursor, _movement_state) -> None:
+        raise RuntimeError("isolated SONIC warm-up attempted to request a replan")
+
+    @staticmethod
+    def try_get_new_motion():
+        return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,6 +209,8 @@ class SonicIntentIngress:
 
 
 class SonicDriver:
+    _STARTUP_QUALIFICATION_STEPS = 5
+
     def __init__(self, config: SimConfig, telemetry: TelemetryStore):
         self.config = config
         self.telemetry = telemetry
@@ -206,8 +229,21 @@ class SonicDriver:
         self._control_condition = threading.Condition(self._lowstate_lock)
         self._control_clock = PlantControlClock(control_hz=config.control_hz)
         self._control_clock_armed = False
+        # ``_control_consumer_ready`` is only the callback/consumer handshake.
+        # Motion remains blocked until ``_motion_ready`` is set after startup
+        # qualification has observed a sustained real 50 Hz simulation stream.
         self._control_consumer_ready = threading.Event()
-        self._pending_control_sample: tuple[Any, PlantControlStep] | None = None
+        self._motion_ready = threading.Event()
+        self._startup_qualifying = False
+        self._startup_qualification_required_steps = (
+            self._STARTUP_QUALIFICATION_STEPS
+        )
+        self._startup_qualification_consecutive_steps = 0
+        self._startup_qualification_dropped_samples = 0
+        self._startup_qualification_drop_generation = 0
+        self._pending_control_sample: (
+            tuple[Any, PlantControlStep, int] | None
+        ) = None
         self._wall_clock = time.monotonic
         self._control_clock_armed_at_wall_s: float | None = None
         self._last_lowstate_wall_s: float | None = None
@@ -317,16 +353,46 @@ class SonicDriver:
                 else:
                     if control_step is not None:
                         if self._pending_control_sample is not None:
-                            pending_tick = self._pending_control_sample[1].tick_ms
-                            clock_fault = (
-                                "MuJoCo control sample overrun: "
-                                f"{pending_tick}ms was not consumed before "
-                                f"{control_step.tick_ms}ms; catch-up is forbidden"
-                            )
+                            if self._startup_qualifying:
+                                # Before motion is armed, the plant is held at
+                                # its measured pose and policy state is frozen.
+                                # A cold scheduler delay may therefore discard
+                                # an obsolete *stationary measurement* in favor
+                                # of the latest one.  This is synchronization,
+                                # not policy catch-up: no dropped sample is ever
+                                # replayed or presented to the controller.
+                                self._startup_qualification_dropped_samples += 1
+                                self._startup_qualification_drop_generation += 1
+                                self._startup_qualification_consecutive_steps = 0
+                                self._pending_control_sample = (
+                                    message,
+                                    control_step,
+                                    self._startup_qualification_drop_generation,
+                                )
+                                self._control_condition.notify_all()
+                            else:
+                                pending_tick = self._pending_control_sample[1].tick_ms
+                                clock_fault = (
+                                    "MuJoCo control sample overrun: "
+                                    f"{pending_tick}ms was not consumed before "
+                                    f"{control_step.tick_ms}ms; catch-up is forbidden"
+                                )
                         else:
-                            self._pending_control_sample = (message, control_step)
+                            self._pending_control_sample = (
+                                message,
+                                control_step,
+                                self._startup_qualification_drop_generation,
+                            )
                             self._control_condition.notify_all()
-        self.telemetry.update(plant_tick=tick)
+        self.telemetry.update(
+            plant_tick=tick,
+            startup_qualification_dropped_samples=(
+                self._startup_qualification_dropped_samples
+            ),
+            startup_qualification_consecutive_steps=(
+                self._startup_qualification_consecutive_steps
+            ),
+        )
         if clock_fault is not None:
             # Any clock discontinuity invalidates policy history and actuator
             # continuity.  Never rebuild history or replay missed policy ticks.
@@ -350,42 +416,163 @@ class SonicDriver:
                 raise RuntimeError("timed out waiting for initial MuJoCo LowState")
             return self._lowstate
 
-    def _warm_controller_inference(self) -> None:
-        """Warm encoder/decoder kernels without advancing SONIC controller state."""
+    @staticmethod
+    def _clone_state_owner(owner, *, excluded: frozenset[str]):
+        """Shallow-clone an owner, then detach all explicitly mutable state."""
+
+        clone = copy.copy(owner)
+        for name, value in vars(owner).items():
+            if name not in excluded:
+                setattr(clone, name, copy.deepcopy(value))
+        return clone
+
+    @classmethod
+    def _isolated_warmup_controller(cls, controller):
+        """Clone policy state while sharing only immutable/read-only ORT sessions.
+
+        Constructing another official controller would load three new sessions
+        and leave *that* new instance cold.  Instead this clone shares the live
+        encoder/decoder session objects, but owns every history/reference array,
+        movement state and cursor.  Its planner is a no-I/O boundary, so the
+        async live planner queues cannot be observed or changed by warm-up.
+        """
+
+        if getattr(controller, "_smpl_stream", None) is not None:
+            raise RuntimeError(
+                "isolated SONIC warm-up requires the navigation profile without SMPL stream"
+            )
+        runtime = controller._runtime
+        pipeline = runtime.controller
+        if controller.controller is not pipeline or controller.ms is not runtime.ms:
+            raise RuntimeError("unexpected SONIC controller/runtime alias layout")
+        if int(runtime.step) != 0:
+            raise RuntimeError("SONIC full-path warm-up must precede every policy step")
+
+        warm_pipeline = cls._clone_state_owner(
+            pipeline,
+            excluded=frozenset({"encoder", "decoder", "planner", "motion_lock"}),
+        )
+        # ORT InferenceSession objects are intentionally shared: exercising the
+        # same sessions is the purpose of the cold-path warm-up.
+        warm_pipeline.encoder = pipeline.encoder
+        warm_pipeline.decoder = pipeline.decoder
+        warm_pipeline.motion_lock = threading.Lock()
+
+        warm_ms = copy.deepcopy(runtime.ms)
+        warm_planner = _WarmupPlannerIsolation()
+        warm_pipeline.planner = warm_planner
+
+        warm_runtime = cls._clone_state_owner(
+            runtime,
+            excluded=frozenset({"controller", "planner", "ms"}),
+        )
+        warm_runtime.controller = warm_pipeline
+        warm_runtime.planner = warm_planner
+        warm_runtime.ms = warm_ms
+
+        warm_controller = cls._clone_state_owner(
+            controller,
+            excluded=frozenset(
+                {"_runtime", "controller", "ms", "_smpl_stream"}
+            ),
+        )
+        warm_controller._runtime = warm_runtime
+        warm_controller.controller = warm_pipeline
+        warm_controller.ms = warm_ms
+        warm_controller._smpl_stream = None
+        return warm_controller
+
+    @classmethod
+    def _policy_state_digest(cls, controller) -> str:
+        """Digest all live policy/history state, excluding sessions and locks."""
 
         import numpy as np
 
-        self.telemetry.update(control_clock_status="warming_inference")
-        started_at = self._wall_clock()
-        pipeline = self._controller.controller
+        digest = hashlib.sha256()
 
-        # ``run_encoder`` and ``build_decoder_obs`` are pure reads of the
-        # already-initialized history buffers.  Calling the sessions directly
-        # warms their kernels without incrementing the runtime step, advancing
-        # the reference cursor, requesting a plan, or publishing a motor target.
-        encoder_output = np.asarray(pipeline.run_encoder())
-        decoder_observation = np.asarray(
-            pipeline.build_decoder_obs(), dtype=np.float32
-        ).reshape(1, -1)
-        decoder_output = np.asarray(
-            pipeline.decoder.run(
-                None,
-                {pipeline.decoder_input: decoder_observation},
-            )[0]
-        )
-        if not np.all(np.isfinite(encoder_output)):
-            raise RuntimeError("SONIC encoder warm-up produced non-finite output")
-        if not np.all(np.isfinite(decoder_output)):
-            raise RuntimeError("SONIC decoder warm-up produced non-finite output")
+        def update(value) -> None:
+            digest.update(type(value).__qualname__.encode("utf-8"))
+            digest.update(b"\0")
+            if value is None or isinstance(value, (bool, int, float, str, bytes)):
+                digest.update(repr(value).encode("utf-8"))
+            elif isinstance(value, np.ndarray):
+                digest.update(value.dtype.str.encode("ascii"))
+                digest.update(repr(value.shape).encode("ascii"))
+                digest.update(np.ascontiguousarray(value).tobytes())
+            elif isinstance(value, dict):
+                for key in sorted(value, key=repr):
+                    update(key)
+                    update(value[key])
+            elif isinstance(value, (list, tuple, deque)):
+                for item in value:
+                    update(item)
+            elif isinstance(value, (set, frozenset)):
+                for item in sorted(value, key=repr):
+                    update(item)
+            elif hasattr(value, "__dict__"):
+                update(vars(value))
+            else:
+                digest.update(repr(value).encode("utf-8"))
+            digest.update(b"\xff")
+
+        runtime = controller._runtime
+        pipeline = runtime.controller
+        sections = {
+            "wrapper": {
+                name: value
+                for name, value in vars(controller).items()
+                if name
+                not in {"_runtime", "controller", "ms", "_smpl_stream", "kp", "kd"}
+            },
+            "runtime": {
+                name: value
+                for name, value in vars(runtime).items()
+                if name not in {"controller", "planner", "ms", "kp", "kd"}
+            },
+            "pipeline": {
+                name: value
+                for name, value in vars(pipeline).items()
+                if name not in {"encoder", "decoder", "planner", "motion_lock"}
+            },
+            "movement_state": vars(runtime.ms),
+        }
+        update(sections)
+        return digest.hexdigest()
+
+    def _warm_controller_inference(self, lowstate=None) -> None:
+        """Warm one complete controller step without advancing live policy state."""
+
+        import numpy as np
+
+        if lowstate is None:
+            lowstate = self._lowstate
+        if lowstate is None:
+            raise RuntimeError("SONIC full-path warm-up requires a LowState")
+
+        self.telemetry.update(control_clock_status="warming_full_controller_path")
+        started_at = self._wall_clock()
+        state_before = self._policy_state_digest(self._controller)
+        warm_controller = self._isolated_warmup_controller(self._controller)
+        output = warm_controller.run_step({}, lowstate)
+        values = np.asarray(list(output.values()), dtype=np.float64)
+        if len(output) != 29 or values.shape != (29,) or not np.all(np.isfinite(values)):
+            raise RuntimeError(
+                "SONIC full-controller warm-up did not produce 29 finite targets"
+            )
+        state_after = self._policy_state_digest(self._controller)
+        if state_after != state_before:
+            raise RuntimeError("SONIC warm-up contaminated live controller state")
+
         elapsed = max(0.0, self._wall_clock() - started_at)
         logger.info(
-            "SONIC encoder/decoder warm-up complete in %.3fs; control clock remains disarmed",
+            "SONIC full-controller warm-up complete in %.3fs; live policy state unchanged",
             elapsed,
         )
         self.telemetry.update(
             controller_warmup_complete=True,
             controller_warmup_wall_s=elapsed,
-            control_clock_status="warm_ready_to_arm",
+            controller_warmup_state_unchanged=True,
+            control_clock_status="warm_ready_to_qualify",
         )
 
     def _prepare_idle_startup(self) -> None:
@@ -397,7 +584,7 @@ class SonicDriver:
         if not self._set_plant_support_mode("idle"):
             raise RuntimeError("MuJoCo idle support is unavailable during SONIC warm-up")
         self._publish_measured_hold(lowstate)
-        self._warm_controller_inference()
+        self._warm_controller_inference(lowstate)
         if self._fault_latched.is_set():
             raise RuntimeError(self._terminal_fault_reason or "startup fault latched")
 
@@ -405,7 +592,7 @@ class SonicDriver:
         self,
         *,
         wait_timeout_s: float = 0.10,
-    ) -> tuple[Any, PlantControlStep] | None:
+    ) -> tuple[Any, PlantControlStep, int] | None:
         """Consume at most one admitted sample; wall time is only a wake timeout."""
 
         clock_fault: str | None = None
@@ -427,10 +614,21 @@ class SonicDriver:
                 assert baseline is not None
                 self._pending_control_sample = None
                 self._control_clock_armed_at_wall_s = self._wall_clock()
+                self._startup_qualifying = True
+                self._startup_qualification_consecutive_steps = 0
+                self._startup_qualification_dropped_samples = 0
+                self._startup_qualification_drop_generation = 0
+                self._motion_ready.clear()
                 self._control_clock_armed = True
                 self._control_consumer_ready.set()
                 self.telemetry.update(
-                    control_clock_status="simulation_time_50hz_waiting_first_step"
+                    control_clock_status="startup_qualification_waiting_first_step",
+                    startup_qualification_required_steps=(
+                        self._startup_qualification_required_steps
+                    ),
+                    startup_qualification_consecutive_steps=0,
+                    startup_qualification_dropped_samples=0,
+                    motion_ready=False,
                 )
             if (
                 self._pending_control_sample is None
@@ -467,6 +665,58 @@ class SonicDriver:
             self._latch_terminal_fault(clock_fault)
         return sample
 
+    def _complete_startup_qualification_step(
+        self,
+        *,
+        sample_drop_generation: int,
+    ) -> bool:
+        """Credit one stationary sample only if no newer sample overran it.
+
+        The caller publishes a measured-position hold before invoking this
+        method.  If two new control samples arrived during that work, the
+        callback has already replaced the obsolete pending sample and advanced
+        the drop generation; this step then earns no credit.  No policy,
+        handoff, arm guard, replan timer or reference cursor advances here.
+        """
+
+        with self._control_condition:
+            if not self._startup_qualifying:
+                return False
+            if (
+                sample_drop_generation
+                != self._startup_qualification_drop_generation
+            ):
+                self._startup_qualification_consecutive_steps = 0
+            else:
+                self._startup_qualification_consecutive_steps += 1
+            complete = (
+                self._startup_qualification_consecutive_steps
+                >= self._startup_qualification_required_steps
+            )
+            if complete:
+                self._startup_qualifying = False
+                self._motion_ready.set()
+            consecutive = self._startup_qualification_consecutive_steps
+            dropped = self._startup_qualification_dropped_samples
+
+        self.telemetry.update(
+            status="running" if complete else "qualifying",
+            control_clock_status=(
+                "simulation_time_50hz_motion_ready"
+                if complete
+                else "startup_qualification"
+            ),
+            startup_qualification_consecutive_steps=consecutive,
+            startup_qualification_dropped_samples=dropped,
+            motion_ready=complete,
+        )
+        if complete:
+            logger.info(
+                "SONIC startup qualified after %d consecutive simulation-time steps; motion may now be accepted",
+                consecutive,
+            )
+        return complete
+
     def _publish_measured_hold(self, lowstate) -> None:
         for index in range(29):
             motor = self._msg.motor_cmd[index]
@@ -487,6 +737,10 @@ class SonicDriver:
         self._terminal_fault_reason = str(reason)
         self.guard.stop(source="terminal_fault")
         self._navigation_task_active = False
+        self._startup_qualifying = False
+        motion_ready = getattr(self, "_motion_ready", None)
+        if motion_ready is not None:
+            motion_ready.clear()
         self._fault_latched.set()
         trace_path: str | None = None
         trace_samples = 0
@@ -518,6 +772,7 @@ class SonicDriver:
             motion_handoff_active=False,
             motion_handoff_ratio=0.0,
             navigation_task_active=False,
+            motion_ready=False,
             control_clock_status="fault",
             last_error=self._terminal_fault_reason,
         )
@@ -842,7 +1097,11 @@ class SonicDriver:
             self._latch_terminal_fault(f"SONIC startup fault: {exc}")
             self._stop.set()
         else:
-            self.telemetry.update(status="running")
+            self.telemetry.update(
+                status="qualifying",
+                control_clock_status="warm_ready_to_qualify",
+                motion_ready=False,
+            )
         while not self._stop.is_set():
             sample = self._next_control_sample()
             if self._fault_latched.is_set():
@@ -856,8 +1115,17 @@ class SonicDriver:
                 break
             if sample is None:
                 continue
-            lowstate, control_step = sample
+            lowstate, control_step, sample_drop_generation = sample
             try:
+                if self._startup_qualifying:
+                    # Qualification is intentionally policy-free.  The plant is
+                    # stationary, obsolete samples may still be latest-only
+                    # synchronized, and only a measured hold is published.
+                    self._publish_measured_hold(lowstate)
+                    self._complete_startup_qualification_step(
+                        sample_drop_generation=sample_drop_generation
+                    )
+                    continue
                 intent = self._apply_intent(
                     control_step.dt_s,
                     simulation_now_s=control_step.tick_ms / 1_000.0,
@@ -928,7 +1196,7 @@ class SonicDriver:
                 self.telemetry.update(
                     control_tick_ms=control_step.tick_ms,
                     control_dt_s=control_step.dt_s,
-                    control_clock_status="simulation_time_50hz",
+                    control_clock_status="simulation_time_50hz_motion_ready",
                     static_hold_active=decision.static_hold_active,
                     motion_handoff_active=decision.motion_handoff_active,
                     motion_handoff_ratio=decision.handoff_ratio,
@@ -944,11 +1212,14 @@ class SonicDriver:
             self._controller.shutdown()
         finally:
             if not self._fault_latched.is_set():
-                self.telemetry.update(status="stopped")
+                self.telemetry.update(status="stopped", motion_ready=False)
 
     def stop(self):
         self._stop.set()
         self.guard.stop()
+        motion_ready = getattr(self, "_motion_ready", None)
+        if motion_ready is not None:
+            motion_ready.clear()
         condition = getattr(self, "_control_condition", None)
         if condition is not None:
             with condition:
@@ -1004,10 +1275,10 @@ class SonicDriver:
                 last_error=decision.reason,
             )
             return
-        if not self._control_consumer_ready.is_set():
+        if not self._motion_ready.is_set():
             # A command received while ONNX is warming cannot be replayed after
-            # startup.  Hold it at the actuator boundary and require a fresh
-            # gait-adapter intent after the strict consumer handshake.
+            # startup/qualification.  Hold it at the actuator boundary and
+            # require a fresh gait-adapter intent after motion readiness.
             self.guard.stop(source="sonic_startup_hold")
             self._navigation_task_active = False
             self.telemetry.update(

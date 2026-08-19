@@ -303,6 +303,13 @@ def bare_driver(clock: Clock) -> SonicDriver:
     driver._control_clock_armed = False
     driver._control_consumer_ready = threading.Event()
     driver._control_consumer_ready.set()
+    driver._motion_ready = threading.Event()
+    driver._motion_ready.set()
+    driver._startup_qualifying = False
+    driver._startup_qualification_required_steps = 5
+    driver._startup_qualification_consecutive_steps = 0
+    driver._startup_qualification_dropped_samples = 0
+    driver._startup_qualification_drop_generation = 0
     driver._pending_control_sample = None
     driver._wall_clock = clock
     driver._control_clock_armed_at_wall_s = None
@@ -330,6 +337,31 @@ def test_driver_obeys_stop_before_model_guard_mapping() -> None:
     driver.accept_json(payload)
     assert driver.guard.accepted == [(0.20, 0.0, 0.0, "nav2")]
     assert driver.guard.stops[-1] == "gait_adapter"
+
+
+def test_driver_requires_startup_qualification_before_accepting_motion() -> None:
+    clock = Clock()
+    adapter, _ = runtime(clock)
+    driver = bare_driver(clock)
+    driver._motion_ready.clear()
+
+    idle = adapter.tick(now=clock.value)
+    driver.accept_json(_intent_payload(idle, measured_heading_yaw=0.0))
+    clock.value += 0.01
+    motion = adapter.ingest_twist(twist(clock, vx=0.20), now=clock.value)
+    driver.accept_json(_intent_payload(motion, measured_heading_yaw=0.0))
+
+    assert driver.guard.accepted == []
+    assert driver.guard.stops[-1] == "sonic_startup_hold"
+    assert driver.telemetry.values["nav2_state"] == "startup_hold"
+
+    # The rejected command is never replayed. Only a fresh, later gait intent
+    # may cross the boundary after qualification becomes motion-ready.
+    driver._motion_ready.set()
+    clock.value += 0.01
+    fresh = adapter.ingest_twist(twist(clock, vx=0.20), now=clock.value)
+    driver.accept_json(_intent_payload(fresh, measured_heading_yaw=0.0))
+    assert driver.guard.accepted == [(0.20, 0.0, 0.0, "nav2")]
 
 
 def test_driver_rejects_raw_cmd_vel_and_fails_closed() -> None:
