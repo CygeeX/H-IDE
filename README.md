@@ -187,13 +187,20 @@ bounded pre-fault control-trace sample.
 The telemetry JSON also includes a read-only `runtime_diagnostics` snapshot.
 It records LowState-callback, successful-control-publish, and health-probe
 gaps, together with CPython cyclic-GC count, last/max/total pause, and how much
-completed GC time overlapped each last gap.  SONIC performs one full collection
-and freezes the warmed long-lived Python object graph before arming its strict
-control clock; automatic GC remains enabled for runtime request and control
-objects, and the applied/error state is explicit in telemetry.  The hot
-LowState-only hot update mutates scalar telemetry in place; the ordinary
-update API retains its isolated-snapshot return contract, and HTTP readers
-also receive isolated copies.
+completed GC time overlapped each last gap.  For every stream it also preserves
+the latest over-threshold gap and GC overlap after healthy samples resume, plus
+counters for over-threshold gaps with any GC overlap and those whose remaining
+non-GC time independently exceeds the same threshold. These durable fields use
+the `*_last_over_threshold_gap_s`,
+`*_last_over_threshold_gc_pause_s`,
+`*_over_threshold_gc_overlap_count`, and
+`*_over_threshold_non_gc_residual_count` suffixes. SONIC performs one full
+collection and freezes the warmed long-lived Python object graph before arming
+its strict control clock; automatic GC remains enabled for runtime request and
+control objects, and the applied/error state is explicit in telemetry. The
+LowState-only hot update mutates scalar telemetry in place; the ordinary update
+API retains its isolated-snapshot return contract, and HTTP readers also
+receive isolated copies.
 
 MuJoCo `/state` and `/healthz` expose `runtimeTiming`: last/max duration,
 over-stale-threshold count, and the latest slow timestamp for the authoritative

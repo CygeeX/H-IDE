@@ -70,6 +70,14 @@ def test_sonic_runtime_diagnostics_distinguishes_stream_gap_from_gc_pause():
     assert state["lowstate_callback_last_gap_s"] == pytest.approx(0.15)
     assert state["lowstate_callback_over_threshold_count"] == 1
     assert state["lowstate_callback_last_gap_gc_pause_s"] == 0.0
+    assert state["lowstate_callback_last_over_threshold_gap_s"] == pytest.approx(
+        0.15
+    )
+    assert state["lowstate_callback_last_over_threshold_gc_pause_s"] == 0.0
+    assert state["lowstate_callback_over_threshold_gc_overlap_count"] == 0
+    assert state[
+        "lowstate_callback_over_threshold_non_gc_residual_count"
+    ] == 1
     assert state["health_probe_last_gap_s"] == pytest.approx(0.025)
     assert state["health_probe_over_threshold_count"] == 0
     assert state["python_gc_collection_count"] == 0
@@ -103,12 +111,77 @@ def test_sonic_runtime_diagnostics_correlates_completed_gc_with_control_gap():
     state = diagnostics.snapshot()
     assert state["control_publish_last_gap_s"] == pytest.approx(0.15)
     assert state["control_publish_last_gap_gc_pause_s"] == pytest.approx(0.12)
+    assert state["control_publish_last_over_threshold_gap_s"] == pytest.approx(
+        0.15
+    )
+    assert state[
+        "control_publish_last_over_threshold_gc_pause_s"
+    ] == pytest.approx(0.12)
+    assert state["control_publish_over_threshold_gc_overlap_count"] == 1
+    assert state[
+        "control_publish_over_threshold_non_gc_residual_count"
+    ] == 0
     assert state["python_gc_collection_count"] == 1
     assert state["python_gc_last_generation"] == 2
     assert state["python_gc_last_pause_s"] == pytest.approx(0.12)
     assert state["python_gc_max_pause_s"] == pytest.approx(0.12)
     assert state["python_gc_total_pause_s"] == pytest.approx(0.12)
     assert state["python_gc_pause_active"] is False
+
+    diagnostics.close()
+
+
+def test_mixed_stall_persists_gc_and_non_gc_evidence_after_healthy_sample():
+    monotonic = FakeClock()
+    unix = FakeClock(1_700_000_000.0)
+    fake_gc = FakeGc()
+    diagnostics = SonicRuntimeDiagnostics(
+        stall_threshold_s=0.1,
+        monotonic_clock=monotonic,
+        unix_clock=unix,
+        gc_module=fake_gc,
+    )
+    diagnostics.observe_health_probe()
+
+    monotonic.advance(0.020)
+    unix.advance(0.020)
+    fake_gc.emit("start", generation=1)
+    monotonic.advance(0.120)
+    unix.advance(0.120)
+    fake_gc.emit("stop", generation=1)
+    monotonic.advance(0.110)
+    unix.advance(0.110)
+    diagnostics.observe_health_probe()
+
+    stalled = diagnostics.snapshot()
+    assert stalled["health_probe_last_gap_s"] == pytest.approx(0.25)
+    assert stalled["health_probe_last_gap_gc_pause_s"] == pytest.approx(0.12)
+    assert stalled["health_probe_last_over_threshold_gap_s"] == pytest.approx(
+        0.25
+    )
+    assert stalled[
+        "health_probe_last_over_threshold_gc_pause_s"
+    ] == pytest.approx(0.12)
+    assert stalled["health_probe_over_threshold_gc_overlap_count"] == 1
+    assert stalled["health_probe_over_threshold_non_gc_residual_count"] == 1
+    stalled_at = stalled["health_probe_last_over_threshold_at_unix_s"]
+
+    monotonic.advance(0.025)
+    unix.advance(0.025)
+    diagnostics.observe_health_probe()
+
+    recovered = diagnostics.snapshot()
+    assert recovered["health_probe_last_gap_s"] == pytest.approx(0.025)
+    assert recovered["health_probe_last_gap_gc_pause_s"] == 0.0
+    assert recovered["health_probe_last_over_threshold_gap_s"] == pytest.approx(
+        0.25
+    )
+    assert recovered[
+        "health_probe_last_over_threshold_gc_pause_s"
+    ] == pytest.approx(0.12)
+    assert recovered["health_probe_last_over_threshold_at_unix_s"] == stalled_at
+    assert recovered["health_probe_over_threshold_gc_overlap_count"] == 1
+    assert recovered["health_probe_over_threshold_non_gc_residual_count"] == 1
 
     diagnostics.close()
 

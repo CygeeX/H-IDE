@@ -24,6 +24,10 @@ class _GapProbe:
         self.over_threshold_count = 0
         self.last_over_threshold_at_unix_s: float | None = None
         self.last_gap_gc_pause_s = 0.0
+        self.last_over_threshold_gap_s: float | None = None
+        self.last_over_threshold_gc_pause_s: float | None = None
+        self.over_threshold_gc_overlap_count = 0
+        self.over_threshold_non_gc_residual_count = 0
 
     def observe(
         self,
@@ -41,13 +45,21 @@ class _GapProbe:
         gap = max(0.0, at_s - previous)
         self.last_gap_s = gap
         self.max_gap_s = max(self.max_gap_s, gap)
-        self.last_gap_gc_pause_s = max(
+        gc_pause = max(
             0.0,
             gc_total_pause_s - previous_gc_total,
         )
+        self.last_gap_gc_pause_s = gc_pause
         if gap > self.threshold_s:
             self.over_threshold_count += 1
             self.last_over_threshold_at_unix_s = unix_s
+            self.last_over_threshold_gap_s = gap
+            self.last_over_threshold_gc_pause_s = gc_pause
+            if gc_pause > 0.0:
+                self.over_threshold_gc_overlap_count += 1
+            non_gc_residual = max(0.0, gap - gc_pause)
+            if non_gc_residual > self.threshold_s:
+                self.over_threshold_non_gc_residual_count += 1
 
     def snapshot(self, prefix: str) -> dict[str, Any]:
         return {
@@ -58,6 +70,18 @@ class _GapProbe:
                 self.last_over_threshold_at_unix_s
             ),
             f"{prefix}_last_gap_gc_pause_s": self.last_gap_gc_pause_s,
+            f"{prefix}_last_over_threshold_gap_s": (
+                self.last_over_threshold_gap_s
+            ),
+            f"{prefix}_last_over_threshold_gc_pause_s": (
+                self.last_over_threshold_gc_pause_s
+            ),
+            f"{prefix}_over_threshold_gc_overlap_count": (
+                self.over_threshold_gc_overlap_count
+            ),
+            f"{prefix}_over_threshold_non_gc_residual_count": (
+                self.over_threshold_non_gc_residual_count
+            ),
         }
 
 
