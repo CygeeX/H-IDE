@@ -17,6 +17,9 @@ dependencies = [
   "websockets>=14,<18",
 ]
 
+[project.scripts]
+h-ide-admin-bootstrap = "services.control_api.admin_cli:cli"
+
 [project.optional-dependencies]
 scene = [
   "numpy>=2.1,<3",
