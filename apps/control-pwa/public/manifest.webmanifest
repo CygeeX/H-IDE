@@ -1,11 +1,18 @@
 {
-  "name": "Robot Action Console",
-  "short_name": "Action Console",
-  "description": "工作站机器人行动控制台",
+  "name": "H-IDE Robot Workspace",
+  "short_name": "H-IDE",
+  "description": "聊天优先的机器人任务规划与控制工作站",
   "start_url": "/",
   "display": "standalone",
-  "background_color": "#080e19",
-  "theme_color": "#0b1220",
+  "background_color": "#0b0c0f",
+  "theme_color": "#0e0f12",
   "lang": "zh-CN",
-  "icons": []
+  "icons": [
+    {
+      "src": "/icons/h-ide.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
 }

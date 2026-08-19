@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Protocol, runtime_checkable
+from datetime import datetime, timezone
+from typing import Any, Mapping, Protocol, runtime_checkable
+
+from packages.scene_core import NAVIGATION_COMMAND_KEY, PoseMap
 
 from .models import CapabilitySnapshot, CommandRequest, MappingVersion
 
@@ -33,6 +36,8 @@ class FakeAdapter:
         self.probe_result = probe_result or AdapterResult(status="probed")
         self.dispatches: list[tuple[CommandRequest, MappingVersion]] = []
         self.cancellations: list[str] = []
+        self.poses: dict[str, PoseMap] = {}
+        self._results: dict[str, AdapterResult] = {}
 
     def discover(self, robot_id: str | None = None) -> AdapterResult:
         return AdapterResult(status="available", result={"robotId": robot_id})
@@ -42,6 +47,33 @@ class FakeAdapter:
 
     def dispatch(self, request: CommandRequest, mapping: MappingVersion) -> AdapterResult:
         self.dispatches.append((request, mapping))
+        if (
+            request.commandKey == NAVIGATION_COMMAND_KEY
+            and str(self.result.status).lower() in {"succeeded", "success", "ok", "completed"}
+        ):
+            try:
+                pose = PoseMap.model_validate(request.payload.get("goalPose")).model_copy(
+                    update={"observedAt": datetime.now(timezone.utc)}
+                )
+            except (TypeError, ValueError):
+                return AdapterResult(status="failed", error="fake navigation goalPose is invalid")
+            if self.result.result is None:
+                result = {}
+            elif isinstance(self.result.result, Mapping):
+                result = dict(self.result.result)
+            else:
+                return self.result
+            result["pose"] = pose.model_dump(mode="json")
+            self.poses[request.robotId] = pose
+            outcome = AdapterResult(
+                status=self.result.status,
+                result=result,
+                error=self.result.error,
+                details=dict(self.result.details),
+            )
+            self._results[request.commandId] = outcome
+            return outcome
+        self._results[request.commandId] = self.result
         return self.result
 
     def cancel(self, command_id: str) -> AdapterResult:
@@ -49,7 +81,7 @@ class FakeAdapter:
         return AdapterResult(status="cancelled")
 
     def query(self, command_id: str) -> AdapterResult:
-        return AdapterResult(status="unknown", error="not found")
+        return self._results.get(command_id, AdapterResult(status="unknown", error="not found"))
 
 
 class _UnavailableAdapter:

@@ -13,6 +13,9 @@ import math
 import threading
 from typing import Any, Callable, Mapping
 
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import SchemaError, ValidationError as JsonSchemaValidationError
+
 from .adapters import AdapterResult, CommandAdapter
 from .models import CommandDefinition, CommandKind, CommandReceipt, CommandRequest, CommandStatus, MappingVersion
 from .registry import validate_mapping_safety
@@ -32,6 +35,8 @@ class _InFlight:
     adapter: CommandAdapter
     motion: bool
     kind: CommandKind
+    safety_epoch: int | None = None
+    safety_owner: str = ""
 
 
 class ActionRuntime:
@@ -344,6 +349,17 @@ class ActionRuntime:
         if mapping.commandKey != request.commandKey or mapping.transport != request.transport:
             return self._rejected(request, mapping, "mapping mismatch")
         try:
+            Draft202012Validator.check_schema(definition.payloadSchema)
+            Draft202012Validator(definition.payloadSchema).validate(dict(request.payload))
+        except SchemaError:
+            return self._rejected(request, mapping, "command payload schema is invalid")
+        except JsonSchemaValidationError as exc:
+            return self._rejected(
+                request,
+                mapping,
+                f"command payload does not match schema: {exc.message}",
+            )
+        try:
             validate_mapping_safety(mapping)
         except ValueError as exc:
             return self._rejected(request, mapping, str(exc))
@@ -389,7 +405,15 @@ class ActionRuntime:
         self._receipt(request, CommandStatus.RUNNING, startedAt=self.clock())
         if motion:
             self._leases[robot] = _Lease(request.commandId, min(request.expiresAt, self.clock() + lease_duration))
-        self._inflight[request.commandId] = _InFlight(request, mapping, adapter, motion, definition.kind)
+        self._inflight[request.commandId] = _InFlight(
+            request,
+            mapping,
+            adapter,
+            motion,
+            definition.kind,
+            safety_epoch,
+            safety_owner,
+        )
         return (adapter, motion, cancel_actions, is_safety, safety_epoch, safety_owner, None)
 
     def _finish_dispatch(self, request: CommandRequest, mapping: MappingVersion, outcome: AdapterResult, motion: bool, is_safety: bool = False, safety_epoch: int | None = None, safety_owner: str = "") -> CommandReceipt:
@@ -425,6 +449,46 @@ class ActionRuntime:
             return receipt
         if status in {"running", "accepted", "pending"}:
             return current
+        if status == "rejected":
+            self._release_lease(request.robotId, request.commandId)
+            self._inflight.pop(request.commandId, None)
+            if is_safety:
+                self._clear_safety_barrier(request.robotId, safety_owner, safety_epoch)
+            return self._receipt(
+                request,
+                CommandStatus.REJECTED,
+                error=self._error_text(outcome.error, "adapter rejected command"),
+                completedAt=self.clock(),
+            )
+        if status in {"expired", "timed_out", "timeout"}:
+            self._release_lease(request.robotId, request.commandId)
+            self._inflight.pop(request.commandId, None)
+            if is_safety:
+                self._clear_safety_barrier(request.robotId, safety_owner, safety_epoch)
+            return self._receipt(
+                request,
+                CommandStatus.EXPIRED,
+                error=self._error_text(outcome.error, "adapter command expired"),
+                completedAt=self.clock(),
+            )
+        if status == "unknown":
+            self._release_lease(request.robotId, request.commandId)
+            self._inflight.pop(request.commandId, None)
+            # Unknown physical execution is terminal for this command but not
+            # proof that the robot stopped. Keep/claim a safety barrier so a
+            # reconnect cannot silently admit another motion command.
+            if motion and not is_safety:
+                self._claim_safety_barrier(
+                    request.robotId,
+                    f"unknown:{request.commandId}",
+                )
+            return self._receipt(
+                request,
+                CommandStatus.UNKNOWN,
+                error=self._error_text(outcome.error, "adapter execution state is unknown"),
+                completedAt=self.clock(),
+                safetyWarning="physical execution state is unknown",
+            )
         self._release_lease(request.robotId, request.commandId)
         self._inflight.pop(request.commandId, None)
         if is_safety:
@@ -433,13 +497,70 @@ class ActionRuntime:
 
     submit = dispatch
 
+    def reconcile(self, command_id: str) -> CommandReceipt:
+        """Refresh one in-flight receipt from its adapter without replaying it."""
+
+        self._expire_leases()
+        with self._lock:
+            current = self._receipts.get(command_id)
+            if current is None:
+                raise ValueError("command not found")
+            if current.status in {
+                CommandStatus.SUCCEEDED,
+                CommandStatus.FAILED,
+                CommandStatus.CANCELLED,
+                CommandStatus.EXPIRED,
+                CommandStatus.REJECTED,
+                CommandStatus.UNKNOWN,
+            }:
+                return current
+            action = self._inflight.get(command_id)
+        if action is None:
+            return current
+        try:
+            outcome = self._normalize_result(action.adapter.query(command_id), "query")
+        except Exception as exc:
+            self._warn("adapter query failed while reconciling command", exc=exc)
+            return current
+        # A transient Gateway/network outage is not evidence that the robot
+        # command failed. Keep the motion lease until the command deadline;
+        # lease expiry performs cancellation and fail-closed terminalization.
+        if str(outcome.status).lower() == "unavailable":
+            self._warn(
+                "adapter unavailable while reconciling command",
+                exc=RuntimeError(outcome.error or "adapter unavailable"),
+            )
+            return current
+        with self._lock:
+            active = self._inflight.get(command_id)
+            if active is not action:
+                return self._receipts[command_id]
+            receipt = self._finish_dispatch(
+                action.request,
+                action.mapping,
+                outcome,
+                action.motion,
+                action.kind is CommandKind.SAFETY,
+                action.safety_epoch,
+                action.safety_owner,
+            )
+        self._flush_events()
+        return receipt
+
     def cancel(self, command_id: str) -> CommandReceipt:
         with self._lock:
             if command_id not in self._receipts:
                 raise ValueError("command not found")
             request = self._requests[command_id]
             current = self._receipts[command_id]
-            if current.status in {CommandStatus.SUCCEEDED, CommandStatus.FAILED, CommandStatus.CANCELLED, CommandStatus.EXPIRED, CommandStatus.REJECTED}:
+            if current.status in {
+                CommandStatus.SUCCEEDED,
+                CommandStatus.FAILED,
+                CommandStatus.CANCELLED,
+                CommandStatus.EXPIRED,
+                CommandStatus.REJECTED,
+                CommandStatus.UNKNOWN,
+            }:
                 return current
             action = self._inflight.get(command_id)
             owner = f"cancel:{command_id}"

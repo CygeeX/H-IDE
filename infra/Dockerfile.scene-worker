@@ -1,0 +1,115 @@
+FROM ubuntu:24.04 AS toolchain-build
+
+ARG PCL_COMMIT=3346843ea6b97697a1577293aa9cdf236b5c7ffb
+ARG PDAL_COMMIT=bfe12d25949e3c10f6856a5665cd85d593cecdfb
+ARG POTREE_CONVERTER_COMMIT=a70ef212198b0e5ae1d071713a0c8cbda8fcc9a7
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       build-essential ca-certificates cmake git ninja-build \
+       libboost-all-dev libeigen3-dev libflann-dev libgdal-dev libgeotiff-dev \
+       liblzma-dev libpng-dev libproj-dev libqhull-dev libtbb-dev libusb-1.0-0-dev \
+       libxml2-dev libzstd-dev nlohmann-json3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone --filter=blob:none https://github.com/PointCloudLibrary/pcl.git /src/pcl \
+    && git -C /src/pcl checkout --detach "${PCL_COMMIT}" \
+    && test "$(git -C /src/pcl rev-parse HEAD)" = "${PCL_COMMIT}"
+RUN cmake -S /src/pcl -B /build/pcl -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DBUILD_SHARED_LIBS=ON \
+      -DBUILD_apps=OFF \
+      -DBUILD_examples=OFF \
+      -DBUILD_global_tests=OFF \
+      -DBUILD_tools=ON \
+      -DWITH_CUDA=OFF \
+      -DWITH_LIBUSB=OFF \
+      -DWITH_OPENGL=OFF \
+      -DWITH_OPENNI=OFF \
+      -DWITH_OPENNI2=OFF \
+      -DWITH_PCAP=OFF \
+      -DWITH_QT=OFF \
+      -DWITH_VTK=OFF \
+    && cmake --build /build/pcl --target pcl_convert_pcd_ascii_binary --parallel 2 \
+    && mkdir -p /opt/pcl/bin /opt/pcl/lib \
+    && cp /build/pcl/bin/pcl_convert_pcd_ascii_binary /opt/pcl/bin/ \
+    && find /build/pcl/lib -maxdepth 1 \( -type f -o -type l \) -name 'libpcl_*.so*' -exec cp -a {} /opt/pcl/lib/ \;
+
+RUN git clone --filter=blob:none https://github.com/PDAL/PDAL.git /src/pdal \
+    && git -C /src/pdal checkout --detach "${PDAL_COMMIT}" \
+    && test "$(git -C /src/pdal rev-parse HEAD)" = "${PDAL_COMMIT}"
+RUN cmake -S /src/pdal -B /build/pdal -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/opt/pdal \
+      -DBUILD_DOCS=OFF \
+      -DBUILD_PLUGIN_ARROW=OFF \
+      -DBUILD_PLUGIN_CPD=OFF \
+      -DBUILD_PLUGIN_DRACO=OFF \
+      -DBUILD_PLUGIN_E57=OFF \
+      -DBUILD_PLUGIN_FBX=OFF \
+      -DBUILD_PLUGIN_HDF=OFF \
+      -DBUILD_PLUGIN_ICEBRIDGE=OFF \
+      -DBUILD_PLUGIN_MATLAB=OFF \
+      -DBUILD_PLUGIN_MBIO=OFF \
+      -DBUILD_PLUGIN_NITF=OFF \
+      -DBUILD_PLUGIN_OPENSCENEGRAPH=OFF \
+      -DBUILD_PLUGIN_PGPOINTCLOUD=OFF \
+      -DBUILD_PLUGIN_RDBLIB=OFF \
+      -DBUILD_PLUGIN_RIVLIB=OFF \
+      -DBUILD_PLUGIN_SPZ=OFF \
+      -DBUILD_PLUGIN_TEASER=OFF \
+      -DBUILD_PLUGIN_TILEDB=OFF \
+      -DBUILD_PLUGIN_TRAJECTORY=OFF \
+      -DWITH_TESTS=OFF \
+    && cmake --build /build/pdal --target install --parallel 2
+
+RUN git clone --filter=blob:none https://github.com/potree/PotreeConverter.git /src/potree \
+    && git -C /src/potree checkout --detach "${POTREE_CONVERTER_COMMIT}" \
+    && test "$(git -C /src/potree rev-parse HEAD)" = "${POTREE_CONVERTER_COMMIT}"
+RUN cmake -S /src/potree -B /build/potree -G Ninja -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build /build/potree --target PotreeConverter --parallel 2 \
+    && mkdir -p /opt/potree/bin \
+    && cp /build/potree/PotreeConverter /opt/potree/bin/
+RUN mkdir -p /opt/potree/lib \
+    && cp /build/potree/liblaszip.so /opt/potree/lib/
+
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       ca-certificates libboost-filesystem1.83.0 libboost-iostreams1.83.0 \
+       libboost-system1.83.0 libflann1.9 libgdal34t64 libgeotiff5 libgomp1 \
+       libgl1 liblzma5 libpng16-16t64 libproj25 libqhull-r8.0 libtbb12 libusb-1.0-0 \
+       libxml2 libzstd1 python3 python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=toolchain-build /opt/pcl /opt/pcl
+COPY --from=toolchain-build /opt/pdal /opt/pdal
+COPY --from=toolchain-build /opt/potree /opt/potree
+ENV PATH=/opt/venv/bin:/opt/pcl/bin:/opt/pdal/bin:/opt/potree/bin:${PATH} \
+    LD_LIBRARY_PATH=/opt/pcl/lib:/opt/pdal/lib:/opt/potree/lib
+
+RUN ldd /opt/pcl/bin/pcl_convert_pcd_ascii_binary | tee /tmp/pcl-ldd \
+    && ! grep -q 'not found' /tmp/pcl-ldd \
+    && ldd /opt/pdal/bin/pdal | tee /tmp/pdal-ldd \
+    && ! grep -q 'not found' /tmp/pdal-ldd \
+    && ldd /opt/potree/bin/PotreeConverter | tee /tmp/potree-ldd \
+    && ! grep -q 'not found' /tmp/potree-ldd \
+    && rm -f /tmp/pcl-ldd /tmp/pdal-ldd /tmp/potree-ldd
+
+WORKDIR /app
+COPY pyproject.toml ./
+COPY packages/ ./packages/
+COPY services/ ./services/
+RUN python3 -m venv /opt/venv \
+    && /opt/venv/bin/pip install --no-cache-dir '.[scene]' \
+    && groupadd --gid 20002 scene \
+    && useradd --uid 10002 --gid scene --create-home scene \
+    && mkdir -p /scene-data \
+    && chown -R scene:scene /app /scene-data
+
+USER scene
+ENV SCENE_STORAGE_ROOT=/scene-data
+CMD ["python", "-m", "services.scene_worker.main"]

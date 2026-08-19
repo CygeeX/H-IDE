@@ -68,6 +68,10 @@ class MappingStateConflict(ValueError):
         )
 
 
+class AssistantTurnConflict(ValueError):
+    """A conversation already owns an active planning turn."""
+
+
 _MAPPING_POINTER_UNSET = object()
 _MAPPING_PROBE_UNSET = object()
 
@@ -163,12 +167,180 @@ class SQLiteStore:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS assistant_conversations (
+                    conversation_id TEXT PRIMARY KEY,
+                    robot_id TEXT NOT NULL,
+                    requested_by TEXT NOT NULL,
+                    locale TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS assistant_messages (
+                    message_id TEXT PRIMARY KEY,
+                    conversation_id TEXT NOT NULL,
+                    task_id TEXT,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    modality TEXT NOT NULL,
+                    transcription_id TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(conversation_id) REFERENCES assistant_conversations(conversation_id)
+                );
+                CREATE TABLE IF NOT EXISTS assistant_turns (
+                    task_id TEXT PRIMARY KEY,
+                    conversation_id TEXT NOT NULL,
+                    request_json TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    result_json TEXT,
+                    error TEXT,
+                    cancellation_requested INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(conversation_id) REFERENCES assistant_conversations(conversation_id)
+                );
+                CREATE TABLE IF NOT EXISTS assistant_draft_metadata (
+                    draft_id TEXT PRIMARY KEY,
+                    conversation_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    review_json TEXT NOT NULL,
+                    revision_of_draft_id TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(draft_id) REFERENCES assistant_drafts(draft_id),
+                    FOREIGN KEY(conversation_id) REFERENCES assistant_conversations(conversation_id),
+                    FOREIGN KEY(task_id) REFERENCES assistant_turns(task_id)
+                );
+                CREATE TABLE IF NOT EXISTS speech_transcriptions (
+                    transcription_id TEXT PRIMARY KEY,
+                    text TEXT NOT NULL,
+                    language TEXT,
+                    locale TEXT NOT NULL,
+                    filename TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS mapping_active (
                     command_key TEXT PRIMARY KEY,
                     mapping_id TEXT NOT NULL,
                     version TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS visual_missions (
+                    mission_id TEXT PRIMARY KEY,
+                    draft_id TEXT NOT NULL UNIQUE,
+                    robot_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    plan_json TEXT NOT NULL,
+                    state_json TEXT NOT NULL,
+                    error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(draft_id) REFERENCES assistant_drafts(draft_id)
+                );
+                CREATE TABLE IF NOT EXISTS visual_mission_stages (
+                    mission_id TEXT NOT NULL,
+                    stage_id TEXT NOT NULL,
+                    attempt INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    visual_resolution_id TEXT,
+                    command_id TEXT,
+                    state_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(mission_id, stage_id, attempt),
+                    FOREIGN KEY(mission_id) REFERENCES visual_missions(mission_id)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS visual_resolution_one_command_uq
+                    ON visual_mission_stages(visual_resolution_id)
+                    WHERE visual_resolution_id IS NOT NULL;
+                CREATE TABLE IF NOT EXISTS missions (
+                    mission_id TEXT PRIMARY KEY,
+                    robot_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    plan_json TEXT NOT NULL,
+                    authorization_json TEXT NOT NULL,
+                    snapshot_json TEXT NOT NULL,
+                    active_revision_id TEXT NOT NULL,
+                    last_sequence INTEGER NOT NULL,
+                    error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS mission_drafts (
+                    draft_id TEXT PRIMARY KEY,
+                    robot_id TEXT NOT NULL,
+                    plan_json TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS mission_revisions (
+                    revision_id TEXT PRIMARY KEY,
+                    mission_id TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(mission_id, sequence),
+                    FOREIGN KEY(mission_id) REFERENCES missions(mission_id)
+                );
+                CREATE TABLE IF NOT EXISTS mission_authorizations (
+                    authorization_id TEXT PRIMARY KEY,
+                    mission_id TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(mission_id) REFERENCES missions(mission_id)
+                );
+                CREATE TABLE IF NOT EXISTS mission_events (
+                    mission_id TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    event_id TEXT NOT NULL UNIQUE,
+                    event_type TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(mission_id, sequence),
+                    FOREIGN KEY(mission_id) REFERENCES missions(mission_id)
+                );
+                CREATE TABLE IF NOT EXISTS mission_world_records (
+                    record_id TEXT PRIMARY KEY,
+                    mission_id TEXT NOT NULL,
+                    robot_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    predicate TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    FOREIGN KEY(mission_id) REFERENCES missions(mission_id)
+                );
+                CREATE TABLE IF NOT EXISTS mission_node_states (
+                    mission_id TEXT NOT NULL,
+                    revision_id TEXT NOT NULL,
+                    node_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    attempt INTEGER NOT NULL DEFAULT 0,
+                    state_json TEXT NOT NULL DEFAULT '{}',
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(mission_id, revision_id, node_id),
+                    FOREIGN KEY(mission_id) REFERENCES missions(mission_id),
+                    FOREIGN KEY(revision_id) REFERENCES mission_revisions(revision_id)
+                );
+                CREATE TABLE IF NOT EXISTS mission_skill_executions (
+                    request_id TEXT PRIMARY KEY,
+                    mission_id TEXT NOT NULL,
+                    revision_id TEXT NOT NULL,
+                    node_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    request_json TEXT NOT NULL,
+                    progress_json TEXT NOT NULL DEFAULT '{}',
+                    result_json TEXT,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(mission_id) REFERENCES missions(mission_id),
+                    FOREIGN KEY(revision_id) REFERENCES mission_revisions(revision_id)
+                );
+                CREATE INDEX IF NOT EXISTS mission_events_sequence_idx
+                    ON mission_events(mission_id, sequence);
+                CREATE INDEX IF NOT EXISTS mission_world_subject_idx
+                    ON mission_world_records(mission_id, subject, predicate, observed_at);
+                CREATE INDEX IF NOT EXISTS mission_skill_node_idx
+                    ON mission_skill_executions(mission_id, revision_id, node_id, updated_at);
                 """
             )
             # Existing installations predate the durable idempotency and
@@ -181,6 +353,18 @@ class SQLiteStore:
             self._connection.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS commands_idempotency_key_uq "
                 "ON commands(idempotency_key) WHERE idempotency_key IS NOT NULL"
+            )
+            self._connection.execute(
+                "CREATE INDEX IF NOT EXISTS assistant_messages_conversation_idx "
+                "ON assistant_messages(conversation_id, created_at, message_id)"
+            )
+            self._connection.execute(
+                "CREATE INDEX IF NOT EXISTS assistant_turns_conversation_idx "
+                "ON assistant_turns(conversation_id, created_at, task_id)"
+            )
+            self._connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS assistant_turns_one_active_idx "
+                "ON assistant_turns(conversation_id) WHERE status IN ('queued', 'running')"
             )
             self._backfill_mapping_pointers()
             self._connection.commit()
@@ -824,6 +1008,519 @@ class SQLiteStore:
             result.append(payload)
         return result
 
+    def create_assistant_conversation(
+        self,
+        conversation_id: str,
+        robot_id: str,
+        requested_by: str,
+        locale: str,
+    ) -> dict[str, Any]:
+        now = self._now()
+        with self._lock:
+            self._connection.execute(
+                "INSERT INTO assistant_conversations("
+                "conversation_id, robot_id, requested_by, locale, status, created_at, updated_at"
+                ") VALUES (?, ?, ?, ?, 'idle', ?, ?)",
+                (conversation_id, robot_id, requested_by, locale, now, now),
+            )
+            self._connection.commit()
+        return {
+            "conversationId": conversation_id,
+            "robotId": robot_id,
+            "requestedBy": requested_by,
+            "locale": locale,
+            "status": "idle",
+            "createdAt": now,
+            "updatedAt": now,
+        }
+
+    @staticmethod
+    def _assistant_conversation_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "conversationId": row["conversation_id"],
+            "robotId": row["robot_id"],
+            "requestedBy": row["requested_by"],
+            "locale": row["locale"],
+            "status": row["status"],
+            "createdAt": row["created_at"],
+            "updatedAt": row["updated_at"],
+        }
+
+    def list_assistant_conversations(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM assistant_conversations ORDER BY updated_at DESC, conversation_id"
+            ).fetchall()
+        return [self._assistant_conversation_row(row) for row in rows]
+
+    def get_assistant_conversation(self, conversation_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM assistant_conversations WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+        return None if row is None else self._assistant_conversation_row(row)
+
+    def list_assistant_messages(self, conversation_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT message_id, task_id, role, content, modality, transcription_id, created_at "
+                "FROM assistant_messages WHERE conversation_id = ? "
+                "ORDER BY created_at, message_id",
+                (conversation_id,),
+            ).fetchall()
+        return [
+            {
+                "messageId": row["message_id"],
+                "taskId": row["task_id"],
+                "role": row["role"],
+                "content": row["content"],
+                "modality": row["modality"],
+                "transcriptionId": row["transcription_id"],
+                "createdAt": row["created_at"],
+            }
+            for row in rows
+        ]
+
+    @staticmethod
+    def _assistant_turn_row(row: sqlite3.Row) -> dict[str, Any]:
+        result = _decode(row["result_json"]) if row["result_json"] else None
+        return {
+            "taskId": row["task_id"],
+            "conversationId": row["conversation_id"],
+            "status": row["status"],
+            "request": _decode(row["request_json"]),
+            "result": result,
+            "error": row["error"],
+            "cancellationRequested": bool(row["cancellation_requested"]),
+            "createdAt": row["created_at"],
+            "updatedAt": row["updated_at"],
+        }
+
+    def list_assistant_turns(self, conversation_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM assistant_turns WHERE conversation_id = ? "
+                "ORDER BY created_at, task_id",
+                (conversation_id,),
+            ).fetchall()
+        return [self._assistant_turn_row(row) for row in rows]
+
+    def get_assistant_turn(self, task_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM assistant_turns WHERE task_id = ?", (task_id,)
+            ).fetchone()
+        return None if row is None else self._assistant_turn_row(row)
+
+    def _restore_revision_source(self, request_json: str, now: str) -> None:
+        """Make the immutable source draft reviewable when no replacement was produced.
+
+        The caller holds ``self._lock`` and an open transaction. Only the
+        lifecycle status changes; the stored plan payload is never rewritten.
+        """
+        request = _decode(request_json)
+        revision_of = request.get("revisionOfDraftId") if isinstance(request, Mapping) else None
+        if isinstance(revision_of, str) and revision_of:
+            self._connection.execute(
+                "UPDATE assistant_drafts SET status = 'draft', updated_at = ? "
+                "WHERE draft_id = ? AND status = 'revision_requested'",
+                (now, revision_of),
+            )
+
+    def create_assistant_turn(
+        self,
+        task_request: Mapping[str, Any],
+        *,
+        message_id: str,
+    ) -> dict[str, Any]:
+        task_id = task_request.get("taskId")
+        conversation_id = task_request.get("conversationId")
+        text = task_request.get("text")
+        modality = task_request.get("modality", "text")
+        transcription_id = task_request.get("transcriptionId")
+        revision_of = task_request.get("revisionOfDraftId")
+        if not all(isinstance(value, str) and value for value in (task_id, conversation_id, text)):
+            raise ValueError("taskId, conversationId, and text are required")
+        now = self._now()
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                conversation = self._connection.execute(
+                    "SELECT robot_id FROM assistant_conversations WHERE conversation_id = ?",
+                    (conversation_id,),
+                ).fetchone()
+                if conversation is None:
+                    raise ValueError("assistant conversation not found")
+                active = self._connection.execute(
+                    "SELECT task_id FROM assistant_turns WHERE conversation_id = ? "
+                    "AND status IN ('queued', 'running') LIMIT 1",
+                    (conversation_id,),
+                ).fetchone()
+                if active is not None:
+                    raise AssistantTurnConflict("assistant conversation already has an active turn")
+                if isinstance(revision_of, str) and revision_of:
+                    draft = self._connection.execute(
+                        "SELECT d.status, m.conversation_id FROM assistant_drafts d "
+                        "JOIN assistant_draft_metadata m ON m.draft_id = d.draft_id "
+                        "WHERE d.draft_id = ?",
+                        (revision_of,),
+                    ).fetchone()
+                    if draft is None or draft["conversation_id"] != conversation_id:
+                        raise ValueError("assistant draft does not belong to conversation")
+                    if draft["status"] != "draft":
+                        raise AssistantTurnConflict(
+                            f"assistant draft is not revisable (status={draft['status']})"
+                        )
+                    self._connection.execute(
+                        "UPDATE assistant_drafts SET status = 'revision_requested', updated_at = ? "
+                        "WHERE draft_id = ? AND status = 'draft'",
+                        (now, revision_of),
+                    )
+                self._connection.execute(
+                    "INSERT INTO assistant_messages("
+                    "message_id, conversation_id, task_id, role, content, modality, transcription_id, created_at"
+                    ") VALUES (?, ?, ?, 'user', ?, ?, ?, ?)",
+                    (message_id, conversation_id, task_id, text, modality, transcription_id, now),
+                )
+                self._connection.execute(
+                    "INSERT INTO assistant_turns("
+                    "task_id, conversation_id, request_json, status, result_json, error, "
+                    "cancellation_requested, created_at, updated_at"
+                    ") VALUES (?, ?, ?, 'queued', NULL, NULL, 0, ?, ?)",
+                    (task_id, conversation_id, _encode(task_request), now, now),
+                )
+                self._connection.execute(
+                    "UPDATE assistant_conversations SET status = 'planning', updated_at = ? "
+                    "WHERE conversation_id = ?",
+                    (now, conversation_id),
+                )
+                self._connection.commit()
+            except sqlite3.IntegrityError as exc:
+                self._connection.rollback()
+                raise AssistantTurnConflict("assistant conversation already has an active turn") from exc
+            except Exception:
+                self._connection.rollback()
+                raise
+        return self.get_assistant_turn(task_id) or {}
+
+    def mark_assistant_turn_running(self, task_id: str) -> bool:
+        with self._lock:
+            cursor = self._connection.execute(
+                "UPDATE assistant_turns SET status = 'running', updated_at = ? "
+                "WHERE task_id = ? AND status = 'queued' AND cancellation_requested = 0",
+                (self._now(), task_id),
+            )
+            self._connection.commit()
+            return cursor.rowcount == 1
+
+    def is_assistant_turn_cancelled(self, task_id: str) -> bool:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT status, cancellation_requested FROM assistant_turns WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+        return row is None or bool(row["cancellation_requested"]) or row["status"] == "cancelled"
+
+    def cancel_assistant_turn(self, task_id: str) -> dict[str, Any] | None:
+        now = self._now()
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                row = self._connection.execute(
+                    "SELECT conversation_id, status, request_json FROM assistant_turns WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()
+                if row is None:
+                    self._connection.rollback()
+                    return None
+                if row["status"] in {"queued", "running"}:
+                    self._restore_revision_source(row["request_json"], now)
+                    self._connection.execute(
+                        "UPDATE assistant_turns SET status = 'cancelled', cancellation_requested = 1, "
+                        "updated_at = ? WHERE task_id = ?",
+                        (now, task_id),
+                    )
+                    self._connection.execute(
+                        "UPDATE assistant_conversations SET status = 'idle', updated_at = ? "
+                        "WHERE conversation_id = ?",
+                        (now, row["conversation_id"]),
+                    )
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+        return self.get_assistant_turn(task_id)
+
+    def complete_assistant_turn(
+        self,
+        task_id: str,
+        *,
+        status: str,
+        result: Mapping[str, Any],
+        assistant_message: str,
+        message_id: str,
+        conversation_status: str,
+        draft: Mapping[str, Any] | None = None,
+        review: Mapping[str, Any] | None = None,
+    ) -> bool:
+        """Atomically persist a terminal turn, reply, and optional immutable draft."""
+        now = self._now()
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                row = self._connection.execute(
+                    "SELECT conversation_id, request_json, status FROM assistant_turns WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()
+                if row is None or row["status"] not in {"queued", "running"}:
+                    self._connection.rollback()
+                    return False
+                conversation_id = row["conversation_id"]
+                request = _decode(row["request_json"])
+                revision_of = request.get("revisionOfDraftId") if isinstance(request, Mapping) else None
+                if draft is not None:
+                    draft_id = draft.get("draftId")
+                    plan = draft.get("plan")
+                    if not isinstance(draft_id, str) or not isinstance(plan, Mapping):
+                        raise ValueError("draftId and plan are required")
+                    self._connection.execute(
+                        "INSERT INTO assistant_drafts("
+                        "draft_id, payload_json, status, execution_json, error, created_at, updated_at"
+                        ") VALUES (?, ?, 'draft', '{}', NULL, ?, ?)",
+                        (draft_id, _encode(plan), now, now),
+                    )
+                    self._connection.execute(
+                        "INSERT INTO assistant_draft_metadata("
+                        "draft_id, conversation_id, task_id, review_json, revision_of_draft_id, created_at"
+                        ") VALUES (?, ?, ?, ?, ?, ?)",
+                        (draft_id, conversation_id, task_id, _encode(review or {}), revision_of, now),
+                    )
+                    if isinstance(revision_of, str) and revision_of:
+                        updated = self._connection.execute(
+                            "UPDATE assistant_drafts SET status = 'superseded', updated_at = ? "
+                            "WHERE draft_id = ? AND status = 'revision_requested'",
+                            (now, revision_of),
+                        )
+                        if updated.rowcount != 1:
+                            raise AssistantTurnConflict("revision source is no longer supersedable")
+                elif isinstance(revision_of, str) and revision_of:
+                    self._restore_revision_source(row["request_json"], now)
+                self._connection.execute(
+                    "UPDATE assistant_turns SET status = ?, result_json = ?, error = NULL, updated_at = ? "
+                    "WHERE task_id = ?",
+                    (status, _encode(result), now, task_id),
+                )
+                self._connection.execute(
+                    "INSERT INTO assistant_messages("
+                    "message_id, conversation_id, task_id, role, content, modality, transcription_id, created_at"
+                    ") VALUES (?, ?, ?, 'assistant', ?, 'text', NULL, ?)",
+                    (message_id, conversation_id, task_id, assistant_message, now),
+                )
+                self._connection.execute(
+                    "UPDATE assistant_conversations SET status = ?, updated_at = ? WHERE conversation_id = ?",
+                    (conversation_status, now, conversation_id),
+                )
+                self._connection.commit()
+                return True
+            except Exception:
+                self._connection.rollback()
+                raise
+
+    def fail_assistant_turn(self, task_id: str, error: str) -> bool:
+        now = self._now()
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                row = self._connection.execute(
+                    "SELECT conversation_id, status, request_json FROM assistant_turns WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()
+                if row is None or row["status"] not in {"queued", "running"}:
+                    self._connection.rollback()
+                    return False
+                self._restore_revision_source(row["request_json"], now)
+                self._connection.execute(
+                    "UPDATE assistant_turns SET status = 'failed', error = ?, updated_at = ? WHERE task_id = ?",
+                    (error, now, task_id),
+                )
+                self._connection.execute(
+                    "UPDATE assistant_conversations SET status = 'failed', updated_at = ? WHERE conversation_id = ?",
+                    (now, row["conversation_id"]),
+                )
+                self._connection.commit()
+                return True
+            except Exception:
+                self._connection.rollback()
+                raise
+
+    def recover_active_assistant_turns(self) -> None:
+        """Never replay an LLM planning run after a process restart."""
+        now = self._now()
+        message = "planning turn interrupted by process restart; submit a new turn"
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT request_json FROM assistant_turns WHERE status IN ('queued', 'running')"
+            ).fetchall()
+            for row in rows:
+                self._restore_revision_source(row["request_json"], now)
+            self._connection.execute(
+                "UPDATE assistant_turns SET status = 'unknown', error = ?, updated_at = ? "
+                "WHERE status IN ('queued', 'running')",
+                (message, now),
+            )
+            self._connection.execute(
+                "UPDATE assistant_conversations SET status = 'failed', updated_at = ? "
+                "WHERE status = 'planning'",
+                (now,),
+            )
+            self._connection.commit()
+
+    def get_assistant_draft_review(self, draft_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT conversation_id, task_id, review_json, revision_of_draft_id, created_at "
+                "FROM assistant_draft_metadata WHERE draft_id = ?",
+                (draft_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "conversationId": row["conversation_id"],
+            "taskId": row["task_id"],
+            "review": _decode(row["review_json"]),
+            "revisionOfDraftId": row["revision_of_draft_id"],
+            "createdAt": row["created_at"],
+        }
+
+    def list_assistant_conversation_drafts(self, conversation_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT m.draft_id FROM assistant_draft_metadata m "
+                "JOIN assistant_drafts d ON d.draft_id = m.draft_id "
+                "WHERE m.conversation_id = ? ORDER BY m.created_at, m.draft_id",
+                (conversation_id,),
+            ).fetchall()
+        result = []
+        for row in rows:
+            draft = self.get_assistant_draft(row["draft_id"])
+            if draft is not None:
+                metadata = self.get_assistant_draft_review(row["draft_id"])
+                draft["review"] = (metadata or {}).get("review", {})
+                draft["revisionOfDraftId"] = (metadata or {}).get("revisionOfDraftId")
+                result.append(draft)
+        return result
+
+    def get_assistant_draft_for_task(self, task_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT draft_id FROM assistant_draft_metadata WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        draft = self.get_assistant_draft(row["draft_id"])
+        if draft is None:
+            return None
+        metadata = self.get_assistant_draft_review(row["draft_id"])
+        draft["review"] = (metadata or {}).get("review", {})
+        draft["revisionOfDraftId"] = (metadata or {}).get("revisionOfDraftId")
+        return draft
+
+    def reject_assistant_draft(self, draft_id: str, reason: str, *, message_id: str) -> dict[str, Any] | None:
+        now = self._now()
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                row = self._connection.execute(
+                    "SELECT d.status, m.conversation_id FROM assistant_drafts d "
+                    "JOIN assistant_draft_metadata m ON m.draft_id = d.draft_id "
+                    "WHERE d.draft_id = ?",
+                    (draft_id,),
+                ).fetchone()
+                if row is None:
+                    self._connection.rollback()
+                    return None
+                if row["status"] != "draft":
+                    raise AssistantTurnConflict(
+                        f"assistant draft is not rejectable (status={row['status']})"
+                    )
+                self._connection.execute(
+                    "UPDATE assistant_drafts SET status = 'rejected', error = ?, updated_at = ? "
+                    "WHERE draft_id = ?",
+                    (reason, now, draft_id),
+                )
+                self._connection.execute(
+                    "UPDATE assistant_conversations SET status = 'rejected', updated_at = ? "
+                    "WHERE conversation_id = ?",
+                    (now, row["conversation_id"]),
+                )
+                self._connection.execute(
+                    "INSERT INTO assistant_messages("
+                    "message_id, conversation_id, task_id, role, content, modality, transcription_id, created_at"
+                    ") VALUES (?, ?, NULL, 'system', ?, 'text', NULL, ?)",
+                    (message_id, row["conversation_id"], f"计划已拒绝：{reason}", now),
+                )
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+        return self.get_assistant_draft(draft_id)
+
+    def set_assistant_conversation_status_for_draft(self, draft_id: str, status: str) -> bool:
+        with self._lock:
+            cursor = self._connection.execute(
+                "UPDATE assistant_conversations SET status = ?, updated_at = ? WHERE conversation_id = ("
+                "SELECT conversation_id FROM assistant_draft_metadata WHERE draft_id = ?)",
+                (status, self._now(), draft_id),
+            )
+            self._connection.commit()
+            return cursor.rowcount == 1
+
+    def save_transcription(
+        self,
+        transcription_id: str,
+        text: str,
+        *,
+        language: str | None,
+        locale: str,
+        filename: str,
+    ) -> dict[str, Any]:
+        created_at = self._now()
+        with self._lock:
+            self._connection.execute(
+                "INSERT INTO speech_transcriptions("
+                "transcription_id, text, language, locale, filename, created_at"
+                ") VALUES (?, ?, ?, ?, ?, ?)",
+                (transcription_id, text, language, locale, filename, created_at),
+            )
+            self._connection.commit()
+        return {
+            "transcriptionId": transcription_id,
+            "text": text,
+            "language": language,
+            "locale": locale,
+            "createdAt": created_at,
+        }
+
+    def get_transcription(self, transcription_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT transcription_id, text, language, locale, filename, created_at "
+                "FROM speech_transcriptions WHERE transcription_id = ?",
+                (transcription_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "transcriptionId": row["transcription_id"],
+            "text": row["text"],
+            "language": row["language"],
+            "locale": row["locale"],
+            "filename": row["filename"],
+            "createdAt": row["created_at"],
+        }
+
     def save_assistant_draft(self, draft_id: str, payload: Mapping[str, Any], *, status: str = "draft") -> bool:
         """Insert an immutable draft; never overwrite an existing plan."""
         if not isinstance(draft_id, str) or not draft_id:
@@ -840,6 +1537,164 @@ class SQLiteStore:
             )
             self._connection.commit()
             return cursor.rowcount == 1
+
+    def create_visual_mission(
+        self,
+        mission_id: str,
+        draft_id: str,
+        robot_id: str,
+        plan: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Idempotently create a durable parent mission after draft confirmation."""
+        now = self._now()
+        state = {"currentStageIndex": 0, "cancelRequested": False, "receipts": []}
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                row = self._connection.execute(
+                    "SELECT draft_id, plan_json FROM visual_missions WHERE mission_id = ?",
+                    (mission_id,),
+                ).fetchone()
+                if row is not None:
+                    if row["draft_id"] != draft_id or _decode(row["plan_json"]) != _jsonable(plan):
+                        raise ValueError("visual mission ID is already bound to another immutable plan")
+                    self._connection.rollback()
+                    result = self.get_visual_mission(mission_id)
+                    assert result is not None
+                    return result
+                self._connection.execute(
+                    "INSERT INTO visual_missions VALUES (?, ?, ?, 'approved', ?, ?, NULL, ?, ?)",
+                    (mission_id, draft_id, robot_id, _encode(plan), _encode(state), now, now),
+                )
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+        result = self.get_visual_mission(mission_id)
+        assert result is not None
+        return result
+
+    def get_visual_mission(self, mission_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM visual_missions WHERE mission_id = ?", (mission_id,)
+            ).fetchone()
+            stages = self._connection.execute(
+                "SELECT * FROM visual_mission_stages WHERE mission_id = ? ORDER BY rowid",
+                (mission_id,),
+            ).fetchall()
+        if row is None:
+            return None
+        return {
+            "missionId": mission_id,
+            "draftId": row["draft_id"],
+            "robotId": row["robot_id"],
+            "status": row["status"],
+            "plan": _decode(row["plan_json"]),
+            "state": _decode(row["state_json"]),
+            "error": row["error"],
+            "createdAt": row["created_at"],
+            "updatedAt": row["updated_at"],
+            "stages": [
+                {
+                    "stageId": item["stage_id"],
+                    "attempt": item["attempt"],
+                    "status": item["status"],
+                    "visualResolutionId": item["visual_resolution_id"],
+                    "commandId": item["command_id"],
+                    "state": _decode(item["state_json"]),
+                    "updatedAt": item["updated_at"],
+                }
+                for item in stages
+            ],
+        }
+
+    def transition_visual_mission(
+        self,
+        mission_id: str,
+        status: str,
+        *,
+        expected_status: str | tuple[str, ...] | None = None,
+        state: Mapping[str, Any] | None = None,
+        error: str | None = None,
+    ) -> bool:
+        expected = (expected_status,) if isinstance(expected_status, str) else expected_status
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT status, state_json FROM visual_missions WHERE mission_id = ?", (mission_id,)
+            ).fetchone()
+            if row is None or expected is not None and row["status"] not in expected:
+                return False
+            next_state = _decode(row["state_json"]) if state is None else dict(state)
+            cursor = self._connection.execute(
+                "UPDATE visual_missions SET status = ?, state_json = ?, error = ?, updated_at = ? "
+                "WHERE mission_id = ? AND status = ?",
+                (status, _encode(next_state), error, self._now(), mission_id, row["status"]),
+            )
+            self._connection.commit()
+            return cursor.rowcount == 1
+
+    def save_visual_stage(
+        self,
+        mission_id: str,
+        stage_id: str,
+        attempt: int,
+        status: str,
+        *,
+        visual_resolution_id: str | None = None,
+        command_id: str | None = None,
+        state: Mapping[str, Any] | None = None,
+    ) -> None:
+        with self._lock:
+            self._connection.execute(
+                "INSERT INTO visual_mission_stages VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(mission_id, stage_id, attempt) DO UPDATE SET "
+                "status=excluded.status, "
+                "visual_resolution_id=COALESCE(visual_mission_stages.visual_resolution_id, excluded.visual_resolution_id), "
+                "command_id=COALESCE(visual_mission_stages.command_id, excluded.command_id), "
+                "state_json=excluded.state_json, updated_at=excluded.updated_at",
+                (
+                    mission_id,
+                    stage_id,
+                    attempt,
+                    status,
+                    visual_resolution_id,
+                    command_id,
+                    _encode(state or {}),
+                    self._now(),
+                ),
+            )
+            self._connection.commit()
+
+    def request_visual_mission_cancel(self, mission_id: str) -> bool:
+        mission = self.get_visual_mission(mission_id)
+        if mission is None or mission["status"] in {
+            "completed",
+            "rejected",
+            "failed",
+            "cancelled",
+            "unknown",
+        }:
+            return False
+        state = dict(mission["state"])
+        state["cancelRequested"] = True
+        return self.transition_visual_mission(
+            mission_id,
+            "cancelled",
+            expected_status=mission["status"],
+            state=state,
+            error="cancelled by user",
+        )
+
+    def recover_visual_missions(self) -> None:
+        """Never replay a motion whose terminal state was lost across restart."""
+        with self._lock:
+            self._connection.execute(
+                "UPDATE visual_missions SET status='unknown', error=?, updated_at=? "
+                "WHERE status IN ('observing','resolving','dispatching','navigating','verifying')",
+                ("visual mission interrupted by process restart; reconcile before retry", self._now()),
+            )
+            self._connection.commit()
 
     def get_assistant_draft(self, draft_id: str) -> dict[str, Any] | None:
         with self._lock:
@@ -930,12 +1785,529 @@ class SQLiteStore:
             self._connection.commit()
             return cursor.rowcount == 1
 
+    # ------------------------------------------------------------------
+    # Mission V2 durable event store
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _mission_identity(payload: Mapping[str, Any], field: str = "missionId") -> str:
+        mission_id = payload.get(field)
+        if not isinstance(mission_id, str) or not mission_id:
+            raise ValueError(f"{field} is required")
+        return mission_id
+
+    def create_mission(
+        self,
+        plan: Mapping[str, Any],
+        authorization: Mapping[str, Any],
+        revision: Mapping[str, Any],
+        snapshot: Mapping[str, Any],
+        event: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Atomically create an approved immutable Mission and event 1.
+
+        A retry with the same immutable plan returns the existing mission.  A
+        reused mission ID with different content is rejected before any state
+        is changed.
+        """
+
+        plan_payload = dict(_jsonable(plan))
+        authorization_payload = dict(_jsonable(authorization))
+        revision_payload = dict(_jsonable(revision))
+        snapshot_payload = dict(_jsonable(snapshot))
+        event_payload = dict(_jsonable(event))
+        mission_id = self._mission_identity(revision_payload)
+        if snapshot_payload.get("missionId") != mission_id or event_payload.get("missionId") != mission_id:
+            raise ValueError("mission creation identity mismatch")
+        if int(snapshot_payload.get("lastSequence", -1)) != 1 or int(event_payload.get("sequence", -1)) != 1:
+            raise ValueError("mission creation must commit sequence 1")
+        robot_id = snapshot_payload.get("robotId")
+        if not isinstance(robot_id, str) or not robot_id:
+            raise ValueError("mission robotId is required")
+        revision_id = revision_payload.get("revisionId")
+        if snapshot_payload.get("activeRevisionId") != revision_id:
+            raise ValueError("initial mission revision binding mismatch")
+        now = self._now()
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                existing = self._connection.execute(
+                    "SELECT plan_json FROM missions WHERE mission_id = ?", (mission_id,)
+                ).fetchone()
+                if existing is not None:
+                    if _decode(existing["plan_json"]) != plan_payload:
+                        raise ValueError("mission ID is already bound to another immutable plan")
+                    self._connection.rollback()
+                    result = self.get_mission(mission_id)
+                    assert result is not None
+                    return result
+                self._connection.execute(
+                    "INSERT INTO missions(mission_id, robot_id, status, plan_json, authorization_json, "
+                    "snapshot_json, active_revision_id, last_sequence, error, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?)",
+                    (
+                        mission_id,
+                        robot_id,
+                        snapshot_payload["status"],
+                        _encode(plan_payload),
+                        _encode(authorization_payload),
+                        _encode(snapshot_payload),
+                        revision_id,
+                        now,
+                        now,
+                    ),
+                )
+                self._connection.execute(
+                    "INSERT INTO mission_revisions(revision_id, mission_id, sequence, payload_json, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        revision_id,
+                        mission_id,
+                        int(revision_payload["sequence"]),
+                        _encode(revision_payload),
+                        revision_payload.get("createdAt", now),
+                    ),
+                )
+                self._connection.execute(
+                    "INSERT INTO mission_authorizations(authorization_id, mission_id, payload_json, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        authorization_payload["authorizationId"],
+                        mission_id,
+                        _encode(authorization_payload),
+                        authorization_payload.get("approvedAt", now),
+                    ),
+                )
+                self._connection.execute(
+                    "INSERT INTO mission_events(mission_id, sequence, event_id, event_type, payload_json, created_at) "
+                    "VALUES (?, 1, ?, ?, ?, ?)",
+                    (
+                        mission_id,
+                        event_payload["eventId"],
+                        event_payload["eventType"],
+                        _encode(event_payload),
+                        event_payload.get("occurredAt", now),
+                    ),
+                )
+                for node in revision_payload.get("nodes", []):
+                    self._connection.execute(
+                        "INSERT INTO mission_node_states(mission_id, revision_id, node_id, status, attempt, state_json, updated_at) "
+                        "VALUES (?, ?, ?, 'pending', 0, '{}', ?)",
+                        (mission_id, revision_id, node["nodeId"], now),
+                    )
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+        result = self.get_mission(mission_id)
+        assert result is not None
+        return result
+
+    def save_mission_draft(
+        self,
+        draft_id: str,
+        robot_id: str,
+        plan: Mapping[str, Any],
+        *,
+        status: str = "draft",
+    ) -> bool:
+        now = self._now()
+        with self._lock:
+            cursor = self._connection.execute(
+                "INSERT INTO mission_drafts(draft_id, robot_id, plan_json, status, error, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, NULL, ?, ?) ON CONFLICT(draft_id) DO NOTHING",
+                (draft_id, robot_id, _encode(plan), status, now, now),
+            )
+            self._connection.commit()
+            return cursor.rowcount == 1
+
+    def get_mission_draft(self, draft_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM mission_drafts WHERE draft_id = ?", (draft_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "draftId": row["draft_id"],
+            "robotId": row["robot_id"],
+            "plan": _decode(row["plan_json"]),
+            "status": row["status"],
+            "error": row["error"],
+            "createdAt": row["created_at"],
+            "updatedAt": row["updated_at"],
+        }
+
+    def set_mission_draft_status(
+        self,
+        draft_id: str,
+        status: str,
+        *,
+        expected_status: str | None = None,
+        error: str | None = None,
+    ) -> bool:
+        with self._lock:
+            where = "draft_id = ?"
+            values: list[Any] = [status, error, self._now(), draft_id]
+            if expected_status is not None:
+                where += " AND status = ?"
+                values.append(expected_status)
+            cursor = self._connection.execute(
+                f"UPDATE mission_drafts SET status=?, error=?, updated_at=? WHERE {where}",
+                values,
+            )
+            self._connection.commit()
+            return cursor.rowcount == 1
+
+    def list_mission_drafts(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT draft_id FROM mission_drafts ORDER BY updated_at DESC, draft_id LIMIT ?",
+                (max(1, min(int(limit), 500)),),
+            ).fetchall()
+        return [draft for row in rows if (draft := self.get_mission_draft(row["draft_id"])) is not None]
+
+    def get_mission(self, mission_id: str, *, after_sequence: int = 0) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM missions WHERE mission_id = ?", (mission_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            revisions = self._connection.execute(
+                "SELECT payload_json FROM mission_revisions WHERE mission_id = ? ORDER BY sequence",
+                (mission_id,),
+            ).fetchall()
+            authorizations = self._connection.execute(
+                "SELECT payload_json FROM mission_authorizations WHERE mission_id = ? ORDER BY created_at, authorization_id",
+                (mission_id,),
+            ).fetchall()
+            events = self._connection.execute(
+                "SELECT payload_json FROM mission_events WHERE mission_id = ? AND sequence > ? ORDER BY sequence",
+                (mission_id, max(0, int(after_sequence))),
+            ).fetchall()
+            world = self._connection.execute(
+                "SELECT payload_json FROM mission_world_records WHERE mission_id = ? ORDER BY observed_at, record_id",
+                (mission_id,),
+            ).fetchall()
+            nodes = self._connection.execute(
+                "SELECT * FROM mission_node_states WHERE mission_id = ? ORDER BY revision_id, rowid",
+                (mission_id,),
+            ).fetchall()
+            skills = self._connection.execute(
+                "SELECT * FROM mission_skill_executions WHERE mission_id = ? ORDER BY updated_at, request_id",
+                (mission_id,),
+            ).fetchall()
+        revisions_payload = [_decode(item["payload_json"]) for item in revisions]
+        return {
+            "missionId": mission_id,
+            "robotId": row["robot_id"],
+            "status": row["status"],
+            "plan": _decode(row["plan_json"]),
+            "authorization": _decode(row["authorization_json"]),
+            "authorizations": [_decode(item["payload_json"]) for item in authorizations],
+            "snapshot": _decode(row["snapshot_json"]),
+            "activeRevisionId": row["active_revision_id"],
+            "activeRevision": next(
+                (
+                    item
+                    for item in reversed(revisions_payload)
+                    if item.get("revisionId") == row["active_revision_id"]
+                ),
+                None,
+            ),
+            "revisions": revisions_payload,
+            "events": [_decode(item["payload_json"]) for item in events],
+            "worldRecords": [_decode(item["payload_json"]) for item in world],
+            "nodeStates": [
+                {
+                    "missionId": item["mission_id"],
+                    "revisionId": item["revision_id"],
+                    "nodeId": item["node_id"],
+                    "status": item["status"],
+                    "attempt": item["attempt"],
+                    "state": _decode(item["state_json"]),
+                    "updatedAt": item["updated_at"],
+                }
+                for item in nodes
+            ],
+            "skillExecutions": [
+                {
+                    "requestId": item["request_id"],
+                    "missionId": item["mission_id"],
+                    "revisionId": item["revision_id"],
+                    "nodeId": item["node_id"],
+                    "status": item["status"],
+                    "request": _decode(item["request_json"]),
+                    "progress": _decode(item["progress_json"]),
+                    "result": None if item["result_json"] is None else _decode(item["result_json"]),
+                    "updatedAt": item["updated_at"],
+                }
+                for item in skills
+            ],
+            "lastSequence": row["last_sequence"],
+            "error": row["error"],
+            "createdAt": row["created_at"],
+            "updatedAt": row["updated_at"],
+        }
+
+    def list_missions(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT mission_id FROM missions ORDER BY updated_at DESC, mission_id LIMIT ?",
+                (max(1, min(int(limit), 500)),),
+            ).fetchall()
+        return [mission for row in rows if (mission := self.get_mission(row["mission_id"])) is not None]
+
+    def commit_mission_transition(
+        self,
+        mission_id: str,
+        *,
+        expected_last_sequence: int,
+        snapshot: Mapping[str, Any],
+        event: Mapping[str, Any],
+        revision: Mapping[str, Any] | None = None,
+        authorization: Mapping[str, Any] | None = None,
+        world_record: Mapping[str, Any] | None = None,
+        skill_request: Mapping[str, Any] | None = None,
+        skill_progress: Mapping[str, Any] | None = None,
+        skill_result: Mapping[str, Any] | None = None,
+        node_states: Iterable[Mapping[str, Any]] = (),
+        error: str | None = None,
+    ) -> bool:
+        """Commit one Mission transition and all of its evidence atomically."""
+
+        snapshot_payload = dict(_jsonable(snapshot))
+        event_payload = dict(_jsonable(event))
+        next_sequence = expected_last_sequence + 1
+        if snapshot_payload.get("missionId") != mission_id or event_payload.get("missionId") != mission_id:
+            raise ValueError("mission transition identity mismatch")
+        if snapshot_payload.get("lastSequence") != next_sequence or event_payload.get("sequence") != next_sequence:
+            raise ValueError("mission event and snapshot sequence mismatch")
+        now = self._now()
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                row = self._connection.execute(
+                    "SELECT last_sequence, active_revision_id FROM missions WHERE mission_id = ?",
+                    (mission_id,),
+                ).fetchone()
+                if row is None:
+                    self._connection.rollback()
+                    return False
+                if int(row["last_sequence"]) != expected_last_sequence:
+                    self._connection.rollback()
+                    return False
+                if revision is not None:
+                    revision_payload = dict(_jsonable(revision))
+                    if revision_payload.get("missionId") != mission_id:
+                        raise ValueError("mission revision identity mismatch")
+                    self._connection.execute(
+                        "INSERT INTO mission_revisions(revision_id, mission_id, sequence, payload_json, created_at) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (
+                            revision_payload["revisionId"],
+                            mission_id,
+                            int(revision_payload["sequence"]),
+                            _encode(revision_payload),
+                            revision_payload.get("createdAt", now),
+                        ),
+                    )
+                if authorization is not None:
+                    authorization_payload = dict(_jsonable(authorization))
+                    if authorization_payload.get("missionId") != mission_id:
+                        raise ValueError("mission authorization identity mismatch")
+                    self._connection.execute(
+                        "INSERT INTO mission_authorizations(authorization_id, mission_id, payload_json, created_at) "
+                        "VALUES (?, ?, ?, ?)",
+                        (
+                            authorization_payload["authorizationId"],
+                            mission_id,
+                            _encode(authorization_payload),
+                            authorization_payload.get("approvedAt", now),
+                        ),
+                    )
+                if world_record is not None:
+                    record_payload = dict(_jsonable(world_record))
+                    if record_payload.get("missionId") != mission_id:
+                        raise ValueError("world record mission identity mismatch")
+                    existing = self._connection.execute(
+                        "SELECT payload_json FROM mission_world_records WHERE record_id = ?",
+                        (record_payload["recordId"],),
+                    ).fetchone()
+                    if existing is not None and _decode(existing["payload_json"]) != record_payload:
+                        raise ValueError("world record ID is bound to different evidence")
+                    if existing is None:
+                        self._connection.execute(
+                            "INSERT INTO mission_world_records(record_id, mission_id, robot_id, kind, subject, predicate, payload_json, observed_at) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                            (
+                                record_payload["recordId"],
+                                mission_id,
+                                record_payload["robotId"],
+                                record_payload["kind"],
+                                record_payload["subject"],
+                                record_payload["predicate"],
+                                _encode(record_payload),
+                                record_payload["observedAt"],
+                            ),
+                        )
+                if skill_request is not None:
+                    request_payload = dict(_jsonable(skill_request))
+                    if request_payload.get("missionId") != mission_id:
+                        raise ValueError("skill request mission identity mismatch")
+                    self._connection.execute(
+                        "INSERT INTO mission_skill_executions(request_id, mission_id, revision_id, node_id, status, request_json, progress_json, result_json, updated_at) "
+                        "VALUES (?, ?, ?, ?, 'requested', ?, '{}', NULL, ?)",
+                        (
+                            request_payload["requestId"],
+                            mission_id,
+                            request_payload["revisionId"],
+                            request_payload["nodeId"],
+                            _encode(request_payload),
+                            now,
+                        ),
+                    )
+                if skill_progress is not None:
+                    progress_payload = dict(_jsonable(skill_progress))
+                    cursor = self._connection.execute(
+                        "UPDATE mission_skill_executions SET status='running', progress_json=?, updated_at=? "
+                        "WHERE request_id=? AND mission_id=? AND result_json IS NULL",
+                        (_encode(progress_payload), now, progress_payload["requestId"], mission_id),
+                    )
+                    if cursor.rowcount != 1:
+                        raise ValueError("skill progress is not bound to an active request")
+                if skill_result is not None:
+                    result_payload = dict(_jsonable(skill_result))
+                    cursor = self._connection.execute(
+                        "UPDATE mission_skill_executions SET status=?, result_json=?, updated_at=? "
+                        "WHERE request_id=? AND mission_id=? AND result_json IS NULL",
+                        (
+                            result_payload["status"],
+                            _encode(result_payload),
+                            now,
+                            result_payload["requestId"],
+                            mission_id,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise ValueError("skill result is not bound to an active request")
+                active_revision_id = snapshot_payload.get("activeRevisionId")
+                for item in node_states:
+                    state = dict(_jsonable(item))
+                    revision_id = state.get("revisionId") or active_revision_id
+                    self._connection.execute(
+                        "INSERT INTO mission_node_states(mission_id, revision_id, node_id, status, attempt, state_json, updated_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                        "ON CONFLICT(mission_id, revision_id, node_id) DO UPDATE SET "
+                        "status=excluded.status, attempt=excluded.attempt, state_json=excluded.state_json, updated_at=excluded.updated_at",
+                        (
+                            mission_id,
+                            revision_id,
+                            state["nodeId"],
+                            state["status"],
+                            int(state.get("attempt", 0)),
+                            _encode(state.get("state", {})),
+                            now,
+                        ),
+                    )
+                self._connection.execute(
+                    "INSERT INTO mission_events(mission_id, sequence, event_id, event_type, payload_json, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        mission_id,
+                        next_sequence,
+                        event_payload["eventId"],
+                        event_payload["eventType"],
+                        _encode(event_payload),
+                        event_payload.get("occurredAt", now),
+                    ),
+                )
+                current_authorization = (
+                    _encode(dict(_jsonable(authorization)))
+                    if authorization is not None
+                    else None
+                )
+                cursor = self._connection.execute(
+                    "UPDATE missions SET status=?, snapshot_json=?, active_revision_id=?, last_sequence=?, "
+                    "authorization_json=COALESCE(?, authorization_json), error=?, updated_at=? "
+                    "WHERE mission_id=? AND last_sequence=?",
+                    (
+                        snapshot_payload["status"],
+                        _encode(snapshot_payload),
+                        active_revision_id,
+                        next_sequence,
+                        current_authorization,
+                        error,
+                        now,
+                        mission_id,
+                        expected_last_sequence,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("mission transition lost compare-and-set ownership")
+                self._connection.commit()
+                return True
+            except Exception:
+                self._connection.rollback()
+                raise
+
+    def recover_active_missions(self) -> int:
+        """Suspend interrupted Missions; never replay an in-flight skill."""
+
+        active = {
+            "planning", "observing", "dispatching", "executing", "verifying"
+        }
+        recovered = 0
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT mission_id, snapshot_json, last_sequence FROM missions"
+            ).fetchall()
+        for row in rows:
+            snapshot = _decode(row["snapshot_json"])
+            if snapshot.get("status") not in active:
+                continue
+            sequence = int(row["last_sequence"]) + 1
+            snapshot.update(
+                {
+                    "status": "suspended",
+                    "lastSequence": sequence,
+                    "activeSkillRequestId": None,
+                    "updatedAt": self._now(),
+                    "errorCode": "PROCESS_RESTART",
+                    "detail": "Mission interrupted by process restart; reconcile before resume",
+                }
+            )
+            event = {
+                "schemaVersion": "h-ide.mission-event/2",
+                "eventId": f"recovery-{row['mission_id']}-{sequence}",
+                "missionId": row["mission_id"],
+                "sequence": sequence,
+                "eventType": "mission.suspended_after_restart",
+                "occurredAt": self._now(),
+                "causationId": None,
+                "correlationId": f"recovery-{row['mission_id']}",
+                "revisionId": snapshot.get("activeRevisionId"),
+                "nodeId": snapshot.get("activeNodeId"),
+                "payload": {"reason": "process_restart"},
+            }
+            if self.commit_mission_transition(
+                row["mission_id"],
+                expected_last_sequence=int(row["last_sequence"]),
+                snapshot=snapshot,
+                event=event,
+                error=snapshot["detail"],
+            ):
+                recovered += 1
+        return recovered
+
     def close(self) -> None:
         with self._lock:
             self._connection.close()
 
 
 __all__ = [
+    "AssistantTurnConflict",
     "CommandClaim",
     "MappingPointerConflict",
     "MappingStateConflict",

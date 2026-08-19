@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
 import threading
 import time
+from uuid import UUID
 import warnings
 
 import pytest
@@ -10,7 +11,7 @@ from starlette.exceptions import StarletteDeprecationWarning
 warnings.filterwarnings("ignore", category=StarletteDeprecationWarning)
 from fastapi.testclient import TestClient
 
-from packages.control_core.adapters import AdapterResult, FakeAdapter
+from packages.control_core.adapters import AdapterResult, FakeAdapter, RobotAgentAdapter
 from services.control_api.main import create_app
 from services.control_api.store import SQLiteStore
 
@@ -59,6 +60,71 @@ class _TaggedProbeAdapter(FakeAdapter):
         return AdapterResult(status="probed", details={"tag": self._tag})
 
 
+class _LateRobotAgentDriver:
+    """Mutable discovery fixture for an Agent that connects after API startup."""
+
+    def __init__(self):
+        self.available = False
+        self.dispatches = []
+
+    def _availability(self):
+        if not self.available:
+            return AdapterResult(status="unavailable", error="agent is offline")
+        return AdapterResult(
+            status="available",
+            result={
+                "robotId": "g1-dev",
+                "robotBootId": "11111111-1111-4111-8111-111111111111",
+                "capabilitiesDigest": "sha256:" + "a" * 64,
+                "capabilities": ["navigation.navigate_to_pose"],
+                "protocol": "robot-agent.v1",
+                "executionBackend": "real_robot_agent",
+                "observation": {
+                    "status": "USABLE",
+                    "sessionId": "observation-session-live",
+                },
+            },
+        )
+
+    def discover(self, robot_id=None):
+        assert robot_id == "g1-dev"
+        return self._availability()
+
+    def probe(self, mapping):
+        del mapping
+        return (
+            AdapterResult(status="probed")
+            if self.available
+            else AdapterResult(status="unavailable", error="agent is offline")
+        )
+
+    def dispatch(self, request, mapping):
+        self.dispatches.append((request, mapping))
+        return AdapterResult(status="succeeded")
+
+    def cancel(self, command_id):
+        del command_id
+        return AdapterResult(status="cancelled")
+
+    def query(self, command_id):
+        del command_id
+        return AdapterResult(status="succeeded")
+
+
+class _AsyncLateRobotAgentDriver(_LateRobotAgentDriver):
+    def __init__(self):
+        super().__init__()
+        self.queries = []
+
+    def dispatch(self, request, mapping):
+        self.dispatches.append((request, mapping))
+        return AdapterResult(status="running")
+
+    def query(self, command_id):
+        self.queries.append(command_id)
+        return AdapterResult(status="succeeded", result={"goalReached": True})
+
+
 def auth():
     return {"Authorization": f"Bearer {TOKEN}"}
 
@@ -98,6 +164,270 @@ def test_bearer_auth_and_seeded_robot():
     assert any(robot["robotId"] == "robot-1" for robot in response.json())
     capabilities = client.get("/api/v1/robots/robot-1/capabilities", headers=auth()).json()
     assert capabilities["schema"] == {"type": "object"}
+
+
+def test_gateway_url_does_not_disable_fake_demo_without_explicit_switch(monkeypatch):
+    monkeypatch.delenv("ROBOT_AGENT_GATEWAY_ENABLED", raising=False)
+    monkeypatch.setenv("ROBOT_AGENT_GATEWAY_URL", "http://127.0.0.1:8093")
+    monkeypatch.setenv("ROBOT_AGENT_GATEWAY_TOKEN", "configured-but-disabled")
+    app = create_app(auth_token=TOKEN)
+    assert set(app.state.runtime.adapters) == {"fake"}
+    robot = TestClient(app).get("/api/v1/robots", headers=auth()).json()[0]
+    assert robot["robotId"] == "robot-1"
+    assert robot["details"]["adapter"] == "fake"
+
+
+def test_gateway_profile_requires_complete_explicit_configuration(monkeypatch):
+    monkeypatch.setenv("ROBOT_AGENT_GATEWAY_ENABLED", "true")
+    monkeypatch.delenv("ROBOT_AGENT_GATEWAY_URL", raising=False)
+    monkeypatch.delenv("ROBOT_AGENT_GATEWAY_TOKEN", raising=False)
+    with pytest.raises(ValueError, match="requires ROBOT_AGENT_GATEWAY_URL"):
+        create_app(auth_token=TOKEN)
+
+
+def test_invalid_gateway_profile_switch_fails_startup(monkeypatch):
+    monkeypatch.setenv("ROBOT_AGENT_GATEWAY_ENABLED", "tru")
+    with pytest.raises(ValueError, match="explicit boolean"):
+        create_app(auth_token=TOKEN)
+
+
+def test_robot_agent_late_connection_refreshes_state_capability_and_mapping(monkeypatch):
+    monkeypatch.setenv("ROBOT_AGENT_ID", "g1-dev")
+    driver = _LateRobotAgentDriver()
+    app = create_app(
+        auth_token=TOKEN,
+        adapters={"robot_agent": RobotAgentAdapter(driver=driver)},
+    )
+    assert "fake" not in app.state.runtime.adapters
+    client = TestClient(app)
+
+    offline = client.get("/api/v1/robots", headers=auth()).json()[0]
+    assert offline["robotId"] == "g1-dev"
+    assert offline["status"] == "unknown"
+    assert offline["connected"] is False
+    assert client.get(
+        "/api/v1/robots/g1-dev/capabilities", headers=auth()
+    ).json()["capabilities"] == []
+
+    driver.available = True
+    online = client.get("/api/v1/robots", headers=auth()).json()[0]
+    assert online["status"] == "online"
+    assert online["connected"] is True
+    capability = client.get(
+        "/api/v1/robots/g1-dev/capabilities", headers=auth()
+    ).json()
+    assert capability["capabilities"] == ["navigation.navigate_to_pose"]
+    assert app.state.control.mapping("navigation.navigate_to_pose").transport.value == (
+        "robot_agent"
+    )
+    assert online["details"]["observationSessionId"] == "observation-session-live"
+    assert "localizationEpochId" not in online["details"]
+
+
+def test_real_profile_projects_only_explicit_localization_epoch(monkeypatch):
+    monkeypatch.setenv("ROBOT_AGENT_ID", "g1-dev")
+    monkeypatch.setenv(
+        "ROBOT_AGENT_LOCALIZATION_EPOCH_ID",
+        "q40-map-epoch-dev-1",
+    )
+    driver = _LateRobotAgentDriver()
+    driver.available = True
+    app = create_app(
+        auth_token=TOKEN,
+        adapters={"robot_agent": RobotAgentAdapter(driver=driver)},
+    )
+
+    robot = TestClient(app).get("/api/v1/robots", headers=auth()).json()[0]
+    assert robot["details"]["localizationEpochId"] == "q40-map-epoch-dev-1"
+
+
+def test_real_profile_generates_stable_uuid_command_identity(monkeypatch):
+    monkeypatch.setenv("ROBOT_AGENT_ID", "g1-dev")
+    driver = _LateRobotAgentDriver()
+    driver.available = True
+    app = create_app(
+        auth_token=TOKEN,
+        adapters={"robot_agent": RobotAgentAdapter(driver=driver)},
+    )
+    client = TestClient(app)
+    body = {
+        "robotId": "g1-dev",
+        "commandKey": "navigation.navigate_to_pose",
+        "commandVersion": "1",
+        "transport": "robot_agent",
+        "idempotencyKey": "stable-robot-agent-command",
+        "payload": {
+            "payloadType": "spatial_resolution",
+            "goalPose": {"frameId": "map", "x": 1, "y": 2, "z": 0, "yaw": 0},
+            "goalPurpose": "final",
+            "missionId": "mission-1",
+            "stageId": "stage-1",
+            "spatialResolutionId": "spatial-1",
+            "observationSessionId": "observation-session-live",
+            "robotBootId": "11111111-1111-4111-8111-111111111111",
+            "localizationEpochId": "epoch-1",
+            "maximumSpeedMps": 0.2,
+            "sceneRef": {"sceneId": "scene-1", "revision": 1},
+        },
+    }
+
+    first = client.post("/api/v1/commands", headers=auth(), json=body)
+    second = client.post("/api/v1/commands", headers=auth(), json=body)
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assert first.json()["commandId"] == second.json()["commandId"]
+    assert str(UUID(first.json()["commandId"])) == first.json()["commandId"]
+    assert len(driver.dispatches) == 1
+
+
+def test_real_profile_manual_command_remains_async(monkeypatch):
+    """Only PlanDraft confirmation owns the bounded terminal wait."""
+
+    monkeypatch.setenv("ROBOT_AGENT_ID", "g1-dev")
+    driver = _AsyncLateRobotAgentDriver()
+    driver.available = True
+    app = create_app(
+        auth_token=TOKEN,
+        adapters={"robot_agent": RobotAgentAdapter(driver=driver)},
+    )
+    response = TestClient(app).post(
+        "/api/v1/commands",
+        headers=auth(),
+        json={
+            "robotId": "g1-dev",
+            "commandKey": "navigation.navigate_to_pose",
+            "commandVersion": "1",
+            "transport": "robot_agent",
+            "idempotencyKey": "async-robot-agent-command",
+            "payload": {
+                "payloadType": "spatial_resolution",
+                "goalPose": {"frameId": "map", "x": 1, "y": 2, "z": 0, "yaw": 0},
+                "goalPurpose": "final",
+                "missionId": "mission-1",
+                "stageId": "stage-1",
+                "spatialResolutionId": "spatial-1",
+                "observationSessionId": "observation-session-live",
+                "robotBootId": "11111111-1111-4111-8111-111111111111",
+                "localizationEpochId": "epoch-1",
+                "maximumSpeedMps": 0.2,
+                "sceneRef": {"sceneId": "scene-1", "revision": 1},
+            },
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "running"
+    assert driver.queries == []
+
+
+def test_persisted_fake_navigation_mapping_migrates_to_real_profile(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "profile-switch.db")
+    fake_app = create_app(db_path=db_path, auth_token=TOKEN)
+    assert fake_app.state.control.mapping("navigation.navigate_to_pose").transport.value == "fake"
+    fake_app.state.stop_watchdog()
+    fake_app.state.store.close()
+
+    monkeypatch.setenv("ROBOT_AGENT_ID", "g1-dev")
+    driver = _LateRobotAgentDriver()
+    driver.available = True
+    real_app = create_app(
+        db_path=db_path,
+        auth_token=TOKEN,
+        adapters={"robot_agent": RobotAgentAdapter(driver=driver)},
+    )
+    mapping = real_app.state.control.mapping("navigation.navigate_to_pose")
+    assert mapping.transport.value == "robot_agent"
+    assert mapping.mappingId.endswith("-robot-agent")
+
+
+def test_persisted_real_navigation_mapping_migrates_back_to_fake_profile(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = str(tmp_path / "profile-switch-back.db")
+    monkeypatch.setenv("ROBOT_AGENT_ID", "g1-dev")
+    driver = _LateRobotAgentDriver()
+    driver.available = True
+    real_app = create_app(
+        db_path=db_path,
+        auth_token=TOKEN,
+        adapters={"robot_agent": RobotAgentAdapter(driver=driver)},
+    )
+    assert real_app.state.control.mapping("navigation.navigate_to_pose").transport.value == (
+        "robot_agent"
+    )
+    real_app.state.stop_watchdog()
+    real_app.state.store.close()
+
+    fake_app = create_app(db_path=db_path, auth_token=TOKEN)
+    mapping = fake_app.state.control.mapping("navigation.navigate_to_pose")
+    assert mapping.transport.value == "fake"
+    assert mapping.mappingId.endswith("-fake")
+
+
+def test_robot_agent_refresh_never_clears_persisted_estop(monkeypatch):
+    monkeypatch.setenv("ROBOT_AGENT_ID", "g1-dev")
+    driver = _LateRobotAgentDriver()
+    driver.available = True
+    app = create_app(
+        auth_token=TOKEN,
+        adapters={"robot_agent": RobotAgentAdapter(driver=driver)},
+    )
+    current = app.state.store.get_robot("g1-dev")
+    assert current is not None
+    app.state.store.upsert_robot(
+        {
+            **current,
+            "status": "estop",
+            "safetyMode": "estop",
+            "connected": False,
+        }
+    )
+    robot = TestClient(app).get("/api/v1/robots", headers=auth()).json()[0]
+    assert robot["status"] == "estop"
+    assert robot["safetyMode"] == "estop"
+    assert robot["connected"] is True
+
+
+def test_real_profile_rejects_commands_missing_from_live_capabilities(monkeypatch):
+    monkeypatch.setenv("ROBOT_AGENT_ID", "g1-dev")
+    driver = _LateRobotAgentDriver()
+    driver.available = True
+    app = create_app(
+        auth_token=TOKEN,
+        adapters={"robot_agent": RobotAgentAdapter(driver=driver)},
+    )
+    response = TestClient(app).post(
+        "/api/v1/commands",
+        headers=auth(),
+        json=command_body(
+            robotId="g1-dev",
+            commandKey="stop",
+            transport="fake",
+            idempotencyKey="no-fake-stop",
+        ),
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"] == "current robot capability is missing: stop"
+
+
+def test_real_profile_does_not_publish_fake_mapping_rows(monkeypatch):
+    monkeypatch.setenv("ROBOT_AGENT_ID", "g1-dev")
+    driver = _LateRobotAgentDriver()
+    driver.available = True
+    app = create_app(
+        auth_token=TOKEN,
+        adapters={"robot_agent": RobotAgentAdapter(driver=driver)},
+    )
+
+    mappings = TestClient(app).get("/api/v1/mappings", headers=auth()).json()
+
+    assert mappings
+    assert {item["mapping"]["transport"] for item in mappings} == {"robot_agent"}
+    assert {item["mapping"]["commandKey"] for item in mappings} == {
+        "navigation.navigate_to_pose"
+    }
 
 
 def test_manual_command_receipt_and_restart_persistence(tmp_path):

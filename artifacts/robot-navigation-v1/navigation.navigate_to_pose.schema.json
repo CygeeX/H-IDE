@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:h-ide:robot-navigation:v1:navigation.navigate_to_pose",
+  "title": "H-IDE reviewed navigation target",
+  "description": "One reviewed visual, static-map, or relative target pose with fresh Robot Agent observation bindings. This contract contains no path or velocity sequence.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "payloadType",
+    "goalPose",
+    "goalPurpose",
+    "missionId",
+    "stageId",
+    "observationSessionId",
+    "robotBootId",
+    "localizationEpochId",
+    "maximumSpeedMps"
+  ],
+  "properties": {
+    "payloadType": { "enum": ["visual_resolution", "spatial_resolution", "relative_resolution"] },
+    "goalPose": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["frameId", "x", "y", "z", "yaw"],
+      "properties": {
+        "frameId": { "const": "map" },
+        "x": { "type": "number" },
+        "y": { "type": "number" },
+        "z": { "type": "number" },
+        "yaw": { "type": "number", "minimum": -3.141592653589793, "maximum": 3.141592653589793 },
+        "observedAt": { "type": ["string", "null"], "format": "date-time" }
+      }
+    },
+    "goalPurpose": { "enum": ["observe", "approach", "final"] },
+    "missionId": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "stageId": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "visualResolutionId": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "spatialResolutionId": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "relativeResolutionId": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "observationSessionId": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "robotBootId": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "localizationEpochId": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "maximumSpeedMps": { "type": "number", "exclusiveMinimum": 0, "maximum": 0.5 },
+    "sceneRef": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["sceneId", "revision"],
+      "properties": {
+        "sceneId": { "type": "string", "minLength": 1 },
+        "revision": { "type": "integer", "minimum": 1 }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "payloadType": { "const": "visual_resolution" } } },
+      "then": {
+        "required": ["visualResolutionId"],
+        "not": {
+          "anyOf": [
+            { "required": ["spatialResolutionId"] },
+            { "required": ["relativeResolutionId"] }
+          ]
+        }
+      }
+    },
+    {
+      "if": { "properties": { "payloadType": { "const": "spatial_resolution" } } },
+      "then": {
+        "required": ["spatialResolutionId", "sceneRef"],
+        "properties": {
+          "goalPurpose": { "const": "final" },
+          "sceneRef": { "type": "object" }
+        },
+        "not": {
+          "anyOf": [
+            { "required": ["visualResolutionId"] },
+            { "required": ["relativeResolutionId"] }
+          ]
+        }
+      }
+    },
+    {
+      "if": { "properties": { "payloadType": { "const": "relative_resolution" } } },
+      "then": {
+        "required": ["relativeResolutionId"],
+        "properties": { "goalPurpose": { "const": "final" } },
+        "not": {
+          "anyOf": [
+            { "required": ["visualResolutionId"] },
+            { "required": ["spatialResolutionId"] },
+            { "required": ["sceneRef"] }
+          ]
+        }
+      }
+    }
+  ]
+}

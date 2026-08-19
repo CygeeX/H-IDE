@@ -21,6 +21,14 @@ configured.
 
 ## Routes
 
+- Mission V2 is the primary Agent task API. `POST /api/v2/missions/drafts`
+  creates a review-only semantic DAG; approval and bounded continuous
+  execution use `POST .../drafts/{draftId}/approve` and
+  `POST .../missions/{missionId}/advance`. Follow-up messages produce an
+  immutable PlanRevision. `POST .../missions/{missionId}/cancel` first
+  cancels the active ActionRuntime / Robot Agent command under the same
+  request ID, then terminalizes the Mission. `GET /api/v2/missions` and
+  `GET .../{missionId}` expose the durable event, fact and execution record.
 - `GET /api/v1/robots` and
   `GET /api/v1/robots/{robotId}/capabilities` return the seeded fake robot
   and capability snapshots.
@@ -39,7 +47,9 @@ configured.
   `POST /api/v1/mappings/{mappingId}/{version}/{validate|probe|activate}`;
   rollback is `POST /api/v1/mappings/{commandKey}/rollback` with optional
   `{"version": "..."}`.  `GET /api/v1/mappings` lists persisted records.
-- `POST /api/v1/assistant/drafts` (singular alias supported) stores a
+- The `/api/v1/assistant/*` routes are migration compatibility for historical
+  records and pre-Mission workflows. `POST /api/v1/assistant/drafts`
+  (singular alias supported) stores a
   `PlanDraft` only.  No adapter is called until
   `POST /api/v1/assistant/drafts/{draftId}/confirm`; confirmation returns the
   receipts produced by `ActionRuntime`. Confirmation is a durable
@@ -47,6 +57,25 @@ configured.
   confirmed|failed|partial|expired|unknown`); a restart marks an in-flight
   confirmation `unknown` and it is never replayed. Per-step receipts remain
   persisted for reconciliation, and a second confirmation is rejected.
+- `POST /api/v1/assistant/conversations` creates a robot-scoped conversation;
+  `POST /api/v1/assistant/conversations/{conversationId}/messages` accepts a
+  natural-language text or reviewed voice transcript and returns `202` with a
+  planning `taskId`. `GET /api/v1/assistant/turns/{taskId}` polls the durable
+  result and `POST .../cancel` cancels locally even when Mastra is unavailable.
+  Generated proposals are validated against the frozen robot context and
+  command JSON Schemas before becoming ordinary `PlanDraft` records.
+- Generated drafts support `POST /api/v1/assistant/drafts/{draftId}/revise`
+  with feedback and `POST .../reject` with a reason. Revision creates a new
+  planning turn and never mutates the original plan payload.
+- Scene upload, conversion, calibration, annotations, publishing and robot
+  bindings are owned by the separate Scene API and exposed through the
+  same-origin gateway. For planning, Control API reads only the internal
+  compact context for the robot. A browser may submit a matching `sceneRef`
+  and one selected map point, but cannot replace canonical bounds or semantic
+  annotations.
+- `POST /api/v1/speech/transcriptions` accepts at most 60 seconds / 10 MiB of
+  16 kHz mono 16-bit PCM WAV and delegates transcription to the configured
+  local whisper.cpp endpoint. Transcription never submits a task by itself.
 - `GET /api/v1/events` reads persisted runtime events.  The websocket at the
   same path replays stored events and polls for new ones; disconnects stop the
   polling task without retaining a subscription.
@@ -58,3 +87,55 @@ the request robot.  Non-safety actions fail closed unless the persisted robot
 state is explicitly connected and in an online/degraded, normal/degraded
 safety state; `stop` remains a `SAFETY` command. Direct in-process runtime
 callers remain responsible for that binding and robot-state check.
+
+`navigation.navigate_to_pose` is the logical command used by spatial Agent
+plans. Its payload contains both a ROS `map` goal and the complete deterministic
+`spatialResolution`. Control API resolves it once before persisting a draft and
+again on confirmation. A changed scene binding, altered resolution, or robot
+pose drift beyond the configured thresholds is rejected before dispatch.
+Path planning is deliberately outside this API and remains a Robot Agent/Nav2
+responsibility.
+
+## Robot Agent execution profile
+
+The default profile is an isolated `FakeAdapter` demo. A configured Gateway
+URL/token does not silently change command authority. To use the real internal
+Gateway, set all three values:
+
+```dotenv
+ROBOT_AGENT_GATEWAY_ENABLED=true
+ROBOT_AGENT_GATEWAY_URL=http://127.0.0.1:8093
+ROBOT_AGENT_GATEWAY_TOKEN=<internal-token>
+```
+
+For the inbound Robot Agent profile,
+`ROBOT_AGENT_OBSERVATION_PREFLIGHT_TIMEOUT_SECONDS` (default `2`) bounds how
+long the workstation waits for a fresh Robot Agent observation state, and
+`ROBOT_AGENT_OBSERVATION_PREFLIGHT_MAX_AGE_MS` (default `400`) limits both ACK
+and capture age. Navigation is rejected in the Gateway ledger with zero
+`command.request` messages when status, session, epoch, or age is unsafe.
+
+Real mode does not auto-install a Fake fallback. Robot state and command
+buttons are projected from live Gateway discovery, and every manual or planned
+command must be present in the current capability snapshot. A missing or
+disconnected Robot Agent therefore fails closed.
+
+## Assistant service configuration
+
+- `MASTRA_PLANNING_URL` and `MASTRA_INTERNAL_TOKEN` enable the internal
+  planning-only client; if either is missing, assistant turns fail closed while
+  manual control remains available.
+- `MASTRA_PLANNING_TIMEOUT_SECONDS` defaults to 120 seconds.
+- `WHISPER_ENDPOINT` enables local speech transcription and normally ends in
+  `/inference`; `WHISPER_TIMEOUT_SECONDS` defaults to 45 seconds.
+- `SCENE_API_INTERNAL_URL` and `SCENE_API_INTERNAL_TOKEN` enable canonical
+  robot scene context. The token must be distinct from browser and Mastra
+  tokens; `SCENE_API_TIMEOUT_SECONDS` defaults to 3 seconds.
+- `SPATIAL_CONFIRM_TRANSLATION_DRIFT_METERS` and
+  `SPATIAL_CONFIRM_YAW_DRIFT_RADIANS` default to `0.5` and `0.35`. They only
+  allow bounded motion between planning and confirmation; they do not weaken
+  the exact scene revision or deterministic goal checks.
+
+The browser never receives the Mastra token or Whisper endpoint. See
+`docs/architecture/assistant-supervisor-worker.md` and
+`docs/architecture/pcd-scene-spatial-agent.md` for the full trust boundary.

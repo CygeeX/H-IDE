@@ -1,0 +1,424 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import threading
+import time
+from datetime import UTC, datetime, timedelta
+from uuid import uuid4
+
+from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
+
+from packages.control_core.capabilities import (
+    CapabilityDescriptor,
+    CapabilityKind,
+    CapabilityManifest,
+    RiskLevel,
+    RobotProfile,
+    SensorKind,
+    SensorProfile,
+)
+from services.robot_agent_gateway.main import create_app
+from services.robot_agent_gateway.protocol import ProtocolCommand
+from services.robot_agent_gateway.wire import SUBPROTOCOL, build_message, parse_message
+from services.robot_agent_gateway.ws_inbound import RobotAgentInboundPeer
+
+CAPABILITIES = ("navigation.navigate_to_pose", "command.cancel", "command.query")
+CAPABILITY_DIGEST = "sha256:" + hashlib.sha256(
+    json.dumps(list(CAPABILITIES), sort_keys=True, separators=(",", ":")).encode()
+).hexdigest()
+BOOT_ID = "11111111-1111-4111-8111-111111111111"
+OBSERVATION_SESSION_ID = "observation-session-test"
+LOCALIZATION_EPOCH_ID = "localization-epoch-test"
+
+
+def command(command_id: str) -> ProtocolCommand:
+    issued = datetime.now(UTC)
+    return ProtocolCommand(
+        command_id=command_id,
+        robot_id="g1-dev",
+        kind="navigation.navigate_to_pose",
+        issued_at=issued,
+        ttl_ms=10_000,
+        params={
+            "goalPose": {"frameId": "map", "x": 1.0, "y": 2.0, "z": 0.0, "yaw": 0.0},
+            "observationSessionId": OBSERVATION_SESSION_ID,
+            "localizationEpochId": LOCALIZATION_EPOCH_ID,
+        },
+        payload_hash="a" * 64,
+    )
+
+
+def run_fake_agent(
+    websocket,
+    *,
+    terminal_delay: float = 0.05,
+    observation_status: str = "USABLE",
+    received_types: list[str] | None = None,
+    hello_payload_overrides: dict[str, object] | None = None,
+) -> None:
+    hello_payload = {
+        "agent_version": "test-agent",
+        "boot_id": BOOT_ID,
+        "supported_versions": ["1.0"],
+        "transport_mode": "client",
+        "capabilities_digest": CAPABILITY_DIGEST,
+    }
+    hello_payload.update(hello_payload_overrides or {})
+    websocket.send_text(build_message(
+        "session.hello",
+        robot_id="g1-dev",
+        session_id=None,
+        payload=hello_payload,
+    ))
+    welcome = parse_message(websocket.receive_text(), expected_robot_id="g1-dev")
+    session_id = welcome["session_id"]
+    assert welcome["type"] == "session.welcome"
+    websocket.send_text(build_message(
+        "control.status",
+        robot_id="g1-dev",
+        session_id=session_id,
+        payload={
+            "state": "SAFE_HOLD",
+            "reason": "new session requires control",
+            "lease_sequence": None,
+        },
+    ))
+    websocket.send_text(build_message(
+        "state.snapshot",
+        robot_id="g1-dev",
+        session_id=session_id,
+        payload={
+            "sequence": 0,
+            "observed_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            "state": {
+                "observation": {
+                    "status": observation_status,
+                    "sensor_id": "camera-test",
+                    "session_id": OBSERVATION_SESSION_ID,
+                    "scene_version": "scene-test",
+                    "localization_epoch_id": LOCALIZATION_EPOCH_ID,
+                    "ack_age_ms": 5.0,
+                    "capture_age_ms": 5.0,
+                    "drop_count": 0,
+                },
+                "localization": {
+                    "frame_id": "map",
+                    # Deliberately use a ROS/simulation-clock stamp.  Gateway
+                    # freshness must come from the UTC state-envelope time,
+                    # not from this unrelated clock domain.
+                    "stamp": {"sec": 0, "nanosec": 0},
+                    "position": {"x": 0.4, "y": -0.2, "z": 0.0},
+                    "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+                },
+            },
+        },
+    ))
+    while True:
+        incoming = parse_message(
+            websocket.receive_text(),
+            expected_robot_id="g1-dev",
+            expected_session_id=session_id,
+        )
+        if received_types is not None:
+            received_types.append(incoming["type"])
+        payload = incoming["payload"]
+        if incoming["type"] == "control.acquire":
+            websocket.send_text(build_message(
+                "control.status",
+                robot_id="g1-dev",
+                session_id=session_id,
+                payload={"state": "ACTIVE", "reason": "control acquired", "lease_sequence": None},
+            ))
+        elif incoming["type"] == "lease.renew":
+            websocket.send_text(build_message(
+                "lease.status",
+                robot_id="g1-dev",
+                session_id=session_id,
+                payload={
+                    "sequence": payload["sequence"],
+                    "expires_at": (datetime.now(UTC) + timedelta(seconds=2))
+                    .isoformat()
+                    .replace("+00:00", "Z"),
+                },
+            ))
+        elif incoming["type"] == "command.request":
+            command_id = payload["command_id"]
+            websocket.send_text(build_message(
+                "command.status",
+                robot_id="g1-dev",
+                session_id=session_id,
+                payload={
+                    "command_id": command_id,
+                    "state": "RUNNING",
+                    "detail": "mock Nav2 is moving",
+                    "progress": 0.25,
+                    "result": None,
+                },
+            ))
+            time.sleep(terminal_delay)
+            websocket.send_text(build_message(
+                "command.status",
+                robot_id="g1-dev",
+                session_id=session_id,
+                payload={
+                    "command_id": command_id,
+                    "state": "SUCCEEDED",
+                    "detail": "mock Nav2 reached the goal",
+                    "progress": 1.0,
+                    "result": {"goalReached": True},
+                },
+            ))
+            websocket.send_text(build_message(
+                "state.update",
+                robot_id="g1-dev",
+                session_id=session_id,
+                payload={
+                    "sequence": 1,
+                    "observed_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                    "changes": {"localization.position.x": 0.9},
+                },
+            ))
+            time.sleep(0.03)
+            websocket.send_text(build_message(
+                "state.update",
+                robot_id="g1-dev",
+                session_id=session_id,
+                payload={
+                    "sequence": 2,
+                    "observed_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                    "changes": {"localization.position.x": 0.9001},
+                },
+            ))
+            time.sleep(0.03)
+            websocket.send_text(build_message(
+                "state.update",
+                robot_id="g1-dev",
+                session_id=session_id,
+                payload={
+                    "sequence": 3,
+                    "observed_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                    "changes": {"localization.position.x": 0.9002},
+                },
+            ))
+        elif incoming["type"] == "session.goodbye":
+            return
+
+
+def test_inbound_gateway_accepts_agent_client_and_tracks_terminal_status() -> None:
+    peer = RobotAgentInboundPeer(
+        robot_id="g1-dev",
+        expected_capabilities_digest=CAPABILITY_DIGEST,
+        capabilities=CAPABILITIES,
+        allow_plaintext_loopback=True,
+        heartbeat=False,
+        terminal_pose_stable_seconds=0.02,
+        terminal_pose_max_wait_seconds=0.2,
+    )
+    with (
+        TestClient(create_app(peer, internal_token="test-token")) as client,
+        client.websocket_connect("/agent", subprotocols=[SUBPROTOCOL]) as websocket,
+    ):
+        agent = threading.Thread(target=run_fake_agent, args=(websocket,), daemon=True)
+        agent.start()
+        deadline = time.monotonic() + 1.0
+        while not peer.discover("g1-dev").get("available") and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert peer.discover("g1-dev")["robotBootId"] == BOOT_ID
+        deadline = time.monotonic() + 1.0
+        while (
+            peer.discover("g1-dev")["observation"]["status"] != "USABLE"
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        assert peer.discover("g1-dev")["observation"]["sessionId"] == (
+            OBSERVATION_SESSION_ID
+        )
+        current_pose = peer.discover("g1-dev")["currentPose"]
+        assert current_pose["frameId"] == "map"
+        assert current_pose["x"] == 0.4
+        assert current_pose["y"] == -0.2
+        assert current_pose["yaw"] == 0.0
+        assert peer.acquire("g1-dev")["state"] == "ACTIVE"
+        assert peer.renew("g1-dev", 1)["sequence"] == 0
+        command_id = str(uuid4())
+        first = peer.submit(command(command_id))
+        assert first.state == "RECEIVED"
+        deadline = time.monotonic() + 1.0
+        status = peer.query(command_id)
+        while (
+            status.state != "SUCCEEDED"
+            or status.result is None
+            or status.result.get("finalPoseRelation") != "stable_after_terminal"
+        ) and time.monotonic() < deadline:
+            time.sleep(0.01)
+            status = peer.query(command_id)
+        assert status.state == "SUCCEEDED"
+        assert status.result is not None
+        assert status.result["goalReached"] is True
+        assert status.result["finalPose"]["frameId"] == "map"
+        assert status.result["finalPose"]["x"] == 0.9002
+        assert status.result["finalPose"]["y"] == -0.2
+        assert status.result["finalPose"]["observedAt"]
+        assert status.result["finalPoseRelation"] == "stable_after_terminal"
+        # Repeated dispatch is a ledger lookup, never a second robot request.
+        assert peer.submit(command(command_id)) == status
+        peer.close()
+        agent.join(timeout=1)
+
+
+def test_inbound_gateway_validates_v2_manifest_and_derives_capabilities() -> None:
+    profile = RobotProfile.build(
+        robotId="g1-dev",
+        baseType="differential_drive",
+        headMotion="fixed",
+        sensors=[
+            SensorProfile(
+                sensorId="head_rgbd",
+                kind=SensorKind.RGBD,
+                frameId="camera_color_optical_frame",
+                fixedMount=True,
+                horizontalFovRad=1.211,
+                depthCapable=True,
+            )
+        ],
+        metadata={"motionOwner": "robot_agent"},
+    )
+    manifest = CapabilityManifest.build(
+        robotId="g1-dev",
+        agentVersion="0.2.0",
+        robotProfileDigest=profile.profileDigest,
+        capabilities=[
+            CapabilityDescriptor(
+                skillId="navigation.rotate",
+                skillVersion="2.0.0",
+                description="Rotate through Nav2 Spin",
+                kind=CapabilityKind.MOTION,
+                riskLevel=RiskLevel.MEDIUM,
+                inputSchema={
+                    "type": "object",
+                    "properties": {"targetYawRad": {"type": "number"}},
+                    "required": ["targetYawRad"],
+                    "additionalProperties": False,
+                },
+                resources=["motion", "navigation"],
+                cancellable=True,
+                interruptible=True,
+                timeoutMs=60_000,
+                executor="nav2",
+                executorProfile="nav2.behaviors.spin",
+            )
+        ],
+    )
+    peer = RobotAgentInboundPeer(
+        robot_id="g1-dev",
+        expected_capabilities_digest=None,
+        capabilities=(),
+        allow_plaintext_loopback=True,
+        heartbeat=False,
+    )
+    with (
+        TestClient(create_app(peer, internal_token="test-token")) as client,
+        client.websocket_connect("/agent", subprotocols=[SUBPROTOCOL]) as websocket,
+    ):
+        agent = threading.Thread(
+            target=run_fake_agent,
+            args=(websocket,),
+            kwargs={
+                "hello_payload_overrides": {
+                    "agent_version": "0.2.0",
+                    "capabilities_digest": manifest.manifestDigest,
+                    "robot_profile": profile.model_dump(mode="json"),
+                    "capability_manifest": manifest.model_dump(mode="json"),
+                }
+            },
+            daemon=True,
+        )
+        agent.start()
+        deadline = time.monotonic() + 1.0
+        snapshot = peer.discover("g1-dev")
+        while not snapshot.get("available") and time.monotonic() < deadline:
+            time.sleep(0.01)
+            snapshot = peer.discover("g1-dev")
+        assert snapshot["capabilities"] == ["navigation.rotate"]
+        assert snapshot["robotProfile"]["headMotion"] == "fixed"
+        assert snapshot["capabilityManifest"]["manifestDigest"] == (
+            manifest.manifestDigest
+        )
+        peer.close()
+        agent.join(timeout=1)
+
+
+def test_inbound_gateway_rejects_degraded_observation_without_dispatch() -> None:
+    peer = RobotAgentInboundPeer(
+        robot_id="g1-dev",
+        expected_capabilities_digest=CAPABILITY_DIGEST,
+        capabilities=CAPABILITIES,
+        allow_plaintext_loopback=True,
+        heartbeat=False,
+        observation_preflight_timeout_seconds=0.1,
+    )
+    received_types: list[str] = []
+    with (
+        TestClient(create_app(peer, internal_token="test-token")) as client,
+        client.websocket_connect("/agent", subprotocols=[SUBPROTOCOL]) as websocket,
+    ):
+        agent = threading.Thread(
+            target=run_fake_agent,
+            args=(websocket,),
+            kwargs={
+                "observation_status": "DEGRADED",
+                "received_types": received_types,
+            },
+            daemon=True,
+        )
+        agent.start()
+        deadline = time.monotonic() + 1.0
+        while (
+            peer.connection_snapshot()["observation"]["status"] != "DEGRADED"
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        assert peer.acquire("g1-dev")["state"] == "ACTIVE"
+
+        status = peer.submit(command(str(uuid4())))
+
+        assert status.state == "REJECTED"
+        assert "status is not USABLE" in status.detail
+        assert "command.request" not in received_types
+        peer.close()
+        agent.join(timeout=1)
+
+
+def test_inbound_gateway_rejects_unexpected_capability_digest() -> None:
+    peer = RobotAgentInboundPeer(
+        robot_id="g1-dev",
+        expected_capabilities_digest="sha256:" + "0" * 64,
+        capabilities=CAPABILITIES,
+        allow_plaintext_loopback=True,
+        heartbeat=False,
+    )
+    with (
+        TestClient(create_app(peer, internal_token="test-token")) as client,
+        client.websocket_connect("/agent", subprotocols=[SUBPROTOCOL]) as websocket,
+    ):
+        websocket.send_text(build_message(
+                "session.hello",
+                robot_id="g1-dev",
+                session_id=None,
+                payload={
+                    "agent_version": "test-agent",
+                    "boot_id": BOOT_ID,
+                    "supported_versions": ["1.0"],
+                    "transport_mode": "client",
+                    "capabilities_digest": CAPABILITY_DIGEST,
+                },
+        ))
+        try:
+            websocket.receive_text()
+        except (RuntimeError, WebSocketDisconnect):
+            pass
+        snapshot = peer.connection_snapshot()
+        assert snapshot["connected"] is False
+        assert "digest mismatch" in (snapshot["lastError"] or "")

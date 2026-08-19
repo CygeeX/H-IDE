@@ -46,18 +46,93 @@ def test_duplicate_id_or_idempotency_returns_original_without_dispatch():
     assert len(adapter.dispatches) == 1
 
 
+def test_payload_schema_is_enforced_before_adapter_dispatch():
+    adapter = FakeAdapter()
+    runtime = ActionRuntime(adapters={"fake": adapter})
+    bad_request = request().model_copy(update={"payload": {"unexpected": True}})
+    strict_definition = CommandDefinition(
+        commandKey="move.forward",
+        commandVersion="1",
+        transports=["fake"],
+        payloadSchema={"type": "object", "additionalProperties": False},
+    )
+    receipt = runtime.dispatch(bad_request, strict_definition, mapping())
+    assert receipt.status.value == "rejected"
+    assert "does not match schema" in (receipt.error or "")
+    assert adapter.dispatches == []
+
+
 def test_cancel_and_unknown_result_are_safe():
     adapter = FakeAdapter(result=AdapterResult(status="unknown"))
     runtime = ActionRuntime(adapters={"fake": adapter})
     receipt = runtime.dispatch(request(), definition(), mapping())
-    assert receipt.status.value == "failed"
+    assert receipt.status.value == "unknown"
     assert "unknown" in (receipt.error or "")
+    blocked = runtime.dispatch(
+        request("after-unknown", "after-unknown"),
+        definition(),
+        mapping("move.forward", "v2"),
+    )
+    assert blocked.status.value == "rejected"
+    assert "safety barrier" in (blocked.error or "")
 
     adapter2 = FakeAdapter(result=AdapterResult(status="running"))
     runtime2 = ActionRuntime(adapters={"fake": adapter2})
     runtime2.dispatch(request(), definition(), mapping())
     cancelled = runtime2.cancel("c1")
     assert cancelled.status.value == "cancelled"
+
+
+def test_reconcile_advances_running_command_without_replaying_dispatch():
+    class ReconcileAdapter(FakeAdapter):
+        def __init__(self):
+            super().__init__(result=AdapterResult(status="running"))
+            self.queries = 0
+
+        def query(self, command_id):
+            self.queries += 1
+            if self.queries == 1:
+                return AdapterResult(status="running")
+            return AdapterResult(status="succeeded", result={"goalReached": True})
+
+    adapter = ReconcileAdapter()
+    runtime = ActionRuntime(adapters={"fake": adapter})
+    assert runtime.dispatch(request(), definition(), mapping()).status.value == "running"
+    assert runtime.reconcile("c1").status.value == "running"
+    final = runtime.reconcile("c1")
+    assert final.status.value == "succeeded"
+    assert final.result["goalReached"] is True
+    assert len(adapter.dispatches) == 1
+
+
+def test_reconcile_unavailable_keeps_command_running_until_fail_closed_deadline():
+    class UnavailableQuery(FakeAdapter):
+        def query(self, command_id):
+            return AdapterResult(status="unavailable", error="gateway reconnecting")
+
+    adapter = UnavailableQuery(result=AdapterResult(status="running"))
+    runtime = ActionRuntime(adapters={"fake": adapter})
+    runtime.dispatch(request(), definition(), mapping())
+    assert runtime.reconcile("c1").status.value == "running"
+    assert "c1" in runtime._inflight
+
+
+def test_reconcile_preserves_robot_agent_rejected_and_expired_states():
+    class TerminalQuery(FakeAdapter):
+        def __init__(self, terminal):
+            super().__init__(result=AdapterResult(status="running"))
+            self.terminal = terminal
+
+        def query(self, command_id):
+            return AdapterResult(status=self.terminal, error=f"robot {self.terminal}")
+
+    for expected, terminal in (("rejected", "rejected"), ("expired", "expired")):
+        adapter = TerminalQuery(terminal)
+        runtime = ActionRuntime(adapters={"fake": adapter})
+        assert runtime.dispatch(request(), definition(), mapping()).status.value == "running"
+        receipt = runtime.reconcile("c1")
+        assert receipt.status.value == expected
+        assert terminal in (receipt.error or "")
 
 
 def test_expired_motion_lease_cancels_adapter_and_publishes_safety_stop():

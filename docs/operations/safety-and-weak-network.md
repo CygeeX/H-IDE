@@ -46,6 +46,9 @@ degraded}` 才放行；缺失、类型错误或未知状态一律 fail-closed。
   audit 和 Agent 草案状态都能恢复。
 - 场景转换、视频帧、ASR/规划服务的超时或崩溃只能显示 stale/degraded UI，不能
   拦截或替代 `stop`/`cancel`。
+- 相对/语义/选点导航草案确认前会重新读取场景绑定和机器人位姿。绑定 revision
+  改变，或位姿漂移超过配置的平移/yaw 阈值时必须重新规划，不能把旧草案直接
+  重试到当前地图。
 
 ## 映射变更安全流程
 
@@ -74,12 +77,14 @@ adapter 日志和机器人侧日志：
 | 租约过期 | 缩短测试 lease 或阻断回执 | receipt=`expired`，尝试 cancel，安全 barrier 生效 |
 | 重复/乱序 | 重发相同幂等键、延迟旧事件 | 只一次 dispatch；PWA 按 eventId 去重并可从 cursor 重放 |
 | 场景/视频故障 | 停 worker、丢 ZMQ 帧、阻断 WebRTC | 画面/场景 stale，stop/cancel 成功路径不受影响 |
+| 场景/位姿漂移 | 规划后切换绑定 revision 或移动 Fake/真机位姿 | confirm 返回冲突，零 adapter dispatch，重新规划 |
 | 急停 | 真机物理 E-stop | 远程动作被拒绝；必须现场复位并重新确认，软件不得代替复位 |
 
 `tests/test_end_to_end.py` 覆盖其中的可自动化部分：统一 runtime、v1/v2 切换与
 回滚、重复/过期、重启/VPN 失败不重放、任务故障下 stop/cancel、严格安全状态和
-损坏 pointer 恢复。真机急停、DDS/5G 断链和实际 PDAL/WebRTC 仍需在部署环境做
-现场演练。
+损坏 pointer 恢复。PCD/空间闭环的工具链与使用说明见
+[`../architecture/pcd-scene-spatial-agent.md`](../architecture/pcd-scene-spatial-agent.md)。
+真机急停、DDS/5G 断链和实际 PDAL/WebRTC 仍需在部署环境做现场演练。
 
 ## 事件与审计检查
 

@@ -1,0 +1,15 @@
+:8080 {
+	@scene path \
+		/api/v1/scene-* \
+		/api/v1/scenes \
+		/api/v1/scenes/* \
+		/api/v1/robots/*/scene-binding \
+		/scene-assets/*
+	handle @scene {
+		reverse_proxy scene-api:8090
+	}
+
+	handle {
+		reverse_proxy control-api:8080
+	}
+}

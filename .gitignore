@@ -11,5 +11,6 @@ dist/
 .env.*
 !.env.example
 data/
+models/
 *.db
 .DS_Store

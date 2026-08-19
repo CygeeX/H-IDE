@@ -1,0 +1,27 @@
+[Unit]
+Description=Local whisper.cpp speech transcription server
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=whisper
+Group=whisper
+EnvironmentFile=/etc/robot-action-console/whisper.env
+Environment=WHISPER_HOST=127.0.0.1
+Environment=WHISPER_PORT=8081
+ExecStart=/opt/whisper.cpp/build/bin/whisper-server --host ${WHISPER_HOST} --port ${WHISPER_PORT} --model ${WHISPER_MODEL_PATH}
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=20s
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/opt/whisper.cpp /var/lib/whisper
+
+[Install]
+WantedBy=multi-user.target

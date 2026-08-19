@@ -5,9 +5,11 @@ from __future__ import annotations
 from datetime import datetime
 from enum import Enum
 import copy
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_serializer, model_validator
+
+from packages.scene_core.models import PoseMap
 
 from .validation import (
     CLOCK_SKEW,
@@ -63,6 +65,7 @@ class CommandStatus(_ValueEnum):
     CANCELLED = "cancelled"
     EXPIRED = "expired"
     REJECTED = "rejected"
+    UNKNOWN = "unknown"
 
 
 class RobotStatus(_ValueEnum):
@@ -215,6 +218,7 @@ class PlanStep(ContractModel):
 
 
 class PlanDraft(ContractModel):
+    planType: Literal["action"] = "action"
     planId: str = Field(..., alias="plan_id")
     robotId: str = Field(..., alias="robot_id")
     steps: list[PlanStep] = Field(..., min_length=1, max_length=100)
@@ -286,6 +290,7 @@ class RobotState(ContractModel):
     connected: bool = True
     lastSeenAt: datetime | None = Field(default=None, alias="last_seen_at")
     safetyMode: SafetyMode = Field(default=SafetyMode.NORMAL, alias="safety_mode")
+    pose: PoseMap | None = None
     details: dict[str, Any] = Field(default_factory=dict, validate_default=True)
 
     @field_validator("robotId")
@@ -302,6 +307,13 @@ class RobotState(ContractModel):
     @classmethod
     def _details(cls, value):
         return freeze_json_object(value)
+
+    @model_serializer(mode="wrap")
+    def _serialize_without_absent_pose(self, handler):
+        serialized = handler(self)
+        if self.pose is None:
+            serialized.pop("pose", None)
+        return serialized
 
 
 class CapabilitySnapshot(ContractModel):

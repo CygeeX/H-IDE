@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:h-ide:robot-navigation:v1:normalized-feedback",
+  "title": "Robot Agent normalized navigation feedback",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["commandId", "state", "detail", "progress", "result"],
+  "properties": {
+    "commandId": { "type": "string", "format": "uuid" },
+    "state": {
+      "enum": [
+        "ACCEPTED",
+        "RUNNING",
+        "SUCCEEDED",
+        "FAILED",
+        "CANCELLED",
+        "REJECTED",
+        "TIMED_OUT",
+        "ABORTED_AGENT_RESTART",
+        "UNKNOWN"
+      ]
+    },
+    "detail": { "type": "string", "maxLength": 2048 },
+    "progress": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+    "result": {
+      "type": ["object", "null"],
+      "additionalProperties": true,
+      "properties": {
+        "executionBackend": { "type": "string" },
+        "motion": { "enum": ["simulated", "physical", "not_validated"] },
+        "robotAgentCommandId": { "type": "string", "format": "uuid" },
+        "rosGoalId": { "type": ["string", "null"] },
+        "feedbackAgeMs": { "type": ["number", "null"], "minimum": 0 },
+        "remainingDistanceM": { "type": ["number", "null"], "minimum": 0 },
+        "nav2ErrorCode": { "type": ["integer", "null"] },
+        "finalPose": { "type": ["object", "null"] }
+      }
+    }
+  }
+}

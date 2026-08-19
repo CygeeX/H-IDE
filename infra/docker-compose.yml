@@ -10,8 +10,40 @@ services:
       CONTROL_DB_PATH: /data/control.db
       REDIS_URL: redis://redis:6379/0
       DATABASE_URL: postgresql://control:control@postgres:5432/control
-    ports:
-      - "${CONTROL_API_PORT:-8080}:8080"
+      MASTRA_PLANNING_URL: ${MASTRA_COMPOSE_PLANNING_URL:-http://planning-agent:4111}
+      MASTRA_INTERNAL_TOKEN: ${MASTRA_INTERNAL_TOKEN:-dev-internal-token}
+      MASTRA_PLANNING_TIMEOUT_SECONDS: ${MASTRA_PLANNING_TIMEOUT_SECONDS:-120}
+      ASSISTANT_DRAFT_TTL_SECONDS: ${ASSISTANT_DRAFT_TTL_SECONDS:-900}
+      SCENE_API_INTERNAL_URL: http://scene-api:8090
+      SCENE_API_INTERNAL_TOKEN: ${SCENE_API_INTERNAL_TOKEN:-dev-scene-internal-token}
+      SCENE_API_TIMEOUT_SECONDS: ${SCENE_API_TIMEOUT_SECONDS:-3}
+      SPATIAL_CONFIRM_TRANSLATION_DRIFT_METERS: ${SPATIAL_CONFIRM_TRANSLATION_DRIFT_METERS:-0.5}
+      SPATIAL_CONFIRM_YAW_DRIFT_RADIANS: ${SPATIAL_CONFIRM_YAW_DRIFT_RADIANS:-0.35}
+      WHISPER_ENDPOINT: ${WHISPER_COMPOSE_ENDPOINT:-http://whisper:8080/inference}
+      WHISPER_TIMEOUT_SECONDS: ${WHISPER_TIMEOUT_SECONDS:-45}
+      VISUAL_MISSION_MODE: ${VISUAL_MISSION_MODE:-observe}
+      HIDE_VISION_URL: ${HIDE_VISION_COMPOSE_URL:-http://h-ide-vision:8092}
+      HIDE_VISION_AGENT_TOKEN: ${HIDE_VISION_AGENT_TOKEN:-dev-agent-token}
+      HIDE_VISION_CONTROL_TOKEN: ${HIDE_VISION_CONTROL_TOKEN:-dev-control-token}
+      HIDE_VISION_SOURCE_MODE: ${HIDE_VISION_SOURCE_MODE:-synthetic}
+      HIDE_VISION_SENSOR_IDS: ${HIDE_VISION_SENSOR_IDS:-head_rgbd}
+      HIDE_VISION_TASK_TIMEOUT_SECONDS: ${HIDE_VISION_TASK_TIMEOUT_SECONDS:-130}
+      # Audit pins must describe the providers that are actually running.
+      # Qwen is opt-in together with its credential; the safe development
+      # defaults match the current Mastra/FakeVLM services instead of falsely
+      # labelling fixture evidence as cloud inference.
+      HIDE_MISSION_TEXT_PROVIDER: ${HIDE_MISSION_TEXT_PROVIDER:-deepseek}
+      HIDE_MISSION_TEXT_MODEL: ${HIDE_MISSION_TEXT_MODEL:-deepseek-v4-flash}
+      HIDE_MISSION_VISION_PROVIDER: ${HIDE_MISSION_VISION_PROVIDER:-fake}
+      HIDE_MISSION_VISION_MODEL: ${HIDE_MISSION_VISION_MODEL:-fake-fixture-v1}
+      ROBOT_AGENT_GATEWAY_ENABLED: ${ROBOT_AGENT_GATEWAY_ENABLED:-false}
+      ROBOT_AGENT_GATEWAY_URL: http://robot-agent-gateway:8093
+      ROBOT_AGENT_GATEWAY_TOKEN: ${ROBOT_AGENT_GATEWAY_TOKEN:-dev-gateway-token}
+      ROBOT_AGENT_ID: ${ROBOT_AGENT_ID:-robot-1}
+      ROBOT_AGENT_LOCALIZATION_EPOCH_ID: ${ROBOT_AGENT_LOCALIZATION_EPOCH_ID:-}
+      MISSION_V2_CURRENT_POSE_MAX_AGE_SECONDS: ${MISSION_V2_CURRENT_POSE_MAX_AGE_SECONDS:-2}
+    expose:
+      - "8080"
     volumes:
       - control-data:/data
     depends_on:
@@ -19,9 +51,240 @@ services:
         condition: service_healthy
       redis:
         condition: service_started
+      robot-agent-gateway:
+        condition: service_started
     restart: unless-stopped
     # The ROS 2 adapter remains an optional host-network deployment. Do not
     # expose DDS discovery or rosbridge to the browser network.
+
+  gateway:
+    image: caddy:2.10.2-alpine
+    ports:
+      - "${CONTROL_API_PORT:-8080}:8080"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on:
+      control-api:
+        condition: service_started
+      scene-api:
+        # Do not make the control gateway's startup depend on optional scene
+        # readiness; scene failures must not remove stop/cancel access.
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+    restart: unless-stopped
+
+  scene-api:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.scene-api
+    environment:
+      SCENE_API_DB: /scene-data/scene.sqlite3
+      SCENE_STORAGE_ROOT: /scene-data
+      SCENE_API_TOKEN: ${CONTROL_API_TOKEN:-dev-token}
+      SCENE_API_INTERNAL_TOKEN: ${SCENE_API_INTERNAL_TOKEN:-dev-scene-internal-token}
+      SCENE_MAX_UPLOAD_BYTES: ${SCENE_MAX_UPLOAD_BYTES:-2147483648}
+      SCENE_UPLOAD_CHUNK_SIZE: ${SCENE_UPLOAD_CHUNK_SIZE:-8388608}
+      SCENE_DISK_RESERVE_BYTES: ${SCENE_DISK_RESERVE_BYTES:-1073741824}
+      SCENE_ASSET_COOKIE_SECURE: ${SCENE_ASSET_COOKIE_SECURE:-false}
+      SCENE_TARGET_CLEARANCE_METERS: ${SCENE_TARGET_CLEARANCE_METERS:-0.35}
+    expose:
+      - "8090"
+    # Loopback publication is only for the optional host-network ROS 2
+    # control-api profile. Browsers still use the same-origin Caddy gateway.
+    ports:
+      - "127.0.0.1:${SCENE_API_PORT:-8090}:8090"
+    volumes:
+      - scene-data:/scene-data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/readyz', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+    restart: unless-stopped
+
+  scene-worker:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.scene-worker
+    environment:
+      SCENE_API_INTERNAL_URL: http://scene-api:8090
+      SCENE_API_INTERNAL_TOKEN: ${SCENE_API_INTERNAL_TOKEN:-dev-scene-internal-token}
+      SCENE_STORAGE_ROOT: /scene-data
+      SCENE_JOB_LEASE_SECONDS: ${SCENE_JOB_LEASE_SECONDS:-300}
+      SCENE_JOB_POLL_SECONDS: ${SCENE_JOB_POLL_SECONDS:-2}
+      SCENE_COMMAND_TIMEOUT_SECONDS: ${SCENE_COMMAND_TIMEOUT_SECONDS:-3600}
+    volumes:
+      - scene-data:/scene-data
+    depends_on:
+      scene-api:
+        condition: service_healthy
+    cpus: ${SCENE_WORKER_CPUS:-2.0}
+    mem_limit: ${SCENE_WORKER_MEMORY:-4g}
+    pids_limit: 256
+    restart: unless-stopped
+
+  planning-agent:
+    build:
+      context: ../../h-ide-agent
+      dockerfile: Dockerfile
+    environment:
+      HOST: 0.0.0.0
+      PORT: 4111
+      MASTRA_INTERNAL_TOKEN: ${MASTRA_INTERNAL_TOKEN:-dev-internal-token}
+      SUPERVISOR_MODEL: ${SUPERVISOR_MODEL:-alibaba-cn/qwen3.8-max}
+      WORKER_MODEL: ${WORKER_MODEL:-alibaba-cn/qwen3.8-max}
+      STRUCTURING_MODEL: ${STRUCTURING_MODEL:-alibaba-cn/qwen3.8-max}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GOOGLE_GENERATIVE_AI_API_KEY: ${GOOGLE_GENERATIVE_AI_API_KEY:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY:-}
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+      PLANNING_DATABASE_URL: file:/app/data/planning.db
+      MASTRA_MEMORY_URL: file:/app/data/memory.db
+      A2A_ALLOWED_ORIGINS: ${A2A_ALLOWED_ORIGINS:-}
+      A2A_WORKERS_JSON: '${A2A_WORKERS_JSON:-[]}'
+      HIDE_VISION_URL: ${HIDE_VISION_COMPOSE_URL:-http://h-ide-vision:8092}
+      HIDE_VISION_AGENT_TOKEN: ${HIDE_VISION_AGENT_TOKEN:-dev-agent-token}
+      HIDE_VISION_SOURCE_MODE: ${HIDE_VISION_SOURCE_MODE:-synthetic}
+      HIDE_VISION_SENSOR_IDS: ${HIDE_VISION_SENSOR_IDS:-head_rgbd}
+      HIDE_VISION_VLM_PROVIDER: ${HIDE_VISION_VLM_PROVIDER:-FakeVlmProvider}
+      HIDE_VISION_VLM_MODEL: ${HIDE_VISION_VLM_MODEL:-fake-fixture-v1}
+      HIDE_VISION_PROMPT_VERSION: ${HIDE_VISION_PROMPT_VERSION:-visual-grounding-v1}
+      HIDE_VISION_ALGORITHM_VERSION: ${HIDE_VISION_ALGORITHM_VERSION:-rgbd-median-v1}
+      HIDE_VISION_APPROACH_POLICY_VERSION: ${HIDE_VISION_APPROACH_POLICY_VERSION:-v1}
+      HIDE_VISION_APPROACH_POLICY_SHA256: ${HIDE_VISION_APPROACH_POLICY_SHA256:-a97bcf51b108b7c5c5241a82e2710eadb2619f12a1aba6e328d77b5474f35fc0}
+    ports:
+      - "127.0.0.1:${MASTRA_PORT:-4111}:4111"
+    volumes:
+      - planning-data:/app/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4111/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 20s
+    restart: unless-stopped
+
+  # CPU fixture/API profile. The real SAM 2 GPU profile stays in the host
+  # Python 3.11 environment until NVIDIA container support is accepted.
+  h-ide-vision:
+    build:
+      context: ../../h-ide-vision
+      dockerfile: Dockerfile
+    environment:
+      HIDE_VISION_HOST: 0.0.0.0
+      HIDE_VISION_HTTP_PORT: 8092
+      # The default remains loopback for the in-container fixture.  The local
+      # Robot Agent integration profile overrides this to 0.0.0.0 and publishes
+      # the port on workstation loopback so its observation sidecar can connect.
+      HIDE_VISION_GRPC_HOST: ${HIDE_VISION_GRPC_HOST:-127.0.0.1}
+      HIDE_VISION_GRPC_PORT: 50061
+      HIDE_VISION_DATABASE_PATH: /data/h-ide-vision.sqlite3
+      HIDE_VISION_EVIDENCE_DIR: /data/evidence
+      HIDE_VISION_VLM_PROVIDER: ${HIDE_VISION_RUNTIME_VLM_PROVIDER:-fake}
+      HIDE_VISION_SEGMENTATION_PROVIDER: ${HIDE_VISION_SEGMENTATION_PROVIDER:-box}
+      HIDE_VISION_QWEN_BASE_URL: ${HIDE_VISION_QWEN_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
+      HIDE_VISION_QWEN_MODEL: ${HIDE_VISION_VLM_MODEL:-fake-fixture-v1}
+      HIDE_VISION_STABLE_FRAME_WAIT_SECONDS: ${HIDE_VISION_STABLE_FRAME_WAIT_SECONDS:-1}
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+      HIDE_VISION_AGENT_TOKEN: ${HIDE_VISION_AGENT_TOKEN:-dev-agent-token}
+      HIDE_VISION_CONTROL_TOKEN: ${HIDE_VISION_CONTROL_TOKEN:-dev-control-token}
+      HIDE_VISION_ALLOW_INSECURE_LOOPBACK: "true"
+    expose:
+      - "8092"
+    ports:
+      - "127.0.0.1:${HIDE_VISION_PORT:-8092}:8092"
+      - "127.0.0.1:${HIDE_VISION_GRPC_PORT:-50061}:50061"
+      # Optional loopback relay port used when a host-side Robot Agent must
+      # reach the container's loopback-only plaintext gRPC listener.
+      - "127.0.0.1:${HIDE_VISION_GRPC_PROXY_PORT:-50062}:50062"
+    volumes:
+      - vision-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8092/healthz', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 15s
+    restart: unless-stopped
+
+  h-ide-vision-fixture:
+    profiles: ["visual-fixture"]
+    build:
+      context: ../../h-ide-vision
+      dockerfile: Dockerfile
+    network_mode: "service:h-ide-vision"
+    command:
+      - python
+      - tools/observation_fixture_sender.py
+      - --endpoint
+      - 127.0.0.1:50061
+      - --continuous
+      - --interval-seconds
+      - "0.4"
+    depends_on:
+      h-ide-vision:
+        condition: service_healthy
+    restart: unless-stopped
+
+  robot-agent-gateway:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.robot-agent-gateway
+    environment:
+      ROBOT_AGENT_GATEWAY_TOKEN: ${ROBOT_AGENT_GATEWAY_TOKEN:-dev-gateway-token}
+      ROBOT_AGENT_GATEWAY_BACKEND: ${ROBOT_AGENT_GATEWAY_BACKEND:-unavailable}
+      ROBOT_AGENT_WS_URL: ${ROBOT_AGENT_WS_URL:-}
+      ROBOT_AGENT_ID: ${ROBOT_AGENT_ID:-g1-dev}
+      ROBOT_AGENT_CAPABILITIES_DIGEST: ${ROBOT_AGENT_CAPABILITIES_DIGEST:-}
+      ROBOT_AGENT_CAPABILITIES: ${ROBOT_AGENT_CAPABILITIES:-navigation.navigate_to_pose,navigation.rotate,power.enable,task.execute}
+      ROBOT_AGENT_ALLOW_PLAINTEXT_LOOPBACK: ${ROBOT_AGENT_ALLOW_PLAINTEXT_LOOPBACK:-false}
+      ROBOT_AGENT_ALLOWED_PEER_HOSTS: ${ROBOT_AGENT_ALLOWED_PEER_HOSTS:-}
+      ROBOT_AGENT_OBSERVATION_PREFLIGHT_TIMEOUT_SECONDS: ${ROBOT_AGENT_OBSERVATION_PREFLIGHT_TIMEOUT_SECONDS:-2}
+      ROBOT_AGENT_OBSERVATION_PREFLIGHT_MAX_AGE_MS: ${ROBOT_AGENT_OBSERVATION_PREFLIGHT_MAX_AGE_MS:-400}
+      ROBOT_AGENT_TLS_CA: ${ROBOT_AGENT_TLS_CA:-}
+      ROBOT_AGENT_TLS_CERT: ${ROBOT_AGENT_TLS_CERT:-}
+      ROBOT_AGENT_TLS_KEY: ${ROBOT_AGENT_TLS_KEY:-}
+      VISUAL_MISSION_MODE: ${VISUAL_MISSION_MODE:-observe}
+      VISUAL_MISSION_COMMAND_POLL_SECONDS: ${VISUAL_MISSION_COMMAND_POLL_SECONDS:-0.25}
+    expose:
+      - "8093"
+    ports:
+      - "127.0.0.1:${ROBOT_AGENT_GATEWAY_PORT:-8093}:8093"
+    # The inbound client profile is intentionally loopback-only. A Robot Agent
+    # running directly on this Linux host cannot reach a container through the
+    # container's own 127.0.0.1; run this Gateway service on the host for the
+    # first local integration, or give Robot Agent an explicit bridge address.
+    restart: unless-stopped
+
+  # Optional real local speech-to-text service. Put the selected ggml model in
+  # WHISPER_MODEL_DIR before enabling the `speech` profile.
+  whisper:
+    profiles: ["speech"]
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.whisper
+      args:
+        WHISPER_CPP_VERSION: ${WHISPER_CPP_VERSION:-v1.9.2}
+    command:
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --model
+      - /models/${WHISPER_MODEL_NAME:-ggml-small.bin}
+    ports:
+      - "127.0.0.1:${WHISPER_PORT:-8081}:8080"
+    volumes:
+      - ${WHISPER_MODEL_DIR:-../models}:/models:ro
+    restart: unless-stopped
 
   # Provisioned for the PostgreSQL repository/event-fanout profile. The
   # runnable local API currently uses SQLite through CONTROL_DB_PATH; keeping
@@ -56,6 +319,26 @@ services:
     environment:
       CONTROL_API_TOKEN: ${CONTROL_API_TOKEN:-dev-token}
       CONTROL_DB_PATH: /data/control.db
+      MASTRA_PLANNING_URL: ${MASTRA_HOST_PLANNING_URL:-http://127.0.0.1:4111}
+      MASTRA_INTERNAL_TOKEN: ${MASTRA_INTERNAL_TOKEN:-dev-internal-token}
+      MASTRA_PLANNING_TIMEOUT_SECONDS: ${MASTRA_PLANNING_TIMEOUT_SECONDS:-120}
+      ASSISTANT_DRAFT_TTL_SECONDS: ${ASSISTANT_DRAFT_TTL_SECONDS:-900}
+      SCENE_API_INTERNAL_URL: ${SCENE_API_HOST_INTERNAL_URL:-http://127.0.0.1:8090}
+      SCENE_API_INTERNAL_TOKEN: ${SCENE_API_INTERNAL_TOKEN:-dev-scene-internal-token}
+      SCENE_API_TIMEOUT_SECONDS: ${SCENE_API_TIMEOUT_SECONDS:-3}
+      SPATIAL_CONFIRM_TRANSLATION_DRIFT_METERS: ${SPATIAL_CONFIRM_TRANSLATION_DRIFT_METERS:-0.5}
+      SPATIAL_CONFIRM_YAW_DRIFT_RADIANS: ${SPATIAL_CONFIRM_YAW_DRIFT_RADIANS:-0.35}
+      WHISPER_ENDPOINT: ${WHISPER_HOST_ENDPOINT:-http://127.0.0.1:8081/inference}
+      WHISPER_TIMEOUT_SECONDS: ${WHISPER_TIMEOUT_SECONDS:-45}
+      HIDE_VISION_URL: ${HIDE_VISION_HOST_URL:-http://127.0.0.1:8092}
+      HIDE_VISION_AGENT_TOKEN: ${HIDE_VISION_AGENT_TOKEN:-dev-agent-token}
+      HIDE_VISION_SOURCE_MODE: ${HIDE_VISION_SOURCE_MODE:-live}
+      HIDE_VISION_SENSOR_IDS: ${HIDE_VISION_SENSOR_IDS:-head_rgbd}
+      HIDE_VISION_TASK_TIMEOUT_SECONDS: ${HIDE_VISION_TASK_TIMEOUT_SECONDS:-130}
+      HIDE_MISSION_TEXT_PROVIDER: ${HIDE_MISSION_TEXT_PROVIDER:-dashscope}
+      HIDE_MISSION_TEXT_MODEL: ${HIDE_MISSION_TEXT_MODEL:-qwen3.8-max}
+      HIDE_MISSION_VISION_PROVIDER: ${HIDE_MISSION_VISION_PROVIDER:-dashscope}
+      HIDE_MISSION_VISION_MODEL: ${HIDE_MISSION_VISION_MODEL:-qwen3-vl-plus}
     network_mode: host
     volumes:
       - control-data:/data
@@ -64,5 +347,8 @@ services:
 
 volumes:
   control-data:
+  planning-data:
+  vision-data:
   postgres-data:
   redis-data:
+  scene-data:

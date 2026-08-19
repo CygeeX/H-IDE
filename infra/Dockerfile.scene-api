@@ -1,0 +1,21 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+WORKDIR /app
+
+COPY pyproject.toml ./
+COPY packages/ ./packages/
+COPY services/ ./services/
+RUN pip install --no-cache-dir .
+
+RUN groupadd --gid 20002 scene \
+    && useradd --uid 10002 --gid scene --create-home scene \
+    && mkdir -p /scene-data \
+    && chown -R scene:scene /app /scene-data
+
+USER scene
+ENV SCENE_API_DB=/scene-data/scene.sqlite3 SCENE_STORAGE_ROOT=/scene-data
+EXPOSE 8090
+HEALTHCHECK --interval=10s --timeout=3s --retries=6 --start-period=10s \
+  CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/readyz', timeout=2)"]
+CMD ["uvicorn", "services.scene_api.main:app", "--host", "0.0.0.0", "--port", "8090", "--workers", "1"]
