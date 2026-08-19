@@ -511,7 +511,9 @@ def test_mission_runtime_does_not_issue_dependent_navigation_early() -> None:
         runtime.issue_skill("plan-1", "approach", {"goalPose": {}})
 
 
-def test_restart_suspends_in_flight_mission_without_replay(tmp_path) -> None:
+def test_restart_terminalizes_in_flight_workstation_observation_without_replay(
+    tmp_path,
+) -> None:
     path = str(tmp_path / "mission.db")
     store = SQLiteStore(path)
     runtime = MissionRuntime(store)
@@ -525,10 +527,15 @@ def test_restart_suspends_in_flight_mission_without_replay(tmp_path) -> None:
     recovered = restarted_store.get_mission("plan-1")
 
     assert recovered is not None
-    assert recovered["snapshot"]["status"] == "suspended"
+    assert recovered["snapshot"]["status"] == "planning"
     assert recovered["snapshot"]["activeSkillRequestId"] is None
     assert recovered["skillExecutions"][0]["requestId"] == request.requestId
-    assert recovered["skillExecutions"][0]["result"] is None
+    assert recovered["skillExecutions"][0]["result"]["status"] == "failed"
+    assert (
+        recovered["skillExecutions"][0]["result"]["errorCode"]
+        == "WORKSTATION_PROCESS_RESTART"
+    )
+    assert recovered["events"][-1]["eventType"] == "skill.failed_after_restart"
 
 
 def test_human_required_revision_is_not_active_until_separately_approved() -> None:

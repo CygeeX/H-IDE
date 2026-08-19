@@ -4354,7 +4354,14 @@ class SQLiteStore:
                 raise
 
     def recover_active_missions(self) -> int:
-        """Suspend interrupted Missions; never replay an in-flight skill."""
+        """Recover interrupted Missions without replaying a durable request.
+
+        Vision is a synchronous, workstation-owned observation boundary, so an
+        interrupted request can be atomically closed as failed.  Every other
+        in-flight request is treated as potentially external/physical: keep its
+        original request ID active and force the Mission through reconciliation
+        instead of issuing a replacement command.
+        """
 
         active = {
             "planning", "observing", "dispatching", "executing", "verifying"
@@ -4369,35 +4376,165 @@ class SQLiteStore:
             if snapshot.get("status") not in active:
                 continue
             sequence = int(row["last_sequence"]) + 1
-            snapshot.update(
-                {
-                    "status": "suspended",
-                    "lastSequence": sequence,
-                    "activeSkillRequestId": None,
-                    "updatedAt": self._now(),
-                    "errorCode": "PROCESS_RESTART",
-                    "detail": "Mission interrupted by process restart; reconcile before resume",
-                }
+            now = self._now()
+            request_id = snapshot.get("activeSkillRequestId")
+            execution = None
+            if isinstance(request_id, str) and request_id:
+                with self._lock:
+                    execution = self._connection.execute(
+                        "SELECT revision_id, node_id, request_json, result_json "
+                        "FROM mission_skill_executions "
+                        "WHERE mission_id = ? AND request_id = ?",
+                        (row["mission_id"], request_id),
+                    ).fetchone()
+            request_payload = (
+                _decode(execution["request_json"])
+                if execution is not None and execution["result_json"] is None
+                else None
             )
+            skill_id = (
+                request_payload.get("skillId")
+                if isinstance(request_payload, Mapping)
+                else None
+            )
+            workstation_vision = (
+                isinstance(skill_id, str) and skill_id.startswith("vision.")
+            )
+            external_reconciliation = (
+                execution is not None
+                and execution["result_json"] is None
+                and isinstance(request_id, str)
+                and bool(request_id)
+                and not workstation_vision
+            )
+            skill_result = None
+            node_states: list[dict[str, Any]] = []
+            if workstation_vision:
+                detail = (
+                    "Workstation observation was interrupted by process restart; "
+                    "a reviewed retry is required"
+                )
+                error_code = "WORKSTATION_PROCESS_RESTART"
+                snapshot.update(
+                    {
+                        "status": "planning",
+                        "lastSequence": sequence,
+                        "activeSkillRequestId": None,
+                        "updatedAt": now,
+                        "errorCode": error_code,
+                        "detail": detail,
+                    }
+                )
+                skill_result = {
+                    "requestId": request_id,
+                    "status": "failed",
+                    "completedAt": now,
+                    "result": {
+                        "dispatchAuthority": "workstation",
+                        "recoveredAfterRestart": True,
+                    },
+                    "evidenceIds": [],
+                    "errorCode": error_code,
+                    "detail": detail,
+                }
+                with self._lock:
+                    state = self._connection.execute(
+                        "SELECT attempt, state_json FROM mission_node_states "
+                        "WHERE mission_id = ? AND revision_id = ? AND node_id = ?",
+                        (
+                            row["mission_id"],
+                            execution["revision_id"],
+                            execution["node_id"],
+                        ),
+                    ).fetchone()
+                previous_state = (
+                    _decode(state["state_json"]) if state is not None else {}
+                )
+                node_states.append(
+                    {
+                        "revisionId": execution["revision_id"],
+                        "nodeId": execution["node_id"],
+                        "status": "failed",
+                        "attempt": int(state["attempt"]) if state is not None else 1,
+                        "state": {
+                            **previous_state,
+                            "skillRequestId": request_id,
+                            "resultStatus": "failed",
+                            "recoveredAfterRestart": True,
+                        },
+                    }
+                )
+                event_type = "skill.failed_after_restart"
+                correlation_id = request_id
+                payload = {
+                    "reason": "process_restart",
+                    "requestId": request_id,
+                    "errorCode": error_code,
+                    "dispatchAuthority": "workstation",
+                }
+            elif external_reconciliation:
+                detail = (
+                    "External skill was interrupted by process restart; reconcile "
+                    "the original request before any further command"
+                )
+                error_code = "ROBOT_AGENT_RECONCILIATION_REQUIRED"
+                snapshot.update(
+                    {
+                        "status": "dispatching",
+                        "lastSequence": sequence,
+                        "activeSkillRequestId": request_id,
+                        "updatedAt": now,
+                        "errorCode": error_code,
+                        "detail": detail,
+                    }
+                )
+                event_type = "mission.reconciliation_required_after_restart"
+                correlation_id = request_id
+                payload = {
+                    "reason": "process_restart",
+                    "requestId": request_id,
+                    "errorCode": error_code,
+                    "recoveryRequired": True,
+                }
+            else:
+                detail = (
+                    "Mission interrupted by process restart; reconcile before resume"
+                )
+                error_code = "PROCESS_RESTART"
+                snapshot.update(
+                    {
+                        "status": "suspended",
+                        "lastSequence": sequence,
+                        "activeSkillRequestId": None,
+                        "updatedAt": now,
+                        "errorCode": error_code,
+                        "detail": detail,
+                    }
+                )
+                event_type = "mission.suspended_after_restart"
+                correlation_id = f"recovery-{row['mission_id']}"
+                payload = {"reason": "process_restart"}
             event = {
                 "schemaVersion": "h-ide.mission-event/2",
                 "eventId": f"recovery-{row['mission_id']}-{sequence}",
                 "missionId": row["mission_id"],
                 "sequence": sequence,
-                "eventType": "mission.suspended_after_restart",
-                "occurredAt": self._now(),
+                "eventType": event_type,
+                "occurredAt": now,
                 "causationId": None,
-                "correlationId": f"recovery-{row['mission_id']}",
+                "correlationId": correlation_id,
                 "revisionId": snapshot.get("activeRevisionId"),
                 "nodeId": snapshot.get("activeNodeId"),
-                "payload": {"reason": "process_restart"},
+                "payload": payload,
             }
             if self.commit_mission_transition(
                 row["mission_id"],
                 expected_last_sequence=int(row["last_sequence"]),
                 snapshot=snapshot,
                 event=event,
-                error=snapshot["detail"],
+                skill_result=skill_result,
+                node_states=node_states,
+                error=detail,
             ):
                 recovered += 1
         return recovered

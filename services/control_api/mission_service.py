@@ -48,6 +48,7 @@ from packages.mission_core import (
 from .mission_client import MissionPlanningClient
 from .mission_policy import MissionPolicy, MissionPolicyDenied, PolicyActor
 from .store import SQLiteStore
+from .visual_task_client import VisualTaskUnavailable
 
 
 class MissionServiceError(ValueError):
@@ -67,6 +68,16 @@ _BASE_NAVIGATION_SKILLS = frozenset(
         "navigation.rotate",
     }
 )
+
+_WORKSTATION_DISPATCH_FAILED = "WORKSTATION_DISPATCH_FAILED"
+_VISION_RESULT_INVALID = "VISION_RESULT_INVALID"
+_WORKSTATION_RESULT_PROCESSING_FAILED = "WORKSTATION_RESULT_PROCESSING_FAILED"
+_WORKSTATION_RESULT_RECOVERY_REQUIRED = "WORKSTATION_RESULT_RECOVERY_REQUIRED"
+_ROBOT_AGENT_POLICY_DENIED = "ROBOT_AGENT_POLICY_DENIED"
+_ROBOT_AGENT_POLICY_RESULT_RECOVERY_REQUIRED = (
+    "ROBOT_AGENT_POLICY_RESULT_RECOVERY_REQUIRED"
+)
+_ROBOT_AGENT_RECONCILIATION_REQUIRED = "ROBOT_AGENT_RECONCILIATION_REQUIRED"
 
 
 def _sha256(value: Any) -> str:
@@ -2257,6 +2268,296 @@ class MissionService:
                 )
         return completed
 
+    def _raise_workstation_dispatch_failure(
+        self,
+        request: SkillRequest,
+        *,
+        error_code: str,
+        detail: str,
+        cause: Exception,
+    ) -> None:
+        """Durably terminalize a synchronous workstation failure, then raise.
+
+        Persisted details are intentionally fixed strings: upstream HTTP
+        errors can contain URLs, headers or provider diagnostics that must not
+        become Mission audit data.  The original exception remains attached as
+        the Python cause for local diagnostics.
+        """
+
+        current = self.runtime.get(request.missionId)
+        execution = next(
+            (
+                item
+                for item in current.get("skillExecutions", [])
+                if item.get("requestId") == request.requestId
+            ),
+            None,
+        )
+        if isinstance(execution, Mapping) and execution.get("result") is not None:
+            # Completion itself was already durable and cleared the active
+            # request.  A later bookkeeping error must never overwrite that
+            # immutable result with a fabricated failure.
+            raise MissionServiceError(
+                "Workstation skill post-processing did not complete; inspect the durable result"
+            ) from cause
+
+        failure = SkillResult(
+            requestId=request.requestId,
+            status="failed",
+            completedAt=utc_now(),
+            result={"dispatchAuthority": "workstation"},
+            errorCode=error_code,
+            detail=detail,
+        )
+        try:
+            self.runtime.record_result(request.missionId, failure)
+        except Exception as result_error:
+            try:
+                self.runtime.record_recovery_required(
+                    request.missionId,
+                    request_id=request.requestId,
+                    error_code=_WORKSTATION_RESULT_RECOVERY_REQUIRED,
+                    detail=(
+                        "Workstation skill result persistence was interrupted; "
+                        "manual recovery is required"
+                    ),
+                )
+            except Exception as recovery_error:
+                raise MissionServiceError(
+                    "Workstation skill failed and its recovery marker could not be persisted"
+                ) from ExceptionGroup(
+                    "workstation dispatch failure chain",
+                    [cause, result_error, recovery_error],
+                )
+            raise MissionServiceError(
+                "Workstation skill failed; Mission is suspended for manual recovery"
+            ) from ExceptionGroup(
+                "workstation result persistence failure chain",
+                [cause, result_error],
+            )
+        if isinstance(cause, VisualTaskUnavailable):
+            raise VisualTaskUnavailable(detail) from cause
+        raise MissionServiceError(detail) from cause
+
+    def _raise_robot_agent_reconciliation_required(
+        self,
+        request: SkillRequest,
+        *,
+        cause: Exception,
+    ) -> None:
+        """Record an uncertain external dispatch without claiming it failed."""
+
+        detail = (
+            "Robot Agent dispatch outcome is unknown; reconcile the original "
+            "request before any further physical command"
+        )
+        try:
+            self.runtime.mark_reconciliation_required(
+                request.missionId,
+                request_id=request.requestId,
+                error_code=_ROBOT_AGENT_RECONCILIATION_REQUIRED,
+                detail=detail,
+            )
+        except Exception as marker_error:
+            # The original skill.requested transition is still active and thus
+            # blocks issue_skill/advance from dispatching a replacement.  Keep
+            # both errors for local diagnosis without persisting their text.
+            raise MissionServiceError(
+                "Robot Agent dispatch outcome is unknown and requires manual reconciliation"
+            ) from ExceptionGroup(
+                "robot agent reconciliation marker failure chain",
+                [cause, marker_error],
+            )
+        raise MissionServiceError(detail) from cause
+
+    def _raise_robot_agent_policy_denied(
+        self,
+        request: SkillRequest,
+        *,
+        cause: MissionPolicyDenied,
+    ) -> None:
+        """Close a request rejected by the final pre-dispatch policy gate."""
+
+        detail = "Robot Agent dispatch was denied by the current Mission policy"
+        try:
+            self.runtime.record_result(
+                request.missionId,
+                SkillResult(
+                    requestId=request.requestId,
+                    status="rejected",
+                    completedAt=utc_now(),
+                    result={"dispatchAuthority": "robot_agent", "submitted": False},
+                    errorCode=_ROBOT_AGENT_POLICY_DENIED,
+                    detail=detail,
+                ),
+            )
+        except Exception as result_error:
+            try:
+                self.runtime.record_recovery_required(
+                    request.missionId,
+                    request_id=request.requestId,
+                    error_code=_ROBOT_AGENT_POLICY_RESULT_RECOVERY_REQUIRED,
+                    detail=(
+                        "Pre-dispatch policy rejection persistence was interrupted; "
+                        "manual recovery is required"
+                    ),
+                )
+            except Exception as recovery_error:
+                raise MissionServiceError(
+                    "Robot Agent policy denied dispatch and recovery state could not be persisted"
+                ) from ExceptionGroup(
+                    "robot agent policy rejection failure chain",
+                    [cause, result_error, recovery_error],
+                )
+            raise MissionServiceError(
+                "Robot Agent policy denied dispatch; Mission is suspended for manual recovery"
+            ) from ExceptionGroup(
+                "robot agent policy rejection persistence failure chain",
+                [cause, result_error],
+            )
+        raise MissionPolicyDenied(detail) from cause
+
+    def _dispatch_issued_skill(
+        self,
+        request: SkillRequest,
+        *,
+        workstation_skill: bool,
+        dispatcher: Callable[[Any], Mapping[str, Any]] | None,
+    ) -> dict[str, Any]:
+        """Dispatch an already durable SkillRequest across the correct boundary."""
+
+        base = {
+            "request": request.model_dump(mode="json"),
+            "authority": "h-ide-mission-runtime",
+        }
+        if dispatcher is None:
+            return {
+                **base,
+                "dispatch": (
+                    "pending_workstation_bridge"
+                    if workstation_skill
+                    else "pending_robot_agent_bridge"
+                ),
+            }
+
+        if workstation_skill:
+            try:
+                dispatch = dict(dispatcher(request))
+            except Exception as exc:
+                self._raise_workstation_dispatch_failure(
+                    request,
+                    error_code=_WORKSTATION_DISPATCH_FAILED,
+                    detail="Workstation observation dispatch did not complete",
+                    cause=exc,
+                )
+                raise AssertionError("unreachable")
+            if dispatch.get("mode") != "h_ide_vision":
+                self._raise_workstation_dispatch_failure(
+                    request,
+                    error_code=_VISION_RESULT_INVALID,
+                    detail="Vision returned a result outside the pinned product contract",
+                    cause=MissionServiceError(
+                        "workstation dispatcher did not return h_ide_vision mode"
+                    ),
+                )
+                raise AssertionError("unreachable")
+            try:
+                updated_mission = self._complete_visual_skill(request, dispatch)
+            except MissionServiceError as exc:
+                self._raise_workstation_dispatch_failure(
+                    request,
+                    error_code=_VISION_RESULT_INVALID,
+                    detail="Vision returned a result outside the pinned product contract",
+                    cause=exc,
+                )
+                raise AssertionError("unreachable")
+            except Exception as exc:
+                self._raise_workstation_dispatch_failure(
+                    request,
+                    error_code=_WORKSTATION_RESULT_PROCESSING_FAILED,
+                    detail="Workstation observation result could not be recorded",
+                    cause=exc,
+                )
+                raise AssertionError("unreachable")
+            return {**base, "dispatch": dispatch, "mission": updated_mission}
+
+        try:
+            dispatch = dict(dispatcher(request))
+        except MissionPolicyDenied as exc:
+            self._raise_robot_agent_policy_denied(request, cause=exc)
+            raise AssertionError("unreachable")
+        except Exception as exc:
+            self._raise_robot_agent_reconciliation_required(request, cause=exc)
+            raise AssertionError("unreachable")
+        receipt = dispatch.get("receipt")
+        if not isinstance(receipt, Mapping):
+            self._raise_robot_agent_reconciliation_required(
+                request,
+                cause=MissionServiceError(
+                    "skill dispatcher returned no command receipt"
+                ),
+            )
+            raise AssertionError("unreachable")
+        receipt_status = str(receipt.get("status", "")).lower()
+        updated_mission: dict[str, Any] | None = None
+        try:
+            if receipt_status == "succeeded":
+                updated_mission = self.runtime.record_result(
+                    request.missionId,
+                    SkillResult(
+                        requestId=request.requestId,
+                        status="succeeded",
+                        completedAt=utc_now(),
+                        result={"commandReceipt": dict(receipt)},
+                        evidenceIds=[f"command:{request.requestId}"],
+                    ),
+                )
+            elif receipt_status in {
+                "failed",
+                "rejected",
+                "cancelled",
+                "expired",
+                "unknown",
+            }:
+                result_status = {
+                    "expired": "timed_out",
+                    "unknown": "unknown",
+                }.get(receipt_status, receipt_status)
+                updated_mission = self.runtime.record_result(
+                    request.missionId,
+                    SkillResult(
+                        requestId=request.requestId,
+                        status=result_status,
+                        completedAt=utc_now(),
+                        result={"commandReceipt": dict(receipt)},
+                        errorCode=f"ROBOT_AGENT_{receipt_status.upper()}",
+                        detail=(
+                            receipt.get("error")
+                            or f"Robot Agent command {receipt_status}"
+                        ),
+                    ),
+                )
+            elif receipt_status in {"accepted", "running", "pending"}:
+                updated_mission = self.runtime.record_progress(
+                    request.missionId,
+                    SkillProgress(
+                        requestId=request.requestId,
+                        sequence=0,
+                        progress=None,
+                        phase=receipt_status,
+                        observedAt=utc_now(),
+                        detail="Robot Agent accepted the Mission skill",
+                    ),
+                )
+            else:
+                raise MissionServiceError(
+                    "Robot Agent returned an unsupported command receipt status"
+                )
+        except Exception as exc:
+            self._raise_robot_agent_reconciliation_required(request, cause=exc)
+            raise AssertionError("unreachable")
+        return {**base, "dispatch": dispatch, "mission": updated_mission}
+
     def issue_resolved_skill(
         self,
         mission_id: str,
@@ -2371,75 +2672,11 @@ class MissionService:
         dispatcher = (
             self.workstation_skill_dispatcher if workstation_skill else self.skill_dispatcher
         )
-        if dispatcher is None:
-            return {
-                "request": request.model_dump(mode="json"),
-                "dispatch": (
-                    "pending_workstation_bridge"
-                    if workstation_skill
-                    else "pending_robot_agent_bridge"
-                ),
-                "authority": "h-ide-mission-runtime",
-            }
-        dispatch = dict(dispatcher(request))
-        if dispatch.get("mode") == "h_ide_vision":
-            updated_mission = self._complete_visual_skill(request, dispatch)
-            return {
-                "request": request.model_dump(mode="json"),
-                "dispatch": dispatch,
-                "authority": "h-ide-mission-runtime",
-                "mission": updated_mission,
-            }
-        receipt = dispatch.get("receipt")
-        if not isinstance(receipt, Mapping):
-            raise MissionServiceError("skill dispatcher returned no command receipt")
-        receipt_status = str(receipt.get("status", "")).lower()
-        updated_mission: dict[str, Any] | None = None
-        if receipt_status == "succeeded":
-            updated_mission = self.runtime.record_result(
-                mission_id,
-                SkillResult(
-                    requestId=request.requestId,
-                    status="succeeded",
-                    completedAt=utc_now(),
-                    result={"commandReceipt": dict(receipt)},
-                    evidenceIds=[f"command:{request.requestId}"],
-                ),
-            )
-        elif receipt_status in {"failed", "rejected", "cancelled", "expired", "unknown"}:
-            result_status = {
-                "expired": "timed_out",
-                "unknown": "unknown",
-            }.get(receipt_status, receipt_status)
-            updated_mission = self.runtime.record_result(
-                mission_id,
-                SkillResult(
-                    requestId=request.requestId,
-                    status=result_status,
-                    completedAt=utc_now(),
-                    result={"commandReceipt": dict(receipt)},
-                    errorCode=f"ROBOT_AGENT_{receipt_status.upper()}",
-                    detail=receipt.get("error") or f"Robot Agent command {receipt_status}",
-                ),
-            )
-        elif receipt_status in {"accepted", "running", "pending"}:
-            updated_mission = self.runtime.record_progress(
-                mission_id,
-                SkillProgress(
-                    requestId=request.requestId,
-                    sequence=0,
-                    progress=None,
-                    phase=receipt_status,
-                    observedAt=utc_now(),
-                    detail="Robot Agent accepted the Mission skill",
-                ),
-            )
-        return {
-            "request": request.model_dump(mode="json"),
-            "dispatch": dispatch,
-            "authority": "h-ide-mission-runtime",
-            "mission": updated_mission,
-        }
+        return self._dispatch_issued_skill(
+            request,
+            workstation_skill=workstation_skill,
+            dispatcher=dispatcher,
+        )
 
     def progress(self, mission_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.runtime.record_progress(mission_id, SkillProgress.model_validate(body))

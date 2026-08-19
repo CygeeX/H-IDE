@@ -709,6 +709,182 @@ class MissionRuntime:
             error=None if succeeded else next_snapshot.detail,
         )
 
+    def record_recovery_required(
+        self,
+        mission_id: str,
+        *,
+        request_id: str,
+        error_code: str,
+        detail: str,
+    ) -> dict[str, Any]:
+        """Atomically close a non-physical request whose normal result write failed.
+
+        This is deliberately a separate transition from :meth:`record_result`.
+        The application service uses it only as the last durable fallback when
+        recording the original workstation failure raised.  The skill gets an
+        ``unknown`` terminal result, while the Mission is suspended so neither
+        ``advance`` nor a process restart can silently issue another attempt.
+        An operator can still inspect or cancel the Mission.
+        """
+
+        identifier = non_empty_id(request_id, "requestId")
+        code = non_empty_id(error_code, "errorCode")
+        safe_detail = non_empty_id(detail, "detail")
+        record = self.get(mission_id)
+        execution = next(
+            (
+                item
+                for item in record["skillExecutions"]
+                if item["requestId"] == identifier
+            ),
+            None,
+        )
+        if execution is None or execution.get("result") is not None:
+            raise MissionConflict(
+                "skill recovery result is not bound to an active request"
+            )
+        snapshot = self._snapshot(record)
+        if snapshot.activeSkillRequestId != identifier:
+            raise MissionConflict("skill recovery request is not active")
+        revision = self._revision(record)
+        states = self._node_states(record, revision.revisionId)
+        current_state = states.get(execution["nodeId"], {})
+        now = utc_now()
+        value = SkillResult(
+            requestId=identifier,
+            status=SkillResultStatus.UNKNOWN,
+            completedAt=now,
+            result={"recoveryRequired": True},
+            errorCode=code,
+            detail=safe_detail,
+        )
+        next_snapshot = snapshot.model_copy(
+            update={
+                "status": MissionStatus.SUSPENDED,
+                "lastSequence": snapshot.lastSequence + 1,
+                "activeNodeId": execution["nodeId"],
+                "activeSkillRequestId": None,
+                "updatedAt": now,
+                "errorCode": code,
+                "detail": safe_detail,
+            }
+        )
+        event = self._event(
+            snapshot,
+            event_type="skill.recovery_required",
+            correlation_id=identifier,
+            payload={
+                "requestId": identifier,
+                "status": SkillResultStatus.UNKNOWN.value,
+                "errorCode": code,
+                "recoveryRequired": True,
+            },
+            node_id=execution["nodeId"],
+        )
+        return self._commit(
+            record,
+            next_snapshot,
+            event,
+            skill_result=_plain(value),
+            node_states=[
+                {
+                    "revisionId": revision.revisionId,
+                    "nodeId": execution["nodeId"],
+                    "status": SkillResultStatus.UNKNOWN.value,
+                    "attempt": int(current_state.get("attempt", 1)),
+                    "state": {
+                        **dict(current_state.get("state", {})),
+                        "skillRequestId": identifier,
+                        "resultStatus": SkillResultStatus.UNKNOWN.value,
+                        "recoveryRequired": True,
+                    },
+                }
+            ],
+            error=safe_detail,
+        )
+
+    def mark_reconciliation_required(
+        self,
+        mission_id: str,
+        *,
+        request_id: str,
+        error_code: str,
+        detail: str,
+    ) -> dict[str, Any]:
+        """Keep an externally dispatched request active until it is reconciled.
+
+        A Robot Agent call can fail after the remote side has accepted the
+        idempotent command.  Therefore this transition records uncertainty but
+        does *not* invent a terminal SkillResult and does not clear the active
+        request.  Subsequent ``advance`` calls take the reconciliation branch
+        and cannot dispatch the physical command again.
+        """
+
+        identifier = non_empty_id(request_id, "requestId")
+        code = non_empty_id(error_code, "errorCode")
+        safe_detail = non_empty_id(detail, "detail")
+        record = self.get(mission_id)
+        execution = next(
+            (
+                item
+                for item in record["skillExecutions"]
+                if item["requestId"] == identifier
+            ),
+            None,
+        )
+        if execution is None or execution.get("result") is not None:
+            raise MissionConflict(
+                "skill reconciliation marker is not bound to an active request"
+            )
+        snapshot = self._snapshot(record)
+        if snapshot.activeSkillRequestId != identifier:
+            raise MissionConflict("skill reconciliation request is not active")
+        revision = self._revision(record)
+        states = self._node_states(record, revision.revisionId)
+        current_state = states.get(execution["nodeId"], {})
+        now = utc_now()
+        next_snapshot = snapshot.model_copy(
+            update={
+                "status": MissionStatus.DISPATCHING,
+                "lastSequence": snapshot.lastSequence + 1,
+                "activeNodeId": execution["nodeId"],
+                "activeSkillRequestId": identifier,
+                "updatedAt": now,
+                "errorCode": code,
+                "detail": safe_detail,
+            }
+        )
+        event = self._event(
+            snapshot,
+            event_type="skill.reconciliation_required",
+            correlation_id=identifier,
+            payload={
+                "requestId": identifier,
+                "errorCode": code,
+                "recoveryRequired": True,
+            },
+            node_id=execution["nodeId"],
+        )
+        return self._commit(
+            record,
+            next_snapshot,
+            event,
+            node_states=[
+                {
+                    "revisionId": revision.revisionId,
+                    "nodeId": execution["nodeId"],
+                    "status": "running",
+                    "attempt": int(current_state.get("attempt", 1)),
+                    "state": {
+                        **dict(current_state.get("state", {})),
+                        "skillRequestId": identifier,
+                        "dispatchState": "unknown_reconcile_required",
+                    },
+                }
+            ],
+            error=safe_detail,
+        )
+
     def skip_nodes(
         self,
         mission_id: str,
