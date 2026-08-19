@@ -1432,9 +1432,17 @@ def test_terminal_fault_cannot_be_rearmed_online(monkeypatch) -> None:
     assert driver._plant_support_safety_latched is True
 
 
-def test_driver_rejects_raw_cmd_vel_and_fails_closed() -> None:
+def test_driver_rejects_raw_cmd_vel_and_fails_closed(monkeypatch) -> None:
     clock = Clock()
     driver = bare_driver(clock)
+
+    def unavailable_support(*_args, **_kwargs):
+        raise OSError("isolated test Plant is unavailable")
+
+    monkeypatch.setattr(
+        "hide_mujoco_sonic.sonic_driver.set_plant_support",
+        unavailable_support,
+    )
     with pytest.raises(ValueError, match="sonic_intent"):
         driver.accept_json(
             {

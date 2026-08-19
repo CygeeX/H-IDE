@@ -53,6 +53,10 @@ HIDE_DOCKER_OBSERVATION_BIND_HOST="$(
 )"
 : "${HIDE_DOCKER_OBSERVATION_BIND_HOST:?Docker observation gateway resolution returned empty}"
 export HIDE_DOCKER_OBSERVATION_BIND_HOST
+# Robot Agent keeps its diagnostic listener on loopback.  The separately
+# constrained proxy below is the only Docker-visible route, so Compose must
+# never point control-api directly at the loopback-only 8796 endpoint.
+export SIMULATION_ROBOT_AGENT_DIAGNOSTICS_URL="http://host.docker.internal:8797"
 
 mkdir -p "${HIDE_DEMO_RUN_ROOT}"
 
@@ -456,6 +460,22 @@ start_process \
   '-m robot_agent.cli run --config.*robot_agent.mujoco.yaml' \
   "${HIDE_DEMO_ROBOT_ROOT}" \
   'source /opt/ros/jazzy/setup.bash; source "$HIDE_DEMO_ROBOT_ROOT/tools/activate-local-nav2-jazzy.bash"; source "$HIDE_DEMO_ROBOT_ROOT/install/setup.bash"; export ROS_DOMAIN_ID=232 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp CYCLONEDDS_URI="$HIDE_DEMO_CYCLONE"; export PYTHONPATH="$HIDE_DEMO_ROBOT_ROOT/src/robot_agent${PYTHONPATH:+:$PYTHONPATH}"; exec "$HIDE_DEMO_ROBOT_ROOT/.venv/bin/python" -u -m robot_agent.cli run --config "$HIDE_DEMO_ROBOT_CONFIG"'
+
+wait_for_http \
+  'Robot Agent loopback diagnostics' \
+  'http://127.0.0.1:8796/healthz' \
+  30
+
+start_process \
+  robot-agent-diagnostics-proxy \
+  '-m hide_mujoco_sonic.robot_agent_diagnostics_proxy' \
+  "${HIDE_DEMO_SIM_ROOT}" \
+  'exec "$HIDE_DEMO_SIM_ROOT/.venv/bin/python" -u -m hide_mujoco_sonic.robot_agent_diagnostics_proxy --bind-host "$HIDE_DOCKER_OBSERVATION_BIND_HOST"'
+
+wait_for_http \
+  'Docker Robot Agent diagnostics' \
+  "http://${HIDE_DOCKER_OBSERVATION_BIND_HOST}:8797/healthz" \
+  30
 
 printf '\nRuntime logs: %s\n' "${HIDE_DEMO_RUN_ROOT}"
 printf 'MuJoCo viewer uses DISPLAY=%s. Open http://127.0.0.1:8080/simulation for RGB-D and mission evidence.\n' "${DISPLAY}"

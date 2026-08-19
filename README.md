@@ -104,6 +104,12 @@ non-semantic integrity manifest.
   probe. It exposes both LowState age and last successful control-step age; the
   25 ms probe, 20 ms timeout, and 100 ms stale bounds stay below the 300 ms
   Robot Agent cancellation budget without placing ROS code inside SONIC.
+* Robot Agent diagnostics remain loopback-only on `127.0.0.1:8796`. The
+  launcher starts a separate proxy on Docker's dynamically verified default
+  bridge at port `8797`; it can forward only bodyless GET requests for
+  `/healthz`, `/readyz`, `/v1/diagnostics`, and `/v1/capabilities` to that fixed
+  loopback upstream. It rejects redirects, query strings, request bodies,
+  non-JSON/oversized responses, and every write method.
 
 ## One-command workstation start
 

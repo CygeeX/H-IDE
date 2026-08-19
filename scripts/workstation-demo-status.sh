@@ -2,6 +2,7 @@
 set -u
 
 HIDE_STATUS_H_IDE_ROOT="/home/phi/learn-projects/h-ide"
+HIDE_STATUS_SIM_ROOT="/home/phi/learn-projects/h-ide-mujoco-sonic"
 HIDE_STATUS_ENV="${HIDE_STATUS_H_IDE_ROOT}/.env"
 
 env_value() {
@@ -42,6 +43,18 @@ else
 fi
 http_status 'MuJoCo plant + RGB-D' 'http://127.0.0.1:8794/healthz'
 http_status 'SONIC telemetry' 'http://127.0.0.1:8792/healthz'
+http_status 'Robot Agent diagnostics' 'http://127.0.0.1:8796/healthz'
+docker_diagnostics_host="$(
+  "${HIDE_STATUS_SIM_ROOT}/.venv/bin/python" \
+    -m hide_mujoco_sonic.network --requested auto 2>/dev/null || true
+)"
+if [[ -n "${docker_diagnostics_host}" ]]; then
+  http_status \
+    'Docker diagnostics proxy' \
+    "http://${docker_diagnostics_host}:8797/healthz"
+else
+  printf '%-28s unavailable (bridge unresolved)\n' 'Docker diagnostics proxy'
+fi
 http_status 'g1-sim Robot Agent gateway' 'http://127.0.0.1:8094/internal/v1/discover?robotId=g1-sim' -H "Authorization: Bearer ${gateway_token}"
 
 nav2_state=""
