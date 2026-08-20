@@ -2952,6 +2952,7 @@ def test_required_planner_deadline_latches_terminal_exact_target_hold(
     assert [call[0] for call in block_live_driver_plant_writes] == [
         "latch_plant_physics_fault"
     ]
+    block_live_driver_plant_writes.clear()
 
 
 def test_driver_requires_startup_qualification_before_accepting_motion() -> None:
@@ -3503,7 +3504,9 @@ def test_driver_rejects_raw_cmd_vel_and_fails_closed(monkeypatch) -> None:
     assert driver.guard.stops[-1] == "plant_safety_stop_unconfirmed"
 
 
-def test_driver_tick_rollback_is_terminal_and_never_resyncs() -> None:
+def test_driver_tick_rollback_is_terminal_and_never_resyncs(
+    block_live_driver_plant_writes,
+) -> None:
     clock = Clock()
     driver = bare_driver(clock)
     driver._tick_guard = PlantTickGuard()
@@ -3514,3 +3517,7 @@ def test_driver_tick_rollback_is_terminal_and_never_resyncs() -> None:
     assert driver.guard.stops[-1] == "terminal_fault"
     assert driver.telemetry.values["status"] == "failed"
     assert "explicit process restart" in str(driver.telemetry.values["last_error"])
+    assert [call[0] for call in block_live_driver_plant_writes] == [
+        "latch_plant_physics_fault"
+    ]
+    block_live_driver_plant_writes.clear()

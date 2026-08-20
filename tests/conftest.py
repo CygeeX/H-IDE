@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import pytest
@@ -14,7 +14,7 @@ PlantWriteCall = tuple[str, tuple[Any, ...], dict[str, Any]]
 @pytest.fixture(autouse=True)
 def block_live_driver_plant_writes(
     monkeypatch: pytest.MonkeyPatch,
-) -> list[PlantWriteCall]:
+) -> Iterator[list[PlantWriteCall]]:
     """Fail closed unless a test explicitly supplies its Plant transport.
 
     Driver unit/integration fixtures are intentionally incomplete and must
@@ -40,4 +40,7 @@ def block_live_driver_plant_writes(
         "set_plant_support",
     ):
         monkeypatch.setattr(sonic_driver, name, blocked(name))
-    return calls
+    yield calls
+    if calls:
+        names = ", ".join(call[0] for call in calls)
+        pytest.fail(f"test left unacknowledged blocked Plant writes: {names}")
