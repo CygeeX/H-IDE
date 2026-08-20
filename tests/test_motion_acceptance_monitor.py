@@ -41,6 +41,9 @@ def _payloads(sample: dict[str, object], index: int) -> tuple[dict, dict]:
     plant = {
         "status": "running",
         "schemaVersion": "h-ide.mujoco-capture/1",
+        "robotId": "g1-sim",
+        "sourceId": "mujoco:unitree-g1:g1-sim",
+        "localizationEpochId": "g1-sim-map-epoch-1",
         "sequence": sequence,
         "capturedAtUnixNs": int(timestamp * 1_000_000_000),
         "pose": {
@@ -74,6 +77,7 @@ def _payloads(sample: dict[str, object], index: int) -> tuple[dict, dict]:
     }
     sonic = {
         "status": "running",
+        "robot_id": "g1-sim",
         "motion_ready": True,
         "updated_at": timestamp,
         "plant_tick": int(float(sample["t"]) * 1000) + 5000,
@@ -92,11 +96,16 @@ def _payloads(sample: dict[str, object], index: int) -> tuple[dict, dict]:
         "motion_handoff_ratio": 1.0 if active else 0.0,
         "sonic_planner_reference_ready": active,
         "sonic_planner_required_pending": False,
+        "sonic_reference_authority_state": "GRANTED" if active else "REVOKED",
+        "sonic_reference_actuator_authority": active,
+        "sonic_reference_authority_dds_target_sequence": 1 if active else None,
+        "sonic_execution_feedback_pending": False,
         "plant_support_mode": support_mode,
         "plant_support_requested_mode": support_mode,
         "plant_support_confirmed_mode": support_mode,
         "plant_support_stop_pending": False,
         "plant_support_safety_latched": safe_hold,
+        "plant_support_stop_generation": 1 if safe_hold else None,
         "fault_trace_path": "/tmp/sonic-fault-trace.json" if fault_trace_count else None,
         "fault_trace_sample_count": fault_trace_count,
         "last_error": last_error,
@@ -180,6 +189,31 @@ def test_unknown_plant_capture_schema_remains_rejected() -> None:
     assert "h-ide.mujoco-capture/3" in schema_failure["detail"]
 
 
+def test_motion_acceptance_rejects_crossed_robot_identity_globally() -> None:
+    case = next(
+        item
+        for item in json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+        if item["name"] == "negative_ninety_degree_turn_passes"
+    )
+    evaluator = MotionAcceptanceEvaluator(
+        AcceptanceLimits(
+            phase="turn",
+            expected_turn_rad=math.radians(float(case["expected_turn_deg"])),
+        )
+    )
+    for index, sample in enumerate(case["samples"]):
+        plant, sonic = _payloads(sample, index)
+        plant["robotId"] = "g1-other"
+        evaluator.observe(plant, sonic, observed_s=float(sample["t"]))
+
+    result = evaluator.finalize()
+
+    assert result["pass"] is False
+    assert {failure["code"] for failure in result["failures"]}.issuperset(
+        {"SOURCE_IDENTITY_MISMATCH"}
+    )
+
+
 def test_nonfinite_source_value_fails_and_can_still_be_recorded_safely() -> None:
     plant, sonic = _payloads(
         {"t": 0.0, "state": "safe_hold", "x": 0.0, "y": 0.0, "z": 0.78, "yaw": 0.0},
@@ -224,6 +258,74 @@ def test_idle_safe_hold_uses_structure_not_reason_allowlist(hold_reason: str) ->
 
 
 @pytest.mark.parametrize(
+    ("plant_robot_id", "sonic_robot_id"),
+    [
+        ("", ""),
+        ("g1-sim", "other-robot"),
+        (1, 1),
+    ],
+)
+def test_safe_hold_requires_matching_nonempty_string_robot_identity(
+    plant_robot_id: object,
+    sonic_robot_id: object,
+) -> None:
+    plant, sonic = _payloads(
+        {"t": 0.0, "state": "safe_hold", "x": 0.0, "y": 0.0, "z": 0.78, "yaw": 0.0},
+        0,
+    )
+    plant["robotId"] = plant_robot_id
+    sonic["robot_id"] = sonic_robot_id
+    evaluator = MotionAcceptanceEvaluator(AcceptanceLimits(phase="idle"))
+
+    derived = evaluator.observe(plant, sonic, observed_s=0.0)
+    result = evaluator.finalize()
+
+    assert derived["healthy_settled_safe_hold"] is False
+    assert {failure["code"] for failure in result["failures"]}.issuperset(
+        {"SAFE_HOLD_STATE_CONTRADICTION"}
+    )
+
+
+@pytest.mark.parametrize(
+    "last_rearm_generation",
+    [True, -1, 1.0, "1", 2],
+)
+def test_safe_hold_rejects_invalid_or_newer_plant_rearm_generation(
+    last_rearm_generation: object,
+) -> None:
+    plant, sonic = _payloads(
+        {"t": 0.0, "state": "safe_hold", "x": 0.0, "y": 0.0, "z": 0.78, "yaw": 0.0},
+        0,
+    )
+    plant["support"]["lastRearmGeneration"] = last_rearm_generation
+    evaluator = MotionAcceptanceEvaluator(AcceptanceLimits(phase="idle"))
+
+    derived = evaluator.observe(plant, sonic, observed_s=0.0)
+    result = evaluator.finalize()
+
+    assert derived["healthy_settled_safe_hold"] is False
+    assert {failure["code"] for failure in result["failures"]}.issuperset(
+        {"SAFE_HOLD_STATE_CONTRADICTION"}
+    )
+
+
+def test_safe_hold_accepts_correlated_nonnegative_plant_rearm_generation() -> None:
+    plant, sonic = _payloads(
+        {"t": 0.0, "state": "safe_hold", "x": 0.0, "y": 0.0, "z": 0.78, "yaw": 0.0},
+        0,
+    )
+    plant["support"]["lastRearmGeneration"] = 1
+    evaluator = MotionAcceptanceEvaluator(AcceptanceLimits(phase="idle"))
+
+    derived = evaluator.observe(plant, sonic, observed_s=0.0)
+    evaluator.observe(plant, sonic, observed_s=0.2)
+    result = evaluator.finalize()
+
+    assert derived["healthy_settled_safe_hold"] is True
+    assert result["pass"] is True
+
+
+@pytest.mark.parametrize(
     ("mutations", "expected_codes"),
     [
         (
@@ -246,6 +348,34 @@ def test_idle_safe_hold_uses_structure_not_reason_allowlist(hold_reason: str) ->
             {"plant_support_confirmed_mode": "idle"},
             {"SAFE_HOLD_STATE_CONTRADICTION"},
         ),
+        (
+            {"sonic_reference_authority_state": "PRIMED"},
+            {"SAFE_HOLD_STATE_CONTRADICTION"},
+        ),
+        (
+            {"sonic_reference_actuator_authority": True},
+            {"SAFE_HOLD_STATE_CONTRADICTION"},
+        ),
+        (
+            {"sonic_reference_authority_dds_target_sequence": 7},
+            {"SAFE_HOLD_STATE_CONTRADICTION"},
+        ),
+        (
+            {"sonic_execution_feedback_pending": True},
+            {"SAFE_HOLD_STATE_CONTRADICTION"},
+        ),
+        (
+            {"last_cmd_vx": 0.001},
+            {"SAFE_HOLD_STATE_CONTRADICTION"},
+        ),
+        (
+            {"motion_handoff_ratio": 0.001},
+            {"SAFE_HOLD_STATE_CONTRADICTION"},
+        ),
+        (
+            {"plant_support_stop_generation": None},
+            {"SAFE_HOLD_STATE_CONTRADICTION"},
+        ),
     ],
 )
 def test_safe_hold_reason_cannot_mask_structural_faults(
@@ -266,6 +396,50 @@ def test_safe_hold_reason_cannot_mask_structural_faults(
     assert result["pass"] is False
     assert {failure["code"] for failure in result["failures"]}.issuperset(
         expected_codes
+    )
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "sonic_reference_authority_state",
+        "sonic_reference_actuator_authority",
+        "sonic_reference_authority_dds_target_sequence",
+        "sonic_execution_feedback_pending",
+        "plant_support_stop_generation",
+    ],
+)
+def test_safe_hold_requires_complete_authority_and_support_telemetry(
+    field: str,
+) -> None:
+    plant, sonic = _payloads(
+        {"t": 0.0, "state": "safe_hold", "x": 0.0, "y": 0.0, "z": 0.78, "yaw": 0.0},
+        0,
+    )
+    del sonic[field]
+    evaluator = MotionAcceptanceEvaluator(AcceptanceLimits(phase="idle"))
+
+    evaluator.observe(plant, sonic, observed_s=0.0)
+    result = evaluator.finalize()
+
+    assert {failure["code"] for failure in result["failures"]}.issuperset(
+        {"SCHEMA_INVALID", "SAFE_HOLD_STATE_CONTRADICTION"}
+    )
+
+
+def test_safe_hold_requires_a_positive_plant_stop_epoch() -> None:
+    plant, sonic = _payloads(
+        {"t": 0.0, "state": "safe_hold", "x": 0.0, "y": 0.0, "z": 0.78, "yaw": 0.0},
+        0,
+    )
+    plant["support"]["safetyStopEpoch"] = 0
+    evaluator = MotionAcceptanceEvaluator(AcceptanceLimits(phase="idle"))
+
+    evaluator.observe(plant, sonic, observed_s=0.0)
+    result = evaluator.finalize()
+
+    assert {failure["code"] for failure in result["failures"]}.issuperset(
+        {"SAFE_HOLD_STATE_CONTRADICTION"}
     )
 
 

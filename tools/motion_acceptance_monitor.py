@@ -396,11 +396,16 @@ class MotionAcceptanceEvaluator:
             "motion_handoff_ratio",
             "sonic_planner_reference_ready",
             "sonic_planner_required_pending",
+            "sonic_reference_authority_state",
+            "sonic_reference_actuator_authority",
+            "sonic_reference_authority_dds_target_sequence",
+            "sonic_execution_feedback_pending",
             "plant_support_mode",
             "plant_support_requested_mode",
             "plant_support_confirmed_mode",
             "plant_support_stop_pending",
             "plant_support_safety_latched",
+            "plant_support_stop_generation",
             "fault_trace_path",
             "fault_trace_sample_count",
             "last_error",
@@ -444,11 +449,43 @@ class MotionAcceptanceEvaluator:
                 f"unexpected SONIC backend {sonic.get('backend')!r}",
                 observed_s,
             )
+        plant_robot_id = plant.get("robotId")
+        plant_source_id = plant.get("sourceId")
+        localization_epoch_id = plant.get("localizationEpochId")
+        sonic_robot_id = sonic.get("robot_id")
+        identity_fields = {
+            "plant.robotId": plant_robot_id,
+            "plant.sourceId": plant_source_id,
+            "plant.localizationEpochId": localization_epoch_id,
+            "sonic.robot_id": sonic_robot_id,
+        }
+        invalid_identity_fields = sorted(
+            name
+            for name, value in identity_fields.items()
+            if not isinstance(value, str) or not value.strip()
+        )
+        if invalid_identity_fields:
+            self._fail(
+                "SCHEMA_INVALID",
+                "source identity fields must be non-empty strings: "
+                + ", ".join(invalid_identity_fields),
+                observed_s,
+            )
+        matching_robot_identity = (
+            not invalid_identity_fields and plant_robot_id == sonic_robot_id
+        )
+        if not invalid_identity_fields and not matching_robot_identity:
+            self._fail(
+                "SOURCE_IDENTITY_MISMATCH",
+                f"Plant robotId {plant_robot_id!r} does not match SONIC "
+                f"robot_id {sonic_robot_id!r}",
+                observed_s,
+            )
         identity = (
-            plant.get("robotId"),
-            plant.get("sourceId"),
-            plant.get("localizationEpochId"),
-            sonic.get("robot_id"),
+            plant_robot_id,
+            plant_source_id,
+            localization_epoch_id,
+            sonic_robot_id,
         )
         if self.source_identity is None:
             self.source_identity = identity
@@ -625,9 +662,11 @@ class MotionAcceptanceEvaluator:
             and nav2_state == "safety_stop"
             and sonic.get("plant_support_safety_latched") is True
         )
-        command_zero = all(
-            value <= self.limits.command_epsilon for value in command_values
-        )
+        # A settled stop is a wire/control boundary, not a motion-detection
+        # threshold.  The Driver publishes exact zeroes after revoking an
+        # intent; accepting a small residual command here would disagree with
+        # SonicHealth.nav2_command_zero and the correlated normal-stop wire.
+        command_zero = all(value == 0.0 for value in command_values)
         no_fault_trace = (
             sonic.get("fault_trace_path") in {None, ""}
             and sonic.get("fault_trace_sample_count") in {None, 0}
@@ -641,9 +680,36 @@ class MotionAcceptanceEvaluator:
                 f"motion handoff telemetry is invalid: {exc}",
                 observed_s,
             )
+        support_epoch = support.get("safetyStopEpoch")
+        support_stop_generation = sonic.get("plant_support_stop_generation")
+        last_rearm_generation = support.get("lastRearmGeneration")
+        valid_last_rearm_generation = (
+            last_rearm_generation is None
+            or (
+                isinstance(last_rearm_generation, int)
+                and not isinstance(last_rearm_generation, bool)
+                and last_rearm_generation >= 0
+            )
+        )
+        confirmed_support_identity = (
+            isinstance(support_epoch, int)
+            and not isinstance(support_epoch, bool)
+            and support_epoch > 0
+            and isinstance(support_stop_generation, int)
+            and not isinstance(support_stop_generation, bool)
+            and support_stop_generation >= 0
+            and matching_robot_identity
+            and valid_last_rearm_generation
+            and (
+                last_rearm_generation is None
+                or last_rearm_generation <= support_stop_generation
+            )
+        )
         healthy_settled_safe_hold = (
             safe_hold
+            and not missing
             and support_latched is True
+            and confirmed_support_identity
             and fault in {None, ""}
             and plant.get("status") == "running"
             and sonic.get("status") == "running"
@@ -653,11 +719,15 @@ class MotionAcceptanceEvaluator:
             and sonic_mode == "IDLE"
             and sonic.get("static_hold_active") is True
             and sonic.get("motion_handoff_active") is False
-            and abs(motion_handoff_ratio) <= self.limits.command_epsilon
+            and motion_handoff_ratio == 0.0
             and command_zero
             and sonic.get("navigation_task_active") is False
             and sonic.get("sonic_planner_reference_ready") is False
             and sonic.get("sonic_planner_required_pending") is False
+            and sonic.get("sonic_reference_authority_state") == "REVOKED"
+            and sonic.get("sonic_reference_actuator_authority") is False
+            and sonic.get("sonic_reference_authority_dds_target_sequence") is None
+            and sonic.get("sonic_execution_feedback_pending") is False
             and sonic.get("plant_support_mode") == "safety_stop"
             and sonic.get("plant_support_requested_mode") == "safety_stop"
             and sonic.get("plant_support_confirmed_mode") == "safety_stop"
