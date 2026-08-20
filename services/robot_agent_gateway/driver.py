@@ -26,6 +26,9 @@ STATUS_MAP = {
 }
 
 
+_PRE_DISPATCH_CANCEL_CAPACITY = 4096
+
+
 class RobotAgentGatewayDriver:
     """Control API driver for a robot-agent.v1 peer; no ROS credentials live here."""
 
@@ -42,6 +45,35 @@ class RobotAgentGatewayDriver:
         self._released_commands: dict[str, dict[str, Any]] = {}
         self._cancel_confirmed_commands: set[str] = set()
         self._release_pending: set[str] = set()
+        # A cancel can race a dispatch on separate HTTP connections.  If the
+        # cancel enters this driver first, remember the normalized command ID
+        # so the later dispatch cannot acquire control or reach the Robot
+        # Agent.  The ledger is deliberately process-lifetime state: eviction
+        # could turn a proved cancel-first ordering into a false negative.
+        self._pre_dispatch_cancels: dict[str, AdapterResult] = {}
+        self._pre_dispatch_cancel_saturated = False
+
+    @staticmethod
+    def _canonical_wire_uuid(command_id: str) -> bool:
+        try:
+            return str(UUID(command_id)) == command_id
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _suppressed_dispatch(command_id: str) -> AdapterResult:
+        truth = {
+            "robotAgentCommandId": command_id,
+            "dispatchSuppressed": True,
+        }
+        return AdapterResult(
+            status="cancelled",
+            result=truth,
+            details={
+                "protocolState": "CANCELLED",
+                "dispatchSuppressed": True,
+            },
+        )
 
     def discover(self, robot_id: str | None = None) -> AdapterResult:
         value = self.peer.discover(robot_id)
@@ -80,6 +112,23 @@ class RobotAgentGatewayDriver:
         identity = (request.robotId, request.commandKey, payload_hash)
         with self._lease_lock:
             existing_identity = self._command_identities.get(wire_command_id)
+            if wire_command_id in self._pre_dispatch_cancels:
+                return self._suppressed_dispatch(wire_command_id)
+            if (
+                existing_identity is None
+                and self._pre_dispatch_cancel_saturated
+            ):
+                return AdapterResult(
+                    status="rejected",
+                    error=(
+                        "Robot Agent dispatch is fail-closed because the "
+                        "pre-dispatch cancel ledger is saturated"
+                    ),
+                    details={
+                        "protocolState": "REJECTED",
+                        "dispatchSuppressed": True,
+                    },
+                )
             if existing_identity is not None and existing_identity != identity:
                 return AdapterResult(
                     status="rejected",
@@ -126,6 +175,9 @@ class RobotAgentGatewayDriver:
     def cancel(self, command_id: str) -> AdapterResult:
         wire_command_id = self._wire_command_id(command_id)
         with self._lease_lock:
+            pre_dispatch = self._pre_dispatch_cancels.get(wire_command_id)
+            if pre_dispatch is not None:
+                return pre_dispatch
             terminal = self._terminal_statuses.get(wire_command_id)
             if terminal is not None:
                 robot_id = self._command_robots.get(wire_command_id)
@@ -136,9 +188,53 @@ class RobotAgentGatewayDriver:
                     robot_id=robot_id,
                     wire_command_id=wire_command_id,
                 )
-            status = self.peer.cancel(wire_command_id)
+            if (
+                wire_command_id not in self._command_identities
+                and self._canonical_wire_uuid(wire_command_id)
+            ):
+                if len(self._pre_dispatch_cancels) >= _PRE_DISPATCH_CANCEL_CAPACITY:
+                    # Never evict a live tombstone.  Saturation instead closes
+                    # admission for every previously unseen command ID.
+                    self._pre_dispatch_cancel_saturated = True
+                else:
+                    # Install before touching the peer.  A dispatch arriving
+                    # on another HTTP connection must serialize after this
+                    # exact cancellation boundary.
+                    self._pre_dispatch_cancels[wire_command_id] = (
+                        self._suppressed_dispatch(wire_command_id)
+                    )
+            try:
+                status = self.peer.cancel(wire_command_id)
+            except Exception as exc:
+                uncertain = AdapterResult(
+                    status="unavailable",
+                    error=(
+                        "Robot Agent cancellation is unconfirmed: "
+                        f"{type(exc).__name__}"
+                    ),
+                    details={
+                        "protocolState": "UNKNOWN",
+                        "dispatchSuppressed": (
+                            wire_command_id in self._pre_dispatch_cancels
+                            or self._pre_dispatch_cancel_saturated
+                        ),
+                    },
+                )
+                if wire_command_id in self._pre_dispatch_cancels:
+                    self._pre_dispatch_cancels[wire_command_id] = uncertain
+                return uncertain
             robot_id = self._command_robots.get(wire_command_id)
             if robot_id is None:
+                if wire_command_id in self._pre_dispatch_cancels:
+                    # REJECTED merely means the Robot Agent had not seen this
+                    # ID yet.  The local tombstone is the authoritative proof
+                    # that any later dispatch will be suppressed.  If the
+                    # Robot Agent did know the ID, preserve its terminal truth.
+                    if status.state == "REJECTED":
+                        return self._pre_dispatch_cancels[wire_command_id]
+                    result = self._result(status)
+                    self._pre_dispatch_cancels[wire_command_id] = result
+                    return result
                 return self._result(status)
             if status.state == "CANCELLED":
                 # The frozen cancel contract already waits for a new confirmed
@@ -164,6 +260,9 @@ class RobotAgentGatewayDriver:
     def query(self, command_id: str) -> AdapterResult:
         wire_command_id = self._wire_command_id(command_id)
         with self._lease_lock:
+            pre_dispatch = self._pre_dispatch_cancels.get(wire_command_id)
+            if pre_dispatch is not None:
+                return pre_dispatch
             status = self._terminal_statuses.get(wire_command_id)
             if status is None:
                 status = self.peer.query(wire_command_id)
