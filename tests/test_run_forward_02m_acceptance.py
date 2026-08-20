@@ -461,6 +461,21 @@ class FakeTransport:
         if url.startswith(f"{runner.DEFAULT_GATEWAY_BASE}/internal/v1/discover?"):
             assert method == "GET"
             pose = _plant(forward=0.0, state="safe_hold")["pose"]
+            capabilities: Any = [
+                "navigation.navigate_to_pose",
+                "navigation.rotate",
+            ]
+            if self.mode == "discover_missing_navigation":
+                capabilities = ["navigation.rotate"]
+            elif self.mode == "discover_duplicate_capability":
+                capabilities = [
+                    "navigation.navigate_to_pose",
+                    "navigation.navigate_to_pose",
+                ]
+            elif self.mode == "discover_capabilities_nonlist":
+                capabilities = {"navigation.navigate_to_pose": True}
+            elif self.mode == "discover_invalid_capability":
+                capabilities = ["navigation.navigate_to_pose", 7]
             return runner.HttpResponse(
                 200,
                 {
@@ -470,11 +485,7 @@ class FakeTransport:
                         "protocol": "robot-agent.v1",
                         "robotId": "g1-sim",
                         "robotBootId": "robot-boot-1",
-                        "capabilities": [
-                            "navigation.navigate_to_pose",
-                            "command.cancel",
-                            "command.query",
-                        ],
+                        "capabilities": capabilities,
                         "observation": {
                             "status": "USABLE",
                             "sessionId": "observation-session-1",
@@ -1329,6 +1340,30 @@ def test_success_posts_exact_frozen_payload_once_then_queries_once(
     assert machine.safety.identities["plant.viewerWorkerMode"] == "disabled"
     assert machine.safety.identities["plant.viewerWorkerPid"] is None
     assert machine.safety.identities["plant.viewerWorkerBootId"] is None
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "discover_missing_navigation",
+        "discover_duplicate_capability",
+        "discover_capabilities_nonlist",
+        "discover_invalid_capability",
+    ],
+)
+def test_discover_skill_capabilities_fail_closed_before_command_write(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    machine, _clock, transport, _evidence = _build(monkeypatch, mode=mode)
+
+    result = machine.run()
+
+    assert result["passed"] is False
+    assert result["discoverGetCount"] == 1
+    assert result["commandPostCount"] == 0
+    assert len(_calls(transport, "GET", "/internal/v1/discover?robotId=g1-sim")) == 1
+    assert not any(call.method == "POST" for call in transport.calls)
 
 
 def test_uncertain_post_is_never_retried_and_ra_unknown_still_cancels_once(

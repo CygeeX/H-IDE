@@ -1401,14 +1401,23 @@ class Forward02mRunner:
         envelope = self._json_response("GET", url, authenticated=True)
         result = _mapping(envelope.get("result"), "Gateway discover result")
         capabilities = result.get("capabilities")
+        skill_ids_are_valid = bool(
+            isinstance(capabilities, list)
+            and all(
+                isinstance(capability, str)
+                and capability
+                and all(ord(char) >= 0x21 and ord(char) != 0x7F for char in capability)
+                for capability in capabilities
+            )
+        )
         if (
             envelope.get("status") != "available"
             or result.get("available") is not True
             or result.get("protocol") != "robot-agent.v1"
             or result.get("robotId") != ROBOT_ID
-            or not isinstance(capabilities, list)
+            or not skill_ids_are_valid
             or len(capabilities) != len(set(capabilities))
-            or not {COMMAND_KEY, "command.cancel", "command.query"}.issubset(capabilities)
+            or COMMAND_KEY not in capabilities
         ):
             raise AcceptanceError("Gateway discover did not return one usable unique robot contract")
         observation = _mapping(result.get("observation"), "Gateway discovery observation")
