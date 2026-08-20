@@ -17,6 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import IntEnum, StrEnum
+from fractions import Fraction
 import math
 from types import MappingProxyType
 from typing import Callable, Iterable, Mapping
@@ -254,6 +255,41 @@ DEFAULT_SKILL_RULES: Mapping[str, SkillRule] = MappingProxyType(
 
 
 _ALL_AUTONOMY_MODES = frozenset(AutonomyMode)
+
+# Policy requests reconstruct continuous motion values from map-frame poses.
+# Keep the persisted limit exact while admitting only 1e-9 in each quantity's
+# SI unit (m, m/s, rad, or rad/s) as floating-point reconstruction noise at a
+# non-zero boundary. A zero limit is categorical and must never gain motion
+# authority through this tolerance.
+_MOTION_BOUND_ABS_TOLERANCE = Fraction(1, 1_000_000_000)
+
+
+def _is_finite_nonnegative_number(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value) and value >= 0
+    except (OverflowError, TypeError, ValueError):
+        return False
+
+
+def _within_motion_bound(requested: object, maximum: object) -> bool:
+    if not _is_finite_nonnegative_number(
+        requested
+    ) or not _is_finite_nonnegative_number(maximum):
+        return False
+    if maximum == 0:
+        return requested == 0
+    if requested <= maximum:
+        return True
+    # Fraction preserves both integer identity and the exact binary value of a
+    # float.  math.isclose() first coerces integers to double precision, which
+    # can collapse 10**16 + 1 onto 10**16 and silently widen authorization by
+    # a full SI unit.
+    return (
+        Fraction(requested) - Fraction(maximum)
+        <= _MOTION_BOUND_ABS_TOLERANCE
+    )
 
 
 def _limits(
@@ -551,7 +587,7 @@ class PolicyGate:
             ("rotation_rad", request.rotation_rad),
             ("angular_speed_rad_s", request.angular_speed_rad_s),
         ):
-            if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            if not _is_finite_nonnegative_number(value):
                 failed.append(name)
         if request.is_initial_plan and request.is_replan:
             failed.append("plan_phase")
@@ -617,8 +653,12 @@ class PolicyGate:
             ),
         )
         for name, value, maximum in comparisons:
-            if value > maximum:
-                failed.append(f"{name}={value:g}>max={maximum:g}")
+            if not _within_motion_bound(value, maximum):
+                failed.append(
+                    f"{name}=invalid_limit"
+                    if not _is_finite_nonnegative_number(maximum)
+                    else f"{name}=outside_trusted_limit"
+                )
         if request.distance_m > 0 and request.speed_mps <= 0:
             failed.append("speed_mps must be positive for translation")
         if request.rotation_rad > 0 and request.angular_speed_rad_s <= 0:
@@ -711,12 +751,7 @@ class PolicyGate:
             ),
         )
         for name, requested, maximum in comparisons:
-            if (
-                not isinstance(maximum, (int, float))
-                or not math.isfinite(maximum)
-                or maximum < 0
-                or requested > maximum
-            ):
+            if not _within_motion_bound(requested, maximum):
                 failed.append(name)
         if failed:
             return self._deny(

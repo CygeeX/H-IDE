@@ -16,6 +16,7 @@ from services.control_api.autonomy_policy import (
     ExecutionTarget,
     HeadState,
     HealthStatus,
+    MotionLimits,
     PolicyEffect,
     PolicyGate,
     PolicyRequest,
@@ -207,6 +208,215 @@ def test_valid_short_lived_grant_allows_approved_revision_in_ask_every_mode() ->
     assert decision.effect is PolicyEffect.ALLOW
     assert decision.code is DecisionCode.ALLOW_VALID_GRANT
     assert decision.grant_id == "grant-1"
+
+
+def test_grant_accepts_map_distance_reconstruction_at_exact_nonzero_boundary() -> None:
+    request = motion_request(
+        distance_m=5.000000000148959,
+        is_initial_plan=False,
+        grant=valid_grant(max_distance_m=5.0),
+    )
+
+    decision = gate().decide(request)
+
+    assert decision.effect is PolicyEffect.ALLOW
+    assert decision.code is DecisionCode.ALLOW_VALID_GRANT
+
+
+def test_grant_rejects_distance_beyond_absolute_boundary_tolerance() -> None:
+    request = motion_request(
+        distance_m=5.0 + 2e-9,
+        is_initial_plan=False,
+        grant=valid_grant(max_distance_m=5.0),
+    )
+
+    decision = gate().decide(request)
+
+    assert decision.effect is PolicyEffect.DENY
+    assert decision.code is DecisionCode.DENY_GRANT_SCOPE
+    assert "max_distance_m" in decision.failed_checks
+
+
+def test_grant_bound_does_not_collapse_large_adjacent_integers() -> None:
+    request = motion_request(
+        distance_m=10**16 + 1,
+        is_initial_plan=False,
+        grant=valid_grant(max_distance_m=10**16),
+    )
+    limits = MotionLimits(
+        max_risk=RiskLevel.MEDIUM,
+        max_distance_m=10**16 + 2,
+        max_speed_mps=0.5,
+        max_rotation_rad=math.pi,
+        max_angular_speed_rad_s=0.5,
+    )
+
+    decision = gate(
+        role_limits={(Role.USER, ExecutionTarget.SIM): limits}
+    ).decide(request)
+
+    assert decision.effect is PolicyEffect.DENY
+    assert decision.code is DecisionCode.DENY_GRANT_SCOPE
+    assert "max_distance_m" in decision.failed_checks
+
+
+def test_zero_distance_grant_remains_strictly_zero() -> None:
+    request = motion_request(
+        distance_m=1e-12,
+        is_initial_plan=False,
+        grant=valid_grant(max_distance_m=0.0),
+    )
+
+    decision = gate().decide(request)
+
+    assert decision.effect is PolicyEffect.DENY
+    assert decision.code is DecisionCode.DENY_GRANT_SCOPE
+    assert "max_distance_m" in decision.failed_checks
+
+
+def test_zero_distance_role_limit_remains_strictly_zero() -> None:
+    limits = MotionLimits(
+        max_risk=RiskLevel.MEDIUM,
+        max_distance_m=0.0,
+        max_speed_mps=0.5,
+        max_rotation_rad=math.pi,
+        max_angular_speed_rad_s=0.5,
+    )
+    request = motion_request(
+        distance_m=1e-12,
+        is_initial_plan=False,
+        grant=valid_grant(max_distance_m=1.0),
+    )
+
+    decision = gate(
+        role_limits={(Role.USER, ExecutionTarget.SIM): limits}
+    ).decide(request)
+
+    assert decision.effect is PolicyEffect.DENY
+    assert decision.code is DecisionCode.DENY_MOTION_LIMIT
+    assert "distance_m=outside_trusted_limit" in decision.failed_checks
+
+
+@pytest.mark.parametrize("maximum", [float("nan"), float("inf"), -1.0, True])
+def test_illegal_numeric_grant_bound_fails_closed(maximum: object) -> None:
+    request = motion_request(
+        is_initial_plan=False,
+        grant=valid_grant(max_distance_m=maximum),
+    )
+
+    decision = gate().decide(request)
+
+    assert decision.effect is PolicyEffect.DENY
+    assert decision.code is DecisionCode.DENY_GRANT_SCOPE
+    assert "max_distance_m" in decision.failed_checks
+
+
+def test_oversized_integer_grant_bound_fails_closed_without_overflow() -> None:
+    request = motion_request(
+        is_initial_plan=False,
+        grant=valid_grant(max_distance_m=10**10_000),
+    )
+
+    decision = gate().decide(request)
+
+    assert decision.effect is PolicyEffect.DENY
+    assert decision.code is DecisionCode.DENY_GRANT_SCOPE
+    assert "max_distance_m" in decision.failed_checks
+
+
+@pytest.mark.parametrize(
+    ("distance_m", "expected_code"),
+    [
+        (5.000000000148959, DecisionCode.ALLOW_VALID_GRANT),
+        (5.0 + 2e-9, DecisionCode.DENY_MOTION_LIMIT),
+    ],
+)
+def test_role_distance_limit_uses_same_absolute_boundary(
+    distance_m: float,
+    expected_code: DecisionCode,
+) -> None:
+    request = motion_request(
+        execution_target=ExecutionTarget.REAL,
+        distance_m=distance_m,
+        is_initial_plan=False,
+        grant=valid_grant(
+            execution_target=ExecutionTarget.REAL,
+            max_distance_m=10.0,
+        ),
+    )
+
+    decision = gate().decide(request)
+
+    assert decision.code is expected_code
+    assert decision.effect is (
+        PolicyEffect.ALLOW
+        if expected_code is DecisionCode.ALLOW_VALID_GRANT
+        else PolicyEffect.DENY
+    )
+
+
+def test_role_bound_does_not_collapse_large_adjacent_integers() -> None:
+    limits = MotionLimits(
+        max_risk=RiskLevel.MEDIUM,
+        max_distance_m=10**16,
+        max_speed_mps=0.5,
+        max_rotation_rad=math.pi,
+        max_angular_speed_rad_s=0.5,
+    )
+    request = motion_request(
+        distance_m=10**16 + 1,
+        is_initial_plan=False,
+        grant=valid_grant(max_distance_m=10**16 + 2),
+    )
+
+    decision = gate(
+        role_limits={(Role.USER, ExecutionTarget.SIM): limits}
+    ).decide(request)
+
+    assert decision.effect is PolicyEffect.DENY
+    assert decision.code is DecisionCode.DENY_MOTION_LIMIT
+    assert "distance_m=outside_trusted_limit" in decision.failed_checks
+
+
+@pytest.mark.parametrize("maximum", [float("nan"), float("inf"), -1.0, True])
+def test_illegal_numeric_role_bound_fails_closed(maximum: object) -> None:
+    limits = MotionLimits(
+        max_risk=RiskLevel.MEDIUM,
+        max_distance_m=maximum,
+        max_speed_mps=0.5,
+        max_rotation_rad=math.pi,
+        max_angular_speed_rad_s=0.5,
+    )
+    request = motion_request(
+        is_initial_plan=False,
+        grant=valid_grant(),
+    )
+
+    decision = gate(
+        role_limits={(Role.USER, ExecutionTarget.SIM): limits}
+    ).decide(request)
+
+    assert decision.effect is PolicyEffect.DENY
+    assert decision.code is DecisionCode.DENY_MOTION_LIMIT
+    assert any(item.startswith("distance_m=") for item in decision.failed_checks)
+
+
+def test_oversized_integer_role_bound_fails_closed_without_formatting_it() -> None:
+    limits = MotionLimits(
+        max_risk=RiskLevel.MEDIUM,
+        max_distance_m=10**10_000,
+        max_speed_mps=0.5,
+        max_rotation_rad=math.pi,
+        max_angular_speed_rad_s=0.5,
+    )
+
+    decision = gate(
+        role_limits={(Role.USER, ExecutionTarget.SIM): limits}
+    ).decide(motion_request())
+
+    assert decision.effect is PolicyEffect.DENY
+    assert decision.code is DecisionCode.DENY_MOTION_LIMIT
+    assert "distance_m=invalid_limit" in decision.failed_checks
 
 
 @pytest.mark.parametrize(
@@ -425,6 +635,8 @@ def test_custom_developer_skill_rejects_user_role() -> None:
     "change",
     [
         {"distance_m": float("nan")},
+        {"distance_m": True},
+        {"distance_m": 10**10_000},
         {"speed_mps": float("inf")},
         {"rotation_rad": -1.0},
         {"is_initial_plan": True, "is_replan": True},
