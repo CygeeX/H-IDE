@@ -19,7 +19,7 @@ stale or cancelled.
 
 ## What is vendored and what is downloaded
 
-* `vendor/lerobot` is pinned to `be49454734c8526340fbd997c374aaa1eb9e83cb`.
+* `vendor/lerobot` is pinned to `cab2c37a172c0101391d95f754123ed054f1b6e6`.
   The source is Apache-2.0.
 * `models/unitree-g1-mujoco` is the public `lerobot/unitree-g1-mujoco`
   repository.  Its scene/assets are used as the MuJoCo plant.
@@ -70,14 +70,16 @@ non-semantic integrity manifest.
   transitions are immediate, while in-motion clip updates are rate-limited so
   asynchronous planner results cannot overtake newer commands.
 * Every admitted motion intent and asynchronous planner request has a local
-  generation/signature lineage.  The static joint handoff stays at ratio zero
-  until a uniquely correlated new reference is blendable at the live cursor;
-  translational references must also predict positive root displacement in the
+  generation/signature lineage.  Reference authority is binary: the exact last
+  successful 29-DoF DDS target remains held until a uniquely correlated
+  reference is installed and primed, and only its first successful DDS write
+  grants motion.  There is no post-policy target blend.  The exact published
+  target is converted back into executed-action history, and the reference
+  cursor advances only for a candidate from the same install epoch and cursor.
+  Translational references must also predict positive root displacement in the
   requested direction.  Ambiguous, stale and opposite-direction results are
-  dropped rather than guessed. Each required generation freezes the exact last
-  29-DoF DDS target and blends from that boundary; if a matching reference is
-  still absent after `planner_reference_timeout_s` of MuJoCo time, SONIC enters
-  a terminal exact-target hold. A bad periodic refresh is discarded without
+  dropped rather than guessed; an absent matching reference times out into a
+  terminal exact-target hold.  A bad periodic refresh is discarded without
   revoking the currently proven reference.
 * Pure rotations additionally require the planned root quaternion trajectory
   to contain a meaningful shortest yaw delta with the same sign as the
@@ -92,6 +94,13 @@ non-semantic integrity manifest.
   so all accepted map motion still comes from SONIC.
 * A Nav2 cancel, bridge disconnect, or stale command publishes an idle SONIC
   intent and sends a zero/hold command to the MuJoCo plant.
+* A normal Robot Agent safe-stop uses a correlated transaction rather than the
+  terminal-fault path: SONIC first freezes and revokes authority, GaitAdapter
+  requires fresh post-request stationary odometry, Plant then latches
+  `safety_stop`, and Driver identity/epoch plus fresh health are revalidated
+  before success is exposed.  The bridge transaction is bounded to 3.5 s and
+  its loopback proxy to 3.65 s; failures remain failures and never synthesize a
+  confirmed hold.
 * GaitAdapter faults, SONIC loss/terminal faults, and confirmed stale LowState
   reception or SONIC control steps publish one strict
   `h-ide.motion-safety-fault/v1` JSON event on

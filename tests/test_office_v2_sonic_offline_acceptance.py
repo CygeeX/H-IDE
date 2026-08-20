@@ -10,11 +10,14 @@ import sys
 import pytest
 
 from tools.office_v2_sonic_offline_acceptance import (
+    EXPECTED_PROFILE_ARTIFACTS,
     ExclusiveJsonOutput,
     LOCK_PATH,
     MODEL_PATH,
     PROFILE_ID,
     REPO_ROOT,
+    _require_clean_vendor_worktree,
+    _validated_profile_entries,
 )
 
 
@@ -44,6 +47,40 @@ def test_evidence_output_is_exclusive_and_rejects_symlinks(tmp_path: Path) -> No
     linked_parent.symlink_to(real_parent, target_is_directory=True)
     with pytest.raises(ValueError, match="symbolic link"):
         ExclusiveJsonOutput(linked_parent / "through-link.json")
+
+
+def _locked_profile() -> dict[str, object]:
+    lock = json.loads(LOCK_PATH.read_text(encoding="utf-8"))
+    return lock["profiles"][PROFILE_ID]
+
+
+def test_profile_artifact_contract_is_exact() -> None:
+    entries = _validated_profile_entries(_locked_profile())
+    assert {entry["id"]: entry["role"] for entry in entries} == EXPECTED_PROFILE_ARTIFACTS
+
+
+@pytest.mark.parametrize("mutation", ["missing", "misrole", "duplicate", "not-present"])
+def test_profile_artifact_contract_rejects_drift(mutation: str) -> None:
+    profile = json.loads(json.dumps(_locked_profile()))
+    files = profile["files"]
+    planner = next(entry for entry in files if entry["id"] == "python-planner")
+    if mutation == "missing":
+        files.remove(planner)
+    elif mutation == "misrole":
+        planner["role"] = "decoder"
+    elif mutation == "duplicate":
+        files.append(dict(planner))
+    else:
+        planner["present"] = False
+
+    with pytest.raises(RuntimeError):
+        _validated_profile_entries(profile)
+
+
+def test_vendor_worktree_must_be_clean() -> None:
+    _require_clean_vendor_worktree({"dirty": False})
+    with pytest.raises(RuntimeError, match="worktree is dirty"):
+        _require_clean_vendor_worktree({"dirty": True})
 
 
 def _require_real_runtime() -> None:
@@ -114,6 +151,17 @@ def test_real_office_v2_binary_authority_closed_loop(tmp_path: Path) -> None:
     assert len(evidence["provenance"]["outer_worktree"]["worktree_fingerprint_sha256"]) == 64
     assert len(evidence["provenance"]["vendor_worktree"]["worktree_fingerprint_sha256"]) == 64
     assert all(item["lock_match"] for item in evidence["provenance"]["model_files"])
+    assert {
+        item["id"] for item in evidence["provenance"]["model_files"]
+    } == {"python-planner", "python-encoder", "python-decoder"}
+    assert evidence["provenance"]["profile_source_lock_matches_runtime"] is True
+    assert {
+        item["id"] for item in evidence["provenance"]["runtime_source_files"]
+    } == {"python-controller", "python-pipeline", "python-profile"}
+    assert all(
+        item["lock_match"]
+        for item in evidence["provenance"]["runtime_source_files"]
+    )
 
     transaction = evidence["reference_transaction"]
     assert transaction["commit_count"] == 250

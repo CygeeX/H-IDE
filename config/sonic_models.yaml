@@ -56,7 +56,7 @@ audit_findings:
     tuple before any motion-capable process starts.
   - >-
     The experimental runtime is pinned to the actual nested LeRobot revision
-    b32c6b81....  Any source checkout drift causes startup to fail closed.
+    cab2c37a....  Any source checkout drift causes startup to fail closed.
   - >-
     Integrity verification only proves artifact/source identity.  It does not
     prove that the controller is dynamically stable or safe to activate.

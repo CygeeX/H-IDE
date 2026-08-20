@@ -72,4 +72,4 @@ sonic_model_profile: sonic-python-experimental
 sonic_model_lock: /home/phi/learn-projects/h-ide-mujoco-sonic/config/sonic-models.lock.json
 sonic_model_repo: nvidia/GEAR-SONIC
 sonic_model_revision: 9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2
-lerobot_commit: b32c6b81ca45ddd93696d0587a970ce65560943f
+lerobot_commit: cab2c37a172c0101391d95f754123ed054f1b6e6

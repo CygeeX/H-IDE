@@ -92,6 +92,230 @@ def _git_head(path: Path) -> str:
     return completed.stdout.strip()
 
 
+def _git_status_porcelain(path: Path) -> str:
+    try:
+        completed = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(path),
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        raise ValueError(f"cannot execute git: {exc}") from exc
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or "cannot inspect Git worktree"
+        raise ValueError(detail)
+    return completed.stdout
+
+
+def _git_blob(path: Path, revision: str, relative_path: str) -> bytes:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(path), "show", f"{revision}:{relative_path}"],
+            check=False,
+            capture_output=True,
+        )
+    except OSError as exc:
+        raise ValueError(f"cannot execute git: {exc}") from exc
+    if completed.returncode != 0:
+        detail = completed.stderr.decode("utf-8", errors="replace").strip()
+        raise ValueError(detail or "cannot read audited config from Git")
+    return completed.stdout
+
+
+def _git_revision_is_ancestor(path: Path, revision: str) -> bool:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(path), "merge-base", "--is-ancestor", revision, "HEAD"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        raise ValueError(f"cannot execute git: {exc}") from exc
+    if completed.returncode == 0:
+        return True
+    if completed.returncode == 1:
+        return False
+    detail = completed.stderr.strip() or "cannot resolve audited repository revision"
+    raise ValueError(detail)
+
+
+def _gitlink_revision(path: Path, revision: str, relative_path: str) -> str:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(path), "ls-tree", revision, "--", relative_path],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        raise ValueError(f"cannot execute git: {exc}") from exc
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or "cannot inspect audited source gitlink"
+        raise ValueError(detail)
+    fields = completed.stdout.split()
+    if len(fields) < 4 or fields[0] != "160000" or fields[1] != "commit":
+        raise ValueError(f"audited source path is not a Git gitlink: {relative_path}")
+    return fields[2]
+
+
+def _validate_audited_runtime(
+    lock: dict[str, Any],
+    repo_root: Path,
+    *,
+    lock_path: Path,
+    profile_id: str,
+    model_repository_id: object,
+    model_revision: object,
+    source_repository: object,
+    source_revision: object,
+) -> list[str]:
+    errors: list[str] = []
+    audited = lock.get("audited_runtime")
+    if not isinstance(audited, dict):
+        return ["lock has no audited_runtime object"]
+    if audited.get("lock_safe") is not True:
+        reason = audited.get("reason") or "no reason recorded"
+        errors.append(f"audited runtime is not lock-safe: {reason}")
+    elif not isinstance(audited.get("reason"), str) or not audited["reason"].strip():
+        errors.append("lock-safe audited runtime must record a non-empty reason")
+
+    revision = lock.get("repository_revision_at_audit")
+    if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
+        errors.append("repository_revision_at_audit must be a full 40-character Git SHA")
+    else:
+        try:
+            if not _git_revision_is_ancestor(repo_root, revision):
+                errors.append("repository_revision_at_audit is not an ancestor of HEAD")
+        except ValueError as exc:
+            errors.append(f"cannot validate repository_revision_at_audit: {exc}")
+
+    config = audited.get("config")
+    if not isinstance(config, dict):
+        errors.append("audited_runtime.config must be an object")
+        return errors
+    raw_path = config.get("path")
+    if not isinstance(raw_path, str) or not re.fullmatch(r"[A-Za-z0-9_./-]+", raw_path):
+        errors.append("audited_runtime.config.path must be a safe relative repository path")
+        return errors
+    relative_path = Path(raw_path)
+    if relative_path.is_absolute() or ".." in relative_path.parts:
+        errors.append("audited_runtime.config.path must stay within the repository")
+        return errors
+    expected_size = config.get("size")
+    expected_sha256 = config.get("sha256")
+    if (
+        not isinstance(expected_size, int)
+        or isinstance(expected_size, bool)
+        or expected_size <= 0
+    ):
+        errors.append("audited_runtime.config.size must be a positive integer")
+    if not isinstance(expected_sha256, str) or not SHA256_RE.fullmatch(expected_sha256):
+        errors.append("audited_runtime.config.sha256 must be a lowercase 64-character digest")
+
+    current_path = (repo_root / relative_path).resolve()
+    try:
+        current_path.relative_to(repo_root.resolve())
+    except ValueError:
+        errors.append("audited_runtime.config.path resolves outside the repository")
+        return errors
+    if not current_path.is_file():
+        errors.append(f"audited runtime config is missing: {current_path}")
+    elif isinstance(expected_size, int) and isinstance(expected_sha256, str):
+        current_size = current_path.stat().st_size
+        current_sha256 = _sha256(current_path)
+        if current_size != expected_size or current_sha256 != expected_sha256:
+            errors.append(
+                "current audited runtime config does not match its locked size/SHA-256"
+            )
+
+    anchored: bytes | None = None
+    if isinstance(revision, str) and re.fullmatch(r"[0-9a-f]{40}", revision):
+        try:
+            anchored = _git_blob(repo_root, revision, relative_path.as_posix())
+        except ValueError as exc:
+            errors.append(f"cannot reproduce audited runtime config: {exc}")
+        else:
+            anchored_sha256 = hashlib.sha256(anchored).hexdigest()
+            if len(anchored) != expected_size or anchored_sha256 != expected_sha256:
+                errors.append(
+                    "audited runtime config Git blob does not match its locked size/SHA-256"
+                )
+            elif current_path.is_file() and current_path.read_bytes() != anchored:
+                errors.append("current audited runtime config differs from its anchored Git blob")
+
+    if anchored is not None:
+        try:
+            anchored_config = yaml.safe_load(anchored)
+        except yaml.YAMLError as exc:
+            errors.append(f"anchored audited runtime config is invalid YAML: {exc}")
+            anchored_config = None
+        if not isinstance(anchored_config, dict):
+            errors.append("anchored audited runtime config must be a YAML object")
+        else:
+            expected_selectors = {
+                "sonic_model_profile": profile_id,
+                "sonic_model_repo": model_repository_id,
+                "sonic_model_revision": model_revision,
+                "lerobot_commit": source_revision,
+            }
+            for selector, expected in expected_selectors.items():
+                if anchored_config.get(selector) != expected:
+                    errors.append(
+                        f"anchored audited runtime selector {selector} does not match the lock"
+                    )
+            configured_lock = anchored_config.get("sonic_model_lock")
+            try:
+                configured_lock_path = Path(str(configured_lock)).expanduser()
+                if not configured_lock_path.is_absolute():
+                    configured_lock_path = current_path.parent / configured_lock_path
+                if configured_lock_path.resolve() != lock_path.resolve():
+                    errors.append("anchored audited runtime selects a different model lock")
+            except (OSError, RuntimeError, ValueError) as exc:
+                errors.append(f"anchored audited runtime has an invalid model lock path: {exc}")
+
+    if isinstance(source_repository, dict):
+        raw_source_path = source_repository.get("path")
+    else:
+        raw_source_path = None
+    if not isinstance(raw_source_path, str) or not re.fullmatch(
+        r"[A-Za-z0-9_./-]+", raw_source_path
+    ):
+        errors.append("audited runtime source repository path must be repository-relative")
+    else:
+        source_path = Path(raw_source_path)
+        if source_path.is_absolute() or ".." in source_path.parts:
+            errors.append("audited runtime source repository path must stay within the repository")
+        elif isinstance(revision, str) and re.fullmatch(r"[0-9a-f]{40}", revision):
+            try:
+                gitlink_revision = _gitlink_revision(
+                    repo_root, revision, source_path.as_posix()
+                )
+            except ValueError as exc:
+                errors.append(f"cannot validate audited runtime source gitlink: {exc}")
+            else:
+                if gitlink_revision != source_revision:
+                    errors.append(
+                        "audited runtime source gitlink does not match the locked source revision"
+                    )
+
+    if audited.get("declared_model_revision") != model_revision:
+        errors.append("audited runtime model revision does not match the selected profile")
+    if audited.get("declared_lerobot_revision") != source_revision:
+        errors.append("audited runtime declared source revision does not match the selected profile")
+    if audited.get("observed_lerobot_revision") != source_revision:
+        errors.append("audited runtime observed source revision does not match the selected profile")
+    return errors
+
+
 def _validate_file_entry(entry: object, repo_root: Path) -> list[str]:
     if not isinstance(entry, dict):
         return ["file entry must be an object"]
@@ -211,6 +435,16 @@ def verify_profile(
                 f"{repository_id}: revision mismatch: expected {revision}, got {actual_revision}"
             )
             continue
+        try:
+            worktree_status = _git_status_porcelain(path)
+        except ValueError as exc:
+            errors.append(f"{repository_id}: {exc}")
+            continue
+        if worktree_status:
+            errors.append(
+                f"{repository_id}: source worktree is dirty; refusing unlocked runtime source"
+            )
+            continue
         verified_repositories += 1
 
     entries = profile.get("files")
@@ -258,6 +492,27 @@ def verify_profile(
             if source_repository not in repository_ids:
                 errors.append("controller.source_repository is not locked by this profile")
 
+    if not bundle_only:
+        controller = profile.get("controller")
+        source_id = controller.get("source_repository") if isinstance(controller, dict) else None
+        source = source_repositories.get(source_id)
+        source_revision = source.get("revision") if isinstance(source, dict) else None
+        model_repository_id = (
+            model_repository.get("repo_id") if isinstance(model_repository, dict) else None
+        )
+        errors.extend(
+            _validate_audited_runtime(
+                lock,
+                root,
+                lock_path=lock_path,
+                profile_id=profile_id,
+                model_repository_id=model_repository_id,
+                model_revision=model_revision,
+                source_repository=source,
+                source_revision=source_revision,
+            )
+        )
+
     return VerificationResult(
         profile_id,
         tuple(errors),
@@ -285,6 +540,8 @@ def verify_runtime_config(
     profile_id = raw.get("sonic_model_profile")
     if not isinstance(profile_id, str) or not profile_id:
         return VerificationResult("<config>", ("runtime config has no sonic_model_profile",))
+
+    root = (repo_root or lock_path.resolve().parent.parent).resolve()
 
     base = verify_profile(lock_path, profile_id, repo_root=repo_root)
     errors = list(base.errors)

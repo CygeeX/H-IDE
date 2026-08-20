@@ -33,6 +33,14 @@ VENDOR_ROOT = REPO_ROOT / "vendor" / "lerobot"
 LOCK_PATH = REPO_ROOT / "config" / "sonic-models.lock.json"
 PROFILE_PATH = REPO_ROOT / "profiles" / "sonic-python-experimental.yaml"
 MODEL_PATH = REPO_ROOT / "scenes" / "office_v2" / "generated" / "mujoco" / "office_v2.runtime.xml"
+EXPECTED_PROFILE_ARTIFACTS = {
+    "python-planner": "planner",
+    "python-encoder": "encoder",
+    "python-decoder": "decoder",
+    "python-controller": "controller",
+    "python-pipeline": "observation_config",
+    "python-profile": "profile_manifest",
+}
 
 PHYSICS_DT_S = 0.004
 CONTROL_EVERY = 5
@@ -154,31 +162,80 @@ def _git_worktree_evidence(path: Path) -> dict[str, Any]:
     }
 
 
+def _validated_profile_entries(profile: object) -> tuple[dict[str, Any], ...]:
+    if not isinstance(profile, dict):
+        raise RuntimeError(f"locked SONIC profile is not an object: {PROFILE_ID}")
+    raw_entries = profile.get("files")
+    if not isinstance(raw_entries, list):
+        raise RuntimeError("locked SONIC profile files must be a list")
+
+    entries_by_id: dict[str, dict[str, Any]] = {}
+    for raw_entry in raw_entries:
+        if not isinstance(raw_entry, dict):
+            raise RuntimeError("locked SONIC artifact entry is not an object")
+        artifact_id = raw_entry.get("id")
+        if not isinstance(artifact_id, str) or not artifact_id:
+            raise RuntimeError("locked SONIC artifact has no canonical id")
+        if artifact_id in entries_by_id:
+            raise RuntimeError(f"locked SONIC artifact id is duplicated: {artifact_id}")
+        entries_by_id[artifact_id] = raw_entry
+
+    actual_ids = set(entries_by_id)
+    expected_ids = set(EXPECTED_PROFILE_ARTIFACTS)
+    if actual_ids != expected_ids:
+        missing = sorted(expected_ids - actual_ids)
+        unexpected = sorted(actual_ids - expected_ids)
+        raise RuntimeError(
+            "locked SONIC artifact set does not match the exact runtime contract: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+
+    for artifact_id, expected_role in EXPECTED_PROFILE_ARTIFACTS.items():
+        entry = entries_by_id[artifact_id]
+        if entry.get("role") != expected_role:
+            raise RuntimeError(
+                f"locked SONIC artifact role mismatch for {artifact_id}: "
+                f"expected {expected_role!r}, got {entry.get('role')!r}"
+            )
+        if entry.get("present") is not True:
+            raise RuntimeError(f"locked SONIC artifact is not declared present: {artifact_id}")
+
+    return tuple(entries_by_id[artifact_id] for artifact_id in EXPECTED_PROFILE_ARTIFACTS)
+
+
+def _require_clean_vendor_worktree(evidence: object) -> None:
+    if not isinstance(evidence, dict) or evidence.get("dirty") is not False:
+        raise RuntimeError("LeRobot runtime source worktree is dirty")
+
+
 def _load_model_provenance() -> dict[str, Any]:
     lock = json.loads(LOCK_PATH.read_text(encoding="utf-8"))
     profile = lock["profiles"][PROFILE_ID]
     model_revision = profile["model_revision"]
     model_entries = []
-    for entry in profile["files"]:
-        if entry.get("role") not in {"planner", "encoder", "decoder"}:
-            continue
+    runtime_source_entries = []
+    for entry in _validated_profile_entries(profile):
         path = Path(entry["path"]).expanduser()
+        if not path.is_absolute():
+            path = REPO_ROOT / path
         if not path.is_file():
-            raise FileNotFoundError(f"locked SONIC model is missing: {path}")
+            raise FileNotFoundError(f"locked SONIC artifact is missing: {path}")
         size = path.stat().st_size
         digest = _sha256(path)
         if size != entry["size"] or digest != entry["sha256"]:
-            raise RuntimeError(f"locked SONIC model hash/size mismatch: {path}")
-        model_entries.append(
-            {
-                "id": entry["id"],
-                "role": entry["role"],
-                "path": str(path),
-                "size": size,
-                "sha256": digest,
-                "lock_match": True,
-            }
-        )
+            raise RuntimeError(f"locked SONIC artifact hash/size mismatch: {path}")
+        evidence = {
+            "id": entry["id"],
+            "role": entry["role"],
+            "path": str(path),
+            "size": size,
+            "sha256": digest,
+            "lock_match": True,
+        }
+        if entry.get("role") in {"planner", "encoder", "decoder"}:
+            model_entries.append(evidence)
+        else:
+            runtime_source_entries.append(evidence)
 
     cache_root = Path(lock["model_repository"]["cache_root"]).expanduser()
     main_ref = cache_root / "refs" / "main"
@@ -187,6 +244,13 @@ def _load_model_provenance() -> dict[str, Any]:
 
     vendor_sha = _git_sha(VENDOR_ROOT)
     source_lock = lock["source_repositories"]["lerobot-python"]["revision"]
+    if vendor_sha != source_lock:
+        raise RuntimeError(
+            "locked LeRobot source revision does not match the runtime checkout: "
+            f"expected {source_lock}, got {vendor_sha}"
+        )
+    vendor_worktree = _git_worktree_evidence(VENDOR_ROOT)
+    _require_clean_vendor_worktree(vendor_worktree)
     return {
         "profile_id": PROFILE_ID,
         "profile_activation": profile["activation"],
@@ -197,17 +261,18 @@ def _load_model_provenance() -> dict[str, Any]:
         "model_revision": model_revision,
         "model_variant": profile["model_variant"],
         "model_files": model_entries,
+        "runtime_source_files": runtime_source_entries,
         "offline_main_ref": str(main_ref),
         "outer_git_sha": _git_sha(REPO_ROOT),
         "vendor_git_sha": vendor_sha,
         "outer_worktree": _git_worktree_evidence(REPO_ROOT),
-        "vendor_worktree": _git_worktree_evidence(VENDOR_ROOT),
+        "vendor_worktree": vendor_worktree,
         "acceptance_runner_sha256": _sha256(Path(__file__).resolve()),
         "profile_locked_vendor_sha": source_lock,
-        "profile_source_lock_matches_runtime": vendor_sha == source_lock,
+        "profile_source_lock_matches_runtime": True,
         "runtime_source_note": (
-            "The model profile remains evaluation_only; the exact live vendor SHA and source hashes "
-            "are recorded independently because parity fixes postdate its source lock."
+            "The model profile remains evaluation_only; the exact vendor revision, "
+            "controller, pipeline, and profile manifest all match the reviewed lock."
         ),
         "controller_sha256": _sha256(
             VENDOR_ROOT
