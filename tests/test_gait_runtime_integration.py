@@ -23,6 +23,7 @@ from hide_mujoco_sonic.motion_fault import (
     HealthFaultDecision,
     MotionFaultCause,
     SonicHealth,
+    SonicHealthTransportGate,
     sonic_health_probe,
 )
 from hide_mujoco_sonic.normal_stop import NormalStopIdentity, NormalStopState
@@ -254,6 +255,47 @@ def test_bridge_does_not_grant_authority_before_hard_fault_decision() -> None:
         terminal,
         decision,
         now=10.025,
+    ) is False
+    assert adapter._start_at is None
+
+
+def test_bridge_never_observes_authority_while_transport_is_unknown() -> None:
+    clock = Clock()
+    adapter, _ = runtime(clock)
+    clock.value = 10.01
+    starting = adapter.ingest_twist(twist(clock, vx=0.20), now=clock.value)
+    health = reference_health(starting, granted_at=10.015)
+    gate = SonicHealthTransportGate(
+        probe_period_s=0.025,
+        probe_timeout_s=0.020,
+    )
+    pending = gate.observe_timeout(
+        request_id=UUID("60000000-0000-4000-8000-000000000006"),
+        probe_started_at_s=10.000,
+        probe_completed_at_s=10.020,
+    )
+
+    assert _observe_health_reference_authority(
+        adapter,
+        health,
+        healthy_decision(health),
+        now=10.025,
+        transport_decision=pending,
+    ) is False
+    assert adapter._start_at is None
+
+    confirmed = gate.observe_timeout(
+        request_id=UUID("70000000-0000-4000-8000-000000000007"),
+        probe_started_at_s=10.025,
+        probe_completed_at_s=10.045,
+    )
+    assert confirmed.confirmed_cause is not None
+    assert _observe_health_reference_authority(
+        adapter,
+        health,
+        healthy_decision(health),
+        now=10.050,
+        transport_decision=confirmed,
     ) is False
     assert adapter._start_at is None
 

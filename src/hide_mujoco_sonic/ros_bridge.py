@@ -8,7 +8,7 @@ kept in the plant/observation adapter; this node never invents localization.
 from __future__ import annotations
 
 import argparse
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import math
 import os
 import time
@@ -26,9 +26,11 @@ from .gait_adapter import (
 )
 from .motion_fault import (
     HealthFaultDecision,
+    HealthTransportDecision,
     MotionFaultLatch,
     MotionSafetyFault,
     SonicHealthFaultGate,
+    SonicHealthTransportGate,
     SonicHealth,
     motion_fault_qos,
     require_fresh_motion_health,
@@ -43,6 +45,9 @@ from .safety import (
     TranslationHeadingGuard,
 )
 from .transport import (
+    JsonResponseContractError,
+    JsonResponseTimeoutError,
+    JsonResponseUnavailableError,
     latch_plant_physics_fault,
     request_json,
     send_json,
@@ -63,6 +68,117 @@ class _SafetyTimerNode(Protocol):
         callback_group: object,
         clock: object,
     ) -> object: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _HealthProbeAttempt:
+    """One health I/O attempt plus its transport-fence transition."""
+
+    health: SonicHealth | None
+    transport: HealthTransportDecision
+    timeout_error: JsonResponseTimeoutError | None
+    request_attempted: bool
+
+
+def _health_transport_command_action(
+    *,
+    fenced: bool,
+    gait_state: GaitState,
+    vx: float,
+    vy: float,
+    wz: float,
+) -> str:
+    """Return ``allow``, ``block``, or ``cancel_start`` for one Nav2 input."""
+
+    if not isinstance(fenced, bool):
+        raise TypeError("fenced must be a boolean")
+    if not isinstance(gait_state, GaitState):
+        raise TypeError("gait_state must be a GaitState")
+    values = tuple(float(value) for value in (vx, vy, wz))
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("Nav2 command must be finite")
+    if not fenced or not any(value != 0.0 for value in values):
+        return "allow"
+    if gait_state is GaitState.STARTING:
+        return "cancel_start"
+    # An already-authorized gait may retain only its last accepted target for
+    # the bounded confirmation window.  No new non-zero callback (including a
+    # changed target while WALKING/TURNING) is consumed while health is unknown.
+    return "block"
+
+
+def _suppress_for_unknown_health_transport(
+    fenced: bool,
+    intent: SonicIntent,
+) -> bool:
+    """Fence every ordinary motion-bearing envelope, never a stop or FAULT."""
+
+    if not isinstance(fenced, bool):
+        raise TypeError("fenced must be a boolean")
+    if not isinstance(intent, SonicIntent):
+        raise TypeError("intent must be a SonicIntent")
+    return bool(
+        fenced
+        and intent.state != GaitState.FAULT.value
+        and intent.motion_enabled
+    )
+
+
+def _attempt_sonic_health_probe(
+    request_id: UUID,
+    *,
+    request_health: Callable[[UUID], SonicHealth],
+    transport_gate: SonicHealthTransportGate,
+    clock: Callable[[], float] = time.monotonic,
+) -> _HealthProbeAttempt:
+    """Run one probe; only a typed socket timeout enters confirmation.
+
+    :func:`request_json` wraps only socket connect/send/receive timeouts as
+    :class:`JsonResponseTimeoutError`.  Bare application ``TimeoutError`` and
+    connection/EOF/protocol/schema failures deliberately propagate to their
+    immediate terminal classification.  A caller must fully parse the v2
+    response inside ``request_health`` before this function can report strict
+    success and clear an earlier transport fence.
+    """
+
+    if not isinstance(request_id, UUID):
+        raise TypeError("request_id must be a UUID")
+    started_at = float(clock())
+    before = transport_gate.check_deadline(now_s=started_at)
+    if before.confirmed_cause is not None:
+        return _HealthProbeAttempt(
+            health=None,
+            transport=before,
+            timeout_error=None,
+            request_attempted=False,
+        )
+    try:
+        health = request_health(request_id)
+    except JsonResponseTimeoutError as exc:
+        completed_at = float(clock())
+        decision = transport_gate.observe_timeout(
+            request_id=request_id,
+            probe_started_at_s=started_at,
+            probe_completed_at_s=completed_at,
+        )
+        return _HealthProbeAttempt(
+            health=None,
+            transport=decision,
+            timeout_error=exc,
+            request_attempted=True,
+        )
+    completed_at = float(clock())
+    decision = transport_gate.observe_strict_success(
+        request_id=request_id,
+        probe_started_at_s=started_at,
+        probe_completed_at_s=completed_at,
+    )
+    return _HealthProbeAttempt(
+        health=health,
+        transport=decision,
+        timeout_error=None,
+        request_attempted=True,
+    )
 
 
 def _new_bridge_generation() -> int:
@@ -136,10 +252,19 @@ def _observe_health_reference_authority(
     decision: HealthFaultDecision,
     *,
     now: float,
+    transport_decision: HealthTransportDecision | None = None,
 ) -> bool:
     """Forward a correlated first-DDS grant only from a healthy snapshot."""
 
     if (
+        (
+            transport_decision is not None
+            and (
+                transport_decision.confirmed_cause is not None
+                or transport_decision.pending is not None
+            )
+        )
+        or
         decision.confirmed_cause is not None
         or decision.pending is not None
         or decision.quarantined_cause is not None
@@ -282,6 +407,10 @@ def run_ros_bridge(config: SimConfig) -> None:
         plant_lowstate_stale_s=config.plant_lowstate_stale_s,
         sonic_control_step_stale_s=config.sonic_control_step_stale_s,
     )
+    health_transport_gate = SonicHealthTransportGate(
+        probe_period_s=config.sonic_health_probe_period_s,
+        probe_timeout_s=config.sonic_health_probe_timeout_s,
+    )
     health_quarantine: dict[str, str | bool | None] = {
         "active": False,
         "code": None,
@@ -326,6 +455,20 @@ def run_ros_bridge(config: SimConfig) -> None:
             response,
             expected_request_id=request_id,
             expected_robot_id=config.robot_id,
+        )
+
+    def attempt_sonic_health(
+        request_id: UUID,
+        *,
+        timeout_s: float | None = None,
+    ) -> _HealthProbeAttempt:
+        return _attempt_sonic_health_probe(
+            request_id,
+            request_health=lambda identity: request_sonic_health(
+                identity,
+                timeout_s=timeout_s,
+            ),
+            transport_gate=health_transport_gate,
         )
 
     def interlock_reason() -> str | None:
@@ -420,7 +563,121 @@ def run_ros_bridge(config: SimConfig) -> None:
             f"{event.reason}"
         )
 
+    def log_health_transport_transition(
+        decision: HealthTransportDecision,
+        *,
+        context: str,
+    ) -> None:
+        if decision.transition not in {"pending", "recovered", "confirmed"}:
+            return
+        pending = decision.pending
+        details = (
+            "SONIC_HEALTH_PROBE_TIMEOUT "
+            f"state={decision.transition.upper()} context={context} "
+            f"count={0 if pending is None else pending.count}/"
+            f"{decision.required_count} "
+            f"totalTimeoutCount={decision.total_timeout_count} "
+            f"recoveredTimeoutCount={decision.recovered_timeout_count} "
+            f"confirmedTimeoutCount={decision.confirmed_timeout_count} "
+            f"confirmationBudgetS={decision.confirmation_budget_s:.6f}"
+        )
+        if pending is not None:
+            details += (
+                f" firstRequestId={pending.first_request_id} "
+                f"latestRequestId={pending.latest_request_id} "
+                f"deadlineMonotonicS={pending.confirmation_deadline_s:.9f}"
+            )
+        if decision.transition == "confirmed":
+            node.get_logger().error(details)
+        elif decision.transition == "pending":
+            node.get_logger().warning(details)
+        else:
+            node.get_logger().info(details)
+
+    def enforce_transport_decision(
+        decision: HealthTransportDecision,
+        *,
+        context: str,
+        probe_request_id: UUID | None = None,
+    ) -> bool:
+        """Log the transition and terminalize an expired/confirmed fence."""
+
+        log_health_transport_transition(decision, context=context)
+        cause = decision.confirmed_cause
+        if cause is None:
+            return decision.pending is not None
+        if bridge_fault["reason"] is None:
+            try:
+                latch_stop(
+                    source=cause.source,
+                    code=cause.code,
+                    reason=cause.reason,
+                    probe_request_id=probe_request_id,
+                )
+            except Exception as delivery_exc:
+                node.get_logger().error(
+                    "failed to enforce SONIC health transport stop: "
+                    f"{delivery_exc}"
+                )
+        return True
+
+    def check_health_transport_fence(*, context: str) -> bool:
+        decision = health_transport_gate.check_deadline(
+            now_s=time.monotonic()
+        )
+        return enforce_transport_decision(decision, context=context)
+
+    def classify_health_probe_exception(
+        exc: Exception,
+    ) -> tuple[str, str]:
+        if isinstance(exc, (JsonResponseContractError, ValueError)):
+            return (
+                "SONIC_HEALTH_CONTRACT_FAULT",
+                f"SONIC health response contract failed: {exc}",
+            )
+        if isinstance(
+            exc,
+            (
+                JsonResponseUnavailableError,
+                ConnectionError,
+                OSError,
+                EOFError,
+            ),
+        ):
+            return (
+                "SONIC_UNAVAILABLE",
+                f"SONIC health transport is unavailable: {exc}",
+            )
+        return (
+            "SONIC_UNAVAILABLE",
+            f"SONIC health probe failed: {exc}",
+        )
+
+    def latch_hard_health_probe_failure(
+        exc: Exception,
+        *,
+        context: str,
+        probe_request_id: UUID,
+    ) -> str:
+        code, reason = classify_health_probe_exception(exc)
+        bounded = f"{reason} during {context}"[:512]
+        try:
+            latch_stop(
+                source="sonic_driver",
+                code=code,
+                reason=bounded,
+                probe_request_id=probe_request_id,
+            )
+        except Exception as delivery_exc:
+            node.get_logger().error(
+                f"failed to enforce hard SONIC health-probe stop: {delivery_exc}"
+            )
+        return bounded
+
     def deliver_intent(intent: SonicIntent, *, context: str) -> bool:
+        transport_fenced = check_health_transport_fence(
+            context=f"intent_delivery:{context}"
+        )
         existing_fault = fault_latch.event
         if existing_fault is not None:
             if fault_latch.complete:
@@ -455,6 +712,16 @@ def run_ros_bridge(config: SimConfig) -> None:
                 node.get_logger().error(
                     f"failed to enforce GaitAdapter fault stop: {exc}"
                 )
+            return False
+        if _suppress_for_unknown_health_transport(
+            transport_fenced,
+            intent,
+        ):
+            node.get_logger().warning(
+                "motion-bearing gait intent suppressed while SONIC health "
+                f"transport is unknown context={context} "
+                f"state={intent.state} sequence={intent.sequence}"
+            )
             return False
         if _suppress_for_correlated_stop(
             normal_stop_coordinator["value"],
@@ -527,7 +794,17 @@ def run_ros_bridge(config: SimConfig) -> None:
         request_id: UUID,
         timeout_s: float,
     ) -> SonicHealth:
-        return request_sonic_health(request_id, timeout_s=timeout_s)
+        # The normal-stop worker has its own reservation/deadline and must not
+        # mutate the state-group transport gate with concurrent probe I/O.
+        # Still leave a persistent acceptance marker for every lost reply.
+        try:
+            return request_sonic_health(request_id, timeout_s=timeout_s)
+        except JsonResponseTimeoutError:
+            node.get_logger().warning(
+                "SONIC_HEALTH_PROBE_TIMEOUT state=NORMAL_STOP "
+                f"context=correlated_normal_stop requestId={request_id}"
+            )
+            raise
 
     def wake_normal_stop_pump() -> None:
         guard = normal_stop_guard["value"]
@@ -694,11 +971,18 @@ def run_ros_bridge(config: SimConfig) -> None:
             wz=float(twist.angular.z),
         )
         latest_observation["value"] = observation
+        transport_fenced = check_health_transport_fence(
+            context="odometry_auto_arm"
+        )
         intent = gait.ingest_observation(observation, now=now)
         if intent.state == GaitState.FAULT.value:
             deliver_intent(intent, context="odometry observation")
             return
-        if bridge_fault["reason"] is None and gait.state is GaitState.DISARMED:
+        if (
+            bridge_fault["reason"] is None
+            and not transport_fenced
+            and gait.state is GaitState.DISARMED
+        ):
             # A successful result proves this exact observation was fresh and
             # stationary; rejected attempts remain fail-closed.
             armed = gait.arm(generation["value"], now=now)
@@ -742,8 +1026,34 @@ def run_ros_bridge(config: SimConfig) -> None:
             except Exception as exc:
                 node.get_logger().error(f"failed to deliver invalid-command stop: {exc}")
             return
+        transport_fenced = check_health_transport_fence(
+            context="nav2_command"
+        )
         if bridge_fault["reason"] is not None:
             deliver_intent(gait.tick(now=now), context="latched bridge fault")
+            return
+        transport_action = _health_transport_command_action(
+            fenced=transport_fenced,
+            gait_state=gait.state,
+            vx=vx,
+            vy=vy,
+            wz=wz,
+        )
+        if transport_action != "allow":
+            if transport_action == "cancel_start":
+                stopped = gait.cancel(
+                    generation["value"],
+                    now,
+                    now=now,
+                )
+                deliver_intent(
+                    stopped,
+                    context="health transport command-start revocation",
+                )
+            node.get_logger().warning(
+                "non-zero Nav2 command blocked while SONIC health transport "
+                "is unknown"
+            )
             return
         direction_admitted = direction_guard.accept_command(vx, vy, wz)
         goal_admitted = goal_guard.accept_command(vx, vy, wz)
@@ -788,6 +1098,12 @@ def run_ros_bridge(config: SimConfig) -> None:
                 "navigation safety interlock is latched; process restart is required"
             )
             return response
+        if check_health_transport_fence(context="control_arm_admission"):
+            response.success = False
+            response.message = (
+                "control arm rejected while SONIC health transport is unknown"
+            )
+            return response
         if gait.state in {
             GaitState.STARTING,
             GaitState.WALKING,
@@ -800,22 +1116,28 @@ def run_ros_bridge(config: SimConfig) -> None:
 
         health_request_id = uuid4()
         try:
-            health = request_sonic_health(health_request_id)
+            attempt = attempt_sonic_health(health_request_id)
         except Exception as exc:
-            reason = f"SONIC health probe failed during control arm: {exc}"
-            try:
-                latch_stop(
-                    source="sonic_driver",
-                    code="SONIC_UNAVAILABLE",
-                    reason=reason,
-                )
-            except Exception as delivery_exc:
-                node.get_logger().error(
-                    f"failed to enforce control-arm health stop: {delivery_exc}"
-                )
+            reason = latch_hard_health_probe_failure(
+                exc,
+                context="control_arm",
+                probe_request_id=health_request_id,
+            )
             response.success = False
             response.message = reason
             return response
+        transport_blocked = enforce_transport_decision(
+            attempt.transport,
+            context="control_arm",
+            probe_request_id=health_request_id,
+        )
+        if transport_blocked or attempt.health is None:
+            response.success = False
+            response.message = (
+                "control arm rejected while SONIC health transport is unknown"
+            )
+            return response
+        health = attempt.health
 
         health_decision = health_fault_gate.observe(
             health,
@@ -998,20 +1320,46 @@ def run_ros_bridge(config: SimConfig) -> None:
             return
         request_id = uuid4()
         try:
-            health = request_sonic_health(request_id)
+            attempt = attempt_sonic_health(request_id)
         except Exception as exc:
-            try:
-                latch_stop(
-                    source="sonic_driver",
-                    code="SONIC_UNAVAILABLE",
-                    reason=f"SONIC health probe failed: {exc}",
-                    probe_request_id=request_id,
+            latch_hard_health_probe_failure(
+                exc,
+                context="periodic_health",
+                probe_request_id=request_id,
+            )
+            return
+
+        transport_blocked = enforce_transport_decision(
+            attempt.transport,
+            context="periodic_health",
+            probe_request_id=request_id,
+        )
+        if attempt.timeout_error is not None:
+            # STARTING has not yet been acknowledged by this bridge as having
+            # actuator authority.  Revoke that incomplete start immediately;
+            # an old/late DDS grant must not land inside the timeout window.
+            if (
+                attempt.transport.confirmed_cause is None
+                and gait.state is GaitState.STARTING
+            ):
+                now = time.monotonic()
+                stopped = gait.cancel(
+                    generation["value"],
+                    now,
+                    now=now,
                 )
-            except Exception as delivery_exc:
-                node.get_logger().error(
-                    f"failed to enforce SONIC health-probe stop: {delivery_exc}"
+                node.get_logger().warning(
+                    "SONIC health transport became unknown during STARTING; "
+                    "revoking the unconfirmed motion start"
+                )
+                deliver_intent(
+                    stopped,
+                    context="health transport STARTING revocation",
                 )
             return
+        if transport_blocked or attempt.health is None:
+            return
+        health = attempt.health
 
         previous_pending = health_fault_gate.pending
         decision = health_fault_gate.observe(
@@ -1024,6 +1372,7 @@ def run_ros_bridge(config: SimConfig) -> None:
                 health,
                 decision,
                 now=time.monotonic(),
+                transport_decision=attempt.transport,
             )
         except ValueError as exc:
             try:

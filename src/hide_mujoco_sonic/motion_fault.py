@@ -24,6 +24,7 @@ MOTION_FAULT_SCHEMA_VERSION = "h-ide.motion-safety-fault/v1"
 SONIC_HEALTH_SCHEMA_VERSION = "h-ide.sonic-health/v2"
 MOTION_FAULT_MAX_BYTES = 4096
 STALE_HEALTH_CONFIRMATION_PROBES = 2
+SONIC_HEALTH_TRANSPORT_TIMEOUT_CONFIRMATION_PROBES = 2
 
 _FAULT_FIELDS = frozenset(
     {
@@ -730,6 +731,285 @@ class HealthFaultDecision:
     quarantined_cause: MotionFaultCause | None
     settled_safe_hold: bool
     quarantined_stale_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class PendingHealthTransportTimeout:
+    """One bounded streak of health replies whose transport timed out."""
+
+    first_request_id: UUID
+    latest_request_id: UUID
+    count: int
+    first_probe_started_at_s: float
+    latest_probe_completed_at_s: float
+    confirmation_deadline_s: float
+
+
+@dataclass(frozen=True, slots=True)
+class HealthTransportDecision:
+    """Immutable evidence emitted by :class:`SonicHealthTransportGate`."""
+
+    confirmed_cause: MotionFaultCause | None
+    pending: PendingHealthTransportTimeout | None
+    required_count: int
+    confirmation_budget_s: float
+    total_timeout_count: int
+    recovered_timeout_count: int
+    confirmed_timeout_count: int
+    transition: str
+
+
+class SonicHealthTransportGate:
+    """Confirm only SONIC health *transport* timeouts within one hard budget.
+
+    This gate is deliberately separate from :class:`SonicHealthFaultGate`.
+    A missing reply is unknown transport state, not age-only health evidence,
+    and it can never be quarantined as a healthy SAFE_HOLD sample.  The first
+    timeout fences all new motion authority.  A complete, correlated v2 reply
+    may clear that fence before the deadline; a second consecutive timeout or
+    any observation at/after the deadline is terminal.
+
+    Callers serialize admitted probe attempts on one state-machine boundary.
+    The internal lock only makes read-only diagnostics safe; it does not turn
+    concurrently issued probes into valid consecutive confirmation samples.
+    """
+
+    def __init__(
+        self,
+        *,
+        probe_period_s: float,
+        probe_timeout_s: float,
+        required_timeout_samples: int = (
+            SONIC_HEALTH_TRANSPORT_TIMEOUT_CONFIRMATION_PROBES
+        ),
+        cancellation_start_budget_s: float = 0.10,
+    ) -> None:
+        for value, field in (
+            (probe_period_s, "probe_period_s"),
+            (probe_timeout_s, "probe_timeout_s"),
+            (cancellation_start_budget_s, "cancellation_start_budget_s"),
+        ):
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{field} must be finite and positive")
+        if (
+            isinstance(required_timeout_samples, bool)
+            or required_timeout_samples
+            != SONIC_HEALTH_TRANSPORT_TIMEOUT_CONFIRMATION_PROBES
+        ):
+            raise ValueError(
+                "required_timeout_samples is fixed at "
+                f"{SONIC_HEALTH_TRANSPORT_TIMEOUT_CONFIRMATION_PROBES}"
+            )
+        if probe_timeout_s > probe_period_s:
+            raise ValueError("probe_timeout_s must not exceed probe_period_s")
+        confirmation_budget_s = (
+            required_timeout_samples * float(probe_period_s)
+            + float(probe_timeout_s)
+        )
+        if confirmation_budget_s >= float(cancellation_start_budget_s):
+            raise ValueError(
+                "health transport timeout confirmation must remain below the "
+                "cancellation-start budget"
+            )
+
+        self._required_count = int(required_timeout_samples)
+        self._confirmation_budget_s = confirmation_budget_s
+        self._lock = threading.RLock()
+        self._pending: PendingHealthTransportTimeout | None = None
+        self._pending_request_ids: set[UUID] = set()
+        self._confirmed_cause: MotionFaultCause | None = None
+        self._total_timeout_count = 0
+        self._recovered_timeout_count = 0
+        self._confirmed_timeout_count = 0
+
+    @property
+    def confirmation_budget_s(self) -> float:
+        return self._confirmation_budget_s
+
+    @property
+    def pending(self) -> PendingHealthTransportTimeout | None:
+        with self._lock:
+            return self._pending
+
+    @property
+    def confirmed_cause(self) -> MotionFaultCause | None:
+        with self._lock:
+            return self._confirmed_cause
+
+    @staticmethod
+    def _monotonic(value: float, field: str) -> float:
+        result = float(value)
+        if not math.isfinite(result) or result < 0.0:
+            raise ValueError(f"{field} must be finite and non-negative")
+        return result
+
+    @staticmethod
+    def _request_id(value: UUID) -> UUID:
+        if not isinstance(value, UUID):
+            raise TypeError("request_id must be a UUID")
+        return value
+
+    def _decision(self, transition: str = "none") -> HealthTransportDecision:
+        return HealthTransportDecision(
+            confirmed_cause=self._confirmed_cause,
+            pending=self._pending,
+            required_count=self._required_count,
+            confirmation_budget_s=self._confirmation_budget_s,
+            total_timeout_count=self._total_timeout_count,
+            recovered_timeout_count=self._recovered_timeout_count,
+            confirmed_timeout_count=self._confirmed_timeout_count,
+            transition=transition,
+        )
+
+    def _confirm_locked(self, reason: str) -> HealthTransportDecision:
+        if self._confirmed_cause is None:
+            self._confirmed_cause = MotionFaultCause(
+                source="sonic_driver",
+                code="SONIC_UNAVAILABLE",
+                reason=str(reason).strip()[:512]
+                or "SONIC health transport confirmation failed",
+            )
+            self._confirmed_timeout_count += 1
+            return self._decision("confirmed")
+        return self._decision("latched")
+
+    def check_deadline(self, *, now_s: float) -> HealthTransportDecision:
+        """Return the current fence and terminalize an expired pending one."""
+
+        now = self._monotonic(now_s, "now_s")
+        with self._lock:
+            pending = self._pending
+            if (
+                self._confirmed_cause is None
+                and pending is not None
+                and now >= pending.confirmation_deadline_s
+            ):
+                return self._confirm_locked(
+                    "SONIC health transport confirmation deadline expired "
+                    f"after {self._confirmation_budget_s:.6f}s "
+                    f"(firstRequestId={pending.first_request_id}, "
+                    f"latestRequestId={pending.latest_request_id}, "
+                    f"count={pending.count}/{self._required_count})"
+                )
+            return self._decision()
+
+    def observe_timeout(
+        self,
+        *,
+        request_id: UUID,
+        probe_started_at_s: float,
+        probe_completed_at_s: float,
+    ) -> HealthTransportDecision:
+        """Record only one genuine socket/``TimeoutError`` probe outcome."""
+
+        identity = self._request_id(request_id)
+        started = self._monotonic(probe_started_at_s, "probe_started_at_s")
+        completed = self._monotonic(
+            probe_completed_at_s, "probe_completed_at_s"
+        )
+        if completed < started:
+            raise ValueError("probe completion preceded its monotonic start")
+        with self._lock:
+            if self._confirmed_cause is not None:
+                return self._decision("latched")
+            self._total_timeout_count += 1
+            previous = self._pending
+            if previous is None:
+                self._pending = PendingHealthTransportTimeout(
+                    first_request_id=identity,
+                    latest_request_id=identity,
+                    count=1,
+                    first_probe_started_at_s=started,
+                    latest_probe_completed_at_s=completed,
+                    confirmation_deadline_s=(
+                        started + self._confirmation_budget_s
+                    ),
+                )
+                self._pending_request_ids = {identity}
+            else:
+                if completed >= previous.confirmation_deadline_s:
+                    return self._confirm_locked(
+                        "SONIC health transport timeout crossed the confirmation "
+                        f"deadline (firstRequestId={previous.first_request_id}, "
+                        f"latestRequestId={identity}, "
+                        f"count={previous.count}/{self._required_count})"
+                    )
+                if (
+                    identity in self._pending_request_ids
+                    or started < previous.latest_probe_completed_at_s
+                ):
+                    # Concurrent callbacks and idempotent request replays are
+                    # diagnostic timeout events, but they are not a *new
+                    # consecutive* sample after the first timeout completed.
+                    return self._decision("ignored_overlap")
+                self._pending = PendingHealthTransportTimeout(
+                    first_request_id=previous.first_request_id,
+                    latest_request_id=identity,
+                    count=previous.count + 1,
+                    first_probe_started_at_s=previous.first_probe_started_at_s,
+                    latest_probe_completed_at_s=completed,
+                    confirmation_deadline_s=previous.confirmation_deadline_s,
+                )
+                self._pending_request_ids.add(identity)
+
+            pending = self._pending
+            if completed >= pending.confirmation_deadline_s:
+                return self._confirm_locked(
+                    "SONIC health transport timeout crossed the confirmation "
+                    f"deadline (firstRequestId={pending.first_request_id}, "
+                    f"latestRequestId={pending.latest_request_id}, "
+                    f"count={pending.count}/{self._required_count})"
+                )
+            if pending.count >= self._required_count:
+                return self._confirm_locked(
+                    "SONIC health transport timed out on consecutive probes "
+                    f"(firstRequestId={pending.first_request_id}, "
+                    f"latestRequestId={pending.latest_request_id}, "
+                    f"count={pending.count}/{self._required_count})"
+                )
+            return self._decision("pending")
+
+    def observe_strict_success(
+        self,
+        *,
+        request_id: UUID,
+        probe_started_at_s: float,
+        probe_completed_at_s: float,
+    ) -> HealthTransportDecision:
+        """Clear pending only after the caller parsed a strict correlated v2."""
+
+        self._request_id(request_id)
+        started = self._monotonic(probe_started_at_s, "probe_started_at_s")
+        completed = self._monotonic(
+            probe_completed_at_s, "probe_completed_at_s"
+        )
+        if completed < started:
+            raise ValueError("probe completion preceded its monotonic start")
+        with self._lock:
+            if self._confirmed_cause is not None:
+                return self._decision("latched")
+            pending = self._pending
+            if pending is None:
+                return self._decision()
+            if completed >= pending.confirmation_deadline_s:
+                return self._confirm_locked(
+                    "SONIC health reply arrived after the transport "
+                    f"confirmation deadline (firstRequestId="
+                    f"{pending.first_request_id}, replyRequestId={request_id}, "
+                    f"count={pending.count}/{self._required_count})"
+                )
+            if (
+                request_id in self._pending_request_ids
+                or started < pending.latest_probe_completed_at_s
+            ):
+                # Only a new probe that started after the last timed-out probe
+                # completed may prove recovery.  A late reply from an older
+                # overlapping request cannot reopen motion authority.
+                return self._decision("ignored_overlap")
+            self._pending = None
+            self._pending_request_ids.clear()
+            self._recovered_timeout_count += 1
+            return self._decision("recovered")
 
 
 class SonicHealthFaultGate:

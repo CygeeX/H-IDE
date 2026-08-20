@@ -88,6 +88,14 @@ _HARD_LOG_MARKERS = re.compile(
 _TEMPORAL_STALE_MARKERS = re.compile(
     r"\b(?:PLANT_LOWSTATE_STALE|SONIC_CONTROL_STALE)\b"
 )
+_HEALTH_TRANSPORT_TIMEOUT_MARKER = re.compile(
+    r"\bSONIC_HEALTH_PROBE_TIMEOUT\b"
+)
+_HEALTH_TRANSPORT_TIMEOUT_COUNTERS = re.compile(
+    r"\btotalTimeoutCount=(?P<total>[0-9]+)\s+"
+    r"recoveredTimeoutCount=(?P<recovered>[0-9]+)\s+"
+    r"confirmedTimeoutCount=(?P<confirmed>[0-9]+)\b"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,6 +160,8 @@ class LogScan:
     stale_matches: tuple[dict[str, Any], ...]
     errors: tuple[str, ...]
     offsets: dict[str, int]
+    transport_timeout_matches: tuple[dict[str, Any], ...] = ()
+    transport_timeout_counter_rollbacks: tuple[dict[str, Any], ...] = ()
 
 
 def _utc_now() -> str:
@@ -367,6 +377,7 @@ class RuntimeLogScanner:
         self.log_names = tuple(log_names)
         self.max_initial_bytes = int(max_initial_bytes)
         self._offsets: dict[str, int] = {}
+        self._transport_timeout_counters: dict[str, tuple[int, int, int]] = {}
 
     @staticmethod
     def _match_record(name: str, offset: int, line: str) -> dict[str, Any]:
@@ -379,6 +390,8 @@ class RuntimeLogScanner:
     def scan(self) -> LogScan:
         hard: list[dict[str, Any]] = []
         stale: list[dict[str, Any]] = []
+        transport_timeouts: list[dict[str, Any]] = []
+        transport_counter_rollbacks: list[dict[str, Any]] = []
         errors: list[str] = []
         for name in self.log_names:
             path = self.runtime_dir / name
@@ -405,10 +418,47 @@ class RuntimeLogScanner:
                         hard.append(self._match_record(name, line_offset, raw_line))
                     if _TEMPORAL_STALE_MARKERS.search(raw_line):
                         stale.append(self._match_record(name, line_offset, raw_line))
+                    if _HEALTH_TRANSPORT_TIMEOUT_MARKER.search(raw_line):
+                        record = self._match_record(name, line_offset, raw_line)
+                        transport_timeouts.append(record)
+                        counters = _HEALTH_TRANSPORT_TIMEOUT_COUNTERS.search(
+                            raw_line
+                        )
+                        # NORMAL_STOP probes run on a separately reserved
+                        # transaction and intentionally do not mutate the
+                        # state-group timeout counter/gate.
+                        if counters is not None:
+                            current = tuple(
+                                int(counters.group(field))
+                                for field in ("total", "recovered", "confirmed")
+                            )
+                            previous_counters = self._transport_timeout_counters.get(
+                                name
+                            )
+                            if (
+                                previous_counters is not None
+                                and any(
+                                    value < previous
+                                    for value, previous in zip(
+                                        current, previous_counters, strict=True
+                                    )
+                                )
+                            ):
+                                transport_counter_rollbacks.append(record)
+                            self._transport_timeout_counters[name] = current
                     line_offset += len(raw_line.encode("utf-8", errors="replace"))
             except (OSError, ValueError) as exc:
                 errors.append(f"{name}: {type(exc).__name__}: {exc}"[:512])
-        return LogScan(tuple(hard), tuple(stale), tuple(errors), dict(self._offsets))
+        return LogScan(
+            tuple(hard),
+            tuple(stale),
+            tuple(errors),
+            dict(self._offsets),
+            transport_timeout_matches=tuple(transport_timeouts),
+            transport_timeout_counter_rollbacks=tuple(
+                transport_counter_rollbacks
+            ),
+        )
 
 
 class RuntimeCounterTracker:
@@ -1214,6 +1264,7 @@ class IdleSoakEvaluator:
         self._process_latest: dict[str, Any] = {}
         self.runtime_stall_seen = False
         self.temporal_stale_log_seen = False
+        self.health_transport_timeout_log_seen = False
 
     def _fail(self, code: str, detail: str, observed_s: float) -> None:
         if code in self.failures:
@@ -1427,6 +1478,18 @@ class IdleSoakEvaluator:
                 self._fail("NUMERICAL_RESET_OR_CRASH_LOG", detail, observed_s)
             if log_scan.stale_matches:
                 self.temporal_stale_log_seen = True
+            if log_scan.transport_timeout_matches:
+                self.health_transport_timeout_log_seen = True
+            if log_scan.transport_timeout_counter_rollbacks:
+                detail = "; ".join(
+                    f"{match['log']}:{match['offset']}: {match['line']}"
+                    for match in log_scan.transport_timeout_counter_rollbacks[:4]
+                )
+                self._fail(
+                    "HEALTH_PROBE_TIMEOUT_COUNTER_ROLLBACK",
+                    detail,
+                    observed_s,
+                )
 
         plant = batch.payloads.get("plant")
         sonic = batch.payloads.get("sonic")
@@ -1650,6 +1713,7 @@ class IdleSoakEvaluator:
             safe_hold_pass
             and not self.runtime_stall_seen
             and not self.temporal_stale_log_seen
+            and not self.health_transport_timeout_log_seen
             and all(delta == 0 for delta in self.runtime.stall_deltas.values())
             and all(
                 delta == 0
@@ -1667,6 +1731,12 @@ class IdleSoakEvaluator:
             "quarantineExercised": quarantine_exercised,
             "runtimeStallSeen": self.runtime_stall_seen,
             "temporalStaleLogSeen": self.temporal_stale_log_seen,
+            "healthProbeTransportTimeoutLogSeen": (
+                self.health_transport_timeout_log_seen
+            ),
+            "healthProbeTransportTimeoutExercised": bool(
+                self.health_transport_timeout_log_seen and safe_hold_pass
+            ),
             "sampleCount": self.samples,
             "robotAgentSampleCount": self.robot_agent_samples,
             "observedDurationS": elapsed,
@@ -1883,7 +1953,12 @@ def run_soak(
             or tuple(process_errors)
             or (
                 log_scan is not None
-                and (log_scan.hard_matches or log_scan.errors)
+                and (
+                    log_scan.hard_matches
+                    or log_scan.transport_timeout_matches
+                    or log_scan.transport_timeout_counter_rollbacks
+                    or log_scan.errors
+                )
             )
         )
         if not first and not final and (

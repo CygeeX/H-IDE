@@ -9,6 +9,18 @@ from uuid import uuid4
 from urllib import request
 
 
+class JsonResponseUnavailableError(ConnectionError):
+    """The peer closed before returning one complete JSON-lines response."""
+
+
+class JsonResponseContractError(RuntimeError):
+    """The peer returned bytes that violate the correlated response contract."""
+
+
+class JsonResponseTimeoutError(TimeoutError):
+    """A socket operation exceeded the caller's bounded response deadline."""
+
+
 def send_json(host: str, port: int, payload: dict[str, Any], *, timeout: float = 0.2) -> None:
     data = (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8")
     with socket.create_connection((host, port), timeout=timeout) as sock:
@@ -31,29 +43,48 @@ def request_json(
     request_id = str(payload.get("request_id") or uuid4())
     message = {**payload, "request_id": request_id}
     data = (json.dumps(message, separators=(",", ":")) + "\n").encode("utf-8")
-    with socket.create_connection((host, port), timeout=timeout) as sock:
-        sock.settimeout(timeout)
-        sock.sendall(data)
-        sock.shutdown(socket.SHUT_WR)
-        response = b""
-        while b"\n" not in response:
-            chunk = sock.recv(4096)
-            if not chunk:
-                break
-            response += chunk
-            if len(response) > 4096:
-                raise RuntimeError("SONIC command response exceeds the bounded limit")
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            sock.sendall(data)
+            sock.shutdown(socket.SHUT_WR)
+            response = b""
+            while b"\n" not in response:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+                if len(response) > 4096:
+                    raise JsonResponseContractError(
+                        "SONIC command response exceeds the bounded limit"
+                    )
+    except TimeoutError as exc:
+        raise JsonResponseTimeoutError(
+            "SONIC command response timed out"
+        ) from exc
+    if b"\n" not in response:
+        raise JsonResponseUnavailableError(
+            "SONIC command endpoint closed before a complete response"
+        )
     try:
         value = json.loads(response.split(b"\n", 1)[0])
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        raise RuntimeError("SONIC command endpoint returned an invalid response") from exc
+        raise JsonResponseContractError(
+            "SONIC command endpoint returned an invalid response"
+        ) from exc
     if not isinstance(value, dict) or value.get("request_id") != request_id:
-        raise RuntimeError("SONIC command response identity mismatch")
+        raise JsonResponseContractError(
+            "SONIC command response identity mismatch"
+        )
     ok = value.get("ok")
     if not isinstance(ok, bool):
-        raise RuntimeError("SONIC command response truth flag is invalid")
+        raise JsonResponseContractError(
+            "SONIC command response truth flag is invalid"
+        )
     if require_ok and not ok:
-        raise RuntimeError(str(value.get("error") or "SONIC command was rejected"))
+        raise JsonResponseContractError(
+            str(value.get("error") or "SONIC command was rejected")
+        )
     return value
 
 

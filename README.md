@@ -287,7 +287,9 @@ The result deliberately has two verdicts:
   process-identity, counter-rollback, or terminal-fault evidence.
 - `movementReleaseAllowed` additionally requires zero increase from the
   baseline in every Plant and SONIC over-threshold runtime counter and no stale
-  marker in the runtime logs.
+  marker in the runtime logs. Any `SONIC_HEALTH_PROBE_TIMEOUT` marker recorded
+  in the window also keeps this verdict false, including a single timeout that
+  later recovered and a timeout from the separately reserved normal-stop path.
 
 An isolated age/stage stall may therefore leave `safeHoldSafetyPass=true` while
 forcing `movementReleaseAllowed=false`. If Robot Agent remained ready, the
@@ -295,8 +297,11 @@ record also sets `quarantineExercised=true`: this proves the safe-hold
 quarantine did not permanently fault the agent, but the observed performance
 stall still blocks a motion attempt. With no natural stall,
 `quarantineExercised=false`; the injected offline safety tests remain the
-evidence for that unexercised branch. Exit status is zero only when movement is
-released, one for a completed HOLD/failed record, and two for setup errors.
+evidence for that unexercised branch. Transport uncertainty is reported
+separately as `healthProbeTransportTimeoutLogSeen` and
+`healthProbeTransportTimeoutExercised`; it is never folded into the age-only
+quarantine verdict. Exit status is zero only when movement is released, one
+for a completed HOLD/failed record, and two for setup errors.
 `--duration` exists for offline and short diagnostic tests; reducing it does
 not produce ten-minute acceptance evidence.
 

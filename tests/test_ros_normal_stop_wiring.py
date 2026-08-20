@@ -116,6 +116,17 @@ def _calls(path: Path) -> list[ast.Call]:
     return [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
 
 
+def _nested_function(path: Path, name: str) -> ast.FunctionDef:
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    matches = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == name
+    ]
+    assert len(matches) == 1
+    return matches[0]
+
+
 def test_ros_bridge_assigns_every_callback_entity_and_uses_two_threads() -> None:
     calls = _calls(ROOT / "src/hide_mujoco_sonic/ros_bridge.py")
     entity_calls = [
@@ -221,6 +232,54 @@ def test_ros_bridge_assigns_every_callback_entity_and_uses_two_threads() -> None
         and call.func.attr == "spin"
         for call in calls
     )
+
+
+def test_health_transport_fence_precedes_every_control_arm_side_effect() -> None:
+    path = ROOT / "src/hide_mujoco_sonic/ros_bridge.py"
+    source = ast.unparse(_nested_function(path, "perform_control_arm"))
+
+    fence = source.index("check_health_transport_fence")
+    probe = source.index("health_request_id = uuid4()")
+    generation = source.index("generation['value'] = next_generation")
+    arm = source.index("gait.arm(next_generation")
+    driver_io = source.index("acknowledgement = request_json")
+
+    assert fence < probe < generation < arm < driver_io
+
+
+def test_health_transport_fence_wires_command_auto_arm_and_delivery_paths() -> None:
+    path = ROOT / "src/hide_mujoco_sonic/ros_bridge.py"
+    command = ast.unparse(_nested_function(path, "on_cmd"))
+    odometry = ast.unparse(_nested_function(path, "on_odom"))
+    delivery = ast.unparse(_nested_function(path, "deliver_intent"))
+    watchdog = ast.unparse(_nested_function(path, "watchdog"))
+
+    assert command.index("check_health_transport_fence") < command.index(
+        "gait.ingest_twist"
+    )
+    assert "_health_transport_command_action" in command
+    assert "transport_action == 'cancel_start'" in command
+    assert command.index("gait.cancel") < command.index("gait.ingest_twist")
+    assert "not transport_fenced" in odometry
+    assert "gait.state is GaitState.DISARMED" in odometry
+    assert odometry.index("not transport_fenced") < odometry.index("gait.arm")
+    assert "_suppress_for_unknown_health_transport" in delivery
+    assert delivery.index("_suppress_for_unknown_health_transport") < delivery.index(
+        "send_intent(intent)"
+    )
+    assert "deliver_intent(intent, context='gait watchdog')" in watchdog
+
+
+def test_normal_stop_timeout_logs_and_reraises_without_mutating_transport_gate() -> None:
+    path = ROOT / "src/hide_mujoco_sonic/ros_bridge.py"
+    source = ast.unparse(_nested_function(path, "probe_normal_stop_health"))
+
+    assert "except JsonResponseTimeoutError" in source
+    assert "SONIC_HEALTH_PROBE_TIMEOUT state=NORMAL_STOP" in source
+    assert source.rstrip().endswith("raise")
+    assert "health_transport_gate" not in source
+    assert "observe_timeout" not in source
+    assert "observe_strict_success" not in source
 
 
 def test_safe_stop_proxy_uses_separate_groups_and_two_thread_executor() -> None:

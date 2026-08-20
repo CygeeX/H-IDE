@@ -12,6 +12,7 @@ from hide_mujoco_sonic.motion_fault import (
     MotionFaultLatch,
     MotionSafetyFault,
     SonicHealthFaultGate,
+    SonicHealthTransportGate,
     SonicHealth,
     classify_sonic_health,
     motion_fault_qos,
@@ -118,6 +119,13 @@ def health_fault_gate() -> SonicHealthFaultGate:
     return SonicHealthFaultGate(
         plant_lowstate_stale_s=0.10,
         sonic_control_step_stale_s=0.10,
+    )
+
+
+def health_transport_gate() -> SonicHealthTransportGate:
+    return SonicHealthTransportGate(
+        probe_period_s=0.025,
+        probe_timeout_s=0.020,
     )
 
 
@@ -316,6 +324,169 @@ def test_sonic_probe_contract_and_health_classification_are_strict() -> None:
         validate_sonic_health_request(
             {**probe, "motion": True},
             expected_robot_id="g1-sim",
+        )
+
+
+def test_health_transport_timeout_gate_recovers_only_from_strict_success() -> None:
+    gate = health_transport_gate()
+    first_request = REQUEST_ID
+    recovery_request = UUID("60000000-0000-4000-8000-000000000006")
+
+    first = gate.observe_timeout(
+        request_id=first_request,
+        probe_started_at_s=10.000,
+        probe_completed_at_s=10.020,
+    )
+
+    assert first.transition == "pending"
+    assert first.confirmed_cause is None
+    assert first.pending is not None
+    assert first.pending.count == 1
+    assert first.pending.confirmation_deadline_s == pytest.approx(10.070)
+    assert first.total_timeout_count == 1
+    assert first.recovered_timeout_count == 0
+    assert first.confirmed_timeout_count == 0
+
+    recovered = gate.observe_strict_success(
+        request_id=recovery_request,
+        probe_started_at_s=10.025,
+        probe_completed_at_s=10.030,
+    )
+
+    assert recovered.transition == "recovered"
+    assert recovered.confirmed_cause is None
+    assert recovered.pending is None
+    assert recovered.total_timeout_count == 1
+    assert recovered.recovered_timeout_count == 1
+    assert recovered.confirmed_timeout_count == 0
+
+
+def test_health_transport_timeout_gate_second_timeout_is_terminal_once() -> None:
+    gate = health_transport_gate()
+    second_request = UUID("60000000-0000-4000-8000-000000000006")
+
+    first = gate.observe_timeout(
+        request_id=REQUEST_ID,
+        probe_started_at_s=20.000,
+        probe_completed_at_s=20.020,
+    )
+    second = gate.observe_timeout(
+        request_id=second_request,
+        probe_started_at_s=20.025,
+        probe_completed_at_s=20.045,
+    )
+    repeated = gate.observe_timeout(
+        request_id=UUID("70000000-0000-4000-8000-000000000007"),
+        probe_started_at_s=20.050,
+        probe_completed_at_s=20.070,
+    )
+
+    assert first.confirmation_budget_s == pytest.approx(0.070)
+    assert second.transition == "confirmed"
+    assert second.confirmed_cause is not None
+    assert second.confirmed_cause.code == "SONIC_UNAVAILABLE"
+    assert second.pending is not None
+    assert second.pending.count == 2
+    assert second.total_timeout_count == 2
+    assert second.confirmed_timeout_count == 1
+    assert repeated.transition == "latched"
+    assert repeated.confirmed_cause is second.confirmed_cause
+    assert repeated.total_timeout_count == 2
+    assert repeated.confirmed_timeout_count == 1
+
+
+def test_health_transport_timeout_gate_late_callback_cannot_recover() -> None:
+    gate = health_transport_gate()
+    gate.observe_timeout(
+        request_id=REQUEST_ID,
+        probe_started_at_s=30.000,
+        probe_completed_at_s=30.020,
+    )
+
+    expired = gate.check_deadline(now_s=30.070)
+    late_success = gate.observe_strict_success(
+        request_id=UUID("60000000-0000-4000-8000-000000000006"),
+        probe_started_at_s=30.075,
+        probe_completed_at_s=30.080,
+    )
+
+    assert expired.transition == "confirmed"
+    assert expired.confirmed_cause is not None
+    assert "deadline expired" in expired.confirmed_cause.reason
+    assert late_success.transition == "latched"
+    assert late_success.confirmed_cause is expired.confirmed_cause
+    assert late_success.pending is not None
+    assert late_success.recovered_timeout_count == 0
+    assert late_success.confirmed_timeout_count == 1
+
+
+def test_overlapping_success_cannot_clear_health_transport_timeout() -> None:
+    gate = health_transport_gate()
+    gate.observe_timeout(
+        request_id=REQUEST_ID,
+        probe_started_at_s=40.000,
+        probe_completed_at_s=40.020,
+    )
+
+    overlap = gate.observe_strict_success(
+        request_id=UUID("60000000-0000-4000-8000-000000000006"),
+        probe_started_at_s=40.005,
+        probe_completed_at_s=40.025,
+    )
+
+    assert overlap.transition == "ignored_overlap"
+    assert overlap.pending is not None
+    assert overlap.pending.count == 1
+    assert overlap.recovered_timeout_count == 0
+
+
+def test_overlapping_timeout_does_not_count_as_confirmation_sample() -> None:
+    gate = health_transport_gate()
+    gate.observe_timeout(
+        request_id=REQUEST_ID,
+        probe_started_at_s=50.000,
+        probe_completed_at_s=50.020,
+    )
+
+    overlap = gate.observe_timeout(
+        request_id=UUID("60000000-0000-4000-8000-000000000006"),
+        probe_started_at_s=50.005,
+        probe_completed_at_s=50.025,
+    )
+
+    assert overlap.transition == "ignored_overlap"
+    assert overlap.confirmed_cause is None
+    assert overlap.pending is not None
+    assert overlap.pending.count == 1
+    assert overlap.total_timeout_count == 2
+
+
+def test_replayed_request_timeout_does_not_confirm_transport_failure() -> None:
+    gate = health_transport_gate()
+    gate.observe_timeout(
+        request_id=REQUEST_ID,
+        probe_started_at_s=60.000,
+        probe_completed_at_s=60.020,
+    )
+
+    replay = gate.observe_timeout(
+        request_id=REQUEST_ID,
+        probe_started_at_s=60.025,
+        probe_completed_at_s=60.045,
+    )
+
+    assert replay.transition == "ignored_overlap"
+    assert replay.confirmed_cause is None
+    assert replay.pending is not None
+    assert replay.pending.count == 1
+    assert replay.total_timeout_count == 2
+
+
+def test_health_transport_timeout_gate_rejects_unsafe_confirmation_budget() -> None:
+    with pytest.raises(ValueError, match="cancellation-start budget"):
+        SonicHealthTransportGate(
+            probe_period_s=0.040,
+            probe_timeout_s=0.020,
         )
 
     assert classify_sonic_health(

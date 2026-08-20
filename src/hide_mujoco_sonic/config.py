@@ -9,7 +9,10 @@ from typing import Any
 
 import yaml
 
-from .motion_fault import STALE_HEALTH_CONFIRMATION_PROBES
+from .motion_fault import (
+    SONIC_HEALTH_TRANSPORT_TIMEOUT_CONFIRMATION_PROBES,
+    STALE_HEALTH_CONFIRMATION_PROBES,
+)
 from .network import require_loopback_bind_host, resolve_docker_observation_bind_host
 from .scene_runtime import RuntimeScene, load_runtime_scene
 
@@ -137,18 +140,29 @@ class SimConfig:
                 "sonic_control_step_stale_s must cover at least two control "
                 "periods and must not exceed 0.10s"
             )
-        confirmation_handoff_s = (
+        stale_confirmation_handoff_s = (
             STALE_HEALTH_CONFIRMATION_PROBES * health_probe_period_s
             + health_probe_timeout_s
         )
-        if confirmation_handoff_s >= 0.10:
+        transport_confirmation_handoff_s = (
+            SONIC_HEALTH_TRANSPORT_TIMEOUT_CONFIRMATION_PROBES
+            * health_probe_period_s
+            + health_probe_timeout_s
+        )
+        if max(
+            stale_confirmation_handoff_s,
+            transport_confirmation_handoff_s,
+        ) >= 0.10:
             raise ValueError(
                 "motion health confirmation must remain below the 0.10s "
                 "Robot Agent cancellation-start handoff budget"
             )
         if (
             max(plant_lowstate_stale_s, sonic_control_step_stale_s)
-            + confirmation_handoff_s
+            + max(
+                stale_confirmation_handoff_s,
+                transport_confirmation_handoff_s,
+            )
             >= 0.30
         ):
             raise ValueError(

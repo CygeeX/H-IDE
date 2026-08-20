@@ -1122,15 +1122,95 @@ def test_runtime_log_scanner_reads_only_appended_failure_clues(tmp_path: Path) -
     baseline = scanner.scan()
     with log.open("a", encoding="utf-8") as stream:
         stream.write("motion health PLANT_LOWSTATE_STALE quarantined\n")
+        stream.write(
+            "SONIC_HEALTH_PROBE_TIMEOUT state=PENDING count=1/2 "
+            "totalTimeoutCount=1 recoveredTimeoutCount=0 "
+            "confirmedTimeoutCount=0\n"
+        )
+        stream.write(
+            "SONIC_HEALTH_PROBE_TIMEOUT state=RECOVERED count=0/2 "
+            "totalTimeoutCount=1 recoveredTimeoutCount=1 "
+            "confirmedTimeoutCount=0\n"
+        )
         stream.write("MuJoCo QACC became non-finite\n")
     changed = scanner.scan()
     recovered = scanner.scan()
 
     assert baseline.hard_matches == baseline.stale_matches == ()
     assert len(changed.stale_matches) == 1
+    assert len(changed.transport_timeout_matches) == 2
+    assert changed.transport_timeout_counter_rollbacks == ()
     assert len(changed.hard_matches) == 1
     assert changed.hard_matches[0]["line"] == "MuJoCo QACC became non-finite"
     assert recovered.hard_matches == recovered.stale_matches == ()
+    assert recovered.transport_timeout_matches == ()
+
+
+def test_recovered_health_transport_timeout_keeps_safe_hold_but_fails_release() -> None:
+    evaluator = idle_soak.IdleSoakEvaluator()
+    _observe(evaluator, _batch(0), 0)
+    timeout_log = idle_soak.LogScan(
+        hard_matches=(),
+        stale_matches=(),
+        errors=(),
+        offsets={"ros-cmd-vel-bridge.log": 100},
+        transport_timeout_matches=(
+            {
+                "log": "ros-cmd-vel-bridge.log",
+                "offset": 20,
+                "line": (
+                    "SONIC_HEALTH_PROBE_TIMEOUT state=RECOVERED "
+                    "totalTimeoutCount=1 recoveredTimeoutCount=1 "
+                    "confirmedTimeoutCount=0"
+                ),
+            },
+        ),
+    )
+    _observe(evaluator, _batch(1), 1, log_scan=timeout_log)
+
+    result = evaluator.finalize()
+
+    assert result["safeHoldSafetyPass"] is True
+    assert result["movementReleaseAllowed"] is False
+    assert result["temporalStaleLogSeen"] is False
+    assert result["healthProbeTransportTimeoutLogSeen"] is True
+    assert result["healthProbeTransportTimeoutExercised"] is True
+
+
+def test_health_transport_timeout_counter_rollback_is_a_hard_failure(
+    tmp_path: Path,
+) -> None:
+    log = tmp_path / "ros-cmd-vel-bridge.log"
+    log.write_text(
+        "SONIC_HEALTH_PROBE_TIMEOUT state=PENDING count=1/2 "
+        "totalTimeoutCount=2 recoveredTimeoutCount=1 "
+        "confirmedTimeoutCount=0\n",
+        encoding="utf-8",
+    )
+    scanner = idle_soak.RuntimeLogScanner(
+        tmp_path,
+        log_names=("ros-cmd-vel-bridge.log",),
+    )
+    scanner.scan()
+    with log.open("a", encoding="utf-8") as stream:
+        stream.write(
+            "SONIC_HEALTH_PROBE_TIMEOUT state=RECOVERED count=0/2 "
+            "totalTimeoutCount=1 recoveredTimeoutCount=0 "
+            "confirmedTimeoutCount=0\n"
+        )
+
+    rolled_back = scanner.scan()
+    assert len(rolled_back.transport_timeout_counter_rollbacks) == 1
+
+    evaluator = idle_soak.IdleSoakEvaluator()
+    _observe(evaluator, _batch(0), 0)
+    _observe(evaluator, _batch(1), 1, log_scan=rolled_back)
+    result = evaluator.finalize()
+    assert result["safeHoldSafetyPass"] is False
+    assert result["movementReleaseAllowed"] is False
+    assert {failure["code"] for failure in result["failures"]} >= {
+        "HEALTH_PROBE_TIMEOUT_COUNTER_ROLLBACK"
+    }
 
 
 class _FakeClock:
