@@ -307,6 +307,100 @@ describe("Mission V2 planning", () => {
     expect(runtime.replanMission).not.toHaveBeenCalled();
   });
 
+  it("passes the exact operator answer into Mission replanning", async () => {
+    const changed = nodes();
+    changed[0] = {
+      ...changed[0]!,
+      intent: {
+        ...changed[0]!.intent,
+        candidateId: "candidate-1",
+        selectionSourceAnalysisId: "analysis-ambiguous-1",
+        targetDescription: "画面中央的灰色圆柱",
+      },
+    };
+    const runtime = {
+      draftMission: vi.fn(),
+      replanMission: vi.fn().mockResolvedValue({
+        objective: revision().objective,
+        nodes: changed,
+        reasonCode: "operator_intervention",
+        reason: "操作员消除了视觉候选歧义",
+        changeSummary: ["选择候选 1"],
+      }),
+    };
+    const answer = "选择第一个候选，也就是画面中央的灰色圆柱";
+    const candidateId = "candidate-1";
+    const selectionSourceAnalysisId = "analysis-ambiguous-1";
+
+    const decision = await new MissionEngine(runtime).handleEvent({
+      missionId: "mission-1",
+      robotId: "robot-1",
+      eventType: "operator.intervention",
+      payload: {
+        kind: "answer",
+        text: `  ${answer}  `,
+        candidateId,
+        selectionSourceAnalysisId,
+      },
+      correlationId: "intervention-1",
+      occurredAt: new Date().toISOString(),
+      activeRevision: revision(),
+      autoRevisionCount: 0,
+    }, {
+      envelope: envelope(),
+      capabilities: capabilities(),
+      objective: revision().objective,
+      requestedBy: "runtime",
+      contextVersion: "context-2",
+      worldRecords: [],
+    }, new AbortController().signal);
+
+    expect(decision.kind).toBe("replan");
+    expect(runtime.replanMission).toHaveBeenCalledWith(
+      expect.objectContaining({
+        trigger: "operator_intervention",
+        triggerDetail: answer,
+        candidateId,
+        selectionSourceAnalysisId,
+      }),
+      expect.any(AbortSignal),
+    );
+    if (decision.kind !== "replan") throw new Error("expected a replanning decision");
+    expect(decision.request).toMatchObject({ candidateId, selectionSourceAnalysisId });
+    expect(decision.revision.nodes[0]?.intent).toMatchObject({
+      candidateId,
+      selectionSourceAnalysisId,
+    });
+  });
+
+  it("rejects a partially bound operator candidate answer before inference", async () => {
+    const runtime = { draftMission: vi.fn(), replanMission: vi.fn() };
+
+    await expect(new MissionEngine(runtime).handleEvent({
+      missionId: "mission-1",
+      robotId: "robot-1",
+      eventType: "operator.intervention",
+      payload: {
+        kind: "answer",
+        text: "选择第一个候选",
+        candidateId: "candidate-1",
+      },
+      correlationId: "intervention-incomplete-selection",
+      occurredAt: new Date().toISOString(),
+      activeRevision: revision(),
+      autoRevisionCount: 0,
+    }, {
+      envelope: envelope(),
+      capabilities: capabilities(),
+      objective: revision().objective,
+      requestedBy: "runtime",
+      contextVersion: "context-2",
+      worldRecords: [],
+    }, new AbortController().signal)).rejects.toThrow(/selection binding is incomplete/i);
+
+    expect(runtime.replanMission).not.toHaveBeenCalled();
+  });
+
   it("scores candidates with trusted facts but never executes the winner", () => {
     const engine = new MissionEngine({ draftMission: vi.fn(), replanMission: vi.fn() });
     const result = engine.scoreCandidates({

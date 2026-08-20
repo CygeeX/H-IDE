@@ -460,6 +460,8 @@ export const missionReplanRequestSchema = z.object({
     "timeout",
   ]),
   triggerDetail: shortText,
+  candidateId: id.nullable().optional(),
+  selectionSourceAnalysisId: id.nullable().optional(),
   autoRevisionCount: z.number().int().min(0).default(0),
   authorizationId: id.nullable().optional(),
 }).strict().superRefine((value, context) => {
@@ -490,6 +492,21 @@ export const missionReplanRequestSchema = z.object({
   }
   if (value.autoRevisionCount > value.envelope.maximumAutoRevisions) {
     context.addIssue({ code: "custom", path: ["autoRevisionCount"], message: "maximum automatic revisions exceeded" });
+  }
+  const hasCandidateId = value.candidateId != null;
+  const hasSelectionSource = value.selectionSourceAnalysisId != null;
+  if (hasCandidateId !== hasSelectionSource) {
+    context.addIssue({
+      code: "custom",
+      path: [hasCandidateId ? "selectionSourceAnalysisId" : "candidateId"],
+      message: "operator candidate selection binding is incomplete",
+    });
+  } else if (hasCandidateId && value.trigger !== "operator_intervention") {
+    context.addIssue({
+      code: "custom",
+      path: ["candidateId"],
+      message: "operator candidate selection requires an operator intervention trigger",
+    });
   }
 });
 

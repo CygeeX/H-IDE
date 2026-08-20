@@ -276,6 +276,13 @@ export class MissionEngine {
           : event.eventType === "operator.intervention"
             ? "operator_intervention"
             : "skill_failed";
+    const triggerDetail = event.eventType === "operator.intervention"
+      && typeof payload.text === "string"
+      && payload.text.trim()
+      ? payload.text.trim()
+      : typeof payload.detail === "string" && payload.detail.trim()
+        ? payload.detail.trim()
+        : event.eventType;
     const request: MissionReplanRequest = missionReplanRequestSchema.parse({
       requestId: `replan-${event.correlationId}`,
       missionId: event.missionId,
@@ -288,7 +295,17 @@ export class MissionEngine {
       activeRevision: event.activeRevision,
       worldRecords: context.worldRecords ?? [],
       trigger,
-      triggerDetail: typeof payload.detail === "string" ? payload.detail : event.eventType,
+      triggerDetail,
+      candidateId: event.eventType === "operator.intervention"
+        && payload.kind === "answer"
+        && typeof payload.candidateId === "string"
+        ? payload.candidateId
+        : null,
+      selectionSourceAnalysisId: event.eventType === "operator.intervention"
+        && payload.kind === "answer"
+        && typeof payload.selectionSourceAnalysisId === "string"
+        ? payload.selectionSourceAnalysisId
+        : null,
       autoRevisionCount: event.autoRevisionCount,
       authorizationId: typeof payload.authorizationId === "string" ? payload.authorizationId : null,
     });
