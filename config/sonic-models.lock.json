@@ -1,6 +1,6 @@
 {
   "schema_version": "h-ide.sonic-model-lock/1",
-  "repository_revision_at_audit": null,
+  "repository_revision_at_audit": "f8ed69eda50076a3cbf5bd879f05556f323bb5fe",
   "model_repository": {
     "repo_id": "nvidia/GEAR-SONIC",
     "revision": "9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2",
@@ -25,8 +25,8 @@
     "declared_model_revision": "9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2",
     "declared_lerobot_revision": "cab2c37a172c0101391d95f754123ed054f1b6e6",
     "observed_lerobot_revision": "cab2c37a172c0101391d95f754123ed054f1b6e6",
-    "lock_safe": false,
-    "reason": "The reviewed runtime pin update is pending a reproducible repository commit anchor."
+    "lock_safe": true,
+    "reason": "The reviewed ros-headless runtime selectors, SONIC model bundle, and exact LeRobot source are reproducibly anchored by repository commit f8ed69eda50076a3cbf5bd879f05556f323bb5fe."
   },
   "profiles": {
     "sonic-official-default": {
