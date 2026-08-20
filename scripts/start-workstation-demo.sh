@@ -215,25 +215,74 @@ structured_motion_fault = bool(
 settled_safe_hold = (
     value.get("nav2_state") == "safety_stop"
     and value.get("sonic_mode") == "IDLE"
+    and abs(float(value.get("sonic_speed_mps", 1.0))) == 0.0
+    and abs(float(value.get("sonic_policy_speed_mps", 1.0))) == 0.0
     and value.get("static_hold_active") is True
     and value.get("motion_handoff_active") is False
-    and abs(float(value.get("motion_handoff_ratio", 1.0))) <= 1e-9
+    and abs(float(value.get("motion_handoff_ratio", 1.0))) == 0.0
     and value.get("navigation_task_active") is False
-    and all(abs(float(value.get(name, 1.0))) <= 1e-9 for name in (
+    and all(abs(float(value.get(name, 1.0))) == 0.0 for name in (
         "last_cmd_vx", "last_cmd_vy", "last_cmd_wz"
     ))
     and value.get("sonic_planner_reference_ready") is False
     and value.get("sonic_planner_required_pending") is False
+    and value.get("sonic_reference_authority_state") == "REVOKED"
+    and value.get("sonic_reference_actuator_authority") is False
+    and value.get("sonic_reference_authority_dds_target_sequence") is None
+    and value.get("sonic_execution_feedback_pending") is False
     and value.get("plant_support_mode") == "safety_stop"
     and value.get("plant_support_requested_mode") == "safety_stop"
     and value.get("plant_support_confirmed_mode") == "safety_stop"
     and value.get("plant_support_stop_pending") is False
     and value.get("plant_support_safety_latched") is True
+    and isinstance(value.get("plant_support_stop_generation"), int)
+    and not isinstance(value.get("plant_support_stop_generation"), bool)
+    and value.get("plant_support_stop_generation") >= 0
+    and value.get("fault_trace_path") in {None, ""}
+    and value.get("fault_trace_sample_count") in {None, 0}
+)
+support_safety_clue = (
+    value.get("nav2_state") == "safety_stop"
+    or any(value.get(name) == "safety_stop" for name in (
+        "plant_support_mode",
+        "plant_support_requested_mode",
+        "plant_support_confirmed_mode",
+    ))
+    or value.get("plant_support_stop_pending") is True
+    or value.get("plant_support_safety_latched") is True
+    or value.get("plant_support_stop_generation") is not None
+)
+settled_idle = (
+    value.get("nav2_state") == "idle"
+    and value.get("sonic_mode") == "IDLE"
+    and abs(float(value.get("sonic_speed_mps", 1.0))) == 0.0
+    and abs(float(value.get("sonic_policy_speed_mps", 1.0))) == 0.0
+    and value.get("static_hold_active") is True
+    and value.get("motion_handoff_active") is False
+    and abs(float(value.get("motion_handoff_ratio", 1.0))) == 0.0
+    and value.get("navigation_task_active") is False
+    and all(abs(float(value.get(name, 1.0))) == 0.0 for name in (
+        "last_cmd_vx", "last_cmd_vy", "last_cmd_wz"
+    ))
+    and value.get("sonic_planner_reference_ready") is False
+    and value.get("sonic_planner_required_pending") is False
+    and value.get("sonic_reference_authority_state") == "REVOKED"
+    and value.get("sonic_reference_actuator_authority") is False
+    and value.get("sonic_reference_authority_dds_target_sequence") is None
+    and value.get("sonic_execution_feedback_pending") is False
+    and value.get("plant_support_mode") == "idle"
+    and value.get("plant_support_requested_mode") == "idle"
+    and value.get("plant_support_confirmed_mode") == "idle"
+    and value.get("plant_support_stop_pending") is False
+    and value.get("plant_support_safety_latched") is False
+    and value.get("plant_support_stop_generation") is None
     and value.get("fault_trace_path") in {None, ""}
     and value.get("fault_trace_sample_count") in {None, 0}
 )
 ready = base_ready and not structured_motion_fault and (
-    last_error in {None, ""} or settled_safe_hold
+    settled_safe_hold
+    if support_safety_clue
+    else settled_idle and last_error in {None, ""}
 )
 raise SystemExit(0 if ready else 1)
 '; then
@@ -504,6 +553,16 @@ wait_for_http \
   'Docker Robot Agent diagnostics' \
   "http://${HIDE_DOCKER_OBSERVATION_BIND_HOST}:8797/healthz" \
   30
+
+# A listening Robot Agent endpoint is not authority evidence.  Before reporting
+# a successful workstation launch, require two consecutive, cross-identified
+# read-only snapshots of the exact Plant/SONIC/Robot-Agent SAFE_HOLD boundary.
+# The gate has fixed loopback GET endpoints and a hard 30-second total deadline.
+"${HIDE_DEMO_SIM_ROOT}/.venv/bin/python" \
+  "${HIDE_DEMO_SIM_ROOT}/tools/startup_safe_hold_gate.py" \
+  --deadline-seconds 30 \
+  --interval-seconds 0.5 \
+  --http-timeout-seconds 1
 
 printf '\nRuntime logs: %s\n' "${HIDE_DEMO_RUN_ROOT}"
 printf 'MuJoCo viewer uses DISPLAY=%s. Open http://127.0.0.1:8080/simulation for RGB-D and mission evidence.\n' "${DISPLAY}"
