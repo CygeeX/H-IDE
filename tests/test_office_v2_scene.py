@@ -106,6 +106,14 @@ def test_workstation_launcher_exposes_an_explicit_viewer_mode() -> None:
     viewer_gate = launcher.index("wait_for_native_viewer", plant_start)
     sonic_start = launcher.index("start_process \\\n  sonic-driver", plant_start)
     assert plant_start < viewer_gate < sonic_start
+    pause_viewer = launcher.index(
+        "pause_native_viewer_for_sonic_cold_start", viewer_gate
+    )
+    sonic_ready = launcher.index("wait_for_sonic_motion_ready 120", sonic_start)
+    resume_viewer = launcher.index("resume_native_viewer", sonic_ready)
+    second_viewer_gate = launcher.index("wait_for_native_viewer", resume_viewer)
+    assert viewer_gate < pause_viewer < sonic_start < sonic_ready
+    assert sonic_ready < resume_viewer < second_viewer_gate
 
 
 def test_build_is_idempotent_and_matches_committed_outputs(tmp_path: Path) -> None:
