@@ -149,15 +149,23 @@ scripts/start-workstation-demo.sh
 # Rebuild changed H-IDE container images first when source changed:
 scripts/start-workstation-demo.sh --rebuild
 
+# Add the local, non-authoritative MuJoCo third-person window:
+scripts/start-workstation-demo.sh --viewer
+
 # Read-only health summary:
 scripts/workstation-demo-status.sh
 ```
 
 Runtime logs are kept outside the repositories under
 `${XDG_RUNTIME_DIR:-/tmp}/h-ide-mujoco-demo-$UID`. The locked acceptance
-profile disables the optional native viewer; `http://127.0.0.1:8080/simulation`
-shows the robot's first-person RGB-D view, root pose, Nav2/SONIC state and
-trajectory.
+profile disables the optional native viewer;
+`http://127.0.0.1:8080/developer/simulation` shows the robot's first-person
+RGB-D view, root pose, Nav2/SONIC state and trajectory.
+
+`--viewer` preserves that exact reviewed configuration and adds only a passive
+viewer with a private model/data copy. It requires the logged-in X11 session
+and can be selected only during a cold Plant start; it cannot attach to an
+already running Plant or write controller state.
 
 ## Manual component start (for debugging)
 

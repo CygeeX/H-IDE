@@ -23,6 +23,7 @@ from hide_mujoco_sonic.motion_fault import (
 from hide_mujoco_sonic.plant import (
     apply_process_start_spawn,
     configure_tracking_viewer,
+    operator_viewer_enabled,
 )
 from hide_mujoco_sonic.scene_runtime import load_runtime_scene
 
@@ -68,6 +69,39 @@ def test_committed_outputs_are_a_deterministic_build() -> None:
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "match scene.yaml" in result.stdout
+
+
+def test_operator_viewer_override_only_enables_the_private_viewer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = SimConfig.from_file(ROOT / "config" / "ros-headless.yaml")
+    assert config.onscreen is False
+
+    monkeypatch.delenv("HIDE_MUJOCO_ONSCREEN_VIEWER", raising=False)
+    assert operator_viewer_enabled(config) is False
+    monkeypatch.setenv("HIDE_MUJOCO_ONSCREEN_VIEWER", "1")
+    assert operator_viewer_enabled(config) is True
+    monkeypatch.setenv("HIDE_MUJOCO_ONSCREEN_VIEWER", "yes")
+    with pytest.raises(RuntimeError, match="must be exactly 0 or 1"):
+        operator_viewer_enabled(config)
+
+
+def test_workstation_launcher_exposes_an_explicit_viewer_mode() -> None:
+    launcher = (ROOT / "scripts" / "start-workstation-demo.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "--viewer)" in launcher
+    assert "HIDE_MUJOCO_ONSCREEN_VIEWER=1" in launcher
+    assert "export HIDE_MUJOCO_ONSCREEN_VIEWER" not in launcher
+    assert '--setenv="XAUTHORITY=${HIDE_DEMO_XAUTHORITY}"' in launcher
+    assert (
+        '--setenv="HIDE_MUJOCO_ONSCREEN_VIEWER='
+        '${HIDE_MUJOCO_ONSCREEN_VIEWER}"' in launcher
+    )
+    assert 'xdpyinfo -display "${DISPLAY}"' in launcher
+    assert "wait_for_native_viewer" in launcher
+    assert "Plant is already running without a ready native viewer" in launcher
 
 
 def test_build_is_idempotent_and_matches_committed_outputs(tmp_path: Path) -> None:

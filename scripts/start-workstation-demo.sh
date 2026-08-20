@@ -18,6 +18,23 @@ HIDE_DEMO_OBSERVATION_CONFIG="${HIDE_DEMO_ROBOT_ROOT}/src/robot_observation_gate
 HIDE_DEMO_CYCLONE='<CycloneDDS><Domain><General><Interfaces><NetworkInterface name="lo"/></Interfaces><AllowMulticast>true</AllowMulticast></General></Domain></CycloneDDS>'
 HIDE_DEMO_SYSTEMD_PREFIX="h-ide-mujoco-demo"
 HIDE_DOCKER_OBSERVATION_BIND_REQUEST="${HIDE_DOCKER_OBSERVATION_BIND_HOST:-auto}"
+HIDE_DEMO_REBUILD=false
+HIDE_MUJOCO_ONSCREEN_VIEWER=0
+
+for argument in "$@"; do
+  case "${argument}" in
+    --rebuild)
+      HIDE_DEMO_REBUILD=true
+      ;;
+    --viewer)
+      HIDE_MUJOCO_ONSCREEN_VIEWER=1
+      ;;
+    *)
+      printf 'usage: %s [--rebuild] [--viewer]\n' "$0" >&2
+      exit 2
+      ;;
+  esac
+done
 
 # Codex/CI terminal scopes reap their complete process group when the command
 # finishes, including children started through nohup.  Put every long-lived
@@ -27,6 +44,29 @@ HIDE_DOCKER_OBSERVATION_BIND_REQUEST="${HIDE_DOCKER_OBSERVATION_BIND_HOST:-auto}
 export HIDE_DEMO_H_IDE_ROOT HIDE_DEMO_SIM_ROOT HIDE_DEMO_ROBOT_ROOT HIDE_DEMO_VISION_ROOT
 export HIDE_DEMO_CONFIG HIDE_DEMO_ROBOT_CONFIG HIDE_DEMO_OBSERVATION_CONFIG
 export HIDE_DEMO_CYCLONE DISPLAY="${DISPLAY:-:0}"
+HIDE_DEMO_XAUTHORITY="${XAUTHORITY:-${XDG_RUNTIME_DIR}/gdm/Xauthority}"
+if [[ "${HIDE_MUJOCO_ONSCREEN_VIEWER}" == "1" ]]; then
+  HIDE_DEMO_XAUTHORITY_RESOLVED="$(
+    readlink -f -- "${HIDE_DEMO_XAUTHORITY}" 2>/dev/null || true
+  )"
+  if [[ ! -f "${HIDE_DEMO_XAUTHORITY_RESOLVED}" \
+    || ! -r "${HIDE_DEMO_XAUTHORITY_RESOLVED}" ]]; then
+    printf 'MuJoCo viewer Xauthority is not a readable regular file: %s\n' \
+      "${HIDE_DEMO_XAUTHORITY}" >&2
+    exit 2
+  fi
+  if [[ "$(stat -c '%u' "${HIDE_DEMO_XAUTHORITY_RESOLVED}")" != "${UID}" ]]; then
+    printf 'MuJoCo viewer Xauthority is not owned by uid %s: %s\n' \
+      "${UID}" "${HIDE_DEMO_XAUTHORITY_RESOLVED}" >&2
+    exit 2
+  fi
+  HIDE_DEMO_XAUTHORITY="${HIDE_DEMO_XAUTHORITY_RESOLVED}"
+  export XAUTHORITY="${HIDE_DEMO_XAUTHORITY}"
+  if ! xdpyinfo -display "${DISPLAY}" >/dev/null 2>&1; then
+    printf 'MuJoCo viewer cannot connect to display %s\n' "${DISPLAY}" >&2
+    exit 2
+  fi
+fi
 
 for required in \
   "${HIDE_DEMO_H_IDE_ROOT}/.env" \
@@ -41,6 +81,36 @@ for required in \
     exit 2
   fi
 done
+
+if [[ "${HIDE_MUJOCO_ONSCREEN_VIEWER}" == "1" ]] \
+  && systemctl --user is-active --quiet \
+    "${HIDE_DEMO_SYSTEMD_PREFIX}-mujoco-plant.service"; then
+  current_plant_state="$(
+    curl -fsS --max-time 2 http://127.0.0.1:8794/state 2>/dev/null || true
+  )"
+  if [[ -z "${current_plant_state}" ]] || ! printf '%s' "${current_plant_state}" \
+    | "${HIDE_DEMO_SIM_ROOT}/.venv/bin/python" -c '
+import json
+import sys
+
+try:
+    viewer = json.load(sys.stdin).get("viewerWorker")
+except (AttributeError, json.JSONDecodeError, TypeError):
+    raise SystemExit(1)
+ready = (
+    isinstance(viewer, dict)
+    and viewer.get("status") == "running"
+    and viewer.get("ready") is True
+    and viewer.get("alive") is True
+)
+raise SystemExit(0 if ready else 1)
+'; then
+    printf '%s\n' \
+      'MuJoCo Plant is already running without a ready native viewer.' \
+      'Stop the complete simulation chain before selecting --viewer.' >&2
+    exit 3
+  fi
+fi
 
 # Resolve Docker's current host-gateway instead of assuming a fixed subnet. The
 # resolver also proves that the address belongs to Docker's local default
@@ -93,6 +163,18 @@ start_process() {
   local log="${HIDE_DEMO_RUN_ROOT}/${name}.log"
   local existing=""
   local main_pid=""
+  local operator_viewer_env_args=()
+
+  if [[ "${name}" == "mujoco-plant" ]]; then
+    operator_viewer_env_args=(
+      --setenv="HIDE_MUJOCO_ONSCREEN_VIEWER=${HIDE_MUJOCO_ONSCREEN_VIEWER}"
+    )
+    if [[ "${HIDE_MUJOCO_ONSCREEN_VIEWER}" == "1" ]]; then
+      operator_viewer_env_args+=(
+        --setenv="XAUTHORITY=${HIDE_DEMO_XAUTHORITY}"
+      )
+    fi
+  fi
 
   if systemctl --user is-active --quiet "${unit}"; then
     main_pid="$(systemctl --user show -p MainPID --value "${unit}")"
@@ -126,6 +208,7 @@ start_process() {
     --property="StandardOutput=append:${log}" \
     --property="StandardError=append:${log}" \
     --setenv="DISPLAY=${DISPLAY}" \
+    "${operator_viewer_env_args[@]}" \
     --setenv="HIDE_DEMO_H_IDE_ROOT=${HIDE_DEMO_H_IDE_ROOT}" \
     --setenv="HIDE_DEMO_SIM_ROOT=${HIDE_DEMO_SIM_ROOT}" \
     --setenv="HIDE_DEMO_ROBOT_ROOT=${HIDE_DEMO_ROBOT_ROOT}" \
@@ -164,6 +247,46 @@ wait_for_http() {
     sleep 1
   done
   printf '%s did not become ready within %ss: %s\n' "${label}" "${timeout_seconds}" "${url}" >&2
+  return 1
+}
+
+wait_for_native_viewer() {
+  if [[ "${HIDE_MUJOCO_ONSCREEN_VIEWER}" != "1" ]]; then
+    return 0
+  fi
+  local deadline=$((SECONDS + 30))
+  local state=""
+  while (( SECONDS < deadline )); do
+    state="$(curl -fsS --max-time 2 http://127.0.0.1:8794/state 2>/dev/null || true)"
+    if [[ -n "${state}" ]] && printf '%s' "${state}" \
+      | "${HIDE_DEMO_SIM_ROOT}/.venv/bin/python" -c '
+import json
+import sys
+
+try:
+    state = json.load(sys.stdin)
+except (json.JSONDecodeError, TypeError):
+    raise SystemExit(1)
+viewer = state.get("viewerWorker")
+ready = (
+    isinstance(viewer, dict)
+    and viewer.get("status") == "running"
+    and viewer.get("ready") is True
+    and viewer.get("alive") is True
+    and viewer.get("authorityFeedbackEnabled") is False
+    and viewer.get("keyCallbackRegistered") is False
+    and viewer.get("lastError") is None
+)
+if ready:
+    raise SystemExit(0)
+raise SystemExit(1)
+'; then
+      printf '%-28s ready\n' 'MuJoCo native viewer'
+      return 0
+    fi
+    sleep 0.25
+  done
+  printf 'MuJoCo native viewer did not become ready within 30s\n' >&2
   return 1
 }
 
@@ -361,7 +484,7 @@ compose=(
   -f "${HIDE_DEMO_H_IDE_ROOT}/infra/docker-compose.simulation.yml"
 )
 
-if [[ "${1:-}" == "--rebuild" ]]; then
+if [[ "${HIDE_DEMO_REBUILD}" == "true" ]]; then
   "${compose[@]}" up -d --build
 else
   "${compose[@]}" up -d
@@ -461,6 +584,7 @@ start_process \
   'exec "$HIDE_DEMO_SIM_ROOT/.venv/bin/python" -u -m hide_mujoco_sonic sonic --config "$HIDE_DEMO_CONFIG"'
 
 wait_for_http 'MuJoCo plant + RGB-D' 'http://127.0.0.1:8794/healthz' 60
+wait_for_native_viewer
 # A listening telemetry port only proves that the Python process exists.  Keep
 # Nav2 and Robot Agent offline until the full controller path has warmed, the
 # IDLE consumer has sustained the authoritative 50 Hz simulation cadence, and
@@ -565,5 +689,9 @@ wait_for_http \
   --http-timeout-seconds 1
 
 printf '\nRuntime logs: %s\n' "${HIDE_DEMO_RUN_ROOT}"
-printf 'Optional MuJoCo viewer is disabled. Open http://127.0.0.1:8080/simulation for RGB-D and mission evidence.\n'
+if [[ "${HIDE_MUJOCO_ONSCREEN_VIEWER}" == "1" ]]; then
+  printf 'MuJoCo native third-person viewer is enabled on DISPLAY=%s.\n' "${DISPLAY}"
+else
+  printf 'Optional MuJoCo viewer is disabled. Open http://127.0.0.1:8080/developer/simulation for RGB-D and mission evidence.\n'
+fi
 "${HIDE_DEMO_SIM_ROOT}/scripts/workstation-demo-status.sh"

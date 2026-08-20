@@ -45,6 +45,25 @@ class PlantPhysicsFault(RuntimeError):
     """A latched MuJoCo fault that requires an explicit process restart."""
 
 
+_OPERATOR_VIEWER_ENV = "HIDE_MUJOCO_ONSCREEN_VIEWER"
+
+
+def operator_viewer_enabled(config: SimConfig) -> bool:
+    """Return whether the non-authoritative native viewer is requested.
+
+    The reviewed workstation config stays byte-for-byte locked. Operators may
+    explicitly add the private passive viewer for a local demonstration without
+    changing observation cadence, support timing, model selectors, or any
+    motion-capable process. Only the launcher-owned ``0``/``1`` values are
+    accepted so a misspelled environment value cannot silently change mode.
+    """
+
+    override = os.environ.get(_OPERATOR_VIEWER_ENV, "0")
+    if override not in {"0", "1"}:
+        raise RuntimeError(f"{_OPERATOR_VIEWER_ENV} must be exactly 0 or 1")
+    return config.onscreen or override == "1"
+
+
 @dataclass(frozen=True, slots=True)
 class _SupportCommandState:
     mode: str
@@ -1258,6 +1277,7 @@ class PlantFrameStore:
 
 
 def run_plant(config: SimConfig) -> int:
+    onscreen_viewer_enabled = operator_viewer_enabled(config)
     repository_root = Path(__file__).resolve().parents[2]
     simulator_root = repository_root / "models" / "unitree-g1-mujoco"
     if not (simulator_root / "sim" / "simulator_factory.py").is_file():
@@ -1553,7 +1573,7 @@ def run_plant(config: SimConfig) -> int:
 
             simulator.sim_env.update_render_caches = publish_rgbd_snapshot
 
-        if config.onscreen:
+        if onscreen_viewer_enabled:
             viewer_mailbox = LatestStateMailbox(
                 state_shape,
                 producer_boot_id=producer_boot_id,
