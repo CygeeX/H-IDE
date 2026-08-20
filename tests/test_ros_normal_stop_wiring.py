@@ -4,7 +4,10 @@ import ast
 from pathlib import Path
 
 from hide_mujoco_sonic.gait_adapter import GaitState, SonicIntent
-from hide_mujoco_sonic.ros_bridge import _suppress_for_correlated_stop
+from hide_mujoco_sonic.ros_bridge import (
+    _create_safety_timers,
+    _suppress_for_correlated_stop,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -38,6 +41,24 @@ class BlockingCoordinator:
         return generation == 10
 
 
+class RecordingTimerNode:
+    def __init__(self) -> None:
+        self.calls: list[tuple[float, object, object, object]] = []
+
+    def create_timer(
+        self,
+        timer_period_sec: float,
+        callback,
+        *,
+        callback_group: object,
+        clock: object,
+    ) -> object:
+        self.calls.append(
+            (timer_period_sec, callback, callback_group, clock)
+        )
+        return object()
+
+
 def test_active_normal_stop_suppresses_generic_envelopes_but_never_fault() -> None:
     coordinator = BlockingCoordinator()
 
@@ -53,6 +74,34 @@ def test_active_normal_stop_suppresses_generic_envelopes_but_never_fault() -> No
         coordinator,  # type: ignore[arg-type]
         gait_intent(state=GaitState.FAULT),
     ) is False
+
+
+def test_safety_timers_share_the_supplied_clock_and_state_group() -> None:
+    node = RecordingTimerNode()
+    state_group = object()
+    steady_clock = object()
+
+    def watchdog() -> None:
+        pass
+
+    def health_probe() -> None:
+        pass
+
+    timers = _create_safety_timers(
+        node,
+        command_timeout_s=0.25,
+        health_probe_period_s=0.025,
+        watchdog=watchdog,
+        health_probe=health_probe,
+        callback_group=state_group,
+        clock=steady_clock,
+    )
+
+    assert len(timers) == 2
+    assert node.calls == [
+        (0.1, watchdog, state_group, steady_clock),
+        (0.025, health_probe, state_group, steady_clock),
+    ]
 
 
 def _keyword_name(call: ast.Call, keyword: str) -> str | None:
@@ -106,7 +155,37 @@ def test_ros_bridge_assigns_every_callback_entity_and_uses_two_threads() -> None
     assert len(guards) == 1
     assert all(
         _keyword_name(call, "callback_group") == "state_group"
-        for call in subscriptions + timers + guards
+        for call in subscriptions + guards
+    )
+    assert all(
+        _keyword_name(call, "callback_group") == "callback_group"
+        and _keyword_name(call, "clock") == "clock"
+        for call in timers
+    )
+
+    timer_installers = [
+        call
+        for call in calls
+        if isinstance(call.func, ast.Name)
+        and call.func.id == "_create_safety_timers"
+    ]
+    assert len(timer_installers) == 1
+    assert _keyword_name(timer_installers[0], "callback_group") == "state_group"
+    assert _keyword_name(timer_installers[0], "clock") == "safety_timer_clock"
+
+    clock_constructors = [
+        call
+        for call in calls
+        if isinstance(call.func, ast.Name) and call.func.id == "Clock"
+    ]
+    assert len(clock_constructors) == 1
+    assert any(
+        keyword.arg == "clock_type"
+        and isinstance(keyword.value, ast.Attribute)
+        and isinstance(keyword.value.value, ast.Name)
+        and keyword.value.value.id == "ClockType"
+        and keyword.value.attr == "STEADY_TIME"
+        for keyword in clock_constructors[0].keywords
     )
 
     services = {

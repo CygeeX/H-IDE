@@ -12,7 +12,7 @@ from dataclasses import replace
 import math
 import os
 import time
-from typing import Iterable, Mapping
+from typing import Callable, Iterable, Mapping, Protocol
 from uuid import UUID, uuid4
 
 from .config import SimConfig
@@ -52,6 +52,17 @@ from .transport import (
 
 class RosBridgeUnavailable(RuntimeError):
     pass
+
+
+class _SafetyTimerNode(Protocol):
+    def create_timer(
+        self,
+        timer_period_sec: float,
+        callback: Callable[[], None],
+        *,
+        callback_group: object,
+        clock: object,
+    ) -> object: ...
 
 
 def _new_bridge_generation() -> int:
@@ -173,6 +184,34 @@ def _suppress_for_correlated_stop(
     )
 
 
+def _create_safety_timers(
+    node: _SafetyTimerNode,
+    *,
+    command_timeout_s: float,
+    health_probe_period_s: float,
+    watchdog: Callable[[], None],
+    health_probe: Callable[[], None],
+    callback_group: object,
+    clock: object,
+) -> tuple[object, object]:
+    """Create elapsed-time safety timers on one explicitly supplied clock."""
+
+    return (
+        node.create_timer(
+            min(command_timeout_s / 2, 0.1),
+            watchdog,
+            callback_group=callback_group,
+            clock=clock,
+        ),
+        node.create_timer(
+            health_probe_period_s,
+            health_probe,
+            callback_group=callback_group,
+            clock=clock,
+        ),
+    )
+
+
 def run_ros_bridge(config: SimConfig) -> None:
     os.environ["ROS_DOMAIN_ID"] = str(config.ros_domain_id)
     os.environ.setdefault("RMW_IMPLEMENTATION", "rmw_cyclonedds_cpp")
@@ -191,6 +230,8 @@ def run_ros_bridge(config: SimConfig) -> None:
         from geometry_msgs.msg import PoseWithCovarianceStamped, Twist
         from nav_msgs.msg import Odometry, Path
         from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+        from rclpy.clock import Clock
+        from rclpy.clock_type import ClockType
         from rclpy.executors import MultiThreadedExecutor
         from std_msgs.msg import String
         from std_srvs.srv import Trigger
@@ -199,6 +240,7 @@ def run_ros_bridge(config: SimConfig) -> None:
 
     rclpy.init()
     node = rclpy.create_node("h_ide_mujoco_sonic_bridge")
+    safety_timer_clock = Clock(clock_type=ClockType.STEADY_TIME)
     state_group = MutuallyExclusiveCallbackGroup()
     normal_stop_group = MutuallyExclusiveCallbackGroup()
     generation = {"value": _new_bridge_generation()}
@@ -1080,15 +1122,14 @@ def run_ros_bridge(config: SimConfig) -> None:
                 f"failed to enforce SONIC/Plant health stop: {delivery_exc}"
             )
 
-    node.create_timer(
-        min(config.command_timeout_s / 2, 0.1),
-        watchdog,
+    _safety_timers = _create_safety_timers(
+        node,
+        command_timeout_s=config.command_timeout_s,
+        health_probe_period_s=config.sonic_health_probe_period_s,
+        watchdog=watchdog,
+        health_probe=health_probe,
         callback_group=state_group,
-    )
-    node.create_timer(
-        config.sonic_health_probe_period_s,
-        health_probe,
-        callback_group=state_group,
+        clock=safety_timer_clock,
     )
     node.get_logger().info(
         f"H-IDE MuJoCo SONIC bridge listening to {config.cmd_vel_topic} "
