@@ -1624,20 +1624,52 @@ class SonicDriver:
         self._plant_support_safety_latched = False
         self._plant_support_stop_generation = None
 
-    def _publish_committed_plant_rearm(self, generation: int) -> None:
-        self._arm_guard.reset()
-        self.telemetry.update(
-            nav2_state="idle",
-            navigation_task_active=False,
-            plant_support_mode="idle",
-            plant_support_requested_mode="idle",
-            plant_support_confirmed_mode="idle",
-            plant_support_stop_pending=False,
-            plant_support_safety_latched=False,
-            plant_support_stop_generation=None,
-            plant_support_rearm_generation=generation,
-            last_error=None,
-        )
+    def _publish_committed_plant_rearm(self, generation: int) -> bool:
+        """Project a rearm only while its exact committed state is current.
+
+        The Plant acknowledgement and authority commit precede this display
+        update.  A stronger normal/terminal stop may therefore win before this
+        method runs.  Serialize and revalidate the complete rearm identity so
+        that an older publisher cannot erase the newer stop's arm anchor or
+        overwrite its SAFE_HOLD telemetry with ``idle``.
+        """
+
+        with self._support_lock:
+            # Match the support -> terminal order used by normal-stop commits.
+            # Terminal fault claims release their own lock before reaching for
+            # support, so this nests safely while making the predicate, arm
+            # reset, and IDLE projection one terminal-linearized operation.
+            with self._terminal_fault_lock:
+                if (
+                    self._fault_latched.is_set()
+                    or self._stop.is_set()
+                    or self._intent_ingress.generation != generation
+                    or not self._intent_ingress.armed
+                    or (
+                        self._intent_ingress.staged_control_arm_generation
+                        is not None
+                    )
+                    or self._intent_ingress.support_stop_generation is not None
+                    or self._plant_support_mode != "idle"
+                    or self._plant_support_stop_pending
+                    or self._plant_support_safety_latched
+                    or self._plant_support_stop_generation is not None
+                ):
+                    return False
+                self._arm_guard.reset()
+                self.telemetry.update(
+                    nav2_state="idle",
+                    navigation_task_active=False,
+                    plant_support_mode="idle",
+                    plant_support_requested_mode="idle",
+                    plant_support_confirmed_mode="idle",
+                    plant_support_stop_pending=False,
+                    plant_support_safety_latched=False,
+                    plant_support_stop_generation=None,
+                    plant_support_rearm_generation=generation,
+                    last_error=None,
+                )
+                return True
 
     def _support_transition_token_locked(self) -> tuple[int, int | None]:
         """Correlate support I/O with the stop epoch and ingress generation."""
@@ -3526,6 +3558,11 @@ class SonicDriver:
                     )
 
                 assert plant_epoch is not None
+                # Reference telemetry was already revoked at the braking
+                # boundary.  Snapshot it while support is serialized, before
+                # entering the terminal linearization lock; the short commit
+                # below performs no planner/guard/handoff calls.
+                planner_telemetry = self._planner_telemetry_fields()
                 # The external Plant proof and every local authority fact form
                 # one short commit.  No boundary, network, planner, guard, or
                 # handoff call occurs while the terminal lock is retained.
@@ -3555,6 +3592,32 @@ class SonicDriver:
                     )
                     snapshot = state.confirm_driver(identity)
                     self._normal_stop_last_confirmed_plant_epoch = plant_epoch
+                    # Publish the complete externally observed SAFE_HOLD in the
+                    # same support/terminal critical section as DRIVER_CONFIRMED.
+                    # An older rearm publisher revalidates these owner fields
+                    # under _support_lock and therefore cannot write IDLE later.
+                    self.telemetry.update(
+                        nav2_state="safety_stop",
+                        sonic_mode="IDLE",
+                        sonic_speed_mps=0.0,
+                        sonic_policy_speed_mps=0.0,
+                        navigation_task_active=False,
+                        last_cmd_vx=0.0,
+                        last_cmd_vy=0.0,
+                        last_cmd_wz=0.0,
+                        static_hold_active=True,
+                        motion_handoff_active=False,
+                        motion_handoff_ratio=0.0,
+                        plant_support_mode="safety_stop",
+                        plant_support_requested_mode="safety_stop",
+                        plant_support_confirmed_mode="safety_stop",
+                        plant_support_stop_pending=False,
+                        plant_support_safety_latched=True,
+                        plant_support_stop_generation=(
+                            identity.control_generation
+                        ),
+                        **planner_telemetry,
+                    )
 
                 response = self._normal_stop_response_locked(
                     request_id=request.request_id,

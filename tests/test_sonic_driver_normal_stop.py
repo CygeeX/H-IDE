@@ -92,7 +92,7 @@ class ObservedLock:
 
 def bare_driver(clock: Clock) -> SonicDriver:
     driver = SonicDriver.__new__(SonicDriver)
-    driver.config = SimpleNamespace(robot_id=ROBOT_ID, plant_port=8794)
+    driver.config = SimpleNamespace(robot_id=ROBOT_ID, plant_port=0)
     driver.telemetry = Telemetry()
     driver._driver_boot_id = DRIVER_BOOT_ID
     driver._support_lock = threading.RLock()
@@ -359,6 +359,28 @@ def configure_control_arm_health(driver: SonicDriver, clock: Clock) -> None:
     driver._last_control_step_wall_s = clock.value
     driver.config.plant_lowstate_stale_s = 0.10
     driver.config.sonic_control_step_stale_s = 0.10
+
+
+def commit_rearm_without_publication(
+    driver: SonicDriver,
+    clock: Clock,
+    *,
+    generation: int = 11,
+) -> None:
+    arm_intent = stationary_intent(clock, generation=generation, sequence=1)
+    arm_intent.update(
+        state="IDLE",
+        stop_requested=False,
+        control_arm=True,
+        reason="explicit control rearm",
+    )
+    with driver._support_lock:
+        decision = driver._intent_ingress.accept(
+            arm_intent,
+            defer_control_arm=True,
+        )
+        assert decision.arm_acknowledged is True
+        driver._commit_staged_plant_support_rearm_locked(generation)
 
 
 def _capture_exception(
@@ -955,6 +977,25 @@ def test_plant_ack_atomically_confirms_exact_driver_hold(
 ) -> None:
     clock = Clock()
     driver = bare_driver(clock)
+    driver.telemetry.update(
+        nav2_state="idle",
+        sonic_mode="SLOW_WALK",
+        sonic_speed_mps=0.2,
+        sonic_policy_speed_mps=0.2,
+        navigation_task_active=True,
+        last_cmd_vx=0.2,
+        last_cmd_vy=0.1,
+        last_cmd_wz=0.3,
+        static_hold_active=False,
+        motion_handoff_active=True,
+        motion_handoff_ratio=1.0,
+        plant_support_mode="idle",
+        plant_support_requested_mode="idle",
+        plant_support_confirmed_mode="idle",
+        plant_support_stop_pending=True,
+        plant_support_safety_latched=False,
+        plant_support_stop_generation=None,
+    )
     identity = enter_stationary(driver, clock)
     driver._normal_stop_last_confirmed_plant_epoch = 8
     payload = plant_request(
@@ -995,6 +1036,32 @@ def test_plant_ack_atomically_confirms_exact_driver_hold(
     assert driver.guard.command_zero is True
     assert driver._navigation_task_active is False
     assert driver._reference_authority.snapshot.phase == "REVOKED"
+    expected_telemetry = {
+        "nav2_state": "safety_stop",
+        "sonic_mode": "IDLE",
+        "sonic_speed_mps": 0.0,
+        "sonic_policy_speed_mps": 0.0,
+        "navigation_task_active": False,
+        "last_cmd_vx": 0.0,
+        "last_cmd_vy": 0.0,
+        "last_cmd_wz": 0.0,
+        "static_hold_active": True,
+        "motion_handoff_active": False,
+        "motion_handoff_ratio": 0.0,
+        "plant_support_mode": "safety_stop",
+        "plant_support_requested_mode": "safety_stop",
+        "plant_support_confirmed_mode": "safety_stop",
+        "plant_support_stop_pending": False,
+        "plant_support_safety_latched": True,
+        "plant_support_stop_generation": 10,
+        "sonic_reference_authority_state": "REVOKED",
+        "sonic_reference_actuator_authority": False,
+        "sonic_reference_authority_dds_target_sequence": None,
+        "sonic_execution_feedback_pending": False,
+    }
+    assert {
+        name: driver.telemetry.values[name] for name in expected_telemetry
+    } == expected_telemetry
     assert driver.accept_json(payload) == response
 
 
@@ -1426,6 +1493,112 @@ def test_confirmed_stop_releases_static_fence_only_after_rearm_and_reference() -
 
     assert driver._normal_stop.snapshot.phase == "DRIVER_CONFIRMED"
     assert driver._static_hold_active is False
+
+
+def test_late_rearm_publisher_cannot_overwrite_a_newer_confirmed_stop() -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    first_identity = enter_stationary(driver, clock)
+    driver.accept_json(plant_request(identity=first_identity))
+
+    clock.value += 0.01
+    commit_rearm_without_publication(driver, clock)
+
+    resets: list[str] = []
+    driver._arm_guard = SimpleNamespace(
+        reset=lambda: resets.append("obsolete rearm reset"),
+        anchor=lambda _targets: None,
+    )
+    clock.value += 0.01
+    driver.accept_json(
+        begin_request(
+            clock,
+            request_id=UUID("10000000-0000-4000-8000-000000000030"),
+            generation=12,
+            sequence=30,
+        )
+    )
+    second_identity = driver._normal_stop.snapshot.identity
+    assert second_identity is not None
+    driver.accept_json(
+        stationary_request(
+            clock,
+            identity=second_identity,
+            request_id=UUID("10000000-0000-4000-8000-000000000031"),
+        )
+    )
+    driver.accept_json(
+        plant_request(
+            identity=second_identity,
+            request_id=UUID("10000000-0000-4000-8000-000000000032"),
+            plant=plant_success(epoch=10, last_rearm_generation=11),
+        )
+    )
+    telemetry_before = dict(driver.telemetry.values)
+
+    assert driver._publish_committed_plant_rearm(11) is False
+    assert resets == []
+    assert driver.telemetry.values == telemetry_before
+    assert driver.telemetry.values["nav2_state"] == "safety_stop"
+    assert driver.telemetry.values["plant_support_mode"] == "safety_stop"
+    assert driver.telemetry.values["plant_support_safety_latched"] is True
+
+
+def test_terminal_claim_before_rearm_projection_never_writes_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    identity = enter_stationary(driver, clock)
+    driver.accept_json(plant_request(identity=identity))
+    clock.value += 0.01
+    commit_rearm_without_publication(driver, clock)
+    resets: list[str] = []
+    driver._arm_guard = SimpleNamespace(
+        reset=lambda: resets.append("obsolete rearm reset"),
+        anchor=lambda _targets: None,
+    )
+
+    terminal_claimed = threading.Barrier(2)
+
+    def claimed_terminal_plant_halt(*_args: object, **_kwargs: object) -> None:
+        terminal_claimed.wait(timeout=2.0)
+
+    monkeypatch.setattr(
+        "hide_mujoco_sonic.sonic_driver.latch_plant_physics_fault",
+        claimed_terminal_plant_halt,
+    )
+    projected_states: list[str] = []
+    original_update = driver.telemetry.update
+
+    def record_update(**values: object) -> None:
+        nav2_state = values.get("nav2_state")
+        if isinstance(nav2_state, str):
+            projected_states.append(nav2_state)
+        original_update(**values)
+
+    driver.telemetry.update = record_update  # type: ignore[method-assign]
+    terminal_errors: list[Exception] = []
+    terminal_thread = threading.Thread(
+        target=lambda: _capture_exception(
+            terminal_errors,
+            driver._latch_terminal_fault,
+            "terminal claim won before rearm projection",
+        )
+    )
+    terminal_thread.start()
+    terminal_claimed.wait(timeout=2.0)
+    assert driver._fault_latched.is_set() is True
+
+    assert driver._publish_committed_plant_rearm(11) is False
+    terminal_thread.join(timeout=2.0)
+
+    assert terminal_thread.is_alive() is False
+    assert terminal_errors == []
+    assert resets == []
+    assert "idle" not in projected_states
+    assert projected_states[-1] == "fault_latched"
+    assert driver.telemetry.values["nav2_state"] == "fault_latched"
 
 
 def test_rearm_wins_before_late_rejected_tick_without_revoking_new_authority() -> None:
