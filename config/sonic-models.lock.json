@@ -1,6 +1,6 @@
 {
   "schema_version": "h-ide.sonic-model-lock/1",
-  "repository_revision_at_audit": "f8ed69eda50076a3cbf5bd879f05556f323bb5fe",
+  "repository_revision_at_audit": "37c8fb0236bf2c5d2d82476997a31e910ac5e263",
   "model_repository": {
     "repo_id": "nvidia/GEAR-SONIC",
     "revision": "9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2",
@@ -19,14 +19,14 @@
   "audited_runtime": {
     "config": {
       "path": "config/ros-headless.yaml",
-      "size": 3368,
-      "sha256": "50a37928c85b0e2f63ef6262f541fe14d3d0ce05393fefb91b4fb747453b42b1"
+      "size": 3378,
+      "sha256": "cc4ed885823a0759800b7aedf866dd700ade943660822e65918fd567812c5bca"
     },
     "declared_model_revision": "9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2",
     "declared_lerobot_revision": "cab2c37a172c0101391d95f754123ed054f1b6e6",
     "observed_lerobot_revision": "cab2c37a172c0101391d95f754123ed054f1b6e6",
     "lock_safe": true,
-    "reason": "The reviewed ros-headless runtime selectors, SONIC model bundle, and exact LeRobot source are reproducibly anchored by repository commit f8ed69eda50076a3cbf5bd879f05556f323bb5fe."
+    "reason": "The reviewed ros-headless runtime selectors, SONIC model bundle, and exact LeRobot source are reproducibly anchored by repository commit 37c8fb0236bf2c5d2d82476997a31e910ac5e263."
   },
   "profiles": {
     "sonic-official-default": {
