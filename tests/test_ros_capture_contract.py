@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from dataclasses import replace
+import json
 from pathlib import Path
 import time
 
@@ -76,6 +77,36 @@ class _Node:
         return self.logger
 
 
+class _Message:
+    """Minimal auto-vivifying ROS message stand-in for publication tests."""
+
+    def __getattr__(self, name: str):
+        value = _Message()
+        setattr(self, name, value)
+        return value
+
+
+class _RecordingPublisher:
+    def __init__(self, name: str, events: list[str]) -> None:
+        self.name = name
+        self.events = events
+        self.messages: list[object] = []
+
+    def publish(self, message: object) -> None:
+        self.events.append(self.name)
+        self.messages.append(message)
+
+
+class _RecordingTransformBroadcaster:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.batches: list[list[object]] = []
+
+    def sendTransform(self, transforms: list[object]) -> None:
+        self.events.append("tf")
+        self.batches.append(transforms)
+
+
 def _uninitialized_bridge() -> MujocoObservationBridge:
     bridge = object.__new__(MujocoObservationBridge)
     bridge._base_url = "http://127.0.0.1:19080"
@@ -84,6 +115,45 @@ def _uninitialized_bridge() -> MujocoObservationBridge:
     bridge._last_captured_at_ns = 0
     bridge.node = _Node()
     return bridge
+
+
+def _publication_ready_bridge(
+    events: list[str],
+) -> tuple[
+    MujocoObservationBridge,
+    dict[str, _RecordingPublisher],
+    _RecordingTransformBroadcaster,
+]:
+    bridge = _uninitialized_bridge()
+    bridge.PoseWithCovarianceStamped = _Message
+    bridge.TransformStamped = _Message
+    bridge.Odometry = _Message
+    bridge.CameraInfo = _Message
+    bridge.Image = _Message
+    bridge.RGBD = _Message
+    bridge.Metadata = _Message
+    bridge._stamp = lambda unix_ns: unix_ns
+    bridge._pose_difference_diagnostic = PoseDifferenceDiagnostic()
+    bridge._last_pose_difference = PoseDifferenceResult("initialized")
+    bridge._poll_count = 0
+    publishers = {
+        name: _RecordingPublisher(name, events)
+        for name in (
+            "pose",
+            "odom",
+            "color_metadata",
+            "depth_metadata",
+            "rgbd",
+        )
+    }
+    bridge.pose_pub = publishers["pose"]
+    bridge.odom_pub = publishers["odom"]
+    bridge.color_meta_pub = publishers["color_metadata"]
+    bridge.depth_meta_pub = publishers["depth_metadata"]
+    bridge.rgbd_pub = publishers["rgbd"]
+    transform_broadcaster = _RecordingTransformBroadcaster(events)
+    bridge.tf = transform_broadcaster
+    return bridge, publishers, transform_broadcaster
 
 
 def _state(capture: CaptureIdentity) -> dict[str, object]:
@@ -503,6 +573,165 @@ def test_bridge_uses_monotonic_admission_but_drops_unpublishable_wall_stamp(
     assert not responses
     assert bridge._last_sequence == 0
     assert "wall-clock correction" in bridge.node.logger.warnings[-1]
+
+
+@pytest.mark.parametrize(
+    (
+        "publish_boundary_monotonic_ns",
+        "publish_boundary_wall_ns",
+        "expected_events",
+        "wall_boundary_reached",
+        "expected_warning",
+    ),
+    [
+        (
+            20_400_000_000,
+            10_200_000_000,
+            ["odom", "pose", "tf", "color_metadata", "depth_metadata", "rgbd"],
+            True,
+            None,
+        ),
+        (20_400_000_000, 9_999_999_999, [], True, "wall-clock correction"),
+        (
+            20_400_000_000,
+            10_000_000_000 + MAX_CAPTURE_AGE_NS + 1,
+            [],
+            True,
+            "wall-clock correction",
+        ),
+        (
+            20_000_000_000 + MAX_CAPTURE_AGE_NS + 1,
+            10_200_000_000,
+            [],
+            False,
+            "MuJoCo capture is stale",
+        ),
+    ],
+    ids=(
+        "stable-clocks",
+        "wall-jumps-backward",
+        "wall-jumps-forward",
+        "monotonic-becomes-stale",
+    ),
+)
+def test_publish_boundary_clock_gate_is_whole_generation_fail_closed(
+    publish_boundary_monotonic_ns: int,
+    publish_boundary_wall_ns: int,
+    expected_events: list[str],
+    wall_boundary_reached: bool,
+    expected_warning: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_at_monotonic_ns = 20_000_000_000
+    capture = CaptureIdentity(
+        BOOT_A,
+        4,
+        10_000_000_000,
+        captured_at_monotonic_ns,
+    )
+    responses = [
+        _Response(state=_publishable_state(capture), headers=_headers(capture)),
+        _Response(headers=_headers(capture)),
+        _Response(
+            headers=_headers(capture),
+            content=bytes(640 * 480 * 2),
+        ),
+    ]
+    wall_values = iter(
+        [
+            capture.captured_at_unix_ns + 100_000_000,
+            publish_boundary_wall_ns,
+        ]
+    )
+    wall_reads: list[int] = []
+
+    def fake_time_ns() -> int:
+        value = next(wall_values)
+        wall_reads.append(value)
+        return value
+
+    monotonic_values = iter(
+        [
+            captured_at_monotonic_ns + 100_000_000,
+            captured_at_monotonic_ns + 200_000_000,
+            captured_at_monotonic_ns + 300_000_000,
+            publish_boundary_monotonic_ns,
+        ]
+    )
+    import cv2
+    import numpy as np
+
+    monkeypatch.setattr(requests, "get", lambda *_args, **_kwargs: responses.pop(0))
+    monkeypatch.setattr(
+        cv2,
+        "imdecode",
+        lambda *_args, **_kwargs: np.zeros((480, 640, 3), dtype=np.uint8),
+    )
+    monkeypatch.setattr(cv2, "cvtColor", lambda image, _code: image)
+    monkeypatch.setattr(bridge_module.time, "time_ns", fake_time_ns)
+    monkeypatch.setattr(
+        bridge_module.time,
+        "monotonic_ns",
+        lambda: next(monotonic_values),
+    )
+    events: list[str] = []
+    bridge, publishers, transform_broadcaster = _publication_ready_bridge(events)
+
+    bridge.poll()
+
+    assert not responses
+    # The first read is the preliminary gate.  The deterministic second read is
+    # the publish-adjacent barrier after every pose/TF/odom/RGB-D message exists.
+    assert wall_reads == [capture.captured_at_unix_ns + 100_000_000] + (
+        [publish_boundary_wall_ns] if wall_boundary_reached else []
+    )
+    assert events == expected_events
+    publish_count = 1 if expected_events else 0
+    assert {name: len(pub.messages) for name, pub in publishers.items()} == {
+        name: publish_count for name in publishers
+    }
+    assert len(transform_broadcaster.batches) == publish_count
+    if expected_events:
+        stamp = capture.captured_at_unix_ns
+        odom = publishers["odom"].messages[0]
+        pose = publishers["pose"].messages[0]
+        assert odom.header.stamp == stamp
+        assert pose.header.stamp == stamp
+        transforms = transform_broadcaster.batches[0]
+        assert len(transforms) == 4
+        assert [transform.header.stamp for transform in transforms] == [stamp] * 4
+        bundle = publishers["rgbd"].messages[0]
+        assert bundle.header.stamp == stamp
+        assert bundle.rgb.header.stamp == stamp
+        assert bundle.depth.header.stamp == stamp
+        assert bundle.rgb_camera_info.header.stamp == stamp
+        assert bundle.depth_camera_info.header.stamp == stamp
+        expected_metadata = {
+            "frame_number": capture.sequence,
+            "frame_timestamp": stamp / 1_000_000.0,
+            "clock_domain": "global_time",
+        }
+        for name in ("color_metadata", "depth_metadata"):
+            metadata = publishers[name].messages[0]
+            assert metadata.header.stamp == stamp
+            assert json.loads(metadata.json_data) == expected_metadata
+        assert bridge._last_sequence == capture.sequence
+        assert bridge._last_producer_boot_id == capture.producer_boot_id
+        assert bridge._last_captured_at_ns == capture.captured_at_unix_ns
+        assert bridge._last_pose_difference.status == "initialized"
+        assert bridge._pose_difference_diagnostic._last_sample == (
+            capture.captured_at_unix_ns,
+            (0.0, 0.0, 0.8),
+        )
+        assert expected_warning is None
+        assert not bridge.node.logger.warnings
+    else:
+        assert bridge._last_sequence == 0
+        assert bridge._last_producer_boot_id is None
+        assert bridge._last_captured_at_ns == 0
+        assert bridge._last_pose_difference.status == "initialized"
+        assert bridge._pose_difference_diagnostic._last_sample is None
+        assert expected_warning in bridge.node.logger.warnings[-1]
 
 
 def test_capture_age_is_rechecked_after_both_http_responses(

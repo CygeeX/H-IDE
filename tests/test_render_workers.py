@@ -667,15 +667,18 @@ def test_office_v2_worker_reloads_verified_scene_and_emits_one_atomic_rgbd() -> 
     )
     worker.start()
     try:
+        known_capture_monotonic_ns = time.monotonic_ns()
         assert mailbox.try_publish(
             mujoco,
             model,
             authority,
             captured_at_unix_ns=time.time_ns(),
+            captured_at_monotonic_ns=known_capture_monotonic_ns,
         ) == 1
         assert committed_event.wait(30.0), worker.status()
         frame = committed[-1]
         assert (frame.producer_boot_id, frame.sequence) == (boot, 1)
+        assert frame.captured_at_monotonic_ns == known_capture_monotonic_ns
         assert (frame.width, frame.height) == (640, 480)
         assert frame.rgb_jpeg.startswith(b"\xff\xd8")
         assert len(frame.depth_z16_le) == 640 * 480 * 2
@@ -705,6 +708,19 @@ def test_office_v2_worker_reloads_verified_scene_and_emits_one_atomic_rgbd() -> 
         assert timing_status["stages"]["totalMs"]["lastMs"] == pytest.approx(
             dict(frame.render_timing)["totalMs"]
         )
+        support = PlantSupportController()
+        support.finish_startup()
+        store = PlantFrameStore(
+            SimpleNamespace(robot_id="g1-sim", localization_epoch_id="test-epoch"),
+            support,
+            worker_status_provider=lambda: {
+                "status": "running",
+                "ready": True,
+                "alive": True,
+            },
+        )
+        store.commit(frame)
+        assert store.state()["capturedAtMonotonicNs"] == known_capture_monotonic_ns
     finally:
         worker.close(timeout_s=5.0)
 

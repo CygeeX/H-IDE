@@ -442,7 +442,8 @@ class MujocoObservationBridge:
             return
         try:
             # Decode and state validation also consume the 500 ms budget.  This
-            # is the final admission gate immediately before the first publish.
+            # preliminary gate avoids constructing a generation that is already
+            # too old.  A second gate below protects the actual publish boundary.
             capture.validate_age(time.monotonic_ns())
             # ROS and the downstream observation protocol must retain the
             # capture's Unix stamp.  If wall time stepped while this generation
@@ -453,14 +454,6 @@ class MujocoObservationBridge:
             self.node.get_logger().warning(f"MuJoCo capture unavailable: {exc}")
             return
         stamp = self._stamp(captured_at_ns)
-        # Pose differencing is diagnostic-only and starts a new anchor when
-        # the capture producer restarts.  Run it after all admission checks so
-        # a rejected capture cannot contaminate a later accepted generation.
-        self._observe_pose_difference(
-            capture,
-            (x, y, z),
-            (qw, qx, qy, qz),
-        )
         pose = self.PoseWithCovarianceStamped()
         pose.header.stamp, pose.header.frame_id = stamp, "map"
         pose.pose.pose.position.x, pose.pose.pose.position.y, pose.pose.pose.position.z = x, y, z
@@ -469,7 +462,6 @@ class MujocoObservationBridge:
         pose.pose.covariance = [0.0] * 36
         pose.pose.covariance[0] = pose.pose.covariance[7] = pose.pose.covariance[14] = 1e-5
         pose.pose.covariance[35] = 1e-5
-        self.pose_pub.publish(pose)
         # Nav2 consumes the conventional map -> odom -> base_link chain.  The
         # simulator gives us a perfect map pose, so odom is an identity frame;
         # publishing the split chain avoids competing TF authorities while still
@@ -498,7 +490,6 @@ class MujocoObservationBridge:
                 camera_transform.transform.rotation.z,
             ) = base_to_camera
             camera_transforms.append(camera_transform)
-        self.tf.sendTransform([map_to_odom, odom_to_base, *camera_transforms])
 
         odom = self.Odometry()
         odom.header.stamp, odom.header.frame_id, odom.child_frame_id = stamp, "odom", "base_link"
@@ -509,7 +500,6 @@ class MujocoObservationBridge:
         odom.pose.covariance[0] = odom.pose.covariance[7] = odom.pose.covariance[14] = 1e-5
         odom.pose.covariance[35] = 1e-5
         self._assign_twist(odom.twist.twist, root_velocity)
-        self.odom_pub.publish(odom)
 
         def camera_info():
             info = self.CameraInfo()
@@ -540,11 +530,36 @@ class MujocoObservationBridge:
         color_metadata, depth_metadata = self.Metadata(), self.Metadata()
         color_metadata.header.stamp = stamp; depth_metadata.header.stamp = stamp
         color_metadata.json_data = metadata_json; depth_metadata.json_data = metadata_json
+        try:
+            # Message construction can take long enough for either elapsed time
+            # or wall time to cross its admission boundary.  Recheck both clocks
+            # immediately before the first publisher.  A failure here returns
+            # before any topic is touched.  ROS provides no cross-topic
+            # transaction once the consecutive publisher calls begin.
+            capture.validate_age(time.monotonic_ns())
+            capture.validate_publishable_ros_stamp(time.time_ns())
+        except CaptureContractError as exc:
+            self.node.get_logger().warning(f"MuJoCo capture unavailable: {exc}")
+            return
+        # Odometry is the safety-critical first output.  No pose or TF for this
+        # generation may become visible unless the odometry publish boundary has
+        # already passed the adjacent clock gate above.
+        self.odom_pub.publish(odom)
+        self.pose_pub.publish(pose)
+        self.tf.sendTransform([map_to_odom, odom_to_base, *camera_transforms])
         # Metadata and localization must be present before RGBD reaches the
         # strict ingress cache.
         self.color_meta_pub.publish(color_metadata)
         self.depth_meta_pub.publish(depth_metadata)
         self.rgbd_pub.publish(bundle)
+        # Pose differencing is diagnostic-only and starts a new anchor when
+        # the capture producer restarts.  Commit it only after the complete
+        # generation has passed admission and been published.
+        self._observe_pose_difference(
+            capture,
+            (x, y, z),
+            (qw, qx, qy, qz),
+        )
         self._last_producer_boot_id = capture.producer_boot_id
         self._last_sequence = sequence
         self._last_captured_at_ns = captured_at_ns
