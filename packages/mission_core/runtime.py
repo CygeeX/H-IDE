@@ -81,6 +81,8 @@ _RISK_ORDER = {
 _PHYSICAL_SKILLS = frozenset(
     {"navigation.navigate_to_pose", "navigation.rotate"}
 )
+_PLANNED_INTERVENTION_OPERATION = "generic_planner_response"
+_PLANNED_INTERVENTION_PENDING = "PLANNER_EVALUATION_PENDING"
 
 
 def _plain(value: Any) -> dict[str, Any]:
@@ -341,13 +343,25 @@ class MissionRuntime:
             and set(node.dependsOn).issubset(completed)
         ]
 
+    @staticmethod
+    def _assert_no_planned_intervention_fence(
+        snapshot: MissionSnapshot,
+    ) -> None:
+        if snapshot.errorCode == _PLANNED_INTERVENTION_PENDING:
+            raise MissionConflict(
+                "a planned operator response still owns the Mission fence"
+            )
+
     def start(self, mission_id: str) -> dict[str, Any]:
         record = self.get(mission_id)
         snapshot = self._snapshot(record)
         if snapshot.status in _TERMINAL:
             raise MissionConflict(f"mission is terminal ({snapshot.status.value})")
-        if snapshot.status not in {MissionStatus.APPROVED, MissionStatus.SUSPENDED, MissionStatus.READY}:
+        self._assert_no_planned_intervention_fence(snapshot)
+        if snapshot.status not in {MissionStatus.APPROVED, MissionStatus.READY}:
             raise MissionConflict(f"mission cannot start from {snapshot.status.value}")
+        if snapshot.errorCode is not None:
+            raise MissionConflict("mission cannot start while an error is unresolved")
         authorization = MissionAuthorization.model_validate(record["authorization"])
         if authorization.expiresAt <= utc_now():
             raise MissionConflict("mission authorization has expired")
@@ -436,19 +450,597 @@ class MissionRuntime:
         )
         return self._commit(record, next_snapshot, event)
 
+    def retry_visual_candidate(
+        self,
+        intervention: MissionIntervention | Mapping[str, Any],
+        *,
+        node_id: str,
+        source_request_id: str,
+        candidate_id: str,
+        selection_source_analysis_id: str,
+    ) -> dict[str, Any]:
+        """Atomically bind one validated visual candidate and ready its retry.
+
+        Candidate selection is evidence for the existing low-risk observation
+        node, not a semantic plan change.  Keeping it in trusted node state
+        preserves the reviewed revision and the first attempt count, so the
+        next immutable SkillRequest is attempt 2.  The application service
+        resolves natural-language answers, while this runtime boundary still
+        re-validates every durable Mission/result identity before committing.
+        """
+
+        value = (
+            intervention
+            if isinstance(intervention, MissionIntervention)
+            else MissionIntervention.model_validate(intervention)
+        )
+        if value.kind is not MissionInterventionKind.ANSWER:
+            raise MissionConflict("visual candidate retry requires an operator answer")
+        resolved_node_id = non_empty_id(node_id, "nodeId")
+        resolved_request_id = non_empty_id(source_request_id, "sourceRequestId")
+        resolved_candidate_id = non_empty_id(candidate_id, "candidateId")
+        resolved_analysis_id = non_empty_id(
+            selection_source_analysis_id,
+            "selectionSourceAnalysisId",
+        )
+        record = self.get(value.missionId)
+
+        selection = {
+            "candidateId": resolved_candidate_id,
+            "selectionSourceAnalysisId": resolved_analysis_id,
+            "sourceRequestId": resolved_request_id,
+            "selectedBy": value.requestedBy,
+        }
+        existing_events = [
+            item
+            for item in record.get("events", [])
+            if isinstance(item, Mapping)
+            and item.get("correlationId") == value.interventionId
+        ]
+        if existing_events:
+            if len(existing_events) != 1:
+                raise MissionConflict(
+                    "interventionId is bound to an invalid event history"
+                )
+            existing = existing_events[0]
+            payload = existing.get("payload")
+            previous = (
+                payload.get("visualCandidateSelection")
+                if isinstance(payload, Mapping)
+                else None
+            )
+            if (
+                existing.get("eventType") == "operator.answer"
+                and isinstance(payload, Mapping)
+                and payload.get("interventionId") == value.interventionId
+                and payload.get("kind") == value.kind.value
+                and payload.get("text") == value.text
+                and payload.get("requestedBy") == value.requestedBy
+                and isinstance(previous, Mapping)
+                and all(previous.get(key) == item for key, item in selection.items())
+            ):
+                return record
+            raise MissionConflict("interventionId already belongs to another answer")
+
+        snapshot = self._snapshot(record)
+        if snapshot.status is not MissionStatus.NEEDS_INPUT:
+            raise MissionConflict(
+                f"mission cannot select a visual candidate from {snapshot.status.value}"
+            )
+        if snapshot.activeSkillRequestId:
+            raise MissionConflict("visual candidate retry cannot replace an active skill")
+        if snapshot.errorCode != "VISUAL_NEEDS_INPUT":
+            raise MissionConflict("mission is not waiting for a visual candidate")
+        if snapshot.activeNodeId != resolved_node_id:
+            raise MissionConflict("visual candidate node is not the active input request")
+
+        plan = MissionPlanDraft.model_validate(record["plan"])
+        authorization = MissionAuthorization.model_validate(record["authorization"])
+        now = utc_now()
+        if min(plan.expiresAt, plan.envelope.expiresAt, authorization.expiresAt) <= now:
+            raise MissionConflict("mission authorization has expired")
+        revision = self._revision(record)
+        node = next(
+            (item for item in revision.nodes if item.nodeId == resolved_node_id),
+            None,
+        )
+        if node is None or node.skillId != "vision.observe":
+            raise MissionConflict("visual candidate node is not in the active revision")
+
+        states = self._node_states(record, revision.revisionId)
+        current_state = states.get(resolved_node_id)
+        if not isinstance(current_state, Mapping) or current_state.get("status") != "rejected":
+            raise MissionConflict("visual candidate source node is not rejected")
+        attempt = int(current_state.get("attempt", 0))
+        if attempt < 1:
+            raise MissionConflict("visual candidate source attempt is invalid")
+        if attempt >= plan.envelope.maximumStageAttempts:
+            raise MissionConflict("mission node attempt budget is exhausted")
+
+        current_state_payload = current_state.get("state")
+        current_request_id = (
+            current_state_payload.get("skillRequestId")
+            if isinstance(current_state_payload, Mapping)
+            else None
+        )
+        if current_request_id != resolved_request_id:
+            raise MissionConflict("visual candidate source request is stale")
+
+        execution = next(
+            (
+                item
+                for item in record.get("skillExecutions", [])
+                if isinstance(item, Mapping)
+                and item.get("requestId") == current_request_id
+            ),
+            None,
+        )
+        if execution is None:
+            raise MissionConflict("visual candidate source request is unavailable")
+        terminal = execution.get("result")
+        terminal_payload = terminal.get("result") if isinstance(terminal, Mapping) else None
+        visual = (
+            terminal_payload.get("visualResult")
+            if isinstance(terminal_payload, Mapping)
+            else None
+        )
+        request = execution["request"]
+        if (
+            not isinstance(terminal, Mapping)
+            or terminal.get("status") != "rejected"
+            or terminal.get("errorCode") != "VISUAL_NEEDS_INPUT"
+            or not isinstance(visual, Mapping)
+            or visual.get("status") != "needs_input"
+            or visual.get("rejectionReason") != "ambiguous_target"
+            or visual.get("analysisId") != resolved_analysis_id
+            or visual.get("requestId") != resolved_request_id
+            or visual.get("missionId") != value.missionId
+            or visual.get("revisionId") != revision.revisionId
+            or visual.get("nodeId") != resolved_node_id
+            or visual.get("attempt") != attempt
+            or request.get("missionId") != value.missionId
+            or request.get("revisionId") != revision.revisionId
+            or request.get("nodeId") != resolved_node_id
+        ):
+            raise MissionConflict("visual candidate source identity is invalid")
+        candidates = visual.get("ambiguityCandidates")
+        if (
+            not isinstance(candidates, list)
+            or not any(
+                isinstance(item, Mapping)
+                and item.get("candidateId") == resolved_candidate_id
+                for item in candidates
+            )
+        ):
+            raise MissionConflict("visual candidate is not in the latest ambiguity result")
+
+        selection["selectedAt"] = value.requestedAt.isoformat()
+        state_payload = {
+            **dict(current_state.get("state", {})),
+            "visualCandidateSelection": selection,
+        }
+        next_snapshot = snapshot.model_copy(
+            update={
+                "status": MissionStatus.READY,
+                "lastSequence": snapshot.lastSequence + 1,
+                "activeNodeId": resolved_node_id,
+                "activeSkillRequestId": None,
+                "updatedAt": value.requestedAt,
+                "errorCode": None,
+                "detail": None,
+            }
+        )
+        event = self._event(
+            snapshot,
+            event_type="operator.answer",
+            correlation_id=value.interventionId,
+            payload={
+                **_plain(value),
+                "visualCandidateSelection": selection,
+            },
+            node_id=resolved_node_id,
+            revision_id=revision.revisionId,
+        )
+        try:
+            return self._commit(
+                record,
+                next_snapshot,
+                event,
+                node_states=[
+                    {
+                        "revisionId": revision.revisionId,
+                        "nodeId": resolved_node_id,
+                        "status": "pending",
+                        "attempt": attempt,
+                        "state": state_payload,
+                    }
+                ],
+            )
+        except MissionConflict as exc:
+            if str(exc) != "mission state changed concurrently":
+                raise
+            refreshed = self.get(value.missionId)
+            matching = [
+                item
+                for item in refreshed.get("events", [])
+                if isinstance(item, Mapping)
+                and item.get("correlationId") == value.interventionId
+            ]
+            if len(matching) == 1 and matching[0].get("eventType") == "operator.answer":
+                payload = matching[0].get("payload")
+                previous = (
+                    payload.get("visualCandidateSelection")
+                    if isinstance(payload, Mapping)
+                    else None
+                )
+                if (
+                    isinstance(payload, Mapping)
+                    and payload.get("interventionId") == value.interventionId
+                    and payload.get("kind") == value.kind.value
+                    and payload.get("text") == value.text
+                    and payload.get("requestedBy") == value.requestedBy
+                    and isinstance(previous, Mapping)
+                    and all(
+                        previous.get(key) == item
+                        for key, item in selection.items()
+                        if key != "selectedAt"
+                    )
+                ):
+                    return refreshed
+            raise
+
+    @staticmethod
+    def _planned_intervention_state(
+        record: Mapping[str, Any],
+        value: MissionIntervention,
+        request_sha256: str,
+    ) -> dict[str, Any]:
+        generic: list[Mapping[str, Any]] = []
+        collisions: list[Mapping[str, Any]] = []
+        for item in record.get("events", []):
+            if not isinstance(item, Mapping):
+                continue
+            payload = item.get("payload")
+            planned = (
+                isinstance(payload, Mapping)
+                and payload.get("operationType") == _PLANNED_INTERVENTION_OPERATION
+                and payload.get("interventionId") == value.interventionId
+            )
+            if planned:
+                generic.append(item)
+            elif item.get("correlationId") == value.interventionId:
+                collisions.append(item)
+        if not generic:
+            if collisions:
+                raise MissionConflict(
+                    "interventionId already belongs to another operation"
+                )
+            return {
+                "state": "none",
+                "mission": record,
+                "decision": None,
+                "createdAt": value.requestedAt.isoformat(),
+                "claimEvent": None,
+            }
+        for item in generic:
+            payload = item.get("payload")
+            if (
+                not isinstance(payload, Mapping)
+                or payload.get("requestSha256") != request_sha256
+                or payload.get("interventionId") != value.interventionId
+                or payload.get("kind") != value.kind.value
+                or payload.get("text") != value.text
+                or payload.get("requestedBy") != value.requestedBy
+            ):
+                raise MissionConflict("interventionId already belongs to another message")
+        ordered = sorted(generic, key=lambda item: int(item.get("sequence", 0)))
+        claim = next(
+            (
+                item
+                for item in reversed(ordered)
+                if isinstance(item.get("payload"), Mapping)
+                and item["payload"].get("phase") == "claimed"
+            ),
+            None,
+        )
+        completed = next(
+            (
+                item
+                for item in reversed(ordered)
+                if isinstance(item.get("payload"), Mapping)
+                and item["payload"].get("phase") == "completed"
+            ),
+            None,
+        )
+        first_payload = ordered[0].get("payload")
+        created_at = (
+            first_payload.get("requestedAt")
+            if isinstance(first_payload, Mapping)
+            else None
+        ) or value.requestedAt.isoformat()
+        if completed is not None:
+            payload = completed.get("payload")
+            decision = payload.get("decision") if isinstance(payload, Mapping) else None
+            if not isinstance(decision, Mapping):
+                raise MissionConflict("completed intervention has no durable decision")
+            return {
+                "state": "completed",
+                "mission": record,
+                "decision": dict(decision),
+                "createdAt": created_at,
+                "claimEvent": claim,
+            }
+        if collisions:
+            raise MissionConflict("interventionId already belongs to another operation")
+        snapshot_payload = record.get("snapshot")
+        snapshot_status = (
+            snapshot_payload.get("status")
+            if isinstance(snapshot_payload, Mapping)
+            else None
+        )
+        if snapshot_status in {item.value for item in _TERMINAL}:
+            return {
+                "state": "aborted",
+                "mission": record,
+                "decision": None,
+                "createdAt": created_at,
+                "claimEvent": claim,
+            }
+        latest_payload = ordered[-1].get("payload")
+        phase = latest_payload.get("phase") if isinstance(latest_payload, Mapping) else None
+        if phase not in {"claimed", "retryable"}:
+            raise MissionConflict("interventionId is bound to an invalid event history")
+        return {
+            "state": "pending" if phase == "claimed" else "retryable",
+            "mission": record,
+            "decision": None,
+            "createdAt": created_at,
+            "claimEvent": claim,
+        }
+
+    def inspect_planned_intervention(
+        self,
+        intervention: MissionIntervention | Mapping[str, Any],
+        *,
+        request_sha256: str,
+    ) -> dict[str, Any]:
+        value = (
+            intervention
+            if isinstance(intervention, MissionIntervention)
+            else MissionIntervention.model_validate(intervention)
+        )
+        digest = non_empty_id(request_sha256, "requestSha256")
+        return self._planned_intervention_state(
+            self.get(value.missionId), value, digest
+        )
+
+    @staticmethod
+    def _assert_planned_intervention_fence(
+        snapshot: MissionSnapshot,
+        value: MissionIntervention,
+    ) -> None:
+        if (
+            snapshot.status is not MissionStatus.SUSPENDED
+            or snapshot.errorCode != _PLANNED_INTERVENTION_PENDING
+            or snapshot.detail
+            != f"Planner evaluation pending for intervention {value.interventionId}"
+            or snapshot.activeSkillRequestId is not None
+        ):
+            raise MissionConflict("planned intervention no longer owns the Mission fence")
+
+    def claim_planned_intervention(
+        self,
+        intervention: MissionIntervention | Mapping[str, Any],
+        *,
+        request_sha256: str,
+        expected_last_sequence: int,
+    ) -> dict[str, Any]:
+        """Durably fence a generic planner call without fabricating review state."""
+
+        value = (
+            intervention
+            if isinstance(intervention, MissionIntervention)
+            else MissionIntervention.model_validate(intervention)
+        )
+        digest = non_empty_id(request_sha256, "requestSha256")
+        record = self.get(value.missionId)
+        existing = self._planned_intervention_state(record, value, digest)
+        if existing["state"] == "completed":
+            return {**existing, "claimedByCaller": False}
+        snapshot = self._snapshot(record)
+        if existing["state"] == "aborted":
+            raise MissionConflict(
+                f"mission is terminal ({snapshot.status.value})"
+            )
+        if existing["state"] == "pending":
+            self._assert_planned_intervention_fence(snapshot, value)
+            # A call that observes a previously durable pending claim is an
+            # explicit retry (the service serializes calls per Mission).
+            return {**existing, "claimedByCaller": True}
+        if snapshot.status in _TERMINAL:
+            raise MissionConflict(f"mission is terminal ({snapshot.status.value})")
+        if snapshot.activeSkillRequestId:
+            raise MissionConflict(
+                "an active skill must finish or be cancelled before changing the Mission"
+            )
+        if snapshot.errorCode == _PLANNED_INTERVENTION_PENDING:
+            raise MissionConflict("another planned intervention owns the Mission fence")
+        if snapshot.lastSequence != int(expected_last_sequence):
+            raise MissionConflict("mission state changed concurrently")
+        previous_snapshot = _plain(snapshot)
+        next_snapshot = snapshot.model_copy(
+            update={
+                "status": MissionStatus.SUSPENDED,
+                "lastSequence": snapshot.lastSequence + 1,
+                "activeSkillRequestId": None,
+                "updatedAt": value.requestedAt,
+                "errorCode": _PLANNED_INTERVENTION_PENDING,
+                "detail": (
+                    f"Planner evaluation pending for intervention "
+                    f"{value.interventionId}"
+                ),
+            }
+        )
+        event = self._event(
+            snapshot,
+            event_type=f"operator.{value.kind.value}",
+            correlation_id=value.interventionId,
+            payload={
+                **_plain(value),
+                "operationType": _PLANNED_INTERVENTION_OPERATION,
+                "phase": "claimed",
+                "requestSha256": digest,
+                "previousSnapshot": previous_snapshot,
+            },
+        )
+        try:
+            committed = self._commit(record, next_snapshot, event)
+        except MissionConflict as exc:
+            if str(exc) != "mission state changed concurrently":
+                raise
+            refreshed = self._planned_intervention_state(
+                self.get(value.missionId), value, digest
+            )
+            if refreshed["state"] in {"pending", "completed"}:
+                # This caller lost the authoritative CAS.  It must never run
+                # the planner in parallel with the winner.
+                return {**refreshed, "claimedByCaller": False}
+            raise
+        return {
+            **self._planned_intervention_state(committed, value, digest),
+            "claimedByCaller": True,
+        }
+
+    def _restore_planned_intervention_snapshot(
+        self,
+        snapshot: MissionSnapshot,
+        value: MissionIntervention,
+        claim_event: Mapping[str, Any] | None,
+    ) -> MissionSnapshot:
+        self._assert_planned_intervention_fence(snapshot, value)
+        payload = claim_event.get("payload") if isinstance(claim_event, Mapping) else None
+        previous_payload = (
+            payload.get("previousSnapshot") if isinstance(payload, Mapping) else None
+        )
+        if not isinstance(previous_payload, Mapping):
+            raise MissionConflict("planned intervention has no recovery snapshot")
+        previous = MissionSnapshot.model_validate(previous_payload)
+        if (
+            previous.missionId != snapshot.missionId
+            or previous.robotId != snapshot.robotId
+            or previous.activeRevisionId != snapshot.activeRevisionId
+            or previous.activeSkillRequestId is not None
+        ):
+            raise MissionConflict("planned intervention recovery snapshot is stale")
+        return previous.model_copy(
+            update={
+                "lastSequence": snapshot.lastSequence + 1,
+                "updatedAt": utc_now(),
+            }
+        )
+
+    def finalize_planned_intervention(
+        self,
+        intervention: MissionIntervention | Mapping[str, Any],
+        *,
+        request_sha256: str,
+        decision: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Commit one planner outcome; revision and review state stay atomic."""
+
+        value = (
+            intervention
+            if isinstance(intervention, MissionIntervention)
+            else MissionIntervention.model_validate(intervention)
+        )
+        digest = non_empty_id(request_sha256, "requestSha256")
+        normalized = dict(decision)
+        record = self.get(value.missionId)
+        state = self._planned_intervention_state(record, value, digest)
+        if state["state"] == "completed":
+            return state
+        if state["state"] == "aborted":
+            snapshot = self._snapshot(record)
+            raise MissionConflict(
+                f"mission is terminal ({snapshot.status.value})"
+            )
+        kind = normalized.get("kind")
+        if kind == "replan" and isinstance(normalized.get("revision"), Mapping):
+            self.apply_revision(
+                normalized["revision"],
+                source_intervention=value,
+                source_request_sha256=digest,
+                source_decision=normalized,
+            )
+            return self.inspect_planned_intervention(
+                value, request_sha256=digest
+            )
+        if kind != "continue":
+            raise MissionConflict(
+                "generic operator response requires continue or a valid replan"
+            )
+        if state["state"] != "pending":
+            raise MissionConflict("planned intervention was not claimed")
+        snapshot = self._snapshot(record)
+        next_snapshot = self._restore_planned_intervention_snapshot(
+            snapshot, value, state.get("claimEvent")
+        )
+        event = self._event(
+            snapshot,
+            event_type="operator.intervention.completed",
+            correlation_id=value.interventionId,
+            causation_id=(
+                state["claimEvent"].get("eventId")
+                if isinstance(state.get("claimEvent"), Mapping)
+                else None
+            ),
+            payload={
+                **_plain(value),
+                "operationType": _PLANNED_INTERVENTION_OPERATION,
+                "phase": "completed",
+                "requestSha256": digest,
+                "decision": normalized,
+            },
+        )
+        try:
+            completed = self._commit(record, next_snapshot, event)
+        except MissionConflict as exc:
+            if str(exc) != "mission state changed concurrently":
+                raise
+            refreshed = self._planned_intervention_state(
+                self.get(value.missionId), value, digest
+            )
+            if refreshed["state"] == "completed":
+                return refreshed
+            raise
+        return self._planned_intervention_state(completed, value, digest)
+
     def issue_skill(
         self,
         mission_id: str,
         node_id: str,
         input: Mapping[str, Any],
         *,
+        expected_last_sequence: int,
+        expected_revision_id: str,
+        expected_authorization_id: str,
         expires_in_seconds: float = 60,
     ) -> SkillRequest:
         record = self.get(mission_id)
         snapshot = self._snapshot(record)
-        if snapshot.status not in {MissionStatus.READY, MissionStatus.PLANNING}:
-            raise MissionConflict(f"mission cannot issue a skill from {snapshot.status.value}")
         revision = self._revision(record)
+        authorization = MissionAuthorization.model_validate(record["authorization"])
+        if (
+            snapshot.lastSequence != expected_last_sequence
+            or snapshot.activeRevisionId != expected_revision_id
+            or revision.revisionId != expected_revision_id
+            or authorization.authorizationId != expected_authorization_id
+        ):
+            raise MissionConflict("mission state changed before skill issue")
+        if snapshot.status is not MissionStatus.READY:
+            raise MissionConflict(f"mission cannot issue a skill from {snapshot.status.value}")
+        if snapshot.errorCode is not None:
+            raise MissionConflict("mission cannot issue a skill while an error is unresolved")
         node = next((item for item in revision.nodes if item.nodeId == node_id), None)
         if node is None:
             raise MissionConflict("mission node not found in active revision")
@@ -464,7 +1056,6 @@ class MissionRuntime:
         if not set(node.dependsOn).issubset(completed):
             raise MissionConflict("mission node dependencies are not complete")
         plan = MissionPlanDraft.model_validate(record["plan"])
-        authorization = MissionAuthorization.model_validate(record["authorization"])
         if authorization.expiresAt <= utc_now():
             raise MissionConflict("mission authorization has expired")
         attempt = int(state.get("attempt", 0)) + 1
@@ -907,8 +1498,15 @@ class MissionRuntime:
         snapshot = self._snapshot(record)
         if snapshot.status in _TERMINAL:
             raise MissionConflict(f"mission is terminal ({snapshot.status.value})")
+        self._assert_no_planned_intervention_fence(snapshot)
         if snapshot.activeSkillRequestId is not None:
             raise MissionConflict("cannot skip nodes while a skill request is active")
+        if snapshot.status is not MissionStatus.READY:
+            raise MissionConflict(
+                f"mission cannot skip nodes from {snapshot.status.value}"
+            )
+        if snapshot.errorCode is not None:
+            raise MissionConflict("mission cannot skip nodes while an error is unresolved")
         revision = self._revision(record)
         nodes = {node.nodeId: node for node in revision.nodes}
         missing = [node_id for node_id in identifiers if node_id not in nodes]
@@ -993,10 +1591,45 @@ class MissionRuntime:
             node_states=node_updates,
         )
 
+    @staticmethod
+    def _world_record_is_exact_replay(
+        mission: Mapping[str, Any],
+        value: WorldRecord,
+    ) -> bool:
+        matching_events = [
+            item
+            for item in mission.get("events", [])
+            if isinstance(item, Mapping)
+            and item.get("correlationId") == value.recordId
+        ]
+        matching_records = [
+            item
+            for item in mission.get("worldRecords", [])
+            if isinstance(item, Mapping)
+            and item.get("recordId") == value.recordId
+        ]
+        if not matching_events and not matching_records:
+            return False
+        if (
+            len(matching_events) == 1
+            and matching_events[0].get("eventType") == "world.recorded"
+            and len(matching_records) == 1
+            and dict(matching_records[0]) == _plain(value)
+        ):
+            return True
+        raise MissionConflict("recordId already belongs to another operation")
+
     def record_world(self, record: WorldRecord | Mapping[str, Any]) -> dict[str, Any]:
-        value = record if isinstance(record, WorldRecord) else WorldRecord.model_validate(record)
+        value = (
+            record
+            if isinstance(record, WorldRecord)
+            else WorldRecord.model_validate(record)
+        )
         mission = self.get(value.missionId)
+        if self._world_record_is_exact_replay(mission, value):
+            return mission
         snapshot = self._snapshot(mission)
+        self._assert_no_planned_intervention_fence(snapshot)
         if value.robotId != snapshot.robotId:
             raise MissionConflict("world record robot identity mismatch")
         next_snapshot = snapshot.model_copy(
@@ -1018,20 +1651,67 @@ class MissionRuntime:
                 "confidence": value.confidence,
             },
         )
-        return self._commit(
-            mission,
-            next_snapshot,
-            event,
-            world_record=_plain(value),
-        )
+        try:
+            return self._commit(
+                mission,
+                next_snapshot,
+                event,
+                world_record=_plain(value),
+            )
+        except MissionConflict as exc:
+            if str(exc) != "mission state changed concurrently":
+                raise
+            refreshed = self.get(value.missionId)
+            if self._world_record_is_exact_replay(refreshed, value):
+                return refreshed
+            raise
 
     def apply_revision(
         self,
         revision: PlanRevision | Mapping[str, Any],
+        *,
+        source_intervention: MissionIntervention | Mapping[str, Any] | None = None,
+        source_request_sha256: str | None = None,
+        source_decision: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         value = revision if isinstance(revision, PlanRevision) else PlanRevision.model_validate(revision)
         record = self.get(value.missionId)
         snapshot = self._snapshot(record)
+        if snapshot.activeSkillRequestId is not None:
+            raise MissionConflict(
+                "cannot apply a revision while a skill request is active"
+            )
+        source_value: MissionIntervention | None = None
+        source_digest: str | None = None
+        source_state: dict[str, Any] | None = None
+        supplied_source_fields = (
+            source_intervention is not None,
+            source_request_sha256 is not None,
+            source_decision is not None,
+        )
+        if any(supplied_source_fields) and not all(supplied_source_fields):
+            raise MissionConflict("planned revision source binding is incomplete")
+        if source_intervention is not None:
+            source_value = (
+                source_intervention
+                if isinstance(source_intervention, MissionIntervention)
+                else MissionIntervention.model_validate(source_intervention)
+            )
+            if source_value.missionId != value.missionId:
+                raise MissionConflict("planned revision source mission is stale")
+            source_digest = non_empty_id(
+                source_request_sha256, "sourceRequestSha256"
+            )
+            source_state = self._planned_intervention_state(
+                record, source_value, source_digest
+            )
+            if source_state["state"] == "completed":
+                return record
+            if source_state["state"] != "pending":
+                raise MissionConflict("planned intervention was not claimed")
+            self._assert_planned_intervention_fence(snapshot, source_value)
+        else:
+            self._assert_no_planned_intervention_fence(snapshot)
         active = self._revision(record)
         plan = MissionPlanDraft.model_validate(record["plan"])
         if value.disposition is ApprovalDisposition.HUMAN_APPROVED:
@@ -1085,32 +1765,76 @@ class MissionRuntime:
                 old = old_nodes.get(node.nodeId)
                 old_state = old_states.get(node.nodeId, {})
                 preserve = old == node and old_state.get("status") == "succeeded"
+                preserve_attempt = (
+                    old is not None
+                    and old.skillId == node.skillId
+                    and old.skillVersion == node.skillVersion
+                )
                 node_states.append({
                     "revisionId": value.revisionId,
                     "nodeId": node.nodeId,
                     "status": "succeeded" if preserve else "pending",
-                    "attempt": int(old_state.get("attempt", 0)) if preserve else 0,
+                    "attempt": (
+                        int(old_state.get("attempt", 0))
+                        if preserve_attempt
+                        else 0
+                    ),
                     "state": old_state.get("state", {}) if preserve else {},
                 })
+        event_payload: dict[str, Any] = {
+            "revisionId": value.revisionId,
+            "sequence": value.sequence,
+            "disposition": value.disposition.value,
+            "changeSummary": list(value.changeSummary),
+        }
+        if source_value is not None and source_digest is not None:
+            event_payload.update(
+                {
+                    **_plain(source_value),
+                    "operationType": _PLANNED_INTERVENTION_OPERATION,
+                    "phase": "completed",
+                    "requestSha256": source_digest,
+                    "decision": dict(source_decision or {}),
+                }
+            )
         event = self._event(
             snapshot,
             event_type="revision.awaiting_review" if pending_review else "revision.applied",
-            correlation_id=value.revisionId,
-            payload={
-                "revisionId": value.revisionId,
-                "sequence": value.sequence,
-                "disposition": value.disposition.value,
-                "changeSummary": list(value.changeSummary),
-            },
+            correlation_id=(
+                source_value.interventionId
+                if source_value is not None
+                else value.revisionId
+            ),
+            causation_id=(
+                source_state["claimEvent"].get("eventId")
+                if source_state is not None
+                and isinstance(source_state.get("claimEvent"), Mapping)
+                else None
+            ),
+            payload=event_payload,
             revision_id=value.revisionId,
         )
-        return self._commit(
-            record,
-            next_snapshot,
-            event,
-            revision=_plain(value),
-            node_states=node_states,
-        )
+        try:
+            return self._commit(
+                record,
+                next_snapshot,
+                event,
+                revision=_plain(value),
+                node_states=node_states,
+            )
+        except MissionConflict as exc:
+            if (
+                source_value is None
+                or source_digest is None
+                or str(exc) != "mission state changed concurrently"
+            ):
+                raise
+            refreshed = self._planned_intervention_state(
+                self.get(value.missionId), source_value, source_digest
+            )
+            if refreshed["state"] == "completed":
+                return refreshed["mission"]
+            raise
 
     def approve_pending_revision(
         self,
@@ -1125,6 +1849,7 @@ class MissionRuntime:
 
         record = self.get(mission_id)
         snapshot = self._snapshot(record)
+        self._assert_no_planned_intervention_fence(snapshot)
         if snapshot.status is not MissionStatus.AWAITING_REVIEW:
             raise MissionConflict("mission is not awaiting revision review")
         pending_payload = next(
@@ -1183,12 +1908,21 @@ class MissionRuntime:
             old = old_nodes.get(node.nodeId)
             old_state = old_states.get(node.nodeId, {})
             preserve = old == node and old_state.get("status") == "succeeded"
+            preserve_attempt = (
+                old is not None
+                and old.skillId == node.skillId
+                and old.skillVersion == node.skillVersion
+            )
             node_states.append(
                 {
                     "revisionId": approved.revisionId,
                     "nodeId": node.nodeId,
                     "status": "succeeded" if preserve else "pending",
-                    "attempt": int(old_state.get("attempt", 0)) if preserve else 0,
+                    "attempt": (
+                        int(old_state.get("attempt", 0))
+                        if preserve_attempt
+                        else 0
+                    ),
                     "state": old_state.get("state", {}) if preserve else {},
                 }
             )
@@ -1237,16 +1971,86 @@ class MissionRuntime:
             else MissionIntervention.model_validate(intervention)
         )
         record = self.get(value.missionId)
+        matching = [
+            item
+            for item in record.get("events", [])
+            if isinstance(item, Mapping)
+            and item.get("correlationId") == value.interventionId
+        ]
+        if matching:
+            if len(matching) == 1:
+                event = matching[0]
+                payload = event.get("payload")
+                if (
+                    event.get("eventType") == f"operator.{value.kind.value}"
+                    and isinstance(payload, Mapping)
+                    and payload.get("operationType") is None
+                    and payload.get("interventionId") == value.interventionId
+                    and payload.get("kind") == value.kind.value
+                    and payload.get("text") == value.text
+                    and payload.get("requestedBy") == value.requestedBy
+                ):
+                    return record
+            raise MissionConflict("interventionId already belongs to another operation")
         snapshot = self._snapshot(record)
         if snapshot.status in _TERMINAL:
             raise MissionConflict(f"mission is terminal ({snapshot.status.value})")
+        if snapshot.activeSkillRequestId:
+            raise MissionConflict(
+                "an active skill must be cancelled through the Mission cancellation endpoint"
+            )
+        if value.kind is not MissionInterventionKind.CANCEL:
+            self._assert_no_planned_intervention_fence(snapshot)
         if value.kind is MissionInterventionKind.CANCEL:
             status = MissionStatus.CANCELLED
         elif value.kind is MissionInterventionKind.PAUSE:
+            if snapshot.status is not MissionStatus.READY:
+                raise MissionConflict(
+                    f"mission cannot pause from {snapshot.status.value}"
+                )
+            if snapshot.errorCode is not None:
+                raise MissionConflict("mission cannot pause while an error is unresolved")
             status = MissionStatus.SUSPENDED
         elif value.kind is MissionInterventionKind.RESUME:
-            if snapshot.activeSkillRequestId:
-                raise MissionConflict("cannot resume while an unresolved skill request is active")
+            def latest_direct_intervention_sequence(
+                kind: MissionInterventionKind,
+            ) -> int:
+                event_type = f"operator.{kind.value}"
+                sequences = []
+                for item in record.get("events", []):
+                    if not isinstance(item, Mapping):
+                        continue
+                    sequence = item.get("sequence")
+                    payload = item.get("payload")
+                    if (
+                        type(sequence) is not int
+                        or sequence > snapshot.lastSequence
+                        or item.get("eventType") != event_type
+                        or not isinstance(payload, Mapping)
+                        or payload.get("operationType") is not None
+                        or payload.get("kind") != kind.value
+                        or payload.get("interventionId")
+                        != item.get("correlationId")
+                    ):
+                        continue
+                    sequences.append(sequence)
+                return max(sequences, default=-1)
+
+            latest_pause_sequence = latest_direct_intervention_sequence(
+                MissionInterventionKind.PAUSE
+            )
+            latest_resume_sequence = latest_direct_intervention_sequence(
+                MissionInterventionKind.RESUME
+            )
+            if (
+                snapshot.status is not MissionStatus.SUSPENDED
+                or snapshot.errorCode is not None
+                or snapshot.activeSkillRequestId is not None
+                or latest_pause_sequence <= latest_resume_sequence
+            ):
+                raise MissionConflict(
+                    "mission can resume only from an unconsumed explicit operator pause"
+                )
             status = MissionStatus.READY
         else:
             status = MissionStatus.AWAITING_REVIEW
@@ -1256,7 +2060,16 @@ class MissionRuntime:
                 "lastSequence": snapshot.lastSequence + 1,
                 "activeSkillRequestId": None if status in {MissionStatus.CANCELLED, MissionStatus.SUSPENDED} else snapshot.activeSkillRequestId,
                 "updatedAt": value.requestedAt,
-                "detail": value.text,
+                "errorCode": (
+                    None
+                    if status in {MissionStatus.CANCELLED, MissionStatus.READY}
+                    else snapshot.errorCode
+                ),
+                "detail": (
+                    None
+                    if status in {MissionStatus.CANCELLED, MissionStatus.READY}
+                    else value.text
+                ),
             }
         )
         event = self._event(

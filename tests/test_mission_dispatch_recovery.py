@@ -73,6 +73,23 @@ def _plan(*, plan_id: str, skill_id: str) -> MissionPlanDraft:
     )
 
 
+def _issue_current(
+    runtime: MissionRuntime,
+    mission_id: str,
+    node_id: str,
+    input_payload,
+):
+    record = runtime.get(mission_id)
+    return runtime.issue_skill(
+        mission_id,
+        node_id,
+        input_payload,
+        expected_last_sequence=record["snapshot"]["lastSequence"],
+        expected_revision_id=record["activeRevision"]["revisionId"],
+        expected_authorization_id=record["authorization"]["authorizationId"],
+    )
+
+
 def _issued(
     *, plan_id: str = "mission-workstation", skill_id: str = "vision.observe"
 ):
@@ -80,7 +97,8 @@ def _issued(
     runtime = MissionRuntime(store)
     runtime.approve(_plan(plan_id=plan_id, skill_id=skill_id), approved_by="tester")
     runtime.start(plan_id)
-    request = runtime.issue_skill(
+    request = _issue_current(
+        runtime,
         plan_id,
         "node-1",
         (
@@ -257,7 +275,8 @@ def test_process_restart_closes_vision_but_preserves_physical_request_for_reconc
         approved_by="tester",
     )
     vision_runtime.start("restart-vision")
-    vision_request = vision_runtime.issue_skill(
+    vision_request = _issue_current(
+        vision_runtime,
         "restart-vision",
         "node-1",
         {"mode": "scene_description", "instruction": "describe"},
@@ -283,7 +302,8 @@ def test_process_restart_closes_vision_but_preserves_physical_request_for_reconc
         approved_by="tester",
     )
     physical_runtime.start("restart-physical")
-    physical_request = physical_runtime.issue_skill(
+    physical_request = _issue_current(
+        physical_runtime,
         "restart-physical", "node-1", {"targetYawRad": 0.5}
     )
     physical_store.close()
@@ -314,4 +334,3 @@ def test_process_restart_closes_vision_but_preserves_physical_request_for_reconc
         physical_request.requestId
     )
     assert len(completed["mission"]["skillExecutions"]) == 1
-

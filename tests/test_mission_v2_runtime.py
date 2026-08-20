@@ -11,6 +11,7 @@ from packages.mission_core import (
     ApprovalDisposition,
     MissionEnvelope,
     MissionConflict,
+    MissionIntervention,
     MissionNode,
     MissionPlanDraft,
     MissionRuntime,
@@ -112,6 +113,120 @@ def _plan() -> MissionPlanDraft:
     )
 
 
+def _issue_current(
+    runtime: MissionRuntime,
+    mission_id: str,
+    node_id: str,
+    input_payload,
+    **kwargs,
+):
+    record = runtime.get(mission_id)
+    return runtime.issue_skill(
+        mission_id,
+        node_id,
+        input_payload,
+        expected_last_sequence=record["snapshot"]["lastSequence"],
+        expected_revision_id=record["activeRevision"]["revisionId"],
+        expected_authorization_id=record["authorization"]["authorizationId"],
+        **kwargs,
+    )
+
+
+def _intervention(
+    intervention_id: str,
+    kind: str,
+    text: str,
+) -> MissionIntervention:
+    return MissionIntervention(
+        interventionId=intervention_id,
+        missionId="plan-1",
+        kind=kind,
+        text=text,
+        requestedBy="tester",
+    )
+
+
+def test_resume_accepts_unconsumed_pause_after_world_record() -> None:
+    runtime = MissionRuntime(SQLiteStore(":memory:"))
+    runtime.approve(_plan(), approved_by="tester")
+    runtime.start("plan-1")
+    paused = runtime.intervene(
+        _intervention("pause-before-world", "pause", "先暂停")
+    )
+    assert paused["snapshot"]["status"] == "suspended"
+
+    recorded = runtime.record_world(
+            WorldRecord(
+                recordId="world-while-paused",
+                missionId="plan-1",
+                robotId="robot-1",
+            kind="fact",
+            subject="meeting-room",
+            predicate="door_state",
+            value={"state": "open"},
+            source="operator",
+            sourceRef="operator-observation",
+            confidence=1.0,
+            observedAt=utc_now(),
+            frameId="map",
+        )
+    )
+    assert recorded["snapshot"]["status"] == "suspended"
+    assert recorded["events"][-1]["eventType"] == "world.recorded"
+
+    resumed = runtime.intervene(
+        _intervention("resume-after-world", "resume", "继续")
+    )
+    assert resumed["snapshot"]["status"] == "ready"
+    assert resumed["snapshot"]["errorCode"] is None
+
+
+def test_resume_accepts_unconsumed_pause_after_generic_continue() -> None:
+    runtime = MissionRuntime(SQLiteStore(":memory:"))
+    runtime.approve(_plan(), approved_by="tester")
+    runtime.start("plan-1")
+    paused = runtime.intervene(
+        _intervention("pause-before-message", "pause", "先暂停")
+    )
+    message = _intervention(
+        "message-while-paused",
+        "append_requirement",
+        "保持原任务，不需要修改计划",
+    )
+    digest = "sha256:" + "d" * 64
+    claimed = runtime.claim_planned_intervention(
+        message,
+        request_sha256=digest,
+        expected_last_sequence=paused["snapshot"]["lastSequence"],
+    )
+    assert claimed["mission"]["snapshot"]["errorCode"] == (
+        "PLANNER_EVALUATION_PENDING"
+    )
+    completed = runtime.finalize_planned_intervention(
+        message,
+        request_sha256=digest,
+        decision={"kind": "continue", "reason": "no semantic change"},
+    )
+    assert completed["mission"]["snapshot"]["status"] == "suspended"
+    assert completed["mission"]["snapshot"]["errorCode"] is None
+
+    resumed = runtime.intervene(
+        _intervention("resume-after-message", "resume", "继续")
+    )
+    assert resumed["snapshot"]["status"] == "ready"
+
+
+def test_resume_rejects_a_consumed_operator_pause() -> None:
+    runtime = MissionRuntime(SQLiteStore(":memory:"))
+    runtime.approve(_plan(), approved_by="tester")
+    runtime.start("plan-1")
+    runtime.intervene(_intervention("pause-once", "pause", "暂停"))
+    runtime.intervene(_intervention("resume-once", "resume", "继续"))
+
+    with pytest.raises(MissionConflict, match="unconsumed explicit operator pause"):
+        runtime.intervene(_intervention("resume-twice", "resume", "再次继续"))
+
+
 def test_observation_only_intent_recognizes_structured_no_motion_flags() -> None:
     node = MissionNode(
         nodeId="observe-table",
@@ -159,6 +274,39 @@ def test_mission_runtime_approves_and_retries_idempotently() -> None:
     assert first["snapshot"]["status"] == "approved"
     assert len(first["events"]) == 1
     assert first["activeRevision"]["disposition"] == "human_approved"
+
+
+def test_world_record_exact_replay_is_idempotent_and_record_id_is_owned() -> None:
+    runtime = MissionRuntime(SQLiteStore(":memory:"))
+    runtime.approve(_plan(), approved_by="tester")
+    evidence = WorldRecord(
+        recordId="world-record-owned-id",
+        missionId="plan-1",
+        robotId="robot-1",
+        kind="fact",
+        subject="silver robot",
+        predicate="visible",
+        value=True,
+        source="operator",
+        sourceRef="world-record-idempotency-test",
+        confidence=1.0,
+        observedAt=utc_now(),
+    )
+
+    recorded = runtime.record_world(evidence)
+    replayed = runtime.record_world(evidence)
+
+    assert replayed["lastSequence"] == recorded["lastSequence"]
+    assert len(replayed["worldRecords"]) == 1
+    assert len(
+        [
+            item
+            for item in replayed["events"]
+            if item["correlationId"] == evidence.recordId
+        ]
+    ) == 1
+    with pytest.raises(MissionConflict, match="recordId already belongs"):
+        runtime.record_world(evidence.model_copy(update={"confidence": 0.5}))
 
 
 def test_mission_runtime_rejects_expired_draft_at_approval_boundary() -> None:
@@ -209,7 +357,8 @@ def test_mission_runtime_runs_dependency_dag_one_skill_at_a_time() -> None:
     started = runtime.start("plan-1")
     assert started["snapshot"]["activeNodeId"] == "observe"
 
-    observe = runtime.issue_skill(
+    observe = _issue_current(
+        runtime,
         "plan-1",
         "observe",
         {"visualTaskMode": "object_approach", "targetDescription": "银白色机器人"},
@@ -238,7 +387,8 @@ def test_mission_runtime_runs_dependency_dag_one_skill_at_a_time() -> None:
     assert after_observe["snapshot"]["status"] == "ready"
     assert after_observe["snapshot"]["activeNodeId"] == "approach"
 
-    navigation = runtime.issue_skill(
+    navigation = _issue_current(
+        runtime,
         "plan-1",
         "approach",
         {
@@ -266,11 +416,223 @@ def test_mission_runtime_runs_dependency_dag_one_skill_at_a_time() -> None:
     )
 
 
+def test_mission_runtime_atomically_readies_validated_visual_candidate_attempt_two() -> None:
+    runtime = MissionRuntime(SQLiteStore(":memory:"))
+    runtime.approve(_plan(), approved_by="tester")
+    runtime.start("plan-1")
+    first = _issue_current(
+        runtime,
+        "plan-1",
+        "observe",
+        {"mode": "object_approach", "targetDescription": "银白色机器人"},
+    )
+    analysis_id = "analysis-runtime-ambiguity-1"
+    candidate_id = "candidate-runtime-left"
+    waiting = runtime.record_result(
+        "plan-1",
+        SkillResult(
+            requestId=first.requestId,
+            status="rejected",
+            completedAt=utc_now(),
+            result={
+                "visualResult": {
+                    "schemaVersion": "h-ide.visual-result/2",
+                    "analysisId": analysis_id,
+                    "requestId": first.requestId,
+                    "missionId": first.missionId,
+                    "revisionId": first.revisionId,
+                    "nodeId": first.nodeId,
+                    "attempt": 1,
+                    "status": "needs_input",
+                    "rejectionReason": "ambiguous_target",
+                    "ambiguityCandidates": [
+                        {
+                            "candidateId": candidate_id,
+                            "label": "左侧银白色机器人",
+                            "box": [10, 20, 100, 200],
+                            "score": 0.9,
+                        }
+                    ],
+                }
+            },
+            errorCode="VISUAL_NEEDS_INPUT",
+            detail="ambiguous_target",
+        ),
+    )
+    assert waiting["snapshot"]["status"] == "needs_input"
+    before_sequence = waiting["lastSequence"]
+
+    with pytest.raises(MissionConflict, match="not in the latest"):
+        runtime.retry_visual_candidate(
+            MissionIntervention(
+                interventionId="intervention-runtime-invalid",
+                missionId="plan-1",
+                kind="answer",
+                text="选择外部候选",
+                requestedBy="tester",
+            ),
+            node_id="observe",
+            source_request_id=first.requestId,
+            candidate_id="candidate-from-another-mission",
+            selection_source_analysis_id=analysis_id,
+        )
+    unchanged = runtime.get("plan-1")
+    assert unchanged["lastSequence"] == before_sequence
+    assert unchanged["snapshot"]["status"] == "needs_input"
+
+    intervention = MissionIntervention(
+        interventionId="intervention-runtime-select",
+        missionId="plan-1",
+        kind="answer",
+        text="选择第一个候选",
+        requestedBy="tester",
+    )
+    selected = runtime.retry_visual_candidate(
+        intervention,
+        node_id="observe",
+        source_request_id=first.requestId,
+        candidate_id=candidate_id,
+        selection_source_analysis_id=analysis_id,
+    )
+    state = next(item for item in selected["nodeStates"] if item["nodeId"] == "observe")
+    assert selected["snapshot"]["status"] == "ready"
+    assert selected["activeRevisionId"] == first.revisionId
+    assert state["status"] == "pending"
+    assert state["attempt"] == 1
+    assert state["state"]["visualCandidateSelection"]["candidateId"] == candidate_id
+    assert selected["events"][-1]["eventType"] == "operator.answer"
+
+    repeated = runtime.retry_visual_candidate(
+        intervention,
+        node_id="observe",
+        source_request_id=first.requestId,
+        candidate_id=candidate_id,
+        selection_source_analysis_id=analysis_id,
+    )
+    assert repeated["lastSequence"] == selected["lastSequence"]
+    retry = _issue_current(
+        runtime,
+        "plan-1",
+        "observe",
+        {
+            "mode": "object_approach",
+            "targetDescription": "银白色机器人",
+            "candidateId": candidate_id,
+            "selectionSourceAnalysisId": analysis_id,
+        },
+    )
+    assert retry.requestId.endswith("-observe-2")
+    assert retry.revisionId == first.revisionId
+
+
+def test_visual_candidate_retry_uses_node_request_pointer_not_wall_time_order() -> None:
+    store = SQLiteStore(":memory:")
+    runtime = MissionRuntime(store)
+    runtime.approve(_plan(), approved_by="tester")
+    runtime.start("plan-1")
+
+    def reject(request, analysis_id: str, candidate_id: str, attempt: int) -> None:
+        runtime.record_result(
+            "plan-1",
+            SkillResult(
+                requestId=request.requestId,
+                status="rejected",
+                completedAt=utc_now(),
+                result={
+                    "visualResult": {
+                        "schemaVersion": "h-ide.visual-result/2",
+                        "analysisId": analysis_id,
+                        "requestId": request.requestId,
+                        "missionId": request.missionId,
+                        "revisionId": request.revisionId,
+                        "nodeId": request.nodeId,
+                        "attempt": attempt,
+                        "status": "needs_input",
+                        "rejectionReason": "ambiguous_target",
+                        "ambiguityCandidates": [{
+                            "candidateId": candidate_id,
+                            "label": candidate_id,
+                            "box": [10, 20, 100, 200],
+                            "score": 0.9,
+                        }],
+                    }
+                },
+                errorCode="VISUAL_NEEDS_INPUT",
+                detail="ambiguous_target",
+            ),
+        )
+
+    first = _issue_current(
+        runtime,
+        "plan-1",
+        "observe",
+        {"mode": "object_approach", "targetDescription": "机器人"},
+    )
+    reject(first, "analysis-first", "candidate-first", 1)
+    runtime.retry_visual_candidate(
+        MissionIntervention(
+            interventionId="intervention-first",
+            missionId="plan-1",
+            kind="answer",
+            text="选择第一个候选",
+            requestedBy="tester",
+        ),
+        node_id="observe",
+        source_request_id=first.requestId,
+        candidate_id="candidate-first",
+        selection_source_analysis_id="analysis-first",
+    )
+    second = _issue_current(
+        runtime,
+        "plan-1",
+        "observe",
+        {"mode": "object_approach", "targetDescription": "机器人"},
+    )
+    reject(second, "analysis-second", "candidate-second", 2)
+    store._connection.execute(  # noqa: SLF001 - deterministic ordering regression
+        "UPDATE mission_skill_executions SET updated_at = ? WHERE request_id = ?",
+        ("9999-12-31T23:59:59Z", first.requestId),
+    )
+    store._connection.commit()  # noqa: SLF001
+    assert runtime.get("plan-1")["skillExecutions"][-1]["requestId"] == first.requestId
+
+    with pytest.raises(MissionConflict, match="source request is stale"):
+        runtime.retry_visual_candidate(
+            MissionIntervention(
+                interventionId="intervention-stale",
+                missionId="plan-1",
+                kind="answer",
+                text="选择旧候选",
+                requestedBy="tester",
+            ),
+            node_id="observe",
+            source_request_id=first.requestId,
+            candidate_id="candidate-first",
+            selection_source_analysis_id="analysis-first",
+        )
+
+    selected = runtime.retry_visual_candidate(
+        MissionIntervention(
+            interventionId="intervention-second",
+            missionId="plan-1",
+            kind="answer",
+            text="选择当前候选",
+            requestedBy="tester",
+        ),
+        node_id="observe",
+        source_request_id=second.requestId,
+        candidate_id="candidate-second",
+        selection_source_analysis_id="analysis-second",
+    )
+    assert selected["snapshot"]["status"] == "ready"
+
+
 def test_conditional_navigation_can_be_skipped_without_claiming_motion_success() -> None:
     runtime = MissionRuntime(SQLiteStore(":memory:"))
     runtime.approve(_plan(), approved_by="tester")
     runtime.start("plan-1")
-    observation = runtime.issue_skill(
+    observation = _issue_current(
+        runtime,
         "plan-1",
         "observe",
         {
@@ -350,7 +712,8 @@ def test_blocked_visual_result_skips_navigation_and_readies_final_report() -> No
     runtime = MissionRuntime(SQLiteStore(":memory:"))
     runtime.approve(plan, approved_by="tester")
     runtime.start(plan.planId)
-    request = runtime.issue_skill(
+    request = _issue_current(
+        runtime,
         plan.planId,
         "observe-initial",
         {
@@ -370,9 +733,10 @@ def test_blocked_visual_result_skips_navigation_and_readies_final_report() -> No
                 "analysisId": "analysis-blocked-1",
                 "requestId": request.requestId,
                 "missionId": request.missionId,
-                "revisionId": request.revisionId,
-                "nodeId": request.nodeId,
-                "mode": "directional_free_space",
+                    "revisionId": request.revisionId,
+                    "nodeId": request.nodeId,
+                    "attempt": 1,
+                    "mode": "directional_free_space",
                 "status": "succeeded",
                 "versions": {
                     "vlmProvider": "qwen",
@@ -457,7 +821,7 @@ def test_mission_runtime_reserves_rotation_budget_across_actions() -> None:
     runtime.approve(plan, approved_by="tester")
     runtime.start(plan.planId)
 
-    first = runtime.issue_skill(plan.planId, "rotate-1", {"targetYawRad": 0.5})
+    first = _issue_current(runtime, plan.planId, "rotate-1", {"targetYawRad": 0.5})
     assert runtime.get(plan.planId)["snapshot"]["cumulativeScanYawRad"] == pytest.approx(0.5)
     runtime.record_result(
         plan.planId,
@@ -469,7 +833,7 @@ def test_mission_runtime_reserves_rotation_budget_across_actions() -> None:
     )
 
     with pytest.raises(MissionConflict, match="cumulative scan-yaw"):
-        runtime.issue_skill(plan.planId, "rotate-2", {"targetYawRad": 0.5})
+        _issue_current(runtime, plan.planId, "rotate-2", {"targetYawRad": 0.5})
 
 
 def test_mission_runtime_binds_skill_lifetime_to_capability_timeout() -> None:
@@ -477,7 +841,8 @@ def test_mission_runtime_binds_skill_lifetime_to_capability_timeout() -> None:
     runtime.approve(_plan(), approved_by="tester")
     runtime.start("plan-1")
 
-    request = runtime.issue_skill(
+    request = _issue_current(
+        runtime,
         "plan-1",
         "observe",
         {"targetDescription": "silver robot"},
@@ -494,7 +859,8 @@ def test_mission_runtime_rejects_invalid_skill_lifetime(lifetime: float) -> None
     runtime.start("plan-1")
 
     with pytest.raises(MissionConflict, match="lifetime"):
-        runtime.issue_skill(
+        _issue_current(
+            runtime,
             "plan-1",
             "observe",
             {"targetDescription": "silver robot"},
@@ -508,7 +874,7 @@ def test_mission_runtime_does_not_issue_dependent_navigation_early() -> None:
     runtime.start("plan-1")
 
     with pytest.raises(ValueError, match="dependencies"):
-        runtime.issue_skill("plan-1", "approach", {"goalPose": {}})
+        _issue_current(runtime, "plan-1", "approach", {"goalPose": {}})
 
 
 def test_restart_terminalizes_in_flight_workstation_observation_without_replay(
@@ -519,7 +885,9 @@ def test_restart_terminalizes_in_flight_workstation_observation_without_replay(
     runtime = MissionRuntime(store)
     runtime.approve(_plan(), approved_by="tester")
     runtime.start("plan-1")
-    request = runtime.issue_skill("plan-1", "observe", {"targetDescription": "银白色机器人"})
+    request = _issue_current(
+        runtime, "plan-1", "observe", {"targetDescription": "银白色机器人"}
+    )
     store.close()
 
     restarted_store = SQLiteStore(path)
@@ -541,6 +909,24 @@ def test_restart_terminalizes_in_flight_workstation_observation_without_replay(
 def test_human_required_revision_is_not_active_until_separately_approved() -> None:
     runtime = MissionRuntime(SQLiteStore(":memory:"))
     record = runtime.approve(_plan(), approved_by="tester")
+    runtime.start("plan-1")
+    attempted = _issue_current(
+        runtime,
+        "plan-1",
+        "observe",
+        {"mode": "object_approach", "targetDescription": "银白色机器人"},
+    )
+    runtime.record_result(
+        "plan-1",
+        SkillResult(
+            requestId=attempted.requestId,
+            status="failed",
+            completedAt=utc_now(),
+            errorCode="VISION_TRANSIENT_FAILURE",
+            detail="first observation attempt failed",
+        ),
+    )
+    record = runtime.get("plan-1")
     active = record["activeRevision"]
     proposed = PlanRevision(
         revisionId="revision-proposed-2",
@@ -574,6 +960,14 @@ def test_human_required_revision_is_not_active_until_separately_approved() -> No
     assert approved["activeRevision"]["sequence"] == 3
     assert approved["activeRevision"]["disposition"] == "human_approved"
     assert len(approved["authorizations"]) == 2
+    observe_state = next(
+        item
+        for item in approved["nodeStates"]
+        if item["revisionId"] == approved["activeRevisionId"]
+        and item["nodeId"] == "observe"
+    )
+    assert observe_state["status"] == "pending"
+    assert observe_state["attempt"] == 1
 
 
 def test_planner_cannot_activate_a_physical_policy_inherited_revision() -> None:
@@ -598,3 +992,57 @@ def test_planner_cannot_activate_a_physical_policy_inherited_revision() -> None:
 
     with pytest.raises(MissionConflict, match="physical revisions require"):
         runtime.apply_revision(proposed)
+
+
+def test_policy_inherited_revision_preserves_same_skill_attempt_budget() -> None:
+    base = _plan()
+    observation_plan = base.model_copy(update={"nodes": [base.nodes[0]]})
+    runtime = MissionRuntime(SQLiteStore(":memory:"))
+    record = runtime.approve(observation_plan, approved_by="tester")
+    runtime.start("plan-1")
+    attempted = _issue_current(
+        runtime,
+        "plan-1",
+        "observe",
+        {"mode": "object_approach", "targetDescription": "银白色机器人"},
+    )
+    runtime.record_result(
+        "plan-1",
+        SkillResult(
+            requestId=attempted.requestId,
+            status="failed",
+            completedAt=utc_now(),
+            errorCode="VISION_TRANSIENT_FAILURE",
+            detail="first observation attempt failed",
+        ),
+    )
+    active = record["activeRevision"]
+    changed_node = observation_plan.nodes[0].model_copy(
+        update={"intent": {"targetDescription": "左侧银白色机器人"}}
+    )
+    revised = runtime.apply_revision(
+        PlanRevision(
+            revisionId="revision-observation-retry-2",
+            missionId="plan-1",
+            sequence=2,
+            parentRevisionId=active["revisionId"],
+            objective=observation_plan.objective,
+            nodes=[changed_node],
+            reasonCode="observation_retry",
+            reason="Retry the same visual skill with a refined description",
+            changeSummary=["Refine target description"],
+            disposition=ApprovalDisposition.POLICY_INHERITED,
+            authorizationId=record["authorization"]["authorizationId"],
+            createdBy="h-ide-agent",
+            createdAt=utc_now(),
+        )
+    )
+
+    state = next(
+        item
+        for item in revised["nodeStates"]
+        if item["revisionId"] == revised["activeRevisionId"]
+        and item["nodeId"] == "observe"
+    )
+    assert state["status"] == "pending"
+    assert state["attempt"] == 1

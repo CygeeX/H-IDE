@@ -3,7 +3,9 @@ from __future__ import annotations
 from datetime import timedelta
 import hashlib
 import math
+import threading
 from typing import Any, Mapping
+from uuid import uuid4
 
 from fastapi.testclient import TestClient
 import pytest
@@ -19,7 +21,7 @@ from packages.control_core.capabilities import (
     SensorProfile,
 )
 from packages.control_core.validation import utc_now
-from packages.mission_core import MissionNode
+from packages.mission_core import MissionConflict, MissionNode, PlanRevision
 from packages.scene_core import (
     Bounds3D,
     NAVIGATION_COMMAND_KEY,
@@ -31,6 +33,7 @@ from packages.scene_core import (
     robot_navigation_command_schema,
 )
 from services.control_api.main import create_app
+from services.control_api.mission_client import MissionPlanningUnavailable
 from services.control_api.mission_service import MissionService
 
 
@@ -378,6 +381,42 @@ class FakeMissionPlanningClient:
         }
 
 
+class SameNodeTargetRevisionPlanningClient(FakeMissionPlanningClient):
+    def create_draft(self, brief: Mapping[str, Any]) -> Mapping[str, Any]:
+        response = super().create_draft(brief)
+        response["plan"]["nodes"][0]["intent"] = {
+            "targetRecordId": "target-old",
+        }
+        return response
+
+    def create_revision(self, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        active = request["activeRevision"]
+        nodes = [dict(item) for item in active["nodes"]]
+        nodes[0] = {
+            **nodes[0],
+            "purpose": "到达新审核目标点",
+            "intent": {"targetRecordId": "target-new"},
+        }
+        return {
+            "revision": {
+                "schemaVersion": "h-ide.plan-revision/2",
+                "revisionId": f"revision-{request['requestId']}",
+                "missionId": request["missionId"],
+                "sequence": active["sequence"] + 1,
+                "parentRevisionId": active["revisionId"],
+                "objective": request["objective"],
+                "nodes": nodes,
+                "reasonCode": "operator_intervention",
+                "reason": "Operator selected a different reviewed target",
+                "changeSummary": ["Changed the target record binding"],
+                "disposition": "human_required",
+                "authorizationId": None,
+                "createdBy": "h-ide-agent",
+                "createdAt": utc_now().isoformat(),
+            }
+        }
+
+
 class VisualMissionPlanningClient(FakeMissionPlanningClient):
     def create_draft(self, brief: Mapping[str, Any]) -> Mapping[str, Any]:
         now = utc_now()
@@ -425,12 +464,45 @@ class VisualMissionPlanningClient(FakeMissionPlanningClient):
         }
 
 
-class RespondingMissionPlanningClient(FakeMissionPlanningClient):
+class CandidateRetryPlanningClient(VisualMissionPlanningClient):
+    def __init__(self) -> None:
+        self.event_calls = 0
+
     def evaluate_event(
         self,
         event: Mapping[str, Any],
         context: Mapping[str, Any],
     ) -> Mapping[str, Any]:
+        del event, context
+        self.event_calls += 1
+        raise AssertionError("visual candidate answers must not call the planner")
+
+
+class ContinueVisualMissionPlanningClient(VisualMissionPlanningClient):
+    def __init__(self) -> None:
+        self.event_calls = 0
+
+    def evaluate_event(
+        self,
+        event: Mapping[str, Any],
+        context: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        del event, context
+        self.event_calls += 1
+        return {"kind": "continue", "reason": "fixture visual mission continues"}
+
+
+class RespondingMissionPlanningClient(FakeMissionPlanningClient):
+    def __init__(self) -> None:
+        self.event_calls = 0
+
+    def evaluate_event(
+        self,
+        event: Mapping[str, Any],
+        context: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        del context
+        self.event_calls += 1
         active = event["activeRevision"]
         nodes = [dict(item) for item in active["nodes"]]
         nodes[0] = {
@@ -457,6 +529,94 @@ class RespondingMissionPlanningClient(FakeMissionPlanningClient):
                 "createdAt": utc_now().isoformat(),
             },
         }
+
+
+class FailOnceMissionPlanningClient(FakeMissionPlanningClient):
+    def __init__(self) -> None:
+        self.event_calls = 0
+
+    def evaluate_event(
+        self,
+        event: Mapping[str, Any],
+        context: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        del event, context
+        self.event_calls += 1
+        if self.event_calls == 1:
+            raise MissionPlanningUnavailable("fixture planner timeout")
+        return {"kind": "continue", "reason": "fixture retry continues"}
+
+
+class ContinueMissionPlanningClient(FakeMissionPlanningClient):
+    def __init__(self) -> None:
+        self.event_calls = 0
+
+    def evaluate_event(
+        self,
+        event: Mapping[str, Any],
+        context: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        del event, context
+        self.event_calls += 1
+        return {"kind": "continue", "reason": "fixture continues"}
+
+
+class BlockingFailOnceRevisionPlanningClient(FakeMissionPlanningClient):
+    def __init__(self) -> None:
+        self.revision_calls = 0
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def create_revision(self, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        self.revision_calls += 1
+        if self.revision_calls == 1:
+            self.entered.set()
+            if not self.release.wait(timeout=5):
+                raise AssertionError("blocked revision planner was not released")
+            raise MissionPlanningUnavailable("fixture revision planner timeout")
+        active = request["activeRevision"]
+        nodes = [dict(item) for item in active["nodes"]]
+        nodes[0] = {
+            **nodes[0],
+            "purpose": f"修订后：{request['triggerDetail']}",
+        }
+        return {
+            "revision": {
+                "schemaVersion": "h-ide.plan-revision/2",
+                "revisionId": f"revision-{request['requestId']}",
+                "missionId": request["missionId"],
+                "sequence": active["sequence"] + 1,
+                "parentRevisionId": active["revisionId"],
+                "objective": request["objective"],
+                "nodes": nodes,
+                "reasonCode": "operator_intervention",
+                "reason": "operator requested a revision",
+                "changeSummary": ["updated requested objective"],
+                "disposition": "human_required",
+                "authorizationId": None,
+                "createdBy": "h-ide-agent",
+                "createdAt": utc_now().isoformat(),
+            }
+        }
+
+
+class BlockingEventPlanningClient(FakeMissionPlanningClient):
+    def __init__(self) -> None:
+        self.event_calls = 0
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def evaluate_event(
+        self,
+        event: Mapping[str, Any],
+        context: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        del event, context
+        self.event_calls += 1
+        self.entered.set()
+        if not self.release.wait(timeout=5):
+            raise AssertionError("blocked event planner was not released")
+        return {"kind": "continue", "reason": "event accepted"}
 
 
 class FakeVisualTaskClient:
@@ -558,6 +718,65 @@ class FakeVisualTaskClient:
     def get_evidence(self, analysis_id: str, sha256: str) -> tuple[bytes, str]:
         self.evidence_requests.append((analysis_id, sha256))
         return self.evidence_body, "image/jpeg"
+
+
+class AmbiguousThenSelectedVisualTaskClient(FakeVisualTaskClient):
+    source_analysis_id = "analysis-ambiguous-robot-1"
+    first_candidate_id = "candidate-ambiguous-left"
+    second_candidate_id = "candidate-ambiguous-right"
+
+    def analyze(self, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        result = dict(super().analyze(request))
+        if len(self.requests) == 1:
+            result.update(
+                analysisId=self.source_analysis_id,
+                status="needs_input",
+                hypotheses=[
+                    {
+                        "hypothesisId": self.first_candidate_id,
+                        "source": "qwen",
+                        "label": "左侧银白色机器人",
+                        "pixelBox": [100, 100, 260, 440],
+                        "score": 0.91,
+                    },
+                    {
+                        "hypothesisId": self.second_candidate_id,
+                        "source": "qwen",
+                        "label": "右侧银白色机器人",
+                        "pixelBox": [360, 100, 520, 440],
+                        "score": 0.86,
+                    },
+                ],
+                geometryCandidates=[],
+                ambiguityCandidates=[
+                    {
+                        "candidateId": self.first_candidate_id,
+                        "label": "左侧银白色机器人",
+                        "box": [100, 100, 260, 440],
+                        "score": 0.91,
+                    },
+                    {
+                        "candidateId": self.second_candidate_id,
+                        "label": "右侧银白色机器人",
+                        "box": [360, 100, 520, 440],
+                        "score": 0.86,
+                    },
+                ],
+                selectedCandidateId=None,
+                selectionSourceAnalysisId=None,
+                rejectionReason="ambiguous_target",
+            )
+            return result
+        assert request["attempt"] == 2
+        assert request["candidateId"] == self.first_candidate_id
+        assert request["selectionSourceAnalysisId"] == self.source_analysis_id
+        result.update(
+            analysisId="analysis-selected-robot-2",
+            selectedCandidateId=self.first_candidate_id,
+            selectionSourceAnalysisId=self.source_analysis_id,
+            rejectionReason=None,
+        )
+        return result
 
 
 class FakeSceneContextClient:
@@ -953,9 +1172,11 @@ def test_mission_v2_publishes_pcd_semantic_region_as_static_scene_target_fact() 
 
 
 def test_mission_v2_operator_message_creates_a_reviewed_plan_revision() -> None:
+    planner = RespondingMissionPlanningClient()
     app = create_app(
         auth_token=TOKEN,
-        mission_planning_client=RespondingMissionPlanningClient(),
+        mission_planning_client=planner,
+        mission_supervisor_interval=3600,
     )
     with TestClient(app) as client:
         draft = client.post(
@@ -973,14 +1194,17 @@ def test_mission_v2_operator_message_creates_a_reviewed_plan_revision() -> None:
             json={"approvedBy": "operator-test"},
         ).status_code == 200
 
+        intervention_id = "intervention-reviewed-replan-1"
+        message = {
+            "interventionId": intervention_id,
+            "text": "改为去厨房门口，不要进入厨房",
+            "kind": "modify_goal",
+            "requestedBy": "operator-test",
+        }
         response = client.post(
             f"/api/v2/missions/{mission_id}/messages",
             headers=headers(),
-            json={
-                "text": "改为去厨房门口，不要进入厨房",
-                "kind": "modify_goal",
-                "requestedBy": "operator-test",
-            },
+            json=message,
         )
         assert response.status_code == 200, response.text
         payload = response.json()
@@ -988,6 +1212,39 @@ def test_mission_v2_operator_message_creates_a_reviewed_plan_revision() -> None:
         assert payload["mission"]["snapshot"]["status"] == "awaiting_review"
         pending = payload["decision"]["revision"]
         assert pending["disposition"] == "human_required"
+        assert planner.event_calls == 1
+        generic_events = [
+            item
+            for item in payload["mission"]["events"]
+            if item["correlationId"] == intervention_id
+        ]
+        assert [item["payload"]["phase"] for item in generic_events] == [
+            "claimed",
+            "completed",
+        ]
+        assert generic_events[1]["payload"]["decision"] == payload["decision"]
+        assert generic_events[1]["causationId"] == generic_events[0]["eventId"]
+        assert len(payload["mission"]["revisions"]) == 2
+
+        replay = client.post(
+            f"/api/v2/missions/{mission_id}/messages",
+            headers=headers(),
+            json=message,
+        )
+        assert replay.status_code == 200, replay.text
+        assert replay.json()["decision"] == payload["decision"]
+        assert replay.json()["mission"]["lastSequence"] == payload["mission"][
+            "lastSequence"
+        ]
+        assert len(replay.json()["mission"]["revisions"]) == 2
+        assert planner.event_calls == 1
+
+        rebound = client.post(
+            f"/api/v2/missions/{mission_id}/messages",
+            headers=headers(),
+            json={**message, "text": "同一个 ID 但不同内容"},
+        )
+        assert rebound.status_code == 409, rebound.text
 
         approved = client.post(
             f"/api/v2/missions/{mission_id}/revisions/{pending['revisionId']}/approve",
@@ -996,6 +1253,1011 @@ def test_mission_v2_operator_message_creates_a_reviewed_plan_revision() -> None:
         )
         assert approved.status_code == 200, approved.text
         assert approved.json()["snapshot"]["status"] == "ready"
+
+
+def test_generic_message_planner_failure_stays_fenced_and_restarts_safely() -> None:
+    planner = FailOnceMissionPlanningClient()
+    app = create_app(
+        auth_token=TOKEN,
+        mission_planning_client=planner,
+        mission_supervisor_interval=3600,
+    )
+    with TestClient(app) as client:
+        draft = client.post(
+            "/api/v2/missions/drafts",
+            headers=headers(),
+            json={
+                "requestId": "request-generic-retry-1",
+                "objective": "去厨房",
+            },
+        )
+        assert draft.status_code == 201, draft.text
+        mission_id = draft.json()["draftId"]
+        approved = client.post(
+            f"/api/v2/missions/drafts/{mission_id}/approve",
+            headers=headers(),
+            json={"approvedBy": "operator-test"},
+        )
+        assert approved.status_code == 200, approved.text
+        started = client.post(
+            f"/api/v2/missions/{mission_id}/start",
+            headers=headers(),
+        )
+        assert started.status_code == 200, started.text
+        before = started.json()
+        assert before["snapshot"]["status"] == "ready"
+
+        # Bind the semantic target so a fence bypass would be capable of
+        # issuing the old reviewed navigation node.
+        target = client.post(
+            f"/api/v2/missions/{mission_id}/world-records",
+            headers=headers(),
+            json={
+                "recordId": "record-generic-retry-target-1",
+                "robotId": "robot-1",
+                "kind": "fact",
+                "subject": "厨房",
+                "predicate": "target_pose",
+                "value": {
+                    "targetPose": {
+                        "frameId": "map",
+                        "x": 0.5,
+                        "y": 0.0,
+                        "z": 0.0,
+                        "yaw": 0.0,
+                    },
+                },
+                "source": "operator",
+                "sourceRef": "generic-retry-target",
+                "confidence": 1.0,
+                "observedAt": utc_now().isoformat(),
+                "frameId": "map",
+            },
+        )
+        assert target.status_code == 200, target.text
+        before = target.json()
+        before_states = before["nodeStates"]
+
+        intervention_id = "intervention-generic-retry-1"
+        message = {
+            "interventionId": intervention_id,
+            "text": "仍然去厨房，但到门口停下",
+            "kind": "append_requirement",
+        }
+        failed = client.post(
+            f"/api/v2/missions/{mission_id}/messages",
+            headers=headers(),
+            json=message,
+        )
+        assert failed.status_code == 503, failed.text
+        assert planner.event_calls == 1
+
+        fenced = app.state.mission_runtime.get(mission_id)
+        assert fenced["snapshot"]["status"] == "suspended"
+        assert fenced["snapshot"]["errorCode"] == "PLANNER_EVALUATION_PENDING"
+        assert fenced["snapshot"]["activeSkillRequestId"] is None
+        assert fenced["nodeStates"] == before_states
+        assert fenced["skillExecutions"] == []
+        claim = next(
+            item
+            for item in fenced["events"]
+            if item["correlationId"] == intervention_id
+        )
+        assert claim["payload"]["phase"] == "claimed"
+        assert claim["payload"]["previousSnapshot"]["status"] == "ready"
+
+        # Every public/direct path that could otherwise clear the fence or
+        # dispatch the old goal stays fail-closed.
+        assert client.post(
+            f"/api/v2/missions/{mission_id}/start", headers=headers()
+        ).status_code == 409
+        advanced = client.post(
+            f"/api/v2/missions/{mission_id}/advance",
+            headers=headers(),
+            json={"maximumSteps": 20},
+        )
+        assert advanced.status_code == 200, advanced.text
+        assert advanced.json()["actions"] == []
+        assert advanced.json()["stoppedBecause"] == "suspended"
+        resumed = client.post(
+            f"/api/v2/missions/{mission_id}/interventions",
+            headers=headers(),
+            json={
+                "interventionId": "resume-during-planner-fence",
+                "kind": "resume",
+                "text": "恢复",
+            },
+        )
+        assert resumed.status_code == 409, resumed.text
+        issued = client.post(
+            f"/api/v2/missions/{mission_id}/nodes/navigate-kitchen/skill-requests",
+            headers=headers(),
+        )
+        assert issued.status_code == 409, issued.text
+        assert app.state.mission.converge_supervised_missions() == []
+
+        runtime = app.state.mission_runtime
+        with pytest.raises(MissionConflict, match="owns the Mission fence"):
+            runtime.skip_nodes(
+                mission_id,
+                ["navigate-kitchen"],
+                reason="must not bypass planner",
+                causation_id="skip-during-planner-fence",
+            )
+        active = PlanRevision.model_validate(fenced["activeRevision"])
+        ordinary_revision = active.model_copy(
+            update={
+                "revisionId": "revision-bypass-attempt",
+                "sequence": active.sequence + 1,
+                "parentRevisionId": active.revisionId,
+                "reasonCode": "test_bypass",
+                "reason": "must remain fenced",
+                "changeSummary": ["attempted ordinary revision"],
+                "disposition": "human_required",
+                "authorizationId": None,
+                "createdAt": utc_now(),
+            }
+        )
+        with pytest.raises(MissionConflict, match="owns the Mission fence"):
+            runtime.apply_revision(ordinary_revision)
+        assert runtime.get(mission_id)["skillExecutions"] == []
+
+        # A different key cannot steal the durable fence.
+        stolen = client.post(
+            f"/api/v2/missions/{mission_id}/messages",
+            headers=headers(),
+            json={**message, "interventionId": "intervention-generic-other"},
+        )
+        assert stolen.status_code == 409, stolen.text
+        assert planner.event_calls == 1
+
+        # Recreate the service (and therefore its in-process locks) over the
+        # same store/runtime.  The persisted claim is sufficient to retry and
+        # restore the first claim's READY snapshot.
+        original_service = app.state.mission
+        restarted_service = MissionService(
+            app.state.store,
+            app.state.mission_runtime,
+            planner,
+            allow_synthetic_profile=original_service.allow_synthetic_profile,
+            policy=original_service.policy,
+        )
+        restarted_service.robot_refresher = original_service.robot_refresher
+        restarted_service.scene_context_client = original_service.scene_context_client
+        requested_by = claim["payload"]["requestedBy"]
+        recovered = restarted_service.respond(
+            mission_id,
+            {**message, "requestedBy": requested_by},
+        )
+        assert recovered["decision"] == {
+            "kind": "continue",
+            "reason": "fixture retry continues",
+        }
+        assert recovered["mission"]["snapshot"]["status"] == "ready"
+        assert recovered["mission"]["snapshot"]["errorCode"] is None
+        assert recovered["mission"]["nodeStates"] == before_states
+        assert planner.event_calls == 2
+
+        replay = client.post(
+            f"/api/v2/missions/{mission_id}/messages",
+            headers=headers(),
+            json=message,
+        )
+        assert replay.status_code == 200, replay.text
+        assert replay.json()["decision"] == recovered["decision"]
+        assert replay.json()["mission"]["lastSequence"] == recovered["mission"][
+            "lastSequence"
+        ]
+        assert planner.event_calls == 2
+
+
+def test_generic_message_fences_before_a_blocked_robot_refresh() -> None:
+    planner = ContinueMissionPlanningClient()
+    app = create_app(
+        auth_token=TOKEN,
+        mission_planning_client=planner,
+        mission_supervisor_interval=3600,
+    )
+    with TestClient(app) as client:
+        draft = client.post(
+            "/api/v2/missions/drafts",
+            headers=headers(),
+            json={
+                "requestId": "request-blocked-refresh-1",
+                "objective": "去厨房",
+            },
+        )
+        assert draft.status_code == 201, draft.text
+        mission_id = draft.json()["draftId"]
+        assert client.post(
+            f"/api/v2/missions/drafts/{mission_id}/approve",
+            headers=headers(),
+            json={"approvedBy": "operator-test"},
+        ).status_code == 200
+        started = client.post(
+            f"/api/v2/missions/{mission_id}/start",
+            headers=headers(),
+        )
+        assert started.status_code == 200, started.text
+        before_states = started.json()["nodeStates"]
+
+        service = app.state.mission
+        original_refresher = service.robot_refresher
+        entered = threading.Event()
+        release = threading.Event()
+        outcome: dict[str, Any] = {}
+        errors: list[BaseException] = []
+
+        def blocked_refresher(robot_id: str | None) -> None:
+            entered.set()
+            if not release.wait(timeout=5):
+                raise AssertionError("blocked refresher was not released")
+            if original_refresher is not None:
+                original_refresher(robot_id)
+
+        def respond() -> None:
+            try:
+                outcome.update(
+                    service.respond(
+                        mission_id,
+                        {
+                            "interventionId": "intervention-blocked-refresh-1",
+                            "text": "保持原目标并继续",
+                            "kind": "append_requirement",
+                            "requestedBy": "operator-test",
+                        },
+                    )
+                )
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        service.robot_refresher = blocked_refresher
+        worker = threading.Thread(target=respond, name="blocked-planner-refresh-test")
+        worker.start()
+        world_record = {
+            "recordId": "record-blocked-refresh-1",
+            "robotId": "robot-1",
+            "kind": "fact",
+            "subject": "厨房",
+            "predicate": "visible",
+            "value": True,
+            "source": "operator",
+            "sourceRef": "blocked-refresh-test",
+            "confidence": 1.0,
+            "observedAt": utc_now().isoformat(),
+        }
+        try:
+            assert entered.wait(timeout=2)
+            fenced = app.state.mission_runtime.get(mission_id)
+            assert fenced["snapshot"]["status"] == "suspended"
+            assert fenced["snapshot"]["errorCode"] == "PLANNER_EVALUATION_PENDING"
+            assert fenced["nodeStates"] == before_states
+            assert fenced["skillExecutions"] == []
+            assert service.converge_supervised_missions() == []
+            assert app.state.mission_runtime.get(mission_id)["skillExecutions"] == []
+            assert planner.event_calls == 0
+            blocked_world = client.post(
+                f"/api/v2/missions/{mission_id}/world-records",
+                headers=headers(),
+                json=world_record,
+            )
+            assert blocked_world.status_code == 409, blocked_world.text
+        finally:
+            release.set()
+            worker.join(timeout=5)
+            service.robot_refresher = original_refresher
+        assert not worker.is_alive()
+        assert errors == []
+        assert outcome["decision"]["kind"] == "continue"
+        assert outcome["mission"]["snapshot"]["status"] == "ready"
+        assert outcome["mission"]["nodeStates"] == before_states
+        assert planner.event_calls == 1
+        accepted_world = client.post(
+            f"/api/v2/missions/{mission_id}/world-records",
+            headers=headers(),
+            json=world_record,
+        )
+        assert accepted_world.status_code == 200, accepted_world.text
+
+
+def test_cancel_aborts_a_pending_planner_fence_without_stale_error() -> None:
+    planner = FailOnceMissionPlanningClient()
+    app = create_app(
+        auth_token=TOKEN,
+        mission_planning_client=planner,
+        mission_supervisor_interval=3600,
+    )
+    with TestClient(app) as client:
+        draft = client.post(
+            "/api/v2/missions/drafts",
+            headers=headers(),
+            json={
+                "requestId": "request-cancel-planner-fence-1",
+                "objective": "去厨房",
+            },
+        )
+        assert draft.status_code == 201, draft.text
+        mission_id = draft.json()["draftId"]
+        assert client.post(
+            f"/api/v2/missions/drafts/{mission_id}/approve",
+            headers=headers(),
+            json={"approvedBy": "operator-test"},
+        ).status_code == 200
+        message = {
+            "interventionId": "intervention-cancelled-planner-1",
+            "kind": "append_requirement",
+            "text": "到门口停下",
+        }
+        failed = client.post(
+            f"/api/v2/missions/{mission_id}/messages",
+            headers=headers(),
+            json=message,
+        )
+        assert failed.status_code == 503, failed.text
+
+        cancelled = client.post(
+            f"/api/v2/missions/{mission_id}/cancel",
+            headers=headers(),
+            json={"reason": "不再执行这项任务"},
+        )
+        assert cancelled.status_code == 200, cancelled.text
+        snapshot = cancelled.json()["mission"]["snapshot"]
+        assert snapshot["status"] == "cancelled"
+        assert snapshot["errorCode"] is None
+        assert snapshot["detail"] is None
+        inspected = app.state.mission_runtime.inspect_planned_intervention(
+            {
+                "interventionId": message["interventionId"],
+                "missionId": mission_id,
+                "kind": message["kind"],
+                "text": message["text"],
+                "requestedBy": next(
+                    item["payload"]["requestedBy"]
+                    for item in cancelled.json()["mission"]["events"]
+                    if item["correlationId"] == message["interventionId"]
+                ),
+            },
+            request_sha256=next(
+                item["payload"]["requestSha256"]
+                for item in cancelled.json()["mission"]["events"]
+                if item["correlationId"] == message["interventionId"]
+            ),
+        )
+        assert inspected["state"] == "aborted"
+
+        retried = client.post(
+            f"/api/v2/missions/{mission_id}/messages",
+            headers=headers(),
+            json=message,
+        )
+        assert retried.status_code == 409, retried.text
+        assert planner.event_calls == 1
+
+
+def test_revision_request_fences_before_planner_and_retries_atomically() -> None:
+    planner = BlockingFailOnceRevisionPlanningClient()
+    app = create_app(
+        auth_token=TOKEN,
+        mission_planning_client=planner,
+        mission_supervisor_interval=3600,
+    )
+    with TestClient(app) as client:
+        draft = client.post(
+            "/api/v2/missions/drafts",
+            headers=headers(),
+            json={
+                "requestId": "request-revision-saga-draft-1",
+                "objective": "去厨房",
+            },
+        )
+        assert draft.status_code == 201, draft.text
+        mission_id = draft.json()["draftId"]
+        assert client.post(
+            f"/api/v2/missions/drafts/{mission_id}/approve",
+            headers=headers(),
+            json={"approvedBy": "operator-test"},
+        ).status_code == 200
+        started = client.post(
+            f"/api/v2/missions/{mission_id}/start",
+            headers=headers(),
+        )
+        assert started.status_code == 200, started.text
+        before = started.json()
+
+        body = {
+            "requestId": "request-revision-saga-1",
+            "requestedBy": "operator-test",
+            "objective": "去厨房门口",
+            "trigger": "operator_intervention",
+            "triggerDetail": "到门口停下，不进入厨房",
+        }
+        errors: list[BaseException] = []
+
+        def request_revision() -> None:
+            try:
+                app.state.mission.request_revision(mission_id, body)
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        worker = threading.Thread(
+            target=request_revision,
+            name="blocked-revision-planner-test",
+        )
+        worker.start()
+        try:
+            assert planner.entered.wait(timeout=2)
+            fenced = app.state.mission_runtime.get(mission_id)
+            assert fenced["snapshot"]["status"] == "suspended"
+            assert fenced["snapshot"]["errorCode"] == "PLANNER_EVALUATION_PENDING"
+            assert fenced["snapshot"]["activeSkillRequestId"] is None
+            assert fenced["nodeStates"] == before["nodeStates"]
+            assert fenced["skillExecutions"] == []
+            assert app.state.mission.converge_supervised_missions() == []
+            assert app.state.mission_runtime.get(mission_id)["skillExecutions"] == []
+        finally:
+            planner.release.set()
+            worker.join(timeout=5)
+        assert not worker.is_alive()
+        assert len(errors) == 1
+        assert isinstance(errors[0], MissionPlanningUnavailable)
+        failed = app.state.mission_runtime.get(mission_id)
+        assert failed["snapshot"]["status"] == "suspended"
+        assert failed["snapshot"]["errorCode"] == "PLANNER_EVALUATION_PENDING"
+        assert len(failed["revisions"]) == 1
+
+        completed = app.state.mission.request_revision(mission_id, body)
+        assert completed["snapshot"]["status"] == "awaiting_review"
+        assert completed["snapshot"]["errorCode"] is None
+        assert len(completed["revisions"]) == 2
+        assert planner.revision_calls == 2
+        events = [
+            item
+            for item in completed["events"]
+            if item["correlationId"] == body["requestId"]
+        ]
+        assert [item["payload"]["phase"] for item in events] == [
+            "claimed",
+            "completed",
+        ]
+
+        replay = app.state.mission.request_revision(mission_id, body)
+        assert replay["lastSequence"] == completed["lastSequence"]
+        assert len(replay["revisions"]) == 2
+        assert planner.revision_calls == 2
+        with pytest.raises(MissionConflict):
+            app.state.mission.request_revision(
+                mission_id,
+                {**body, "objective": "换一个不同目标"},
+            )
+
+
+def test_internal_event_evaluation_fences_before_blocked_planner() -> None:
+    planner = BlockingEventPlanningClient()
+    app = create_app(
+        auth_token=TOKEN,
+        mission_planning_client=planner,
+        mission_supervisor_interval=3600,
+    )
+    with TestClient(app) as client:
+        draft = client.post(
+            "/api/v2/missions/drafts",
+            headers=headers(),
+            json={
+                "requestId": "request-blocked-event-draft-1",
+                "objective": "去厨房",
+            },
+        )
+        assert draft.status_code == 201, draft.text
+        mission_id = draft.json()["draftId"]
+        assert client.post(
+            f"/api/v2/missions/drafts/{mission_id}/approve",
+            headers=headers(),
+            json={"approvedBy": "operator-test"},
+        ).status_code == 200
+        started = client.post(
+            f"/api/v2/missions/{mission_id}/start",
+            headers=headers(),
+        )
+        assert started.status_code == 200, started.text
+        before = started.json()
+        event = {
+            "eventType": "observation.updated",
+            "payload": {"detail": "目标仍然可见"},
+            "correlationId": "observation-event-blocked-1",
+            "occurredAt": utc_now().isoformat(),
+        }
+        outcome: dict[str, Any] = {}
+        errors: list[BaseException] = []
+
+        def evaluate() -> None:
+            try:
+                outcome.update(app.state.mission.evaluate_event(mission_id, event))
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        worker = threading.Thread(target=evaluate, name="blocked-event-planner-test")
+        worker.start()
+        try:
+            assert planner.entered.wait(timeout=2)
+            fenced = app.state.mission_runtime.get(mission_id)
+            assert fenced["snapshot"]["status"] == "suspended"
+            assert fenced["snapshot"]["errorCode"] == "PLANNER_EVALUATION_PENDING"
+            assert fenced["nodeStates"] == before["nodeStates"]
+            assert fenced["skillExecutions"] == []
+            assert app.state.mission.converge_supervised_missions() == []
+            assert app.state.mission_runtime.get(mission_id)["skillExecutions"] == []
+        finally:
+            planner.release.set()
+            worker.join(timeout=5)
+        assert not worker.is_alive()
+        assert errors == []
+        assert outcome["decision"] == {
+            "kind": "continue",
+            "reason": "event accepted",
+        }
+        assert outcome["mission"]["snapshot"]["status"] == "ready"
+        assert outcome["mission"]["nodeStates"] == before["nodeStates"]
+        assert planner.event_calls == 1
+
+        replay = app.state.mission.evaluate_event(mission_id, event)
+        assert replay["decision"] == outcome["decision"]
+        assert replay["mission"]["lastSequence"] == outcome["mission"][
+            "lastSequence"
+        ]
+        assert planner.event_calls == 1
+
+
+def _create_ambiguous_visual_mission(client: TestClient) -> tuple[str, dict[str, Any]]:
+    created = client.post(
+        "/api/v2/missions/drafts",
+        headers=headers(),
+        json={
+            "requestId": f"request-ambiguous-{uuid4().hex}",
+            "objective": "找到银白色机器人并去它旁边",
+        },
+    )
+    assert created.status_code == 201, created.text
+    mission_id = created.json()["draftId"]
+    approved = client.post(
+        f"/api/v2/missions/drafts/{mission_id}/approve",
+        headers=headers(),
+        json={"approvedBy": "operator-test"},
+    )
+    assert approved.status_code == 200, approved.text
+    started = client.post(
+        f"/api/v2/missions/{mission_id}/start",
+        headers=headers(),
+    )
+    assert started.status_code == 200, started.text
+    issued = client.post(
+        f"/api/v2/missions/{mission_id}/nodes/observe-target/skill-requests",
+        headers=headers(),
+    )
+    assert issued.status_code == 202, issued.text
+    mission = issued.json()["mission"]
+    assert mission["snapshot"]["status"] == "needs_input"
+    assert mission["snapshot"]["errorCode"] == "VISUAL_NEEDS_INPUT"
+    return mission_id, mission
+
+
+def test_completed_generic_answer_replays_before_later_visual_candidate_input(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("HIDE_VISION_SOURCE_MODE", "synthetic")
+    planner = ContinueVisualMissionPlanningClient()
+    visual = AmbiguousThenSelectedVisualTaskClient()
+    app = create_app(
+        auth_token=TOKEN,
+        mission_planning_client=planner,
+        visual_task_client=visual,
+        mission_supervisor_interval=3600,
+    )
+    intervention_id = "intervention-generic-before-visual-input"
+    answer = {
+        "interventionId": intervention_id,
+        "kind": "answer",
+        "text": "先保持当前观察计划",
+    }
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v2/missions/drafts",
+            headers=headers(),
+            json={
+                "requestId": "request-generic-before-visual-input",
+                "objective": "找到银白色机器人并去它旁边",
+            },
+        )
+        assert created.status_code == 201, created.text
+        mission_id = created.json()["draftId"]
+        assert client.post(
+            f"/api/v2/missions/drafts/{mission_id}/approve",
+            headers=headers(),
+            json={"approvedBy": "operator-test"},
+        ).status_code == 200
+        assert client.post(
+            f"/api/v2/missions/{mission_id}/start",
+            headers=headers(),
+        ).status_code == 200
+
+        first = client.post(
+            f"/api/v2/missions/{mission_id}/messages",
+            headers=headers(),
+            json=answer,
+        )
+        assert first.status_code == 200, first.text
+        first_payload = first.json()
+        assert first_payload["decision"] == {
+            "kind": "continue",
+            "reason": "fixture visual mission continues",
+        }
+        assert planner.event_calls == 1
+
+        # A later evidence writer cannot steal or poison the completed
+        # intervention identity.
+        collision = client.post(
+            f"/api/v2/missions/{mission_id}/world-records",
+            headers=headers(),
+            json={
+                "recordId": intervention_id,
+                "robotId": "robot-1",
+                "kind": "fact",
+                "subject": "silver robot",
+                "predicate": "visible",
+                "value": True,
+                "source": "operator",
+                "sourceRef": "generic-correlation-collision",
+                "confidence": 1.0,
+                "observedAt": utc_now().isoformat(),
+            },
+        )
+        assert collision.status_code == 409, collision.text
+
+        issued = client.post(
+            f"/api/v2/missions/{mission_id}/nodes/observe-target/skill-requests",
+            headers=headers(),
+        )
+        assert issued.status_code == 202, issued.text
+        ambiguous = issued.json()["mission"]
+        assert ambiguous["snapshot"]["status"] == "needs_input"
+        assert ambiguous["snapshot"]["errorCode"] == "VISUAL_NEEDS_INPUT"
+        assert len(visual.requests) == 1
+
+        replay = client.post(
+            f"/api/v2/missions/{mission_id}/messages",
+            headers=headers(),
+            json=answer,
+        )
+        assert replay.status_code == 200, replay.text
+        replay_payload = replay.json()
+        assert replay_payload["decision"] == first_payload["decision"]
+        assert replay_payload["mission"]["lastSequence"] == ambiguous["lastSequence"]
+        assert replay_payload["mission"]["snapshot"]["status"] == "needs_input"
+        assert planner.event_calls == 1
+        assert len(visual.requests) == 1
+        node_state = next(
+            item
+            for item in replay_payload["mission"]["nodeStates"]
+            if item["nodeId"] == "observe-target"
+        )
+        assert node_state["status"] == "rejected"
+        assert "visualCandidateSelection" not in node_state["state"]
+        assert not any(
+            isinstance(item.get("payload"), Mapping)
+            and "visualCandidateSelection" in item["payload"]
+            for item in replay_payload["mission"]["events"]
+            if item["correlationId"] == intervention_id
+        )
+
+        rebound = client.post(
+            f"/api/v2/missions/{mission_id}/messages",
+            headers=headers(),
+            json={**answer, "text": "同一个 ID 但不同答案"},
+        )
+        assert rebound.status_code == 409, rebound.text
+        assert planner.event_calls == 1
+        assert len(visual.requests) == 1
+
+
+@pytest.mark.parametrize(
+    ("text", "candidate_id"),
+    [
+        (
+            "选择第一个候选,继续当前mission",
+            AmbiguousThenSelectedVisualTaskClient.first_candidate_id,
+        ),
+        (
+            "选择候选：左侧银白色机器人",
+            AmbiguousThenSelectedVisualTaskClient.first_candidate_id,
+        ),
+        (
+            f"confirm {AmbiguousThenSelectedVisualTaskClient.second_candidate_id}",
+            AmbiguousThenSelectedVisualTaskClient.second_candidate_id,
+        ),
+    ],
+)
+def test_visual_candidate_free_text_allowlist_accepts_only_complete_selection_forms(
+    text: str,
+    candidate_id: str,
+) -> None:
+    ambiguity = {
+        "nodeId": "observe-target",
+        "sourceRequestId": "skill-observe-1",
+        "selectionSourceAnalysisId": (
+            AmbiguousThenSelectedVisualTaskClient.source_analysis_id
+        ),
+        "candidates": [
+            {
+                "candidateId": AmbiguousThenSelectedVisualTaskClient.first_candidate_id,
+                "label": "左侧银白色机器人",
+            },
+            {
+                "candidateId": AmbiguousThenSelectedVisualTaskClient.second_candidate_id,
+                "label": "右侧银白色机器人",
+            },
+        ],
+    }
+
+    resolved = MissionService._resolve_visual_candidate_answer({}, text, ambiguity)
+
+    assert resolved["candidateId"] == candidate_id
+    assert resolved["selectionSourceAnalysisId"] == (
+        AmbiguousThenSelectedVisualTaskClient.source_analysis_id
+    )
+
+
+def test_mission_v2_visual_candidate_answer_retries_same_node_as_attempt_two(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("HIDE_VISION_SOURCE_MODE", "synthetic")
+    planner = CandidateRetryPlanningClient()
+    visual = AmbiguousThenSelectedVisualTaskClient()
+    app = create_app(
+        auth_token=TOKEN,
+        mission_planning_client=planner,
+        visual_task_client=visual,
+        mission_supervisor_interval=3600,
+    )
+    intervention_id = "intervention-select-first-candidate"
+    answer = {
+        "text": "选择第一个候选，继续当前任务",
+        "kind": "answer",
+        "interventionId": intervention_id,
+    }
+    with TestClient(app) as client:
+        mission_id, before = _create_ambiguous_visual_mission(client)
+        active_revision_id = before["activeRevisionId"]
+        answered = client.post(
+            f"/api/v2/missions/{mission_id}/messages",
+            headers=headers(),
+            json=answer,
+        )
+        assert answered.status_code == 200, answered.text
+        payload = answered.json()
+        assert payload["decision"]["kind"] == "continue"
+        assert (
+            payload["decision"]["candidateId"]
+            == AmbiguousThenSelectedVisualTaskClient.first_candidate_id
+        )
+        selected = payload["mission"]
+        assert selected["snapshot"]["status"] == "ready"
+        assert selected["activeRevisionId"] == active_revision_id
+        assert len(selected["revisions"]) == 1
+        node_state = next(
+            item for item in selected["nodeStates"] if item["nodeId"] == "observe-target"
+        )
+        assert node_state["status"] == "pending"
+        assert node_state["attempt"] == 1
+        selection = node_state["state"]["visualCandidateSelection"]
+        assert selection["candidateId"] == (
+            AmbiguousThenSelectedVisualTaskClient.first_candidate_id
+        )
+        assert selection["selectionSourceAnalysisId"] == (
+            AmbiguousThenSelectedVisualTaskClient.source_analysis_id
+        )
+        assert selection["sourceRequestId"] == before["skillExecutions"][0][
+            "requestId"
+        ]
+        assert selection["selectedBy"]
+        assert selection["selectedAt"]
+        assert len(visual.requests) == 1
+
+        collision = client.post(
+            f"/api/v2/missions/{mission_id}/world-records",
+            headers=headers(),
+            json={
+                "recordId": intervention_id,
+                "robotId": "robot-1",
+                "kind": "fact",
+                "subject": "silver robot",
+                "predicate": "selected",
+                "value": True,
+                "source": "operator",
+                "sourceRef": "candidate-correlation-collision",
+                "confidence": 1.0,
+                "observedAt": utc_now().isoformat(),
+            },
+        )
+        assert collision.status_code == 409, collision.text
+
+        repeated = client.post(
+            f"/api/v2/missions/{mission_id}/messages",
+            headers=headers(),
+            json=answer,
+        )
+        assert repeated.status_code == 200, repeated.text
+        assert repeated.json()["mission"]["lastSequence"] == selected["lastSequence"]
+        assert len(
+            [
+                item
+                for item in repeated.json()["mission"]["events"]
+                if item["eventType"] == "operator.answer"
+                and item["correlationId"] == intervention_id
+            ]
+        ) == 1
+
+        rebound = client.post(
+            f"/api/v2/missions/{mission_id}/messages",
+            headers=headers(),
+            json={
+                **answer,
+                "candidateId": (
+                    AmbiguousThenSelectedVisualTaskClient.second_candidate_id
+                ),
+                "selectionSourceAnalysisId": (
+                    AmbiguousThenSelectedVisualTaskClient.source_analysis_id
+                ),
+            },
+        )
+        assert rebound.status_code == 409, rebound.text
+        changed_kind = client.post(
+            f"/api/v2/missions/{mission_id}/messages",
+            headers=headers(),
+            json={
+                **answer,
+                "kind": "modify_goal",
+            },
+        )
+        assert changed_kind.status_code == 409, changed_kind.text
+
+        retried = client.post(
+            f"/api/v2/missions/{mission_id}/nodes/observe-target/skill-requests",
+            headers=headers(),
+        )
+        assert retried.status_code == 202, retried.text
+        request = retried.json()["request"]
+        assert request["revisionId"] == active_revision_id
+        assert request["nodeId"] == "observe-target"
+        assert request["requestId"].endswith("-observe-target-2")
+        assert (
+            request["input"]["candidateId"]
+            == AmbiguousThenSelectedVisualTaskClient.first_candidate_id
+        )
+        assert request["input"]["selectionSourceAnalysisId"] == (
+            AmbiguousThenSelectedVisualTaskClient.source_analysis_id
+        )
+
+    assert planner.event_calls == 0
+    assert len(visual.requests) == 2
+    assert visual.requests[1]["attempt"] == 2
+
+
+@pytest.mark.parametrize(
+    ("answer", "expected_status"),
+    [
+        (
+            {
+                "text": "选择这个候选",
+                "kind": "answer",
+                "candidateId": "candidate-from-another-mission",
+                "selectionSourceAnalysisId": (
+                    AmbiguousThenSelectedVisualTaskClient.source_analysis_id
+                ),
+            },
+            422,
+        ),
+        (
+            {
+                "text": "选择左侧候选",
+                "kind": "answer",
+                "candidateId": AmbiguousThenSelectedVisualTaskClient.first_candidate_id,
+                "selectionSourceAnalysisId": "analysis-stale-result",
+            },
+            409,
+        ),
+        ({"text": "选择第三个候选", "kind": "answer"}, 422),
+        ({"text": "选择第一个候选和第二个候选", "kind": "answer"}, 422),
+        ({"text": "第一个还是第二个？", "kind": "answer"}, 422),
+        ({"text": "候选1或候选2", "kind": "answer"}, 422),
+        ({"text": "不要选择第一个候选", "kind": "answer"}, 422),
+        ({"text": "是不是选择第一个候选？", "kind": "answer"}, 422),
+        ({"text": "如果可以就选择第一个候选", "kind": "answer"}, 422),
+        (
+            {
+                "text": "选择左侧候选",
+                "kind": "answer",
+                "candidateId": AmbiguousThenSelectedVisualTaskClient.first_candidate_id,
+            },
+            422,
+        ),
+    ],
+)
+def test_mission_v2_invalid_visual_candidate_stays_needs_input_without_dispatch(
+    monkeypatch,
+    answer: dict[str, Any],
+    expected_status: int,
+) -> None:
+    monkeypatch.setenv("HIDE_VISION_SOURCE_MODE", "synthetic")
+    planner = CandidateRetryPlanningClient()
+    visual = AmbiguousThenSelectedVisualTaskClient()
+    app = create_app(
+        auth_token=TOKEN,
+        mission_planning_client=planner,
+        visual_task_client=visual,
+        mission_supervisor_interval=3600,
+    )
+    with TestClient(app) as client:
+        mission_id, before = _create_ambiguous_visual_mission(client)
+        rejected = client.post(
+            f"/api/v2/missions/{mission_id}/messages",
+            headers=headers(),
+            json=answer,
+        )
+        assert rejected.status_code == expected_status, rejected.text
+        current = client.get(
+            f"/api/v2/missions/{mission_id}",
+            headers=headers(),
+        )
+        assert current.status_code == 200, current.text
+        mission = current.json()
+        assert mission["snapshot"]["status"] == "needs_input"
+        assert mission["lastSequence"] == before["lastSequence"]
+        node_state = next(
+            item for item in mission["nodeStates"] if item["nodeId"] == "observe-target"
+        )
+        assert node_state["status"] == "rejected"
+        assert node_state["attempt"] == 1
+        assert not any(item["eventType"] == "operator.answer" for item in mission["events"])
+
+    assert planner.event_calls == 0
+    assert len(visual.requests) == 1
+
+
+def test_mission_v2_expired_visual_candidate_stays_needs_input_without_dispatch(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("HIDE_VISION_SOURCE_MODE", "synthetic")
+    planner = CandidateRetryPlanningClient()
+    visual = AmbiguousThenSelectedVisualTaskClient()
+    app = create_app(
+        auth_token=TOKEN,
+        mission_planning_client=planner,
+        visual_task_client=visual,
+        mission_supervisor_interval=3600,
+    )
+    with TestClient(app) as client:
+        mission_id, before = _create_ambiguous_visual_mission(client)
+        monkeypatch.setattr(
+            "packages.mission_core.runtime.utc_now",
+            lambda: utc_now() + timedelta(hours=1),
+        )
+        rejected = client.post(
+            f"/api/v2/missions/{mission_id}/messages",
+            headers=headers(),
+            json={"text": "选择第一个候选", "kind": "answer"},
+        )
+        assert rejected.status_code == 409, rejected.text
+        current = client.get(
+            f"/api/v2/missions/{mission_id}",
+            headers=headers(),
+        )
+        assert current.status_code == 200, current.text
+        mission = current.json()
+        assert mission["snapshot"]["status"] == "needs_input"
+        assert mission["lastSequence"] == before["lastSequence"]
+        assert not any(item["eventType"] == "operator.answer" for item in mission["events"])
+
+    assert planner.event_calls == 0
+    assert len(visual.requests) == 1
 
 
 def test_mission_v2_visual_skill_keeps_qwen_hypothesis_separate_from_geometry_fact(
@@ -1177,6 +2439,170 @@ def test_mission_v2_dispatches_reviewed_pose_only_through_robot_agent_nav2(
     assert "path" not in command.payload
     assert "cmd_vel" not in command.payload
     assert mapping.transport.value == "robot_agent"
+
+
+def test_skill_issue_rejects_stale_input_after_same_node_revision(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("ROBOT_AGENT_ID", "robot-1")
+    monkeypatch.setenv("ROBOT_AGENT_LOCALIZATION_EPOCH_ID", "epoch-live-1")
+    driver = MissionRobotDriver()
+    app = create_app(
+        auth_token=TOKEN,
+        adapters={"robot_agent": RobotAgentAdapter(driver=driver)},
+        mission_planning_client=SameNodeTargetRevisionPlanningClient(),
+        mission_supervisor_interval=3600,
+    )
+    with TestClient(app) as client:
+        draft = client.post(
+            "/api/v2/missions/drafts",
+            headers=headers(),
+            json={
+                "requestId": "request-stale-skill-input-1",
+                "objective": "去审核过的目标点",
+            },
+        )
+        assert draft.status_code == 201, draft.text
+        mission_id = draft.json()["draftId"]
+        approved = client.post(
+            f"/api/v2/missions/drafts/{mission_id}/approve",
+            headers=headers(),
+            json={"approvedBy": "operator-test"},
+        )
+        assert approved.status_code == 200, approved.text
+
+        for record_id, x in (("target-old", 0.5), ("target-new", 1.5)):
+            recorded = client.post(
+                f"/api/v2/missions/{mission_id}/world-records",
+                headers=headers(),
+                json={
+                    "recordId": record_id,
+                    "robotId": "robot-1",
+                    "kind": "fact",
+                    "subject": "审核目标",
+                    "predicate": "target_pose",
+                    "value": {
+                        "targetPose": {
+                            "frameId": "map",
+                            "x": x,
+                            "y": 0.0,
+                            "z": 0.0,
+                            "yaw": 0.0,
+                        }
+                    },
+                    "source": "operator",
+                    "sourceRef": f"operator-{record_id}",
+                    "confidence": 1.0,
+                    "observedAt": utc_now().isoformat(),
+                    "frameId": "map",
+                },
+            )
+            assert recorded.status_code == 200, recorded.text
+        started = client.post(
+            f"/api/v2/missions/{mission_id}/start",
+            headers=headers(),
+        )
+        assert started.status_code == 200, started.text
+
+        service = app.state.mission
+        original_refresher = service.robot_refresher
+        original_authorize_skill = service.policy.authorize_skill
+        entered = threading.Event()
+        release = threading.Event()
+        refresh_lock = threading.Lock()
+        refresh_count = 0
+        issue_responses: list[Any] = []
+        issue_errors: list[BaseException] = []
+
+        def blocked_second_refresher(robot_id: str | None) -> None:
+            nonlocal refresh_count
+            with refresh_lock:
+                refresh_count += 1
+                should_block = refresh_count == 2
+            if should_block:
+                entered.set()
+                if not release.wait(timeout=5):
+                    raise AssertionError("blocked skill refresher was not released")
+            if original_refresher is not None:
+                original_refresher(robot_id)
+
+        def issue() -> None:
+            try:
+                issue_responses.append(
+                    client.post(
+                        f"/api/v2/missions/{mission_id}/nodes/"
+                        "navigate-kitchen/skill-requests",
+                        headers=headers(),
+                    )
+                )
+            except BaseException as exc:  # pragma: no cover - asserted below
+                issue_errors.append(exc)
+
+        service.robot_refresher = blocked_second_refresher
+        # Isolate the runtime compare-and-set contract from a coincidental
+        # policy denial caused by revoking the old revision's grant. Without
+        # the state binding below, the request would otherwise be constructed
+        # with the new revision/authorization but the old resolved target.
+        service.policy.authorize_skill = lambda **_: None
+        worker = threading.Thread(target=issue, name="stale-skill-input-test")
+        worker.start()
+        try:
+            assert entered.wait(timeout=2)
+            revised = client.post(
+                f"/api/v2/missions/{mission_id}/revisions",
+                headers=headers(),
+                json={
+                    "requestId": "request-stale-skill-revision-1",
+                    "objective": "改去新审核目标点",
+                    "trigger": "operator_intervention",
+                    "triggerDetail": "将同一导航节点绑定到新目标",
+                },
+            )
+            assert revised.status_code == 200, revised.text
+            pending = revised.json()["revisions"][-1]
+            assert pending["nodes"][0]["nodeId"] == "navigate-kitchen"
+            assert pending["nodes"][0]["intent"] == {
+                "targetRecordId": "target-new"
+            }
+            newly_approved = client.post(
+                f"/api/v2/missions/{mission_id}/revisions/"
+                f"{pending['revisionId']}/approve",
+                headers=headers(),
+                json={"approvedBy": "operator-test"},
+            )
+            assert newly_approved.status_code == 200, newly_approved.text
+            assert newly_approved.json()["snapshot"]["status"] == "ready"
+            approved_revision_id = newly_approved.json()["activeRevision"][
+                "revisionId"
+            ]
+        finally:
+            release.set()
+            worker.join(timeout=5)
+            service.robot_refresher = original_refresher
+            service.policy.authorize_skill = original_authorize_skill
+
+        assert not worker.is_alive()
+        assert issue_errors == []
+        assert len(issue_responses) == 1
+        rejected = issue_responses[0]
+        assert rejected.status_code == 409, rejected.text
+        assert "mission state changed before skill issue" in rejected.json()["detail"]
+
+        current = client.get(
+            f"/api/v2/missions/{mission_id}", headers=headers()
+        )
+        assert current.status_code == 200, current.text
+        mission = current.json()
+        assert mission["snapshot"]["status"] == "ready"
+        assert mission["activeRevision"]["revisionId"] == approved_revision_id
+        assert mission["activeRevision"]["nodes"][0]["intent"] == {
+            "targetRecordId": "target-new"
+        }
+        assert mission["skillExecutions"] == []
+        assert not any(
+            event["eventType"] == "skill.requested" for event in mission["events"]
+        )
+    assert driver.dispatches == []
 
 
 def test_mission_v2_refuses_navigation_approval_without_live_map_pose(
@@ -1447,6 +2873,22 @@ def test_mission_v2_cancel_stops_active_nav2_command_before_terminalizing_missio
         active_request_id = running.json()["mission"]["snapshot"][
             "activeSkillRequestId"
         ]
+
+        for kind in ("pause", "cancel"):
+            bypass = client.post(
+                f"/api/v2/missions/{mission_id}/interventions",
+                headers=headers(),
+                json={
+                    "interventionId": f"direct-{kind}-active-request",
+                    "kind": kind,
+                    "text": f"direct {kind} must not orphan Robot Agent work",
+                },
+            )
+            assert bypass.status_code == 409, bypass.text
+            unchanged = app.state.mission_runtime.get(mission_id)
+            assert unchanged["snapshot"]["activeSkillRequestId"] == active_request_id
+            assert unchanged["snapshot"]["status"] in {"dispatching", "executing"}
+            assert driver.cancellations == []
 
         cancelled = client.post(
             f"/api/v2/missions/{mission_id}/cancel",

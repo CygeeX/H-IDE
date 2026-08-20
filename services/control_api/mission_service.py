@@ -13,6 +13,7 @@ import json
 import math
 import os
 import re
+import threading
 from typing import Any, Callable, Mapping
 from uuid import uuid4
 
@@ -31,8 +32,10 @@ from packages.control_core.validation import utc_now
 from packages.scene_core import Point3D, PoseMap, SceneRef
 from packages.mission_core import (
     MissionConflict,
+    MissionAuthorization,
     MissionEnvelope,
     MissionIntervention,
+    MissionInterventionKind,
     MissionNode,
     MissionPlanDraft,
     MissionRuntime,
@@ -46,7 +49,7 @@ from packages.mission_core import (
     WorldRecordKind,
 )
 
-from .mission_client import MissionPlanningClient
+from .mission_client import MissionPlanningClient, MissionPlanningUnavailable
 from .mission_policy import MissionPolicy, MissionPolicyDenied, PolicyActor
 from .store import SQLiteStore
 from .visual_task_client import VisualTaskUnavailable
@@ -120,6 +123,17 @@ class MissionService:
         self.skill_input_resolvers: dict[
             str, Callable[[Mapping[str, Any], MissionNode], Mapping[str, Any]]
         ] = {}
+        self._planned_response_locks_guard = threading.Lock()
+        self._planned_response_locks: dict[str, threading.Lock] = {}
+
+    def _planned_response_lock(
+        self,
+        mission_id: str,
+    ) -> threading.Lock:
+        with self._planned_response_locks_guard:
+            return self._planned_response_locks.setdefault(
+                mission_id, threading.Lock()
+            )
 
     @staticmethod
     def _workstation_descriptors() -> tuple[CapabilityDescriptor, ...]:
@@ -947,6 +961,21 @@ class MissionService:
         return node
 
     @staticmethod
+    def _skill_issue_binding(record: Mapping[str, Any]) -> tuple[int, str, str]:
+        """Freeze the reviewed Mission state used to derive executable input."""
+
+        snapshot = MissionSnapshot.model_validate(record["snapshot"])
+        revision = PlanRevision.model_validate(record["activeRevision"])
+        authorization = MissionAuthorization.model_validate(record["authorization"])
+        if snapshot.activeRevisionId != revision.revisionId:
+            raise MissionConflict("mission active revision is inconsistent")
+        return (
+            snapshot.lastSequence,
+            revision.revisionId,
+            authorization.authorizationId,
+        )
+
+    @staticmethod
     def _semantic_text(intent: Mapping[str, Any], key: str) -> str | None:
         # Structured model providers do not always preserve the preferred
         # camelCase spelling for semantic intent fields.  Accept the matching
@@ -1331,6 +1360,52 @@ class MissionService:
             )
         candidate_id = self._semantic_text(intent, "candidateId")
         selection_id = self._semantic_text(intent, "selectionSourceAnalysisId")
+        trusted_selection: Mapping[str, Any] | None = None
+        for item in record.get("nodeStates", []):
+            if (
+                not isinstance(item, Mapping)
+                or item.get("revisionId") != revision.revisionId
+                or item.get("nodeId") != node.nodeId
+            ):
+                continue
+            state = item.get("state")
+            value = (
+                state.get("visualCandidateSelection")
+                if isinstance(state, Mapping)
+                else None
+            )
+            if isinstance(value, Mapping):
+                trusted_selection = value
+            break
+        if trusted_selection is None and (candidate_id or selection_id):
+            raise MissionInputRequired(
+                "VISUAL_CANDIDATE_BINDING_UNTRUSTED",
+                "视觉候选只能来自当前 Mission 的操作员确认记录",
+            )
+        if trusted_selection is not None:
+            trusted_candidate_id = self._semantic_text(
+                trusted_selection,
+                "candidateId",
+            )
+            trusted_analysis_id = self._semantic_text(
+                trusted_selection,
+                "selectionSourceAnalysisId",
+            )
+            if not trusted_candidate_id or not trusted_analysis_id:
+                raise MissionInputRequired(
+                    "VISUAL_CANDIDATE_BINDING_INVALID",
+                    "可信视觉候选绑定不完整",
+                )
+            if (
+                (candidate_id and candidate_id != trusted_candidate_id)
+                or (selection_id and selection_id != trusted_analysis_id)
+            ):
+                raise MissionInputRequired(
+                    "VISUAL_CANDIDATE_BINDING_MISMATCH",
+                    "计划中的视觉候选与操作员确认记录不一致",
+                )
+            candidate_id = trusted_candidate_id
+            selection_id = trusted_analysis_id
         if candidate_id or selection_id:
             if not candidate_id or not selection_id:
                 raise MissionInputRequired(
@@ -1716,7 +1791,7 @@ class MissionService:
                 error_code=str(result.get("errorCode") or "SKILL_REJECTED"),
                 detail=str(result.get("detail") or "技能被拒绝，需要补充信息或人工处理"),
             )
-        return self.evaluate_event(
+        evaluated = self.evaluate_event(
             record["missionId"],
             {
                 "eventType": "skill.result",
@@ -1731,7 +1806,22 @@ class MissionService:
                 "correlationId": failed["requestId"],
                 "occurredAt": result.get("completedAt") or utc_now().isoformat(),
             },
-        )["mission"]
+        )
+        if evaluated["decision"].get("kind") == "continue":
+            # A failed execution is still unresolved when the planner makes
+            # no revision.  Convert both the immediate outcome and a durable
+            # completed-event replay after a crash into the same human-input
+            # gate instead of looping forever in PLANNING.
+            return self.runtime.request_input(
+                record["missionId"],
+                node_id=str(failed["nodeId"]),
+                error_code="REPLAN_NO_CHANGE",
+                detail=str(
+                    evaluated["decision"].get("reason")
+                    or "规划器未提出可解决本次失败的修订，需要人工处理"
+                ),
+            )
+        return evaluated["mission"]
 
     def _reconcile_active_skill(self, record: Mapping[str, Any]) -> dict[str, Any]:
         request_id = record.get("snapshot", {}).get("activeSkillRequestId")
@@ -1846,6 +1936,7 @@ class MissionService:
             try:
                 node = self._active_node(record)
                 skill_input = self._build_node_input(record, node)
+                issue_binding = self._skill_issue_binding(record)
             except MissionInputRequired as exc:
                 record = self.runtime.request_input(
                     mission_id,
@@ -1865,7 +1956,13 @@ class MissionService:
                 )
                 break
             outcome = self.issue_skill(
-                mission_id, node.nodeId, skill_input, actor=actor
+                mission_id,
+                node.nodeId,
+                skill_input,
+                actor=actor,
+                expected_last_sequence=issue_binding[0],
+                expected_revision_id=issue_binding[1],
+                expected_authorization_id=issue_binding[2],
             )
             actions.append(
                 {
@@ -1923,6 +2020,39 @@ class MissionService:
                 revision = PlanRevision.model_validate(record["activeRevision"])
             except (KeyError, TypeError, ValueError):
                 continue
+            if (
+                status is MissionStatus.SUSPENDED
+                and record["snapshot"].get("errorCode")
+                == "PLANNER_EVALUATION_PENDING"
+            ):
+                retry_event = self._pending_failed_skill_evaluation(record)
+                if retry_event is None:
+                    continue
+                try:
+                    evaluated = self.evaluate_event(
+                        str(record["missionId"]),
+                        retry_event,
+                        force_human_review=False,
+                    )
+                except (MissionConflict, MissionPlanningUnavailable):
+                    # The persisted fence remains authoritative.  The next
+                    # supervisor cadence may retry the exact failed-skill
+                    # event, but it can never dispatch the old revision.
+                    continue
+                mission = evaluated["mission"]
+                outcomes.append(
+                    {
+                        "mission": mission,
+                        "actions": [
+                            {
+                                "kind": "planning_evaluated",
+                                "status": mission["snapshot"]["status"],
+                            }
+                        ],
+                        "stoppedBecause": mission["snapshot"]["status"],
+                    }
+                )
+                continue
             if status not in eligible or not any(
                 node.skillId in _BASE_NAVIGATION_SKILLS
                 for node in revision.nodes
@@ -1955,16 +2085,334 @@ class MissionService:
             outcomes.append(result)
         return outcomes
 
+    @staticmethod
+    def _pending_failed_skill_evaluation(
+        record: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        prefix = "event-evaluation:"
+        snapshot = record.get("snapshot")
+        detail = snapshot.get("detail") if isinstance(snapshot, Mapping) else None
+        fence_prefix = "Planner evaluation pending for intervention "
+        if not isinstance(detail, str) or not detail.startswith(fence_prefix):
+            return None
+        fence_owner = detail.removeprefix(fence_prefix)
+        claim = next(
+            (
+                item
+                for item in reversed(record.get("events", []))
+                if isinstance(item, Mapping)
+                and isinstance(item.get("payload"), Mapping)
+                and item["payload"].get("operationType")
+                == "generic_planner_response"
+                and item["payload"].get("phase") == "claimed"
+                and isinstance(item["payload"].get("interventionId"), str)
+                and item["payload"]["interventionId"] == fence_owner
+                and fence_owner.startswith(prefix)
+                and str(item["payload"].get("text") or "").startswith(
+                    "evaluate_event: skill.result"
+                )
+            ),
+            None,
+        )
+        if claim is None:
+            return None
+        intervention_id = str(claim["payload"]["interventionId"])
+        request_id = intervention_id.removeprefix(prefix)
+        execution = next(
+            (
+                item
+                for item in reversed(record.get("skillExecutions", []))
+                if isinstance(item, Mapping)
+                and item.get("requestId") == request_id
+                and isinstance(item.get("result"), Mapping)
+                and item["result"].get("status") != "succeeded"
+            ),
+            None,
+        )
+        if execution is None:
+            return None
+        result = execution["result"]
+        return {
+            "eventType": "skill.result",
+            "payload": {
+                "status": result.get("status"),
+                "errorCode": result.get("errorCode"),
+                "detail": result.get("detail"),
+                "authorizationId": record.get("authorization", {}).get(
+                    "authorizationId"
+                ),
+            },
+            "correlationId": request_id,
+            "occurredAt": result.get("completedAt"),
+        }
+
+    @staticmethod
+    def _current_visual_ambiguity(
+        record: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        snapshot = record.get("snapshot")
+        if not isinstance(snapshot, Mapping):
+            raise MissionServiceError("Mission snapshot is unavailable")
+        node_id = snapshot.get("activeNodeId")
+        revision_id = snapshot.get("activeRevisionId")
+        if not isinstance(node_id, str) or not isinstance(revision_id, str):
+            raise MissionServiceError("current visual ambiguity identity is unavailable")
+        node_state = next(
+            (
+                item
+                for item in record.get("nodeStates", [])
+                if isinstance(item, Mapping)
+                and item.get("revisionId") == revision_id
+                and item.get("nodeId") == node_id
+            ),
+            None,
+        )
+        state_payload = node_state.get("state") if isinstance(node_state, Mapping) else None
+        request_id = (
+            state_payload.get("skillRequestId")
+            if isinstance(state_payload, Mapping)
+            else None
+        )
+        attempt = node_state.get("attempt") if isinstance(node_state, Mapping) else None
+        if (
+            not isinstance(request_id, str)
+            or not request_id
+            or isinstance(attempt, bool)
+            or not isinstance(attempt, int)
+            or attempt < 1
+            or node_state.get("status") != "rejected"
+        ):
+            raise MissionServiceError("current visual ambiguity node state is invalid")
+        execution = next(
+            (
+                item
+                for item in record.get("skillExecutions", [])
+                if isinstance(item, Mapping) and item.get("requestId") == request_id
+            ),
+            None,
+        )
+        if execution is None:
+            raise MissionServiceError("current visual ambiguity result is unavailable")
+        terminal = execution.get("result")
+        result_payload = terminal.get("result") if isinstance(terminal, Mapping) else None
+        visual = (
+            result_payload.get("visualResult")
+            if isinstance(result_payload, Mapping)
+            else None
+        )
+        request = execution["request"]
+        if (
+            not isinstance(terminal, Mapping)
+            or terminal.get("status") != "rejected"
+            or terminal.get("errorCode") != "VISUAL_NEEDS_INPUT"
+            or not isinstance(visual, Mapping)
+            or visual.get("status") != "needs_input"
+            or visual.get("rejectionReason") != "ambiguous_target"
+            or visual.get("requestId") != execution.get("requestId")
+            or visual.get("missionId") != record.get("missionId")
+            or visual.get("revisionId") != revision_id
+            or visual.get("nodeId") != node_id
+            or visual.get("attempt") != attempt
+            or request.get("missionId") != record.get("missionId")
+            or request.get("revisionId") != revision_id
+            or request.get("nodeId") != node_id
+        ):
+            raise MissionServiceError("current visual ambiguity identity is invalid")
+        analysis_id = _id(visual.get("analysisId"), "selectionSourceAnalysisId")
+        candidates = visual.get("ambiguityCandidates")
+        if not isinstance(candidates, list) or not candidates:
+            raise MissionServiceError("current visual ambiguity has no candidates")
+        normalized: list[dict[str, Any]] = []
+        identifiers: set[str] = set()
+        for item in candidates:
+            if not isinstance(item, Mapping):
+                raise MissionServiceError("current visual ambiguity candidate is invalid")
+            candidate_id = _id(item.get("candidateId"), "candidateId")
+            if candidate_id in identifiers:
+                raise MissionServiceError("current visual ambiguity candidate IDs are duplicated")
+            identifiers.add(candidate_id)
+            normalized.append(dict(item))
+        return {
+            "nodeId": node_id,
+            "sourceRequestId": _id(execution.get("requestId"), "sourceRequestId"),
+            "selectionSourceAnalysisId": analysis_id,
+            "candidates": normalized,
+        }
+
+    @staticmethod
+    def _candidate_ordinal(value: str) -> int | None:
+        token = value.strip().casefold()
+        if token.isdigit():
+            return int(token)
+        english = {
+            "first": 1,
+            "second": 2,
+            "third": 3,
+            "fourth": 4,
+            "fifth": 5,
+        }
+        if token in english:
+            return english[token]
+        digits = {
+            "一": 1,
+            "二": 2,
+            "两": 2,
+            "三": 3,
+            "四": 4,
+            "五": 5,
+            "六": 6,
+            "七": 7,
+            "八": 8,
+            "九": 9,
+        }
+        if token == "十":
+            return 10
+        if "十" in token:
+            left, right = token.split("十", 1)
+            tens = digits.get(left, 1 if not left else 0)
+            ones = digits.get(right, 0 if not right else -1)
+            if tens > 0 and ones >= 0:
+                return tens * 10 + ones
+        return digits.get(token)
+
+    @classmethod
+    def _resolve_visual_candidate_answer(
+        cls,
+        body: Mapping[str, Any],
+        text: str,
+        ambiguity: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        candidates = ambiguity["candidates"]
+        analysis_id = str(ambiguity["selectionSourceAnalysisId"])
+        nested = body.get("candidateSelection")
+        selection_body = nested if isinstance(nested, Mapping) else body
+        explicit_candidate = selection_body.get("candidateId")
+        explicit_analysis = selection_body.get("selectionSourceAnalysisId")
+        if (explicit_candidate is None) != (explicit_analysis is None):
+            raise MissionServiceError(
+                "candidateId and selectionSourceAnalysisId must be supplied together"
+            )
+        selected: Mapping[str, Any] | None = None
+        if explicit_candidate is not None:
+            candidate_id = _id(explicit_candidate, "candidateId")
+            supplied_analysis = _id(
+                explicit_analysis,
+                "selectionSourceAnalysisId",
+            )
+            if supplied_analysis != analysis_id:
+                raise MissionServiceError("visual candidate selection source is stale")
+            selected = next(
+                (item for item in candidates if item.get("candidateId") == candidate_id),
+                None,
+            )
+            if selected is None:
+                raise MissionServiceError(
+                    "visual candidate is not in the current ambiguity result"
+                )
+        else:
+            exact_targets = {
+                str(item["candidateId"]).strip()
+                for item in candidates
+            }
+            exact_targets.update(
+                item["label"].strip()
+                for item in candidates
+                if isinstance(item.get("label"), str) and item["label"].strip()
+            )
+            exact_pattern = "|".join(
+                re.escape(item)
+                for item in sorted(exact_targets, key=len, reverse=True)
+            )
+            ordinal_token = (
+                r"[0-9一二两三四五六七八九十]+|"
+                r"first|second|third|fourth|fifth"
+            )
+            ordinal_target = (
+                rf"第\s*(?:{ordinal_token})\s*(?:个|号)?\s*(?:候选|目标|candidate)"
+                rf"|(?:候选|目标|candidate)\s*(?:第|#|number\s*)?\s*(?:{ordinal_token})"
+                rf"|(?:the\s+)?(?:first|second|third|fourth|fifth|[0-9]+)\s+(?:candidate|target)"
+            )
+            named_target = (
+                rf"(?:(?:候选|目标|candidate)\s*[:：]\s*)?(?:{exact_pattern})"
+                if exact_pattern
+                else r"(?!)"
+            )
+            continuation = (
+                r"(?:\s*[,，。;；]?\s*(?:"
+                r"继续(?:当前)?(?:mission|任务)|"
+                r"continue\s+(?:the\s+)?current\s+mission"
+                r"))?"
+            )
+            affirmative = (
+                rf"\s*(?:选择|选中|确认|就是|select\b|choose\b|confirm\b)"
+                rf"\s*(?:{ordinal_target}|{named_target}){continuation}\s*"
+            )
+            if re.fullmatch(affirmative, text, flags=re.IGNORECASE) is None:
+                raise MissionServiceError(
+                    "visual candidate answer must be an unambiguous affirmative selection"
+                )
+            selected_ids = {
+                str(item["candidateId"])
+                for item in candidates
+                if str(item["candidateId"]) in text
+            }
+            ordinal_matches = [
+                *re.finditer(
+                    r"第\s*([0-9一二两三四五六七八九十]+)\s*(?:个|号)?\s*(?:候选|目标)?",
+                    text,
+                    flags=re.IGNORECASE,
+                ),
+                *re.finditer(
+                    r"(?:候选|目标|candidate)\s*(?:第|#)?\s*([0-9一二两三四五六七八九十]+|first|second|third|fourth|fifth)",
+                    text,
+                    flags=re.IGNORECASE,
+                ),
+                *re.finditer(
+                    r"\b(first|second|third|fourth|fifth)\b",
+                    text,
+                    flags=re.IGNORECASE,
+                ),
+            ]
+            for match in ordinal_matches:
+                ordinal = cls._candidate_ordinal(match.group(1))
+                if ordinal is None:
+                    continue
+                if ordinal < 1 or ordinal > len(candidates):
+                    raise MissionServiceError("visual candidate ordinal is out of range")
+                selected_ids.add(str(candidates[ordinal - 1]["candidateId"]))
+            selected_ids.update(
+                str(item["candidateId"])
+                for item in candidates
+                if isinstance(item.get("label"), str)
+                and item["label"].strip()
+                and item["label"].strip() in text
+            )
+            if len(selected_ids) > 1:
+                raise MissionServiceError(
+                    "visual candidate answer identifies multiple candidates"
+                )
+            if not selected_ids:
+                raise MissionServiceError(
+                    "visual candidate answer must identify exactly one current candidate"
+                )
+            selected_id = next(iter(selected_ids))
+            selected = next(
+                item for item in candidates if item["candidateId"] == selected_id
+            )
+        return {
+            "candidateId": str(selected["candidateId"]),
+            "selectionSourceAnalysisId": analysis_id,
+            "sourceRequestId": str(ambiguity["sourceRequestId"]),
+            "nodeId": str(ambiguity["nodeId"]),
+            "label": selected.get("label"),
+        }
+
     def respond(self, mission_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
         """Add an operator message to an existing Mission and re-evaluate it."""
 
         record = self.runtime.get(mission_id)
         text = _id(body.get("text"), "text")
         current_status = MissionStatus(record["snapshot"]["status"])
-        if record["snapshot"].get("activeSkillRequestId"):
-            raise MissionServiceError(
-                "an active physical skill must finish or be explicitly cancelled before changing the Mission"
-            )
         requested_kind = body.get("kind")
         if requested_kind is None:
             requested_kind = (
@@ -1978,19 +2426,169 @@ class MissionService:
             "interventionId",
         )
         occurred_at = utc_now()
-        self.runtime.intervene(
-            MissionIntervention(
-                interventionId=intervention_id,
-                missionId=mission_id,
-                kind=requested_kind,
-                text=text,
-                requestedBy=requested_by,
-                requestedAt=occurred_at,
-            )
+        intervention = MissionIntervention(
+            interventionId=intervention_id,
+            missionId=mission_id,
+            kind=requested_kind,
+            text=text,
+            requestedBy=requested_by,
+            requestedAt=occurred_at,
         )
-        result = self.evaluate_event(
-            mission_id,
+        existing_events = [
+            item
+            for item in record.get("events", [])
+            if isinstance(item, Mapping)
+            and item.get("correlationId") == intervention_id
+        ]
+        generic_events = [
+            item
+            for item in existing_events
+            if (
+                isinstance(item.get("payload"), Mapping)
+                and item["payload"].get("operationType")
+                == "generic_planner_response"
+            )
+        ]
+        non_generic_events = [
+            item
+            for item in existing_events
+            if item not in generic_events
+        ]
+        request_sha256 = _sha256(
             {
+                "missionId": mission_id,
+                "interventionId": intervention_id,
+                "kind": requested_kind,
+                "text": text,
+                "requestedBy": requested_by,
+            }
+        )
+        # A generic planner response owns its durable replay identity across
+        # later Mission states.  In particular, a completed answer must not be
+        # reinterpreted as a selection merely because the Mission subsequently
+        # entered VISUAL_NEEDS_INPUT.
+        if not generic_events and non_generic_events:
+            if len(existing_events) != 1 or len(non_generic_events) != 1:
+                raise MissionServiceError("interventionId already belongs to another operation")
+            existing = existing_events[0]
+            payload = existing.get("payload")
+            nested_selection = body.get("candidateSelection")
+            selection_body = (
+                nested_selection
+                if isinstance(nested_selection, Mapping)
+                else body
+            )
+            replay_candidate_id = selection_body.get("candidateId")
+            replay_analysis_id = selection_body.get("selectionSourceAnalysisId")
+            if (replay_candidate_id is None) != (replay_analysis_id is None):
+                raise MissionServiceError(
+                    "candidateId and selectionSourceAnalysisId must be supplied together"
+                )
+            previous_selection = (
+                payload.get("visualCandidateSelection")
+                if isinstance(payload, Mapping)
+                else None
+            )
+            selection_matches = replay_candidate_id is None or (
+                isinstance(previous_selection, Mapping)
+                and previous_selection.get("candidateId") == replay_candidate_id
+                and previous_selection.get("selectionSourceAnalysisId")
+                == replay_analysis_id
+            )
+            if (
+                existing.get("eventType") == f"operator.{requested_kind}"
+                and isinstance(payload, Mapping)
+                and payload.get("interventionId") == intervention_id
+                and payload.get("kind") == requested_kind
+                and payload.get("text") == text
+                and payload.get("requestedBy") == requested_by
+                and isinstance(previous_selection, Mapping)
+                and selection_matches
+            ):
+                replay_decision: dict[str, Any] = {
+                    "kind": "continue",
+                    "reason": "该补充信息已经处理，无需重复提交。",
+                }
+                if isinstance(previous_selection, Mapping):
+                    replay_decision.update(
+                        candidateId=previous_selection.get("candidateId"),
+                        selectionSourceAnalysisId=previous_selection.get(
+                            "selectionSourceAnalysisId"
+                        ),
+                    )
+                return {
+                    "message": {
+                        "interventionId": intervention_id,
+                        "kind": requested_kind,
+                        "text": text,
+                        "requestedBy": requested_by,
+                        "createdAt": payload.get("requestedAt") or occurred_at.isoformat(),
+                    },
+                    "decision": replay_decision,
+                    "mission": record,
+                }
+            raise MissionServiceError("interventionId already belongs to another operation")
+
+        if (
+            not generic_events
+            and current_status is MissionStatus.NEEDS_INPUT
+            and requested_kind == "answer"
+            and record["snapshot"].get("errorCode") == "VISUAL_NEEDS_INPUT"
+        ):
+            ambiguity = self._current_visual_ambiguity(record)
+            selection = self._resolve_visual_candidate_answer(body, text, ambiguity)
+            selected_mission = self.runtime.retry_visual_candidate(
+                intervention,
+                node_id=selection["nodeId"],
+                source_request_id=selection["sourceRequestId"],
+                candidate_id=selection["candidateId"],
+                selection_source_analysis_id=selection[
+                    "selectionSourceAnalysisId"
+                ],
+            )
+            label = selection.get("label")
+            return {
+                "message": {
+                    "interventionId": intervention_id,
+                    "kind": requested_kind,
+                    "text": text,
+                    "requestedBy": requested_by,
+                    "createdAt": occurred_at.isoformat(),
+                },
+                "decision": {
+                    "kind": "continue",
+                    "reason": (
+                        f"已确认视觉候选：{label}，下一次观察将进行确定性复核。"
+                        if isinstance(label, str) and label.strip()
+                        else "已确认视觉候选，下一次观察将进行确定性复核。"
+                    ),
+                    "candidateId": selection["candidateId"],
+                    "selectionSourceAnalysisId": selection[
+                        "selectionSourceAnalysisId"
+                    ],
+                },
+                "mission": selected_mission,
+            }
+
+        with self._planned_response_lock(mission_id):
+            record = self.runtime.get(mission_id)
+            state = self.runtime.inspect_planned_intervention(
+                intervention,
+                request_sha256=request_sha256,
+            )
+            if state["state"] == "completed":
+                return {
+                    "message": {
+                        "interventionId": intervention_id,
+                        "kind": requested_kind,
+                        "text": text,
+                        "requestedBy": requested_by,
+                        "createdAt": state["createdAt"],
+                    },
+                    "decision": state["decision"],
+                    "mission": state["mission"],
+                }
+            event = {
                 "eventType": "operator.intervention",
                 "payload": {
                     "kind": requested_kind,
@@ -2002,18 +2600,59 @@ class MissionService:
                 },
                 "correlationId": intervention_id,
                 "occurredAt": occurred_at.isoformat(),
-            },
-        )
-        return {
-            "message": {
-                "interventionId": intervention_id,
-                "kind": requested_kind,
-                "text": text,
-                "requestedBy": requested_by,
-                "createdAt": occurred_at.isoformat(),
-            },
-            **result,
-        }
+            }
+            state = self.runtime.claim_planned_intervention(
+                intervention,
+                request_sha256=request_sha256,
+                expected_last_sequence=int(record["lastSequence"]),
+            )
+            if state["state"] == "completed":
+                return {
+                    "message": {
+                        "interventionId": intervention_id,
+                        "kind": requested_kind,
+                        "text": text,
+                        "requestedBy": requested_by,
+                        "createdAt": state["createdAt"],
+                    },
+                    "decision": state["decision"],
+                    "mission": state["mission"],
+                }
+            if not state.get("claimedByCaller", False):
+                raise MissionConflict(
+                    "planned operator response is already being evaluated"
+                )
+            # The durable SUSPENDED fence must exist before robot refresh,
+            # manifest/context collection, or the planner can block.  Build
+            # the planner request from the immutable pre-claim record while
+            # the persisted Mission state remains fail-closed.
+            planner_payload, planner_context = self._prepare_event_evaluation(
+                mission_id, record, event
+            )
+            raw = self.planner.evaluate_event(planner_payload, planner_context)
+            if not isinstance(raw, Mapping):
+                raise MissionServiceError(
+                    "Mission planner returned an invalid event decision"
+                )
+            decision = self._normalize_event_decision(
+                raw, force_human_review=False
+            )
+            completed = self.runtime.finalize_planned_intervention(
+                intervention,
+                request_sha256=request_sha256,
+                decision=decision,
+            )
+            return {
+                "message": {
+                    "interventionId": intervention_id,
+                    "kind": requested_kind,
+                    "text": text,
+                    "requestedBy": requested_by,
+                    "createdAt": completed["createdAt"],
+                },
+                "decision": completed["decision"],
+                "mission": completed["mission"],
+            }
 
     def cancel(self, mission_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
         """Cancel the active physical skill first, then terminalize the Mission.
@@ -2156,6 +2795,29 @@ class MissionService:
         if not isinstance(expected_mode, str) or visual_mode != expected_mode:
             raise MissionServiceError(
                 "H-IDE Vision result mode is not bound to the active skill request"
+            )
+        try:
+            expected_attempt = int(request.requestId.rsplit("-", 1)[1])
+        except (IndexError, ValueError) as exc:
+            raise MissionServiceError(
+                "active visual skill request has no valid attempt identity"
+            ) from exc
+        if visual.get("attempt") != expected_attempt:
+            raise MissionServiceError(
+                "H-IDE Vision result attempt is not bound to the active skill request"
+            )
+        expected_candidate_id = request.input.get("candidateId")
+        expected_selection_id = request.input.get("selectionSourceAnalysisId")
+        if (expected_candidate_id is None) != (expected_selection_id is None):
+            raise MissionServiceError(
+                "active visual skill request has an incomplete candidate binding"
+            )
+        if expected_candidate_id is not None and (
+            visual.get("selectedCandidateId") != expected_candidate_id
+            or visual.get("selectionSourceAnalysisId") != expected_selection_id
+        ):
+            raise MissionServiceError(
+                "H-IDE Vision result did not confirm the trusted candidate binding"
             )
         analysis_id = _id(visual.get("analysisId"), "analysisId")
         observed_at = visual.get("createdAt") or utc_now()
@@ -2641,11 +3303,15 @@ class MissionService:
         node = next((item for item in revision.nodes if item.nodeId == node_id), None)
         if node is None:
             raise MissionServiceError("mission node not found")
+        issue_binding = self._skill_issue_binding(record)
         return self.issue_skill(
             mission_id,
             node_id,
             self._build_node_input(record, node),
             actor=actor,
+            expected_last_sequence=issue_binding[0],
+            expected_revision_id=issue_binding[1],
+            expected_authorization_id=issue_binding[2],
         )
 
     def issue_skill(
@@ -2655,8 +3321,17 @@ class MissionService:
         input: Mapping[str, Any],
         *,
         actor: PolicyActor,
+        expected_last_sequence: int,
+        expected_revision_id: str,
+        expected_authorization_id: str,
     ) -> dict[str, Any]:
         mission = self.runtime.get(mission_id)
+        if self._skill_issue_binding(mission) != (
+            expected_last_sequence,
+            expected_revision_id,
+            expected_authorization_id,
+        ):
+            raise MissionConflict("mission state changed before skill issue")
         plan = MissionPlanDraft.model_validate(mission["plan"])
         if self.robot_refresher is not None:
             self.robot_refresher(plan.robotId)
@@ -2728,6 +3403,9 @@ class MissionService:
             mission_id,
             node_id,
             payload,
+            expected_last_sequence=expected_last_sequence,
+            expected_revision_id=expected_revision_id,
+            expected_authorization_id=expected_authorization_id,
             expires_in_seconds=descriptor.timeoutMs / 1000,
         )
         workstation_skill = descriptor.metadata.get("authority") == "workstation"
@@ -2755,51 +3433,144 @@ class MissionService:
         return self.runtime.intervene(MissionIntervention.model_validate(payload))
 
     def request_revision(self, mission_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
-        record = self.runtime.get(mission_id)
-        snapshot = MissionSnapshot.model_validate(record["snapshot"])
-        active = PlanRevision.model_validate(record["activeRevision"])
-        plan = MissionPlanDraft.model_validate(record["plan"])
-        if self.robot_refresher is not None:
-            self.robot_refresher(plan.robotId)
-        robot, _, manifest = self._robot_manifest(plan.robotId)
-        self._assert_live_mission_identity(plan, robot)
-        if manifest.manifestDigest != plan.envelope.capabilityManifestDigest:
-            raise MissionServiceError("Mission capability manifest is no longer current")
-        if _sha256(
-            [item.model_dump(mode="json") for item in self._workstation_descriptors()]
-        ) != plan.envelope.workstationCapabilityDigest:
-            raise MissionServiceError("Mission workstation capability catalog is stale")
-        request = {
-            "requestId": body.get("requestId", f"replan-{uuid4().hex}"),
-            "missionId": mission_id,
-            "robotId": plan.robotId,
-            "requestedBy": body.get("requestedBy", "operator"),
-            "objective": body.get("objective", active.objective),
-            "contextVersion": body.get("contextVersion", "h-ide-runtime"),
-            "envelope": plan.envelope.model_dump(mode="json"),
-            "capabilities": self._capability_catalog(
-                [*manifest.capabilities, *self._workstation_descriptors()]
-            ),
-            "activeRevision": active.model_dump(mode="json"),
-            "worldRecords": record.get("worldRecords", []),
-            "trigger": body.get("trigger", "operator_intervention"),
-            "triggerDetail": body.get("triggerDetail", "operator requested a revision"),
-            "autoRevisionCount": snapshot.autoRevisionCount,
-            "authorizationId": body.get("authorizationId", record["authorization"].get("authorizationId")),
-        }
-        raw = self.planner.create_revision(request)
-        payload = raw.get("revision") if isinstance(raw.get("revision"), Mapping) else raw
-        revision_payload = dict(payload)
-        proposed_nodes = revision_payload.get("nodes")
-        has_physical = isinstance(proposed_nodes, list) and any(
-            isinstance(item, Mapping) and item.get("skillId") in _BASE_NAVIGATION_SKILLS
-            for item in proposed_nodes
-        )
-        if has_physical or revision_payload.get("disposition") == "human_approved":
-            revision_payload["disposition"] = "human_required"
-            revision_payload["authorizationId"] = None
-        revision = PlanRevision.model_validate(revision_payload)
-        return self.runtime.apply_revision(revision)
+        with self._planned_response_lock(mission_id):
+            record = self.runtime.get(mission_id)
+            snapshot = MissionSnapshot.model_validate(record["snapshot"])
+            active = PlanRevision.model_validate(record["activeRevision"])
+            requested_by = _id(body.get("requestedBy", "operator"), "requestedBy")
+            objective = _id(body.get("objective", active.objective), "objective")
+            context_version = _id(
+                body.get("contextVersion", "h-ide-runtime"),
+                "contextVersion",
+            )
+            trigger = _id(
+                body.get("trigger", "operator_intervention"),
+                "trigger",
+            )
+            trigger_detail = _id(
+                body.get("triggerDetail", "operator requested a revision"),
+                "triggerDetail",
+            )
+            authorization_id = body.get(
+                "authorizationId",
+                record["authorization"].get("authorizationId"),
+            )
+            if authorization_id is not None:
+                authorization_id = _id(authorization_id, "authorizationId")
+            raw_request_id = body.get("requestId")
+            request_id = _id(
+                raw_request_id
+                if raw_request_id is not None
+                else (
+                    "replan-"
+                    + _sha256(
+                        {
+                            "missionId": mission_id,
+                            "activeRevisionId": active.revisionId,
+                            "requestedBy": requested_by,
+                            "objective": objective,
+                            "contextVersion": context_version,
+                            "trigger": trigger,
+                            "triggerDetail": trigger_detail,
+                            "authorizationId": authorization_id,
+                        }
+                    )[:32]
+                ),
+                "requestId",
+            )
+            semantic_request = {
+                "operation": "request_revision",
+                "requestId": request_id,
+                "missionId": mission_id,
+                "requestedBy": requested_by,
+                "objective": objective,
+                "contextVersion": context_version,
+                "trigger": trigger,
+                "triggerDetail": trigger_detail,
+                "authorizationId": authorization_id,
+            }
+            request_sha256 = _sha256(semantic_request)
+            intervention = MissionIntervention(
+                interventionId=request_id,
+                missionId=mission_id,
+                kind=MissionInterventionKind.MODIFY_GOAL,
+                text=f"request_revision: {objective}\n{trigger_detail}",
+                requestedBy=requested_by,
+                requestedAt=utc_now(),
+            )
+            state = self.runtime.inspect_planned_intervention(
+                intervention,
+                request_sha256=request_sha256,
+            )
+            if state["state"] == "completed":
+                return state["mission"]
+            state = self.runtime.claim_planned_intervention(
+                intervention,
+                request_sha256=request_sha256,
+                expected_last_sequence=int(record["lastSequence"]),
+            )
+            if state["state"] == "completed":
+                return state["mission"]
+            if not state.get("claimedByCaller", False):
+                raise MissionConflict("Mission revision is already being planned")
+
+            # No refresh, manifest lookup, or planner call may happen before
+            # the durable SUSPENDED fence above.
+            plan = MissionPlanDraft.model_validate(record["plan"])
+            if self.robot_refresher is not None:
+                self.robot_refresher(plan.robotId)
+            robot, _, manifest = self._robot_manifest(plan.robotId)
+            self._assert_live_mission_identity(plan, robot)
+            if manifest.manifestDigest != plan.envelope.capabilityManifestDigest:
+                raise MissionServiceError(
+                    "Mission capability manifest is no longer current"
+                )
+            workstation = self._workstation_descriptors()
+            if _sha256(
+                [item.model_dump(mode="json") for item in workstation]
+            ) != plan.envelope.workstationCapabilityDigest:
+                raise MissionServiceError(
+                    "Mission workstation capability catalog is stale"
+                )
+            request = {
+                **semantic_request,
+                "robotId": plan.robotId,
+                "envelope": plan.envelope.model_dump(mode="json"),
+                "capabilities": self._capability_catalog(
+                    [*manifest.capabilities, *workstation]
+                ),
+                "activeRevision": active.model_dump(mode="json"),
+                "worldRecords": record.get("worldRecords", []),
+                "autoRevisionCount": snapshot.autoRevisionCount,
+            }
+            request.pop("operation", None)
+            raw = self.planner.create_revision(request)
+            if not isinstance(raw, Mapping):
+                raise MissionServiceError(
+                    "Mission planner returned an invalid revision"
+                )
+            payload = raw.get("revision")
+            revision_payload = dict(payload) if isinstance(payload, Mapping) else dict(raw)
+            proposed_nodes = revision_payload.get("nodes")
+            has_physical = isinstance(proposed_nodes, list) and any(
+                isinstance(item, Mapping)
+                and item.get("skillId") in _BASE_NAVIGATION_SKILLS
+                for item in proposed_nodes
+            )
+            if has_physical or revision_payload.get("disposition") == "human_approved":
+                revision_payload["disposition"] = "human_required"
+                revision_payload["authorizationId"] = None
+            revision = PlanRevision.model_validate(revision_payload)
+            completed = self.runtime.finalize_planned_intervention(
+                intervention,
+                request_sha256=request_sha256,
+                decision={
+                    "kind": "replan",
+                    "request": {"requestId": request_id},
+                    "revision": revision.model_dump(mode="json"),
+                },
+            )
+            return completed["mission"]
 
     def approve_revision(
         self,
@@ -2877,22 +3648,12 @@ class MissionService:
         }
         return dict(self.planner.score_candidates(request))
 
-    def evaluate_event(
+    def _prepare_event_evaluation(
         self,
         mission_id: str,
+        record: Mapping[str, Any],
         event: Mapping[str, Any],
-        *,
-        force_human_review: bool = False,
-    ) -> dict[str, Any]:
-        """Evaluate one observation and optionally force the review gate.
-
-        Simulation events use ``force_human_review=True`` even when the
-        planner's normal policy would inherit an authorization.  This keeps
-        the simulator's every-replan contract stricter than a future
-        supervised production profile; it never grants or dispatches a
-        physical skill.
-        """
-        record = self.runtime.get(mission_id)
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         plan = MissionPlanDraft.model_validate(record["plan"])
         if self.robot_refresher is not None:
             self.robot_refresher(plan.robotId)
@@ -2918,30 +3679,132 @@ class MissionService:
         payload.setdefault("missionId", mission_id)
         payload.setdefault("robotId", plan.robotId)
         payload.setdefault("activeRevision", record.get("activeRevision"))
-        payload.setdefault("autoRevisionCount", record["snapshot"].get("autoRevisionCount", 0))
-        raw = self.planner.evaluate_event(payload, context)
-        if raw.get("kind") == "replan" and isinstance(raw.get("revision"), Mapping):
-            revision_payload = dict(raw["revision"])
-            has_physical = isinstance(revision_payload.get("nodes"), list) and any(
-                isinstance(item, Mapping)
-                and item.get("skillId") in _BASE_NAVIGATION_SKILLS
-                for item in revision_payload["nodes"]
+        payload.setdefault(
+            "autoRevisionCount", record["snapshot"].get("autoRevisionCount", 0)
+        )
+        return payload, context
+
+    @staticmethod
+    def _normalize_event_decision(
+        raw: Mapping[str, Any],
+        *,
+        force_human_review: bool,
+    ) -> dict[str, Any]:
+        decision = dict(raw)
+        if decision.get("kind") != "replan":
+            return decision
+        raw_revision = decision.get("revision")
+        if not isinstance(raw_revision, Mapping):
+            raise MissionServiceError("Mission planner returned an invalid revision decision")
+        revision_payload = dict(raw_revision)
+        has_physical = isinstance(revision_payload.get("nodes"), list) and any(
+            isinstance(item, Mapping)
+            and item.get("skillId") in _BASE_NAVIGATION_SKILLS
+            for item in revision_payload["nodes"]
+        )
+        if (
+            force_human_review
+            or has_physical
+            or revision_payload.get("disposition") == "human_approved"
+        ):
+            revision_payload["disposition"] = "human_required"
+            revision_payload["authorizationId"] = None
+            revision_payload["reason"] = (
+                f"Simulation event requires operator review: "
+                f"{revision_payload.get('reason') or 'planner proposed a revision'}"
             )
-            if (
-                force_human_review
-                or has_physical
-                or revision_payload.get("disposition") == "human_approved"
-            ):
-                revision_payload["disposition"] = "human_required"
-                revision_payload["authorizationId"] = None
-                revision_payload["reason"] = (
-                    f"Simulation event requires operator review: "
-                    f"{revision_payload.get('reason') or 'planner proposed a revision'}"
+        return {**decision, "revision": revision_payload}
+
+    def evaluate_event(
+        self,
+        mission_id: str,
+        event: Mapping[str, Any],
+        *,
+        force_human_review: bool = False,
+    ) -> dict[str, Any]:
+        """Evaluate one observation and optionally force the review gate.
+
+        Simulation events use ``force_human_review=True`` even when the
+        planner's normal policy would inherit an authorization.  This keeps
+        the simulator's every-replan contract stricter than a future
+        supervised production profile; it never grants or dispatches a
+        physical skill.
+        """
+        correlation_id = _id(event.get("correlationId"), "correlationId")
+        event_type = _id(event.get("eventType"), "eventType")
+        canonical_event = dict(event)
+        canonical_event["correlationId"] = correlation_id
+        canonical_event["eventType"] = event_type
+        canonical_event.setdefault("payload", {})
+        if not isinstance(canonical_event["payload"], Mapping):
+            raise MissionServiceError("event payload must be an object")
+        request_sha256 = _sha256(
+            {
+                "operation": "evaluate_event",
+                "missionId": mission_id,
+                "event": canonical_event,
+                "forceHumanReview": bool(force_human_review),
+            }
+        )
+        detail = canonical_event["payload"].get("detail")
+        intervention = MissionIntervention(
+            interventionId=f"event-evaluation:{correlation_id}",
+            missionId=mission_id,
+            kind=MissionInterventionKind.MODIFY_GOAL,
+            text=(
+                f"evaluate_event: {event_type}: {detail}"
+                if isinstance(detail, str) and detail.strip()
+                else f"evaluate_event: {event_type}"
+            ),
+            requestedBy="mission-runtime",
+            requestedAt=utc_now(),
+        )
+        with self._planned_response_lock(mission_id):
+            record = self.runtime.get(mission_id)
+            state = self.runtime.inspect_planned_intervention(
+                intervention,
+                request_sha256=request_sha256,
+            )
+            if state["state"] == "completed":
+                return {
+                    "decision": state["decision"],
+                    "mission": state["mission"],
+                }
+            state = self.runtime.claim_planned_intervention(
+                intervention,
+                request_sha256=request_sha256,
+                expected_last_sequence=int(record["lastSequence"]),
+            )
+            if state["state"] == "completed":
+                return {
+                    "decision": state["decision"],
+                    "mission": state["mission"],
+                }
+            if not state.get("claimedByCaller", False):
+                raise MissionConflict("Mission event is already being evaluated")
+            payload, context = self._prepare_event_evaluation(
+                mission_id,
+                record,
+                canonical_event,
+            )
+            raw = self.planner.evaluate_event(payload, context)
+            if not isinstance(raw, Mapping):
+                raise MissionServiceError(
+                    "Mission planner returned an invalid event decision"
                 )
-                raw = {**dict(raw), "revision": revision_payload}
-            applied = self.runtime.apply_revision(revision_payload)
-            return {"decision": raw, "mission": applied}
-        return {"decision": raw, "mission": record}
+            decision = self._normalize_event_decision(
+                raw,
+                force_human_review=force_human_review,
+            )
+            completed = self.runtime.finalize_planned_intervention(
+                intervention,
+                request_sha256=request_sha256,
+                decision=decision,
+            )
+            return {
+                "decision": completed["decision"],
+                "mission": completed["mission"],
+            }
 
 
 __all__ = ["MissionService", "MissionServiceError"]
