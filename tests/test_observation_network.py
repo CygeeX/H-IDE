@@ -315,14 +315,18 @@ def test_docker_plant_listener_serves_live_rgb_but_rejects_support_write() -> No
     )
     jpeg = b"\xff\xd8read-only-fixture\xff\xd9"
     captured_at = time.time_ns()
+    captured_at_monotonic = time.monotonic_ns()
     producer_boot_id = str(uuid.uuid4())
     store.commit(
         RenderedFrame(
             producer_boot_id=producer_boot_id,
             sequence=1,
             captured_at_unix_ns=captured_at,
+            captured_at_monotonic_ns=captured_at_monotonic,
             render_started_at_unix_ns=captured_at + 1,
+            render_started_at_monotonic_ns=captured_at_monotonic + 1,
             rendered_at_unix_ns=captured_at + 2,
+            rendered_at_monotonic_ns=captured_at_monotonic + 2,
             simulation_time_s=1.0,
             pose=(0.0, 0.0, 0.8, 1.0, 0.0, 0.0, 0.0),
             root_velocity=BodyTwist.zero(),
@@ -459,13 +463,17 @@ def test_docker_plant_listener_serves_live_rgb_but_rejects_support_write() -> No
             lambda: {"status": "running", "ready": True, "alive": True}
         )
         stale_at = time.time_ns() - 500_000_001
+        stale_at_monotonic = time.monotonic_ns() - 500_000_001
         store.commit(
             RenderedFrame(
                 producer_boot_id=producer_boot_id,
                 sequence=2,
                 captured_at_unix_ns=stale_at,
+                captured_at_monotonic_ns=stale_at_monotonic,
                 render_started_at_unix_ns=stale_at + 1,
+                render_started_at_monotonic_ns=stale_at_monotonic + 1,
                 rendered_at_unix_ns=stale_at + 2,
+                rendered_at_monotonic_ns=stale_at_monotonic + 2,
                 simulation_time_s=2.0,
                 pose=(0.0, 0.0, 0.8, 1.0, 0.0, 0.0, 0.0),
                 root_velocity=BodyTwist.zero(),

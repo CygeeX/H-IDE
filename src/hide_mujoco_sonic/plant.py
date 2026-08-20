@@ -781,14 +781,20 @@ class PlantFrameStore:
     def commit(self, frame: RenderedFrame) -> None:
         """Atomically install one complete RGB-D/state generation."""
 
-        if frame.sequence <= 0 or frame.captured_at_unix_ns <= 0:
-            raise ValueError("rendered frame identity is invalid")
-        if not (
-            frame.captured_at_unix_ns
-            <= frame.render_started_at_unix_ns
-            <= frame.rendered_at_unix_ns
+        if (
+            frame.sequence <= 0
+            or frame.captured_at_unix_ns <= 0
+            or frame.captured_at_monotonic_ns <= 0
         ):
-            raise ValueError("rendered frame timestamps are not ordered")
+            raise ValueError("rendered frame identity is invalid")
+        if frame.render_started_at_unix_ns <= 0 or frame.rendered_at_unix_ns <= 0:
+            raise ValueError("rendered frame wall timestamps are invalid")
+        if not (
+            frame.captured_at_monotonic_ns
+            <= frame.render_started_at_monotonic_ns
+            <= frame.rendered_at_monotonic_ns
+        ):
+            raise ValueError("rendered frame monotonic timestamps are not ordered")
         uuid.UUID(frame.producer_boot_id)
         if (
             frame.width <= 0
@@ -900,15 +906,19 @@ class PlantFrameStore:
         self,
         frame: RenderedFrame | None,
         *,
-        now_ns: int | None = None,
+        now_monotonic_ns: int | None = None,
     ) -> tuple[str, float | None, dict[str, object]]:
         worker = self._worker_status()
         age_ns = None
         age_ms = None
         if frame is not None:
             age_ns = (
-                (time.time_ns() if now_ns is None else int(now_ns))
-                - frame.captured_at_unix_ns
+                (
+                    time.monotonic_ns()
+                    if now_monotonic_ns is None
+                    else int(now_monotonic_ns)
+                )
+                - frame.captured_at_monotonic_ns
             )
             age_ms = age_ns / 1_000_000.0
             if age_ns < 0:
@@ -961,12 +971,25 @@ class PlantFrameStore:
             "producerBootId": frame.producer_boot_id if frame is not None else None,
             "sequence": frame.sequence if frame is not None else 0,
             "capturedAtUnixNs": frame.captured_at_unix_ns if frame is not None else 0,
+            "capturedAtMonotonicNs": (
+                frame.captured_at_monotonic_ns if frame is not None else 0
+            ),
             "renderStartedAtUnixNs": frame.render_started_at_unix_ns if frame is not None else 0,
+            "renderStartedAtMonotonicNs": (
+                frame.render_started_at_monotonic_ns if frame is not None else 0
+            ),
             "renderedAtUnixNs": frame.rendered_at_unix_ns if frame is not None else 0,
+            "renderedAtMonotonicNs": (
+                frame.rendered_at_monotonic_ns if frame is not None else 0
+            ),
             "simulationTimeS": frame.simulation_time_s if frame is not None else None,
             "captureAgeMs": capture_age_ms,
             "renderLatencyMs": (
-                (frame.rendered_at_unix_ns - frame.captured_at_unix_ns) / 1_000_000.0
+                (
+                    frame.rendered_at_monotonic_ns
+                    - frame.captured_at_monotonic_ns
+                )
+                / 1_000_000.0
                 if frame is not None
                 else None
             ),

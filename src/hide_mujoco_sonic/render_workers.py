@@ -234,8 +234,11 @@ class RenderedFrame:
     producer_boot_id: str
     sequence: int
     captured_at_unix_ns: int
+    captured_at_monotonic_ns: int
     render_started_at_unix_ns: int
+    render_started_at_monotonic_ns: int
     rendered_at_unix_ns: int
+    rendered_at_monotonic_ns: int
     simulation_time_s: float
     pose: tuple[float, float, float, float, float, float, float]
     root_velocity: BodyTwist
@@ -581,13 +584,19 @@ def _render_snapshot(
         math.radians(float(model.cam_fovy[camera_id])) / 2.0
     )
     rendered_at_ns = time.time_ns()
+    rendered_at_monotonic_ns = time.monotonic_ns()
+    if rendered_at_monotonic_ns < render_started_monotonic_ns:
+        raise RuntimeError("render worker monotonic timestamps are not ordered")
     total_ms = (time.perf_counter() - render_total_started) * 1000.0
     return RenderedFrame(
         producer_boot_id=snapshot.producer_boot_id,
         sequence=snapshot.sequence,
         captured_at_unix_ns=snapshot.captured_at_unix_ns,
+        captured_at_monotonic_ns=snapshot.captured_at_monotonic_ns,
         render_started_at_unix_ns=render_started_ns,
+        render_started_at_monotonic_ns=render_started_monotonic_ns,
         rendered_at_unix_ns=rendered_at_ns,
+        rendered_at_monotonic_ns=rendered_at_monotonic_ns,
         simulation_time_s=float(data.time),
         pose=root_pose,  # type: ignore[arg-type]
         root_velocity=root_velocity,

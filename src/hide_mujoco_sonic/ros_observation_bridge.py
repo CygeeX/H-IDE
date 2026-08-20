@@ -8,7 +8,7 @@ import json
 import math
 import os
 import time
-from typing import Iterable, Mapping
+from typing import Callable, Iterable, Mapping, Protocol
 from urllib.parse import urlencode
 import uuid
 
@@ -20,10 +20,36 @@ from .render_workers import MAX_CAPTURE_AGE_NS
 _CAPTURE_BOOT_HEADER = "X-Hide-Capture-Boot-Id"
 _CAPTURE_SEQUENCE_HEADER = "X-Hide-Capture-Sequence"
 _CAPTURE_TIME_HEADER = "X-Hide-Captured-At-Unix-Ns"
+_CAPTURE_SCHEMA_VERSION = "h-ide.mujoco-capture/2"
 
 
 class CaptureContractError(ValueError):
     """A state or image response cannot belong to one atomic RGB-D capture."""
+
+
+class _ObservationTimerNode(Protocol):
+    def create_timer(
+        self,
+        timer_period_sec: float,
+        callback: Callable[[], None],
+        *,
+        clock: object,
+    ) -> object: ...
+
+
+def _create_observation_timer(
+    node: _ObservationTimerNode,
+    *,
+    observation_hz: float,
+    callback: Callable[[], None],
+    clock: object,
+) -> object:
+    """Create the polling cadence on an explicitly supplied elapsed-time clock."""
+
+    hz = float(observation_hz)
+    if not math.isfinite(hz) or hz <= 0.0:
+        raise ValueError("observation_hz must be finite and positive")
+    return node.create_timer(1.0 / hz, callback, clock=clock)
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,9 +57,12 @@ class CaptureIdentity:
     producer_boot_id: str
     sequence: int
     captured_at_unix_ns: int
+    captured_at_monotonic_ns: int
 
     @classmethod
     def from_state(cls, state: Mapping[str, object]) -> "CaptureIdentity":
+        if state.get("schemaVersion") != _CAPTURE_SCHEMA_VERSION:
+            raise CaptureContractError("MuJoCo state has an unsupported capture schema")
         producer_boot_id = state.get("producerBootId")
         if not isinstance(producer_boot_id, str) or not producer_boot_id.strip():
             raise CaptureContractError("MuJoCo state has no producerBootId")
@@ -44,26 +73,41 @@ class CaptureIdentity:
         try:
             raw_sequence = state["sequence"]
             raw_captured_at = state["capturedAtUnixNs"]
+            raw_captured_at_monotonic = state["capturedAtMonotonicNs"]
         except KeyError as exc:
             raise CaptureContractError(
-                "MuJoCo state has an invalid capture sequence or timestamp"
+                "MuJoCo state has an invalid capture sequence or timestamp; "
+                "capture v2 requires a monotonic timestamp"
             ) from exc
         if (
             isinstance(raw_sequence, bool)
             or not isinstance(raw_sequence, int)
             or isinstance(raw_captured_at, bool)
             or not isinstance(raw_captured_at, int)
+            or isinstance(raw_captured_at_monotonic, bool)
+            or not isinstance(raw_captured_at_monotonic, int)
         ):
             raise CaptureContractError(
-                "MuJoCo state has an invalid capture sequence or timestamp"
+                "MuJoCo state has an invalid capture sequence or timestamp; "
+                "capture v2 requires an integer monotonic timestamp"
             )
         sequence = raw_sequence
         captured_at_unix_ns = raw_captured_at
+        captured_at_monotonic_ns = raw_captured_at_monotonic
         if sequence <= 0:
             raise CaptureContractError("MuJoCo capture sequence is not positive")
         if captured_at_unix_ns <= 0:
             raise CaptureContractError("MuJoCo capture timestamp is invalid")
-        return cls(producer_boot_id, sequence, captured_at_unix_ns)
+        if captured_at_monotonic_ns <= 0:
+            raise CaptureContractError(
+                "MuJoCo capture monotonic timestamp is invalid"
+            )
+        return cls(
+            producer_boot_id,
+            sequence,
+            captured_at_unix_ns,
+            captured_at_monotonic_ns,
+        )
 
     def exact_resource_url(self, base_url: str, resource: str) -> str:
         if not resource.startswith("/"):
@@ -73,13 +117,31 @@ class CaptureIdentity:
         )
         return f"{base_url}{resource}?{query}"
 
-    def validate_age(self, now_unix_ns: int) -> int:
-        age_ns = int(now_unix_ns) - self.captured_at_unix_ns
+    def validate_age(self, now_monotonic_ns: int) -> int:
+        age_ns = int(now_monotonic_ns) - self.captured_at_monotonic_ns
         if age_ns < 0:
-            raise CaptureContractError("MuJoCo capture timestamp is in the future")
+            raise CaptureContractError(
+                "MuJoCo capture monotonic timestamp is in the future"
+            )
         if age_ns > MAX_CAPTURE_AGE_NS:
             raise CaptureContractError(
                 f"MuJoCo capture is stale ({age_ns / 1_000_000.0:.1f} ms)"
+            )
+        return age_ns
+
+    def validate_publishable_ros_stamp(self, now_unix_ns: int) -> int:
+        """Reject one crossed-clock generation before publishing its wall stamp."""
+
+        age_ns = int(now_unix_ns) - self.captured_at_unix_ns
+        if age_ns < 0:
+            raise CaptureContractError(
+                "MuJoCo capture crossed a wall-clock correction; "
+                "its ROS stamp would be in the future"
+            )
+        if age_ns > MAX_CAPTURE_AGE_NS:
+            raise CaptureContractError(
+                "MuJoCo capture crossed a wall-clock correction; "
+                "its ROS stamp would be stale"
             )
         return age_ns
 
@@ -140,6 +202,8 @@ def is_new_capture(
 class MujocoObservationBridge:
     def __init__(self, config: SimConfig):
         import rclpy
+        from rclpy.clock import Clock
+        from rclpy.clock_type import ClockType
         from geometry_msgs.msg import PoseWithCovarianceStamped, TransformStamped
         from nav_msgs.msg import Odometry
         from rclpy.node import Node
@@ -173,7 +237,13 @@ class MujocoObservationBridge:
         self._poll_count = 0
         self._base_url = f"http://{config.telemetry_host}:{config.plant_port}"
         epoch = String(); epoch.data = config.localization_epoch_id; self.epoch_pub.publish(epoch)
-        self.timer = self.node.create_timer(1.0 / config.observation_hz, self.poll)
+        self._timer_clock = Clock(clock_type=ClockType.STEADY_TIME)
+        self.timer = _create_observation_timer(
+            self.node,
+            observation_hz=config.observation_hz,
+            callback=self.poll,
+            clock=self._timer_clock,
+        )
 
     @staticmethod
     def _quaternion_multiply(
@@ -291,7 +361,7 @@ class MujocoObservationBridge:
             ):
                 return
             # Check the source timestamp before spending either network timeout.
-            capture.validate_age(time.time_ns())
+            capture.validate_age(time.monotonic_ns())
             rgb_response = requests.get(
                 capture.exact_resource_url(self._base_url, "/rgb.jpg"),
                 timeout=0.2,
@@ -307,7 +377,7 @@ class MujocoObservationBridge:
             # Network latency is part of true capture age.  Recheck only after
             # both exact resources have arrived; a 409 or mismatch never reaches
             # any ROS publisher.
-            capture.validate_age(time.time_ns())
+            capture.validate_age(time.monotonic_ns())
 
             import cv2
             import numpy as np
@@ -327,7 +397,6 @@ class MujocoObservationBridge:
         sequence = capture.sequence
         captured_at_ns = capture.captured_at_unix_ns
 
-        stamp = self._stamp(captured_at_ns)
         raw_pose = state["pose"]
         values = [float(raw_pose[key]) for key in ("x", "y", "z", "qw", "qx", "qy", "qz")]
         if not all(math.isfinite(value) for value in values):
@@ -374,10 +443,16 @@ class MujocoObservationBridge:
         try:
             # Decode and state validation also consume the 500 ms budget.  This
             # is the final admission gate immediately before the first publish.
-            capture.validate_age(time.time_ns())
+            capture.validate_age(time.monotonic_ns())
+            # ROS and the downstream observation protocol must retain the
+            # capture's Unix stamp.  If wall time stepped while this generation
+            # was in flight, drop just that generation rather than publishing a
+            # timestamp downstream will necessarily classify as future/stale.
+            capture.validate_publishable_ros_stamp(time.time_ns())
         except CaptureContractError as exc:
             self.node.get_logger().warning(f"MuJoCo capture unavailable: {exc}")
             return
+        stamp = self._stamp(captured_at_ns)
         # Pose differencing is diagnostic-only and starts a new anchor when
         # the capture producer restarts.  Run it after all admission checks so
         # a rejected capture cannot contaminate a later accepted generation.
@@ -489,7 +564,8 @@ class MujocoObservationBridge:
             self.node.get_logger().info(
                 f"published synthetic RGB-D sequence={sequence} "
                 f"poll_ms={(time.perf_counter() - poll_started) * 1000.0:.1f} "
-                f"capture_age_ms={(time.time_ns() - captured_at_ns) / 1_000_000.0:.1f} "
+                "capture_age_ms="
+                f"{(time.monotonic_ns() - capture.captured_at_monotonic_ns) / 1_000_000.0:.1f} "
                 f"{velocity_diagnostic}"
             )
 

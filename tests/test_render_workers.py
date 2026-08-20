@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 import inspect
 import math
 import multiprocessing
@@ -273,14 +274,23 @@ def _frame(
     *,
     captured_at_ns: int,
     boot: str,
+    captured_at_monotonic_ns: int | None = None,
     render_timing: tuple[tuple[str, float], ...] | None = None,
 ) -> RenderedFrame:
+    captured_monotonic_ns = (
+        time.monotonic_ns()
+        if captured_at_monotonic_ns is None
+        else captured_at_monotonic_ns
+    )
     return RenderedFrame(
         producer_boot_id=boot,
         sequence=sequence,
         captured_at_unix_ns=captured_at_ns,
+        captured_at_monotonic_ns=captured_monotonic_ns,
         render_started_at_unix_ns=captured_at_ns + 10,
+        render_started_at_monotonic_ns=captured_monotonic_ns + 10,
         rendered_at_unix_ns=captured_at_ns + 20,
+        rendered_at_monotonic_ns=captured_monotonic_ns + 20,
         simulation_time_s=float(sequence),
         pose=(0.0, 0.0, 0.8, 1.0, 0.0, 0.0, 0.0),
         root_velocity=BodyTwist.zero(),
@@ -671,6 +681,11 @@ def test_office_v2_worker_reloads_verified_scene_and_emits_one_atomic_rgbd() -> 
         assert len(frame.depth_z16_le) == 640 * 480 * 2
         assert frame.pose == pytest.approx(tuple(float(value) for value in authority.qpos[:7]))
         assert frame.rendered_at_unix_ns >= frame.render_started_at_unix_ns
+        assert (
+            frame.captured_at_monotonic_ns
+            <= frame.render_started_at_monotonic_ns
+            <= frame.rendered_at_monotonic_ns
+        )
         assert set(dict(frame.render_timing)) == {
             "stateApplyMs",
             "rgbRenderMs",
@@ -1180,7 +1195,7 @@ def test_worker_shutdown_terminates_an_unresponsive_child_within_bound() -> None
     assert not worker._process.is_alive()
 
 
-def test_frame_store_retains_only_latest_and_previous_and_uses_source_age() -> None:
+def test_frame_store_retains_only_latest_and_previous_and_uses_monotonic_age() -> None:
     support = PlantSupportController()
     support.finish_startup()
     store = PlantFrameStore(
@@ -1190,8 +1205,16 @@ def test_frame_store_retains_only_latest_and_previous_and_uses_source_age() -> N
     )
     boot = str(uuid.uuid4())
     now = time.time_ns()
+    captured_monotonic_ns = 10_000_000_000
     for sequence in (1, 2, 3):
-        store.commit(_frame(sequence, captured_at_ns=now + sequence, boot=boot))
+        store.commit(
+            _frame(
+                sequence,
+                captured_at_ns=now + sequence,
+                captured_at_monotonic_ns=captured_monotonic_ns + sequence,
+                boot=boot,
+            )
+        )
 
     assert store._select_frame(f"boot={boot}&sequence=1") == (None, True)
     assert store._select_frame(f"boot={boot}&sequence=2")[0].sequence == 2  # type: ignore[union-attr]
@@ -1202,17 +1225,62 @@ def test_frame_store_retains_only_latest_and_previous_and_uses_source_age() -> N
     latest = store._select_frame("")[0]
     status, age_ms, _worker = store._observation_status(
         latest,
-        now_ns=latest.captured_at_unix_ns + MAX_CAPTURE_AGE_NS + 1,  # type: ignore[union-attr]
+        now_monotonic_ns=(
+            latest.captured_at_monotonic_ns + MAX_CAPTURE_AGE_NS + 1  # type: ignore[union-attr]
+        ),
     )
     assert status == "stale"
     assert age_ms == pytest.approx(500.000001)
 
     status, age_ms, _worker = store._observation_status(
         latest,
-        now_ns=latest.captured_at_unix_ns - 1,  # type: ignore[union-attr]
+        now_monotonic_ns=latest.captured_at_monotonic_ns - 1,  # type: ignore[union-attr]
     )
     assert status == "failed"
     assert age_ms == pytest.approx(-0.000001)
+
+
+@pytest.mark.parametrize(
+    ("render_started_wall_ns", "rendered_wall_ns"),
+    [
+        (20_000_000_000, 30_000_000_000),
+        (9_000_000_000, 8_000_000_000),
+    ],
+    ids=("wall-forward", "wall-backward"),
+)
+def test_frame_store_wall_clock_corrections_do_not_change_freshness(
+    render_started_wall_ns: int,
+    rendered_wall_ns: int,
+) -> None:
+    support = PlantSupportController()
+    support.finish_startup()
+    store = PlantFrameStore(
+        SimpleNamespace(robot_id="g1", localization_epoch_id="epoch"),
+        support,
+        worker_status_provider=lambda: {"status": "running", "alive": True},
+    )
+    captured_monotonic_ns = time.monotonic_ns() - 100_000_000
+    frame = replace(
+        _frame(
+            1,
+            captured_at_ns=10_000_000_000,
+            captured_at_monotonic_ns=captured_monotonic_ns,
+            boot=str(uuid.uuid4()),
+        ),
+        render_started_at_unix_ns=render_started_wall_ns,
+        rendered_at_unix_ns=rendered_wall_ns,
+        render_started_at_monotonic_ns=captured_monotonic_ns + 10_000_000,
+        rendered_at_monotonic_ns=captured_monotonic_ns + 20_000_000,
+    )
+
+    store.commit(frame)
+    state = store.state()
+
+    assert state["observationStatus"] == "running"
+    assert 0.0 <= state["captureAgeMs"] <= 500.0
+    assert state["renderLatencyMs"] == pytest.approx(20.0)
+    assert state["capturedAtUnixNs"] == 10_000_000_000
+    assert state["capturedAtMonotonicNs"] == captured_monotonic_ns
 
 
 def test_frame_store_http_reads_do_not_wait_for_commit_and_see_one_window() -> None:
