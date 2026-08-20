@@ -25,6 +25,13 @@ import {
   type WorldRecord,
 } from "./contracts.js";
 
+class MissionReplanNoChangeError extends Error {
+  constructor() {
+    super("replan did not change the active mission");
+    this.name = "MissionReplanNoChangeError";
+  }
+}
+
 export interface MissionPlanningRuntime {
   draftMission(input: MissionBrief, signal: AbortSignal): Promise<unknown>;
   replanMission(input: MissionReplanRequest, signal: AbortSignal): Promise<unknown>;
@@ -193,7 +200,7 @@ export class MissionEngine {
     validateNodesAgainstCapabilities(modelOutput.nodes, request.capabilities);
     const changed = changedNodeIds(request.activeRevision.nodes, modelOutput.nodes);
     if (changed.length === 0 && modelOutput.objective === request.activeRevision.objective) {
-      throw new Error("replan did not change the active mission");
+      throw new MissionReplanNoChangeError();
     }
     const inherited = autoRevisionEligible(request, modelOutput, changed);
     const disposition = inherited ? "policy_inherited" : "human_required";
@@ -309,7 +316,18 @@ export class MissionEngine {
       autoRevisionCount: event.autoRevisionCount,
       authorizationId: typeof payload.authorizationId === "string" ? payload.authorizationId : null,
     });
-    const revision = await this.replan(request, signal);
+    let revision: PlanRevision;
+    try {
+      revision = await this.replan(request, signal);
+    } catch (error) {
+      if (error instanceof MissionReplanNoChangeError) {
+        return missionDecisionSchema.parse({
+          kind: "continue",
+          reason: "补充信息没有改变当前任务步骤；已保留现有 Mission。",
+        });
+      }
+      throw error;
+    }
     return missionDecisionSchema.parse({ kind: "replan", request, revision });
   }
 

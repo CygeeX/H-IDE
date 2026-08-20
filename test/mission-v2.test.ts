@@ -401,6 +401,43 @@ describe("Mission V2 planning", () => {
     expect(runtime.replanMission).not.toHaveBeenCalled();
   });
 
+  it("returns a stable continue decision when operator input changes no Mission semantics", async () => {
+    const runtime = {
+      draftMission: vi.fn(),
+      replanMission: vi.fn().mockResolvedValue({
+        objective: revision().objective,
+        nodes: revision().nodes,
+        reasonCode: "operator_intervention",
+        reason: "No semantic changes are required",
+        changeSummary: ["Keep the current mission"],
+      }),
+    };
+
+    const decision = await new MissionEngine(runtime).handleEvent({
+      missionId: "mission-1",
+      robotId: "robot-1",
+      eventType: "operator.intervention",
+      payload: { kind: "modify_goal", text: "继续当前任务" },
+      correlationId: "intervention-no-change",
+      occurredAt: new Date().toISOString(),
+      activeRevision: revision(),
+      autoRevisionCount: 0,
+    }, {
+      envelope: envelope(),
+      capabilities: capabilities(),
+      objective: revision().objective,
+      requestedBy: "runtime",
+      contextVersion: "context-2",
+      worldRecords: [],
+    }, new AbortController().signal);
+
+    expect(decision).toEqual({
+      kind: "continue",
+      reason: "补充信息没有改变当前任务步骤；已保留现有 Mission。",
+    });
+    expect(runtime.replanMission).toHaveBeenCalledOnce();
+  });
+
   it("scores candidates with trusted facts but never executes the winner", () => {
     const engine = new MissionEngine({ draftMission: vi.fn(), replanMission: vi.fn() });
     const result = engine.scoreCandidates({
