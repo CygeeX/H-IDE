@@ -102,6 +102,10 @@ def test_workstation_launcher_exposes_an_explicit_viewer_mode() -> None:
     assert 'xdpyinfo -display "${DISPLAY}"' in launcher
     assert "wait_for_native_viewer" in launcher
     assert "Plant is already running without a ready native viewer" in launcher
+    plant_start = launcher.index("start_process \\\n  mujoco-plant")
+    viewer_gate = launcher.index("wait_for_native_viewer", plant_start)
+    sonic_start = launcher.index("start_process \\\n  sonic-driver", plant_start)
+    assert plant_start < viewer_gate < sonic_start
 
 
 def test_build_is_idempotent_and_matches_committed_outputs(tmp_path: Path) -> None:

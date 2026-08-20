@@ -577,14 +577,19 @@ start_process \
   "${HIDE_DEMO_SIM_ROOT}" \
   'exec "$HIDE_DEMO_SIM_ROOT/.venv/bin/python" -u -m hide_mujoco_sonic plant --config "$HIDE_DEMO_CONFIG"'
 
+wait_for_http 'MuJoCo plant + RGB-D' 'http://127.0.0.1:8794/healthz' 60
+wait_for_native_viewer
+
+# Native viewer/X11 initialization and SONIC's ONNX model load are both heavy
+# cold-start operations. Complete the passive viewer gate first so they cannot
+# combine into a false Plant control-clock discontinuity. This does not relax
+# the runtime gap threshold; the Plant remains fail-closed throughout.
 start_process \
   sonic-driver \
   '-m hide_mujoco_sonic sonic --config' \
   "${HIDE_DEMO_SIM_ROOT}" \
   'exec "$HIDE_DEMO_SIM_ROOT/.venv/bin/python" -u -m hide_mujoco_sonic sonic --config "$HIDE_DEMO_CONFIG"'
 
-wait_for_http 'MuJoCo plant + RGB-D' 'http://127.0.0.1:8794/healthz' 60
-wait_for_native_viewer
 # A listening telemetry port only proves that the Python process exists.  Keep
 # Nav2 and Robot Agent offline until the full controller path has warmed, the
 # IDLE consumer has sustained the authoritative 50 Hz simulation cadence, and
