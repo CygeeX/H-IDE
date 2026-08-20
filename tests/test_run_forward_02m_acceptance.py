@@ -220,7 +220,7 @@ def _robot_agent(*, state: str, epoch: int, active_count: int = 0) -> dict[str, 
             "standby": not active,
             "canAcquire": not active,
             "authorityRevoked": not active,
-            "safeStopState": "armed" if active else "confirmed",
+            "safeStopState": "confirmed",
             "safeStopEpoch": epoch,
             "leaseValid": active,
             "leaseRemainingMs": 1500.0 if active else None,
@@ -239,6 +239,46 @@ def _robot_agent(*, state: str, epoch: int, active_count: int = 0) -> dict[str, 
             "motionSafetyFault": {"required": True, "ready": True},
         },
     }
+
+
+def _requested_safe_hold_robot_agent(*, epoch: int) -> dict[str, Any]:
+    """Return the Robot Agent's exact in-flight safe-stop diagnostics shape."""
+
+    payload = _robot_agent(state="safe_hold", epoch=epoch, active_count=0)
+    payload["ready"] = False
+    payload["commandReadiness"] = {
+        "ready": False,
+        "mode": "BLOCKED",
+        "reason": "control_acquire_blocked",
+    }
+    payload["controlState"].update(
+        {
+            "standby": False,
+            "canAcquire": False,
+            "safeStopState": "requested",
+        }
+    )
+    payload["checks"]["control"] = {
+        "required": True,
+        "ready": False,
+        "state": "SAFE_HOLD",
+        "mode": "BLOCKED",
+        "active": False,
+        "canAcquire": False,
+        "leaseValid": False,
+        "activeCommandCount": 0,
+        "reason": "control_acquire_blocked",
+        "leaseRemainingMs": None,
+    }
+    payload["checks"]["safeStop"] = {
+        "required": True,
+        "ready": False,
+        "reason": "safe_stop_requested",
+        "authorityRevoked": True,
+        "state": "requested",
+        "epoch": epoch,
+    }
+    return payload
 
 
 class FakeTransport:
@@ -917,6 +957,812 @@ class DelayedAcceptedTransport(FakeTransport):
         )
 
 
+class ControlPhaseSkewTransport(DelayedAcceptedTransport):
+    """Inject deterministic phase transitions between direct and Gateway GETs."""
+
+    def __init__(self, clock: FakeClock, *, skew_mode: str) -> None:
+        super().__init__(clock, response_delay_s=0.5)
+        self.skew_mode = skew_mode
+        self.skew_started_at: float | None = None
+        self.hard_fault_started_at: float | None = None
+        self.direct_reads_after_post = 0
+        self.transition_injected = False
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        json_body: dict[str, Any] | None = None,
+        timeout_s: float = 1.0,
+    ) -> Any:
+        response = super().request(
+            method,
+            url,
+            headers=headers,
+            json_body=json_body,
+            timeout_s=timeout_s,
+        )
+        if self.post_at is None or not self.active or method != "GET":
+            return response
+        if url == runner.ROBOT_AGENT_URL:
+            self.direct_reads_after_post += 1
+            if self.skew_mode == "safe-to-active" and not self.transition_injected:
+                self.transition_injected = True
+                self.skew_started_at = self.clock()
+                return runner.HttpResponse(
+                    200,
+                    _robot_agent(state="safe_hold", epoch=7, active_count=0),
+                )
+            if self.skew_mode == "active-to-safe" and not self.transition_injected:
+                self.transition_injected = True
+                self.skew_started_at = self.clock()
+                self.released_forward = self.state()[1]
+                self.released_pose = self.capture_release_pose()
+                self.active = False
+                self.released = True
+                # The direct GET was captured before the transition. Gateway
+                # and every later GET observe the new SAFE_HOLD epoch.
+                return response
+            if self.skew_mode == "stable":
+                if self.skew_started_at is None:
+                    self.skew_started_at = self.clock()
+                return runner.HttpResponse(
+                    200,
+                    _robot_agent(state="safe_hold", epoch=7, active_count=0),
+                )
+            if self.skew_mode in {"gateway-last-error", "gateway-boot"}:
+                # Pair the hard Gateway failure with the same otherwise
+                # retryable SAFE_HOLD->ACTIVE cross-read skew.
+                return runner.HttpResponse(
+                    200,
+                    _robot_agent(state="safe_hold", epoch=7, active_count=0),
+                )
+            if self.skew_mode == "robot-agent-fault":
+                if self.hard_fault_started_at is None:
+                    self.hard_fault_started_at = self.clock()
+                payload = _robot_agent(state="safe_hold", epoch=7, active_count=0)
+                payload["motionSafetyFault"].update(
+                    {
+                        "ready": False,
+                        "latched": True,
+                        "eventId": "phase-skew-hard-fault",
+                        "source": "fixture",
+                        "code": "FAULT",
+                    }
+                )
+                return runner.HttpResponse(200, payload)
+            if self.skew_mode.startswith("direct-hard-"):
+                if self.hard_fault_started_at is None:
+                    self.hard_fault_started_at = self.clock()
+                payload = deepcopy(response.payload)
+                control = payload["controlState"]
+                mutation = self.skew_mode.removeprefix("direct-hard-")
+                if mutation == "ready":
+                    payload["ready"] = 1
+                elif mutation == "command-readiness":
+                    payload["commandReadiness"] = "ACTIVE"
+                elif mutation == "active":
+                    control["active"] = 1
+                elif mutation == "standby":
+                    control["standby"] = 0
+                elif mutation == "can-acquire":
+                    control["canAcquire"] = 0
+                elif mutation == "lease-valid":
+                    control["leaseValid"] = 1
+                elif mutation == "lease-remaining":
+                    control["leaseRemainingMs"] = "1500"
+                elif mutation == "count":
+                    control["activeCommandCount"] = True
+                else:  # pragma: no cover - fixture contract
+                    raise AssertionError(f"unknown direct hard mutation {mutation}")
+                return runner.HttpResponse(200, payload)
+        if url == f"{runner.DEFAULT_GATEWAY_BASE}/healthz":
+            if self.skew_mode in {"gateway-last-error", "gateway-boot"}:
+                if self.hard_fault_started_at is None:
+                    self.hard_fault_started_at = self.clock()
+                payload = deepcopy(response.payload)
+                if self.skew_mode == "gateway-last-error":
+                    payload["robotAgent"]["lastError"] = "synthetic gateway lease failure"
+                else:
+                    payload["robotAgent"]["robotBootId"] = "robot-boot-replacement"
+                return runner.HttpResponse(200, payload)
+            if self.skew_mode.startswith("direct-hard-"):
+                payload = deepcopy(response.payload)
+                payload["robotAgent"].update(
+                    {
+                        "controlState": "SAFE_HOLD",
+                        "authorityRevoked": True,
+                        "safeStopState": "confirmed",
+                        "safeStopEpoch": 7,
+                    }
+                )
+                return runner.HttpResponse(200, payload)
+        return response
+
+
+class SlowGetControlPhaseSkewTransport(ControlPhaseSkewTransport):
+    """Advance fake time for health GETs and honor the supplied timeout."""
+
+    def __init__(self, clock: FakeClock, *, get_delay_s: float = 0.08) -> None:
+        super().__init__(clock, skew_mode="stable")
+        self.get_delay_s = get_delay_s
+        self.read_timeouts: list[tuple[str, float]] = []
+        self.timed_out_get = False
+        self.first_read_group_started_at: float | None = None
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        json_body: dict[str, Any] | None = None,
+        timeout_s: float = 1.0,
+    ) -> Any:
+        if (
+            method == "GET"
+            and self.post_at is not None
+            and self.active
+            and url
+            in {
+                runner.PLANT_URL,
+                runner.SONIC_URL,
+                runner.ROBOT_AGENT_URL,
+                f"{runner.DEFAULT_GATEWAY_BASE}/healthz",
+            }
+        ):
+            if self.first_read_group_started_at is None:
+                self.first_read_group_started_at = self.clock()
+            self.read_timeouts.append((url, timeout_s))
+            if self.get_delay_s > timeout_s:
+                self.clock.sleep(timeout_s)
+                self.timed_out_get = True
+                raise runner.TransportUncertain("scripted health GET exceeded its timeout")
+            self.clock.sleep(self.get_delay_s)
+        return super().request(
+            method,
+            url,
+            headers=headers,
+            json_body=json_body,
+            timeout_s=timeout_s,
+        )
+
+
+class PostMergeAbortRefreshDelayTransport(FakeTransport):
+    """Keep a post-merge phase skew while every abort-time GET is slow."""
+
+    _HEALTH_URLS = {
+        runner.PLANT_URL,
+        runner.SONIC_URL,
+        runner.ROBOT_AGENT_URL,
+        f"{runner.DEFAULT_GATEWAY_BASE}/healthz",
+    }
+
+    def __init__(self, clock: FakeClock) -> None:
+        super().__init__(clock)
+        self.post_merged = False
+        self.post_merged_at: float | None = None
+        self.skew_started_at: float | None = None
+        self.abort_entered_at: float | None = None
+        self.abort_health_read_starts: list[float] = []
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        json_body: dict[str, Any] | None = None,
+        timeout_s: float = 1.0,
+    ) -> Any:
+        read_started_at = self.clock()
+        response = super().request(
+            method,
+            url,
+            headers=headers,
+            json_body=json_body,
+            timeout_s=timeout_s,
+        )
+        if method != "GET" or url not in self._HEALTH_URLS:
+            return response
+        if self.abort_entered_at is not None:
+            self.abort_health_read_starts.append(read_started_at)
+            delay_s = min(0.2, timeout_s)
+            self.clock.sleep(delay_s)
+            if delay_s < 0.2:
+                raise runner.TransportUncertain(
+                    "scripted abort health GET exceeded its timeout"
+                )
+        if not self.post_merged or not self.active:
+            return response
+        if url == runner.PLANT_URL and self.skew_started_at is None:
+            self.skew_started_at = read_started_at
+        if url == runner.ROBOT_AGENT_URL:
+            return runner.HttpResponse(
+                200,
+                _robot_agent(state="safe_hold", epoch=7, active_count=0),
+            )
+        return response
+
+
+class SlowAbortHoldBudgetTransport(FakeTransport):
+    """Make abort-hold health reads take 0.99 s within their timeout."""
+
+    _HEALTH_URLS = {
+        runner.PLANT_URL,
+        runner.SONIC_URL,
+        runner.ROBOT_AGENT_URL,
+        f"{runner.DEFAULT_GATEWAY_BASE}/healthz",
+    }
+
+    def __init__(self, clock: FakeClock) -> None:
+        super().__init__(clock)
+        self.abort_hold_started_at: float | None = None
+        self.hold_read_durations: list[float] = []
+        self.hold_read_timeouts: list[float] = []
+        self.hold_read_timed_out = False
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        json_body: dict[str, Any] | None = None,
+        timeout_s: float = 1.0,
+    ) -> Any:
+        response = super().request(
+            method,
+            url,
+            headers=headers,
+            json_body=json_body,
+            timeout_s=timeout_s,
+        )
+        if (
+            self.abort_hold_started_at is None
+            or method != "GET"
+            or url not in self._HEALTH_URLS
+        ):
+            return response
+        self.hold_read_timeouts.append(timeout_s)
+        duration_s = min(0.99, timeout_s)
+        self.clock.sleep(duration_s)
+        self.hold_read_durations.append(duration_s)
+        if duration_s < 0.99:
+            self.hold_read_timed_out = True
+            raise runner.TransportUncertain(
+                "scripted abort-hold health GET exceeded its timeout"
+            )
+        return response
+
+
+class FinalHoldPhaseSkewTransport(FakeTransport):
+    """Inject one transient cross-read after terminal release."""
+
+    def __init__(self, clock: FakeClock) -> None:
+        super().__init__(clock)
+        self.final_skew_injected = False
+        self.awaiting_coherent_sample = False
+        self.coherent_after_skew_at: float | None = None
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        json_body: dict[str, Any] | None = None,
+        timeout_s: float = 1.0,
+    ) -> Any:
+        response = super().request(
+            method,
+            url,
+            headers=headers,
+            json_body=json_body,
+            timeout_s=timeout_s,
+        )
+        if self.query_at is None or not self.released or method != "GET":
+            return response
+        if url == runner.ROBOT_AGENT_URL:
+            if (
+                not self.final_skew_injected
+                and self.clock() - self.query_at >= 0.4
+            ):
+                self.final_skew_injected = True
+                self.awaiting_coherent_sample = True
+                return runner.HttpResponse(
+                    200,
+                    _robot_agent(state="active", epoch=7, active_count=0),
+                )
+            if self.awaiting_coherent_sample:
+                self.coherent_after_skew_at = self.clock()
+        if (
+            url == f"{runner.DEFAULT_GATEWAY_BASE}/healthz"
+            and self.coherent_after_skew_at is not None
+        ):
+            self.awaiting_coherent_sample = False
+        return response
+
+
+class TerminalIdlePhaseSkewTransport(FakeTransport):
+    """Hide a short locomotion relapse behind a crossed terminal-phase read."""
+
+    def __init__(self, clock: FakeClock) -> None:
+        super().__init__(clock)
+        self.skew_seen = False
+        self.coherent_after_skew_at: float | None = None
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        json_body: dict[str, Any] | None = None,
+        timeout_s: float = 1.0,
+    ) -> Any:
+        response = super().request(
+            method,
+            url,
+            headers=headers,
+            json_body=json_body,
+            timeout_s=timeout_s,
+        )
+        if (
+            self.post_at is None
+            or not self.active
+            or self.query_at is not None
+            or method != "GET"
+        ):
+            return response
+        in_skew_window = 2.5 <= self.elapsed < 2.7
+        if in_skew_window and url == runner.PLANT_URL:
+            self.skew_seen = True
+            return runner.HttpResponse(200, _plant(forward=0.2, state="active"))
+        if in_skew_window and url == runner.SONIC_URL:
+            return runner.HttpResponse(200, _sonic(state="active"))
+        if in_skew_window and url == f"{runner.DEFAULT_GATEWAY_BASE}/healthz":
+            payload = deepcopy(response.payload)
+            payload["robotAgent"].update(
+                {
+                    "controlState": "SAFE_HOLD",
+                    "authorityRevoked": True,
+                    "safeStopState": "confirmed",
+                    "safeStopEpoch": 7,
+                }
+            )
+            return runner.HttpResponse(200, payload)
+        if (
+            self.skew_seen
+            and self.elapsed >= 2.7
+            and self.coherent_after_skew_at is None
+            and url == f"{runner.DEFAULT_GATEWAY_BASE}/healthz"
+        ):
+            self.coherent_after_skew_at = self.clock()
+        return response
+
+
+class LateTerminalQueryTransport(FakeTransport):
+    """Return valid release truth only after the terminal query hard deadline."""
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        json_body: dict[str, Any] | None = None,
+        timeout_s: float = 1.0,
+    ) -> Any:
+        if (
+            self.command_id is not None
+            and method == "GET"
+            and url.endswith(f"/commands/{self.command_id}")
+        ):
+            self.clock.sleep(8.1)
+        return super().request(
+            method,
+            url,
+            headers=headers,
+            json_body=json_body,
+            timeout_s=timeout_s,
+        )
+
+
+class TerminalQuerySafeStopTransitionTransport(FakeTransport):
+    """Expose the real requested-to-confirmed phase during the sole query."""
+
+    _HEALTH_URLS = {
+        runner.PLANT_URL,
+        runner.SONIC_URL,
+        runner.ROBOT_AGENT_URL,
+        f"{runner.DEFAULT_GATEWAY_BASE}/healthz",
+    }
+
+    def __init__(
+        self,
+        clock: FakeClock,
+        *,
+        phase: str,
+        confirm_after_s: float = 0.2,
+        query_uncertain: bool = False,
+    ) -> None:
+        super().__init__(clock)
+        self.phase = phase
+        self.confirm_after_s = confirm_after_s
+        self.query_uncertain = query_uncertain
+        self.query_response_release = threading.Event()
+        self.first_requested_at: float | None = None
+        self.confirmed_at: float | None = None
+        self.invalid_phase_at: float | None = None
+        self.terminal_query_health_reads: list[float] = []
+        self.terminal_query_confirmed_at: float | None = None
+
+    def _phase_at(self, now: float) -> str:
+        assert self.query_at is not None
+        if self.phase == "requested-to-confirmed":
+            if now - self.query_at >= self.confirm_after_s:
+                return "confirmed"
+            return "requested"
+        return self.phase
+
+    def _direct_for_phase(self, phase: str) -> dict[str, Any]:
+        if phase == "confirmed":
+            return _robot_agent(state="safe_hold", epoch=8, active_count=0)
+        payload = _requested_safe_hold_robot_agent(epoch=8)
+        if phase == "failed":
+            payload["controlState"]["safeStopState"] = "failed"
+        elif phase == "malformed-requested":
+            payload["commandReadiness"]["reason"] = None
+        elif phase != "requested":  # pragma: no cover - fixture contract
+            raise AssertionError(f"unknown terminal transition phase {phase}")
+        return payload
+
+    def _terminal_receipt(self) -> runner.HttpResponse:
+        release = {
+            "state": "SAFE_HOLD",
+            "authorityRevoked": True,
+            "safeStopState": "confirmed",
+            "safeStopEpoch": 8,
+        }
+        return runner.HttpResponse(
+            200,
+            {
+                "status": "succeeded",
+                "result": {
+                    "robotAgentCommandId": self.command_id,
+                    "controlRelease": dict(release),
+                },
+                "details": {"controlRelease": dict(release)},
+            },
+        )
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        json_body: dict[str, Any] | None = None,
+        timeout_s: float = 1.0,
+    ) -> Any:
+        terminal_url = (
+            f"{runner.DEFAULT_GATEWAY_BASE}/internal/v1/commands/{self.command_id}"
+        )
+        if self.command_id is not None and method == "GET" and url == terminal_url:
+            self.calls.append(Call(method, url, deepcopy(json_body), self.clock()))
+            assert headers == {"Authorization": "Bearer fake-secret"}
+            assert self.query_at is None, "terminal command GET was retried"
+            self.query_at = self.clock()
+            self.released_forward = self.state()[1]
+            self.released_pose = self.capture_release_pose()
+            self.active = False
+            self.released = True
+            if self.query_uncertain:
+                raise runner.TransportUncertain(
+                    "scripted uncertain terminal query during requested stop"
+                )
+            if not self.query_response_release.wait(timeout=1.0):
+                raise runner.TransportUncertain(
+                    "scripted terminal query transition was never resolved"
+                )
+            return self._terminal_receipt()
+        if method == "POST" and url.endswith("/cancel"):
+            try:
+                return super().request(
+                    method,
+                    url,
+                    headers=headers,
+                    json_body=json_body,
+                    timeout_s=timeout_s,
+                )
+            finally:
+                self.query_response_release.set()
+
+        response = super().request(
+            method,
+            url,
+            headers=headers,
+            json_body=json_body,
+            timeout_s=timeout_s,
+        )
+        if (
+            self.query_at is None
+            or method != "GET"
+            or url not in self._HEALTH_URLS
+        ):
+            return response
+        now = self.clock()
+        if self.terminal_query_confirmed_at is None:
+            self.terminal_query_health_reads.append(now)
+        phase = self._phase_at(now)
+        if phase == "confirmed":
+            if self.confirmed_at is None:
+                self.confirmed_at = now
+            if self.terminal_query_confirmed_at is None:
+                self.terminal_query_confirmed_at = now
+            self.query_response_release.set()
+            return response
+        if phase == "requested":
+            if self.first_requested_at is None:
+                self.first_requested_at = now
+        elif self.invalid_phase_at is None:
+            self.invalid_phase_at = now
+        if url == runner.ROBOT_AGENT_URL:
+            return runner.HttpResponse(200, self._direct_for_phase(phase))
+        if url == f"{runner.DEFAULT_GATEWAY_BASE}/healthz":
+            payload = deepcopy(response.payload)
+            payload["robotAgent"].update(
+                {
+                    "controlState": "SAFE_HOLD",
+                    "authorityRevoked": True,
+                    "safeStopState": (
+                        "requested" if phase == "malformed-requested" else phase
+                    ),
+                    "safeStopEpoch": 8,
+                }
+            )
+            return runner.HttpResponse(200, payload)
+        return response
+
+
+class TerminalQueryMidPollCompletionTransport(
+    TerminalQuerySafeStopTransitionTransport
+):
+    """Complete the query worker while its first requested health read runs."""
+
+    def __init__(self, clock: FakeClock, *, outcome: str) -> None:
+        super().__init__(clock, phase="requested")
+        self.outcome = outcome
+        self.release_query_worker = threading.Event()
+        self.product_query_completed = threading.Event()
+        self.first_health_at: float | None = None
+        self.worker_completed_at: float | None = None
+        self.cancel_seen = False
+        self.abort_refresh_started_at: float | None = None
+        self.abort_refresh_health_reads: list[float] = []
+        self.abort_refresh_confirmed_at: float | None = None
+        self.first_health_clock_target: Any = None
+        self.boundary_reached_at: float | None = None
+
+    def _midpoll_phase(self) -> str:
+        if self.cancel_seen:
+            return "confirmed"
+        if (
+            self.outcome == "uncertain"
+            and self.abort_refresh_started_at is not None
+            and self.clock() - self.abort_refresh_started_at >= 0.15
+        ):
+            return "confirmed"
+        return "requested"
+
+    def _malformed_terminal_receipt(self) -> runner.HttpResponse:
+        response = self._terminal_receipt()
+        payload = deepcopy(response.payload)
+        payload["result"]["controlRelease"]["safeStopState"] = "requested"
+        return runner.HttpResponse(200, payload)
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        json_body: dict[str, Any] | None = None,
+        timeout_s: float = 1.0,
+    ) -> Any:
+        if (
+            self.query_at is not None
+            and method == "GET"
+            and url == runner.PLANT_URL
+            and self.first_health_at is None
+            and self.first_health_clock_target is not None
+        ):
+            target = float(self.first_health_clock_target())
+            assert target >= self.clock()
+            self.clock.value = target
+            self.boundary_reached_at = self.clock()
+        terminal_url = (
+            f"{runner.DEFAULT_GATEWAY_BASE}/internal/v1/commands/{self.command_id}"
+        )
+        if self.command_id is not None and method == "GET" and url == terminal_url:
+            self.calls.append(Call(method, url, deepcopy(json_body), self.clock()))
+            assert headers == {"Authorization": "Bearer fake-secret"}
+            assert self.query_at is None, "terminal command GET was retried"
+            self.query_at = self.clock()
+            self.released_forward = self.state()[1]
+            self.released_pose = self.capture_release_pose()
+            self.active = False
+            self.released = True
+            if not self.release_query_worker.wait(timeout=1.0):
+                raise AssertionError("first terminal health GET never released query worker")
+            self.worker_completed_at = self.clock()
+            if self.outcome == "uncertain":
+                raise runner.TransportUncertain(
+                    "scripted terminal query completed uncertain mid-poll"
+                )
+            if self.outcome == "malformed":
+                return self._malformed_terminal_receipt()
+            raise AssertionError(f"unknown mid-poll query outcome {self.outcome}")
+        if method == "POST" and url.endswith("/cancel"):
+            self.cancel_seen = True
+            return FakeTransport.request(
+                self,
+                method,
+                url,
+                headers=headers,
+                json_body=json_body,
+                timeout_s=timeout_s,
+            )
+
+        response = FakeTransport.request(
+            self,
+            method,
+            url,
+            headers=headers,
+            json_body=json_body,
+            timeout_s=timeout_s,
+        )
+        if (
+            self.query_at is None
+            or method != "GET"
+            or url not in self._HEALTH_URLS
+        ):
+            return response
+        if url == runner.PLANT_URL and self.first_health_at is None:
+            self.first_health_at = self.clock()
+            self.release_query_worker.set()
+            if not self.product_query_completed.wait(timeout=1.0):
+                raise AssertionError("terminal query completion barrier was not reached")
+        phase = self._midpoll_phase()
+        if self.abort_refresh_started_at is not None:
+            if self.abort_refresh_confirmed_at is None:
+                self.abort_refresh_health_reads.append(self.clock())
+            if phase == "confirmed" and self.abort_refresh_confirmed_at is None:
+                self.abort_refresh_confirmed_at = self.clock()
+        if phase == "confirmed":
+            return response
+        if url == runner.ROBOT_AGENT_URL:
+            return runner.HttpResponse(
+                200,
+                _requested_safe_hold_robot_agent(epoch=8),
+            )
+        if url == f"{runner.DEFAULT_GATEWAY_BASE}/healthz":
+            payload = deepcopy(response.payload)
+            payload["robotAgent"].update(
+                {
+                    "controlState": "SAFE_HOLD",
+                    "authorityRevoked": True,
+                    "safeStopState": "requested",
+                    "safeStopEpoch": 8,
+                }
+            )
+            return runner.HttpResponse(200, payload)
+        return response
+
+
+class CoherentActiveTerminalQueryCompletionTransport(FakeTransport):
+    """Finish an uncertain query around a coherent ACTIVE poll boundary."""
+
+    def __init__(self, clock: FakeClock, *, complete_during_health: bool) -> None:
+        super().__init__(clock)
+        self.complete_during_health = complete_during_health
+        self.release_query_worker = threading.Event()
+        self.product_query_completed = threading.Event()
+        self.worker_completed_at: float | None = None
+        self.coherent_snapshot_completed_at: float | None = None
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        json_body: dict[str, Any] | None = None,
+        timeout_s: float = 1.0,
+    ) -> Any:
+        terminal_url = (
+            f"{runner.DEFAULT_GATEWAY_BASE}/internal/v1/commands/{self.command_id}"
+        )
+        if self.command_id is not None and method == "GET" and url == terminal_url:
+            self.calls.append(Call(method, url, deepcopy(json_body), self.clock()))
+            assert headers == {"Authorization": "Bearer fake-secret"}
+            assert self.query_at is None, "terminal command GET was retried"
+            self.query_at = self.clock()
+            if not self.release_query_worker.wait(timeout=1.0):
+                raise AssertionError("coherent terminal query worker was never released")
+            self.worker_completed_at = self.clock()
+            raise runner.TransportUncertain(
+                "scripted coherent terminal query completed uncertain"
+            )
+
+        response = super().request(
+            method,
+            url,
+            headers=headers,
+            json_body=json_body,
+            timeout_s=timeout_s,
+        )
+        if (
+            self.query_at is not None
+            and method == "GET"
+            and url == f"{runner.DEFAULT_GATEWAY_BASE}/healthz"
+        ):
+            if self.coherent_snapshot_completed_at is None:
+                self.coherent_snapshot_completed_at = self.clock()
+            if self.complete_during_health and not self.release_query_worker.is_set():
+                self.release_query_worker.set()
+                if not self.product_query_completed.wait(timeout=1.0):
+                    raise AssertionError(
+                        "coherent terminal query completion barrier was not reached"
+                    )
+        return response
+
+
+class PostMergeReleasePhaseSkewTransport(DelayedAcceptedTransport):
+    """Release only after the accepted POST receipt has been merged."""
+
+    def __init__(self, clock: FakeClock) -> None:
+        super().__init__(clock, response_delay_s=0.5)
+        self.transition_at: float | None = None
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        json_body: dict[str, Any] | None = None,
+        timeout_s: float = 1.0,
+    ) -> Any:
+        response = super().request(
+            method,
+            url,
+            headers=headers,
+            json_body=json_body,
+            timeout_s=timeout_s,
+        )
+        if (
+            method == "GET"
+            and url == runner.ROBOT_AGENT_URL
+            and self.active
+            and self.accepted_at is not None
+            and self.state()[0] == "idle"
+            and self.elapsed >= 3.0
+            and self.transition_at is None
+        ):
+            self.transition_at = self.clock()
+            self.released_forward = self.state()[1]
+            self.released_pose = self.capture_release_pose()
+            self.active = False
+            self.released = True
+            # Return the ACTIVE direct snapshot captured before the transition;
+            # Gateway and the coherent resample observe SAFE_HOLD epoch+1.
+        return response
+
+
 class OutOfOrderPostTransport(FakeTransport):
     """An unknown-ID cancel tombstone suppresses a later POST admission."""
 
@@ -1194,6 +2040,97 @@ def _build(
         utcnow=clock.utcnow,
     )
     return machine, clock, transport, evidence
+
+
+def _build_control_phase_skew(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    skew_mode: str,
+    motion_fault: str | None = None,
+    sidecar_fault: str | None = None,
+    config: Any | None = None,
+) -> tuple[
+    Any,
+    FakeClock,
+    ControlPhaseSkewTransport,
+    FakeEvidence,
+    FakeJsonl,
+    FakeJsonl,
+]:
+    ids = iter((ACCEPTANCE_ID, COMMAND_ID))
+    monkeypatch.setattr(runner, "uuid4", lambda: next(ids))
+    clock = FakeClock()
+    transport = ControlPhaseSkewTransport(clock, skew_mode=skew_mode)
+    evidence = FakeEvidence()
+    motion = FakeJsonl(clock, transport, kind="motion", fault=motion_fault)
+    sidecar = FakeJsonl(clock, transport, kind="sidecar", fault=sidecar_fault)
+    machine = runner.Forward02mRunner(
+        config=config or _config(),
+        token="fake-secret",
+        transport=transport,
+        motion_jsonl=motion,
+        sidecar_jsonl=sidecar,
+        evidence=evidence,
+        clock=clock,
+        sleeper=clock.sleep,
+        utcnow=clock.utcnow,
+    )
+    return machine, clock, transport, evidence, motion, sidecar
+
+
+def _build_with_transport(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    clock: FakeClock,
+    transport: FakeTransport,
+    config: Any | None = None,
+    motion_fault: str | None = None,
+    sidecar_fault: str | None = None,
+) -> tuple[Any, FakeEvidence, FakeJsonl, FakeJsonl]:
+    ids = iter((ACCEPTANCE_ID, COMMAND_ID))
+    monkeypatch.setattr(runner, "uuid4", lambda: next(ids))
+    evidence = FakeEvidence()
+    motion = FakeJsonl(clock, transport, kind="motion", fault=motion_fault)
+    sidecar = FakeJsonl(clock, transport, kind="sidecar", fault=sidecar_fault)
+    machine = runner.Forward02mRunner(
+        config=config or _config(),
+        token="fake-secret",
+        transport=transport,
+        motion_jsonl=motion,
+        sidecar_jsonl=sidecar,
+        evidence=evidence,
+        clock=clock,
+        sleeper=clock.sleep,
+        utcnow=clock.utcnow,
+    )
+    return machine, evidence, motion, sidecar
+
+
+def _install_terminal_query_completion_barrier(
+    monkeypatch: pytest.MonkeyPatch,
+    transport: Any,
+) -> None:
+    """Signal only after query_once has set its private completion event."""
+
+    real_thread = threading.Thread
+
+    def thread_with_completion_signal(*args: Any, **kwargs: Any) -> threading.Thread:
+        if kwargs.get("name") != "forward-02m-terminal-query":
+            return real_thread(*args, **kwargs)
+        target = kwargs.get("target")
+        assert callable(target)
+
+        def target_with_signal() -> None:
+            try:
+                target()
+            finally:
+                transport.product_query_completed.set()
+
+        wrapped = dict(kwargs)
+        wrapped["target"] = target_with_signal
+        return real_thread(*args, **wrapped)
+
+    monkeypatch.setattr(runner.threading, "Thread", thread_with_completion_signal)
 
 
 def _calls(transport: FakeTransport, method: str, suffix: str) -> list[Call]:
@@ -1569,6 +2506,988 @@ def test_live_jsonl_stall_after_post_cancels_once(
 
     assert result["passed"] is False
     _assert_call_budget(transport, query=0, cancel=1)
+
+
+def test_safe_hold_to_active_cross_get_skew_resamples_without_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    machine, _clock, transport, _evidence, motion, sidecar = (
+        _build_control_phase_skew(monkeypatch, skew_mode="safe-to-active")
+    )
+
+    result = machine.run()
+
+    assert result["passed"] is True
+    assert transport.transition_injected is True
+    assert transport.direct_reads_after_post >= 2
+    assert motion.read_count >= 2
+    assert sidecar.read_count >= 2
+    _assert_call_budget(transport, query=1, cancel=0)
+
+
+def test_active_to_safe_hold_cross_get_skew_cannot_be_mistaken_for_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    machine, _clock, transport, _evidence, _motion, _sidecar = (
+        _build_control_phase_skew(monkeypatch, skew_mode="active-to-safe")
+    )
+
+    result = machine.run()
+
+    assert result["passed"] is False
+    assert transport.transition_injected is True
+    assert result["commandGetCount"] == 0
+    _assert_call_budget(transport, query=0, cancel=1)
+
+
+def test_stable_control_phase_skew_cancels_once_within_point_three_seconds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    machine, _clock, transport, _evidence, motion, sidecar = (
+        _build_control_phase_skew(monkeypatch, skew_mode="stable")
+    )
+
+    result = machine.run()
+
+    _assert_failed_hold(result)
+    assert result["reason"] == "Gateway and Robot Agent control phase skew persisted"
+    assert transport.skew_started_at is not None
+    cancel = _calls(transport, "POST", f"/{COMMAND_ID}/cancel")[0]
+    assert 0.0 < cancel.at - transport.skew_started_at <= 0.3 + 1e-9
+    assert transport.direct_reads_after_post >= 3
+    assert motion.read_count >= transport.direct_reads_after_post
+    assert sidecar.read_count >= transport.direct_reads_after_post
+    _assert_call_budget(transport, query=0, cancel=1)
+
+
+@pytest.mark.parametrize(
+    "skew_mode",
+    ["gateway-last-error", "gateway-boot", "robot-agent-fault"],
+)
+def test_non_dynamic_health_failure_during_phase_change_cancels_immediately(
+    monkeypatch: pytest.MonkeyPatch,
+    skew_mode: str,
+) -> None:
+    machine, _clock, transport, _evidence, _motion, _sidecar = (
+        _build_control_phase_skew(monkeypatch, skew_mode=skew_mode)
+    )
+
+    result = machine.run()
+
+    _assert_failed_hold(result)
+    assert transport.hard_fault_started_at is not None
+    assert transport.direct_reads_after_post == 1
+    cancel = _calls(transport, "POST", f"/{COMMAND_ID}/cancel")[0]
+    assert cancel.at == pytest.approx(transport.hard_fault_started_at)
+    _assert_call_budget(transport, query=0, cancel=1)
+
+
+@pytest.mark.parametrize(
+    "skew_mode",
+    [
+        "direct-hard-ready",
+        "direct-hard-command-readiness",
+        "direct-hard-active",
+        "direct-hard-standby",
+        "direct-hard-can-acquire",
+        "direct-hard-lease-valid",
+        "direct-hard-lease-remaining",
+        "direct-hard-count",
+    ],
+)
+def test_malformed_direct_phase_fact_is_hard_even_during_dynamic_skew(
+    monkeypatch: pytest.MonkeyPatch,
+    skew_mode: str,
+) -> None:
+    machine, _clock, transport, _evidence, _motion, _sidecar = (
+        _build_control_phase_skew(monkeypatch, skew_mode=skew_mode)
+    )
+
+    result = machine.run()
+
+    _assert_failed_hold(result)
+    assert transport.hard_fault_started_at is not None
+    assert transport.direct_reads_after_post == 1
+    cancel = _calls(transport, "POST", f"/{COMMAND_ID}/cancel")[0]
+    assert cancel.at == pytest.approx(transport.hard_fault_started_at)
+    _assert_call_budget(transport, query=0, cancel=1)
+
+
+@pytest.mark.parametrize(
+    ("deadline", "expected_reason"),
+    [
+        ("progress", "command made less than 0.03 m progress in 15 seconds"),
+        ("run", "command remained unfinished for 25 seconds"),
+    ],
+)
+def test_control_phase_resample_does_not_extend_command_deadlines(
+    monkeypatch: pytest.MonkeyPatch,
+    deadline: str,
+    expected_reason: str,
+) -> None:
+    config = (
+        _config(progress_deadline_s=0.2, run_deadline_s=1.0)
+        if deadline == "progress"
+        else _config(progress_deadline_s=0.1, run_deadline_s=0.2)
+    )
+    machine, _clock, transport, _evidence, _motion, _sidecar = (
+        _build_control_phase_skew(
+            monkeypatch,
+            skew_mode="stable",
+            config=config,
+        )
+    )
+    if deadline == "run":
+        machine._progress_seen = True
+
+    result = machine.run()
+
+    assert result["passed"] is False
+    assert result["reason"] == expected_reason
+    assert transport.skew_started_at is not None
+    cancel = _calls(transport, "POST", f"/{COMMAND_ID}/cancel")[0]
+    assert cancel.at - transport.skew_started_at <= 0.2 + 1e-9
+    _assert_call_budget(transport, query=0, cancel=1)
+
+
+def test_control_phase_resample_continues_jsonl_stall_detection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    machine, _clock, transport, _evidence, motion, _sidecar = (
+        _build_control_phase_skew(
+            monkeypatch,
+            skew_mode="stable",
+            motion_fault="stale",
+            config=_config(file_stall_s=0.15),
+        )
+    )
+
+    result = machine.run()
+
+    assert result["passed"] is False
+    assert result["reason"] == "motion JSONL file stalled"
+    assert transport.skew_started_at is not None
+    cancel = _calls(transport, "POST", f"/{COMMAND_ID}/cancel")[0]
+    assert cancel.at - transport.skew_started_at < 0.3
+    assert motion.read_count >= 3
+    _assert_call_budget(transport, query=0, cancel=1)
+
+
+def test_gateway_boolean_like_authority_is_a_hard_schema_failure() -> None:
+    clock = FakeClock()
+    plant, sonic, robot_agent, gateway = FakeTransport(clock).snapshots()
+    gateway["robotAgent"]["authorityRevoked"] = 1
+
+    with pytest.raises(runner.AcceptanceError) as caught:
+        runner.SafetyTracker().observe_snapshot(
+            runner.Snapshot(plant, sonic, robot_agent, gateway)
+        )
+
+    assert not isinstance(caught.value, runner.TransientControlPhaseSkew)
+
+
+def test_slow_gets_cannot_overrun_absolute_control_skew_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeClock()
+    transport = SlowGetControlPhaseSkewTransport(clock)
+    machine, _evidence, _motion, _sidecar = _build_with_transport(
+        monkeypatch,
+        clock=clock,
+        transport=transport,
+        config=_config(
+            progress_deadline_s=5.0,
+            run_deadline_s=10.0,
+            file_stall_s=2.0,
+        ),
+    )
+
+    result = machine.run()
+
+    _assert_failed_hold(result)
+    assert transport.skew_started_at is not None
+    assert transport.first_read_group_started_at is not None
+    cancel = _calls(transport, "POST", f"/{COMMAND_ID}/cancel")[0]
+    assert cancel.at - transport.first_read_group_started_at <= 0.3 + 1e-9
+    assert transport.timed_out_get is True
+    assert any(timeout < 1.0 for _url, timeout in transport.read_timeouts)
+    _assert_call_budget(transport, query=0, cancel=1)
+
+
+def test_post_merge_skew_abort_cancels_without_a_slow_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeClock()
+    transport = PostMergeAbortRefreshDelayTransport(clock)
+    machine, _evidence, _motion, _sidecar = _build_with_transport(
+        monkeypatch,
+        clock=clock,
+        transport=transport,
+    )
+    merge_post = machine._merge_post_transaction_if_finished
+
+    def merge_and_mark() -> bool:
+        merged = merge_post()
+        if merged and not transport.post_merged:
+            transport.post_merged = True
+            transport.post_merged_at = clock()
+        return merged
+
+    abort = machine._abort
+
+    def abort_and_mark(reason: str) -> dict[str, Any]:
+        assert transport.post_merged is True
+        transport.abort_entered_at = clock()
+        return abort(reason)
+
+    monkeypatch.setattr(machine, "_merge_post_transaction_if_finished", merge_and_mark)
+    monkeypatch.setattr(machine, "_abort", abort_and_mark)
+
+    result = machine.run()
+
+    assert result["passed"] is False
+    assert result["reason"] == "Gateway and Robot Agent control phase skew persisted"
+    assert transport.post_merged_at is not None
+    assert transport.skew_started_at is not None
+    assert transport.skew_started_at >= transport.post_merged_at
+    assert transport.abort_entered_at is not None
+    cancel = _calls(transport, "POST", f"/{COMMAND_ID}/cancel")[0]
+    assert cancel.at == pytest.approx(transport.abort_entered_at)
+    assert cancel.at == pytest.approx(transport.skew_started_at + 0.3)
+    assert transport.abort_health_read_starts
+    assert all(
+        read_started_at >= cancel.at
+        for read_started_at in transport.abort_health_read_starts
+    )
+    _assert_call_budget(transport, query=0, cancel=1)
+
+
+def test_abort_hold_slow_gets_cannot_prove_after_eight_second_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeClock()
+    transport = SlowAbortHoldBudgetTransport(clock)
+    machine, _evidence, _motion, _sidecar = _build_with_transport(
+        monkeypatch,
+        clock=clock,
+        transport=transport,
+        config=_config(
+            control_phase_skew_timeout_s=4.0,
+            file_stall_s=20.0,
+        ),
+        sidecar_fault="counter",
+    )
+    prove_abort_hold = machine._prove_abort_hold
+
+    def prove_abort_hold_after_cancel() -> bool:
+        assert transport.released is True
+        assert len(_calls(transport, "POST", f"/{COMMAND_ID}/cancel")) == 1
+        transport.abort_hold_started_at = clock()
+        return prove_abort_hold()
+
+    monkeypatch.setattr(machine, "_prove_abort_hold", prove_abort_hold_after_cancel)
+
+    result = machine.run()
+
+    assert result["passed"] is False
+    assert result["terminalSafeHoldProved"] is False
+    assert transport.abort_hold_started_at is not None
+    assert clock() - transport.abort_hold_started_at == pytest.approx(8.0)
+    completed_reads = [
+        duration
+        for duration in transport.hold_read_durations
+        if duration == pytest.approx(0.99)
+    ]
+    assert len(completed_reads) >= 7
+    assert all(0.0 < duration < 1.0 for duration in transport.hold_read_durations)
+    assert transport.hold_read_timed_out is True
+    assert transport.hold_read_timeouts[-1] < 0.99
+    _assert_call_budget(transport, query=0, cancel=1)
+
+
+@pytest.mark.parametrize("boundary", ["progress", "run", "file-stall"])
+def test_slow_gets_cannot_cross_command_or_file_deadlines(
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    clock = FakeClock()
+    transport = SlowGetControlPhaseSkewTransport(clock)
+    if boundary == "progress":
+        config = _config(
+            progress_deadline_s=0.2,
+            run_deadline_s=1.0,
+            file_stall_s=1.0,
+        )
+        motion_fault = None
+    elif boundary == "run":
+        config = _config(
+            progress_deadline_s=0.1,
+            run_deadline_s=0.2,
+            file_stall_s=1.0,
+        )
+        motion_fault = None
+    else:
+        config = _config(
+            progress_deadline_s=1.0,
+            run_deadline_s=2.0,
+            file_stall_s=0.2,
+        )
+        motion_fault = "stale"
+    machine, _evidence, _motion, _sidecar = _build_with_transport(
+        monkeypatch,
+        clock=clock,
+        transport=transport,
+        config=config,
+        motion_fault=motion_fault,
+    )
+    if boundary == "run":
+        machine._progress_seen = True
+
+    result = machine.run()
+
+    assert result["passed"] is False
+    post = _calls(transport, "POST", "/internal/v1/commands")[0]
+    cancel = _calls(transport, "POST", f"/{COMMAND_ID}/cancel")[0]
+    assert cancel.at - post.at <= 0.2 + 1e-9
+    assert transport.timed_out_get is True
+    assert any(timeout < 1.0 for _url, timeout in transport.read_timeouts)
+    _assert_call_budget(transport, query=0, cancel=1)
+
+
+def test_final_hold_phase_skew_restarts_full_continuity_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeClock()
+    transport = FinalHoldPhaseSkewTransport(clock)
+    machine, _evidence, _motion, _sidecar = _build_with_transport(
+        monkeypatch,
+        clock=clock,
+        transport=transport,
+    )
+
+    result = machine.run()
+
+    assert result["passed"] is True
+    assert transport.final_skew_injected is True
+    assert transport.coherent_after_skew_at is not None
+    assert clock() - transport.coherent_after_skew_at >= 1.0 - 1e-9
+    _assert_call_budget(transport, query=1, cancel=0)
+
+
+def test_terminal_idle_phase_skew_restarts_full_settle_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeClock()
+    transport = TerminalIdlePhaseSkewTransport(clock)
+    machine, _evidence, _motion, _sidecar = _build_with_transport(
+        monkeypatch,
+        clock=clock,
+        transport=transport,
+    )
+
+    result = machine.run()
+
+    assert result["passed"] is True
+    assert transport.skew_seen is True
+    assert transport.coherent_after_skew_at is not None
+    assert transport.query_at is not None
+    assert transport.query_at - transport.coherent_after_skew_at >= 1.0 - 1e-9
+    _assert_call_budget(transport, query=1, cancel=0)
+
+
+def test_terminal_query_late_success_cannot_cross_eight_second_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeClock()
+    transport = LateTerminalQueryTransport(clock)
+    machine, _evidence, _motion, _sidecar = _build_with_transport(
+        monkeypatch,
+        clock=clock,
+        transport=transport,
+    )
+
+    result = machine.run()
+
+    _assert_failed_hold(result)
+    assert result["reason"] == "terminal command GET completion timed out"
+    _assert_call_budget(transport, query=1, cancel=1)
+
+
+def test_terminal_query_accepts_exact_requested_then_prompt_confirmed_transition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested = _requested_safe_hold_robot_agent(epoch=8)
+    assert runner._ra_requested_safe_hold(requested, epoch=8) is True
+    clock = FakeClock()
+    transport = TerminalQuerySafeStopTransitionTransport(
+        clock,
+        phase="requested-to-confirmed",
+        confirm_after_s=0.15,
+    )
+    machine, _evidence, _motion, _sidecar = _build_with_transport(
+        monkeypatch,
+        clock=clock,
+        transport=transport,
+    )
+
+    result = machine.run()
+
+    assert result["passed"] is True
+    assert transport.query_at is not None
+    assert transport.first_requested_at is not None
+    assert transport.confirmed_at is not None
+    assert 0.1 <= transport.confirmed_at - transport.first_requested_at <= 0.2 + 1e-9
+    _assert_call_budget(transport, query=1, cancel=0)
+
+
+def test_terminal_query_persistent_requested_phase_cancels_once_at_skew_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeClock()
+    transport = TerminalQuerySafeStopTransitionTransport(
+        clock,
+        phase="requested",
+    )
+    machine, _evidence, _motion, _sidecar = _build_with_transport(
+        monkeypatch,
+        clock=clock,
+        transport=transport,
+    )
+
+    result = machine.run()
+
+    assert result["passed"] is False
+    assert transport.first_requested_at is not None
+    cancel = _calls(transport, "POST", f"/{COMMAND_ID}/cancel")[0]
+    assert cancel.at == pytest.approx(transport.first_requested_at + 0.3)
+    _assert_call_budget(transport, query=1, cancel=1)
+
+
+@pytest.mark.parametrize("phase", ["failed", "malformed-requested"])
+def test_terminal_query_invalid_safe_stop_phase_cancels_once_without_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+) -> None:
+    if phase == "malformed-requested":
+        malformed = _requested_safe_hold_robot_agent(epoch=8)
+        malformed["commandReadiness"]["reason"] = None
+        assert runner._ra_requested_safe_hold(malformed, epoch=8) is False
+    clock = FakeClock()
+    transport = TerminalQuerySafeStopTransitionTransport(clock, phase=phase)
+    machine, _evidence, _motion, _sidecar = _build_with_transport(
+        monkeypatch,
+        clock=clock,
+        transport=transport,
+    )
+
+    result = machine.run()
+
+    assert result["passed"] is False
+    assert transport.invalid_phase_at is not None
+    cancel = _calls(transport, "POST", f"/{COMMAND_ID}/cancel")[0]
+    assert cancel.at == pytest.approx(transport.invalid_phase_at)
+    _assert_call_budget(transport, query=1, cancel=1)
+
+
+def test_uncertain_terminal_query_gets_only_point_three_second_health_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeClock()
+    transport = TerminalQuerySafeStopTransitionTransport(
+        clock,
+        phase="requested-to-confirmed",
+        confirm_after_s=0.15,
+        query_uncertain=True,
+    )
+    machine, _evidence, _motion, _sidecar = _build_with_transport(
+        monkeypatch,
+        clock=clock,
+        transport=transport,
+    )
+
+    result = machine.run()
+
+    assert result["passed"] is False
+    assert result["terminalSafeHoldProved"] is True
+    assert transport.query_at is not None
+    assert transport.terminal_query_health_reads
+    assert transport.terminal_query_confirmed_at is not None
+    assert (
+        transport.terminal_query_confirmed_at - transport.query_at
+        <= 0.3 + 1e-9
+    )
+    assert (
+        max(transport.terminal_query_health_reads) - transport.query_at
+        <= 0.3 + 1e-9
+    )
+    _assert_call_budget(transport, query=1, cancel=0)
+
+
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt(), SystemExit(130)])
+def test_abort_refresh_retry_interrupt_cannot_escape_cancel_or_hold_proof(
+    monkeypatch: pytest.MonkeyPatch,
+    interrupt: BaseException,
+) -> None:
+    clock = FakeClock()
+    transport = TerminalQuerySafeStopTransitionTransport(
+        clock,
+        phase="requested-to-confirmed",
+        confirm_after_s=0.15,
+        query_uncertain=True,
+    )
+    machine, _evidence, _motion, _sidecar = _build_with_transport(
+        monkeypatch,
+        clock=clock,
+        transport=transport,
+    )
+    refresh = machine._terminal_release_refresh_proves_advanced_hold
+    refresh_active = False
+    interrupt_injected = False
+
+    def tracked_refresh() -> bool:
+        nonlocal refresh_active
+        refresh_active = True
+        try:
+            return refresh()
+        finally:
+            refresh_active = False
+
+    sleep = machine.sleeper
+
+    def interrupting_sleep(duration: float) -> None:
+        nonlocal interrupt_injected
+        if refresh_active and not interrupt_injected:
+            interrupt_injected = True
+            raise interrupt
+        sleep(duration)
+
+    prove_abort_hold = machine._prove_abort_hold
+    hold_proof_entered = False
+
+    def tracked_hold_proof() -> bool:
+        nonlocal hold_proof_entered
+        hold_proof_entered = True
+        return prove_abort_hold()
+
+    monkeypatch.setattr(
+        machine,
+        "_terminal_release_refresh_proves_advanced_hold",
+        tracked_refresh,
+    )
+    monkeypatch.setattr(machine, "_prove_abort_hold", tracked_hold_proof)
+    machine.sleeper = interrupting_sleep
+    escaped: list[BaseException] = []
+    result: dict[str, Any] = {}
+
+    try:
+        result.update(machine.run())
+    except BaseException as exc:  # pragma: no cover - assertion reports it
+        escaped.append(exc)
+
+    assert escaped == []
+    assert interrupt_injected is True
+    assert transport.first_requested_at is not None
+    assert hold_proof_entered is True
+    assert result["passed"] is False
+    assert result["terminalSafeHoldProved"] is True
+    _assert_call_budget(transport, query=1, cancel=1)
+
+
+def test_malformed_terminal_receipt_completed_midpoll_fails_without_skew_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeClock()
+    transport = TerminalQueryMidPollCompletionTransport(
+        clock,
+        outcome="malformed",
+    )
+    machine, _evidence, _motion, _sidecar = _build_with_transport(
+        monkeypatch,
+        clock=clock,
+        transport=transport,
+    )
+    _install_terminal_query_completion_barrier(monkeypatch, transport)
+
+    result = machine.run()
+
+    assert result["passed"] is False
+    assert (
+        result["reason"]
+        == "terminal command receipt lacks exact succeeded SAFE_HOLD release truth"
+    )
+    assert transport.first_health_at is not None
+    assert transport.worker_completed_at is not None
+    cancel = _calls(transport, "POST", f"/{COMMAND_ID}/cancel")[0]
+    assert cancel.at == pytest.approx(transport.worker_completed_at)
+    assert cancel.at - transport.first_health_at < 0.3
+    assert result["terminalSafeHoldProved"] is True
+    _assert_call_budget(transport, query=1, cancel=1)
+
+
+def test_uncertain_terminal_query_completed_midpoll_starts_fresh_abort_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeClock()
+    transport = TerminalQueryMidPollCompletionTransport(
+        clock,
+        outcome="uncertain",
+    )
+    machine, _evidence, _motion, _sidecar = _build_with_transport(
+        monkeypatch,
+        clock=clock,
+        transport=transport,
+    )
+    _install_terminal_query_completion_barrier(monkeypatch, transport)
+    refresh = machine._terminal_release_refresh_proves_advanced_hold
+
+    def tracked_refresh() -> bool:
+        assert transport.product_query_completed.is_set()
+        assert transport.worker_completed_at is not None
+        transport.abort_refresh_started_at = clock()
+        return refresh()
+
+    monkeypatch.setattr(
+        machine,
+        "_terminal_release_refresh_proves_advanced_hold",
+        tracked_refresh,
+    )
+
+    result = machine.run()
+
+    assert result["passed"] is False
+    assert result["reason"] == "scripted terminal query completed uncertain mid-poll"
+    assert transport.worker_completed_at is not None
+    assert transport.abort_refresh_started_at is not None
+    assert transport.abort_refresh_started_at >= transport.worker_completed_at
+    assert transport.abort_refresh_health_reads
+    assert transport.abort_refresh_confirmed_at is not None
+    assert (
+        transport.abort_refresh_confirmed_at - transport.abort_refresh_started_at
+        <= 0.3 + 1e-9
+    )
+    assert (
+        max(transport.abort_refresh_health_reads)
+        - transport.abort_refresh_started_at
+        <= 0.3 + 1e-9
+    )
+    assert result["terminalSafeHoldProved"] is True
+    _assert_call_budget(transport, query=1, cancel=0)
+
+
+@pytest.mark.parametrize(
+    ("boundary", "expected_reason"),
+    [
+        ("motion-stall", "motion JSONL file stalled"),
+        ("query-deadline", "terminal command GET completion timed out"),
+    ],
+)
+def test_terminal_query_completion_cannot_outrank_expired_safety_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+    expected_reason: str,
+) -> None:
+    clock = FakeClock()
+    transport = TerminalQueryMidPollCompletionTransport(
+        clock,
+        outcome="uncertain",
+    )
+    config = (
+        _config(file_stall_s=0.2)
+        if boundary == "motion-stall"
+        else _config(file_stall_s=20.0)
+    )
+    machine, _evidence, motion, _sidecar = _build_with_transport(
+        monkeypatch,
+        clock=clock,
+        transport=transport,
+        config=config,
+    )
+    if boundary == "motion-stall":
+        live_motion_read = motion.read_new
+
+        def stall_motion_after_query() -> list[dict[str, Any]]:
+            if transport.query_at is not None:
+                motion.read_count += 1
+                return []
+            return live_motion_read()
+
+        monkeypatch.setattr(motion, "read_new", stall_motion_after_query)
+
+        def motion_stall_boundary() -> float:
+            assert machine._last_motion_record_s is not None
+            return machine._last_motion_record_s + config.file_stall_s
+
+        transport.first_health_clock_target = motion_stall_boundary
+    else:
+
+        def query_deadline_overshoot() -> float:
+            assert transport.query_at is not None
+            return transport.query_at + 8.01
+
+        transport.first_health_clock_target = query_deadline_overshoot
+    _install_terminal_query_completion_barrier(monkeypatch, transport)
+    refresh = machine._terminal_release_refresh_proves_advanced_hold
+    refresh_calls = 0
+
+    def counted_refresh() -> bool:
+        nonlocal refresh_calls
+        refresh_calls += 1
+        return refresh()
+
+    monkeypatch.setattr(
+        machine,
+        "_terminal_release_refresh_proves_advanced_hold",
+        counted_refresh,
+    )
+
+    result = machine.run()
+
+    assert result["passed"] is False
+    assert result["reason"] == expected_reason
+    assert transport.product_query_completed.is_set()
+    assert transport.boundary_reached_at is not None
+    assert transport.worker_completed_at is not None
+    assert transport.worker_completed_at == pytest.approx(
+        transport.boundary_reached_at
+    )
+    cancel = _calls(transport, "POST", f"/{COMMAND_ID}/cancel")[0]
+    assert cancel.at == pytest.approx(transport.worker_completed_at)
+    assert refresh_calls == 0
+    assert result["terminalSafeHoldProved"] is True
+    _assert_call_budget(transport, query=1, cancel=1)
+
+
+def test_coherent_poll_completion_is_parsed_before_outer_sleep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeClock()
+    transport = CoherentActiveTerminalQueryCompletionTransport(
+        clock,
+        complete_during_health=True,
+    )
+    machine, _evidence, _motion, _sidecar = _build_with_transport(
+        monkeypatch,
+        clock=clock,
+        transport=transport,
+    )
+    _install_terminal_query_completion_barrier(monkeypatch, transport)
+    refresh = machine._terminal_release_refresh_proves_advanced_hold
+    refresh_started_at: float | None = None
+
+    def tracked_refresh() -> bool:
+        nonlocal refresh_started_at
+        assert transport.product_query_completed.is_set()
+        refresh_started_at = clock()
+        return refresh()
+
+    monkeypatch.setattr(
+        machine,
+        "_terminal_release_refresh_proves_advanced_hold",
+        tracked_refresh,
+    )
+
+    result = machine.run()
+
+    assert result["passed"] is False
+    assert result["reason"] == "scripted coherent terminal query completed uncertain"
+    assert transport.coherent_snapshot_completed_at is not None
+    assert transport.worker_completed_at is not None
+    assert transport.worker_completed_at == pytest.approx(
+        transport.coherent_snapshot_completed_at
+    )
+    assert refresh_started_at == pytest.approx(transport.worker_completed_at)
+    cancel = _calls(transport, "POST", f"/{COMMAND_ID}/cancel")[0]
+    assert cancel.at == pytest.approx(transport.worker_completed_at)
+    assert result["terminalSafeHoldProved"] is True
+    _assert_call_budget(transport, query=1, cancel=1)
+
+
+def test_completion_during_outer_sleep_cannot_outrank_motion_stall(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeClock()
+    transport = CoherentActiveTerminalQueryCompletionTransport(
+        clock,
+        complete_during_health=False,
+    )
+    config = _config(file_stall_s=0.1)
+    machine, _evidence, motion, _sidecar = _build_with_transport(
+        monkeypatch,
+        clock=clock,
+        transport=transport,
+        config=config,
+    )
+    live_motion_read = motion.read_new
+
+    def stall_motion_after_query() -> list[dict[str, Any]]:
+        if transport.query_at is not None:
+            motion.read_count += 1
+            return []
+        return live_motion_read()
+
+    monkeypatch.setattr(motion, "read_new", stall_motion_after_query)
+    _install_terminal_query_completion_barrier(monkeypatch, transport)
+    sleep = machine.sleeper
+    outer_sleep_started_at: float | None = None
+
+    def complete_query_at_stall_boundary(duration: float) -> None:
+        nonlocal outer_sleep_started_at
+        if (
+            transport.query_at is not None
+            and transport.coherent_snapshot_completed_at is not None
+            and not transport.release_query_worker.is_set()
+        ):
+            outer_sleep_started_at = clock()
+            assert machine._last_motion_record_s is not None
+            stall_deadline = machine._last_motion_record_s + config.file_stall_s
+            assert clock() <= stall_deadline <= clock() + duration + 1e-9
+            sleep(stall_deadline - clock())
+            transport.release_query_worker.set()
+            if not transport.product_query_completed.wait(timeout=1.0):
+                raise AssertionError(
+                    "outer-sleep terminal query completion barrier was not reached"
+                )
+            return
+        sleep(duration)
+
+    machine.sleeper = complete_query_at_stall_boundary
+    refresh = machine._terminal_release_refresh_proves_advanced_hold
+    refresh_calls = 0
+
+    def counted_refresh() -> bool:
+        nonlocal refresh_calls
+        refresh_calls += 1
+        return refresh()
+
+    monkeypatch.setattr(
+        machine,
+        "_terminal_release_refresh_proves_advanced_hold",
+        counted_refresh,
+    )
+
+    result = machine.run()
+
+    assert result["passed"] is False
+    assert result["reason"] == "motion JSONL file stalled"
+    assert outer_sleep_started_at is not None
+    assert transport.worker_completed_at is not None
+    cancel = _calls(transport, "POST", f"/{COMMAND_ID}/cancel")[0]
+    assert cancel.at == pytest.approx(transport.worker_completed_at)
+    assert refresh_calls == 0
+    assert result["terminalSafeHoldProved"] is True
+    _assert_call_budget(transport, query=1, cancel=1)
+
+
+def test_active_to_safe_skew_after_post_merge_never_unlocks_terminal_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeClock()
+    transport = PostMergeReleasePhaseSkewTransport(clock)
+    machine, evidence, _motion, _sidecar = _build_with_transport(
+        monkeypatch,
+        clock=clock,
+        transport=transport,
+    )
+
+    result = machine.run()
+
+    _assert_failed_hold(result)
+    assert transport.accepted_at is not None
+    assert transport.transition_at is not None
+    assert transport.transition_at >= transport.accepted_at
+    assert transport.post_at is not None
+    assert transport.transition_at - transport.post_at >= 3.0
+    assert any(
+        record.get("kind") == "command_post_accepted"
+        for record in evidence.records
+    )
+    assert result["commandGetCount"] == 0
+    _assert_call_budget(transport, query=0, cancel=0)
+
+
+def test_transient_phase_skew_does_not_mutate_safety_tracker_anchors() -> None:
+    clock = FakeClock()
+    base_plant, base_sonic, base_robot_agent, base_gateway = (
+        FakeTransport(clock).snapshots()
+    )
+    tracker = runner.SafetyTracker()
+    tracker.observe_snapshot(
+        runner.Snapshot(base_plant, base_sonic, base_robot_agent, base_gateway)
+    )
+    identities = tracker.identities
+    identities_before = deepcopy(identities)
+    previous_before = tracker.previous_pose
+    baseline_before = tracker.baseline_pose
+    unwrapped_before = tracker.unwrapped_yaw
+
+    skew_plant = _plant(forward=0.02, state="safe_hold", yaw=0.35)
+    skew_sonic = _sonic(state="safe_hold")
+    skew_robot_agent = _robot_agent(state="safe_hold", epoch=7, active_count=0)
+    skew_gateway = deepcopy(base_gateway)
+    skew_gateway["robotAgent"].update(
+        {
+            "controlState": "ACTIVE",
+            "authorityRevoked": False,
+            "safeStopState": "confirmed",
+            "safeStopEpoch": 7,
+        }
+    )
+    skew_snapshot = runner.Snapshot(
+        skew_plant,
+        skew_sonic,
+        skew_robot_agent,
+        skew_gateway,
+    )
+
+    with pytest.raises(runner.TransientControlPhaseSkew):
+        tracker.observe_snapshot(skew_snapshot)
+
+    assert tracker.identities is identities
+    assert tracker.identities == identities_before
+    assert tracker.previous_pose == previous_before
+    assert tracker.baseline_pose == baseline_before
+    assert tracker.unwrapped_yaw == unwrapped_before
+
+    fresh_tracker = runner.SafetyTracker()
+    with pytest.raises(runner.TransientControlPhaseSkew):
+        fresh_tracker.observe_snapshot(skew_snapshot)
+    assert fresh_tracker.identities is None
+    assert fresh_tracker.previous_pose is None
+    assert fresh_tracker.baseline_pose is None
+    assert fresh_tracker.unwrapped_yaw == 0.0
+
+    coherent_gateway = deepcopy(skew_gateway)
+    coherent_gateway["robotAgent"].update(
+        {
+            "controlState": "SAFE_HOLD",
+            "authorityRevoked": True,
+            "safeStopState": "confirmed",
+            "safeStopEpoch": 7,
+        }
+    )
+    coherent_snapshot = runner.Snapshot(
+        skew_plant,
+        skew_sonic,
+        skew_robot_agent,
+        coherent_gateway,
+    )
+    tracker.observe_snapshot(coherent_snapshot)
+    committed = (
+        tracker.identities,
+        tracker.previous_pose,
+        tracker.baseline_pose,
+        tracker.unwrapped_yaw,
+    )
+    tracker.observe_snapshot(coherent_snapshot)
+    assert (
+        tracker.identities,
+        tracker.previous_pose,
+        tracker.baseline_pose,
+        tracker.unwrapped_yaw,
+    ) == committed
+    assert tracker.identities is identities
+    assert tracker.baseline_pose == baseline_before
+    assert tracker.unwrapped_yaw == pytest.approx(0.05)
 
 
 @pytest.mark.parametrize(

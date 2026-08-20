@@ -42,6 +42,7 @@ RUN_DEADLINE_S = 25.0
 SETTLE_S = 1.0
 FILE_STALL_S = 2.0
 POLL_INTERVAL_S = 0.1
+CONTROL_PHASE_SKEW_TIMEOUT_S = 0.3
 MAX_JSON_BYTES = 2 * 1024 * 1024
 MOTION_MONITOR_SCHEMA = "h-ide.motion-acceptance-monitor/1"
 SIDECAR_MONITOR_SCHEMA = "h-ide.idle-soak-monitor/1"
@@ -104,6 +105,18 @@ class AcceptanceError(RuntimeError):
 
 class TransportUncertain(AcceptanceError):
     """The peer may have received the request but no response was proved."""
+
+
+class TransientControlPhaseSkew(AcceptanceError):
+    """Sequential health GETs straddled one Robot Agent control transition."""
+
+
+class SnapshotReadDeadlineExpired(AcceptanceError):
+    """A bounded read group exhausted its caller-owned monotonic deadline."""
+
+
+class TerminalQueryCompletedDuringPhaseSample(AcceptanceError):
+    """The terminal GET finished while a retryable health phase was sampled."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -389,6 +402,7 @@ class RunnerConfig:
     file_stall_s: float = FILE_STALL_S
     settle_s: float = SETTLE_S
     poll_interval_s: float = POLL_INTERVAL_S
+    control_phase_skew_timeout_s: float = CONTROL_PHASE_SKEW_TIMEOUT_S
 
     def __post_init__(self) -> None:
         parsed = urlsplit(self.gateway_base)
@@ -407,6 +421,7 @@ class RunnerConfig:
             "file_stall_s",
             "settle_s",
             "poll_interval_s",
+            "control_phase_skew_timeout_s",
         ):
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0:
@@ -736,6 +751,94 @@ def _ra_safe_hold(value: Mapping[str, Any], *, epoch: int | None = None) -> bool
         return False
 
 
+def _ra_requested_safe_hold(value: Mapping[str, Any], *, epoch: int) -> bool:
+    """Recognize only the exact, short-lived physical-stop transition."""
+
+    try:
+        control = _ra_control(value)
+        command = _mapping(value.get("commandReadiness"), "Robot Agent commandReadiness")
+        fault = _mapping(value.get("motionSafetyFault"), "Robot Agent motionSafetyFault")
+        checks = _mapping(value.get("checks"), "Robot Agent checks")
+        control_check = _mapping(
+            checks.get("control"),
+            "Robot Agent requested control check",
+        )
+        safe_stop_check = _mapping(
+            checks.get("safeStop"),
+            "Robot Agent requested safeStop check",
+        )
+        if not _REQUIRED_RA_CHECKS.issubset(checks):
+            return False
+        for name in _REQUIRED_RA_CHECKS:
+            check = checks.get(name)
+            if not isinstance(check, Mapping) or check.get("required") is not True:
+                return False
+            expected_ready = name not in {"control", "safeStop"}
+            if check.get("ready") is not expected_ready:
+                return False
+        reason = command.get("reason")
+        return bool(
+            value.get("schemaVersion") == "robot-agent.diagnostics/1"
+            and value.get("robotId") == ROBOT_ID
+            and value.get("ready") is False
+            and command.get("ready") is False
+            and command.get("mode") == "BLOCKED"
+            and reason == "control_acquire_blocked"
+            and control.get("state") == "SAFE_HOLD"
+            and control.get("active") is False
+            and control.get("standby") is False
+            and control.get("canAcquire") is False
+            and control.get("authorityRevoked") is True
+            and control.get("safeStopState") == "requested"
+            and _integer(
+                control.get("safeStopEpoch"),
+                "Robot Agent requested safeStopEpoch",
+                minimum=1,
+            )
+            == epoch
+            and control.get("leaseValid") is False
+            and control.get("leaseRemainingMs") is None
+            and _integer(
+                control.get("activeCommandCount"),
+                "Robot Agent requested activeCommandCount",
+            )
+            == 0
+            and fault.get("ready") is True
+            and fault.get("latched") is False
+            and all(
+                fault.get(field) is None
+                for field in ("eventId", "source", "code")
+            )
+            and control_check.get("required") is True
+            and control_check.get("ready") is False
+            and control_check.get("state") == "SAFE_HOLD"
+            and control_check.get("mode") == "BLOCKED"
+            and control_check.get("active") is False
+            and control_check.get("canAcquire") is False
+            and control_check.get("leaseValid") is False
+            and _integer(
+                control_check.get("activeCommandCount"),
+                "Robot Agent requested control-check activeCommandCount",
+            )
+            == 0
+            and control_check.get("reason") == "control_acquire_blocked"
+            and control_check.get("leaseRemainingMs") is None
+            and safe_stop_check.get("required") is True
+            and safe_stop_check.get("ready") is False
+            and safe_stop_check.get("reason") == "safe_stop_requested"
+            and safe_stop_check.get("authorityRevoked") is True
+            and safe_stop_check.get("state") == "requested"
+            and _integer(
+                safe_stop_check.get("epoch"),
+                "Robot Agent requested safeStop-check epoch",
+                minimum=1,
+            )
+            == epoch
+        )
+    except AcceptanceError:
+        return False
+
+
 class SafetyTracker:
     """Reject physical, identity, fault, process, runtime, and worker changes."""
 
@@ -763,7 +866,16 @@ class SafetyTracker:
             raise AcceptanceError(f"{name} identity is missing")
         return value
 
-    def _validate_physical(self, plant: Mapping[str, Any], sonic: Mapping[str, Any], *, track_pose: bool) -> float:
+    def _validate_physical(
+        self,
+        plant: Mapping[str, Any],
+        sonic: Mapping[str, Any],
+        *,
+        track_pose: bool,
+        compare_pose: bool | None = None,
+    ) -> float:
+        if compare_pose is None:
+            compare_pose = track_pose
         if plant.get("status") != "running" or sonic.get("status") != "running" or sonic.get("motion_ready") is not True:
             raise AcceptanceError("Plant or SONIC is not running")
         if plant.get("robotId") != ROBOT_ID or sonic.get("robot_id") != ROBOT_ID:
@@ -779,16 +891,22 @@ class SafetyTracker:
             raise AcceptanceError("root-height hard threshold exceeded")
         if abs(roll) > 0.25 or abs(pitch) > 0.25:
             raise AcceptanceError("roll/pitch hard threshold exceeded")
-        if track_pose and self.previous_pose is not None:
+        if compare_pose and self.previous_pose is not None:
             px, py, pz, pyaw = self.previous_pose
             if math.dist((x, y, z), (px, py, pz)) > 0.08:
                 raise AcceptanceError("position-jump hard threshold exceeded")
             yaw_jump = abs((yaw - pyaw + math.pi) % (2 * math.pi) - math.pi)
             if yaw_jump > 0.20:
                 raise AcceptanceError("yaw-jump hard threshold exceeded")
-            self.unwrapped_yaw += (yaw - pyaw + math.pi) % (2 * math.pi) - math.pi
-            if abs(self.unwrapped_yaw) > 0.20:
+            candidate_unwrapped_yaw = (
+                self.unwrapped_yaw
+                + (yaw - pyaw + math.pi) % (2 * math.pi)
+                - math.pi
+            )
+            if abs(candidate_unwrapped_yaw) > 0.20:
                 raise AcceptanceError("heading hard threshold exceeded")
+            if track_pose:
+                self.unwrapped_yaw = candidate_unwrapped_yaw
         if track_pose:
             self.previous_pose = (x, y, z, yaw)
             if self.baseline_pose is None:
@@ -845,7 +963,12 @@ class SafetyTracker:
             raise AcceptanceError("directional-travel hard threshold exceeded")
         return forward
 
-    def observe_snapshot(self, snapshot: Snapshot) -> float:
+    def observe_snapshot(
+        self,
+        snapshot: Snapshot,
+        *,
+        allow_requested_transition: bool = False,
+    ) -> float:
         if snapshot.gateway.get("status") != "ok" or snapshot.gateway.get("protocol") != "robot-agent.v1":
             raise AcceptanceError("Gateway health is invalid")
         plant = snapshot.plant
@@ -860,14 +983,65 @@ class SafetyTracker:
         gateway_observation = _mapping(gateway_agent.get("observation"), "Gateway observation health")
         gateway_epoch = _integer(gateway_agent.get("safeStopEpoch"), "Gateway safeStopEpoch", minimum=1)
         direct_epoch = _integer(control.get("safeStopEpoch"), "Robot Agent safeStopEpoch", minimum=1)
+        gateway_authority_revoked = gateway_agent.get("authorityRevoked")
+        direct_authority_revoked = control.get("authorityRevoked")
+        if not isinstance(gateway_authority_revoked, bool) or not isinstance(
+            direct_authority_revoked,
+            bool,
+        ):
+            raise AcceptanceError(
+                "Gateway and Robot Agent authority truth is not boolean"
+            )
+        gateway_phase = (
+            gateway_agent.get("controlState"),
+            gateway_authority_revoked,
+            gateway_agent.get("safeStopState"),
+            gateway_epoch,
+        )
+        direct_phase = (
+            control.get("state"),
+            direct_authority_revoked,
+            control.get("safeStopState"),
+            direct_epoch,
+        )
+        direct_requested_is_valid = bool(
+            allow_requested_transition
+            and _ra_requested_safe_hold(robot_agent, epoch=direct_epoch)
+        )
+        direct_phase_is_valid = bool(
+            _ra_safe_hold(robot_agent, epoch=direct_epoch)
+            or (
+                _ra_active_runtime(robot_agent, epoch=direct_epoch)
+                and control.get("safeStopState") == "confirmed"
+            )
+            or direct_requested_is_valid
+        )
+        gateway_phase_is_valid = bool(
+            (
+                gateway_phase[0] == "SAFE_HOLD"
+                and gateway_phase[1] is True
+                and gateway_phase[2] == "confirmed"
+            )
+            or (
+                gateway_phase[0] == "ACTIVE"
+                and gateway_phase[1] is False
+                and gateway_phase[2] == "confirmed"
+            )
+            or (
+                allow_requested_transition
+                and gateway_phase[0] == "SAFE_HOLD"
+                and gateway_phase[1] is True
+                and gateway_phase[2] == "requested"
+            )
+        )
+        if not direct_phase_is_valid or not gateway_phase_is_valid:
+            raise AcceptanceError(
+                "Gateway or Robot Agent control phase is internally invalid"
+            )
         if (
             gateway_agent.get("connected") is not True
             or gateway_agent.get("robotId") != ROBOT_ID
             or gateway_agent.get("robotBootId") != robot_agent.get("robotBootId")
-            or gateway_agent.get("controlState") != control.get("state")
-            or gateway_agent.get("authorityRevoked") is not control.get("authorityRevoked")
-            or gateway_agent.get("safeStopState") != control.get("safeStopState")
-            or gateway_epoch != direct_epoch
             or gateway_agent.get("lastError") is not None
             or gateway_observation.get("status") != "USABLE"
             or gateway_observation.get("localizationEpochId") != plant.get("localizationEpochId")
@@ -891,7 +1065,7 @@ class SafetyTracker:
             raise AcceptanceError("Robot Agent motion-safety fault is not clear")
         if any(fault.get(field) is not None for field in ("eventId", "source", "code")):
             raise AcceptanceError("Robot Agent motion-safety fault identity is present")
-        if not _ra_checks_ready(robot_agent):
+        if not direct_requested_is_valid and not _ra_checks_ready(robot_agent):
             raise AcceptanceError("Robot Agent required diagnostics check is not ready")
         fault_counters = _mapping(fault.get("counters"), "Robot Agent motionSafetyFault counters")
         normalized_fault_counters: tuple[tuple[str, int], ...] = tuple(
@@ -963,14 +1137,31 @@ class SafetyTracker:
         }
         if "driver_boot_id" in sonic:
             identities["sonic.driver_boot_id"] = self._identity(sonic.get("driver_boot_id"), "SONIC boot")
-        if self.identities is None:
-            self.identities = identities
-        elif identities != self.identities:
+        if self.identities is not None and identities != self.identities:
             raise AcceptanceError("runtime source identity changed")
         if self.motion_identities is not None:
             for name, value in self.motion_identities.items():
                 if name in identities and identities[name] != value:
                     raise AcceptanceError("motion JSONL and live source identities differ")
+        # Validate every physical/worker/fault fact before classifying the
+        # only retryable condition.  This pass is deliberately non-mutating:
+        # a cross-GET phase skew must not advance the pose or identity anchor.
+        self._validate_physical(
+            plant,
+            sonic,
+            track_pose=False,
+            compare_pose=True,
+        )
+        if direct_requested_is_valid or gateway_phase[2] == "requested":
+            raise TransientControlPhaseSkew(
+                "Robot Agent safe-stop confirmation is still requested"
+            )
+        if gateway_phase != direct_phase:
+            raise TransientControlPhaseSkew(
+                "Gateway and Robot Agent dynamic control phases disagree"
+            )
+        if self.identities is None:
+            self.identities = identities
         return self._validate_physical(plant, sonic, track_pose=True)
 
     def observe_motion_record(self, record: Mapping[str, Any]) -> None:
@@ -1123,6 +1314,8 @@ class Forward02mRunner:
         self.command_post_attempted = False
         self.cancel_post_attempted = False
         self.command_get_attempted = False
+        self._terminal_query_pending = False
+        self._terminal_query_uncertain = False
         self.discover_get_attempted = False
         self._last_snapshot: Snapshot | None = None
         self._last_motion_record_s: float | None = None
@@ -1203,7 +1396,15 @@ class Forward02mRunner:
         if not allowed:
             raise AcceptanceError("transport request is outside the fixed method/URL/auth/body allowlist")
 
-    def _json_response(self, method: str, url: str, *, authenticated: bool = False, body: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
+    def _json_response(
+        self,
+        method: str,
+        url: str,
+        *,
+        authenticated: bool = False,
+        body: Mapping[str, Any] | None = None,
+        timeout_cap_s: float | None = None,
+    ) -> Mapping[str, Any]:
         self._authorize_transport_call(
             method,
             url,
@@ -1219,6 +1420,10 @@ class Forward02mRunner:
             timeout_s = 8.0
         else:
             timeout_s = 1.0
+        if timeout_cap_s is not None:
+            if not math.isfinite(timeout_cap_s) or timeout_cap_s <= 0.0:
+                raise AcceptanceError("snapshot read deadline expired")
+            timeout_s = min(timeout_s, timeout_cap_s)
         response = self.transport.request(
             method,
             url,
@@ -1230,12 +1435,27 @@ class Forward02mRunner:
             raise AcceptanceError(f"{method} {urlsplit(url).path} did not return HTTP 200 JSON")
         return response.payload
 
-    def _snapshot(self) -> Snapshot:
+    def _snapshot(self, *, read_deadline_s: float | None = None) -> Snapshot:
+        def read(url: str) -> Mapping[str, Any]:
+            timeout_cap_s: float | None = None
+            if read_deadline_s is not None:
+                timeout_cap_s = read_deadline_s - self.clock()
+                if timeout_cap_s <= 0.0:
+                    raise SnapshotReadDeadlineExpired
+            payload = self._json_response(
+                "GET",
+                url,
+                timeout_cap_s=timeout_cap_s,
+            )
+            if read_deadline_s is not None and self.clock() >= read_deadline_s:
+                raise SnapshotReadDeadlineExpired
+            return payload
+
         snapshot = Snapshot(
-            plant=self._json_response("GET", PLANT_URL),
-            sonic=self._json_response("GET", SONIC_URL),
-            robot_agent=self._json_response("GET", ROBOT_AGENT_URL),
-            gateway=self._json_response("GET", f"{self.config.base}/healthz"),
+            plant=read(PLANT_URL),
+            sonic=read(SONIC_URL),
+            robot_agent=read(ROBOT_AGENT_URL),
+            gateway=read(f"{self.config.base}/healthz"),
         )
         self._last_snapshot = snapshot
         return snapshot
@@ -1619,7 +1839,7 @@ class Forward02mRunner:
                 self._cancel_once_if_active(self._last_snapshot, force_unknown=True)
                 break
             try:
-                snapshot, forward = self._poll()
+                snapshot, forward, _had_phase_skew = self._poll()
                 self._validate_pending_phase(snapshot, forward)
                 if _sonic_intent_active(snapshot.sonic):
                     self._intent_seen = True
@@ -1688,6 +1908,8 @@ class Forward02mRunner:
         if self.command_get_attempted or self.command_id is None:
             raise AcceptanceError("terminal command GET exactly-once latch is unavailable")
         self.command_get_attempted = True
+        self._terminal_query_pending = True
+        self._terminal_query_uncertain = False
         url = f"{self.config.base}/internal/v1/commands/{quote(self.command_id, safe='')}"
         completed = threading.Event()
         outcome: dict[str, Any] = {}
@@ -1701,17 +1923,24 @@ class Forward02mRunner:
                 completed.set()
 
         query_started = self.clock()
+        query_deadline_s = query_started + 8.0
         threading.Thread(
             target=query_once,
             name="forward-02m-terminal-query",
             daemon=True,
         ).start()
         while not completed.is_set():
-            if self.clock() - query_started >= 8.0:
+            if self.clock() >= query_deadline_s:
+                self._terminal_query_pending = False
+                self._terminal_query_uncertain = True
                 self._cancel_once_if_active(self._last_snapshot, force_unknown=True)
                 raise TransportUncertain("terminal command GET completion timed out")
             try:
-                snapshot, _forward = self._poll()
+                snapshot, _forward, _had_phase_skew = self._poll(
+                    hard_deadline_s=query_deadline_s,
+                    hard_deadline_reason="terminal command GET completion timed out",
+                    transient_stop_event=completed,
+                )
                 phase_is_valid = bool(
                     _ra_active_runtime(snapshot.robot_agent, epoch=baseline_epoch)
                     or (
@@ -1721,12 +1950,75 @@ class Forward02mRunner:
                 )
                 if not phase_is_valid:
                     raise AcceptanceError("terminal query entered an incoherent release phase")
+            except TerminalQueryCompletedDuringPhaseSample:
+                break
             except BaseException:
+                self._terminal_query_pending = False
                 self._cancel_once_if_active(self._last_snapshot, force_unknown=True)
                 raise
-            self.sleeper(self.config.poll_interval_s)
+            if completed.is_set():
+                continue
+            now = self.clock()
+            sleep_deadlines = [query_deadline_s]
+            if self._last_motion_record_s is not None:
+                sleep_deadlines.append(
+                    self._last_motion_record_s + self.config.file_stall_s
+                )
+            if self._last_sidecar_record_s is not None:
+                sleep_deadlines.append(
+                    self._last_sidecar_record_s + self.config.file_stall_s
+                )
+            self.sleeper(
+                min(
+                    self.config.poll_interval_s,
+                    max(0.0, min(sleep_deadlines) - now),
+                )
+            )
+        try:
+            # The query may complete just after the no-sleep check above.  A
+            # final evidence read makes any file/query deadline crossed by
+            # that outer sleep win before the worker outcome is parsed.
+            self._consume_jsonl()
+            completion_now = self.clock()
+            if self._last_motion_record_s is None:
+                raise AcceptanceError("motion JSONL file stalled")
+            if self._last_sidecar_record_s is None:
+                raise AcceptanceError("sidecar JSONL file stalled")
+            expired = [
+                (
+                    self._last_motion_record_s + self.config.file_stall_s,
+                    0,
+                    "motion JSONL file stalled",
+                ),
+                (
+                    self._last_sidecar_record_s + self.config.file_stall_s,
+                    1,
+                    "sidecar JSONL file stalled",
+                ),
+                (
+                    query_deadline_s,
+                    2,
+                    "terminal command GET completion timed out",
+                ),
+            ]
+            elapsed = [entry for entry in expired if completion_now >= entry[0]]
+            if elapsed:
+                _deadline, _priority, deadline_reason = min(
+                    elapsed,
+                    key=lambda entry: (entry[0], entry[1]),
+                )
+                if deadline_reason == "terminal command GET completion timed out":
+                    self._terminal_query_uncertain = True
+                    raise TransportUncertain(deadline_reason)
+                raise AcceptanceError(deadline_reason)
+        except BaseException:
+            self._terminal_query_pending = False
+            self._cancel_once_if_active(self._last_snapshot, force_unknown=True)
+            raise
+        self._terminal_query_pending = False
         error = outcome.get("error")
         if isinstance(error, BaseException):
+            self._terminal_query_uncertain = isinstance(error, TransportUncertain)
             raise error
         envelope = _mapping(outcome.get("envelope"), "terminal command envelope")
         result = _mapping(envelope.get("result"), "terminal command result")
@@ -1760,51 +2052,265 @@ class Forward02mRunner:
         self._record("terminal_query_validated", commandId=self.command_id, safeStopEpoch=baseline_epoch + 1)
         return baseline_epoch + 1
 
-    def _poll(self) -> tuple[Snapshot, float]:
-        self._consume_jsonl()
-        now = self.clock()
-        if self._post_started_s is not None:
-            if self._last_motion_record_s is None or now - self._last_motion_record_s > self.config.file_stall_s:
-                raise AcceptanceError("motion JSONL file stalled")
-            if self._last_sidecar_record_s is None or now - self._last_sidecar_record_s > self.config.file_stall_s:
-                raise AcceptanceError("sidecar JSONL file stalled")
-        snapshot = self._snapshot()
-        progress = self.safety.observe_snapshot(snapshot)
-        return snapshot, progress
+    def _poll(
+        self,
+        *,
+        hard_deadline_s: float | None = None,
+        hard_deadline_reason: str | None = None,
+        transient_stop_event: threading.Event | None = None,
+    ) -> tuple[Snapshot, float, bool]:
+        if (hard_deadline_s is None) != (hard_deadline_reason is None):
+            raise AcceptanceError("poll hard deadline contract is incomplete")
+        skew_started_s: float | None = None
+        skew_deadline_s: float | None = None
+        had_phase_skew = False
+
+        def deadline_entries() -> list[tuple[float, int, str]]:
+            entries: list[tuple[float, int, str]] = []
+            if self._post_started_s is not None:
+                if self._last_motion_record_s is not None:
+                    entries.append(
+                        (
+                            self._last_motion_record_s + self.config.file_stall_s,
+                            0,
+                            "motion JSONL file stalled",
+                        )
+                    )
+                if self._last_sidecar_record_s is not None:
+                    entries.append(
+                        (
+                            self._last_sidecar_record_s + self.config.file_stall_s,
+                            1,
+                            "sidecar JSONL file stalled",
+                        )
+                    )
+                if not self.command_get_attempted:
+                    if not self._progress_seen:
+                        entries.append(
+                            (
+                                self._post_started_s
+                                + self.config.progress_deadline_s,
+                                2,
+                                "command made less than 0.03 m progress in 15 seconds",
+                            )
+                        )
+                    entries.append(
+                        (
+                            self._post_started_s + self.config.run_deadline_s,
+                            3,
+                            "command remained unfinished for 25 seconds",
+                        )
+                    )
+            if skew_deadline_s is not None:
+                entries.append(
+                    (
+                        skew_deadline_s,
+                        4,
+                        "Gateway and Robot Agent control phase skew persisted",
+                    )
+                )
+            if hard_deadline_s is not None:
+                assert hard_deadline_reason is not None
+                entries.append((hard_deadline_s, 5, hard_deadline_reason))
+            return entries
+
+        def raise_if_deadline_expired(now: float) -> None:
+            expired = [entry for entry in deadline_entries() if now >= entry[0]]
+            if expired:
+                _deadline, _priority, reason = min(
+                    expired,
+                    key=lambda entry: (entry[0], entry[1]),
+                )
+                raise AcceptanceError(reason)
+
+        while True:
+            self._consume_jsonl()
+            now = self.clock()
+            if self._post_started_s is not None:
+                if self._last_motion_record_s is None:
+                    raise AcceptanceError("motion JSONL file stalled")
+                if self._last_sidecar_record_s is None:
+                    raise AcceptanceError("sidecar JSONL file stalled")
+            raise_if_deadline_expired(now)
+            if (
+                had_phase_skew
+                and transient_stop_event is not None
+                and transient_stop_event.is_set()
+            ):
+                raise TerminalQueryCompletedDuringPhaseSample
+            entries = deadline_entries()
+            # A phase transition can happen anywhere in the four sequential
+            # GETs, including the first group before a mismatch is observable.
+            # Therefore every live group has the same 0.3 s coherence cap;
+            # once skew is seen, later groups additionally share its original
+            # absolute deadline.
+            read_group_deadline_s = (
+                now + self.config.control_phase_skew_timeout_s
+            )
+            read_deadline_s = min(
+                [read_group_deadline_s, *(entry[0] for entry in entries)]
+            )
+            read_group_started_s = now
+            try:
+                snapshot = self._snapshot(read_deadline_s=read_deadline_s)
+            except SnapshotReadDeadlineExpired:
+                raise_if_deadline_expired(self.clock())
+                raise AcceptanceError(
+                    "control phase snapshot coherence read deadline expired"
+                )
+            except BaseException:
+                # A transport timeout at the exact caller-owned boundary is a
+                # deadline outcome, while an earlier endpoint failure keeps
+                # its original hard-fault classification.
+                raise_if_deadline_expired(self.clock())
+                if self.clock() >= read_group_deadline_s:
+                    raise AcceptanceError(
+                        "control phase snapshot coherence read deadline expired"
+                    )
+                raise
+            try:
+                progress = self.safety.observe_snapshot(
+                    snapshot,
+                    allow_requested_transition=self._terminal_query_pending,
+                )
+            except TransientControlPhaseSkew as exc:
+                retry_now = self.clock()
+                raise_if_deadline_expired(retry_now)
+                if (
+                    transient_stop_event is not None
+                    and transient_stop_event.is_set()
+                ):
+                    raise TerminalQueryCompletedDuringPhaseSample from exc
+                had_phase_skew = True
+                if skew_started_s is None:
+                    # The phase divergence may have occurred anywhere in this
+                    # sequential four-GET group. Charge the whole first group
+                    # to the bounded resampling window rather than starting a
+                    # fresh 0.3 s budget only after the mismatch is observed.
+                    skew_started_s = read_group_started_s
+                    skew_deadline_s = (
+                        skew_started_s
+                        + self.config.control_phase_skew_timeout_s
+                    )
+                assert skew_deadline_s is not None
+                remaining = skew_deadline_s - retry_now
+                # Avoid a zero-progress retry when a deterministic/fake clock
+                # lands one floating-point ulp below the exact boundary.
+                if remaining <= 1e-9:
+                    raise AcceptanceError(
+                        "Gateway and Robot Agent control phase skew persisted"
+                    ) from exc
+                next_deadline_s = min(
+                    (entry[0] for entry in deadline_entries()),
+                    default=retry_now + self.config.poll_interval_s,
+                )
+                sleep_for = min(
+                    self.config.poll_interval_s,
+                    remaining,
+                    max(0.0, next_deadline_s - retry_now),
+                )
+                self.sleeper(sleep_for)
+                continue
+            return snapshot, progress, had_phase_skew
+
+    def _snapshot_proves_advanced_hold(self, snapshot: Snapshot | None) -> bool:
+        if snapshot is None:
+            return False
+        try:
+            control = _ra_control(snapshot.robot_agent)
+            epoch = _integer(
+                control.get("safeStopEpoch"),
+                "abort safeStopEpoch",
+                minimum=1,
+            )
+            gateway_agent = _mapping(
+                snapshot.gateway.get("robotAgent"),
+                "abort Gateway Robot Agent",
+            )
+            return bool(
+                self._baseline_epoch is not None
+                and epoch > self._baseline_epoch
+                and snapshot.robot_agent.get("robotBootId")
+                == self._baseline_robot_boot_id
+                and _ra_safe_hold(snapshot.robot_agent, epoch=epoch)
+                and _safe_hold_plant_sonic(snapshot.plant, snapshot.sonic)
+                and snapshot.gateway.get("status") == "ok"
+                and snapshot.gateway.get("protocol") == "robot-agent.v1"
+                and gateway_agent.get("connected") is True
+                and gateway_agent.get("robotBootId")
+                == self._baseline_robot_boot_id
+                and gateway_agent.get("controlState") == "SAFE_HOLD"
+                and gateway_agent.get("authorityRevoked") is True
+                and gateway_agent.get("safeStopState") == "confirmed"
+                and gateway_agent.get("safeStopEpoch") == epoch
+                and gateway_agent.get("lastError") is None
+            )
+        except AcceptanceError:
+            return False
+
+    def _terminal_release_refresh_proves_advanced_hold(self) -> bool:
+        """Bound a read-only refresh after an uncertain terminal query."""
+
+        deadline_s = self.clock() + self.config.control_phase_skew_timeout_s
+        refresh_safety = SafetyTracker()
+        refresh_safety.identities = (
+            None if self.safety.identities is None else dict(self.safety.identities)
+        )
+        refresh_safety.motion_identities = (
+            None
+            if self.safety.motion_identities is None
+            else dict(self.safety.motion_identities)
+        )
+        refresh_safety.previous_pose = self.safety.previous_pose
+        refresh_safety.baseline_pose = self.safety.baseline_pose
+        refresh_safety.unwrapped_yaw = self.safety.unwrapped_yaw
+        while self.clock() < deadline_s:
+            try:
+                snapshot = self._snapshot(read_deadline_s=deadline_s)
+                refresh_safety.observe_snapshot(
+                    snapshot,
+                    allow_requested_transition=True,
+                )
+            except TransientControlPhaseSkew:
+                remaining = deadline_s - self.clock()
+                if remaining <= 0.0:
+                    return False
+                self.sleeper(min(self.config.poll_interval_s, remaining))
+                continue
+            except BaseException:
+                return False
+            return self._snapshot_proves_advanced_hold(snapshot)
+        return False
 
     def _abort(self, reason: str) -> dict[str, Any]:
         snapshot = self._last_snapshot
-        # Refresh authority once after an ambiguous/failing command boundary.
-        # This is read-only and gives a just-activated command one chance to be
-        # seen; a transport failure here never authorizes a blind cancellation.
-        refresh_proved_safe = False
-        refresh_failed = False
         if self.command_post_attempted:
-            try:
-                snapshot = self._snapshot()
-                self.safety.observe_snapshot(snapshot)
-                control = _ra_control(snapshot.robot_agent)
-                epoch = control.get("safeStopEpoch")
-                same_boot = snapshot.robot_agent.get("robotBootId") == self._baseline_robot_boot_id
-                refresh_proved_safe = bool(
-                    same_boot
-                    and self._baseline_epoch is not None
-                    and isinstance(epoch, int)
-                    and not isinstance(epoch, bool)
-                    and epoch > self._baseline_epoch
-                    and _ra_safe_hold(snapshot.robot_agent)
-                    and _safe_hold_plant_sonic(snapshot.plant, snapshot.sonic)
-                )
-            except BaseException:
-                refresh_failed = True
-                snapshot = self._last_snapshot
-        if self.command_post_attempted and not refresh_proved_safe:
-            # The Gateway's cancel ledger is safe for unknown IDs and is the
-            # only fail-safe convergence action when POST/RA truth is unknown.
-            self._cancel_once_if_active(
-                snapshot,
-                force_unknown=refresh_failed or snapshot is None or not _ra_is_active(snapshot.robot_agent),
+            # A terminal GET may have completed the release even when its HTTP
+            # response was lost.  Re-read for at most one coherence window;
+            # every other failure path cancels immediately.  The one-shot
+            # latch still prevents a second mutation.
+            last_snapshot_proves_advanced_hold = (
+                self._snapshot_proves_advanced_hold(snapshot)
             )
+            if (
+                not last_snapshot_proves_advanced_hold
+                and self._terminal_query_uncertain
+                and not self.cancel_post_attempted
+            ):
+                try:
+                    last_snapshot_proves_advanced_hold = (
+                        self._terminal_release_refresh_proves_advanced_hold()
+                    )
+                except BaseException:
+                    # A second interrupt cannot bypass the already-frozen
+                    # command's sole cancellation attempt.
+                    last_snapshot_proves_advanced_hold = False
+                snapshot = self._last_snapshot
+            if not last_snapshot_proves_advanced_hold:
+                self._cancel_once_if_active(
+                    snapshot,
+                    force_unknown=True,
+                )
         terminal_hold_proved = False
         if self.command_post_attempted:
             try:
@@ -1832,6 +2338,7 @@ class Forward02mRunner:
         """After cancellation/failure, tail inputs and prove 1 s physical hold."""
 
         started = self.clock()
+        proof_deadline_s = started + 8.0
         hold_since: float | None = None
         # A hard trajectory violation deliberately poisons the movement
         # tracker.  Terminal convergence starts a new trajectory baseline at
@@ -1842,7 +2349,7 @@ class Forward02mRunner:
         hold_safety.motion_identities = (
             None if self.safety.motion_identities is None else dict(self.safety.motion_identities)
         )
-        while self.clock() - started < 8.0:
+        while self.clock() < proof_deadline_s:
             # Evaluate this before the direct snapshot. A newly merged accepted
             # response therefore forces its first hold sample after admission.
             post_fenced = self._merge_post_transaction_if_finished()
@@ -1892,8 +2399,15 @@ class Forward02mRunner:
                 # evidence stream. Keep attempting both tails, but do not let
                 # that prevent an independent physical SAFE_HOLD proof.
                 self._abort_hold_evidence_clean = False
+            if self.clock() >= proof_deadline_s:
+                return False
             try:
-                snapshot = self._snapshot()
+                snapshot = self._snapshot(
+                    read_deadline_s=min(
+                        proof_deadline_s,
+                        self.clock() + self.config.control_phase_skew_timeout_s,
+                    )
+                )
                 hold_safety.observe_snapshot(snapshot)
                 control = _ra_control(snapshot.robot_agent)
                 epoch = control.get("safeStopEpoch")
@@ -1918,13 +2432,21 @@ class Forward02mRunner:
                 )
             except BaseException:
                 strict = False
+            sample_now = self.clock()
+            if sample_now >= proof_deadline_s:
+                return False
             if strict:
-                hold_since = self.clock() if hold_since is None else hold_since
-                if self.clock() - hold_since >= self.config.settle_s:
+                hold_since = sample_now if hold_since is None else hold_since
+                if sample_now - hold_since >= self.config.settle_s:
                     return True
             else:
                 hold_since = None
-            self.sleeper(self.config.poll_interval_s)
+            self.sleeper(
+                min(
+                    self.config.poll_interval_s,
+                    max(0.0, proof_deadline_s - self.clock()),
+                )
+            )
         return False
 
     def _observe_until_terminal_gate(self, baseline_epoch: int) -> int:
@@ -1936,7 +2458,7 @@ class Forward02mRunner:
             elapsed = self.clock() - self._post_started_s
             if elapsed >= self.config.run_deadline_s:
                 raise AcceptanceError("command remained unfinished for 25 seconds")
-            snapshot, forward = self._poll()
+            snapshot, forward, had_phase_skew = self._poll()
             if not _ra_active_runtime(snapshot.robot_agent, epoch=baseline_epoch):
                 raise AcceptanceError("Robot Agent left the strict ACTIVE command phase")
             if _sonic_intent_active(snapshot.sonic):
@@ -1948,6 +2470,8 @@ class Forward02mRunner:
                 self._progress_seen = True
             if not progress_seen and observed_elapsed >= self.config.progress_deadline_s:
                 raise AcceptanceError("command made less than 0.03 m progress in 15 seconds")
+            if had_phase_skew:
+                idle_since = None
             if _strict_idle_plant_sonic(snapshot.plant, snapshot.sonic):
                 idle_since = self.clock() if idle_since is None else idle_since
             else:
@@ -1968,12 +2492,18 @@ class Forward02mRunner:
 
     def _prove_final_hold(self, epoch: int) -> None:
         final_started = self.clock()
+        final_deadline_s = final_started + 8.0
         hold_since: float | None = None
         hold_started = False
         while True:
-            if self.clock() - final_started >= 8.0:
+            if self.clock() >= final_deadline_s:
                 raise AcceptanceError("final SAFE_HOLD was not proved within its 8 second budget")
-            snapshot, _forward = self._poll()
+            snapshot, _forward, had_phase_skew = self._poll(
+                hard_deadline_s=final_deadline_s,
+                hard_deadline_reason=(
+                    "final SAFE_HOLD was not proved within its 8 second budget"
+                ),
+            )
             motion_truth = bool(
                 self._latest_motion_healthy
                 and not self._latest_motion_intent
@@ -1985,6 +2515,8 @@ class Forward02mRunner:
                 and _ra_safe_hold(snapshot.robot_agent, epoch=epoch)
                 and motion_truth
             )
+            if had_phase_skew:
+                hold_since = None
             if strict:
                 hold_since = self.clock() if hold_since is None else hold_since
                 hold_started = True
