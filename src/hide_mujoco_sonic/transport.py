@@ -21,8 +21,12 @@ def request_json(
     payload: dict[str, Any],
     *,
     timeout: float = 0.5,
+    require_ok: bool = True,
 ) -> dict[str, Any]:
     """Send one bounded loopback command and require its matching ACK."""
+
+    if not isinstance(require_ok, bool):
+        raise ValueError("require_ok must be a boolean")
 
     request_id = str(payload.get("request_id") or uuid4())
     message = {**payload, "request_id": request_id}
@@ -45,7 +49,10 @@ def request_json(
         raise RuntimeError("SONIC command endpoint returned an invalid response") from exc
     if not isinstance(value, dict) or value.get("request_id") != request_id:
         raise RuntimeError("SONIC command response identity mismatch")
-    if value.get("ok") is not True:
+    ok = value.get("ok")
+    if not isinstance(ok, bool):
+        raise RuntimeError("SONIC command response truth flag is invalid")
+    if require_ok and not ok:
         raise RuntimeError(str(value.get("error") or "SONIC command was rejected"))
     return value
 

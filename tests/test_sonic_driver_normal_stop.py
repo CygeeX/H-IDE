@@ -15,7 +15,13 @@ from hide_mujoco_sonic.normal_stop_wire import (
     parse_normal_stop_response,
 )
 from hide_mujoco_sonic.reference_authority import ReferenceAuthorityState
-from hide_mujoco_sonic.sonic_driver import SonicDriver, SonicIntentIngress
+from hide_mujoco_sonic.sonic_driver import (
+    SonicDriver,
+    SonicIntentIngress,
+    _bind_command_server,
+    _handle_command_connection,
+)
+from hide_mujoco_sonic.transport import request_json
 
 
 DRIVER_BOOT_ID = UUID("30000000-0000-4000-8000-000000000003")
@@ -2251,3 +2257,50 @@ def test_terminal_fault_never_enters_normal_stop() -> None:
     assert driver._normal_stop.snapshot.phase == "NONE"
     assert driver._normal_stop_bridge_boot_id is None
     assert driver.guard.stops == []
+
+
+def test_real_driver_failed_response_crosses_negative_truth_transport() -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    identity = enter_stationary(driver, clock)
+    payload = plant_request(
+        identity=identity,
+        plant=plant_failure("Plant confirmation was unavailable"),
+    )
+    server = _bind_command_server("127.0.0.1", 0)
+    port = int(server.getsockname()[1])
+    failures: list[Exception] = []
+
+    def serve() -> None:
+        try:
+            connection, _address = server.accept()
+            with connection:
+                _handle_command_connection(driver, connection)
+        except Exception as exc:
+            failures.append(exc)
+
+    worker = threading.Thread(target=serve, daemon=True)
+    worker.start()
+    try:
+        response = request_json(
+            "127.0.0.1",
+            port,
+            payload,
+            timeout=1.0,
+            require_ok=False,
+        )
+    finally:
+        worker.join(timeout=2.0)
+        server.close()
+
+    assert worker.is_alive() is False
+    assert failures == []
+    parsed = parse_normal_stop_response(
+        response,
+        expected_request_id=PLANT_REQUEST_ID,
+        expected_driver_boot_id=DRIVER_BOOT_ID,
+        expected_identity=identity,
+        expected_phases=frozenset({"FAILED"}),
+    )
+    assert parsed.ok is False
+    assert driver._normal_stop.snapshot.phase == "FAILED"

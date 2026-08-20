@@ -12,7 +12,7 @@ from dataclasses import replace
 import math
 import os
 import time
-from typing import Iterable
+from typing import Iterable, Mapping
 from uuid import UUID, uuid4
 
 from .config import SimConfig
@@ -34,6 +34,7 @@ from .motion_fault import (
     require_fresh_motion_health,
     sonic_health_probe,
 )
+from .normal_stop_coordinator import BridgeNormalStopCoordinator
 from .safety import (
     BodyStabilityGuard,
     GoalProgressGuard,
@@ -45,6 +46,7 @@ from .transport import (
     latch_plant_physics_fault,
     request_json,
     send_json,
+    set_plant_support,
 )
 
 
@@ -158,6 +160,19 @@ def _observe_health_reference_authority(
     )
 
 
+def _suppress_for_correlated_stop(
+    coordinator: BridgeNormalStopCoordinator | None,
+    intent: SonicIntent,
+) -> bool:
+    """Keep ordinary envelopes behind strict stop correlation, never FAULT."""
+
+    return bool(
+        coordinator is not None
+        and intent.state != GaitState.FAULT.value
+        and coordinator.blocks_generic_intent(intent.generation)
+    )
+
+
 def run_ros_bridge(config: SimConfig) -> None:
     os.environ["ROS_DOMAIN_ID"] = str(config.ros_domain_id)
     os.environ.setdefault("RMW_IMPLEMENTATION", "rmw_cyclonedds_cpp")
@@ -175,6 +190,8 @@ def run_ros_bridge(config: SimConfig) -> None:
         import rclpy
         from geometry_msgs.msg import PoseWithCovarianceStamped, Twist
         from nav_msgs.msg import Odometry, Path
+        from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+        from rclpy.executors import MultiThreadedExecutor
         from std_msgs.msg import String
         from std_srvs.srv import Trigger
     except ImportError as exc:  # pragma: no cover - depends on ROS installation
@@ -182,7 +199,10 @@ def run_ros_bridge(config: SimConfig) -> None:
 
     rclpy.init()
     node = rclpy.create_node("h_ide_mujoco_sonic_bridge")
+    state_group = MutuallyExclusiveCallbackGroup()
+    normal_stop_group = MutuallyExclusiveCallbackGroup()
     generation = {"value": _new_bridge_generation()}
+    bridge_boot_id = uuid4()
     fault_latch = MotionFaultLatch(
         robot_id=config.robot_id,
         localization_epoch_id=config.localization_epoch_id,
@@ -213,6 +233,9 @@ def run_ros_bridge(config: SimConfig) -> None:
     latest_heading = {"yaw": None}
     latest_observation: dict[str, BaseObservation | None] = {"value": None}
     bridge_fault = {"reason": None}
+    normal_stop_coordinator: dict[
+        str, BridgeNormalStopCoordinator | None
+    ] = {"value": None}
     health_fault_gate = SonicHealthFaultGate(
         plant_lowstate_stale_s=config.plant_lowstate_stale_s,
         sonic_control_step_stale_s=config.sonic_control_step_stale_s,
@@ -236,7 +259,11 @@ def run_ros_bridge(config: SimConfig) -> None:
     )
     stability_guard = BodyStabilityGuard()
 
-    def request_sonic_health(request_id: UUID) -> SonicHealth:
+    def request_sonic_health(
+        request_id: UUID,
+        *,
+        timeout_s: float | None = None,
+    ) -> SonicHealth:
         """Read one correlated, strict v2 health snapshot from SONIC."""
 
         response = request_json(
@@ -247,7 +274,11 @@ def run_ros_bridge(config: SimConfig) -> None:
                 producer_boot_id=fault_latch.producer_boot_id,
                 request_id=request_id,
             ),
-            timeout=config.sonic_health_probe_timeout_s,
+            timeout=(
+                config.sonic_health_probe_timeout_s
+                if timeout_s is None
+                else float(timeout_s)
+            ),
         )
         return SonicHealth.from_response(
             response,
@@ -298,6 +329,11 @@ def run_ros_bridge(config: SimConfig) -> None:
         bounded_reason = str(reason).strip()[:512] or "motion safety fault"
         if bridge_fault["reason"] is None:
             bridge_fault["reason"] = f"{source}/{code}: {bounded_reason}"
+        coordinator = normal_stop_coordinator["value"]
+        if coordinator is not None:
+            coordinator.notify_terminal(
+                f"{source}/{code}: {bounded_reason}"
+            )
 
         def local_stop() -> None:
             errors: list[str] = []
@@ -378,6 +414,11 @@ def run_ros_bridge(config: SimConfig) -> None:
                     f"failed to enforce GaitAdapter fault stop: {exc}"
                 )
             return False
+        if _suppress_for_correlated_stop(
+            normal_stop_coordinator["value"],
+            intent,
+        ):
+            return False
         try:
             send_intent(intent)
         except Exception as exc:
@@ -395,6 +436,85 @@ def run_ros_bridge(config: SimConfig) -> None:
                 )
             return False
         return True
+
+    normal_stop_guard: dict[str, object | None] = {"value": None}
+
+    def normal_stop_terminal_reason() -> str | None:
+        reason = bridge_fault["reason"]
+        if reason is not None:
+            return str(reason)
+        event = fault_latch.event
+        if event is None:
+            return None
+        return f"{event.source}/{event.code}: {event.reason}"
+
+    def request_normal_gait_stop(
+        control_generation: int,
+        now: float,
+    ) -> dict[str, object]:
+        intent = gait.request_safe_stop(control_generation, now=now)
+        if intent.state == GaitState.FAULT.value:
+            # FAULT is never repackaged as a recoverable normal failure.
+            deliver_intent(intent, context="correlated safe-stop request")
+        return _intent_payload(
+            intent,
+            measured_heading_yaw=latest_heading["yaw"],
+        )
+
+    def request_normal_stop_driver(
+        payload: Mapping[str, object],
+        timeout_s: float,
+    ) -> dict[str, object]:
+        return request_json(
+            config.command_host,
+            config.command_port,
+            dict(payload),
+            timeout=timeout_s,
+            require_ok=False,
+        )
+
+    def stop_normal_stop_plant(timeout_s: float) -> dict[str, object]:
+        return set_plant_support(
+            "127.0.0.1",
+            config.plant_port,
+            "safety_stop",
+            timeout=timeout_s,
+        )
+
+    def probe_normal_stop_health(
+        request_id: UUID,
+        timeout_s: float,
+    ) -> SonicHealth:
+        return request_sonic_health(request_id, timeout_s=timeout_s)
+
+    def wake_normal_stop_pump() -> None:
+        guard = normal_stop_guard["value"]
+        if guard is None:
+            raise RuntimeError("normal-stop GuardCondition is unavailable")
+        guard.trigger()  # type: ignore[attr-defined]
+
+    coordinator = BridgeNormalStopCoordinator(
+        robot_id=config.robot_id,
+        bridge_boot_id=bridge_boot_id,
+        generation=lambda: generation["value"],
+        request_gait_stop=request_normal_gait_stop,
+        request_driver=request_normal_stop_driver,
+        stop_plant=stop_normal_stop_plant,
+        probe_health=probe_normal_stop_health,
+        wake_state_pump=wake_normal_stop_pump,
+        terminal_reason=normal_stop_terminal_reason,
+        plant_lowstate_stale_s=config.plant_lowstate_stale_s,
+        sonic_control_step_stale_s=config.sonic_control_step_stale_s,
+    )
+    normal_stop_coordinator["value"] = coordinator
+
+    def pump_normal_stop() -> None:
+        coordinator.pump()
+
+    normal_stop_guard["value"] = node.create_guard_condition(
+        pump_normal_stop,
+        callback_group=state_group,
+    )
 
     def on_pose(message: PoseWithCovarianceStamped):
         pose = message.pose.pose
@@ -542,6 +662,12 @@ def run_ros_bridge(config: SimConfig) -> None:
             armed = gait.arm(generation["value"], now=now)
             if armed.state == GaitState.IDLE.value:
                 intent = armed
+        coordinator.observe_stationary_intent(
+            _intent_payload(
+                intent,
+                measured_heading_yaw=latest_heading["yaw"],
+            )
+        )
         deliver_intent(intent, context="measured gait state")
 
     def on_path(message: Path):
@@ -611,7 +737,7 @@ def run_ros_bridge(config: SimConfig) -> None:
         )
         deliver_intent(intent, context="Nav2 gait intent")
 
-    def control_arm(_request, response):
+    def perform_control_arm(_request, response):
         """Use one explicit Robot Agent control.acquire to rearm the plant."""
 
         if bridge_fault["reason"] is not None:
@@ -757,11 +883,66 @@ def run_ros_bridge(config: SimConfig) -> None:
         )
         return response
 
-    node.create_subscription(Twist, config.cmd_vel_topic, on_cmd, 10)
-    node.create_subscription(Odometry, config.odom_topic, on_odom, 10)
-    node.create_subscription(PoseWithCovarianceStamped, config.localization_topic, on_pose, 10)
-    node.create_subscription(Path, config.nav_path_topic, on_path, 10)
-    node.create_service(Trigger, "/robot/control_arm", control_arm)
+    def control_arm(request, response):
+        blocked = coordinator.reserve_control_arm()
+        if blocked is not None:
+            response.success = False
+            response.message = f"control arm rejected: {blocked}"
+            return response
+        try:
+            return perform_control_arm(request, response)
+        finally:
+            coordinator.release_control_arm()
+
+    node.create_subscription(
+        Twist,
+        config.cmd_vel_topic,
+        on_cmd,
+        10,
+        callback_group=state_group,
+    )
+    node.create_subscription(
+        Odometry,
+        config.odom_topic,
+        on_odom,
+        10,
+        callback_group=state_group,
+    )
+    node.create_subscription(
+        PoseWithCovarianceStamped,
+        config.localization_topic,
+        on_pose,
+        10,
+        callback_group=state_group,
+    )
+    node.create_subscription(
+        Path,
+        config.nav_path_topic,
+        on_path,
+        10,
+        callback_group=state_group,
+    )
+    node.create_service(
+        Trigger,
+        "/robot/control_arm",
+        control_arm,
+        callback_group=state_group,
+    )
+
+    def normal_stop(_request, response):
+        result = coordinator.request_stop(
+            "Robot Agent requested a correlated simulation safe-stop"
+        )
+        response.success = result.success
+        response.message = result.message
+        return response
+
+    node.create_service(
+        Trigger,
+        "/h_ide/mujoco/normal_stop",
+        normal_stop,
+        callback_group=normal_stop_group,
+    )
 
     def watchdog():
         now = time.monotonic()
@@ -899,16 +1080,27 @@ def run_ros_bridge(config: SimConfig) -> None:
                 f"failed to enforce SONIC/Plant health stop: {delivery_exc}"
             )
 
-    node.create_timer(min(config.command_timeout_s / 2, 0.1), watchdog)
-    node.create_timer(config.sonic_health_probe_period_s, health_probe)
+    node.create_timer(
+        min(config.command_timeout_s / 2, 0.1),
+        watchdog,
+        callback_group=state_group,
+    )
+    node.create_timer(
+        config.sonic_health_probe_period_s,
+        health_probe,
+        callback_group=state_group,
+    )
     node.get_logger().info(
         f"H-IDE MuJoCo SONIC bridge listening to {config.cmd_vel_topic} "
         f"and {config.nav_path_topic} on ROS domain {config.ros_domain_id}; "
         f"faults publish on {config.motion_fault_topic}"
     )
+    executor = MultiThreadedExecutor(num_threads=2)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     finally:
+        coordinator.shutdown()
         try:
             send_json(
                 config.command_host,
@@ -921,6 +1113,7 @@ def run_ros_bridge(config: SimConfig) -> None:
             )
         except OSError:
             pass
+        executor.shutdown()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

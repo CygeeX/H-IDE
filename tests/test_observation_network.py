@@ -117,6 +117,85 @@ def test_loopback_command_request_requires_a_matching_positive_ack() -> None:
     assert response == {"request_id": "request-7", "ok": True, "mode": "idle"}
 
 
+def _request_with_loopback_response(
+    response: dict[str, object] | bytes,
+    *,
+    require_ok: bool = True,
+) -> dict[str, object]:
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = int(server.getsockname()[1])
+
+    def respond() -> None:
+        connection, _address = server.accept()
+        with connection:
+            raw = b""
+            while b"\n" not in raw:
+                raw += connection.recv(4096)
+            encoded = (
+                response
+                if isinstance(response, bytes)
+                else json.dumps(response).encode("utf-8")
+            )
+            connection.sendall(encoded + b"\n")
+
+    worker = threading.Thread(target=respond, daemon=True)
+    worker.start()
+    try:
+        return request_json(
+            "127.0.0.1",
+            port,
+            {"type": "test", "request_id": "request-8"},
+            timeout=1.0,
+            require_ok=require_ok,
+        )
+    finally:
+        worker.join(timeout=2.0)
+        server.close()
+
+
+def test_loopback_transport_can_return_strict_negative_truth_to_caller() -> None:
+    negative = {
+        "request_id": "request-8",
+        "ok": False,
+        "error": "strict state machine rejected the phase",
+    }
+
+    with pytest.raises(RuntimeError, match="rejected the phase"):
+        _request_with_loopback_response(negative)
+    assert _request_with_loopback_response(
+        negative,
+        require_ok=False,
+    ) == negative
+
+
+@pytest.mark.parametrize("ok", [None, 0, 1, "false"])
+def test_negative_truth_mode_still_requires_an_exact_boolean(ok: object) -> None:
+    with pytest.raises(RuntimeError, match="truth flag"):
+        _request_with_loopback_response(
+            {"request_id": "request-8", "ok": ok},
+            require_ok=False,
+        )
+
+
+def test_negative_truth_mode_keeps_identity_and_protocol_fail_closed() -> None:
+    with pytest.raises(RuntimeError, match="identity mismatch"):
+        _request_with_loopback_response(
+            {"request_id": "another-request", "ok": False},
+            require_ok=False,
+        )
+    with pytest.raises(RuntimeError, match="invalid response"):
+        _request_with_loopback_response(b"{not-json", require_ok=False)
+    with pytest.raises(ValueError, match="require_ok"):
+        request_json(
+            "127.0.0.1",
+            1,
+            {"type": "test"},
+            require_ok=0,  # type: ignore[arg-type]
+        )
+
+
 def test_docker_gateway_resolution_is_exact_and_interface_bound() -> None:
     resolved = resolve_docker_observation_bind_host(
         "auto",
