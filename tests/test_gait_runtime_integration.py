@@ -449,7 +449,9 @@ class FakeTelemetry:
 def bare_driver(clock: Clock) -> SonicDriver:
     driver = SonicDriver.__new__(SonicDriver)
     driver.config = SimpleNamespace(
-        plant_port=8794,
+        # Unit-test drivers must never inherit the production Plant endpoint.
+        # Tests exercising a Plant transition inject the transport explicitly.
+        plant_port=0,
         robot_id="g1-sim",
         plant_lowstate_stale_s=0.10,
         sonic_control_step_stale_s=0.10,
@@ -2900,7 +2902,9 @@ def test_mid_gait_replan_reject_wait_accept_and_bad_refresh_use_actual_dds_bound
     assert writes[-1] == pytest.approx(continued_target)
 
 
-def test_required_planner_deadline_latches_terminal_exact_target_hold() -> None:
+def test_required_planner_deadline_latches_terminal_exact_target_hold(
+    block_live_driver_plant_writes,
+) -> None:
     clock = Clock()
     driver, writes = _publishing_driver(clock)
     boundary = tuple(0.01 * index for index in range(29))
@@ -2945,6 +2949,9 @@ def test_required_planner_deadline_latches_terminal_exact_target_hold() -> None:
     assert "required SONIC planner reference timed out" in str(
         driver.telemetry.values["last_error"]
     )
+    assert [call[0] for call in block_live_driver_plant_writes] == [
+        "latch_plant_physics_fault"
+    ]
 
 
 def test_driver_requires_startup_qualification_before_accepting_motion() -> None:
