@@ -48,6 +48,9 @@ class Guard:
         self.stops.append(source)
         self._command_zero = True
 
+    def observe_heading(self, _heading_yaw: float) -> None:
+        return None
+
 
 class Telemetry:
     def __init__(self) -> None:
@@ -55,6 +58,30 @@ class Telemetry:
 
     def update(self, **values: object) -> None:
         self.values.update(values)
+
+
+class ObservedLock:
+    """Plain lock that exposes a deterministic blocked-acquire test hook."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.acquire_attempted = threading.Event()
+
+    def acquire(self, blocking: bool = True, timeout: float = -1.0) -> bool:
+        self.acquire_attempted.set()
+        if timeout < 0:
+            return self._lock.acquire(blocking)
+        return self._lock.acquire(blocking, timeout)
+
+    def release(self) -> None:
+        self._lock.release()
+
+    def __enter__(self) -> ObservedLock:
+        self.acquire()
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.release()
 
 
 def bare_driver(clock: Clock) -> SonicDriver:
@@ -73,7 +100,10 @@ def bare_driver(clock: Clock) -> SonicDriver:
     driver._navigation_task_active = False
     driver._intent_gate = None
     driver._joint_handoff = SimpleNamespace(freeze=lambda _targets: None)
-    driver._arm_guard = SimpleNamespace(anchor=lambda _targets: None)
+    driver._arm_guard = SimpleNamespace(
+        anchor=lambda _targets: None,
+        reset=lambda: None,
+    )
     driver._last_published_targets = tuple(0.0 for _ in range(29))
     driver._safe_hold_targets = None
     driver._static_hold_active = False
@@ -249,6 +279,91 @@ def enter_stationary(driver: SonicDriver, clock: Clock) -> NormalStopIdentity:
     driver.accept_json(stationary_request(clock, identity=identity))
     assert driver._normal_stop.snapshot.phase == "STATIONARY_ACK"
     return identity
+
+
+def generic_gait_intent(
+    clock: Clock,
+    *,
+    generation: int,
+    sequence: int,
+    kind: str,
+) -> dict[str, object]:
+    payload = stopping_intent(
+        clock,
+        generation=generation,
+        sequence=sequence,
+    )
+    if kind == "motion":
+        payload.update(
+            state="WALKING",
+            mode="SLOW_WALK",
+            velocity_x_mps=0.2,
+            linear_speed_mps=0.2,
+            motion_enabled=True,
+            stop_requested=False,
+            stop_acknowledged=False,
+        )
+    elif kind in {"idle", "control_arm"}:
+        payload.update(
+            state="IDLE",
+            stop_requested=False,
+            stop_acknowledged=True,
+        )
+        if kind == "control_arm":
+            payload["control_arm"] = True
+            payload["request_id"] = "control-arm-test"
+    elif kind == "fault":
+        payload.update(
+            state="FAULT",
+            stop_requested=True,
+            stop_acknowledged=False,
+            reason="deterministic terminal gait fault",
+        )
+    elif kind != "stop":
+        raise AssertionError(f"unsupported test gait intent kind: {kind}")
+    return payload
+
+
+def enter_normal_phase(
+    driver: SonicDriver,
+    clock: Clock,
+    phase: str,
+) -> NormalStopIdentity:
+    if phase == "BRAKING":
+        driver.accept_json(begin_request(clock))
+        identity = driver._normal_stop.snapshot.identity
+        assert identity is not None
+        return identity
+    identity = enter_stationary(driver, clock)
+    if phase == "PLANT_CONFIRMED":
+        driver._normal_stop.confirm_plant(identity)
+    elif phase == "FAILED":
+        driver._normal_stop.fail(identity, reason="deterministic normal failure")
+    elif phase != "STATIONARY_ACK":
+        raise AssertionError(f"unsupported normal-stop phase: {phase}")
+    return identity
+
+
+def configure_control_arm_health(driver: SonicDriver, clock: Clock) -> None:
+    driver._control_condition = threading.Condition(threading.RLock())
+    driver._motion_ready = threading.Event()
+    driver._motion_ready.set()
+    driver._wall_clock = clock
+    driver._last_lowstate_wall_s = clock.value
+    driver._last_control_step_wall_s = clock.value
+    driver.config.plant_lowstate_stale_s = 0.10
+    driver.config.sonic_control_step_stale_s = 0.10
+
+
+def _capture_exception(
+    errors: list[Exception],
+    callback: object,
+    *args: object,
+) -> None:
+    try:
+        callback(*args)  # type: ignore[operator]
+    except Exception as exc:
+        errors.append(exc)
 
 
 def complete_state(driver: SonicDriver) -> None:
@@ -1542,6 +1657,500 @@ def test_late_locomotion_support_rejection_is_expected_during_braking() -> None:
     assert outcomes == [(False, True)]
     assert driver._fault_latched.is_set() is False
     assert driver._normal_stop.snapshot.phase == "BRAKING"
+
+
+@pytest.mark.parametrize(
+    "phase",
+    ["BRAKING", "STATIONARY_ACK", "PLANT_CONFIRMED", "FAILED"],
+)
+@pytest.mark.parametrize("kind", ["stop", "idle", "motion", "control_arm"])
+def test_normal_stop_phase_barrier_precedes_generic_ingress_mutation(
+    phase: str,
+    kind: str,
+) -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    enter_normal_phase(driver, clock, phase)
+    snapshot = driver._normal_stop.snapshot
+    ingress_before = (
+        driver._intent_ingress.generation,
+        driver._intent_ingress.sequence,
+        driver._intent_ingress.armed,
+        driver._intent_ingress.staged_control_arm_generation,
+        driver._intent_ingress.support_stop_generation,
+    )
+    stops_before = list(driver.guard.stops)
+    pending_before = driver._plant_support_stop_pending
+    payload = generic_gait_intent(
+        clock,
+        generation=10,
+        sequence=driver._intent_ingress.sequence + 1,
+        kind=kind,
+    )
+
+    if kind == "control_arm":
+        configure_control_arm_health(driver, clock)
+        with pytest.raises(RuntimeError, match="current exact DRIVER_CONFIRMED"):
+            driver.accept_json(payload)
+    elif kind == "motion":
+        with pytest.raises(RuntimeError, match="rejects new gait/control"):
+            driver.accept_json(payload)
+    else:
+        assert driver.accept_json(payload) is None
+
+    assert driver._normal_stop.snapshot is snapshot
+    assert (
+        driver._intent_ingress.generation,
+        driver._intent_ingress.sequence,
+        driver._intent_ingress.armed,
+        driver._intent_ingress.staged_control_arm_generation,
+        driver._intent_ingress.support_stop_generation,
+    ) == ingress_before
+    assert driver.guard.stops == stops_before
+    assert driver._plant_support_stop_pending is pending_before
+
+
+@pytest.mark.parametrize(
+    "phase",
+    ["BRAKING", "STATIONARY_ACK", "PLANT_CONFIRMED", "FAILED"],
+)
+def test_real_gait_fault_bypasses_normal_barrier_into_terminal_path(
+    phase: str,
+) -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    enter_normal_phase(driver, clock, phase)
+    snapshot = driver._normal_stop.snapshot
+    terminal_reasons: list[str] = []
+
+    def fake_terminal(reason: str, **_kwargs: object) -> None:
+        terminal_reasons.append(reason)
+        driver._fault_latched.set()
+
+    driver._latch_terminal_fault = fake_terminal  # type: ignore[method-assign]
+    sequence = driver._intent_ingress.sequence + 1
+    payload = generic_gait_intent(
+        clock,
+        generation=10,
+        sequence=sequence,
+        kind="fault",
+    )
+
+    assert driver.accept_json(payload) is None
+
+    assert terminal_reasons == ["deterministic terminal gait fault"]
+    assert driver._fault_latched.is_set() is True
+    assert driver._normal_stop.snapshot is snapshot
+    assert driver._intent_ingress.sequence == sequence
+    assert driver.guard.stops[-1] == "terminal_fault"
+
+
+def test_control_arm_requires_current_driver_confirmed_identity_before_ingress() -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    configure_control_arm_health(driver, clock)
+    payload = generic_gait_intent(
+        clock,
+        generation=1,
+        sequence=1,
+        kind="control_arm",
+    )
+
+    with pytest.raises(RuntimeError, match="current exact DRIVER_CONFIRMED"):
+        driver.accept_json(payload)
+
+    assert driver._normal_stop.snapshot.phase == "NONE"
+    assert driver._intent_ingress.generation is None
+    assert driver._intent_ingress.sequence == 0
+
+
+def test_begin_winning_after_generic_candidate_read_blocks_ingress_mutation() -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    identity = enter_stationary(driver, clock)
+    driver.accept_json(plant_request(identity=identity))
+    candidate_read = threading.Barrier(2)
+    release_candidate = threading.Barrier(2)
+    errors: list[Exception] = []
+    payload = generic_gait_intent(
+        clock,
+        generation=11,
+        sequence=23,
+        kind="motion",
+    )
+
+    def deliver_candidate() -> None:
+        assert driver._normal_stop.snapshot.phase == "DRIVER_CONFIRMED"
+        candidate_read.wait(timeout=2.0)
+        release_candidate.wait(timeout=2.0)
+        try:
+            driver.accept_json(payload)
+        except Exception as exc:
+            errors.append(exc)
+
+    generic_thread = threading.Thread(target=deliver_candidate)
+    generic_thread.start()
+    candidate_read.wait(timeout=2.0)
+    clock.value += 0.01
+    driver.accept_json(
+        begin_request(
+            clock,
+            request_id=UUID("10000000-0000-4000-8000-000000000031"),
+            generation=11,
+            sequence=22,
+        )
+    )
+    ingress_after_begin = (
+        driver._intent_ingress.generation,
+        driver._intent_ingress.sequence,
+        driver._intent_ingress.armed,
+        driver._intent_ingress.staged_control_arm_generation,
+        driver._intent_ingress.support_stop_generation,
+    )
+    release_candidate.wait(timeout=2.0)
+    generic_thread.join(timeout=2.0)
+
+    assert generic_thread.is_alive() is False
+    assert len(errors) == 1
+    assert "rejects new gait/control authority" in str(errors[0])
+    assert driver._normal_stop.snapshot.phase == "BRAKING"
+    assert (
+        driver._intent_ingress.generation,
+        driver._intent_ingress.sequence,
+        driver._intent_ingress.armed,
+        driver._intent_ingress.staged_control_arm_generation,
+        driver._intent_ingress.support_stop_generation,
+    ) == ingress_after_begin
+
+
+def test_terminal_winning_control_arm_precheck_prevents_staging_and_plant_io(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    identity = enter_stationary(driver, clock)
+    driver.accept_json(plant_request(identity=identity))
+    configure_control_arm_health(driver, clock)
+    terminal_lock = ObservedLock()
+    driver._terminal_fault_lock = terminal_lock  # type: ignore[assignment]
+    rearm_calls: list[int] = []
+    monkeypatch.setattr(
+        "hide_mujoco_sonic.sonic_driver.rearm_plant_support",
+        lambda _host, _port, generation, **_kwargs: rearm_calls.append(generation),
+    )
+    payload = generic_gait_intent(
+        clock,
+        generation=11,
+        sequence=1,
+        kind="control_arm",
+    )
+    ingress_before = (
+        driver._intent_ingress.generation,
+        driver._intent_ingress.sequence,
+        driver._intent_ingress.armed,
+        driver._intent_ingress.staged_control_arm_generation,
+        driver._intent_ingress.support_stop_generation,
+    )
+    errors: list[Exception] = []
+
+    terminal_lock.acquire()
+    terminal_lock.acquire_attempted.clear()
+    arm_thread = threading.Thread(
+        target=lambda: _capture_exception(errors, driver.accept_json, payload)
+    )
+    arm_thread.start()
+    assert terminal_lock.acquire_attempted.wait(timeout=2.0)
+    driver._terminal_fault_reason = "terminal precheck won"
+    driver._fault_latched.set()
+    terminal_lock.release()
+    arm_thread.join(timeout=2.0)
+
+    assert arm_thread.is_alive() is False
+    assert len(errors) == 1
+    assert "terminal fault is latched" in str(errors[0])
+    assert rearm_calls == []
+    assert (
+        driver._intent_ingress.generation,
+        driver._intent_ingress.sequence,
+        driver._intent_ingress.armed,
+        driver._intent_ingress.staged_control_arm_generation,
+        driver._intent_ingress.support_stop_generation,
+    ) == ingress_before
+
+
+def test_terminal_winning_control_arm_postcheck_relatches_without_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    identity = enter_stationary(driver, clock)
+    driver.accept_json(plant_request(identity=identity))
+    configure_control_arm_health(driver, clock)
+    rearm_entered = threading.Event()
+    release_rearm = threading.Event()
+    support_calls: list[str] = []
+
+    def blocked_rearm(*_args: object, **_kwargs: object) -> None:
+        rearm_entered.set()
+        assert release_rearm.wait(timeout=2.0)
+
+    def confirm_support(
+        _host: str,
+        _port: int,
+        mode: str,
+        **_kwargs: object,
+    ) -> dict[str, object]:
+        support_calls.append(mode)
+        return {"mode": mode}
+
+    monkeypatch.setattr(
+        "hide_mujoco_sonic.sonic_driver.rearm_plant_support",
+        blocked_rearm,
+    )
+    monkeypatch.setattr(
+        "hide_mujoco_sonic.sonic_driver.set_plant_support",
+        confirm_support,
+    )
+    payload = generic_gait_intent(
+        clock,
+        generation=11,
+        sequence=1,
+        kind="control_arm",
+    )
+    responses: list[dict[str, object] | None] = []
+    errors: list[Exception] = []
+
+    def arm() -> None:
+        try:
+            responses.append(driver.accept_json(payload))
+        except Exception as exc:
+            errors.append(exc)
+
+    arm_thread = threading.Thread(target=arm)
+    arm_thread.start()
+    assert rearm_entered.wait(timeout=2.0)
+    with driver._terminal_fault_lock:
+        driver._terminal_plant_halt_attempted = True
+        driver._terminal_fault_reason = "terminal postcheck won"
+        driver._fault_latched.set()
+    release_rearm.set()
+    arm_thread.join(timeout=2.0)
+
+    assert arm_thread.is_alive() is False
+    assert responses == []
+    assert len(errors) == 1
+    assert "post-rearm health failed" in str(errors[0])
+    assert "terminal fault is latched" in str(errors[0])
+    assert support_calls == ["safety_stop"]
+    assert driver._intent_ingress.armed is False
+    assert driver._intent_ingress.staged_control_arm_generation is None
+    assert driver._plant_support_mode == "safety_stop"
+    assert driver._plant_support_safety_latched is True
+
+
+def test_control_arm_commit_winning_precedes_terminal_revoke(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    identity = enter_stationary(driver, clock)
+    driver.accept_json(plant_request(identity=identity))
+    configure_control_arm_health(driver, clock)
+    terminal_lock = ObservedLock()
+    driver._terminal_fault_lock = terminal_lock  # type: ignore[assignment]
+    monkeypatch.setattr(
+        "hide_mujoco_sonic.sonic_driver.rearm_plant_support",
+        lambda *_args, **_kwargs: None,
+    )
+    plant_faults: list[str] = []
+    monkeypatch.setattr(
+        "hide_mujoco_sonic.sonic_driver.latch_plant_physics_fault",
+        lambda _host, _port, reason, **_kwargs: plant_faults.append(reason),
+    )
+    commit_entered = threading.Event()
+    release_commit = threading.Event()
+    original_commit = driver._commit_staged_plant_support_rearm_locked
+
+    def blocked_commit(generation: int) -> None:
+        commit_entered.set()
+        assert release_commit.wait(timeout=2.0)
+        original_commit(generation)
+
+    driver._commit_staged_plant_support_rearm_locked = blocked_commit  # type: ignore[method-assign]
+    payload = generic_gait_intent(
+        clock,
+        generation=11,
+        sequence=1,
+        kind="control_arm",
+    )
+    responses: list[dict[str, object] | None] = []
+    arm_errors: list[Exception] = []
+    terminal_errors: list[Exception] = []
+
+    def arm_with_errors() -> None:
+        try:
+            responses.append(driver.accept_json(payload))
+        except Exception as exc:
+            arm_errors.append(exc)
+
+    arm_thread = threading.Thread(target=arm_with_errors)
+    arm_thread.start()
+    assert commit_entered.wait(timeout=2.0)
+    terminal_lock.acquire_attempted.clear()
+    terminal_thread = threading.Thread(
+        target=lambda: _capture_exception(
+            terminal_errors,
+            driver._latch_terminal_fault,
+            "terminal after committed rearm",
+        )
+    )
+    terminal_thread.start()
+    assert terminal_lock.acquire_attempted.wait(timeout=2.0)
+    release_commit.set()
+    arm_thread.join(timeout=2.0)
+    terminal_thread.join(timeout=2.0)
+
+    assert arm_thread.is_alive() is False
+    assert terminal_thread.is_alive() is False
+    assert arm_errors == []
+    assert terminal_errors == []
+    assert responses == [{"ok": True, "mode": "idle", "generation": 11}]
+    assert driver._fault_latched.is_set() is True
+    assert driver._terminal_plant_halt_attempted is True
+    assert plant_faults == ["terminal after committed rearm"]
+    assert driver._safe_hold_targets == driver._last_published_targets
+    assert driver.guard.command_zero is True
+    assert driver._reference_authority.snapshot.phase == "REVOKED"
+
+
+def test_control_arm_succeeds_only_from_exact_driver_confirmed_hold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    identity = enter_stationary(driver, clock)
+    driver.accept_json(plant_request(identity=identity))
+    configure_control_arm_health(driver, clock)
+    monkeypatch.setattr(
+        "hide_mujoco_sonic.sonic_driver.rearm_plant_support",
+        lambda *_args, **_kwargs: None,
+    )
+    payload = generic_gait_intent(
+        clock,
+        generation=11,
+        sequence=1,
+        kind="control_arm",
+    )
+
+    response = driver.accept_json(payload)
+
+    assert response == {"ok": True, "mode": "idle", "generation": 11}
+    assert driver._normal_stop.snapshot.phase == "DRIVER_CONFIRMED"
+    assert driver._normal_stop_plant_safety_stop_epoch == 9
+    assert driver._intent_ingress.generation == 11
+    assert driver._intent_ingress.armed is True
+    assert driver._intent_ingress.support_stop_generation is None
+    assert driver._plant_support_mode == "idle"
+    assert driver._plant_support_safety_latched is False
+
+
+def test_normal_begin_racing_control_arm_postcheck_relatches_support(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    identity = enter_stationary(driver, clock)
+    driver.accept_json(plant_request(identity=identity))
+    configure_control_arm_health(driver, clock)
+    monkeypatch.setattr(
+        "hide_mujoco_sonic.sonic_driver.rearm_plant_support",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "hide_mujoco_sonic.sonic_driver.set_plant_support",
+        lambda _host, _port, mode, **_kwargs: {"mode": mode},
+    )
+    original_rearm = driver._request_staged_plant_support_rearm
+
+    def rearm_then_begin(generation: int) -> bool:
+        assert original_rearm(generation) is True
+        clock.value += 0.01
+        driver.accept_json(
+            begin_request(
+                clock,
+                request_id=UUID("10000000-0000-4000-8000-000000000030"),
+                generation=12,
+                sequence=22,
+            )
+        )
+        return True
+
+    driver._request_staged_plant_support_rearm = rearm_then_begin  # type: ignore[method-assign]
+    payload = generic_gait_intent(
+        clock,
+        generation=11,
+        sequence=1,
+        kind="control_arm",
+    )
+
+    with pytest.raises(RuntimeError, match="post-rearm health failed"):
+        driver.accept_json(payload)
+
+    assert driver._normal_stop.snapshot.phase == "BRAKING"
+    assert driver._normal_stop.snapshot.control_generation == 12
+    assert driver._normal_stop_plant_safety_stop_epoch is None
+    assert driver._intent_ingress.generation == 12
+    assert driver._intent_ingress.armed is False
+    assert driver._intent_ingress.support_stop_generation == 12
+    assert driver._plant_support_mode == "safety_stop"
+    assert driver._plant_support_safety_latched is True
+    assert driver._plant_support_stop_pending is False
+    assert driver._fault_latched.is_set() is False
+
+
+def test_legacy_safe_stop_does_not_start_plant_pending_during_braking() -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    driver.accept_json(begin_request(clock))
+    before = driver._normal_stop.snapshot
+    assert driver._plant_support_stop_pending is False
+
+    assert driver.accept_json(
+        {
+            "type": "stop",
+            "source": "robot_agent_safe_stop",
+            "reason": "obsolete outer safe-stop path",
+        }
+    ) is None
+
+    assert driver._normal_stop.snapshot is before
+    assert driver._normal_stop.snapshot.phase == "BRAKING"
+    assert driver._plant_support_stop_pending is False
+
+
+def test_legacy_plant_notification_only_strengthens_without_phase_progress() -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    driver.accept_json(begin_request(clock))
+    before = driver._normal_stop.snapshot
+
+    response = driver.accept_json(
+        {
+            "type": "plant_support_state",
+            "schema_version": "h-ide.plant-support-state/v1",
+            "mode": "safety_stop",
+            "source": "navigation_guard",
+            "reason": "independent safety strengthening",
+        }
+    )
+
+    assert response == {"ok": True, "mode": "safety_stop", "stopped_generation": 10}
+    assert driver._normal_stop.snapshot is before
+    assert driver._normal_stop.snapshot.phase == "BRAKING"
+    assert driver._normal_stop_plant_safety_stop_epoch is None
+    assert driver._normal_stop_last_confirmed_plant_epoch == 0
+    assert driver._plant_support_mode == "safety_stop"
+    assert driver._plant_support_safety_latched is True
 
 
 def test_new_bridge_boot_resets_only_sequence_after_confirmed_generation() -> None:

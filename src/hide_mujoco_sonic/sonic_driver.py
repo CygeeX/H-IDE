@@ -1485,6 +1485,28 @@ class SonicDriver:
             raise RuntimeError(f"{label}: SONIC terminal fault is latched")
         if self._stop.is_set():
             raise RuntimeError(f"{label}: SONIC is stopping")
+        normal_stop = getattr(self, "_normal_stop", None)
+        if not isinstance(normal_stop, NormalStopState):
+            raise RuntimeError(
+                f"{label}: correlated normal-stop confirmation is unavailable"
+            )
+        normal_snapshot = normal_stop.snapshot
+        normal_identity = normal_snapshot.identity
+        plant_epoch = self._normal_stop_plant_safety_stop_epoch
+        if (
+            normal_snapshot.phase != "DRIVER_CONFIRMED"
+            or normal_identity is None
+            or plant_epoch is None
+            or plant_epoch != self._normal_stop_last_confirmed_plant_epoch
+            or self._plant_support_stop_generation
+            != normal_identity.control_generation
+            or self._intent_ingress.support_stop_generation
+            != normal_identity.control_generation
+        ):
+            raise RuntimeError(
+                f"{label}: control acquisition requires the current exact "
+                "DRIVER_CONFIRMED normal stop"
+            )
         if not self._motion_ready.is_set():
             raise RuntimeError(f"{label}: SONIC is not motion-ready")
 
@@ -3731,7 +3753,10 @@ class SonicDriver:
                 except Exception as exc:
                     boundary_error = exc
                 self._intent_ingress.revoke()
-                if payload.get("source") == "robot_agent_safe_stop":
+                if (
+                    payload.get("source") == "robot_agent_safe_stop"
+                    and not self._normal_stop_fences_motion_locked()
+                ):
                     self._plant_support_stop_pending = True
                 support_latched = self._plant_support_safety_latched
                 support_pending = self._plant_support_stop_pending
@@ -3766,6 +3791,11 @@ class SonicDriver:
             )
             return None
         control_arm = payload.get("control_arm", False)
+        gait_state = payload.get("state")
+        terminal_gait_fault = (
+            payload.get("type") == "sonic_intent"
+            and gait_state == "FAULT"
+        )
         stop_boundary_applied = False
         stop_boundary_error: Exception | None = None
         try:
@@ -3776,15 +3806,31 @@ class SonicDriver:
                 # fresh, complete safe-hold gate.
                 with self._control_condition:
                     with self._support_lock:
-                        self._require_fresh_control_arm_health_locked(
-                            phase="control arm precheck"
-                        )
-                        decision = self._intent_ingress.accept(
-                            payload,
-                            defer_control_arm=True,
-                        )
+                        with self._terminal_fault_lock:
+                            self._require_fresh_control_arm_health_locked(
+                                phase="control arm precheck"
+                            )
+                            decision = self._intent_ingress.accept(
+                                payload,
+                                defer_control_arm=True,
+                            )
             else:
                 with self._support_lock:
+                    if (
+                        self._normal_stop_fences_motion_locked()
+                        and not terminal_gait_fault
+                    ):
+                        if gait_state in SonicIntentIngress._MOTION_STATES:
+                            raise RuntimeError(
+                                "correlated normal stop rejects new gait/control "
+                                "authority"
+                            )
+                        # Periodic STOPPING/DISARMED/IDLE envelopes are obsolete
+                        # once the strict transaction owns the stop sequence.
+                        # Check and ignore under the ingress owner lock so a
+                        # normal-stop begin cannot linearize between the phase
+                        # decision and mutation of generation/sequence.
+                        return None
                     decision = self._intent_ingress.accept(payload)
                     if decision.action == "stop":
                         try:
@@ -3867,12 +3913,13 @@ class SonicDriver:
             try:
                 with self._control_condition:
                     with self._support_lock:
-                        self._require_fresh_control_arm_health_locked(
-                            phase="control arm post-rearm check"
-                        )
-                        self._commit_staged_plant_support_rearm_locked(
-                            decision.generation
-                        )
+                        with self._terminal_fault_lock:
+                            self._require_fresh_control_arm_health_locked(
+                                phase="control arm post-rearm check"
+                            )
+                            self._commit_staged_plant_support_rearm_locked(
+                                decision.generation
+                            )
             except Exception as exc:
                 with self._support_lock:
                     self._intent_ingress.revoke()

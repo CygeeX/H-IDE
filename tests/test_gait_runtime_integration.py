@@ -25,6 +25,12 @@ from hide_mujoco_sonic.motion_fault import (
     SonicHealth,
     sonic_health_probe,
 )
+from hide_mujoco_sonic.normal_stop import NormalStopIdentity, NormalStopState
+from hide_mujoco_sonic.normal_stop_wire import (
+    normal_stop_begin_request,
+    normal_stop_plant_request,
+    normal_stop_stationary_request,
+)
 from hide_mujoco_sonic.planner_evidence import (
     PlannerAuthorityEvidence,
     PlannerReferenceDeadlineExceeded,
@@ -483,6 +489,7 @@ def bare_driver(clock: Clock) -> SonicDriver:
     driver._reference_source_identity = None
     driver._reference_request_pending = False
     driver._vendor_revoke_pending = False
+    driver._intent_gate = None
     driver._dds_target_sequence = 0
     driver._plant_support_mode = "idle"
     driver._plant_support_stop_pending = False
@@ -499,7 +506,84 @@ def bare_driver(clock: Clock) -> SonicDriver:
         reset=lambda: None,
         anchor=lambda _targets: None,
     )
+    driver._normal_stop = NormalStopState()
+    driver._normal_stop_bridge_boot_id = None
+    driver._normal_stop_seen_bridge_boot_ids = set()
+    driver._normal_stop_plant_safety_stop_epoch = None
+    driver._normal_stop_last_confirmed_plant_epoch = 0
+    driver._normal_stop_begin_intent = None
+    driver._normal_stop_seen_request_ids = set()
+    driver._normal_stop_replays = {}
     return driver
+
+
+def confirm_correlated_driver_stop(
+    adapter: GaitAdapter,
+    driver: SonicDriver,
+    clock: Clock,
+) -> NormalStopIdentity:
+    """Drive the real gait/wire/driver stop path to DRIVER_CONFIRMED."""
+
+    generation = adapter.generation
+    assert generation is not None
+    stopping = adapter.request_safe_stop(generation, now=clock.value)
+    assert stopping.state == "STOPPING"
+    bridge_boot_id = UUID("20000000-0000-4000-8000-000000000002")
+    driver.accept_json(
+        normal_stop_begin_request(
+            request_id=UUID("10000000-0000-4000-8000-000000000001"),
+            robot_id="g1-sim",
+            bridge_boot_id=bridge_boot_id,
+            reason="integration test correlated stop",
+            intent=_intent_payload(stopping, measured_heading_yaw=0.0),
+        )
+    )
+    identity = driver._normal_stop.snapshot.identity
+    assert identity is not None
+
+    clock.value += 0.01
+    first = adapter.ingest_observation(
+        observation(clock, generation=generation), now=clock.value
+    )
+    assert first.state == "STOPPING"
+    clock.value += 0.16
+    stationary = adapter.ingest_observation(
+        observation(clock, generation=generation), now=clock.value
+    )
+    assert stationary.state == "DISARMED"
+    assert stationary.stop_acknowledged is True
+    driver.accept_json(
+        normal_stop_stationary_request(
+            request_id=UUID("10000000-0000-4000-8000-000000000002"),
+            robot_id="g1-sim",
+            bridge_boot_id=bridge_boot_id,
+            driver_boot_id=driver._driver_boot_id,
+            identity=identity,
+            intent=_intent_payload(stationary, measured_heading_yaw=0.0),
+        )
+    )
+    driver.accept_json(
+        normal_stop_plant_request(
+            request_id=UUID("10000000-0000-4000-8000-000000000003"),
+            robot_id="g1-sim",
+            bridge_boot_id=bridge_boot_id,
+            driver_boot_id=driver._driver_boot_id,
+            identity=identity,
+            plant={
+                "confirmed": True,
+                "mode": "safety_stop",
+                "safety_stop_latched": True,
+                "safety_stop_epoch": 1,
+                "last_rearm_generation": generation,
+                "fault": None,
+                "error": None,
+            },
+        )
+    )
+    assert driver._normal_stop.snapshot.phase == "DRIVER_CONFIRMED"
+    driver._last_lowstate_wall_s = clock.value
+    driver._last_control_step_wall_s = clock.value
+    return identity
 
 
 def test_sonic_health_probe_is_strict_read_only_and_reports_terminal_fault() -> None:
@@ -2997,6 +3081,10 @@ def test_driver_support_notification_stays_latched_until_control_arm(
     clock = Clock()
     adapter, _ = runtime(clock)
     driver = bare_driver(clock)
+    monkeypatch.setattr(
+        "hide_mujoco_sonic.sonic_driver.set_plant_support",
+        lambda _host, _port, mode, **_kwargs: {"mode": mode},
+    )
     driver.accept_json(
         _intent_payload(adapter.tick(now=clock.value), measured_heading_yaw=0.0)
     )
@@ -3020,13 +3108,14 @@ def test_driver_support_notification_stays_latched_until_control_arm(
     assert driver._set_plant_support_mode("idle") is True
     assert driver._set_plant_support_mode("locomotion") is False
     assert driver.guard.accepted == []
+    confirm_correlated_driver_stop(adapter, driver, clock)
 
     clock.value += 0.01
     same_generation = _intent_payload(
         adapter.tick(now=clock.value), measured_heading_yaw=0.0
     )
     same_generation["control_arm"] = True
-    with pytest.raises(ValueError, match="fresh stationary IDLE"):
+    with pytest.raises(ValueError, match="stopped, acknowledged IDLE"):
         driver.accept_json(same_generation)
     assert driver._plant_support_safety_latched is True
 
@@ -3081,15 +3170,7 @@ def test_control_arm_rechecks_freshness_after_an_earlier_probe(
     driver.accept_json(
         _intent_payload(adapter.tick(now=clock.value), measured_heading_yaw=0.0)
     )
-    driver.accept_json(
-        {
-            "type": "plant_support_state",
-            "schema_version": "h-ide.plant-support-state/v1",
-            "source": "robot_agent_safe_stop",
-            "mode": "safety_stop",
-            "reason": "agent startup",
-        }
-    )
+    confirm_correlated_driver_stop(adapter, driver, clock)
     probe = sonic_health_probe(
         robot_id="g1-sim",
         producer_boot_id=UUID("20000000-0000-4000-8000-000000000002"),
@@ -3151,15 +3232,7 @@ def test_control_arm_rechecks_freshness_after_plant_rearm(
     driver.accept_json(
         _intent_payload(adapter.tick(now=clock.value), measured_heading_yaw=0.0)
     )
-    driver.accept_json(
-        {
-            "type": "plant_support_state",
-            "schema_version": "h-ide.plant-support-state/v1",
-            "source": "robot_agent_safe_stop",
-            "mode": "safety_stop",
-            "reason": "agent startup",
-        }
-    )
+    confirm_correlated_driver_stop(adapter, driver, clock)
     clock.value += 0.01
     adapter.advance_generation(2, now=clock.value)
     adapter.ingest_observation(
@@ -3251,7 +3324,7 @@ def test_safe_stop_pending_blocks_a_racing_control_arm(monkeypatch) -> None:
         adapter.tick(now=clock.value), measured_heading_yaw=0.0
     )
     payload["control_arm"] = True
-    with pytest.raises(RuntimeError, match="confirmed settled safety hold"):
+    with pytest.raises(RuntimeError, match="current exact DRIVER_CONFIRMED"):
         driver.accept_json(payload)
     assert called is False
     assert driver.guard.accepted == []
@@ -3279,15 +3352,7 @@ def test_failed_explicit_rearm_keeps_stop_latched_and_drops_authority(
     driver.accept_json(
         _intent_payload(adapter.tick(now=clock.value), measured_heading_yaw=0.0)
     )
-    driver.accept_json(
-        {
-            "type": "plant_support_state",
-            "schema_version": "h-ide.plant-support-state/v1",
-            "source": "robot_agent_safe_stop",
-            "mode": "safety_stop",
-            "reason": "operator stop",
-        }
-    )
+    confirm_correlated_driver_stop(adapter, driver, clock)
 
     support_calls: list[str] = []
 
