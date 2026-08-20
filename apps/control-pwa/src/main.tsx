@@ -34,7 +34,9 @@ import { SimulationWorkspace } from "./simulation-workspace";
 import { DeveloperDiagnostics } from "./developer-diagnostics";
 import { SceneMemoryWorkspace } from "./scene-memory-workspace";
 import {
+  currentMissionVisualAmbiguity,
   latestMissionVisualResult,
+  MissionVisualCandidateSelection,
   MissionVisualEvidenceDrawer,
   MissionVisualSummary,
 } from "./mission-visual-evidence";
@@ -190,6 +192,79 @@ function makeId(prefix: string): string {
     ? crypto.randomUUID()
     : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   return `${prefix}-${random}`;
+}
+
+interface PendingMissionInterventionEntry {
+  fingerprint: string;
+  interventionId: string;
+}
+
+const PENDING_MISSION_INTERVENTION_PREFIX = "h-ide.pending-mission-interventions.v1";
+
+function pendingMissionInterventionStorageKey(userId: string, missionId: string): string {
+  return `${PENDING_MISSION_INTERVENTION_PREFIX}:${encodeURIComponent(userId)}:${encodeURIComponent(missionId)}`;
+}
+
+function pendingMissionInterventionEntries(storageKey: string): PendingMissionInterventionEntry[] {
+  try {
+    const raw = window.sessionStorage.getItem(storageKey);
+    if (raw === null) return [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    const entries: PendingMissionInterventionEntry[] = [];
+    for (const rawEntry of parsed) {
+      if (!rawEntry || typeof rawEntry !== "object") return [];
+      const entry = rawEntry as Record<string, unknown>;
+      if (typeof entry.fingerprint !== "string" || !entry.fingerprint
+        || typeof entry.interventionId !== "string" || !entry.interventionId
+        || entry.interventionId !== entry.interventionId.trim()
+        || entry.interventionId.length > 256) return [];
+      entries.push({
+        fingerprint: entry.fingerprint,
+        interventionId: entry.interventionId,
+      });
+    }
+    return entries;
+  } catch {
+    return [];
+  }
+}
+
+function storedMissionInterventionId(storageKey: string, fingerprint: string): string | null {
+  const matching = pendingMissionInterventionEntries(storageKey).filter(
+    (entry) => entry.fingerprint === fingerprint,
+  );
+  return matching.length === 1 ? matching[0].interventionId : null;
+}
+
+function storeMissionIntervention(
+  storageKey: string,
+  entry: PendingMissionInterventionEntry,
+): void {
+  try {
+    const entries = pendingMissionInterventionEntries(storageKey)
+      .filter((item) => item.fingerprint !== entry.fingerprint);
+    window.sessionStorage.setItem(storageKey, JSON.stringify([...entries, entry].slice(-8)));
+  } catch {
+    // The in-memory retry identity remains available when browser storage is unavailable.
+  }
+}
+
+function clearStoredMissionIntervention(
+  storageKey: string,
+  entry: PendingMissionInterventionEntry,
+): void {
+  try {
+    const entries = pendingMissionInterventionEntries(storageKey);
+    const remaining = entries.filter((item) => !(
+      item.fingerprint === entry.fingerprint && item.interventionId === entry.interventionId
+    ));
+    if (remaining.length === entries.length) return;
+    if (remaining.length) window.sessionStorage.setItem(storageKey, JSON.stringify(remaining));
+    else window.sessionStorage.removeItem(storageKey);
+  } catch {
+    // A stale browser-storage entry is harmless: the server still binds the id to its payload.
+  }
 }
 
 function wsUrl(after: number): string {
@@ -496,6 +571,7 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
   const voiceReplyEnabledRef = useRef(voiceReplyEnabled);
   voiceReplyEnabledRef.current = voiceReplyEnabled;
   const finalTranscriptRef = useRef(new Set<string>());
+  const pendingMissionInterventionRef = useRef(new Map<string, string>());
   const restoredConversationRef = useRef(false);
   const restoredMissionRef = useRef(false);
   const assistantConversationRef = useRef<AssistantConversation | null>(assistantConversation);
@@ -1044,6 +1120,10 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
     rawText: string,
     modality: "text" | "voice" = "text",
     sourceTranscriptionId: string | null = null,
+    candidateSelection: {
+      candidateId: string;
+      selectionSourceAnalysisId: string;
+    } | null = null,
   ) => {
     const text = rawText.trim();
     if (!text || assistantBusy) return;
@@ -1074,6 +1154,26 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
       transcriptionId: sourceTranscriptionId,
       createdAt: new Date().toISOString(),
     };
+    const kind = activeMission.snapshot.status === "needs_input" ? "answer" : "modify_goal";
+    const interventionFingerprint = JSON.stringify({
+      missionId: activeMission.missionId,
+      kind,
+      text,
+      candidateSelection,
+    });
+    const storageKey = pendingMissionInterventionStorageKey(
+      principal.userId,
+      activeMission.missionId,
+    );
+    const pendingKey = `${storageKey}\u0000${interventionFingerprint}`;
+    const interventionId = pendingMissionInterventionRef.current.get(pendingKey)
+      ?? storedMissionInterventionId(storageKey, interventionFingerprint)
+      ?? makeId("intervention");
+    pendingMissionInterventionRef.current.set(pendingKey, interventionId);
+    storeMissionIntervention(storageKey, {
+      fingerprint: interventionFingerprint,
+      interventionId,
+    });
     setMissionMessages((current) => [...current, userMessage]);
     try {
       const response = await apiFetch<{
@@ -1084,8 +1184,17 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
         body: JSON.stringify({
           requestedBy: "operator",
           text,
-          kind: activeMission.snapshot.status === "needs_input" ? "answer" : "modify_goal",
+          kind,
+          interventionId,
+          ...(candidateSelection ?? {}),
         }),
+      });
+      if (pendingMissionInterventionRef.current.get(pendingKey) === interventionId) {
+        pendingMissionInterventionRef.current.delete(pendingKey);
+      }
+      clearStoredMissionIntervention(storageKey, {
+        fingerprint: interventionFingerprint,
+        interventionId,
       });
       setMissionRecord(response.mission);
       setMissionHistory((current) => [
@@ -1111,7 +1220,7 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
     } finally {
       setAssistantBusy(false);
     }
-  }, [assistantBusy, connection, missionRecord, sendAssistantMessage, speakAssistantReply]);
+  }, [assistantBusy, connection, missionRecord, principal.userId, sendAssistantMessage, speakAssistantReply]);
 
   const submitAssistantMessage = useCallback((event: FormEvent) => {
     event.preventDefault();
@@ -1977,6 +2086,14 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
         onContinueMission={continueMission}
         onCancelMission={cancelMission}
         onApproveMissionRevision={approveMissionRevision}
+        onSelectMissionCandidate={(candidateId, analysisId, label) => {
+          void sendMissionMessage(
+            `选择候选：${label}`,
+            "text",
+            null,
+            { candidateId, selectionSourceAnalysisId: analysisId },
+          );
+        }}
         onReject={rejectDraft}
         onRevise={reviseDraft}
         onReplan={replanExpiredDraft}
@@ -2448,6 +2565,7 @@ function ChatWorkspace({
   onContinueMission,
   onCancelMission,
   onApproveMissionRevision,
+  onSelectMissionCandidate,
   onReject,
   onRevise,
   onReplan,
@@ -2491,6 +2609,11 @@ function ChatWorkspace({
   onContinueMission: () => void;
   onCancelMission: () => void;
   onApproveMissionRevision: () => void;
+  onSelectMissionCandidate: (
+    candidateId: string,
+    analysisId: string,
+    label: string,
+  ) => void;
   onReject: () => void;
   onRevise: () => void;
   onReplan: () => void;
@@ -2544,6 +2667,7 @@ function ChatWorkspace({
           onContinue={onContinueMission}
           onCancel={onCancelMission}
           onApproveRevision={onApproveMissionRevision}
+          onSelectCandidate={onSelectMissionCandidate}
           developerMode={developerMode}
         /> : null}
         {!missionDraft && !mission && draft && isVisualMissionPlan(draft.plan) ? <VisualMissionCard
@@ -2642,12 +2766,13 @@ function MissionPlanCard({ draft, robot, busy, feedback, setFeedback, onConfirm,
   </section>;
 }
 
-function MissionExecutionCard({ mission, busy, onContinue, onCancel, onApproveRevision, developerMode }: {
+function MissionExecutionCard({ mission, busy, onContinue, onCancel, onApproveRevision, onSelectCandidate, developerMode }: {
   mission: MissionRecordV2;
   busy: boolean;
   onContinue: () => void;
   onCancel: () => void;
   onApproveRevision: () => void;
+  onSelectCandidate: (candidateId: string, analysisId: string, label: string) => void;
   developerMode: boolean;
 }) {
   const [visualEvidenceOpen, setVisualEvidenceOpen] = useState(false);
@@ -2664,6 +2789,10 @@ function MissionExecutionCard({ mission, busy, onContinue, onCancel, onApproveRe
     (item) => item.disposition === "human_required",
   );
   const visualResult = latestMissionVisualResult(mission);
+  const currentVisualAmbiguity = currentMissionVisualAmbiguity(mission);
+  const presentedVisualResult = status === "needs_input"
+    ? currentVisualAmbiguity
+    : visualResult;
   const observationOnly = !mission.activeRevision.nodes.some((node) =>
     ["navigation.navigate_to_pose", "navigation.rotate"].includes(node.skillId));
   const loadMissionVisualEvidence = useCallback(async (
@@ -2688,8 +2817,8 @@ function MissionExecutionCard({ mission, busy, onContinue, onCancel, onApproveRe
       <span><small>视觉假设</small><strong>{hypotheses}</strong></span>
       <span><small>可信空间事实</small><strong>{facts}</strong></span>
     </div> : <p className="user-mission-status">{status === "completed" ? "任务已经完成。" : status === "failed" ? "任务没有完成，我已停止执行。" : status === "needs_input" ? "我需要你再补充一点信息。" : "机器人正在按计划执行，我会持续汇报进展。"}</p>}
-    {visualResult ? <MissionVisualSummary
-      result={visualResult}
+    {presentedVisualResult ? <MissionVisualSummary
+      result={presentedVisualResult}
       observationOnly={observationOnly}
       onOpen={() => setVisualEvidenceOpen(true)}
     /> : null}
@@ -2709,7 +2838,12 @@ function MissionExecutionCard({ mission, busy, onContinue, onCancel, onApproveRe
       <summary><span>事件时间线（{mission.events.length}）</span><Icon name="chevron" /></summary>
       <div>{latestEvents.map((event) => <section key={event.eventId}><strong>#{event.sequence} · {event.eventType}</strong><p>{event.nodeId ?? "Mission"} · {formatTime(event.occurredAt)}</p></section>)}</div>
     </details> : null}
-    {status === "needs_input" ? <p className="mission-input-hint">请在下方继续用文字或语音补充。补充内容会进入 PlanRevision，不会绕过审核直接执行。</p> : null}
+    {currentVisualAmbiguity ? <MissionVisualCandidateSelection
+      result={currentVisualAmbiguity}
+      busy={busy}
+      onSelect={onSelectCandidate}
+    /> : null}
+    {status === "needs_input" ? <p className="mission-input-hint">也可以在下方用文字或语音说“选择第一个候选”。候选会先重新观察验证，不会绕过运动授权。</p> : null}
     {status === "awaiting_review" ? <div className="mission-revision-review"><p><strong>修订需要审核</strong><span>{Array.isArray(pendingRevision?.changeSummary) ? pendingRevision.changeSummary.join("；") : "持续规划改变了任务步骤或授权范围。"}</span></p><button type="button" onClick={onApproveRevision} disabled={busy}>审核修订并继续</button></div> : null}
     {!['completed', 'failed', 'cancelled'].includes(status) ? <div className="mission-runtime-actions">
       <button className="mission-cancel-button" type="button" onClick={onCancel} disabled={busy}>取消 Mission</button>
@@ -2717,9 +2851,9 @@ function MissionExecutionCard({ mission, busy, onContinue, onCancel, onApproveRe
     </div> : null}
     {status === "completed" ? <p className="frozen-plan-note"><Icon name="check" />Mission 已完成；每个目标与执行回执均保留在事件记录中。</p> : null}
   </section>
-  {visualEvidenceOpen && visualResult ? <MissionVisualEvidenceDrawer
+  {visualEvidenceOpen && presentedVisualResult ? <MissionVisualEvidenceDrawer
     missionId={mission.missionId}
-    result={visualResult}
+    result={presentedVisualResult}
     observationOnly={observationOnly}
     onClose={() => setVisualEvidenceOpen(false)}
     onLoadEvidence={loadMissionVisualEvidence}

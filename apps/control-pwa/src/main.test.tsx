@@ -9,6 +9,7 @@ import {
   shouldReconcileMission,
 } from "./main";
 import type { MissionDraftRecordV2, MissionRecordV2, MissionStatus } from "./contracts";
+import { visualTaskRequestSha256 } from "./mission-visual-evidence";
 
 vi.mock("./audio", () => ({
   BrowserWavRecorder: class {
@@ -185,56 +186,345 @@ function missionRecordFixture(status: MissionStatus = "approved"): MissionRecord
   };
 }
 
+function visualSourceFixture(capturedAt: string) {
+  return {
+    robotId: "robot-1",
+    robotBootId: "fixture-boot-1",
+    gatewayInstanceId: "gateway-ui-1",
+    sensorId: "head_rgbd",
+    observationSessionId: "observation-ui-1",
+    localizationEpochId: "lab-map-epoch-1",
+    sourceMode: "synthetic",
+    sourceId: "mujoco:unitree-g1:g1-sim",
+    bundleId: "bundle-ui-1",
+    capturedAt,
+    calibrationSha256: "b".repeat(64),
+  };
+}
+
+function visualVersionsFixture() {
+  return {
+    vlmProvider: "qwen",
+    vlmModel: "qwen3-vl-plus",
+    promptVersion: "grounding-v2",
+    visualAlgorithmVersion: "rgbd-target-v2",
+    approachPolicyVersion: "v1",
+    approachPolicySha256: "c".repeat(64),
+    segmentationProvider: "sam2",
+    segmentationModel: "sam2.1_hiera_tiny",
+  };
+}
+
+function visualSkillRequestFixture(
+  requestId: string,
+  revisionId: string,
+  nodeId: string,
+  mode: string,
+) {
+  const input: Record<string, unknown> = {
+    mode,
+    instruction: "观察并定位目标",
+  };
+  if (["object_approach", "landmark_observation", "arrival_verification"].includes(mode)) {
+    input.targetDescription = "目标";
+  }
+  return {
+    schemaVersion: "h-ide.skill-request/2",
+    requestId,
+    missionId: "mission-ui",
+    revisionId,
+    nodeId,
+    robotId: "robot-1",
+    skillId: "vision.observe",
+    skillVersion: "2.0.0",
+    input,
+    capabilityManifestDigest: `sha256:${"a".repeat(64)}`,
+    authorizationId: "auth-mission-ui-1",
+    idempotencyKey: requestId,
+    issuedAt: "2026-08-18T14:48:30Z",
+    expiresAt: "2026-08-18T14:53:30Z",
+  };
+}
+
+function bindVisualTaskRequestSha(
+  visual: Record<string, unknown>,
+  request: Record<string, unknown>,
+): void {
+  const input = request.input as Record<string, unknown>;
+  const source = visual.source as Record<string, unknown>;
+  const payload = {
+    schemaVersion: "h-ide.visual-task/2",
+    requestId: request.requestId,
+    missionId: request.missionId,
+    revisionId: request.revisionId,
+    nodeId: request.nodeId,
+    authorizationId: request.authorizationId,
+    attempt: visual.attempt,
+    traceId: request.requestId,
+    mode: input.mode,
+    instruction: input.instruction,
+    targetDescription: input.targetDescription ?? null,
+    direction: input.direction ?? null,
+    requestedDistanceM: input.requestedDistanceM ?? null,
+    expectedTargetPose: input.expectedTargetPose ?? null,
+    verificationMaximumDistanceM: input.verificationMaximumDistanceM ?? 1.25,
+    verificationMaximumYawRad: input.verificationMaximumYawRad ?? 0.35,
+    robotId: request.robotId,
+    robotBootId: "fixture-boot-1",
+    localizationEpochId: "lab-map-epoch-1",
+    robotProfileDigest: `sha256:${"b".repeat(64)}`,
+    capabilityManifestDigest: request.capabilityManifestDigest,
+    sensorId: source.sensorId,
+    requestedSourceMode: source.sourceMode,
+    sceneId: source.sceneId ?? null,
+    sceneRevision: source.sceneRevision ?? null,
+    candidateId: input.candidateId ?? null,
+    selectionSourceAnalysisId: input.selectionSourceAnalysisId ?? null,
+  };
+  const digest = visualTaskRequestSha256(payload);
+  if (!digest) throw new Error("visual task fixture must be canonical");
+  visual.requestSha256 = digest;
+}
+
 function missionVisualRecordFixture() {
   const mission = missionRecordFixture("completed");
+  const requestId = "skill-mission-ui-1-observe-target-1";
   const observationNode = mission.activeRevision.nodes[0];
+  const request = visualSkillRequestFixture(
+    requestId,
+    mission.snapshot.activeRevisionId!,
+    observationNode.nodeId,
+    "landmark_observation",
+  );
+  const visualResult: Record<string, unknown> = {
+    schemaVersion: "h-ide.visual-result/2",
+    analysisId: "analysis-visual-ui-1",
+    requestId,
+    requestSha256: "",
+    missionId: mission.missionId,
+    revisionId: mission.snapshot.activeRevisionId,
+    nodeId: observationNode.nodeId,
+    attempt: 1,
+    mode: "landmark_observation",
+    status: "succeeded",
+    source: visualSourceFixture("2026-08-18T14:48:34Z"),
+    versions: visualVersionsFixture(),
+    hypotheses: [{
+      hypothesisId: "qwen-display-1",
+      source: "qwen",
+      label: "显示器",
+      pixelBox: [339, 221, 357, 270],
+      score: 1,
+    }],
+    geometryCandidates: [{
+      geometryCandidateId: "geometry-display-1",
+      source: "deterministic_rgbd",
+      role: "landmark",
+      verified: true,
+      landmarkPose: { frameId: "map", x: 3.384, y: -0.616, z: 1.188, yaw: 0 },
+      targetPose: null,
+      safetyGates: [{ name: "stable_frames", passed: true, measured: 3, threshold: 3 }],
+      evidenceIds: [],
+    }],
+    ambiguityCandidates: [],
+    observationSummary: null,
+    directionalClear: null,
+    rejectionReason: null,
+    evidence: [{ kind: "rgb_keyframe", sha256: "d".repeat(64), mediaType: "image/jpeg" }],
+    warnings: [],
+    createdAt: "2026-08-18T14:48:35Z",
+  };
+  bindVisualTaskRequestSha(visualResult, request);
+  const terminal = {
+    requestId,
+    status: "succeeded",
+    completedAt: "2026-08-18T14:48:35Z",
+    result: { visualResult },
+    evidenceIds: ["d".repeat(64)],
+    errorCode: null,
+    detail: null,
+  };
   mission.activeRevision.nodes = [observationNode];
   mission.plan.nodes = [observationNode];
-  mission.nodeStates = [mission.nodeStates[0]];
-  mission.skillExecutions = [{
-    requestId: "skill-visual-ui-1",
-    result: {
-      status: "succeeded",
-      result: {
-        visualResult: {
-          schemaVersion: "h-ide.visual-result/2",
-          analysisId: "analysis-visual-ui-1",
-          mode: "landmark_observation",
-          status: "succeeded",
-          source: {
-            sourceMode: "synthetic",
-            sourceId: "mujoco:unitree-g1:g1-sim",
-            sensorId: "head_rgbd",
-            capturedAt: "2026-08-18T14:48:34Z",
-          },
-          versions: {
-            vlmProvider: "qwen",
-            vlmModel: "qwen3-vl-plus",
-            visualAlgorithmVersion: "rgbd-target-v2",
-            segmentationProvider: "sam2",
-            segmentationModel: "sam2.1_hiera_tiny",
-          },
-          hypotheses: [{
-            hypothesisId: "qwen-display-1",
-            source: "qwen",
-            label: "显示器",
-            pixelBox: [339, 221, 357, 270],
-            score: 1,
-          }],
-          geometryCandidates: [{
-            geometryCandidateId: "geometry-display-1",
-            role: "landmark",
-            verified: true,
-            landmarkPose: { frameId: "map", x: 3.384, y: -0.616, z: 1.188, yaw: 0 },
-            targetPose: null,
-            safetyGates: [{ name: "stable_frames", passed: true, measured: 3, threshold: 3 }],
-          }],
-          evidence: [{ kind: "rgb_keyframe", sha256: "d".repeat(64), mediaType: "image/jpeg" }],
-          warnings: [],
-        },
-      },
-    },
+  mission.nodeStates = [{
+    ...mission.nodeStates[0],
+    status: "succeeded",
+    attempt: 1,
+    state: { skillRequestId: requestId, resultStatus: "succeeded" },
   }];
+  mission.events = [{
+    eventId: "event-visual-ui-1",
+    missionId: mission.missionId,
+    sequence: 8,
+    eventType: "skill.succeeded",
+    occurredAt: "2026-08-18T14:48:35Z",
+    correlationId: requestId,
+    revisionId: mission.snapshot.activeRevisionId,
+    nodeId: observationNode.nodeId,
+    payload: structuredClone(terminal),
+  }];
+  mission.snapshot.lastSequence = 8;
+  mission.skillExecutions = [{
+    requestId,
+    missionId: mission.missionId,
+    revisionId: mission.snapshot.activeRevisionId,
+    nodeId: observationNode.nodeId,
+    status: "succeeded",
+    request,
+    result: terminal,
+  }];
+  return mission;
+}
+
+function missionCandidateRecordFixture(): MissionRecordV2 {
+  const mission = missionRecordFixture("needs_input");
+  const requestId = "skill-mission-ui-1-observe-target-1";
+  const analysisId = "analysis-ambiguous-ui-1";
+  mission.snapshot.errorCode = "VISUAL_NEEDS_INPUT";
+  mission.snapshot.detail = "检测到多个相似目标，请选择本次要重新观察的候选。";
+  mission.snapshot.activeRevisionId = "revision-mission-ui-1";
+  mission.snapshot.activeNodeId = "observe-target";
+  mission.snapshot.activeSkillRequestId = null;
+  mission.nodeStates = mission.nodeStates.map((item) => item.nodeId === "observe-target"
+    ? {
+      ...item,
+      status: "rejected",
+      attempt: 1,
+      state: { skillRequestId: requestId, resultStatus: "rejected" },
+    }
+    : item);
+  const visualResult = {
+    schemaVersion: "h-ide.visual-result/2",
+    analysisId,
+    requestId,
+    requestSha256: "a".repeat(64),
+    missionId: mission.missionId,
+    revisionId: mission.snapshot.activeRevisionId,
+    nodeId: mission.snapshot.activeNodeId,
+    attempt: 1,
+    mode: "object_approach",
+    status: "needs_input",
+    source: visualSourceFixture("2026-08-19T00:00:00Z"),
+    versions: visualVersionsFixture(),
+    hypotheses: [{
+      hypothesisId: "candidate-left",
+      source: "qwen",
+      label: "左侧银白色机器人",
+      pixelBox: [100, 100, 260, 440],
+      score: 0.91,
+    }],
+    ambiguityCandidates: [{
+      candidateId: "candidate-left",
+      label: "左侧银白色机器人",
+      box: [100, 100, 260, 440],
+      score: 0.91,
+    }],
+    geometryCandidates: [],
+    observationSummary: null,
+    directionalClear: null,
+    rejectionReason: "ambiguous_target",
+    evidence: [{
+      kind: "rgb_keyframe",
+      sha256: "c".repeat(64),
+      mediaType: "image/jpeg",
+    }],
+    warnings: [],
+    createdAt: "2026-08-19T00:00:01Z",
+  };
+  const request = visualSkillRequestFixture(
+    requestId,
+    mission.snapshot.activeRevisionId!,
+    mission.snapshot.activeNodeId!,
+    "object_approach",
+  );
+  bindVisualTaskRequestSha(visualResult, request);
+  const terminal = {
+    requestId,
+    status: "rejected",
+    completedAt: "2026-08-19T00:00:01Z",
+    result: { visualResult },
+    evidenceIds: ["c".repeat(64)],
+    errorCode: "VISUAL_NEEDS_INPUT",
+    detail: "ambiguous_target",
+  };
+  mission.events = [{
+    eventId: "event-ambiguous-ui-1",
+    missionId: mission.missionId,
+    sequence: 3,
+    eventType: "skill.failed",
+    occurredAt: "2026-08-19T00:00:01Z",
+    correlationId: requestId,
+    revisionId: mission.snapshot.activeRevisionId,
+    nodeId: mission.snapshot.activeNodeId,
+    payload: structuredClone(terminal),
+  }];
+  mission.snapshot.lastSequence = 3;
+  mission.skillExecutions = [{
+    requestId,
+    missionId: mission.missionId,
+    revisionId: mission.snapshot.activeRevisionId,
+    nodeId: mission.snapshot.activeNodeId,
+    status: "rejected",
+    request,
+    result: terminal,
+  }];
+  return mission;
+}
+
+function missionCandidateWithStaleVisualFixture(): MissionRecordV2 {
+  const mission = missionCandidateRecordFixture();
+  const staleRequestId = "skill-mission-ui-stale-observe-1";
+  const staleVisualResult = {
+    schemaVersion: "h-ide.visual-result/2",
+    analysisId: "analysis-stale-ui-1",
+    requestId: staleRequestId,
+    requestSha256: "a".repeat(64),
+    missionId: mission.missionId,
+    revisionId: "revision-stale-ui-1",
+    nodeId: "observe-stale",
+    attempt: 1,
+    mode: "scene_description",
+    status: "succeeded",
+    source: visualSourceFixture("2026-08-18T00:00:00Z"),
+    versions: visualVersionsFixture(),
+    hypotheses: [],
+    ambiguityCandidates: [],
+    geometryCandidates: [],
+    observationSummary: "旧视觉摘要不应与当前候选混合显示。",
+    directionalClear: null,
+    rejectionReason: null,
+    evidence: [{
+      kind: "rgb_keyframe",
+      sha256: "d".repeat(64),
+      mediaType: "image/jpeg",
+    }],
+    warnings: [],
+    createdAt: "2026-08-18T00:00:01Z",
+  };
+  const staleRequest = visualSkillRequestFixture(
+    staleRequestId,
+    "revision-stale-ui-1",
+    "observe-stale",
+    "scene_description",
+  );
+  bindVisualTaskRequestSha(staleVisualResult, staleRequest);
+  mission.skillExecutions.push({
+    requestId: staleRequestId,
+    missionId: mission.missionId,
+    revisionId: "revision-stale-ui-1",
+    nodeId: "observe-stale",
+    status: "succeeded",
+    request: staleRequest,
+    result: {
+      requestId: staleRequestId,
+      status: "succeeded",
+      completedAt: "2026-08-18T00:00:01Z",
+      evidenceIds: ["d".repeat(64)],
+      errorCode: null,
+      detail: null,
+      result: { visualResult: staleVisualResult },
+    },
+  });
   return mission;
 }
 
@@ -286,6 +576,7 @@ describe("control console", () => {
     confirmConflict = false;
     window.history.replaceState({}, "", "/developer");
     window.localStorage.clear();
+    window.sessionStorage.clear();
     vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith("/api/v1/auth/me")) {
@@ -796,6 +1087,124 @@ describe("control console", () => {
     expect(await screen.findByRole("dialog", { name: "视觉理解与空间依据" })).toBeInTheDocument();
     await waitFor(() => expect(vi.mocked(fetch).mock.calls.some(([input]) =>
       String(input).includes("/api/v2/missions/mission-ui/visual-evidence/analysis-visual-ui-1/"))).toBe(true));
+  });
+
+  it("uses only the current ambiguity for a needs-input summary and evidence drawer", async () => {
+    const fallback = vi.mocked(fetch).getMockImplementation();
+    vi.mocked(fetch).mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/api/v2/missions") && !init?.method) {
+        return Promise.resolve(response([missionCandidateWithStaleVisualFixture()]));
+      }
+      if (url.endsWith("/api/v2/missions/drafts") && !init?.method) {
+        return Promise.resolve(response([]));
+      }
+      if (url.includes("/api/v2/missions/mission-ui/visual-evidence/")) {
+        return Promise.resolve(new Response(new Blob(["jpeg"], { type: "image/jpeg" }), {
+          status: 200,
+          headers: { "content-type": "image/jpeg" },
+        }));
+      }
+      return fallback!(input, init) as Promise<Response>;
+    });
+    window.history.replaceState({}, "", "/tasks/mission-ui");
+
+    render(<App />);
+
+    expect((await screen.findAllByText("左侧银白色机器人")).length).toBeGreaterThan(0);
+    expect(screen.queryByText("旧视觉摘要不应与当前候选混合显示。")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "查看视觉证据" }));
+    expect(await screen.findByRole("dialog", { name: "视觉理解与空间依据" })).toBeInTheDocument();
+    await waitFor(() => expect(vi.mocked(fetch).mock.calls.some(([input]) => (
+      String(input).includes(`/visual-evidence/analysis-ambiguous-ui-1/${"c".repeat(64)}`)
+    ))).toBe(true));
+    expect(vi.mocked(fetch).mock.calls.some(([input]) => (
+      String(input).includes("/visual-evidence/analysis-stale-ui-1/")
+    ))).toBe(false);
+  });
+
+  it("reuses a candidate intervention id after reload without crossing user or Mission storage", async () => {
+    const fallback = vi.mocked(fetch).getMockImplementation();
+    const messageBodies: Array<Record<string, unknown>> = [];
+    vi.mocked(fetch).mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/api/v2/missions") && !init?.method) {
+        return Promise.resolve(response([missionCandidateRecordFixture()]));
+      }
+      if (url.endsWith("/api/v2/missions/drafts") && !init?.method) {
+        return Promise.resolve(response([]));
+      }
+      if (url.endsWith("/api/v2/missions/mission-ui/messages") && init?.method === "POST") {
+        const body = typeof init.body === "string" ? JSON.parse(init.body) : {};
+        messageBodies.push(body);
+        if (messageBodies.length === 1) {
+          return Promise.resolve(response({ detail: "temporary candidate retry failure" }, {
+            status: 503,
+            statusText: "Service Unavailable",
+          }));
+        }
+        return Promise.resolve(response({
+          decision: { kind: "continue", reason: "候选已记录" },
+          mission: missionCandidateRecordFixture(),
+        }));
+      }
+      return fallback!(input, init) as Promise<Response>;
+    });
+    window.history.replaceState({}, "", "/tasks/mission-ui");
+    const fingerprint = JSON.stringify({
+      missionId: "mission-ui",
+      kind: "answer",
+      text: "选择候选：左侧银白色机器人",
+      candidateSelection: {
+        candidateId: "candidate-left",
+        selectionSourceAnalysisId: "analysis-ambiguous-ui-1",
+      },
+    });
+    const activeStorageKey = "h-ide.pending-mission-interventions.v1:developer-ui:mission-ui";
+    const otherUserStorageKey = "h-ide.pending-mission-interventions.v1:other-user:mission-ui";
+    const otherMissionStorageKey = "h-ide.pending-mission-interventions.v1:developer-ui:mission-other";
+    const otherUserValue = JSON.stringify([{
+      fingerprint,
+      interventionId: "intervention-other-user",
+    }]);
+    const otherMissionValue = JSON.stringify([{
+      fingerprint,
+      interventionId: "intervention-other-mission",
+    }]);
+    window.sessionStorage.setItem(otherUserStorageKey, otherUserValue);
+    window.sessionStorage.setItem(otherMissionStorageKey, otherMissionValue);
+
+    const firstRender = render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /左侧银白色机器人/ }));
+    expect(await screen.findByText("temporary candidate retry failure")).toBeInTheDocument();
+    expect(messageBodies).toHaveLength(1);
+    const firstInterventionId = messageBodies[0].interventionId;
+    expect(firstInterventionId).toEqual(expect.stringMatching(/^intervention-/));
+    expect(firstInterventionId).not.toBe("intervention-other-user");
+    expect(firstInterventionId).not.toBe("intervention-other-mission");
+    expect(window.sessionStorage.getItem(activeStorageKey)).not.toBeNull();
+
+    firstRender.unmount();
+    const secondRender = render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /左侧银白色机器人/ }));
+    await waitFor(() => expect(messageBodies).toHaveLength(2));
+
+    expect(messageBodies[1]).toMatchObject({
+      requestedBy: "operator",
+      kind: "answer",
+      text: "选择候选：左侧银白色机器人",
+      interventionId: firstInterventionId,
+      candidateId: "candidate-left",
+      selectionSourceAnalysisId: "analysis-ambiguous-ui-1",
+    });
+    await waitFor(() => expect(window.sessionStorage.getItem(activeStorageKey)).toBeNull());
+    expect(window.sessionStorage.getItem(otherUserStorageKey)).toBe(otherUserValue);
+    expect(window.sessionStorage.getItem(otherMissionStorageKey)).toBe(otherMissionValue);
+    expect(window.sessionStorage.length).toBe(2);
+    const urls = vi.mocked(fetch).mock.calls.map(([input]) => String(input));
+    expect(urls.some((url) => url.includes("/skill-requests"))).toBe(false);
+    expect(urls.some((url) => url.endsWith("/api/v1/commands"))).toBe(false);
+    secondRender.unmount();
   });
 
   it("shows interface center and protects activation behind validation/probe", async () => {
