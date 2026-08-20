@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import TimeoutError as FutureTimeoutError
+from concurrent.futures import (
+    CancelledError as FutureCancelledError,
+    TimeoutError as FutureTimeoutError,
+)
 import math
 import threading
 import time
@@ -705,31 +708,92 @@ class RobotAgentInboundPeer:
             current = self._statuses.get(command_id)
             if current is None:
                 return ProtocolCommandStatus(command_id, "REJECTED", "command not found")
-            if current.state in TERMINAL:
+            if current.state in TERMINAL and current.state != "CANCELLED":
                 return current
+            try:
+                canonical_command_id = str(UUID(command_id))
+            except (TypeError, ValueError):
+                return ProtocolCommandStatus(
+                    command_id,
+                    "REJECTED",
+                    "command ID must be a UUID",
+                )
             control_revision = self._control_revision
             safe_stop_epoch = (
                 self._control_safe_stop_epoch
                 if self._control_safe_stop_truth_supported
                 else None
             )
+            cancel_session_id = self.session_id
+            cancel_boot_id = self.robot_boot_id
+            # Fence future renewals without delaying the safety-critical
+            # cancellation send on an in-flight heartbeat join.
+            self._heartbeat_stop.set()
+        deadline = time.monotonic() + _CANCEL_CONFIRMATION_TIMEOUT_SECONDS
         try:
             self._send(
                 "command.cancel",
                 {
-                    "command_id": str(UUID(command_id)),
+                    "command_id": canonical_command_id,
                     "reason": "H-IDE mission or operator cancellation",
                 },
             )
-        except (ValueError, RuntimeError, TimeoutError, FutureTimeoutError) as exc:
+        except (
+            ValueError,
+            RuntimeError,
+            TimeoutError,
+            FutureCancelledError,
+            FutureTimeoutError,
+            WebSocketDisconnect,
+        ) as exc:
+            try:
+                self._stop_heartbeat(
+                    timeout=max(0.0, deadline - time.monotonic()),
+                    strict=False,
+                )
+            except (
+                ValueError,
+                RuntimeError,
+                TimeoutError,
+                FutureCancelledError,
+                FutureTimeoutError,
+                WebSocketDisconnect,
+            ):
+                pass
             return ProtocolCommandStatus(
                 command_id,
                 "ABORTED_AGENT_RESTART",
                 f"cancellation outcome is unknown: command.cancel was not confirmed: {exc}",
             )
-        deadline = time.monotonic() + _CANCEL_CONFIRMATION_TIMEOUT_SECONDS
+        try:
+            self._stop_heartbeat(timeout=max(0.0, deadline - time.monotonic()))
+        except (ValueError, RuntimeError, TimeoutError, FutureTimeoutError) as exc:
+            return ProtocolCommandStatus(
+                command_id,
+                "ABORTED_AGENT_RESTART",
+                "cancellation outcome is unknown: command.cancel was dispatched "
+                f"but the lease heartbeat did not stop: {exc}",
+            )
         with self._condition:
             while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    status = self._statuses.get(command_id, current)
+                    if status.state == "CANCELLED":
+                        detail = (
+                            "cancellation outcome is unknown: CANCELLED was received "
+                            "without a new confirmed SAFE_HOLD safety truth"
+                        )
+                    else:
+                        detail = (
+                            "cancellation outcome is unknown: timed out waiting for "
+                            "a terminal command status"
+                        )
+                    return ProtocolCommandStatus(
+                        command_id,
+                        "ABORTED_AGENT_RESTART",
+                        detail,
+                    )
                 status = self._statuses.get(command_id, current)
                 if not self._connected:
                     if status.state == "ABORTED_AGENT_RESTART":
@@ -739,6 +803,16 @@ class RobotAgentInboundPeer:
                         "ABORTED_AGENT_RESTART",
                         "cancellation outcome is unknown: Robot Agent disconnected "
                         "before SAFE_HOLD confirmation",
+                    )
+                if (
+                    self.session_id != cancel_session_id
+                    or self.robot_boot_id != cancel_boot_id
+                ):
+                    return ProtocolCommandStatus(
+                        command_id,
+                        "ABORTED_AGENT_RESTART",
+                        "cancellation outcome is unknown: Robot Agent session identity "
+                        "changed before SAFE_HOLD confirmation",
                     )
                 if status.state in TERMINAL:
                     if status.state != "CANCELLED":
@@ -770,23 +844,6 @@ class RobotAgentInboundPeer:
                             "cancellation outcome is unknown: Robot Agent physical "
                             "safe-stop confirmation failed",
                         )
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    if status.state == "CANCELLED":
-                        detail = (
-                            "cancellation outcome is unknown: CANCELLED was received "
-                            "without a new confirmed SAFE_HOLD safety truth"
-                        )
-                    else:
-                        detail = (
-                            "cancellation outcome is unknown: timed out waiting for "
-                            "a terminal command status"
-                        )
-                    return ProtocolCommandStatus(
-                        command_id,
-                        "ABORTED_AGENT_RESTART",
-                        detail,
-                    )
                 self._condition.wait(remaining)
 
     def connection_snapshot(self) -> dict[str, Any]:
@@ -1281,6 +1338,8 @@ class RobotAgentInboundPeer:
                         FutureTimeoutError,
                     ) as exc:
                         with self._condition:
+                            if self._heartbeat_stop.is_set():
+                                return
                             self._last_error = f"Robot Agent lease renewal failed: {exc}"
                             self._condition.notify_all()
                         self._heartbeat_stop.set()
@@ -1307,8 +1366,8 @@ class RobotAgentInboundPeer:
     ) -> None:
         """Stop and join the lease-renewal owner before releasing authority."""
 
-        self._heartbeat_stop.set()
         with self._condition:
+            self._heartbeat_stop.set()
             thread = self._heartbeat_thread
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=timeout)

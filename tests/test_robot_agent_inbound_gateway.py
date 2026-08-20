@@ -4,6 +4,7 @@ import hashlib
 import json
 import threading
 import time
+from concurrent.futures import CancelledError as FutureCancelledError
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
@@ -330,6 +331,346 @@ def test_cancel_ignores_running_revisions_and_waits_for_new_safe_hold(
     worker.join(timeout=0.5)
     assert not worker.is_alive()
     assert results[0].state == "CANCELLED"
+
+
+def test_cancelled_status_before_safe_hold_still_fences_and_waits(
+    monkeypatch,
+) -> None:
+    peer, command_id, sent = _cancel_test_peer(
+        monkeypatch,
+        timeout_seconds=0.5,
+    )
+    _record_command_status(peer, command_id, "CANCELLED")
+
+    results: list[ProtocolCommandStatus] = []
+    worker = threading.Thread(target=lambda: results.append(peer.cancel(command_id)))
+    worker.start()
+    assert sent.wait(timeout=0.5)
+    assert peer._heartbeat_stop.is_set()
+    worker.join(timeout=0.02)
+    assert worker.is_alive()
+
+    peer._record_message(
+        {
+            "type": "control.status",
+            "payload": {
+                "state": "SAFE_HOLD",
+                "reason": "safe stop completed after terminal status",
+                "lease_sequence": None,
+                "authority_revoked": True,
+                "safe_stop_state": "confirmed",
+                "safe_stop_epoch": 8,
+            },
+        }
+    )
+    worker.join(timeout=0.5)
+    assert not worker.is_alive()
+    assert results[0].state == "CANCELLED"
+
+
+def test_cancel_rejects_fresh_safe_hold_received_after_deadline(monkeypatch) -> None:
+    peer, command_id, _sent = _cancel_test_peer(
+        monkeypatch,
+        timeout_seconds=0.05,
+    )
+
+    def confirm_after_deadline(
+        message_type: str,
+        payload: dict[str, object],
+    ) -> None:
+        assert message_type == "command.cancel"
+        assert payload["command_id"] == command_id
+        time.sleep(0.07)
+        _record_command_status(peer, command_id, "CANCELLED")
+        peer._record_message(
+            {
+                "type": "control.status",
+                "payload": {
+                    "state": "SAFE_HOLD",
+                    "reason": "late safe stop completed",
+                    "lease_sequence": None,
+                    "authority_revoked": True,
+                    "safe_stop_state": "confirmed",
+                    "safe_stop_epoch": 8,
+                },
+            }
+        )
+
+    monkeypatch.setattr(peer, "_send", confirm_after_deadline)
+    result = peer.cancel(command_id)
+
+    assert result.state == "ABORTED_AGENT_RESTART"
+
+
+@pytest.mark.parametrize(
+    "send_error",
+    [
+        pytest.param(WebSocketDisconnect(code=1006), id="websocket-disconnect"),
+        pytest.param(FutureCancelledError(), id="cancelled-send-future"),
+    ],
+)
+def test_cancel_transport_failure_joins_blocked_heartbeat(
+    monkeypatch,
+    send_error: Exception,
+) -> None:
+    peer, command_id, _sent = _cancel_test_peer(
+        monkeypatch,
+        timeout_seconds=0.5,
+    )
+    peer.heartbeat = True
+    renew_started = threading.Event()
+    release_renew = threading.Event()
+
+    def blocked_renew(robot_id: str, sequence: int) -> dict[str, object]:
+        del robot_id, sequence
+        renew_started.set()
+        if not release_renew.wait(timeout=1.0):
+            raise TimeoutError("test did not release the blocked renewal")
+        raise RuntimeError("Robot Agent control lease is not active")
+
+    def disconnect_send(message_type: str, payload: dict[str, object]) -> None:
+        assert message_type == "command.cancel"
+        assert payload["command_id"] == command_id
+        raise send_error
+
+    monkeypatch.setattr(peer, "renew", blocked_renew)
+    monkeypatch.setattr(peer, "_send", disconnect_send)
+    peer._start_heartbeat()
+    assert renew_started.wait(timeout=1.0)
+
+    results: list[ProtocolCommandStatus] = []
+    errors: list[BaseException] = []
+
+    def cancel_worker() -> None:
+        try:
+            results.append(peer.cancel(command_id))
+        except BaseException as exc:  # pragma: no cover - asserted empty below
+            errors.append(exc)
+
+    worker = threading.Thread(target=cancel_worker)
+    worker.start()
+    try:
+        assert peer._heartbeat_stop.wait(timeout=0.5)
+        worker.join(timeout=0.02)
+        assert worker.is_alive()
+        release_renew.set()
+        worker.join(timeout=0.5)
+        assert not worker.is_alive()
+        assert errors == []
+        assert results[0].state == "ABORTED_AGENT_RESTART"
+        assert "command.cancel was not confirmed" in results[0].detail
+        with peer._condition:
+            assert peer._heartbeat_thread is None
+        assert peer.connection_snapshot()["lastError"] is None
+    finally:
+        release_renew.set()
+        peer._stop_heartbeat(timeout=0.5, strict=False)
+        worker.join(timeout=0.6)
+
+
+def test_cancel_cannot_join_old_status_to_new_session_safe_hold(monkeypatch) -> None:
+    peer, command_id, sent = _cancel_test_peer(
+        monkeypatch,
+        timeout_seconds=0.5,
+    )
+    with peer._condition:
+        peer.session_id = str(uuid4())
+        peer.robot_boot_id = BOOT_ID
+    _record_command_status(peer, command_id, "CANCELLED")
+
+    results: list[ProtocolCommandStatus] = []
+    worker = threading.Thread(target=lambda: results.append(peer.cancel(command_id)))
+    worker.start()
+    assert sent.wait(timeout=0.5)
+    worker.join(timeout=0.02)
+    assert worker.is_alive()
+
+    with peer._condition:
+        peer._mark_disconnected_locked("synthetic session replacement")
+        peer._connected = True
+        peer.session_id = str(uuid4())
+        peer.robot_boot_id = "22222222-2222-4222-8222-222222222222"
+        peer._condition.notify_all()
+    peer._record_message(
+        {
+            "type": "control.status",
+            "payload": {
+                "state": "SAFE_HOLD",
+                "reason": "new session safe stop completed",
+                "lease_sequence": None,
+                "authority_revoked": True,
+                "safe_stop_state": "confirmed",
+                "safe_stop_epoch": 8,
+            },
+        }
+    )
+
+    worker.join(timeout=0.5)
+    assert not worker.is_alive()
+    assert results[0].state == "ABORTED_AGENT_RESTART"
+    assert "session identity changed" in results[0].detail
+
+
+def test_cancel_stops_heartbeat_without_recording_expected_renew_failure(
+    monkeypatch,
+) -> None:
+    peer, command_id, sent = _cancel_test_peer(
+        monkeypatch,
+        timeout_seconds=0.5,
+    )
+    peer.heartbeat = True
+    renew_started = threading.Event()
+    release_renew = threading.Event()
+
+    def renew_while_cancel_stops_heartbeat(
+        robot_id: str,
+        sequence: int,
+    ) -> dict[str, object]:
+        del robot_id, sequence
+        renew_started.set()
+        if not release_renew.wait(timeout=1.0):
+            raise TimeoutError("test did not release the in-flight renewal")
+        raise RuntimeError("Robot Agent control lease is not active")
+
+    monkeypatch.setattr(peer, "renew", renew_while_cancel_stops_heartbeat)
+    peer._start_heartbeat()
+    assert renew_started.wait(timeout=1.0)
+
+    results: list[ProtocolCommandStatus] = []
+    worker = threading.Thread(target=lambda: results.append(peer.cancel(command_id)))
+    worker.start()
+    try:
+        assert peer._heartbeat_stop.wait(timeout=0.5)
+        assert sent.wait(timeout=0.5)
+        with peer._condition:
+            heartbeat_thread = peer._heartbeat_thread
+        assert heartbeat_thread is not None
+        assert heartbeat_thread.is_alive()
+        assert worker.is_alive()
+        release_renew.set()
+        _record_command_status(peer, command_id, "CANCELLED")
+        peer._record_message(
+            {
+                "type": "control.status",
+                "payload": {
+                    "state": "SAFE_HOLD",
+                    "reason": "safe stop completed",
+                    "lease_sequence": None,
+                    "authority_revoked": True,
+                    "safe_stop_state": "confirmed",
+                    "safe_stop_epoch": 8,
+                },
+            }
+        )
+        worker.join(timeout=0.5)
+        assert not worker.is_alive()
+        assert results[0].state == "CANCELLED"
+        with peer._condition:
+            assert peer._heartbeat_thread is None
+        assert peer.connection_snapshot()["lastError"] is None
+    finally:
+        release_renew.set()
+        peer._stop_heartbeat(timeout=0.5, strict=False)
+        worker.join(timeout=0.6)
+
+
+def test_cancel_unknown_command_does_not_stop_heartbeat(monkeypatch) -> None:
+    peer, _command_id, sent = _cancel_test_peer(
+        monkeypatch,
+        timeout_seconds=0.5,
+    )
+
+    result = peer.cancel(str(uuid4()))
+
+    assert result.state == "REJECTED"
+    assert not peer._heartbeat_stop.is_set()
+    assert not sent.is_set()
+
+
+def test_cancel_send_failure_joins_heartbeat_and_fails_closed(monkeypatch) -> None:
+    peer, command_id, _sent = _cancel_test_peer(
+        monkeypatch,
+        timeout_seconds=0.5,
+    )
+    peer.heartbeat = True
+    peer._start_heartbeat()
+
+    def fail_send(message_type: str, payload: dict[str, object]) -> None:
+        del message_type, payload
+        raise RuntimeError("synthetic cancel send failure")
+
+    monkeypatch.setattr(peer, "_send", fail_send)
+    result = peer.cancel(command_id)
+
+    assert result.state == "ABORTED_AGENT_RESTART"
+    assert "command.cancel was not confirmed" in result.detail
+    assert peer._heartbeat_stop.is_set()
+    with peer._condition:
+        assert peer._heartbeat_thread is None
+
+
+def test_cancel_join_failure_cannot_return_cancelled(monkeypatch) -> None:
+    peer, command_id, _sent = _cancel_test_peer(
+        monkeypatch,
+        timeout_seconds=0.5,
+    )
+
+    def confirm_cancel(message_type: str, payload: dict[str, object]) -> None:
+        assert message_type == "command.cancel"
+        assert payload["command_id"] == command_id
+        _record_command_status(peer, command_id, "CANCELLED")
+        peer._record_message(
+            {
+                "type": "control.status",
+                "payload": {
+                    "state": "SAFE_HOLD",
+                    "reason": "safe stop completed",
+                    "lease_sequence": None,
+                    "authority_revoked": True,
+                    "safe_stop_state": "confirmed",
+                    "safe_stop_epoch": 8,
+                },
+            }
+        )
+
+    def fail_join(*, timeout: float = 2.5, strict: bool = True) -> None:
+        del timeout, strict
+        raise RuntimeError("synthetic heartbeat join timeout")
+
+    monkeypatch.setattr(peer, "_send", confirm_cancel)
+    monkeypatch.setattr(peer, "_stop_heartbeat", fail_join)
+    result = peer.cancel(command_id)
+
+    assert result.state == "ABORTED_AGENT_RESTART"
+    assert "lease heartbeat did not stop" in result.detail
+
+
+def test_unexpected_heartbeat_renew_failure_records_last_error(monkeypatch) -> None:
+    peer, _command_id, _sent = _cancel_test_peer(
+        monkeypatch,
+        timeout_seconds=0.5,
+    )
+    peer.heartbeat = True
+
+    def fail_renew(robot_id: str, sequence: int) -> dict[str, object]:
+        del robot_id, sequence
+        raise RuntimeError("synthetic unexpected renewal failure")
+
+    monkeypatch.setattr(peer, "renew", fail_renew)
+    peer._start_heartbeat()
+    deadline = time.monotonic() + 1.0
+    while peer.connection_snapshot()["lastError"] is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert peer.connection_snapshot()["lastError"] == (
+        "Robot Agent lease renewal failed: synthetic unexpected renewal failure"
+    )
+    with peer._condition:
+        thread = peer._heartbeat_thread
+    if thread is not None:
+        thread.join(timeout=0.5)
+    with peer._condition:
+        assert peer._heartbeat_thread is None
 
 
 def test_cancel_without_new_safe_hold_times_out_as_unknown(monkeypatch) -> None:
