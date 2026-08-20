@@ -45,7 +45,8 @@ It verifies the runtime MJCF, office collision include, render textures and
 Nav2 map hashes, then uses the manifest's west-corridor spawn
 (`x=-6.45, y=0, yaw=0`) only while creating a new process. A physics fault
 never invokes an in-process reset or teleport. The native viewer tracks this
-spawned G1; the head camera continues to publish RGB-D.
+spawned G1 when the optional viewer is enabled; the head camera continues to
+publish RGB-D.
 
 Privileged labels, targets and complete object/spawn inventories exist only in
 `scenes/office_v2/evaluation/manifest.json`. That file and `scene.yaml` are
@@ -137,9 +138,9 @@ non-semantic integrity manifest.
 ## One-command workstation start
 
 The launcher starts the H-IDE Docker services, the isolated Nav2 container,
-the MuJoCo plant/viewer, SONIC, both ROS bridges, the simulation Robot Agent
-Gateway, `g1-sim`, and its Observation Gateway. It is idempotent: already
-running components are reported and left alone.
+the MuJoCo plant and offscreen RGB-D worker, SONIC, both ROS bridges, the
+simulation Robot Agent Gateway, `g1-sim`, and its Observation Gateway. It is
+idempotent: already running components are reported and left alone.
 
 ```bash
 cd /home/phi/learn-projects/h-ide-mujoco-sonic
@@ -153,9 +154,10 @@ scripts/workstation-demo-status.sh
 ```
 
 Runtime logs are kept outside the repositories under
-`${XDG_RUNTIME_DIR:-/tmp}/h-ide-mujoco-demo-$UID`. The native MuJoCo window is
-the third-person physics view; `http://127.0.0.1:8080/simulation` shows the
-robot's first-person RGB-D view, root pose, Nav2/SONIC state and trajectory.
+`${XDG_RUNTIME_DIR:-/tmp}/h-ide-mujoco-demo-$UID`. The locked acceptance
+profile disables the optional native viewer; `http://127.0.0.1:8080/simulation`
+shows the robot's first-person RGB-D view, root pose, Nav2/SONIC state and
+trajectory.
 
 ## Manual component start (for debugging)
 

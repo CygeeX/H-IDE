@@ -53,9 +53,9 @@ observation_jpeg_quality: 85
 # RTX/CUDA is available on the workstation; keeping SONIC on the GPU leaves
 # enough CPU time for MuJoCo's 250 Hz physics and the ROS bridge.
 force_cpu: false
-# Keep the native MuJoCo viewer visible for local operator validation while
-# offscreen RGB-D continues feeding H-IDE Vision.
-onscreen: true
+# Disable the optional native viewer for acceptance; required offscreen RGB-D
+# remains enabled for H-IDE Vision and mission evidence.
+onscreen: false
 offscreen: true
 # Keep the simulation-only vertical/attitude support engaged for the complete
 # workstation demonstration.  A value of 0 means never release it; it does not

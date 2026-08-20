@@ -450,6 +450,9 @@ def test_supported_configs_all_select_the_same_verified_office_v2_bundle() -> No
             + config.sonic_health_probe_timeout_s
             < 0.30
         )
+    acceptance_config = SimConfig.from_file(ROOT / "config" / "ros-headless.yaml")
+    assert acceptance_config.onscreen is False
+    assert acceptance_config.offscreen is True
     for name in ("sim.yaml", "headless.yaml", "ros-headless.yaml"):
         assert "h_ide_office_29dof.xml" not in (
             ROOT / "config" / name

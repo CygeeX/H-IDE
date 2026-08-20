@@ -565,5 +565,5 @@ wait_for_http \
   --http-timeout-seconds 1
 
 printf '\nRuntime logs: %s\n' "${HIDE_DEMO_RUN_ROOT}"
-printf 'MuJoCo viewer uses DISPLAY=%s. Open http://127.0.0.1:8080/simulation for RGB-D and mission evidence.\n' "${DISPLAY}"
+printf 'Optional MuJoCo viewer is disabled. Open http://127.0.0.1:8080/simulation for RGB-D and mission evidence.\n'
 "${HIDE_DEMO_SIM_ROOT}/scripts/workstation-demo-status.sh"
