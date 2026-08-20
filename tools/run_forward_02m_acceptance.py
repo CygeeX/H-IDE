@@ -906,19 +906,39 @@ class SafetyTracker:
         observation_worker = _mapping(plant.get("observationWorker"), "Plant observationWorker")
         viewer_worker = _mapping(plant.get("viewerWorker"), "Plant viewerWorker")
         if (
-            observation_worker.get("ready") is not True
+            observation_worker.get("status") != "running"
+            or observation_worker.get("ready") is not True
             or observation_worker.get("alive") is not True
+            or observation_worker.get("exitCode") is not None
             or _integer(observation_worker.get("failureCount"), "observation worker failureCount") != 0
             or _integer(
                 observation_worker.get("collectorFailureCount"),
                 "observation worker collectorFailureCount",
             )
             != 0
-            or viewer_worker.get("ready") is not True
-            or viewer_worker.get("alive") is not True
-            or _integer(viewer_worker.get("failureCount"), "viewer worker failureCount") != 0
         ):
-            raise AcceptanceError("Plant worker health is invalid")
+            raise AcceptanceError("Plant observation worker health is invalid")
+        viewer_failure_count = viewer_worker.get("failureCount", 0)
+        if (
+            viewer_worker.get("status") != "disabled"
+            or viewer_worker.get("authorityFeedbackEnabled") is not False
+            or viewer_worker.get("keyCallbackRegistered") is not False
+            or (
+                viewer_worker.get("ready") is not None
+                and viewer_worker.get("ready") is not False
+            )
+            or (
+                viewer_worker.get("alive") is not None
+                and viewer_worker.get("alive") is not False
+            )
+            or viewer_worker.get("exitCode") is not None
+            or viewer_worker.get("workerPid") is not None
+            or viewer_worker.get("workerBootId") is not None
+            or _integer(viewer_failure_count, "viewer worker failureCount") != 0
+            or viewer_worker.get("lastFailureAtUnixNs") is not None
+            or viewer_worker.get("lastError") is not None
+        ):
+            raise AcceptanceError("Plant viewer must remain canonically disabled")
         identities: dict[str, Any] = {
             "plant.robotId": plant.get("robotId"),
             "plant.sourceId": self._identity(plant.get("sourceId"), "Plant source"),
@@ -937,10 +957,9 @@ class SafetyTracker:
             "plant.observationWorkerBootId": self._identity(
                 observation_worker.get("workerBootId"), "observation worker boot"
             ),
-            "plant.viewerWorkerPid": _integer(viewer_worker.get("workerPid"), "viewer worker pid", minimum=1),
-            "plant.viewerWorkerBootId": self._identity(
-                viewer_worker.get("workerBootId"), "viewer worker boot"
-            ),
+            "plant.viewerWorkerMode": "disabled",
+            "plant.viewerWorkerPid": None,
+            "plant.viewerWorkerBootId": None,
         }
         if "driver_boot_id" in sonic:
             identities["sonic.driver_boot_id"] = self._identity(sonic.get("driver_boot_id"), "SONIC boot")

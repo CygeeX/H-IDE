@@ -109,19 +109,19 @@ def _plant(*, forward: float, state: str, yaw: float = 0.3) -> dict[str, Any]:
             "lastRearmGeneration": None if safe_hold else 10,
         },
         "observationWorker": {
+            "status": "running",
             "workerPid": 301,
             "workerBootId": "observation-worker-1",
             "failureCount": 0,
             "collectorFailureCount": 0,
             "ready": True,
             "alive": True,
+            "exitCode": None,
         },
         "viewerWorker": {
-            "workerPid": 302,
-            "workerBootId": "viewer-worker-1",
-            "failureCount": 0,
-            "ready": True,
-            "alive": True,
+            "status": "disabled",
+            "authorityFeedbackEnabled": False,
+            "keyCallbackRegistered": False,
         },
     }
 
@@ -301,6 +301,34 @@ class FakeTransport:
         state, forward = self.state()
         plant = _plant(forward=forward, state=state)
         sonic = _sonic(state=state)
+        if self.mode == "observation_worker_starting":
+            plant["observationWorker"]["status"] = "starting"
+        elif self.mode == "viewer_phantom_pid":
+            plant["viewerWorker"]["workerPid"] = 302
+        elif self.mode == "viewer_phantom_boot":
+            plant["viewerWorker"]["workerBootId"] = "viewer-worker-1"
+        elif self.mode == "viewer_failure":
+            plant["viewerWorker"]["failureCount"] = 1
+        elif self.mode == "viewer_error":
+            plant["viewerWorker"]["lastError"] = "viewer should not exist"
+        elif self.mode == "viewer_authority_feedback":
+            plant["viewerWorker"]["authorityFeedbackEnabled"] = True
+        elif self.mode == "viewer_key_callback":
+            plant["viewerWorker"]["keyCallbackRegistered"] = True
+        elif self.mode == "viewer_enabled":
+            plant["viewerWorker"] = {
+                "status": "running",
+                "ready": True,
+                "alive": True,
+                "exitCode": None,
+                "workerPid": 302,
+                "workerBootId": "viewer-worker-1",
+                "failureCount": 0,
+                "lastFailureAtUnixNs": None,
+                "lastError": None,
+                "authorityFeedbackEnabled": False,
+                "keyCallbackRegistered": False,
+            }
         if self.released_pose is not None:
             plant["pose"].update(self.released_pose)
         if (
@@ -1297,6 +1325,10 @@ def test_success_posts_exact_frozen_payload_once_then_queries_once(
     assert final["passed"] is True
     assert final["terminalSafeStopEpoch"] == 8
     assert clock() - query_at > 1.0  # independent continuous terminal hold proof
+    assert machine.safety.identities is not None
+    assert machine.safety.identities["plant.viewerWorkerMode"] == "disabled"
+    assert machine.safety.identities["plant.viewerWorkerPid"] is None
+    assert machine.safety.identities["plant.viewerWorkerBootId"] is None
 
 
 def test_uncertain_post_is_never_retried_and_ra_unknown_still_cancels_once(
@@ -1724,6 +1756,33 @@ def test_fresh_but_unhealthy_first_motion_sample_blocks_discover_and_post(
     assert result["passed"] is False
     assert result["commandPostCount"] == 0
     assert result["discoverGetCount"] == 0
+    assert not any("/internal/v1/" in call.url for call in transport.calls)
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "observation_worker_starting",
+        "viewer_phantom_pid",
+        "viewer_phantom_boot",
+        "viewer_failure",
+        "viewer_error",
+        "viewer_authority_feedback",
+        "viewer_key_callback",
+        "viewer_enabled",
+    ],
+)
+def test_acceptance_profile_rejects_noncanonical_render_worker_health_before_discover(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    machine, _clock, transport, _evidence = _build(monkeypatch, mode=mode)
+
+    result = machine.run()
+
+    assert result["passed"] is False
+    assert result["discoverGetCount"] == 0
+    assert result["commandPostCount"] == 0
     assert not any("/internal/v1/" in call.url for call in transport.calls)
 
 
