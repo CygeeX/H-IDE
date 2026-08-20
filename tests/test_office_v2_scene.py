@@ -23,6 +23,7 @@ from hide_mujoco_sonic.motion_fault import (
 from hide_mujoco_sonic.plant import (
     apply_process_start_spawn,
     configure_tracking_viewer,
+    operator_viewer_deferred,
     operator_viewer_enabled,
 )
 from hide_mujoco_sonic.scene_runtime import load_runtime_scene
@@ -85,6 +86,13 @@ def test_operator_viewer_override_only_enables_the_private_viewer(
     with pytest.raises(RuntimeError, match="must be exactly 0 or 1"):
         operator_viewer_enabled(config)
 
+    monkeypatch.setenv("HIDE_MUJOCO_ONSCREEN_VIEWER", "1")
+    monkeypatch.setenv("HIDE_MUJOCO_DEFER_ONSCREEN_VIEWER", "1")
+    assert operator_viewer_deferred(config) is True
+    monkeypatch.setenv("HIDE_MUJOCO_DEFER_ONSCREEN_VIEWER", "later")
+    with pytest.raises(RuntimeError, match="must be exactly 0 or 1"):
+        operator_viewer_deferred(config)
+
 
 def test_workstation_launcher_exposes_an_explicit_viewer_mode() -> None:
     launcher = (ROOT / "scripts" / "start-workstation-demo.sh").read_text(
@@ -99,21 +107,16 @@ def test_workstation_launcher_exposes_an_explicit_viewer_mode() -> None:
         '--setenv="HIDE_MUJOCO_ONSCREEN_VIEWER='
         '${HIDE_MUJOCO_ONSCREEN_VIEWER}"' in launcher
     )
+    assert '--setenv="HIDE_MUJOCO_DEFER_ONSCREEN_VIEWER=1"' in launcher
     assert 'xdpyinfo -display "${DISPLAY}"' in launcher
     assert "wait_for_native_viewer" in launcher
     assert "Plant is already running without a ready native viewer" in launcher
     plant_start = launcher.index("start_process \\\n  mujoco-plant")
-    viewer_gate = launcher.index("wait_for_native_viewer", plant_start)
     sonic_start = launcher.index("start_process \\\n  sonic-driver", plant_start)
-    assert plant_start < viewer_gate < sonic_start
-    pause_viewer = launcher.index(
-        "pause_native_viewer_for_sonic_cold_start", viewer_gate
-    )
     sonic_ready = launcher.index("wait_for_sonic_motion_ready 120", sonic_start)
-    resume_viewer = launcher.index("resume_native_viewer", sonic_ready)
-    second_viewer_gate = launcher.index("wait_for_native_viewer", resume_viewer)
-    assert viewer_gate < pause_viewer < sonic_start < sonic_ready
-    assert sonic_ready < resume_viewer < second_viewer_gate
+    trigger_viewer = launcher.index("trigger_native_viewer", sonic_ready)
+    viewer_gate = launcher.index("wait_for_native_viewer", trigger_viewer)
+    assert plant_start < sonic_start < sonic_ready < trigger_viewer < viewer_gate
 
 
 def test_build_is_idempotent_and_matches_committed_outputs(tmp_path: Path) -> None:

@@ -16,6 +16,7 @@ import math
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
 from pathlib import Path
+import signal
 import sys
 import threading
 import time
@@ -46,6 +47,7 @@ class PlantPhysicsFault(RuntimeError):
 
 
 _OPERATOR_VIEWER_ENV = "HIDE_MUJOCO_ONSCREEN_VIEWER"
+_DEFERRED_OPERATOR_VIEWER_ENV = "HIDE_MUJOCO_DEFER_ONSCREEN_VIEWER"
 
 
 def operator_viewer_enabled(config: SimConfig) -> bool:
@@ -62,6 +64,19 @@ def operator_viewer_enabled(config: SimConfig) -> bool:
     if override not in {"0", "1"}:
         raise RuntimeError(f"{_OPERATOR_VIEWER_ENV} must be exactly 0 or 1")
     return config.onscreen or override == "1"
+
+
+def operator_viewer_deferred(config: SimConfig) -> bool:
+    """Return whether launcher-triggered viewer creation is requested."""
+
+    override = os.environ.get(_DEFERRED_OPERATOR_VIEWER_ENV, "0")
+    if override not in {"0", "1"}:
+        raise RuntimeError(
+            f"{_DEFERRED_OPERATOR_VIEWER_ENV} must be exactly 0 or 1"
+        )
+    if override == "1" and not operator_viewer_enabled(config):
+        raise RuntimeError("deferred MuJoCo viewer requires an enabled viewer")
+    return override == "1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1278,6 +1293,7 @@ class PlantFrameStore:
 
 def run_plant(config: SimConfig) -> int:
     onscreen_viewer_enabled = operator_viewer_enabled(config)
+    defer_onscreen_viewer = operator_viewer_deferred(config)
     repository_root = Path(__file__).resolve().parents[2]
     simulator_root = repository_root / "models" / "unitree-g1-mujoco"
     if not (simulator_root / "sim" / "simulator_factory.py").is_file():
@@ -1469,6 +1485,11 @@ def run_plant(config: SimConfig) -> int:
     frames: PlantFrameStore | None = None
     rgbd_worker: RgbdRenderWorker | None = None
     viewer_worker: PassiveViewerWorker | None = None
+    viewer_lifecycle_lock = threading.Lock()
+    viewer_start_event: threading.Event | None = None
+    viewer_shutdown_event: threading.Event | None = None
+    viewer_start_thread: threading.Thread | None = None
+    previous_sigusr1_handler = None
     runtime_diagnostics = PlantRuntimeDiagnostics(
         stall_threshold_s=config.plant_lowstate_stale_s,
     )
@@ -1589,9 +1610,39 @@ def run_plant(config: SimConfig) -> int:
                     spawn_y=config.runtime_scene.spawn_y,
                 ),
             )
-            viewer_worker.start()
+
+            def viewer_status():
+                with viewer_lifecycle_lock:
+                    return viewer_worker.status()
+
+            if defer_onscreen_viewer:
+                viewer_start_event = threading.Event()
+                viewer_shutdown_event = threading.Event()
+
+                def request_viewer_start(_signum, _frame):
+                    viewer_start_event.set()
+
+                def start_viewer_after_request():
+                    viewer_start_event.wait()
+                    if viewer_shutdown_event.is_set():
+                        return
+                    with viewer_lifecycle_lock:
+                        if not viewer_shutdown_event.is_set():
+                            viewer_worker.start()
+
+                previous_sigusr1_handler = signal.getsignal(signal.SIGUSR1)
+                signal.signal(signal.SIGUSR1, request_viewer_start)
+                viewer_start_thread = threading.Thread(
+                    target=start_viewer_after_request,
+                    daemon=True,
+                    name="mujoco-native-viewer-starter",
+                )
+                viewer_start_thread.start()
+            else:
+                with viewer_lifecycle_lock:
+                    viewer_worker.start()
             if frames is not None:
-                frames.set_viewer_status_provider(viewer_worker.status)
+                frames.set_viewer_status_provider(viewer_status)
 
             def publish_viewer_snapshot():
                 started = time.monotonic()
@@ -1613,6 +1664,14 @@ def run_plant(config: SimConfig) -> int:
 
         simulator.start()
     finally:
+        if previous_sigusr1_handler is not None:
+            signal.signal(signal.SIGUSR1, previous_sigusr1_handler)
+        if viewer_shutdown_event is not None:
+            viewer_shutdown_event.set()
+        if viewer_start_event is not None:
+            viewer_start_event.set()
+        if viewer_start_thread is not None:
+            viewer_start_thread.join(timeout=1.0)
         try:
             if frames is not None:
                 frames.close()
@@ -1623,7 +1682,8 @@ def run_plant(config: SimConfig) -> int:
             finally:
                 try:
                     if viewer_worker is not None:
-                        viewer_worker.close()
+                        with viewer_lifecycle_lock:
+                            viewer_worker.close()
                 finally:
                     simulator.close()
     return 0

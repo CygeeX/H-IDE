@@ -20,8 +20,6 @@ HIDE_DEMO_SYSTEMD_PREFIX="h-ide-mujoco-demo"
 HIDE_DOCKER_OBSERVATION_BIND_REQUEST="${HIDE_DOCKER_OBSERVATION_BIND_HOST:-auto}"
 HIDE_DEMO_REBUILD=false
 HIDE_MUJOCO_ONSCREEN_VIEWER=0
-HIDE_DEMO_PAUSED_VIEWER_PID=""
-HIDE_DEMO_PAUSED_VIEWER_START_TICKS=""
 
 for argument in "$@"; do
   case "${argument}" in
@@ -174,6 +172,7 @@ start_process() {
     if [[ "${HIDE_MUJOCO_ONSCREEN_VIEWER}" == "1" ]]; then
       operator_viewer_env_args+=(
         --setenv="XAUTHORITY=${HIDE_DEMO_XAUTHORITY}"
+        --setenv="HIDE_MUJOCO_DEFER_ONSCREEN_VIEWER=1"
       )
     fi
   fi
@@ -292,69 +291,29 @@ raise SystemExit(1)
   return 1
 }
 
-resume_native_viewer() {
-  if [[ ! "${HIDE_DEMO_PAUSED_VIEWER_PID}" =~ ^[1-9][0-9]*$ \
-    || ! "${HIDE_DEMO_PAUSED_VIEWER_START_TICKS}" =~ ^[1-9][0-9]*$ ]]; then
-    return 0
-  fi
-  local current_start_ticks=""
-  if [[ -r "/proc/${HIDE_DEMO_PAUSED_VIEWER_PID}/stat" ]]; then
-    current_start_ticks="$(
-      awk '{print $22}' "/proc/${HIDE_DEMO_PAUSED_VIEWER_PID}/stat"
-    )"
-  fi
-  if [[ "${current_start_ticks}" == "${HIDE_DEMO_PAUSED_VIEWER_START_TICKS}" ]]; then
-    kill -CONT "${HIDE_DEMO_PAUSED_VIEWER_PID}"
-  fi
-  HIDE_DEMO_PAUSED_VIEWER_PID=""
-  HIDE_DEMO_PAUSED_VIEWER_START_TICKS=""
-}
-
-pause_native_viewer_for_sonic_cold_start() {
+trigger_native_viewer() {
   if [[ "${HIDE_MUJOCO_ONSCREEN_VIEWER}" != "1" ]]; then
     return 0
   fi
-  local state=""
-  local viewer_pid=""
   local plant_pid=""
-  local viewer_parent_pid=""
-  local viewer_owner_uid=""
-  local viewer_start_ticks=""
-  state="$(curl -fsS --max-time 2 http://127.0.0.1:8794/state)"
-  viewer_pid="$(printf '%s' "${state}" \
-    | "${HIDE_DEMO_SIM_ROOT}/.venv/bin/python" -c '
-import json
-import sys
-
-viewer = json.load(sys.stdin).get("viewerWorker")
-pid = viewer.get("workerPid") if isinstance(viewer, dict) else None
-if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
-    raise SystemExit(1)
-print(pid)
-')"
+  local plant_owner_uid=""
+  local plant_command=""
   plant_pid="$(systemctl --user show -p MainPID --value \
     "${HIDE_DEMO_SYSTEMD_PREFIX}-mujoco-plant.service")"
-  if [[ ! "${viewer_pid}" =~ ^[1-9][0-9]*$ \
-    || ! "${plant_pid}" =~ ^[1-9][0-9]*$ \
-    || ! -r "/proc/${viewer_pid}/status" \
-    || ! -r "/proc/${viewer_pid}/stat" ]]; then
-    printf 'refusing to pause an unverified MuJoCo viewer process\n' >&2
+  if [[ ! "${plant_pid}" =~ ^[1-9][0-9]*$ \
+    || ! -r "/proc/${plant_pid}/cmdline" ]]; then
+    printf 'refusing to trigger a viewer for an unverified Plant process\n' >&2
     return 1
   fi
-  viewer_parent_pid="$(awk '/^PPid:/ {print $2}' "/proc/${viewer_pid}/status")"
-  viewer_owner_uid="$(stat -c '%u' "/proc/${viewer_pid}")"
-  viewer_start_ticks="$(awk '{print $22}' "/proc/${viewer_pid}/stat")"
-  if [[ "${viewer_parent_pid}" != "${plant_pid}" \
-    || "${viewer_owner_uid}" != "${UID}" \
-    || ! "${viewer_start_ticks}" =~ ^[1-9][0-9]*$ ]]; then
-    printf 'MuJoCo viewer process identity does not match the Plant\n' >&2
+  plant_owner_uid="$(stat -c '%u' "/proc/${plant_pid}")"
+  plant_command="$(tr '\0' ' ' <"/proc/${plant_pid}/cmdline")"
+  if [[ "${plant_owner_uid}" != "${UID}" \
+    || "${plant_command}" != *"-m hide_mujoco_sonic plant --config"* ]]; then
+    printf 'MuJoCo Plant process identity does not match the viewer target\n' >&2
     return 1
   fi
-  HIDE_DEMO_PAUSED_VIEWER_PID="${viewer_pid}"
-  HIDE_DEMO_PAUSED_VIEWER_START_TICKS="${viewer_start_ticks}"
-  trap resume_native_viewer EXIT
-  kill -STOP "${viewer_pid}"
-  printf '%-28s paused for SONIC load\n' 'MuJoCo native viewer'
+  kill -USR1 "${plant_pid}"
+  printf '%-28s requested\n' 'MuJoCo native viewer'
 }
 
 wait_for_qwen_vision() {
@@ -645,13 +604,11 @@ start_process \
   'exec "$HIDE_DEMO_SIM_ROOT/.venv/bin/python" -u -m hide_mujoco_sonic plant --config "$HIDE_DEMO_CONFIG"'
 
 wait_for_http 'MuJoCo plant + RGB-D' 'http://127.0.0.1:8794/healthz' 60
-wait_for_native_viewer
-pause_native_viewer_for_sonic_cold_start
 
 # Native viewer/X11 initialization and SONIC's ONNX model load are both heavy
-# cold-start operations. Complete the passive viewer gate first so they cannot
-# combine into a false Plant control-clock discontinuity. This does not relax
-# the runtime gap threshold; the Plant remains fail-closed throughout.
+# cold-start operations. Keep the private viewer unspawned until the controller
+# is fully ready so they cannot combine into a Plant clock discontinuity. This
+# does not relax the runtime gap threshold; the Plant stays fail-closed.
 start_process \
   sonic-driver \
   '-m hide_mujoco_sonic sonic --config' \
@@ -663,8 +620,7 @@ start_process \
 # IDLE consumer has sustained the authoritative 50 Hz simulation cadence, and
 # the driver explicitly opens its motion gate.
 wait_for_sonic_motion_ready 120
-resume_native_viewer
-trap - EXIT
+trigger_native_viewer
 wait_for_native_viewer
 
 # Start ROS ingress only after the actuator-side controller is ready. This
