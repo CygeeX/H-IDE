@@ -116,7 +116,9 @@ def test_workstation_launcher_exposes_an_explicit_viewer_mode() -> None:
     sonic_ready = launcher.index("wait_for_sonic_motion_ready 120", sonic_start)
     trigger_viewer = launcher.index("trigger_native_viewer", sonic_ready)
     viewer_gate = launcher.index("wait_for_native_viewer", trigger_viewer)
+    first_person = launcher.index("first-person-viewer", viewer_gate)
     assert plant_start < sonic_start < sonic_ready < trigger_viewer < viewer_gate
+    assert viewer_gate < first_person
 
 
 def test_build_is_idempotent_and_matches_committed_outputs(tmp_path: Path) -> None:

@@ -175,6 +175,10 @@ start_process() {
         --setenv="HIDE_MUJOCO_DEFER_ONSCREEN_VIEWER=1"
       )
     fi
+  elif [[ "${name}" == "first-person-viewer" ]]; then
+    operator_viewer_env_args=(
+      --setenv="XAUTHORITY=${HIDE_DEMO_XAUTHORITY}"
+    )
   fi
 
   if systemctl --user is-active --quiet "${unit}"; then
@@ -622,6 +626,13 @@ start_process \
 wait_for_sonic_motion_ready 120
 trigger_native_viewer
 wait_for_native_viewer
+if [[ "${HIDE_MUJOCO_ONSCREEN_VIEWER}" == "1" ]]; then
+  start_process \
+    first-person-viewer \
+    'tools/live_first_person_viewer.py' \
+    "${HIDE_DEMO_SIM_ROOT}" \
+    'exec "$HIDE_DEMO_SIM_ROOT/.venv/bin/python" "$HIDE_DEMO_SIM_ROOT/tools/live_first_person_viewer.py"'
+fi
 
 # Start ROS ingress only after the actuator-side controller is ready. This
 # avoids creating an already-armed IDLE lifecycle whose observation stream can
