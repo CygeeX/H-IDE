@@ -164,7 +164,7 @@ def run() -> None:
     try:
         import rclpy
         from lifecycle_msgs.srv import GetState
-        from nav_msgs.msg import OccupancyGrid
+        from nav2_msgs.msg import Costmap
         from rclpy.node import Node
         from std_msgs.msg import String
     except ImportError as exc:  # pragma: no cover - requires the Nav2 image
@@ -192,7 +192,7 @@ def run() -> None:
             self._scan_token = 0
             self._scan_results: dict[int, dict[str, str]] = {}
             self.create_subscription(
-                OccupancyGrid,
+                Costmap,
                 "/local_costmap/costmap_raw",
                 self._on_costmap,
                 10,

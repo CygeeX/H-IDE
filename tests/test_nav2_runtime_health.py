@@ -79,6 +79,8 @@ def test_nav2_health_process_has_no_motion_publisher_or_action_client() -> None:
     assert "/local_costmap/costmap_raw" in string_literals
     assert "/cmd_vel" not in string_literals
     assert "ActionClient" not in source
+    assert "from nav2_msgs.msg import Costmap" in source
+    assert "from nav_msgs.msg import OccupancyGrid" not in source
 
 
 def test_nav2_health_does_not_shadow_rclpy_node_client_storage() -> None:
