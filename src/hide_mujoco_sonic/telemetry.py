@@ -86,6 +86,8 @@ class TelemetryState:
     static_hold_active: bool = True
     motion_handoff_active: bool = False
     motion_handoff_ratio: float = 0.0
+    policy_activation_phase: str = "UNPREPARED"
+    policy_activation_ratio: float = 0.0
     plant_support_mode: str = "unknown"
     plant_support_requested_mode: str = "unknown"
     plant_support_confirmed_mode: str = "unknown"

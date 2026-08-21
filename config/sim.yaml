@@ -38,6 +38,7 @@ command_timeout_s: 0.25
 # reference within this much authoritative MuJoCo time. This expires before
 # the ROS bridge's 1.5 s measured gait-start deadline.
 planner_reference_timeout_s: 0.75
+policy_activation_s: 3.0
 motion_handoff_warmup_s: 0.35
 motion_handoff_blend_s: 0.40
 # Apply SONIC's learned IDLE transition only for this bounded interval after a

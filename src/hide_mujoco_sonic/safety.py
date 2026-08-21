@@ -677,6 +677,188 @@ class JointCommandDecision:
     handoff_ratio: float
 
 
+@dataclass(frozen=True)
+class NominalPolicyActivationDecision:
+    """One immutable proposal in the policy activation ramp."""
+
+    epoch: int
+    targets: tuple[float, ...]
+    ratio: float
+    complete: bool
+
+
+class NominalPolicyActivation:
+    """Prepare the official nominal standing pose before the first policy tick.
+
+    NVIDIA's G1 deployment has a distinct INIT phase which moves the robot from
+    its current joint pose to the policy's nominal standing pose before CONTROL
+    begins.  H-IDE cannot perform that motion during process startup because its
+    cold-start contract is an exact static hold, so the same transition is
+    deferred until the first explicitly authorized Nav2 action.
+
+    Proposals use authoritative MuJoCo milliseconds, never wall time.  State is
+    committed only after the caller reports the exact target that successfully
+    crossed DDS; a stop can therefore invalidate an in-flight proposal without
+    manufacturing a completed activation.
+    """
+
+    _PHASES = frozenset({"UNPREPARED", "PREPARING", "PREPARED"})
+
+    def __init__(self, *, joint_count: int = 29, duration_s: float = 3.0) -> None:
+        if (
+            isinstance(joint_count, bool)
+            or not isinstance(joint_count, int)
+            or joint_count <= 0
+        ):
+            raise ValueError("activation joint_count must be a positive integer")
+        if isinstance(duration_s, bool):
+            raise ValueError("activation duration must be finite and at least 3s")
+        duration = float(duration_s)
+        if not math.isfinite(duration) or duration < 3.0:
+            raise ValueError("activation duration must be finite and at least 3s")
+        duration_ms = round(duration * 1_000.0)
+        if duration_ms <= 0 or not math.isclose(
+            duration_ms / 1_000.0,
+            duration,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            raise ValueError("activation duration must resolve to whole milliseconds")
+        self.joint_count = joint_count
+        self.duration_s = duration
+        self.duration_ms = int(duration_ms)
+        self._phase = "UNPREPARED"
+        self._epoch = 0
+        self._start_targets: tuple[float, ...] | None = None
+        self._start_tick_ms: int | None = None
+        self._ratio = 0.0
+
+    @property
+    def phase(self) -> str:
+        return self._phase
+
+    @property
+    def epoch(self) -> int:
+        return self._epoch
+
+    @property
+    def ratio(self) -> float:
+        return self._ratio
+
+    @property
+    def preparing(self) -> bool:
+        return self._phase == "PREPARING"
+
+    @property
+    def prepared(self) -> bool:
+        return self._phase == "PREPARED"
+
+    def begin(self, targets: Sequence[float], *, tick_ms: int) -> bool:
+        """Begin once per process, preserving an already-running transition."""
+
+        if self.prepared or self.preparing:
+            return False
+        boundary = self._validate_targets(targets, "activation boundary")
+        start_tick = self._validate_tick(tick_ms)
+        self._epoch += 1
+        self._phase = "PREPARING"
+        self._start_targets = boundary
+        self._start_tick_ms = start_tick
+        self._ratio = 0.0
+        return True
+
+    def propose(
+        self,
+        nominal: Sequence[float],
+        *,
+        tick_ms: int,
+    ) -> NominalPolicyActivationDecision:
+        if not self.preparing:
+            raise RuntimeError("nominal policy activation is not preparing")
+        assert self._start_targets is not None
+        assert self._start_tick_ms is not None
+        current_tick = self._validate_tick(tick_ms)
+        if current_tick < self._start_tick_ms:
+            raise ValueError("activation MuJoCo tick moved backwards")
+        nominal_targets = self._validate_targets(nominal, "nominal targets")
+        elapsed_ms = current_tick - self._start_tick_ms
+        ratio = min(1.0, elapsed_ms / self.duration_ms)
+        targets = tuple(
+            start * (1.0 - ratio) + target * ratio
+            for start, target in zip(
+                self._start_targets,
+                nominal_targets,
+                strict=True,
+            )
+        )
+        return NominalPolicyActivationDecision(
+            epoch=self._epoch,
+            targets=targets,
+            ratio=ratio,
+            complete=ratio >= 1.0,
+        )
+
+    def is_current(self, decision: NominalPolicyActivationDecision) -> bool:
+        return bool(
+            isinstance(decision, NominalPolicyActivationDecision)
+            and self.preparing
+            and decision.epoch == self._epoch
+        )
+
+    def commit(
+        self,
+        decision: NominalPolicyActivationDecision,
+        published_targets: Sequence[float],
+    ) -> bool:
+        """Commit one successful DDS fact; return True only on final commit."""
+
+        if not self.is_current(decision):
+            return False
+        actual = self._validate_targets(published_targets, "published targets")
+        if actual != decision.targets:
+            return False
+        if decision.ratio + 1e-12 < self._ratio:
+            raise RuntimeError("activation ratio moved backwards")
+        self._ratio = decision.ratio
+        if decision.complete:
+            self._phase = "PREPARED"
+            self._start_targets = None
+            self._start_tick_ms = None
+            self._ratio = 1.0
+            return True
+        return False
+
+    def abort(self) -> bool:
+        """Invalidate unfinished proposals while preserving process-level prep."""
+
+        if not self.preparing:
+            return False
+        self._epoch += 1
+        self._phase = "UNPREPARED"
+        self._start_targets = None
+        self._start_tick_ms = None
+        self._ratio = 0.0
+        return True
+
+    def _validate_targets(
+        self,
+        values: Sequence[float],
+        label: str,
+    ) -> tuple[float, ...]:
+        result = tuple(float(value) for value in values)
+        if len(result) != self.joint_count:
+            raise ValueError(f"{label} must contain {self.joint_count} values")
+        if not all(math.isfinite(value) for value in result):
+            raise ValueError(f"{label} must be finite")
+        return result
+
+    @staticmethod
+    def _validate_tick(value: int) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError("activation tick_ms must be a non-negative integer")
+        return value
+
+
 class StaticJointHandoff:
     """Select either an exact static hold or an authority-owned policy target.
 
@@ -1162,14 +1344,21 @@ class JointGuardResult:
 
 
 class NavigationArmGuard:
-    """Verify SONIC arm targets without rewriting learned-controller output.
+    """Bound SONIC arm targets and preserve the exact executed history.
 
     SONIC is a whole-body policy, so even a Nav2 walking command can produce
     targets for all fourteen arm joints.  H-IDE's current simulation profile
     has no manipulation capability; large upper-body excursions are therefore
-    neither required nor safe.  This guard rejects non-finite, out-of-envelope,
-    or discontinuous policy targets.  A valid target passes through bit-for-bit
-    (after float conversion), so executed-action feedback matches DDS exactly.
+    neither required nor safe.  This guard rejects non-finite or
+    out-of-envelope policy targets and applies the configured per-joint slew
+    bound to short discontinuities.  The caller must feed the returned
+    actuator target—not the raw candidate—through ``record_executed_target``
+    so recurrent action history remains exactly equal to the DDS fact.
+
+    A brief projection closes reference/intent seams without weakening the
+    physical velocity limit.  Continuously saturated policy output is not a
+    normal gait: each joint has a bounded saturation budget and fails closed
+    when it remains constrained beyond that budget.
 
     It deliberately runs *after* SONIC and before ``rt/lowcmd``.  The lower
     body and waist remain untouched, and this guard cannot create motion on its
@@ -1182,6 +1371,7 @@ class NavigationArmGuard:
         *,
         max_deviation_rad: Sequence[float],
         max_velocity_rps: Sequence[float],
+        max_continuous_saturation_s: float = 0.25,
     ) -> None:
         self.nominal = tuple(float(value) for value in nominal)
         self.max_deviation_rad = tuple(float(value) for value in max_deviation_rad)
@@ -1198,7 +1388,18 @@ class NavigationArmGuard:
             raise ValueError("arm deviations must be finite and positive")
         if not all(math.isfinite(value) and value > 0 for value in self.max_velocity_rps):
             raise ValueError("arm velocity limits must be finite and positive")
+        if isinstance(max_continuous_saturation_s, bool):
+            raise ValueError(
+                "arm saturation budget must be finite and positive"
+            )
+        saturation_budget = float(max_continuous_saturation_s)
+        if not math.isfinite(saturation_budget) or saturation_budget <= 0.0:
+            raise ValueError(
+                "arm saturation budget must be finite and positive"
+            )
+        self.max_continuous_saturation_s = saturation_budget
         self._last: tuple[float, ...] | None = None
+        self._continuous_saturation_s = tuple(0.0 for _ in self.nominal)
 
     def apply(
         self,
@@ -1211,7 +1412,7 @@ class NavigationArmGuard:
             raise ValueError("arm target vector has an unexpected length")
         if measured is not None and len(measured) != len(self.nominal):
             raise ValueError("measured arm vector has an unexpected length")
-        if not math.isfinite(float(dt)) or dt <= 0:
+        if isinstance(dt, bool) or not math.isfinite(float(dt)) or dt <= 0:
             raise ValueError("arm guard dt must be finite and positive")
 
         raw_targets = tuple(float(value) for value in targets)
@@ -1225,25 +1426,56 @@ class NavigationArmGuard:
         else:
             anchor = self._last
 
+        projected_targets: list[float] = []
+        saturation_durations: list[float] = []
+        constrained_joints = 0
         max_step = 0.0
         for index, raw in enumerate(raw_targets):
             if not self._within_envelope_or_recovering(raw, anchor[index], index):
                 raise ValueError(
-                    f"arm policy target {index} exceeds the navigation envelope"
+                    "arm policy target "
+                    f"{index}={raw:.17g} exceeds the navigation envelope "
+                    f"around nominal={self.nominal[index]:.17g} "
+                    f"from anchor={anchor[index]:.17g}"
                 )
             allowed_step = self.max_velocity_rps[index] * float(dt)
             step = raw - anchor[index]
             if abs(step) > allowed_step + 1e-9:
-                raise ValueError(
-                    f"arm policy target {index} exceeds the per-tick slew limit"
+                projected = anchor[index] + math.copysign(
+                    allowed_step,
+                    step,
                 )
-            max_step = max(max_step, abs(step))
+                saturated_for = (
+                    self._continuous_saturation_s[index] + float(dt)
+                )
+                if saturated_for > self.max_continuous_saturation_s + 1e-12:
+                    raise ValueError(
+                        "arm policy target "
+                        f"{index}={raw:.17g} persistently exceeds the per-tick "
+                        f"slew limit: anchor={anchor[index]:.17g}, "
+                        f"delta={step:.17g}, allowed={allowed_step:.17g}, "
+                        f"saturated_for={saturated_for:.17g}s, "
+                        f"budget={self.max_continuous_saturation_s:.17g}s"
+                    )
+                constrained_joints += 1
+            else:
+                projected = raw
+                saturated_for = 0.0
+            projected_targets.append(projected)
+            saturation_durations.append(saturated_for)
+            max_step = max(max_step, abs(projected - anchor[index]))
 
-        self._last = raw_targets
-        return JointGuardResult(self._last, 0, max_step)
+        self._last = tuple(projected_targets)
+        self._continuous_saturation_s = tuple(saturation_durations)
+        return JointGuardResult(
+            self._last,
+            constrained_joints,
+            max_step,
+        )
 
     def reset(self) -> None:
         self._last = None
+        self._continuous_saturation_s = tuple(0.0 for _ in self.nominal)
 
     def anchor(self, targets: Sequence[float]) -> None:
         """Seed verification from the exact actuator-side arm targets.
@@ -1261,6 +1493,7 @@ class NavigationArmGuard:
         if not all(math.isfinite(value) for value in values):
             raise ValueError("arm anchor vector must be finite")
         self._last = values
+        self._continuous_saturation_s = tuple(0.0 for _ in self.nominal)
 
     def _within_envelope_or_recovering(
         self,

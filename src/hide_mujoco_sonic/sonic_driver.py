@@ -48,6 +48,8 @@ from .runtime_diagnostics import SonicRuntimeDiagnostics
 from .safety import (
     CmdVelGuard,
     NavigationArmGuard,
+    NominalPolicyActivation,
+    NominalPolicyActivationDecision,
     PlantControlClock,
     PlantControlClockFault,
     PlantControlStep,
@@ -457,6 +459,10 @@ class SonicDriver:
             warmup_s=config.motion_handoff_warmup_s,
             blend_s=config.motion_handoff_blend_s,
         )
+        self._policy_activation = NominalPolicyActivation(
+            duration_s=config.policy_activation_s
+        )
+        self._policy_activation_requested = False
         self._static_hold_active = True
         self._plant_support_mode: str | None = None
         self._plant_support_stop_pending = False
@@ -543,9 +549,14 @@ class SonicDriver:
         # locomotion policy and relies on shoulder/elbow counter-swing for
         # balance.  The earlier narrow envelope constrained most arm joints on
         # every tick and turned a safety guard into an untrained policy rewrite.
-        # Keep a physical-range envelope and a high slew ceiling that catches
-        # discontinuities while leaving nominal gait dynamics untouched.
-        per_arm_deviation = (2.50, 1.40, 2.20, 1.45, 1.80, 1.50, 1.50)
+        # Keep a physical-range envelope and a high slew ceiling.  Brief
+        # reference seams are projected to that unchanged ceiling and fed
+        # back exactly; persistent saturation still fails closed in the guard.
+        # Shoulder pitch nominal is ~0.2 rad while the checked-in Unitree G1
+        # model's hard upper limit is 2.6704 rad.  Keep a small explicit margin
+        # (2.47 rather than 2.470399997...) so a slew-valid sequence can never
+        # walk the target past the MuJoCo joint range without saturation.
+        per_arm_deviation = (2.47, 1.40, 2.20, 1.45, 1.80, 1.50, 1.50)
         per_arm_velocity = (6.0, 6.0, 6.0, 6.0, 4.0, 4.0, 4.0)
         return NavigationArmGuard(
             DEFAULT_ANGLES[15:29],
@@ -1000,8 +1011,18 @@ class SonicDriver:
             # lock is treated by the post-Write transaction below; never hold
             # the terminal lock across Unitree's unbounded Write call.
             with self._terminal_fault_lock:
-                if self._fault_latched.is_set():
-                    self._enforce_terminal_boundary_locked()
+                terminal_before_write = self._fault_latched.is_set()
+                process_stop_before_write = (
+                    self._process_stop_fences_motion_locked()
+                )
+                if terminal_before_write or process_stop_before_write:
+                    if terminal_before_write:
+                        self._enforce_terminal_boundary_locked()
+                    else:
+                        self._freeze_last_published_hold(
+                            publish_telemetry=False
+                        )
+                        self._consume_vendor_revoke_locked()
                     selected = (
                         self._safe_hold_targets
                         or self._last_published_targets
@@ -1026,11 +1047,23 @@ class SonicDriver:
             with self._terminal_fault_lock:
                 terminal_error: Exception | None = None
                 terminal_after_write = self._fault_latched.is_set()
-                if terminal_after_write:
+                process_stop_after_write = (
+                    self._process_stop_fences_motion_locked()
+                )
+                stopping_after_write = (
+                    terminal_after_write or process_stop_after_write
+                )
+                if stopping_after_write:
                     final_targets = self._record_successful_dds_target(selected)
                     self._safe_hold_targets = final_targets
                     try:
-                        self._enforce_terminal_boundary_locked()
+                        if terminal_after_write:
+                            self._enforce_terminal_boundary_locked()
+                        else:
+                            self._freeze_last_published_hold(
+                                publish_telemetry=False
+                            )
+                            self._consume_vendor_revoke_locked()
                     except Exception as exc:
                         terminal_error = exc
                     try:
@@ -1162,6 +1195,23 @@ class SonicDriver:
                 failures.append(exc)
             try:
                 self.guard.stop(source=source)
+            except Exception as exc:
+                failures.append(exc)
+            activation = getattr(self, "_policy_activation", None)
+            abort_activation = getattr(activation, "abort", None)
+            if callable(abort_activation):
+                try:
+                    abort_activation()
+                except Exception as exc:
+                    failures.append(exc)
+            self._policy_activation_requested = False
+            # Even terminal/fault paths suppressing broader planner telemetry
+            # must publish this local transaction fact; otherwise diagnostics
+            # can claim PREPARING after the activation epoch was invalidated.
+            try:
+                self.telemetry.update(
+                    **self._policy_activation_telemetry_fields_locked()
+                )
             except Exception as exc:
                 failures.append(exc)
             self._navigation_task_active = False
@@ -1982,6 +2032,9 @@ class SonicDriver:
         # Switch to SLOW_WALK only for an actual Nav2 command and request a new
         # reference whenever the hold/move boundary changes.
         previous = self._intent_gate.last
+        starting_motion = intent.mode != "IDLE" and (
+            previous is None or previous.mode == "IDLE"
+        )
         # Replanning is part of the learned controller's state evolution.  Its
         # debounce window must therefore use the same authoritative MuJoCo
         # clock as the policy cursor, handoff blend, and arm slew guard.  Wall
@@ -2001,6 +2054,17 @@ class SonicDriver:
                 raise RuntimeError(
                     "intent transition has no published actuator boundary"
                 )
+        activation = getattr(self, "_policy_activation", None)
+        activation_prepared = bool(
+            activation is None or getattr(activation, "prepared", False)
+        )
+        if starting_motion and not activation_prepared:
+            self._policy_activation_requested = True
+        defer_planner_for_activation = bool(
+            intent.mode != "IDLE"
+            and getattr(self, "_policy_activation_requested", False)
+            and not activation_prepared
+        )
         if admitted and intent.mode != "IDLE":
             with self._support_lock:
                 identity = self._reference_source_identity
@@ -2015,15 +2079,19 @@ class SonicDriver:
                     generation=identity[0],
                     source_sequence=identity[1],
                 )
-                self._reference_request_pending = True
+                self._reference_request_pending = not defer_planner_for_activation
         elif admitted and intent.mode == "IDLE":
             self._revoke_planner_reference("Nav2 intent is IDLE")
-        self._planner_evidence.observe_intent(
-            intent,
-            admitted=admitted,
-            simulation_now_s=simulation_now_s,
-        )
-        starting_motion = intent.mode != "IDLE" and (previous is None or previous.mode == "IDLE")
+            abort_activation = getattr(activation, "abort", None)
+            if callable(abort_activation):
+                abort_activation()
+            self._policy_activation_requested = False
+        if not defer_planner_for_activation:
+            self._planner_evidence.observe_intent(
+                intent,
+                admitted=admitted,
+                simulation_now_s=simulation_now_s,
+            )
         if intent.mode == "IDLE":
             if previous is None or previous.mode != "IDLE":
                 # Re-anchor SONIC's decoder to the measured IMU heading while
@@ -2032,7 +2100,7 @@ class SonicDriver:
                 # decoder reference left by a previous task.
                 decoder.reinit_heading = True
                 decoder.delta_heading = 0.0
-        elif starting_motion:
+        elif starting_motion and admitted:
             decoder.reinit_heading = True
             decoder.delta_heading = 0.0
             # ``step()`` consumes reinit_heading later in this control tick and
@@ -2047,9 +2115,15 @@ class SonicDriver:
                 previous_facing,
             )
             self._decoder_facing_rad = intent.facing_angle_rad
-        elif self._decoder_facing_rad is not None:
+        elif admitted and self._decoder_facing_rad is not None:
             delta = self._angular_delta(intent.facing_angle_rad, self._decoder_facing_rad)
-            decoder.delta_heading += delta
+            if bool(getattr(decoder, "reinit_heading", False)):
+                # No policy tick has consumed the re-anchor yet (notably while
+                # nominal activation/reference planning is in progress). Keep
+                # every admitted facing increment on the post-reinit side.
+                self._pending_decoder_heading_delta_rad += delta
+            else:
+                decoder.delta_heading += delta
             self._decoder_facing_rad = intent.facing_angle_rad
         if admitted:
             controller.ms.mode = LM.SLOW_WALK if intent.mode == "SLOW_WALK" else LM.IDLE
@@ -2079,6 +2153,239 @@ class SonicDriver:
             **self._planner_telemetry_fields(),
         )
         return intent
+
+    def _release_safe_hold_for_policy_activation_locked(
+        self,
+        decision: NominalPolicyActivationDecision,
+    ) -> bool:
+        """Release only the explicitly rearmed boundary for nominal INIT.
+
+        The caller owns ``_support_lock``.  A later stop may re-establish
+        ``_safe_hold_targets`` before the DDS write; the publish path then
+        substitutes that stronger target and the activation commit fails.
+        """
+
+        activation = self._policy_activation
+        authority = self._reference_authority.snapshot
+        identity = self._reference_source_identity
+        ingress = self._intent_ingress
+        controller = self._controller
+        valid = bool(
+            activation.is_current(decision)
+            and getattr(self, "_policy_activation_requested", False)
+            and authority.phase == "REQUIRED"
+            and identity is not None
+            and authority.generation == identity[0]
+            and authority.source_sequence == identity[1]
+            and ingress.armed
+            and ingress.generation == identity[0]
+            and self._navigation_task_active
+            and not self._process_stop_fences_motion_locked()
+            and not self._fault_latched.is_set()
+            and not self._plant_support_stop_pending
+            and not self._plant_support_safety_latched
+            and not self._normal_stop_fences_motion_locked()
+            and not bool(getattr(controller, "execution_feedback_pending", False))
+        )
+        if not valid:
+            return False
+        self._safe_hold_targets = None
+        return True
+
+    def _policy_activation_telemetry_fields_locked(self) -> dict[str, object]:
+        """Return activation facts while the caller owns ``_support_lock``."""
+
+        activation = getattr(self, "_policy_activation", None)
+        if activation is None:
+            return {
+                "policy_activation_phase": "UNPREPARED",
+                "policy_activation_ratio": 0.0,
+            }
+        return {
+            "policy_activation_phase": activation.phase,
+            "policy_activation_ratio": activation.ratio,
+        }
+
+    def _commit_policy_activation_locked(
+        self,
+        decision: NominalPolicyActivationDecision,
+        published_targets: tuple[float, ...],
+        *,
+        simulation_now_s: float,
+    ) -> tuple[bool, bool]:
+        """Commit a DDS activation fact as ``(accepted, completed)``."""
+
+        activation = self._policy_activation
+        authority = self._reference_authority.snapshot
+        identity = self._reference_source_identity
+        admitted_intent = getattr(self._intent_gate, "last", None)
+        if (
+            not activation.is_current(decision)
+            or not getattr(self, "_policy_activation_requested", False)
+            or authority.phase != "REQUIRED"
+            or identity is None
+            or authority.generation != identity[0]
+            or authority.source_sequence != identity[1]
+            or not self._intent_ingress.armed
+            or self._intent_ingress.generation != identity[0]
+            or self._plant_support_stop_pending
+            or self._plant_support_safety_latched
+            or self._normal_stop_fences_motion_locked()
+            or self._process_stop_fences_motion_locked()
+            or self._fault_latched.is_set()
+            or admitted_intent is None
+            or admitted_intent.mode == "IDLE"
+            or tuple(published_targets) != decision.targets
+        ):
+            return False, False
+        completed = activation.commit(decision, published_targets)
+        if not completed:
+            return True, False
+        # Every policy-free waiting tick and the later binary policy handoff
+        # must now originate at the exact nominal DDS boundary.  Retaining the
+        # pre-activation hold here would command a one-tick jump backwards.
+        self._joint_handoff.freeze(published_targets)
+        self._planner_evidence.observe_intent(
+            admitted_intent,
+            admitted=True,
+            simulation_now_s=simulation_now_s,
+        )
+        self._reference_request_pending = True
+        self._policy_activation_requested = False
+        return True, True
+
+    def _run_nominal_policy_activation(
+        self,
+        *,
+        lowstate: Any,
+        control_step: PlantControlStep,
+        intent: Any,
+        measured: tuple[float, ...],
+    ) -> None:
+        """Run one policy-free 50 Hz INIT tick at the actuator boundary."""
+
+        from lerobot.robots.unitree_g1.controllers.sonic_pipeline import (
+            DEFAULT_ANGLES,
+        )
+
+        activation = self._policy_activation
+        with self._support_lock:
+            authority = self._reference_authority.snapshot
+            identity = self._reference_source_identity
+            if (
+                not self._policy_activation_requested
+                or activation.prepared
+                or intent.mode == "IDLE"
+                or authority.phase != "REQUIRED"
+                or identity is None
+                or authority.generation != identity[0]
+                or authority.source_sequence != identity[1]
+                or not self._intent_ingress.armed
+                or self._intent_ingress.generation != identity[0]
+                or not self._navigation_task_active
+                or self._process_stop_fences_motion_locked()
+                or self._fault_latched.is_set()
+                or self._plant_support_stop_pending
+                or self._plant_support_safety_latched
+                or self._normal_stop_fences_motion_locked()
+            ):
+                return
+            boundary = self._last_published_targets
+            if boundary is None:
+                raise RuntimeError(
+                    "nominal policy activation has no executed actuator boundary"
+                )
+            activation.begin(boundary, tick_ms=control_step.tick_ms)
+            decision = activation.propose(
+                DEFAULT_ANGLES,
+                tick_ms=control_step.tick_ms,
+            )
+            released = self._release_safe_hold_for_policy_activation_locked(
+                decision
+            )
+
+        support_ready = self._set_plant_support_mode("idle")
+        with self._support_lock:
+            effective_static_hold = self._commit_static_hold_decision_locked(
+                not released or not support_ready
+            )
+        with self._support_lock:
+            output_targets = (
+                decision.targets
+                if released and support_ready and not effective_static_hold
+                else (
+                    self._safe_hold_targets
+                    or self._last_published_targets
+                    or boundary
+                )
+            )
+        output_action = {
+            f"{self._joint_name(index)}.q": target
+            for index, target in enumerate(output_targets)
+        }
+        published_targets = self._publish(
+            output_action,
+            lowstate,
+            control_dt_s=control_step.dt_s,
+            control_tick_ms=control_step.tick_ms,
+            constrain_arms=not effective_static_hold,
+        )
+        with self._support_lock:
+            activation_committed = False
+            if released and support_ready and not effective_static_hold:
+                activation_committed, _ = (
+                    self._commit_policy_activation_locked(
+                        decision,
+                        published_targets,
+                        simulation_now_s=control_step.tick_ms / 1_000.0,
+                    )
+                )
+            if not activation_committed and activation.is_current(decision):
+                # Time must not advance across a failed support transition or
+                # a stop-overridden DDS target. Restart from the exact latest
+                # published boundary on the next authorized tick.
+                activation.abort()
+
+        self._record_control_trace(
+            lowstate=lowstate,
+            control_step=control_step,
+            intent=intent,
+            policy_targets=tuple(float(value) for value in DEFAULT_ANGLES),
+            handoff_targets=decision.targets,
+            published_targets=published_targets,
+            handoff_ratio=decision.ratio,
+        )
+        with self._support_lock:
+            phase = activation.phase
+            current_static_hold = self._static_hold_active
+            currently_preparing = bool(
+                phase == "PREPARING" and self._policy_activation_requested
+            )
+            self.telemetry.update(
+                sonic_policy_speed_mps=0.0,
+                control_tick_ms=control_step.tick_ms,
+                control_dt_s=control_step.dt_s,
+                control_clock_status=(
+                    "simulation_time_50hz_nominal_prepared"
+                    if phase == "PREPARED"
+                    else (
+                        "simulation_time_50hz_preparing_nominal"
+                        if currently_preparing
+                        else "simulation_time_50hz_motion_ready"
+                    )
+                ),
+                static_hold_active=current_static_hold,
+                motion_handoff_active=(
+                    currently_preparing and not current_static_hold
+                ),
+                motion_handoff_ratio=(
+                    activation.ratio
+                    if currently_preparing and not current_static_hold
+                    else 0.0
+                ),
+                **self._policy_activation_telemetry_fields_locked(),
+                **self._planner_telemetry_fields(),
+            )
 
     def _progress_reference_transaction(self, lowstate) -> bool:
         """Plan, install, and prime one required reference without policy work."""
@@ -2288,11 +2595,17 @@ class SonicDriver:
         guarded_arm = None
         with self._support_lock:
             terminal_boundary = self._enforce_terminal_boundary_locked()
+            process_stop = self._process_stop_fences_motion_locked()
+            if process_stop and not terminal_boundary:
+                self._freeze_last_published_hold(publish_telemetry=False)
             if not terminal_boundary:
                 self._consume_vendor_revoke_locked()
-            if terminal_boundary and self._last_published_targets is None:
+            if (
+                (terminal_boundary or process_stop)
+                and self._last_published_targets is None
+            ):
                 raise RuntimeError(
-                    "terminal SONIC publish has no executed actuator boundary"
+                    "stopping SONIC publish has no executed actuator boundary"
                 )
             # Serialize the final DDS write with stop target freezing.  If a
             # stop wins the lock, this in-flight policy result is replaced by
@@ -2334,8 +2647,18 @@ class SonicDriver:
                 motor.tau = 0.0
             self._msg.crc = self._crc.Crc(self._msg)
             with self._terminal_fault_lock:
-                if self._fault_latched.is_set():
-                    self._enforce_terminal_boundary_locked()
+                terminal_before_write = self._fault_latched.is_set()
+                process_stop_before_write = (
+                    self._process_stop_fences_motion_locked()
+                )
+                if terminal_before_write or process_stop_before_write:
+                    if terminal_before_write:
+                        self._enforce_terminal_boundary_locked()
+                    else:
+                        self._freeze_last_published_hold(
+                            publish_telemetry=False
+                        )
+                        self._consume_vendor_revoke_locked()
                     published_targets = (
                         self._safe_hold_targets
                         or self._last_published_targets
@@ -2359,13 +2682,25 @@ class SonicDriver:
             with self._terminal_fault_lock:
                 terminal_error: Exception | None = None
                 terminal_after_write = self._fault_latched.is_set()
-                if terminal_after_write:
+                process_stop_after_write = (
+                    self._process_stop_fences_motion_locked()
+                )
+                stopping_after_write = (
+                    terminal_after_write or process_stop_after_write
+                )
+                if stopping_after_write:
                     final_targets = self._record_successful_dds_target(
                         published_targets
                     )
                     self._safe_hold_targets = final_targets
                     try:
-                        self._enforce_terminal_boundary_locked()
+                        if terminal_after_write:
+                            self._enforce_terminal_boundary_locked()
+                        else:
+                            self._freeze_last_published_hold(
+                                publish_telemetry=False
+                            )
+                            self._consume_vendor_revoke_locked()
                     except Exception as exc:
                         terminal_error = exc
                     try:
@@ -2383,7 +2718,7 @@ class SonicDriver:
                         published_targets
                     )
                 authority = self._reference_authority.snapshot
-                if not terminal_after_write and authority.phase == "PRIMED":
+                if not stopping_after_write and authority.phase == "PRIMED":
                     if not feedback_committed:
                         raise RuntimeError(
                             "primed SONIC reference wrote no policy execution feedback"
@@ -2531,11 +2866,16 @@ class SonicDriver:
             "FAILED",
         }
 
+    def _process_stop_fences_motion_locked(self) -> bool:
+        stop_event = getattr(self, "_stop", None)
+        return bool(stop_event is not None and stop_event.is_set())
+
     def _normal_stop_static_boundary_locked(self) -> bool:
         """Return the current recoverable stop's physical/local hold fence."""
 
         return (
-            self._plant_support_stop_pending
+            self._process_stop_fences_motion_locked()
+            or self._plant_support_stop_pending
             or self._plant_support_safety_latched
             or self._safe_hold_targets is not None
             or self._normal_stop_fences_motion_locked()
@@ -2681,6 +3021,10 @@ class SonicDriver:
                         published_targets=self._last_published_targets,
                         handoff_ratio=0.0,
                     )
+                    with self._support_lock:
+                        activation_fields = (
+                            self._policy_activation_telemetry_fields_locked()
+                        )
                     self.telemetry.update(
                         sonic_policy_speed_mps=0.0,
                         control_tick_ms=control_step.tick_ms,
@@ -2689,8 +3033,26 @@ class SonicDriver:
                         static_hold_active=True,
                         motion_handoff_active=False,
                         motion_handoff_ratio=0.0,
+                        **activation_fields,
                         **self._planner_telemetry_fields(),
                     )
+                    continue
+
+                activation = getattr(self, "_policy_activation", None)
+                if (
+                    activation is not None
+                    and getattr(self, "_policy_activation_requested", False)
+                    and not activation.prepared
+                ):
+                    self._run_nominal_policy_activation(
+                        lowstate=lowstate,
+                        control_step=control_step,
+                        intent=intent,
+                        measured=measured,
+                    )
+                    # Nominal preparation is policy-free: do not start the
+                    # planner deadline, advance a reference cursor, or decode
+                    # a candidate until its final DDS target is committed.
                     continue
 
                 if not self._progress_reference_transaction(lowstate):

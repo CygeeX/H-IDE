@@ -531,8 +531,10 @@ def test_pre_agent_gate_cannot_use_empty_last_error_to_bypass_a_support_latch() 
     launcher = (ROOT / "scripts" / "start-workstation-demo.sh").read_text(
         encoding="utf-8"
     )
-    predicate = launcher[launcher.index("base_ready = (") : launcher.index(
-        "raise SystemExit(0 if ready else 1)"
+    predicate_start = launcher.index("base_ready = (")
+    predicate = launcher[predicate_start : launcher.index(
+        "raise SystemExit(0 if ready else 1)",
+        predicate_start,
     )]
 
     assert 'value.get("plant_support_safety_latched") is True' in predicate

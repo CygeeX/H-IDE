@@ -37,8 +37,12 @@ max_spin_translation_m: 0.30
 spin_translation_violation_s: 0.50
 command_timeout_s: 0.25
 planner_reference_timeout_s: 0.75
-# Keep the current measured posture while SONIC's async planner prepares the
-# first walking clip, then blend into policy control instead of snapping.
+# Mirror the official controller's distinct INIT phase after the first motion
+# authorization: exact actuator boundary to nominal pose over three seconds,
+# before any planner or policy state is consumed.
+policy_activation_s: 3.0
+# These legacy binary handoff timings remain schema-bound. They do not grant
+# authority; policy_activation_s owns the first authorized posture ramp.
 motion_handoff_warmup_s: 0.35
 motion_handoff_blend_s: 0.40
 control_hz: 50

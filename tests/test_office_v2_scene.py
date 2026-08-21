@@ -469,17 +469,7 @@ def test_supported_configs_all_select_the_same_verified_office_v2_bundle() -> No
         assert config.plant_lowstate_stale_s == pytest.approx(0.10)
         assert config.sonic_control_step_stale_s == pytest.approx(0.10)
         assert config.planner_reference_timeout_s == pytest.approx(0.75)
-        assert (
-            config.planner_reference_timeout_s
-            + config.motion_handoff_warmup_s
-            + 2.0 / config.control_hz
-            < max(
-                1.5,
-                config.motion_handoff_warmup_s
-                + config.motion_handoff_blend_s
-                + 0.75,
-            )
-        )
+        assert config.policy_activation_s == pytest.approx(3.0)
         assert (
             STALE_HEALTH_CONFIRMATION_PROBES
             * config.sonic_health_probe_period_s
@@ -508,3 +498,22 @@ def test_supported_configs_all_select_the_same_verified_office_v2_bundle() -> No
         assert "h_ide_office_29dof.xml" not in (
             ROOT / "config" / name
         ).read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "invalid_duration",
+    [True, 2.999, float("nan")],
+)
+def test_policy_activation_duration_is_the_exact_official_init_budget(
+    tmp_path: Path,
+    invalid_duration,
+) -> None:
+    payload = yaml.safe_load(
+        (ROOT / "config" / "ros-headless.yaml").read_text(encoding="utf-8")
+    )
+    payload["policy_activation_s"] = invalid_duration
+    candidate = tmp_path / "invalid-policy-activation.yaml"
+    candidate.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="policy_activation_s must be exactly 3.0"):
+        SimConfig.from_file(candidate)

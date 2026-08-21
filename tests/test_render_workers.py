@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import threading
 import time
 import uuid
+import weakref
 
 import numpy as np
 import pytest
@@ -212,6 +213,72 @@ def _healthy_viewer_identity_worker(
     _record_viewer_progress(stats, _mailbox, first)
     stats.ready.value = 1
     stop_event.wait(10.0)
+
+
+class _FakeProcess:
+    def __init__(
+        self,
+        *,
+        exit_on_join: bool,
+        exit_on_kill: bool = True,
+    ) -> None:
+        self.pid = 12345
+        self.exitcode = None
+        self._alive = True
+        self._exit_on_join = exit_on_join
+        self._exit_on_kill = exit_on_kill
+        self.join_timeouts: list[float | None] = []
+        self.terminate_calls = 0
+        self.kill_calls = 0
+
+    def join(self, timeout=None) -> None:
+        self.join_timeouts.append(timeout)
+        if self._exit_on_join:
+            self._alive = False
+            self.exitcode = 0
+
+    def is_alive(self) -> bool:
+        return self._alive
+
+    def terminate(self) -> None:
+        self.terminate_calls += 1
+        self._alive = False
+        self.exitcode = -15
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+        if self._exit_on_kill:
+            self._alive = False
+            self.exitcode = -9
+
+
+class _FakeNativeViewer:
+    @staticmethod
+    def exit() -> None:
+        return None
+
+
+class _FakePassiveViewer:
+    def __init__(self) -> None:
+        self._native = _FakeNativeViewer()
+        self._sim = weakref.ref(self._native)
+        self.close_calls = 0
+
+    @property
+    def native_alive(self) -> bool:
+        return self._sim() is not None
+
+    @native_alive.setter
+    def native_alive(self, value: bool) -> None:
+        if value:
+            if self._sim() is None:
+                self._native = _FakeNativeViewer()
+                self._sim = weakref.ref(self._native)
+            return
+        self._native = None
+
+    def close(self) -> None:
+        self.close_calls += 1
 
 
 def _slow_then_normal_timing_worker(
@@ -1095,13 +1162,57 @@ def test_viewer_status_samples_clock_after_concurrent_progress_commit(
     monkeypatch.setattr(time, "monotonic_ns", sample_now)
     worker._stats.ready.value = 1
     try:
-        status = worker.status()
+        # Exercise only the progress/clock ordering without launching X11.
+        # A coherent running status also requires an alive child; restore the
+        # real unstarted Process fact before close().
+        with monkeypatch.context() as process_patch:
+            process_patch.setattr(worker._process, "is_alive", lambda: True)
+            status = worker.status()
         assert status["status"] == "running"
         assert status["ready"] is True
         assert status["progressAgeMs"] == pytest.approx(0.000001)
         assert status["lastError"] is None
     finally:
         worker.close()
+
+
+def test_viewer_nonzero_exit_is_failed_even_after_parent_close() -> None:
+    mujoco, model, _data = _model_data()
+    context = multiprocessing.get_context("spawn")
+    shape = MujocoStateShape.from_model(mujoco, model)
+    worker = PassiveViewerWorker(
+        mailbox=LatestStateMailbox(shape, context=context),
+        shape=shape,
+        config=ViewerWorkerConfig(
+            "missing",
+            "missing",
+            "explicit_process_restart",
+            0.0,
+            0.0,
+        ),
+        context=context,
+    )
+
+    worker._closed = True
+    worker._process._popen = SimpleNamespace(
+        pid=1234,
+        poll=lambda: -11,
+        wait=lambda timeout=None: -11,
+    )
+    worker._stats.ready.value = 1
+    worker._last_viewer_progress = (
+        1_800_000_001_000_000_000,
+        time.monotonic_ns(),
+        1,
+        0,
+    )
+
+    status = worker.status()
+
+    assert status["status"] == "failed"
+    assert status["ready"] is False
+    assert status["alive"] is False
+    assert status["exitCode"] == -11
 
 
 def test_successful_worker_recovery_clears_shared_last_error() -> None:
@@ -1209,6 +1320,188 @@ def test_worker_shutdown_terminates_an_unresponsive_child_within_bound() -> None
     worker.close(timeout_s=0.05)
     assert time.monotonic() - started < 2.0
     assert not worker._process.is_alive()
+
+
+def test_passive_viewer_close_waits_for_native_lifetime_barrier() -> None:
+    viewer = _FakePassiveViewer()
+    now = 0.0
+    waits: list[float] = []
+
+    def monotonic() -> float:
+        return now
+
+    def wait(duration: float) -> None:
+        nonlocal now
+        assert viewer.close_calls == 1
+        waits.append(duration)
+        now += duration
+        if len(waits) == 2:
+            viewer.native_alive = False
+
+    render_workers._close_and_wait_for_passive_viewer(
+        viewer,
+        timeout_s=1.0,
+        poll_s=0.1,
+        monotonic=monotonic,
+        wait=wait,
+    )
+
+    assert viewer.close_calls == 1
+    assert waits == pytest.approx([0.1, 0.1])
+    assert viewer.native_alive is False
+
+
+def test_passive_viewer_requires_a_weak_native_lifetime_contract() -> None:
+    viewer = _FakePassiveViewer()
+    assert render_workers._require_native_lifetime_ref(viewer) is viewer._sim
+
+    viewer._sim = lambda: _FakeNativeViewer()
+    with pytest.raises(RuntimeError, match="weak native lifetime reference"):
+        render_workers._require_native_lifetime_ref(viewer)
+
+
+def test_passive_viewer_close_timeout_is_bounded_and_diagnostic() -> None:
+    viewer = _FakePassiveViewer()
+    now = 0.0
+
+    def monotonic() -> float:
+        return now
+
+    def wait(duration: float) -> None:
+        nonlocal now
+        now += duration
+
+    with pytest.raises(
+        TimeoutError,
+        match="native render thread did not stop within 0.250s",
+    ):
+        render_workers._close_and_wait_for_passive_viewer(
+            viewer,
+            timeout_s=0.25,
+            poll_s=0.1,
+            monotonic=monotonic,
+            wait=wait,
+        )
+
+    assert viewer.close_calls == 1
+    assert now == pytest.approx(0.25)
+    assert viewer.native_alive is True
+
+
+def test_viewer_parent_reserves_native_cleanup_grace() -> None:
+    mujoco, model, _data = _model_data()
+    context = multiprocessing.get_context("spawn")
+    shape = MujocoStateShape.from_model(mujoco, model)
+    worker = PassiveViewerWorker(
+        mailbox=LatestStateMailbox(shape, context=context),
+        shape=shape,
+        config=ViewerWorkerConfig(
+            "missing",
+            "missing",
+            "explicit_process_restart",
+            0.0,
+            0.0,
+        ),
+        context=context,
+    )
+    process = _FakeProcess(exit_on_join=True)
+    worker._process = process
+
+    worker.close(timeout_s=0.01)
+
+    assert process.join_timeouts == [
+        render_workers.VIEWER_NATIVE_SHUTDOWN_TIMEOUT_S
+        + render_workers.VIEWER_NATIVE_SHUTDOWN_PARENT_MARGIN_S
+    ]
+    assert process.terminate_calls == 0
+    status = worker.status()
+    assert status["status"] == "stopped"
+    assert status["ready"] is False
+    assert status["alive"] is False
+
+
+def test_viewer_parent_sigkills_live_native_cleanup_after_full_grace() -> None:
+    mujoco, model, _data = _model_data()
+    context = multiprocessing.get_context("spawn")
+    shape = MujocoStateShape.from_model(mujoco, model)
+    worker = PassiveViewerWorker(
+        mailbox=LatestStateMailbox(shape, context=context),
+        shape=shape,
+        config=ViewerWorkerConfig(
+            "missing",
+            "missing",
+            "explicit_process_restart",
+            0.0,
+            0.0,
+        ),
+        context=context,
+    )
+    process = _FakeProcess(exit_on_join=False)
+    worker._process = process
+    worker._stats.viewer_native_active.value = 1
+    worker._stats.viewer_shutdown_started.value = 1
+    worker._stats.viewer_native_shutdown_complete.value = 0
+
+    worker.close(timeout_s=0.01)
+
+    assert process.terminate_calls == 0
+    assert process.kill_calls == 1
+    assert process.is_alive() is False
+    assert process.join_timeouts == [
+        render_workers.VIEWER_NATIVE_SHUTDOWN_TIMEOUT_S
+        + render_workers.VIEWER_NATIVE_SHUTDOWN_PARENT_MARGIN_S,
+        1.0,
+    ]
+    assert worker._closed is True
+    status = worker.status()
+    assert status["status"] == "failed"
+    assert status["failureCount"] == 1
+    assert status["exitCode"] == -9
+    assert status["nativeViewerActive"] is False
+    assert "forced SIGKILL" in status["lastError"]
+
+    worker.close(timeout_s=0.01)
+    assert process.kill_calls == 1
+
+
+def test_viewer_failed_sigkill_keeps_close_retryable() -> None:
+    mujoco, model, _data = _model_data()
+    context = multiprocessing.get_context("spawn")
+    shape = MujocoStateShape.from_model(mujoco, model)
+    worker = PassiveViewerWorker(
+        mailbox=LatestStateMailbox(shape, context=context),
+        shape=shape,
+        config=ViewerWorkerConfig(
+            "missing",
+            "missing",
+            "explicit_process_restart",
+            0.0,
+            0.0,
+        ),
+        context=context,
+    )
+    process = _FakeProcess(exit_on_join=False, exit_on_kill=False)
+    worker._process = process
+    worker._stats.viewer_native_active.value = 1
+    worker._stats.viewer_shutdown_started.value = 1
+
+    with pytest.raises(
+        RuntimeError,
+        match="remained alive after forced SIGKILL",
+    ):
+        worker.close(timeout_s=0.01)
+
+    assert worker._closed is False
+    assert process.kill_calls == 1
+
+    with pytest.raises(
+        RuntimeError,
+        match="remained alive after forced SIGKILL",
+    ):
+        worker.close(timeout_s=0.01)
+
+    assert worker._closed is False
+    assert process.kill_calls == 2
 
 
 def test_frame_store_retains_only_latest_and_previous_and_uses_monotonic_age() -> None:
@@ -1346,4 +1639,7 @@ def test_viewer_worker_has_no_physics_step_or_input_callback_authority() -> None
     assert "launch_passive(model, data)" in source
     assert 'os.environ.pop("MUJOCO_GL", None)' in source
     assert 'os.environ["MUJOCO_GL"] = config.gl_backend' in source
-    assert "viewer.close()" in source
+    assert "_close_and_wait_for_passive_viewer(" in source
+    assert "simulate_ref=native_lifetime_ref" in source
+    assert "with viewer.lock():" in source
+    assert "viewer.sync(state_only=True)" in source

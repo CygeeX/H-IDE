@@ -40,6 +40,7 @@ from hide_mujoco_sonic.planner_evidence import (
 from hide_mujoco_sonic.reference_authority import ReferenceAuthorityState
 from hide_mujoco_sonic.safety import (
     MovementIntent,
+    NominalPolicyActivation,
     PlantControlClock,
     PlantControlStep,
     PlantTickGuard,
@@ -1373,6 +1374,528 @@ def _movement_intent(angle_rad: float) -> MovementIntent:
         has_movement=True,
         stale=False,
     )
+
+
+def test_arm_slew_projection_is_the_exact_dds_feedback_and_grant_boundary() -> None:
+    from lerobot.robots.unitree_g1.controllers.sonic_pipeline import DEFAULT_ANGLES
+
+    clock = Clock()
+    driver, writes = _publishing_driver(clock)
+    boundary = tuple(float(value) for value in DEFAULT_ANGLES)
+    raw_values = list(boundary)
+    # Real cached SONIC 90-degree first-frame output exceeded this 6 rad/s arm
+    # joint by 0.002218... rad.  The physical limit remains exactly 0.12 rad
+    # per 20 ms; only the projected DDS fact may enter recurrent history.
+    raw_values[23] += 0.12221835553646088
+    raw = tuple(raw_values)
+    lowstate = _lowstate(boundary)
+    driver._last_published_targets = boundary
+    driver._arm_guard.anchor(boundary[15:29])
+    evidence = _TransactionalEvidence()
+    evidence.intent_generation = 1
+    evidence.intent_signature = "intent-1"
+    evidence.accept_current()
+    controller = _TransactionalController(evidence, raw)
+    controller.reference_authority = True
+    controller.execution_feedback_pending = True
+    controller._candidate_identity = (1, 0)
+    driver._controller = controller
+    driver._planner_evidence = evidence
+    driver._reference_authority.require(generation=9, source_sequence=3)
+    driver._reference_authority.mark_installed(
+        generation=9,
+        source_sequence=3,
+        planner_intent_generation=1,
+        reference_epoch=1,
+    )
+    driver._reference_authority.prime(
+        generation=9,
+        source_sequence=3,
+        reference_epoch=1,
+    )
+
+    published = driver._publish(
+        _action(driver, raw),
+        lowstate,
+        control_dt_s=0.02,
+        control_tick_ms=1_020,
+        constrain_arms=True,
+    )
+
+    expected_values = list(raw)
+    expected_values[23] = boundary[23] + 0.12
+    expected = tuple(expected_values)
+    assert raw[23] - boundary[23] > 0.12
+    assert published == pytest.approx(expected)
+    assert writes == [pytest.approx(expected)]
+    assert controller.commits == [pytest.approx(expected)]
+    assert controller.execution_feedback_pending is False
+    assert controller.controller.ref_cursor == 1
+    assert driver._reference_authority.snapshot.phase == "GRANTED"
+    assert driver.telemetry.values["navigation_arm_constrained_joints"] == 1
+    assert driver.telemetry.values["navigation_arm_max_step_rad"] == pytest.approx(
+        0.12
+    )
+
+
+def test_arm_guard_factory_envelopes_stay_inside_mujoco_hard_ranges() -> None:
+    from lerobot.robots.unitree_g1.controllers.sonic_pipeline import DEFAULT_ANGLES
+
+    hard_ranges = (
+        (-3.0892, 2.6704),
+        (-1.5882, 2.2515),
+        (-2.618, 2.618),
+        (-1.0472, 2.0944),
+        (-1.97222, 1.97222),
+        (-1.61443, 1.61443),
+        (-1.61443, 1.61443),
+        (-3.0892, 2.6704),
+        (-2.2515, 1.5882),
+        (-2.618, 2.618),
+        (-1.0472, 2.0944),
+        (-1.97222, 1.97222),
+        (-1.61443, 1.61443),
+        (-1.61443, 1.61443),
+    )
+    guard = bare_driver(Clock())._new_arm_guard()
+
+    for nominal, deviation, (lower, upper) in zip(
+        DEFAULT_ANGLES[15:29],
+        guard.max_deviation_rad,
+        hard_ranges,
+        strict=True,
+    ):
+        assert float(nominal) - deviation >= lower
+        assert float(nominal) + deviation <= upper
+
+
+@pytest.mark.parametrize("arm_offset", [0, 7])
+def test_arm_guard_rejects_slew_valid_progress_beyond_physical_range(
+    arm_offset: int,
+) -> None:
+    from lerobot.robots.unitree_g1.controllers.sonic_pipeline import DEFAULT_ANGLES
+
+    guard = bare_driver(Clock())._new_arm_guard()
+    targets = [float(value) for value in DEFAULT_ANGLES[15:29]]
+    guard.anchor(targets)
+
+    # Approach the shoulder-pitch upper limit at exactly the configured
+    # 6 rad/s (0.12 rad per 20 ms).  No frame is slew-constrained, so only the
+    # physical envelope can prevent the eventual 2.68-rad command.
+    while targets[arm_offset] + 0.12 <= 2.60:
+        targets[arm_offset] += 0.12
+        decision = guard.apply(targets, dt=0.02)
+        assert decision.constrained_joints == 0
+    targets[arm_offset] = 2.68
+    with pytest.raises(ValueError, match="navigation envelope"):
+        guard.apply(targets, dt=0.02)
+
+
+def test_nominal_policy_activation_restarts_after_support_failure_and_freezes_policy() -> None:
+    from lerobot.robots.unitree_g1.controllers.sonic_pipeline import DEFAULT_ANGLES
+
+    clock = Clock()
+    driver, writes = _publishing_driver(clock)
+    nominal = tuple(float(value) for value in DEFAULT_ANGLES)
+    boundary_values = list(nominal)
+    # Exact incident boundary: right wrist roll, arm-local index 11/global 26.
+    boundary_values[26] = 0.010501991026103497
+    boundary = tuple(boundary_values)
+    lowstate = _lowstate(boundary)
+    driver._last_published_targets = boundary
+    driver._safe_hold_targets = boundary
+    driver._joint_handoff.freeze(boundary)
+    driver._arm_guard.anchor(boundary[15:29])
+    driver._policy_activation = NominalPolicyActivation(
+        joint_count=29,
+        duration_s=3.0,
+    )
+    driver._policy_activation_requested = True
+    driver._navigation_task_active = True
+    driver._reference_source_identity = (42, 7)
+    driver._reference_authority.require(generation=42, source_sequence=7)
+    driver._intent_ingress = SimpleNamespace(armed=True, generation=42)
+    driver._controller = SimpleNamespace(execution_feedback_pending=False)
+    intent = _movement_intent(0.0)
+    driver._intent_gate = SimpleNamespace(last=intent)
+    observed_intents: list[tuple[MovementIntent, bool, float]] = []
+    driver._planner_evidence = SimpleNamespace(
+        observe_intent=lambda intent, *, admitted, simulation_now_s: (
+            observed_intents.append((intent, admitted, simulation_now_s))
+        )
+    )
+    driver._planner_telemetry_fields = lambda: {}
+    driver._record_control_trace = lambda **_kwargs: None
+
+    support_modes: list[str] = []
+    support_attempts = 0
+
+    def set_support(mode: str) -> bool:
+        nonlocal support_attempts
+        support_attempts += 1
+        support_modes.append(mode)
+        driver._plant_support_mode = mode
+        # A failed Plant support transition must not allow absolute MuJoCo
+        # time to make the next actuator proposal jump forward.
+        return support_attempts != 51
+
+    driver._set_plant_support_mode = set_support
+
+    for frame in range(202):
+        tick_ms = 1_000 + frame * 20
+        sampled_intent = intent if frame < 201 else _movement_intent(0.15)
+        driver._run_nominal_policy_activation(
+            lowstate=lowstate,
+            control_step=PlantControlStep(tick_ms=tick_ms, dt_s=0.02),
+            intent=sampled_intent,
+            measured=boundary,
+        )
+        # Preparation may publish actuator targets, but it cannot request or
+        # install a policy reference before the final nominal DDS fact.
+        if frame < 201:
+            assert driver._reference_request_pending is False
+            assert observed_intents == []
+            assert driver._reference_authority.snapshot.phase == "REQUIRED"
+
+    assert len(writes) == 202
+    assert writes[0] == pytest.approx(boundary)
+    assert writes[50] == pytest.approx(writes[49])
+    assert writes[51] == pytest.approx(writes[50])
+    assert writes[-1] == pytest.approx(nominal)
+    assert driver._policy_activation.phase == "PREPARED"
+    assert driver._policy_activation_requested is False
+    assert driver._reference_request_pending is True
+    assert observed_intents == [(intent, True, 5.02)]
+    assert set(support_modes) == {"idle"}
+
+    # Planner waiting after INIT must hold nominal, never jump back to the
+    # pre-activation boundary frozen three seconds earlier.
+    waiting = driver._joint_handoff.decide(
+        motion_active=True,
+        reference_ready=False,
+        measured=boundary,
+        policy=boundary,
+        now=4.02,
+    )
+    assert waiting.targets == pytest.approx(nominal)
+
+
+def test_run_never_enters_reference_or_policy_during_nominal_activation() -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    lowstate = _lowstate(tuple(0.0 for _ in range(29)))
+    driver._prepare_idle_startup = lambda: None
+    driver._startup_qualifying = False
+    samples = [(lowstate, PlantControlStep(tick_ms=1_000, dt_s=0.02), 0)]
+    driver._next_control_sample = lambda: samples.pop(0)
+    driver._apply_intent = lambda *_args, **_kwargs: _movement_intent(0.0)
+    driver._policy_activation = SimpleNamespace(prepared=False)
+    driver._policy_activation_requested = True
+    activation_calls: list[int] = []
+
+    def activation_tick(**kwargs) -> None:
+        activation_calls.append(kwargs["control_step"].tick_ms)
+        driver._stop.set()
+
+    driver._run_nominal_policy_activation = activation_tick
+    driver._progress_reference_transaction = lambda _lowstate: (_ for _ in ()).throw(
+        AssertionError("reference transaction ran during nominal activation")
+    )
+    driver._controller = SimpleNamespace(shutdown=lambda: None)
+
+    driver.run()
+
+    assert activation_calls == [1_000]
+
+
+def test_activation_accumulates_only_admitted_heading_after_decoder_reinit() -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    driver._last_published_targets = tuple(0.0 for _ in range(29))
+    driver._reference_source_identity = (42, 7)
+    driver._navigation_task_active = True
+    driver._intent_gate = ReplanIntentGate()
+    driver._decoder_facing_rad = None
+    driver._pending_decoder_heading_delta_rad = 0.0
+    driver._last_intent_signature = None
+    driver._policy_activation = NominalPolicyActivation(duration_s=3.0)
+    driver._policy_activation_requested = False
+    evidence = _TransactionalEvidence()
+    driver._planner_evidence = evidence
+    controller = _TransactionalController(
+        evidence,
+        tuple(0.0 for _ in range(29)),
+    )
+    driver._controller = controller
+    intents = [
+        MovementIntent("SLOW_WALK", 0.2, 0.0, 0.10, True, False),
+        # This intermediate raw sample is below the gate threshold and must
+        # not influence the decoder or final planner evidence.
+        MovementIntent("SLOW_WALK", 0.2, 0.0, 0.12, True, False),
+        MovementIntent("SLOW_WALK", 0.2, 0.0, 0.30, True, False),
+    ]
+    driver.guard = SimpleNamespace(
+        intent=lambda **_kwargs: intents.pop(0),
+        last_received_at=clock.value,
+    )
+
+    first = driver._apply_intent(0.02, simulation_now_s=1.0)
+    rejected = driver._apply_intent(0.02, simulation_now_s=1.1)
+    latest = driver._apply_intent(0.02, simulation_now_s=1.4)
+
+    assert first.facing_angle_rad == pytest.approx(0.10)
+    assert rejected.facing_angle_rad == pytest.approx(0.12)
+    assert latest.facing_angle_rad == pytest.approx(0.30)
+    assert driver._intent_gate.last is latest
+    assert controller.controller.reinit_heading is True
+    assert controller.controller.delta_heading == 0.0
+    assert driver._pending_decoder_heading_delta_rad == pytest.approx(0.30)
+    assert controller.ms.facing_angle == pytest.approx(0.30)
+    assert evidence.intent_generation == 0
+    assert driver._reference_request_pending is False
+
+
+def test_activation_rechecks_stop_before_begin_and_stop_wins_before_telemetry() -> None:
+    from lerobot.robots.unitree_g1.controllers.sonic_pipeline import DEFAULT_ANGLES
+
+    clock = Clock()
+    driver, writes = _publishing_driver(clock)
+    boundary = tuple(float(value) for value in DEFAULT_ANGLES)
+    lowstate = _lowstate(boundary)
+    driver._last_published_targets = boundary
+    driver._safe_hold_targets = boundary
+    driver._joint_handoff.freeze(boundary)
+    driver._arm_guard.anchor(boundary[15:29])
+    driver._policy_activation = NominalPolicyActivation(duration_s=3.0)
+    driver._policy_activation_requested = False
+    driver._navigation_task_active = False
+    driver._reference_source_identity = (42, 7)
+    driver._reference_authority.require(generation=42, source_sequence=7)
+    driver._intent_ingress = SimpleNamespace(armed=True, generation=42)
+    intent = _movement_intent(0.0)
+    driver._intent_gate = SimpleNamespace(last=intent, reset=lambda: None)
+    evidence = _TransactionalEvidence()
+    driver._planner_evidence = evidence
+    driver._controller = _TransactionalController(evidence, boundary)
+    driver._planner_telemetry_fields = lambda: {}
+    driver._set_plant_support_mode = lambda _mode: True
+
+    # Model the outer run-loop seeing a stale "requested" value before stop.
+    # The inner support-lock gate must return without even beginning INIT.
+    driver._run_nominal_policy_activation(
+        lowstate=lowstate,
+        control_step=PlantControlStep(tick_ms=1_000, dt_s=0.02),
+        intent=intent,
+        measured=boundary,
+    )
+    assert driver._policy_activation.phase == "UNPREPARED"
+    assert writes == []
+
+    # stop() linearizes by setting this event before it can acquire the support
+    # boundary. A stale outer run-loop observation may not begin or publish.
+    driver._policy_activation_requested = True
+    driver._navigation_task_active = True
+    driver._stop.set()
+    driver._run_nominal_policy_activation(
+        lowstate=lowstate,
+        control_step=PlantControlStep(tick_ms=1_010, dt_s=0.02),
+        intent=intent,
+        measured=boundary,
+    )
+    assert driver._policy_activation.phase == "UNPREPARED"
+    assert writes == []
+
+    # Also close the smaller window in which stop wins after safe-hold release
+    # but before the DDS publish path takes its final support lock.
+    driver._stop.clear()
+    driver._reference_authority.require(generation=42, source_sequence=7)
+    driver._policy_activation_requested = True
+    driver._navigation_task_active = True
+
+    def set_stop_during_support(_mode: str) -> bool:
+        driver._stop.set()
+        return True
+
+    driver._set_plant_support_mode = set_stop_during_support
+    driver._record_control_trace = lambda **_kwargs: None
+    driver._run_nominal_policy_activation(
+        lowstate=lowstate,
+        control_step=PlantControlStep(tick_ms=1_020, dt_s=0.02),
+        intent=intent,
+        measured=boundary,
+    )
+    assert len(writes) == 1
+    assert writes[0] == pytest.approx(boundary)
+    assert driver._safe_hold_targets == pytest.approx(boundary)
+    assert driver._policy_activation.phase == "UNPREPARED"
+
+    driver._stop.clear()
+    driver._reference_authority.require(generation=42, source_sequence=7)
+    driver._policy_activation_requested = True
+    driver._navigation_task_active = True
+    driver._set_plant_support_mode = lambda _mode: True
+
+    def stop_after_dds_before_telemetry(**_kwargs) -> None:
+        driver._stop_navigation_at_boundary(
+            source="injected_stop",
+            publish_telemetry=False,
+        )
+
+    driver._record_control_trace = stop_after_dds_before_telemetry
+    driver._run_nominal_policy_activation(
+        lowstate=lowstate,
+        control_step=PlantControlStep(tick_ms=1_040, dt_s=0.02),
+        intent=intent,
+        measured=boundary,
+    )
+
+    assert len(writes) == 2
+    assert driver._policy_activation.phase == "UNPREPARED"
+    assert driver._policy_activation_requested is False
+    assert driver.telemetry.values["policy_activation_phase"] == "UNPREPARED"
+    assert driver.telemetry.values["policy_activation_ratio"] == 0.0
+
+
+def test_activation_stop_during_crc_writes_only_exact_executed_boundary() -> None:
+    from lerobot.robots.unitree_g1.controllers.sonic_pipeline import DEFAULT_ANGLES
+
+    clock = Clock()
+    driver, writes = _publishing_driver(clock)
+    boundary_values = [float(value) for value in DEFAULT_ANGLES]
+    # Match the incident's right-wrist-roll actuator seam so the next 20 ms
+    # activation proposal is observably different from the nominal target.
+    boundary_values[26] = 0.010501991026103497
+    boundary = tuple(boundary_values)
+    lowstate = _lowstate(boundary)
+    driver._last_published_targets = boundary
+    driver._safe_hold_targets = boundary
+    driver._joint_handoff.freeze(boundary)
+    driver._arm_guard.anchor(boundary[15:29])
+    driver._policy_activation = NominalPolicyActivation(duration_s=3.0)
+    driver._policy_activation_requested = True
+    driver._navigation_task_active = True
+    driver._reference_source_identity = (42, 7)
+    driver._reference_authority.require(generation=42, source_sequence=7)
+    driver._intent_ingress = SimpleNamespace(armed=True, generation=42)
+    intent = _movement_intent(0.0)
+    driver._intent_gate = SimpleNamespace(last=intent, reset=lambda: None)
+    evidence = _TransactionalEvidence()
+    driver._planner_evidence = evidence
+    controller = _TransactionalController(evidence, boundary)
+    driver._controller = controller
+    driver._planner_telemetry_fields = lambda: {}
+    driver._set_plant_support_mode = lambda _mode: True
+    driver._record_control_trace = lambda **_kwargs: None
+
+    driver._run_nominal_policy_activation(
+        lowstate=lowstate,
+        control_step=PlantControlStep(tick_ms=1_000, dt_s=0.02),
+        intent=intent,
+        measured=boundary,
+    )
+    assert writes == [pytest.approx(boundary)]
+    assert driver._policy_activation.phase == "PREPARING"
+    assert driver._safe_hold_targets is None
+
+    crc_calls = 0
+
+    def stop_during_crc(_message) -> int:
+        nonlocal crc_calls
+        crc_calls += 1
+        if crc_calls == 1:
+            # stop() sets this event while holding _terminal_fault_lock.  The
+            # final pre-Write check must replace the already-built moving
+            # proposal and its CRC with the exact previous DDS boundary.
+            driver._stop.set()
+        return 0
+
+    driver._crc = SimpleNamespace(Crc=stop_during_crc)
+    driver._run_nominal_policy_activation(
+        lowstate=lowstate,
+        control_step=PlantControlStep(tick_ms=1_020, dt_s=0.02),
+        intent=intent,
+        measured=boundary,
+    )
+
+    assert crc_calls == 2
+    assert writes == [pytest.approx(boundary), pytest.approx(boundary)]
+    assert driver._last_published_targets == pytest.approx(boundary)
+    assert driver._safe_hold_targets == pytest.approx(boundary)
+    assert driver._policy_activation.phase == "UNPREPARED"
+    assert driver._reference_authority.snapshot.phase == "REVOKED"
+    assert controller.controller.ref_cursor == 0
+    assert evidence.intent_generation == 0
+
+
+def test_completed_nominal_activation_is_not_repeated_for_second_task() -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    driver._last_published_targets = tuple(0.0 for _ in range(29))
+    activation = NominalPolicyActivation(duration_s=3.0)
+    assert activation.begin(driver._last_published_targets, tick_ms=0) is True
+    final = activation.propose(driver._last_published_targets, tick_ms=3_000)
+    assert activation.commit(final, final.targets) is True
+    driver._policy_activation = activation
+    driver._policy_activation_requested = False
+    driver._reference_source_identity = (42, 7)
+    driver._navigation_task_active = True
+    driver._intent_gate = ReplanIntentGate()
+    driver._decoder_facing_rad = None
+    driver._pending_decoder_heading_delta_rad = 0.0
+    driver._last_intent_signature = None
+    evidence = _TransactionalEvidence()
+    driver._planner_evidence = evidence
+    controller = _TransactionalController(
+        evidence,
+        tuple(0.0 for _ in range(29)),
+    )
+    driver._controller = controller
+    second_intent = _movement_intent(0.0)
+    driver.guard = SimpleNamespace(
+        intent=lambda **_kwargs: second_intent,
+        last_received_at=clock.value,
+    )
+
+    observed = driver._apply_intent(0.02, simulation_now_s=10.0)
+
+    assert observed is second_intent
+    assert activation.phase == "PREPARED"
+    assert driver._policy_activation_requested is False
+    assert driver._reference_request_pending is True
+    assert evidence.intent_generation == 1
+
+
+def test_activation_telemetry_failure_cannot_interrupt_stop_cleanup() -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    driver._policy_activation = NominalPolicyActivation(duration_s=3.0)
+    assert driver._policy_activation.begin(
+        driver._last_published_targets,
+        tick_ms=1_000,
+    )
+    driver._policy_activation_requested = True
+    driver._navigation_task_active = True
+    reset_calls: list[bool] = []
+    driver._intent_gate = SimpleNamespace(
+        reset=lambda: reset_calls.append(True),
+    )
+    driver.telemetry = SimpleNamespace(
+        update=lambda **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("injected telemetry failure")
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="injected telemetry failure"):
+        driver._stop_navigation_at_boundary(
+            source="test",
+            publish_telemetry=False,
+        )
+
+    assert driver._safe_hold_targets == driver._last_published_targets
+    assert driver._policy_activation.phase == "UNPREPARED"
+    assert driver._policy_activation_requested is False
+    assert driver._navigation_task_active is False
+    assert reset_calls == [True]
 
 
 def test_reference_execution_is_transactional_across_grant_refresh_and_stop_race() -> None:

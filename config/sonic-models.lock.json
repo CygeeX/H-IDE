@@ -19,8 +19,8 @@
   "audited_runtime": {
     "config": {
       "path": "config/ros-headless.yaml",
-      "size": 3378,
-      "sha256": "cc4ed885823a0759800b7aedf866dd700ade943660822e65918fd567812c5bca"
+      "size": 3607,
+      "sha256": "4666441149c8b06b204933b85fdca1bc3813c688535c4ea258137b16538ff63d"
     },
     "declared_model_revision": "9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2",
     "declared_lerobot_revision": "cab2c37a172c0101391d95f754123ed054f1b6e6",

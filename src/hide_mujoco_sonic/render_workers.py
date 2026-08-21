@@ -18,6 +18,7 @@ import threading
 import time
 from typing import Callable
 import uuid
+import weakref
 
 import numpy as np
 
@@ -30,6 +31,9 @@ RGB_WIDTH = 640
 RGB_HEIGHT = 480
 RENDER_TIMING_STALL_THRESHOLD_MS = 100.0
 VIEWER_PROGRESS_STALE_NS = 2_000_000_000
+VIEWER_NATIVE_SHUTDOWN_TIMEOUT_S = 5.0
+VIEWER_NATIVE_SHUTDOWN_PARENT_MARGIN_S = 1.0
+VIEWER_NATIVE_SHUTDOWN_POLL_S = 0.01
 _RENDER_TIMING_STAGE_NAMES = (
     "totalMs",
     "rgbRenderMs",
@@ -740,6 +744,92 @@ def _rgbd_worker_main(
                 pass
 
 
+def _require_native_lifetime_ref(viewer) -> weakref.ReferenceType:
+    """Validate the MuJoCo lifetime barrier before the viewer becomes ready."""
+
+    simulate_ref = getattr(viewer, "_sim", None)
+    if not isinstance(simulate_ref, weakref.ReferenceType):
+        raise RuntimeError(
+            "passive viewer does not expose a weak native lifetime reference"
+        )
+    simulate = simulate_ref()
+    if simulate is None or not callable(getattr(simulate, "exit", None)):
+        raise RuntimeError("passive viewer native lifetime is already unavailable")
+    return simulate_ref
+
+
+def _close_and_wait_for_passive_viewer(
+    viewer,
+    *,
+    simulate_ref: weakref.ReferenceType | None = None,
+    timeout_s: float = VIEWER_NATIVE_SHUTDOWN_TIMEOUT_S,
+    poll_s: float = VIEWER_NATIVE_SHUTDOWN_POLL_S,
+    monotonic: Callable[[], float] = time.monotonic,
+    wait: Callable[[float], None] = time.sleep,
+) -> None:
+    """Close a passive viewer only after its native render thread is gone.
+
+    ``Handle.close()`` only submits ``Simulate.exit()``.  In MuJoCo's passive
+    viewer implementation, ``Handle.is_running()`` becomes false as soon as
+    that exit request is visible, before ``render_loop()``, the reload thread,
+    and ``Simulate.destroy()`` have necessarily completed.  The handle's
+    private weak reference is cleared only after ``_launch_internal`` really
+    returns, so it is the lifetime barrier needed before releasing MjData and
+    MjModel in this process.
+    """
+
+    if simulate_ref is None:
+        simulate_ref = _require_native_lifetime_ref(viewer)
+    timeout = max(0.0, float(timeout_s))
+    poll = max(0.001, float(poll_s))
+    deadline = monotonic() + timeout
+    viewer.close()
+    while simulate_ref() is not None:
+        remaining = deadline - monotonic()
+        if remaining <= 0.0:
+            raise TimeoutError(
+                "passive viewer native render thread did not stop within "
+                f"{timeout:.3f}s"
+            )
+        wait(min(poll, remaining))
+
+
+def _abort_viewer_worker_without_python_finalizers(stats, exc: BaseException) -> None:
+    """Fail closed without destructing model/data under a live GL thread."""
+
+    import os
+
+    failure_at = time.time_ns()
+    stats.fatal.value = 1
+    stats.failure_count.value = int(stats.failure_count.value) + 1
+    stats.last_failure_at_ns.value = failure_at
+    _set_shared_error(stats, f"{type(exc).__name__}: {exc}")
+    # Refcount-driven MjData/MjModel cleanup can race MuJoCo's still-running
+    # native render thread.  A process-local immediate exit is the last-resort
+    # fail-closed path: the OS tears down the isolated worker as one unit and
+    # the parent never SIGTERMs it in the middle of Python finalization.
+    os._exit(1)
+
+
+def _viewer_shutdown_watchdog(
+    stop_event,
+    shutdown_requested: threading.Event,
+    shutdown_complete: threading.Event,
+    stats,
+) -> None:
+    """Self-abort if the main worker is stuck inside native viewer code."""
+
+    while not stop_event.is_set():
+        if shutdown_requested.wait(VIEWER_NATIVE_SHUTDOWN_POLL_S):
+            break
+    if shutdown_complete.wait(VIEWER_NATIVE_SHUTDOWN_TIMEOUT_S):
+        return
+    _abort_viewer_worker_without_python_finalizers(
+        stats,
+        TimeoutError("passive viewer native shutdown watchdog expired"),
+    )
+
+
 def _viewer_worker_main(
     mailbox: LatestStateMailbox,
     expected_shape: MujocoStateShape,
@@ -752,6 +842,10 @@ def _viewer_worker_main(
     viewer = None
     model = None
     data = None
+    native_shutdown_requested = threading.Event()
+    native_shutdown_complete = threading.Event()
+    shutdown_watchdog = None
+    native_lifetime_ref = None
     try:
         import os
 
@@ -788,7 +882,44 @@ def _viewer_worker_main(
         # No key_callback is registered.  Mouse perturbations, pause state and
         # all viewer-side edits apply only to this worker-private MjData.
         viewer = mujoco_viewer.launch_passive(model, data)
-        configure_tracking_viewer(mujoco_api, model, viewer, runtime_scene)
+        try:
+            native_lifetime_ref = _require_native_lifetime_ref(viewer)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "unsupported MuJoCo passive-viewer lifetime contract "
+                f"(version={getattr(mujoco_api, '__version__', 'unknown')}): {exc}"
+            ) from exc
+        stats.viewer_native_active.value = 1
+        shutdown_watchdog = threading.Thread(
+            target=_viewer_shutdown_watchdog,
+            args=(
+                stop_event,
+                native_shutdown_requested,
+                native_shutdown_complete,
+                stats,
+            ),
+            daemon=True,
+            name="mujoco-passive-viewer-shutdown-watchdog",
+        )
+        shutdown_watchdog.start()
+        if not viewer.is_running():
+            raise RuntimeError("passive viewer closed before initialization")
+        with viewer.lock():
+            if not viewer.is_running():
+                raise RuntimeError(
+                    "passive viewer closed before camera initialization"
+                )
+            configure_tracking_viewer(
+                mujoco_api,
+                model,
+                viewer,
+                runtime_scene,
+            )
+        # This is both the first coherent camera publication and a startup
+        # feature probe for the state-only sync contract used by the loop.
+        viewer.sync(state_only=True)
+        if not viewer.is_running():
+            raise RuntimeError("passive viewer closed during initialization")
         stats.ready.value = 1
         last_sequence = first.sequence
         while not stop_event.is_set() and viewer.is_running():
@@ -815,14 +946,27 @@ def _viewer_worker_main(
         _set_shared_error(stats, f"{type(exc).__name__}: {exc}")
     finally:
         if viewer is not None:
+            stats.viewer_shutdown_started.value = 1
+            native_shutdown_requested.set()
             try:
-                viewer.close()
-            except Exception:
-                pass
-        # Keep all GL/model/data finalization in the child that created it.
-        viewer = None
-        data = None
-        model = None
+                _close_and_wait_for_passive_viewer(
+                    viewer,
+                    simulate_ref=native_lifetime_ref,
+                )
+                stats.viewer_native_shutdown_complete.value = 1
+                stats.viewer_native_active.value = 0
+                native_shutdown_complete.set()
+            except BaseException as exc:
+                _abort_viewer_worker_without_python_finalizers(stats, exc)
+            if shutdown_watchdog is not None:
+                shutdown_watchdog.join(timeout=0.1)
+        # The native lifetime barrier above is deliberately before these
+        # refcount releases.  Keep all GL/model/data finalization in the child
+        # that created them.
+        if viewer is None or bool(stats.viewer_native_shutdown_complete.value):
+            viewer = None
+            data = None
+            model = None
 
 
 class _SharedWorkerStats:
@@ -851,6 +995,11 @@ class _SharedWorkerStats:
         self.render_timing_last_over_ms = context.RawArray("d", stage_count)
         self.render_timing_last_over_at_ns = context.RawArray("Q", stage_count)
         self.viewer_progress_lock = context.Lock()
+        self.viewer_native_active = context.Value("b", 0, lock=False)
+        self.viewer_shutdown_started = context.Value("b", 0, lock=False)
+        self.viewer_native_shutdown_complete = context.Value(
+            "b", 0, lock=False
+        )
 
 
 class RgbdRenderWorker:
@@ -1079,6 +1228,10 @@ class PassiveViewerWorker:
     def status(self) -> dict[str, object]:
         alive = self._process.is_alive()
         process_failed = bool(self._stats.fatal.value) or (
+            self._process.pid is not None
+            and not alive
+            and self._process.exitcode not in (None, 0)
+        ) or (
             self._process.pid is not None and not alive and not self._closed
         )
         with self._stats.last_error.get_lock():
@@ -1131,15 +1284,17 @@ class PassiveViewerWorker:
         status = (
             "failed"
             if failed
+            else "stopped"
+            if self._closed and not alive and self._process.exitcode == 0
             else "stale"
             if stale
             else "running"
-            if initialized and last_success_at
+            if initialized and last_success_at and alive
             else "starting"
         )
         return {
             "status": status,
-            "ready": initialized and not failed and not stale,
+            "ready": initialized and alive and not failed and not stale,
             "alive": alive,
             "exitCode": self._process.exitcode,
             "workerPid": int(self._stats.worker_pid.value) or None,
@@ -1161,6 +1316,15 @@ class PassiveViewerWorker:
             "lastSuccessMailboxDroppedCount": dropped_at_success,
             "authorityFeedbackEnabled": False,
             "keyCallbackRegistered": False,
+            "nativeViewerActive": bool(
+                self._stats.viewer_native_active.value
+            ),
+            "shutdownStarted": bool(
+                self._stats.viewer_shutdown_started.value
+            ),
+            "nativeShutdownComplete": bool(
+                self._stats.viewer_native_shutdown_complete.value
+            ),
             "lastError": (
                 shared_error
                 or (
@@ -1174,13 +1338,45 @@ class PassiveViewerWorker:
     def close(self, *, timeout_s: float = 3.0) -> None:
         if self._closed:
             return
-        self._closed = True
         self._stop_event.set()
         if self._process.pid is not None:
-            self._process.join(timeout=max(0.0, float(timeout_s)))
+            cooperative_timeout = max(
+                0.0,
+                float(timeout_s),
+                VIEWER_NATIVE_SHUTDOWN_TIMEOUT_S
+                + VIEWER_NATIVE_SHUTDOWN_PARENT_MARGIN_S,
+            )
+            self._process.join(timeout=cooperative_timeout)
             if self._process.is_alive():
-                self._process.terminate()
+                failure_at = time.time_ns()
+                self._stats.fatal.value = 1
+                self._stats.failure_count.value = (
+                    int(self._stats.failure_count.value) + 1
+                )
+                self._stats.last_failure_at_ns.value = failure_at
+                _set_shared_error(
+                    self._stats,
+                    "passive viewer exceeded its cooperative native shutdown "
+                    f"deadline ({cooperative_timeout:.3f}s); forced SIGKILL",
+                )
+                # The viewer is process-isolated and has no control authority.
+                # After the native grace period, SIGKILL is safer than SIGTERM:
+                # it cannot enter Python, GLFW, or X11 finalizers while their
+                # render thread is wedged.
+                try:
+                    self._process.kill()
+                except ProcessLookupError:
+                    pass
                 self._process.join(timeout=1.0)
+                if self._process.is_alive():
+                    raise RuntimeError(
+                        "passive viewer remained alive after forced SIGKILL"
+                    )
+                self._stats.viewer_native_active.value = 0
+        # Do not make a failed close permanently non-retryable.  In particular,
+        # a live non-daemon multiprocessing child would otherwise outlive Plant
+        # cleanup and can block interpreter shutdown indefinitely.
+        self._closed = True
 
 
 __all__ = [
@@ -1195,6 +1391,7 @@ __all__ = [
     "RenderWorkerConfig",
     "RgbdRenderWorker",
     "VIEWER_PROGRESS_STALE_NS",
+    "VIEWER_NATIVE_SHUTDOWN_TIMEOUT_S",
     "ViewerWorkerConfig",
     "WorkerFailure",
     "configure_head_camera",

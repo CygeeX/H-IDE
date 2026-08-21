@@ -13,6 +13,7 @@ from hide_mujoco_sonic.safety import (
     MovementIntent,
     MotionDirectionGuard,
     NavigationArmGuard,
+    NominalPolicyActivation,
     PlantControlClock,
     PlantControlClockFault,
     PlantTickGuard,
@@ -349,6 +350,105 @@ def test_static_joint_handoff_freezes_published_preload_without_reanchoring():
     assert started.targets == pytest.approx((1.50, 1.50))
 
 
+def test_nominal_policy_activation_uses_simulation_ticks_and_exact_dds_commits():
+    activation = NominalPolicyActivation(joint_count=2, duration_s=3.0)
+    assert activation.begin([0.10, -0.20], tick_ms=1_000) is True
+
+    first = activation.propose([0.40, 0.10], tick_ms=1_000)
+    assert first.ratio == 0.0
+    assert first.targets == (0.10, -0.20)
+    assert activation.commit(first, first.targets) is False
+
+    middle = activation.propose([0.40, 0.10], tick_ms=2_500)
+    assert middle.ratio == pytest.approx(0.5)
+    assert middle.targets == pytest.approx((0.25, -0.05))
+    # A target that did not cross DDS cannot advance the transaction.
+    assert activation.commit(middle, first.targets) is False
+    assert activation.ratio == 0.0
+    assert activation.commit(middle, middle.targets) is False
+
+    final = activation.propose([0.40, 0.10], tick_ms=4_000)
+    assert final.complete is True
+    assert activation.commit(final, final.targets) is True
+    assert activation.phase == "PREPARED"
+    assert activation.ratio == 1.0
+    # Official INIT is once per process, not once per Mission.
+    assert activation.begin([9.0, 9.0], tick_ms=5_000) is False
+
+
+@pytest.mark.parametrize("invalid_duration", [True, 2.999, float("nan")])
+def test_nominal_policy_activation_rejects_short_or_non_finite_duration(
+    invalid_duration,
+) -> None:
+    with pytest.raises(ValueError, match="at least 3s"):
+        NominalPolicyActivation(duration_s=invalid_duration)
+
+
+@pytest.mark.parametrize("invalid_joint_count", [True, 1.5, 0])
+def test_nominal_policy_activation_requires_exact_integer_joint_count(
+    invalid_joint_count,
+) -> None:
+    with pytest.raises(ValueError, match="positive integer"):
+        NominalPolicyActivation(joint_count=invalid_joint_count)
+
+
+def test_nominal_policy_activation_abort_invalidates_inflight_decision():
+    activation = NominalPolicyActivation(joint_count=1, duration_s=3.0)
+    assert activation.begin([0.1], tick_ms=10_000) is True
+    stale = activation.propose([0.0], tick_ms=11_000)
+    previous_epoch = stale.epoch
+
+    assert activation.abort() is True
+    assert activation.phase == "UNPREPARED"
+    assert activation.epoch == previous_epoch + 1
+    assert activation.commit(stale, stale.targets) is False
+    with pytest.raises(RuntimeError, match="not preparing"):
+        activation.propose([0.0], tick_ms=12_000)
+
+    assert activation.begin([0.08], tick_ms=20_000) is True
+    with pytest.raises(ValueError, match="moved backwards"):
+        activation.propose([0.0], tick_ms=19_999)
+
+
+def test_official_nominal_ramp_preserves_captured_right_wrist_slew_limit():
+    # Incident boundary for arm-local index 11 / global G1 joint 26.
+    boundary = 0.010501991026103497
+    activation = NominalPolicyActivation(joint_count=1, duration_s=3.0)
+    guard = NavigationArmGuard(
+        [0.0],
+        max_deviation_rad=[1.50],
+        max_velocity_rps=[4.0],
+    )
+    guard.anchor([boundary])
+
+    # The captured first-policy jump is projected to—not through—the original
+    # 4 rad/s limit.  No threshold is widened, and the exact projected target
+    # becomes the next actuator/history anchor.
+    projected = guard.apply(
+        [boundary + 0.0800001],
+        measured=[boundary],
+        dt=0.02,
+    )
+    assert projected.targets == pytest.approx((boundary + 0.08,))
+    assert projected.constrained_joints == 1
+    assert projected.max_step_rad == pytest.approx(0.08)
+
+    assert activation.begin([boundary], tick_ms=1_000) is True
+    last = boundary
+    for frame in range(151):
+        decision = activation.propose([0.0], tick_ms=1_000 + frame * 20)
+        guarded = guard.apply(
+            decision.targets,
+            measured=[boundary],
+            dt=0.02,
+        )
+        assert abs(guarded.targets[0] - last) <= 0.08
+        completed = activation.commit(decision, guarded.targets)
+        last = guarded.targets[0]
+    assert completed is True
+    assert last == pytest.approx(0.0)
+
+
 def test_cmd_vel_is_bounded_and_converted_to_slow_walk():
     now = [100.0]
     guard = CmdVelGuard(max_linear_mps=0.25, max_angular_rps=0.5, timeout_s=0.25, clock=lambda: now[0], smoothing_alpha=1.0)
@@ -609,7 +709,7 @@ def test_navigation_arm_guard_passes_valid_policy_target_unchanged():
     assert second.constrained_joints == 0
 
 
-def test_navigation_arm_guard_rejects_excursion_slew_and_non_finite_target():
+def test_navigation_arm_guard_rejects_excursion_and_projects_slew():
     guard = NavigationArmGuard(
         [0.2],
         max_deviation_rad=[0.4],
@@ -619,8 +719,78 @@ def test_navigation_arm_guard_rejects_excursion_slew_and_non_finite_target():
         guard.apply([float("nan")], measured=[0.2], dt=0.02)
     with pytest.raises(ValueError, match="envelope"):
         guard.apply([0.7], measured=[0.2], dt=0.02)
-    with pytest.raises(ValueError, match="slew"):
-        guard.apply([0.3], measured=[0.2], dt=0.02)
+    projected = guard.apply([0.3], measured=[0.2], dt=0.02)
+    assert projected.targets == pytest.approx((0.22,))
+    assert projected.constrained_joints == 1
+    assert projected.max_step_rad == pytest.approx(0.02)
+
+
+def test_navigation_arm_guard_fails_closed_on_persistent_saturation():
+    guard = NavigationArmGuard(
+        [0.0],
+        max_deviation_rad=[10.0],
+        max_velocity_rps=[1.0],
+        max_continuous_saturation_s=0.25,
+    )
+    guard.anchor([0.0])
+
+    for _ in range(12):
+        anchor = guard._last[0]
+        projected = guard.apply([anchor + 0.10], dt=0.02)
+        assert projected.targets == pytest.approx((anchor + 0.02,))
+        assert projected.constrained_joints == 1
+
+    anchor = guard._last[0]
+    with pytest.raises(ValueError, match="persistently") as rejected:
+        guard.apply([anchor + 0.10], dt=0.02)
+    assert "allowed=0.02" in str(rejected.value)
+    assert "saturated_for=0.25999999999999995s" in str(rejected.value)
+    assert "budget=0.25s" in str(rejected.value)
+
+
+def test_navigation_arm_guard_unconstrained_tick_resets_saturation_budget():
+    guard = NavigationArmGuard(
+        [0.0],
+        max_deviation_rad=[10.0],
+        max_velocity_rps=[1.0],
+        max_continuous_saturation_s=0.04,
+    )
+    guard.anchor([0.0])
+
+    first = guard.apply([0.10], dt=0.02)
+    assert first.constrained_joints == 1
+    cleared = guard.apply([0.03], dt=0.02)
+    assert cleared.constrained_joints == 0
+    assert cleared.targets == pytest.approx((0.03,))
+    second = guard.apply([0.13], dt=0.02)
+    assert second.constrained_joints == 1
+    assert second.targets == pytest.approx((0.05,))
+
+
+@pytest.mark.parametrize(
+    "invalid_budget",
+    [True, 0.0, -0.1, float("nan"), float("inf")],
+)
+def test_navigation_arm_guard_rejects_invalid_saturation_budget(
+    invalid_budget,
+):
+    with pytest.raises(ValueError, match="saturation budget"):
+        NavigationArmGuard(
+            [0.0],
+            max_deviation_rad=[1.0],
+            max_velocity_rps=[1.0],
+            max_continuous_saturation_s=invalid_budget,
+        )
+
+
+def test_navigation_arm_guard_rejects_boolean_control_dt():
+    guard = NavigationArmGuard(
+        [0.0],
+        max_deviation_rad=[1.0],
+        max_velocity_rps=[1.0],
+    )
+    with pytest.raises(ValueError, match="dt"):
+        guard.apply([0.0], dt=True)
 
 
 def test_navigation_arm_guard_anchors_exact_actuator_preload_before_slew():

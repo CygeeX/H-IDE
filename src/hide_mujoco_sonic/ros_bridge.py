@@ -387,7 +387,10 @@ def run_ros_bridge(config: SimConfig) -> None:
             max_angular_rps=config.max_angular_rps,
             linear_deadband_mps=config.min_walk_command_mps,
             angular_deadband_rps=0.05,
-            start_timeout_s=max(1.5, config.motion_handoff_warmup_s + config.motion_handoff_blend_s + 0.75),
+            # This budget begins only after SONIC reports the first exact DDS
+            # authority grant. Nominal activation and reference planning occur
+            # before that fact and must not weaken measured-gait fail-fast.
+            start_timeout_s=1.5,
             stop_timeout_s=2.5,
             max_facing_delta_rad=config.max_facing_lead_rad,
         )
