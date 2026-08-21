@@ -1753,7 +1753,7 @@ def test_nominal_policy_activation_restarts_after_support_failure_and_freezes_po
 
     driver._set_plant_support_mode = set_support
 
-    for frame in range(223):
+    for frame in range(212):
         tick_ms = 1_000 + frame * 20
         sampled_intent = intent if frame < 201 else _movement_intent(0.15)
         driver._run_nominal_policy_activation(
@@ -1764,28 +1764,25 @@ def test_nominal_policy_activation_restarts_after_support_failure_and_freezes_po
         )
         # Preparation may publish actuator targets, but it cannot request or
         # install a policy reference before the final nominal DDS fact.
-        if frame < 222:
+        if frame < 211:
             assert driver._reference_request_pending is False
             assert observed_intents == []
             assert driver._reference_authority.snapshot.phase == "REQUIRED"
-        if frame == 211:
-            release_thread = driver._policy_activation_release_thread
-            assert release_thread is not None
-            release_thread.join(timeout=1.0)
-            assert not release_thread.is_alive()
 
-    assert len(writes) == 223
+    assert len(writes) == 212
     assert writes[0] == pytest.approx(boundary)
     assert writes[50] == pytest.approx(writes[49])
     # A restarted official INIT starts from the freshly measured joints,
     # without carrying elapsed ratio or a stale pre-failure command target.
     assert writes[51] == pytest.approx(boundary)
     assert writes[-1] == pytest.approx(nominal)
-    assert driver._policy_activation.phase == "PREPARED"
+    assert driver._policy_activation.phase == "WAITING_FOR_SUPPORT_RELEASE"
     assert driver._policy_activation_requested is False
     assert driver._reference_request_pending is True
-    assert observed_intents == [(intent, True, 5.44)]
-    assert release_epochs == [3]
+    assert observed_intents == [(intent, True, 5.22)]
+    # The Plant gantry must remain engaged until a matched policy target has
+    # actually crossed DDS.
+    assert release_epochs == []
     assert set(support_modes) == {"idle"}
 
     # Planner waiting after INIT must hold nominal, never jump back to the
@@ -1813,7 +1810,7 @@ def test_nominal_policy_activation_restarts_after_support_failure_and_freezes_po
     assert requested_lowstates == [fresh_lowstate]
 
 
-def test_activation_waits_across_async_release_ticks_without_aborting(
+def test_activation_releases_only_after_policy_dds_grant_without_aborting(
     monkeypatch,
 ) -> None:
     from lerobot.robots.unitree_g1.controllers.sonic_pipeline import DEFAULT_ANGLES
@@ -1889,19 +1886,51 @@ def test_activation_waits_across_async_release_ticks_without_aborting(
         blocking_release,
     )
 
-    for tick_ms in (3_040, 3_060, 3_080):
-        driver._run_nominal_policy_activation(
-            lowstate=lowstate,
-            control_step=PlantControlStep(tick_ms=tick_ms, dt_s=0.02),
-            intent=intent,
-            measured=nominal,
-        )
-        assert worker_entered.wait(timeout=1.0)
-        assert activation.phase == "WAITING_FOR_SUPPORT_RELEASE"
-        assert activation.epoch == activation_epoch
-        assert driver._policy_activation_requested is True
-        assert driver._reference_request_pending is False
-        assert observed_intents == []
+    driver._run_nominal_policy_activation(
+        lowstate=lowstate,
+        control_step=PlantControlStep(tick_ms=3_040, dt_s=0.02),
+        intent=intent,
+        measured=nominal,
+    )
+    assert activation.phase == "WAITING_FOR_SUPPORT_RELEASE"
+    assert activation.epoch == activation_epoch
+    assert driver._policy_activation_requested is False
+    assert driver._reference_request_pending is True
+    assert observed_intents == [(intent, True, 3.04)]
+    assert worker_entered.is_set() is False
+    assert release_epochs == []
+
+    driver._reference_authority.mark_installed(
+        generation=42,
+        source_sequence=7,
+        planner_intent_generation=1,
+        reference_epoch=1,
+    )
+    driver._reference_authority.prime(
+        generation=42,
+        source_sequence=7,
+        reference_epoch=1,
+    )
+    driver._reference_authority.grant(
+        generation=42,
+        source_sequence=7,
+        reference_epoch=1,
+        granted_at_monotonic_s=clock.value,
+        granted_at_tick_ms=3_060,
+        dds_target_sequence=1,
+    )
+    assert driver._advance_policy_activation_release_after_grant(
+        tick_ms=3_060
+    ) is False
+    assert worker_entered.wait(timeout=1.0)
+    assert activation.phase == "WAITING_FOR_SUPPORT_RELEASE"
+    assert release_epochs == [activation_epoch]
+    # Re-observing a still-pending release is idempotent and cannot abort or
+    # start a second HTTP transaction.
+    assert driver._advance_policy_activation_release_after_grant(
+        tick_ms=3_080
+    ) is False
+    assert activation.epoch == activation_epoch
     assert release_epochs == [activation_epoch]
 
     release_worker.set()
@@ -1909,32 +1938,136 @@ def test_activation_waits_across_async_release_ticks_without_aborting(
     assert thread is not None
     thread.join(timeout=1.0)
     assert not thread.is_alive()
-    driver._run_nominal_policy_activation(
-        lowstate=lowstate,
-        control_step=PlantControlStep(tick_ms=3_100, dt_s=0.02),
-        intent=intent,
-        measured=nominal,
-    )
-    assert activation.phase == "SETTLING_UNSUPPORTED"
-    assert driver._reference_request_pending is False
-
-    driver._run_nominal_policy_activation(
-        lowstate=lowstate,
-        control_step=PlantControlStep(tick_ms=3_120, dt_s=0.02),
-        intent=intent,
-        measured=nominal,
-    )
+    assert driver._advance_policy_activation_release_after_grant(
+        tick_ms=3_100
+    ) is True
     assert activation.phase == "PREPARED"
     assert driver._reference_request_pending is True
-    assert observed_intents == [(intent, True, 3.12)]
-    assert len(writes) == 5
-    telemetry = driver.telemetry.values
-    assert telemetry["policy_activation_epoch"] == activation_epoch
-    assert telemetry["policy_activation_path"] == "tethered_release"
+    assert observed_intents == [(intent, True, 3.04)]
+    assert len(writes) == 1
+    with driver._support_lock:
+        activation_fields = driver._policy_activation_telemetry_fields_locked()
+    assert activation_fields["policy_activation_epoch"] == activation_epoch
+    assert activation_fields["policy_activation_path"] == "tethered_release"
     assert (
-        telemetry["policy_activation_release_confirmed_epoch"]
+        activation_fields["policy_activation_release_confirmed_epoch"]
         == activation_epoch
     )
+
+
+def test_run_writes_first_policy_dds_before_requesting_support_release(
+    monkeypatch,
+) -> None:
+    from lerobot.robots.unitree_g1.controllers.sonic_pipeline import DEFAULT_ANGLES
+
+    clock = Clock()
+    driver, writes = _publishing_driver(clock)
+    nominal = tuple(float(value) for value in DEFAULT_ANGLES)
+    lowstate = _lowstate(nominal)
+    activation = NominalPolicyActivation(
+        joint_count=29,
+        duration_s=3.0,
+        settle_consecutive_samples=1,
+    )
+    assert activation.begin(nominal, tick_ms=0)
+    final = activation.propose(nominal, measured=nominal, tick_ms=3_000)
+    assert activation.commit(final, final.targets)
+    activation.observe_settling(
+        nominal=nominal,
+        measured=nominal,
+        velocities=tuple(0.0 for _ in nominal),
+        gyroscope=(0.0, 0.0, 0.0),
+        roll_rad=0.0,
+        pitch_rad=0.0,
+        tick_ms=3_020,
+    )
+    assert activation.waiting_for_support_release
+
+    intent = _movement_intent(0.0)
+    evidence = _TransactionalEvidence()
+    evidence.intent_generation = 1
+    evidence.intent_signature = "intent-1"
+    evidence.accept_current()
+    controller = _TransactionalController(evidence, nominal)
+    controller.reference_authority = True
+    controller.shutdown = lambda: None
+    driver._controller = controller
+    driver._planner_evidence = evidence
+    driver._policy_activation = activation
+    driver._policy_activation_requested = False
+    driver._navigation_task_active = True
+    driver._reference_source_identity = (42, 7)
+    driver._reference_authority.require(generation=42, source_sequence=7)
+    driver._reference_authority.mark_installed(
+        generation=42,
+        source_sequence=7,
+        planner_intent_generation=1,
+        reference_epoch=1,
+    )
+    driver._reference_authority.prime(
+        generation=42,
+        source_sequence=7,
+        reference_epoch=1,
+    )
+    driver._intent_ingress = SimpleNamespace(armed=True, generation=42)
+    driver._intent_gate = SimpleNamespace(last=intent)
+    driver._joint_handoff.freeze(nominal)
+    driver._last_published_targets = nominal
+    driver._safe_hold_targets = None
+    driver._pending_decoder_heading_delta_rad = 0.0
+    driver._prepare_idle_startup = lambda: None
+    driver._startup_qualifying = False
+    driver._apply_intent = lambda *_args, **_kwargs: intent
+    driver._progress_reference_transaction = lambda _lowstate: True
+    driver._record_control_trace = lambda **_kwargs: None
+    support_modes: list[str] = []
+
+    def support(mode: str) -> bool:
+        support_modes.append(mode)
+        driver._plant_support_mode = mode
+        return True
+
+    driver._set_plant_support_mode = support
+    samples = [(lowstate, PlantControlStep(tick_ms=3_040, dt_s=0.02), 0)]
+
+    def next_sample():
+        if samples:
+            return samples.pop(0)
+        driver._stop.set()
+        return None
+
+    driver._next_control_sample = next_sample
+    release_observations: list[tuple[int, str]] = []
+
+    def release(_host: str, _port: int, epoch: int):
+        release_observations.append(
+            (len(writes), driver._reference_authority.snapshot.phase)
+        )
+        return {
+            "fallArrestEnabled": False,
+            "fallArrestReleaseConfirmedEpoch": epoch,
+            "fault": None,
+            "motionFault": None,
+        }
+
+    monkeypatch.setattr(
+        "hide_mujoco_sonic.sonic_driver.release_plant_fall_arrest",
+        release,
+    )
+
+    driver.run()
+    release_thread = driver._policy_activation_release_thread
+    assert release_thread is not None
+    release_thread.join(timeout=1.0)
+    assert not release_thread.is_alive()
+
+    assert len(writes) == 1
+    assert controller.run_calls == 1
+    assert controller.commits == [pytest.approx(writes[0])]
+    assert driver._reference_authority.snapshot.phase == "GRANTED"
+    assert support_modes == ["idle"]
+    assert release_observations == [(1, "GRANTED")]
+    assert activation.waiting_for_support_release
 
 
 
@@ -2209,8 +2342,8 @@ def test_completed_nominal_activation_is_not_repeated_for_second_task() -> None:
         pitch_rad=0.0,
     )
     activation.observe_settling(**settle, tick_ms=3_020)
+    activation.record_support_release(activation.epoch)
     assert activation.confirm_support_release(tick_ms=3_020)
-    activation.observe_settling(**settle, tick_ms=3_040)
     assert activation.prepared
     driver._policy_activation = activation
     driver._policy_activation_requested = False

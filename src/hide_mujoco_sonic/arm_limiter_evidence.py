@@ -380,6 +380,32 @@ class ArmLimiterEvidenceRecorder:
                 self._failed_reason = message
             raise ArmLimiterEvidenceError(self._failed_reason)
 
+    def close_failed_active(self, reason: object) -> str | None:
+        """Close a faulted motion case without poisoning safety-hold writes.
+
+        Once a motion fault is latched, later frozen DDS holds are containment
+        facts rather than samples from the accepted capability case.  Keeping
+        the failed session active would make those deliberately context-free
+        recovery writes raise again and could terminate the Plant.  This
+        operation preserves the first failure reason while atomically removing
+        the active recording identity.
+        """
+
+        message = str(reason).strip().replace("\x00", "")
+        if not message:
+            message = "arm evidence session ended at a motion safety fault"
+        message = message[:512]
+        with self._lock:
+            identity = self._identity
+            if identity is None:
+                return None
+            if self._failed_reason is None:
+                self._failed_reason = message
+            failed_case_id = identity.case_id
+            self._identity = None
+            self._records = []
+            return failed_case_id
+
     def completed(self, *, case_id: str) -> dict[str, Any] | None:
         requested_case = _identifier(case_id, "case_id")
         with self._lock:

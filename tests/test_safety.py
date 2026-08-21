@@ -394,25 +394,15 @@ def test_nominal_policy_activation_uses_simulation_ticks_and_exact_dds_commits()
         )
     assert tethered.stage_complete is True
     assert activation.phase == "WAITING_FOR_SUPPORT_RELEASE"
+    assert activation.ready_targets == pytest.approx((0.40, 0.10))
+    assert activation.record_support_release(activation.epoch) is True
     assert activation.confirm_support_release(tick_ms=4_040) is True
-    assert activation.phase == "SETTLING_UNSUPPORTED"
-    for tick_ms in (4_060, 4_080):
-        unsupported = activation.observe_settling(
-            nominal=[0.40, 0.10],
-            measured=[0.40, 0.10],
-            velocities=[0.0, 0.0],
-            gyroscope=[0.0, 0.0, 0.0],
-            roll_rad=0.0,
-            pitch_rad=0.0,
-            tick_ms=tick_ms,
-        )
-    assert unsupported.prepared is True
     assert activation.phase == "PREPARED"
     # Official INIT is once per process, not once per Mission.
     assert activation.begin([9.0, 9.0], tick_ms=5_000) is False
 
 
-def test_activation_cancel_after_one_way_release_restarts_support_off():
+def test_activation_stop_after_policy_grant_and_release_preserves_init():
     activation = NominalPolicyActivation(
         joint_count=1,
         duration_s=3.0,
@@ -429,37 +419,46 @@ def test_activation_cancel_after_one_way_release_restarts_support_off():
     assert tethered.stage_complete
     with pytest.raises(ValueError, match="predates tethered evidence"):
         activation.confirm_support_release(tick_ms=3_019)
-    assert activation.confirm_support_release(tick_ms=3_020)
     released_epoch = activation.epoch
+    assert activation.record_support_release(released_epoch)
 
+    # A release proof can only be requested after the first policy DDS grant.
+    # If stop wins before the owner tick consumes the response, INIT is still
+    # complete and must never be repeated unsupported.
     assert activation.abort() is True
-    assert activation.phase == "UNPREPARED_SUPPORT_OFF"
+    assert activation.phase == "PREPARED"
     assert activation.support_release_confirmed is True
     assert activation.provenance["support_release"] == {
         "one_way": True,
         "confirmed_epoch": released_epoch,
-        "cancel_recovery": "support_off_reinit_then_settle",
+        "cancel_recovery": "resume_policy_from_exact_frozen_boundary",
     }
+    assert activation.begin([0.05], tick_ms=4_000) is False
+
+
+def test_legacy_support_off_recovery_skips_static_init():
+    activation = NominalPolicyActivation(
+        joint_count=1,
+        duration_s=3.0,
+        settle_consecutive_samples=1,
+    )
+    assert activation.begin([0.1], tick_ms=0)
+    assert activation.abort()
+    released_epoch = 1
+    assert activation.record_support_release(released_epoch)
+    assert activation.phase == "UNPREPARED_SUPPORT_OFF"
 
     assert activation.begin([0.05], tick_ms=4_000)
-    assert activation.phase == "PREPARING_SUPPORT_OFF"
+    assert activation.phase == "WAITING_FOR_SUPPORT_RELEASE"
     assert activation.epoch != released_epoch
+    assert activation.ready_targets == (0.05,)
     assert activation.provenance["activation_epoch"] == activation.epoch
     assert activation.provenance["activation_path"] == "support_off_reinit"
 
-    retry = activation.propose([0.0], measured=[0.01], tick_ms=7_000)
-    assert activation.commit(retry, retry.targets)
-    assert activation.phase == "SETTLING_UNSUPPORTED"
-    unsupported = activation.observe_settling(
-        nominal=[0.0],
-        measured=[0.0],
-        velocities=[0.0],
-        gyroscope=[0.0, 0.0, 0.0],
-        roll_rad=0.0,
-        pitch_rad=0.0,
-        tick_ms=7_020,
-    )
-    assert unsupported.prepared
+    # A newly granted reference may immediately reuse the old release proof
+    # from the exact frozen actuator boundary.
+    assert activation.confirm_support_release(tick_ms=4_020)
+    assert activation.prepared
     assert activation.provenance["activation_epoch"] != released_epoch
     assert activation.provenance["support_release"]["confirmed_epoch"] == released_epoch
 
@@ -549,8 +548,11 @@ def test_nominal_policy_activation_provenance_exposes_fixed_gate():
         "required_consecutive_samples": 10,
         "timeout_s": 3.0,
         "sample_period_ms": 20,
-        "stages": ["tethered", "support_off"],
+        "stages": ["tethered"],
     }
+    assert provenance["policy_takeover"] == (
+        "first_successful_policy_dds_then_exact_epoch_support_release"
+    )
 
 
 @pytest.mark.parametrize("invalid_duration", [True, 2.999, 3.001, float("nan")])

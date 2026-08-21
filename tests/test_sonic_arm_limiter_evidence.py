@@ -239,3 +239,57 @@ def test_unfenced_successful_write_permanently_invalidates_active_evidence(
     with pytest.raises(Exception, match="not fenced"):
         driver._record_successful_dds_target(tuple(0.0 for _ in range(29)))
     assert "not fenced" in str(driver._arm_evidence.failed_reason)
+
+
+def test_recoverable_motion_fault_closes_evidence_before_context_free_hold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = _driver()
+    reason = "navigation_guard/NAVIGATION_GUARD_FAULT: unsafe tilt"
+    driver._recoverable_motion_fault = False
+    driver._terminal_fault_reason = None
+    driver._startup_qualifying = False
+    driver._fault_trace = None
+    telemetry_values: dict[str, object] = {}
+    driver.telemetry = SimpleNamespace(
+        update=lambda **changes: telemetry_values.update(changes)
+    )
+    driver._arm_evidence.begin(
+        case_id="forward-probe-fault",
+        policy_activation_epoch=1,
+        support_release_confirmed_epoch=1,
+        plant_boot_id=PLANT_IDENTITY["producerBootId"],
+        plant_session_id=PLANT_IDENTITY["sessionId"],
+    )
+    monkeypatch.setattr(
+        "hide_mujoco_sonic.sonic_driver.latch_plant_motion_fault",
+        lambda *_args, **_kwargs: {
+            "mode": "safety_stop",
+            "safetyStopLatched": True,
+            "fault": None,
+            "motionFault": reason,
+        },
+    )
+
+    driver._latch_motion_fault(reason, boundary_already_stopped=True)
+
+    assert driver._arm_evidence.active is False
+    assert driver._arm_evidence.failed_reason == reason
+    assert driver._fault_latched.is_set()
+    assert driver._recoverable_motion_fault is True
+
+    # Recovery holds intentionally run outside an accepted capability control
+    # context. They remain real DDS facts, but must neither extend the failed
+    # evidence case nor upgrade the recoverable fault to a process exit.
+    driver._control_evidence_context.control_step = None
+    token = driver._begin_arm_evidence_write()
+    previous_sequence = driver._dds_target_sequence
+    held = driver._record_successful_dds_target(
+        tuple(0.0 for _ in range(29)),
+        evidence_write_token=token,
+    )
+    assert held == tuple(0.0 for _ in range(29))
+    assert driver._dds_target_sequence == previous_sequence + 1
+    assert driver._arm_evidence_writes_inflight == set()
+    assert driver._recoverable_motion_fault is True
+    assert telemetry_values["last_error"] == reason

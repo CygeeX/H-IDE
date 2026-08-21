@@ -1605,6 +1605,18 @@ class SonicDriver:
         motion_ready = getattr(self, "_motion_ready", None)
         if motion_ready is not None:
             motion_ready.clear()
+        # Freeze the acceptance recorder at the original safety fault before
+        # any context-free recovery hold can cross DDS.  The evidence boundary
+        # waits for an already-started control write to finish, while the fault
+        # latch above prevents a newer policy write from acquiring authority.
+        evidence_boundary = getattr(self, "_arm_evidence_boundary_lock", None)
+        arm_evidence = getattr(self, "_arm_evidence", None)
+        close_failed_evidence = getattr(
+            arm_evidence, "close_failed_active", None
+        )
+        if evidence_boundary is not None and callable(close_failed_evidence):
+            with evidence_boundary:
+                close_failed_evidence(detail)
         boundary_error: Exception | None = None
         if not boundary_already_stopped:
             try:
@@ -2598,7 +2610,6 @@ class SonicDriver:
             in {
                 "SETTLING_TETHERED",
                 "WAITING_FOR_SUPPORT_RELEASE",
-                "SETTLING_UNSUPPORTED",
                 "PREPARED",
             }
         )
@@ -2716,10 +2727,14 @@ class SonicDriver:
         self._policy_activation_release_thread = None
 
     def _start_policy_activation_release_locked(self) -> bool:
-        """Start the exact-epoch Plant proof outside the 50 Hz owner thread."""
+        """Start the exact-epoch Plant proof after policy owns DDS."""
 
         activation = self._policy_activation
         if not activation.waiting_for_support_release:
+            return False
+        if activation.activation_path != "tethered_release":
+            return False
+        if self._reference_authority.snapshot.phase != "GRANTED":
             return False
         epoch = activation.epoch
         existing_epoch = getattr(
@@ -2840,21 +2855,28 @@ class SonicDriver:
     def _complete_policy_activation_locked(
         self,
         published_targets: tuple[float, ...],
-        expected_nominal: tuple[float, ...],
+        expected_boundary: tuple[float, ...],
         *,
         tick_ms: int,
         simulation_now_s: float,
     ) -> bool:
-        """Open planning only after the second measured settle gate."""
+        """Open planning after tethered INIT, before fall-arrest release.
+
+        The learned controller must own a successful DDS target before the
+        simulation gantry is released.  Otherwise a fixed nominal PD target is
+        asked to balance an unsupported floating humanoid, which is not a
+        valid state in the official deployment either.
+        """
 
         activation = self._policy_activation
         admitted_intent = getattr(self._intent_gate, "last", None)
         if (
-            not activation.prepared
+            not activation.waiting_for_support_release
             or not self._policy_activation_boundary_valid_locked()
             or admitted_intent is None
             or admitted_intent.mode == "IDLE"
-            or tuple(published_targets) != expected_nominal
+            or activation.ready_targets != tuple(expected_boundary)
+            or tuple(published_targets) != expected_boundary
         ):
             return False
         # Every policy-free waiting tick and the later binary policy handoff
@@ -2866,10 +2888,51 @@ class SonicDriver:
             admitted=True,
             simulation_now_s=simulation_now_s,
         )
-        self._policy_activation_prepared_tick_ms = int(tick_ms)
         self._reference_request_pending = True
         self._policy_activation_requested = False
         return True
+
+    def _advance_policy_activation_release_after_grant(
+        self,
+        *,
+        tick_ms: int,
+    ) -> bool:
+        """Release the simulation gantry only after the first policy DDS.
+
+        This is the software equivalent of NVIDIA's documented gantry
+        sequence: the policy starts balancing while the robot is supported,
+        then the support is released.  The initial release is asynchronous and
+        exact-epoch bound; a cancellation that lost that one-way race resumes
+        from its frozen policy boundary without attempting another release.
+        """
+
+        with self._support_lock:
+            activation = getattr(self, "_policy_activation", None)
+            if activation is None:
+                return True
+            if activation.prepared:
+                return True
+            if not activation.waiting_for_support_release:
+                return False
+            if self._reference_authority.snapshot.phase != "GRANTED":
+                return False
+            if activation.activation_path == "support_off_reinit":
+                if not activation.confirm_support_release(tick_ms=tick_ms):
+                    raise NominalPolicyActivationFault(
+                        "support-off recovery left the activation wait phase"
+                    )
+            elif activation.activation_path == "tethered_release":
+                self._consume_policy_activation_release_locked(tick_ms=tick_ms)
+                if activation.waiting_for_support_release:
+                    self._start_policy_activation_release_locked()
+            else:
+                raise NominalPolicyActivationFault(
+                    "policy activation path is unavailable after DDS grant"
+                )
+            if activation.prepared:
+                self._policy_activation_prepared_tick_ms = int(tick_ms)
+                return True
+            return False
 
     @staticmethod
     def _policy_activation_stability_inputs(
@@ -2960,17 +3023,8 @@ class SonicDriver:
                 released = self._policy_activation_boundary_valid_locked()
                 if released:
                     self._safe_hold_targets = None
-                requested_targets = nominal_targets
-                if phase_at_tick == "WAITING_FOR_SUPPORT_RELEASE":
-                    self._consume_policy_activation_release_locked(
-                        tick_ms=control_step.tick_ms
-                    )
-                    if activation.waiting_for_support_release:
-                        self._start_policy_activation_release_locked()
-                elif phase_at_tick in {
-                    "SETTLING_TETHERED",
-                    "SETTLING_UNSUPPORTED",
-                }:
+                requested_targets = activation.ready_targets or nominal_targets
+                if phase_at_tick == "SETTLING_TETHERED":
                     settle_phase_to_observe = phase_at_tick
 
         support_ready = self._set_plant_support_mode("idle")
@@ -3036,28 +3090,28 @@ class SonicDriver:
                             pitch_rad=pitch,
                             tick_ms=control_step.tick_ms,
                         )
-                        if activation.waiting_for_support_release:
-                            self._start_policy_activation_release_locked()
-                        if observation.prepared:
-                            activation_tick_committed = (
-                                self._complete_policy_activation_locked(
-                                    published_targets,
-                                    nominal_targets,
-                                    tick_ms=control_step.tick_ms,
-                                    simulation_now_s=(
-                                        control_step.tick_ms / 1_000.0
-                                    ),
-                                )
+                    if (
+                        activation_tick_committed
+                        and activation.waiting_for_support_release
+                    ):
+                        activation_tick_committed = (
+                            self._complete_policy_activation_locked(
+                                published_targets,
+                                requested_targets,
+                                tick_ms=control_step.tick_ms,
+                                simulation_now_s=(
+                                    control_step.tick_ms / 1_000.0
+                                ),
                             )
+                        )
             if (
                 not activation_tick_committed
                 and self._policy_activation_requested
                 and not activation.prepared
             ):
                 # Only an actual support/DDS/boundary failure reaches here.
-                # WAITING_FOR_SUPPORT_RELEASE and incomplete SETTLING samples
-                # retain their phase and epoch across arbitrarily many valid
-                # ticks while continuing to publish exact nominal hold.
+                # Incomplete tethered settling samples retain their phase and
+                # epoch across valid ticks while publishing exact nominal hold.
                 activation.abort()
                 self._reset_policy_activation_release_locked()
 
@@ -3079,10 +3133,8 @@ class SonicDriver:
             )
             activation_status = {
                 "PREPARING": "simulation_time_50hz_preparing_nominal",
-                "PREPARING_SUPPORT_OFF": "simulation_time_50hz_repreparing_nominal_support_off",
                 "SETTLING_TETHERED": "simulation_time_50hz_settling_tethered",
-                "WAITING_FOR_SUPPORT_RELEASE": "waiting_for_exact_epoch_support_release",
-                "SETTLING_UNSUPPORTED": "simulation_time_50hz_settling_support_off",
+                "WAITING_FOR_SUPPORT_RELEASE": "waiting_for_matched_reference_before_support_release",
                 "PREPARED": "simulation_time_50hz_nominal_prepared",
             }.get(phase, "simulation_time_50hz_motion_ready")
             self.telemetry.update(
@@ -3815,9 +3867,10 @@ class SonicDriver:
                             "policy_activation/POLICY_ACTIVATION_FAULT: "
                             + str(exc)
                         )
-                    # Nominal preparation is policy-free: do not start the
-                    # planner deadline, advance a reference cursor, or decode
-                    # a candidate until its final DDS target is committed.
+                    # INIT and tethered settling are policy-free.  Their final
+                    # exact DDS boundary opens reference planning; the learned
+                    # controller then receives DDS authority before the
+                    # simulation fall arrest is released.
                     continue
 
                 if not self._progress_reference_transaction(lowstate):
@@ -3857,6 +3910,17 @@ class SonicDriver:
                     )
                     continue
 
+                try:
+                    self._advance_policy_activation_release_after_grant(
+                        tick_ms=control_step.tick_ms
+                    )
+                except NominalPolicyActivationFault as exc:
+                    self._latch_motion_fault(
+                        "policy_activation/POLICY_ACTIVATION_FAULT: "
+                        + str(exc)
+                    )
+                    continue
+
                 # Feed empty external action: the controller reads the mapped
                 # MovementState above and executes the official SONIC pipeline.
                 # Decode creates a pending candidate. Its action history and
@@ -3887,7 +3951,12 @@ class SonicDriver:
                         policy=policy_targets,
                         now=control_step.tick_ms / 1_000.0,
                     )
-                if decision.static_hold_active:
+                activation_waiting_for_release = bool(
+                    activation is not None
+                    and not activation.prepared
+                    and activation.waiting_for_support_release
+                )
+                if decision.static_hold_active or activation_waiting_for_release:
                     desired_support_mode = "idle"
                 elif intent.mode != "IDLE" and decision.handoff_ratio > 0.0:
                     desired_support_mode = "locomotion"
@@ -3956,10 +4025,32 @@ class SonicDriver:
                     published_targets=published_targets,
                     handoff_ratio=decision.handoff_ratio,
                 )
+                try:
+                    self._advance_policy_activation_release_after_grant(
+                        tick_ms=control_step.tick_ms
+                    )
+                except NominalPolicyActivationFault as exc:
+                    self._latch_motion_fault(
+                        "policy_activation/POLICY_ACTIVATION_FAULT: "
+                        + str(exc)
+                    )
+                    continue
+                with self._support_lock:
+                    activation_fields = (
+                        self._policy_activation_telemetry_fields_locked()
+                    )
+                    activation_release_pending = bool(
+                        not self._policy_activation.prepared
+                        and self._policy_activation.waiting_for_support_release
+                    )
                 self.telemetry.update(
                     control_tick_ms=control_step.tick_ms,
                     control_dt_s=control_step.dt_s,
-                    control_clock_status="simulation_time_50hz_motion_ready",
+                    control_clock_status=(
+                        "policy_balancing_before_support_release"
+                        if activation_release_pending
+                        else "simulation_time_50hz_motion_ready"
+                    ),
                     static_hold_active=effective_static_hold,
                     motion_handoff_active=(
                         decision.motion_handoff_active
@@ -3971,6 +4062,7 @@ class SonicDriver:
                         if not effective_static_hold
                         else 0.0
                     ),
+                    **activation_fields,
                     **self._planner_telemetry_fields(),
                 )
             except Exception as exc:

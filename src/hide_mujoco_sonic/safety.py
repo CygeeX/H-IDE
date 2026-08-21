@@ -730,10 +730,8 @@ class NominalPolicyActivation:
             "UNPREPARED",
             "UNPREPARED_SUPPORT_OFF",
             "PREPARING",
-            "PREPARING_SUPPORT_OFF",
             "SETTLING_TETHERED",
             "WAITING_FOR_SUPPORT_RELEASE",
-            "SETTLING_UNSUPPORTED",
             "PREPARED",
         }
     )
@@ -819,6 +817,7 @@ class NominalPolicyActivation:
         self._support_release_tick_ms: int | None = None
         self._support_release_epoch: int | None = None
         self._activation_path: str | None = None
+        self._ready_targets: tuple[float, ...] | None = None
 
     @property
     def phase(self) -> str:
@@ -834,11 +833,11 @@ class NominalPolicyActivation:
 
     @property
     def preparing(self) -> bool:
-        return self._phase in {"PREPARING", "PREPARING_SUPPORT_OFF"}
+        return self._phase == "PREPARING"
 
     @property
     def settling(self) -> bool:
-        return self._phase in {"SETTLING_TETHERED", "SETTLING_UNSUPPORTED"}
+        return self._phase == "SETTLING_TETHERED"
 
     @property
     def waiting_for_support_release(self) -> bool:
@@ -847,6 +846,16 @@ class NominalPolicyActivation:
     @property
     def prepared(self) -> bool:
         return self._phase == "PREPARED"
+
+    @property
+    def activation_path(self) -> str | None:
+        return self._activation_path
+
+    @property
+    def ready_targets(self) -> tuple[float, ...] | None:
+        """Exact actuator boundary used to seed the first policy reference."""
+
+        return self._ready_targets
 
     @property
     def last_settle_observation(self) -> NominalPolicySettleObservation | None:
@@ -859,7 +868,7 @@ class NominalPolicyActivation:
     @property
     def provenance(self) -> dict[str, object]:
         return {
-            "schema_version": "h-ide.sonic-policy-activation/v2",
+            "schema_version": "h-ide.sonic-policy-activation/v3",
             "source": "NVlabs/GR00T-WholeBodyControl::G1Deploy::InitControl",
             "init_interpolation": "measured_current_to_nominal_each_tick",
             "clock": "authoritative_mujoco_lowstate_tick_ms",
@@ -869,7 +878,7 @@ class NominalPolicyActivation:
             "support_release": {
                 "one_way": True,
                 "confirmed_epoch": self._support_release_epoch,
-                "cancel_recovery": "support_off_reinit_then_settle",
+                "cancel_recovery": "resume_policy_from_exact_frozen_boundary",
             },
             "settle_gate": {
                 "max_joint_error_rad": self.max_settle_joint_error_rad,
@@ -879,8 +888,11 @@ class NominalPolicyActivation:
                 "required_consecutive_samples": self.settle_consecutive_samples,
                 "sample_period_ms": self.settle_sample_period_ms,
                 "timeout_s": self.settle_timeout_s,
-                "stages": ["tethered", "support_off"],
+                "stages": ["tethered"],
             },
+            "policy_takeover": (
+                "first_successful_policy_dds_then_exact_epoch_support_release"
+            ),
         }
 
     def begin(self, targets: Sequence[float], *, tick_ms: int) -> bool:
@@ -892,13 +904,14 @@ class NominalPolicyActivation:
         boundary = self._validate_targets(targets, "activation boundary")
         start_tick = self._validate_tick(tick_ms)
         self._epoch += 1
-        self._phase = "PREPARING_SUPPORT_OFF" if support_off else "PREPARING"
+        self._phase = "WAITING_FOR_SUPPORT_RELEASE" if support_off else "PREPARING"
         self._activation_path = (
             "support_off_reinit" if support_off else "tethered_release"
         )
-        self._start_targets = boundary
-        self._start_tick_ms = start_tick
-        self._ratio = 0.0
+        self._start_targets = None if support_off else boundary
+        self._start_tick_ms = None if support_off else start_tick
+        self._ratio = 1.0 if support_off else 0.0
+        self._ready_targets = boundary if support_off else None
         self._settle_start_tick_ms = None
         self._settle_consecutive_samples = 0
         self._last_settle_observation = None
@@ -961,14 +974,11 @@ class NominalPolicyActivation:
             raise RuntimeError("activation ratio moved backwards")
         self._ratio = decision.ratio
         if decision.complete:
-            self._phase = (
-                "SETTLING_UNSUPPORTED"
-                if self.support_release_confirmed
-                else "SETTLING_TETHERED"
-            )
+            self._phase = "SETTLING_TETHERED"
             self._start_targets = None
             self._start_tick_ms = None
             self._ratio = 1.0
+            self._ready_targets = actual
             self._settle_start_tick_ms = decision.tick_ms
             self._settle_consecutive_samples = 0
             self._last_settle_observation = None
@@ -1037,19 +1047,12 @@ class NominalPolicyActivation:
         self._settle_consecutive_samples = (
             self._settle_consecutive_samples + 1 if stable else 0
         )
-        stage = (
-            "tethered"
-            if self._phase == "SETTLING_TETHERED"
-            else "support_off"
-        )
+        stage = "tethered"
         stage_complete = (
             self._settle_consecutive_samples >= self.settle_consecutive_samples
         )
-        if stage_complete and stage == "tethered":
+        if stage_complete:
             self._phase = "WAITING_FOR_SUPPORT_RELEASE"
-            self._settle_start_tick_ms = None
-        elif stage_complete:
-            self._phase = "PREPARED"
             self._settle_start_tick_ms = None
         observation = NominalPolicySettleObservation(
             stage=stage,
@@ -1069,7 +1072,13 @@ class NominalPolicyActivation:
         return observation
 
     def confirm_support_release(self, *, tick_ms: int) -> bool:
-        """Reset the evidence window only after authoritative Plant proof."""
+        """Complete takeover only after policy authority and Plant proof.
+
+        For the initial activation, the release epoch must equal this
+        activation.  A cancellation that lost the one-way race may later
+        resume from the exact frozen policy boundary; in that recovery path
+        the already-confirmed release epoch must strictly precede this one.
+        """
 
         if not self.waiting_for_support_release:
             return False
@@ -1079,13 +1088,27 @@ class NominalPolicyActivation:
             and current_tick < self._last_settle_tick_ms
         ):
             raise ValueError("support release tick predates tethered evidence")
-        self.record_support_release(self._epoch)
+        release_epoch = self._support_release_epoch
+        if release_epoch is None:
+            raise NominalPolicyActivationFault(
+                "policy takeover lacks authoritative Plant support-release proof"
+            )
+        if self._activation_path == "tethered_release":
+            if release_epoch != self._epoch:
+                raise NominalPolicyActivationFault(
+                    "initial Plant support release does not match activation epoch"
+                )
+        elif self._activation_path == "support_off_reinit":
+            if release_epoch >= self._epoch:
+                raise NominalPolicyActivationFault(
+                    "support-off recovery requires an earlier release epoch"
+                )
+        else:
+            raise NominalPolicyActivationFault(
+                "policy activation path is unavailable at support release"
+            )
         self._support_release_tick_ms = current_tick
-        self._phase = "SETTLING_UNSUPPORTED"
-        self._settle_start_tick_ms = current_tick
-        self._settle_consecutive_samples = 0
-        self._last_settle_observation = None
-        self._last_settle_tick_ms = None
+        self._phase = "PREPARED"
         return True
 
     def record_support_release(self, activation_epoch: int) -> bool:
@@ -1116,6 +1139,18 @@ class NominalPolicyActivation:
             "PREPARED",
         }:
             return False
+        if (
+            self._phase == "WAITING_FOR_SUPPORT_RELEASE"
+            and self._activation_path == "tethered_release"
+            and self._support_release_epoch == self._epoch
+        ):
+            # The only writer of this proof starts after a successful first
+            # policy DDS grant.  If a stop wins after the Plant consumed the
+            # one-way release but before the owner tick consumed its HTTP
+            # result, INIT is nevertheless complete and must not be repeated
+            # unsupported on the next task.
+            self._phase = "PREPARED"
+            return True
         self._epoch += 1
         self._phase = (
             "UNPREPARED_SUPPORT_OFF"
@@ -1129,6 +1164,7 @@ class NominalPolicyActivation:
         self._settle_consecutive_samples = 0
         self._last_settle_observation = None
         self._last_settle_tick_ms = None
+        self._ready_targets = None
         if not self.support_release_confirmed:
             self._support_release_tick_ms = None
         return True
