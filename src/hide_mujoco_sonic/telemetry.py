@@ -15,6 +15,8 @@ from typing import Any, Callable
 @dataclass
 class TelemetryState:
     robot_id: str
+    driver_boot_id: str | None = None
+    driver_session_id: str | None = None
     backend: str = "mujoco_sonic"
     status: str = "starting"
     source_mode: str = "synthetic"
@@ -86,8 +88,31 @@ class TelemetryState:
     static_hold_active: bool = True
     motion_handoff_active: bool = False
     motion_handoff_ratio: float = 0.0
+    policy_activation_epoch: int = 0
+    policy_activation_path: str | None = None
     policy_activation_phase: str = "UNPREPARED"
     policy_activation_ratio: float = 0.0
+    policy_activation_provenance: dict[str, Any] | None = None
+    policy_activation_settle_stage: str | None = None
+    policy_activation_settle_stable: bool | None = None
+    policy_activation_settle_consecutive_samples: int = 0
+    policy_activation_settle_required_consecutive_samples: int = 10
+    policy_activation_settle_elapsed_s: float | None = None
+    policy_activation_settle_observed_max_joint_error_rad: float | None = None
+    policy_activation_settle_observed_max_joint_velocity_rps: float | None = None
+    policy_activation_settle_observed_max_gyro_rps: float | None = None
+    policy_activation_settle_observed_roll_rad: float | None = None
+    policy_activation_settle_observed_pitch_rad: float | None = None
+    policy_activation_settle_max_joint_error_rad: float = 0.10
+    policy_activation_settle_max_joint_velocity_rps: float = 0.20
+    policy_activation_settle_max_gyro_rps: float = 0.15
+    policy_activation_settle_max_abs_roll_pitch_rad: float = 0.15
+    policy_activation_settle_timeout_s: float = 3.0
+    policy_activation_release_epoch: int | None = None
+    policy_activation_release_confirmed_epoch: int | None = None
+    policy_activation_release_pending: bool = False
+    policy_activation_release_error: str | None = None
+    policy_activation_prepared_tick_ms: int | None = None
     plant_support_mode: str = "unknown"
     plant_support_requested_mode: str = "unknown"
     plant_support_confirmed_mode: str = "unknown"

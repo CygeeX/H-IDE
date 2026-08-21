@@ -19,6 +19,7 @@ HIDE_DEMO_CYCLONE='<CycloneDDS><Domain><General><Interfaces><NetworkInterface na
 HIDE_DEMO_SYSTEMD_PREFIX="h-ide-mujoco-demo"
 HIDE_DOCKER_OBSERVATION_BIND_REQUEST="${HIDE_DOCKER_OBSERVATION_BIND_HOST:-auto}"
 HIDE_DEMO_REBUILD=false
+HIDE_DEMO_MOTION_CORE=false
 HIDE_MUJOCO_ONSCREEN_VIEWER=0
 
 for argument in "$@"; do
@@ -29,12 +30,24 @@ for argument in "$@"; do
     --viewer)
       HIDE_MUJOCO_ONSCREEN_VIEWER=1
       ;;
+    --motion-core)
+      HIDE_DEMO_MOTION_CORE=true
+      ;;
     *)
-      printf 'usage: %s [--rebuild] [--viewer]\n' "$0" >&2
+      printf 'usage: %s [--rebuild] [--viewer] [--motion-core]\n' "$0" >&2
       exit 2
       ;;
   esac
 done
+
+# Strict motion acceptance binds both the native third-person and the
+# first-person viewer to the same Plant boot/session.  Do not silently weaken
+# that evidence contract by launching a headless motion-core topology.
+if [[ "${HIDE_DEMO_MOTION_CORE}" == "true" \
+  && "${HIDE_MUJOCO_ONSCREEN_VIEWER}" != "1" ]]; then
+  printf '%s\n' '--motion-core requires --viewer' >&2
+  exit 2
+fi
 
 # Codex/CI terminal scopes reap their complete process group when the command
 # finishes, including children started through nohup.  Put every long-lived
@@ -81,6 +94,102 @@ for required in \
     exit 2
   fi
 done
+
+# Idempotence is safe only for a complete motion topology. Reusing a surviving
+# ROS bridge, Nav2 container, or Robot Agent after Plant/SONIC exited preserves
+# stale boot identities and fault latches while bypassing the ordered startup
+# gates below. Refuse that partial state before Compose/build work; the operator
+# must perform the documented dependency-reversed cleanup and cold start.
+HIDE_DEMO_COUPLED_UNIT_SUFFIXES=(
+  mujoco-plant
+  sonic-driver
+  ros-cmd-vel-bridge
+  ros-observation-bridge
+  ros-safe-stop
+  sim-robot-agent-gateway
+  observation-gateway
+  robot-agent-g1-sim
+  robot-agent-diagnostics-proxy
+)
+HIDE_DEMO_ACTIVE_COUPLED_UNITS=()
+for unit_suffix in "${HIDE_DEMO_COUPLED_UNIT_SUFFIXES[@]}"; do
+  unit_name="${HIDE_DEMO_SYSTEMD_PREFIX}-${unit_suffix}.service"
+  if systemctl --user is-active --quiet "${unit_name}"; then
+    HIDE_DEMO_ACTIVE_COUPLED_UNITS+=("${unit_suffix}")
+  fi
+done
+HIDE_DEMO_FIRST_PERSON_ACTIVE=false
+if systemctl --user is-active --quiet \
+  "${HIDE_DEMO_SYSTEMD_PREFIX}-first-person-viewer.service"; then
+  HIDE_DEMO_FIRST_PERSON_ACTIVE=true
+fi
+HIDE_DEMO_NAV2_ACTIVE=false
+if docker container inspect h-ide-nav2-sim >/dev/null 2>&1 \
+  && [[ "$(docker container inspect h-ide-nav2-sim --format '{{.State.Running}}')" == "true" ]]; then
+  HIDE_DEMO_NAV2_ACTIVE=true
+fi
+
+# The strict runner is the sole command owner in motion-core mode.  A surviving
+# RobotAgent or simulation gateway can reacquire a lease after this check, so
+# the same predicate is repeated after Nav2 becomes ready and immediately
+# before the launcher reports success.
+HIDE_DEMO_MOTION_CORE_ISOLATED_UNITS=(
+  sim-robot-agent-gateway
+  observation-gateway
+  robot-agent-g1-sim
+  robot-agent-diagnostics-proxy
+)
+require_motion_core_isolation() {
+  local unit_suffix=""
+  local unit_name=""
+  if [[ "${HIDE_DEMO_MOTION_CORE}" != "true" ]]; then
+    return 0
+  fi
+  for unit_suffix in "${HIDE_DEMO_MOTION_CORE_ISOLATED_UNITS[@]}"; do
+    unit_name="${HIDE_DEMO_SYSTEMD_PREFIX}-${unit_suffix}.service"
+    if systemctl --user is-active --quiet "${unit_name}"; then
+      printf 'motion-core isolation failed: unit is active: %s\n' \
+        "${unit_name}" >&2
+      return 1
+    fi
+  done
+  if "${HIDE_DEMO_SIM_ROOT}/.venv/bin/python" - <<'PY'
+import socket
+
+for port in (8796, 8094):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.2)
+        if sock.connect_ex(("127.0.0.1", port)) == 0:
+            raise SystemExit(0)
+raise SystemExit(1)
+PY
+  then
+    printf '%s\n' \
+      'motion-core isolation failed: RobotAgent port 8796 or simulation gateway port 8094 is listening' >&2
+    return 1
+  fi
+}
+
+require_motion_core_isolation
+if (( ${#HIDE_DEMO_ACTIVE_COUPLED_UNITS[@]} > 0 )) \
+  || [[ "${HIDE_DEMO_NAV2_ACTIVE}" == "true" ]]; then
+  if (( ${#HIDE_DEMO_ACTIVE_COUPLED_UNITS[@]} != ${#HIDE_DEMO_COUPLED_UNIT_SUFFIXES[@]} )) \
+    || [[ "${HIDE_DEMO_NAV2_ACTIVE}" != "true" ]]; then
+    printf '%s\n' \
+      'Refusing to reuse a partial MuJoCo/SONIC/Nav2 motion topology.' \
+      "Active coupled units: ${HIDE_DEMO_ACTIVE_COUPLED_UNITS[*]:-(none)}" \
+      "Nav2 container active: ${HIDE_DEMO_NAV2_ACTIVE}" \
+      'Stop the complete coupled motion chain in dependency-reversed order, then cold start again.' >&2
+    exit 3
+  fi
+fi
+if [[ "${HIDE_DEMO_FIRST_PERSON_ACTIVE}" == "true" ]] \
+  && [[ ! " ${HIDE_DEMO_ACTIVE_COUPLED_UNITS[*]} " =~ " mujoco-plant " ]]; then
+  printf '%s\n' \
+    'Refusing to reuse a first-person viewer without its owning MuJoCo Plant.' \
+    'Stop the stale first-person-viewer unit, then cold start again.' >&2
+  exit 3
+fi
 
 if [[ "${HIDE_MUJOCO_ONSCREEN_VIEWER}" == "1" ]] \
   && systemctl --user is-active --quiet \
@@ -292,6 +401,80 @@ raise SystemExit(1)
     sleep 0.25
   done
   printf 'MuJoCo native viewer did not become ready within 30s\n' >&2
+  return 1
+}
+
+wait_for_first_person_viewer() {
+  if [[ "${HIDE_MUJOCO_ONSCREEN_VIEWER}" != "1" ]]; then
+    return 0
+  fi
+  local status_path="${HIDE_DEMO_RUN_ROOT}/first-person-viewer-status.json"
+  local pid_path="${HIDE_DEMO_RUN_ROOT}/first-person-viewer.pid"
+  local expected_pid=""
+  local deadline=$((SECONDS + 30))
+  while (( SECONDS < deadline )); do
+    expected_pid="$(sed -n '1p' "${pid_path}" 2>/dev/null || true)"
+    if [[ "${expected_pid}" =~ ^[1-9][0-9]*$ ]] \
+      && "${HIDE_DEMO_SIM_ROOT}/.venv/bin/python" - \
+        "${status_path}" "${expected_pid}" "${UID}" <<'PY'
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+import time
+
+path = Path(sys.argv[1])
+expected_pid = int(sys.argv[2])
+expected_uid = int(sys.argv[3])
+try:
+    metadata = path.lstat()
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != expected_uid
+        or metadata.st_mode & 0o022
+    ):
+        raise ValueError("unsafe status file")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    last_success = payload.get("lastSuccessAtUnixNs")
+    success_age_s = (
+        None
+        if isinstance(last_success, bool) or not isinstance(last_success, int)
+        else (time.time_ns() - last_success) / 1_000_000_000.0
+    )
+    ready = (
+        payload.get("schemaVersion") == "h-ide.first-person-viewer-health/1"
+        and payload.get("pid") == expected_pid
+        and payload.get("status") == "running"
+        and payload.get("healthy") is True
+        and payload.get("mapped") is True
+        and isinstance(payload.get("bootId"), str)
+        and bool(payload["bootId"])
+        and isinstance(payload.get("plantBootId"), str)
+        and bool(payload["plantBootId"])
+        and isinstance(payload.get("plantSessionId"), str)
+        and bool(payload["plantSessionId"])
+        and isinstance(payload.get("sequence"), int)
+        and not isinstance(payload.get("sequence"), bool)
+        and payload["sequence"] >= 2
+        and isinstance(payload.get("plantSequence"), int)
+        and not isinstance(payload.get("plantSequence"), bool)
+        and payload["plantSequence"] > 0
+        and success_age_s is not None
+        and 0.0 <= success_age_s <= 2.0
+        and payload.get("lastError") is None
+    )
+except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError):
+    ready = False
+raise SystemExit(0 if ready else 1)
+PY
+    then
+      printf '%-28s ready\n' 'MuJoCo first-person viewer'
+      return 0
+    fi
+    sleep 0.25
+  done
+  printf 'MuJoCo first-person viewer did not become mapped and fresh within 30s\n' >&2
   return 1
 }
 
@@ -514,24 +697,28 @@ compose=(
   -f "${HIDE_DEMO_H_IDE_ROOT}/infra/docker-compose.simulation.yml"
 )
 
-if [[ "${HIDE_DEMO_REBUILD}" == "true" ]]; then
-  "${compose[@]}" up -d --build
+if [[ "${HIDE_DEMO_MOTION_CORE}" != "true" ]]; then
+  if [[ "${HIDE_DEMO_REBUILD}" == "true" ]]; then
+    "${compose[@]}" up -d --build
+  else
+    "${compose[@]}" up -d
+  fi
+
+  # A pinned host GPU service owns the only simulation RGB-D ingress and
+  # Qwen/SAM 2 path. The default Compose profile contains no competing Vision
+  # inference container; containers reach this product service through
+  # host.docker.internal:8092.
+  mkdir -p "${HIDE_DEMO_VISION_ROOT}/var/evidence" "${HIDE_DEMO_VISION_ROOT}/var/models"
+  start_process \
+    h-ide-vision-qwen \
+    'h-ide-vision serve' \
+    "${HIDE_DEMO_VISION_ROOT}" \
+    'env_get() { sed -n "s/^$1=//p" "$HIDE_DEMO_H_IDE_ROOT/.env" | tail -n 1; }; agent_token="$(env_get HIDE_VISION_AGENT_TOKEN)"; control_token="$(env_get HIDE_VISION_CONTROL_TOKEN)"; export DASHSCOPE_API_KEY="$(env_get DASHSCOPE_API_KEY)" HIDE_VISION_AGENT_TOKEN="${agent_token:-dev-agent-token}" HIDE_VISION_CONTROL_TOKEN="${control_token:-dev-control-token}" HIDE_VISION_SAM2_CHECKPOINT="$(env_get HIDE_VISION_SAM2_CHECKPOINT)"; test -n "$DASHSCOPE_API_KEY"; test -f "$HIDE_VISION_SAM2_CHECKPOINT"; export HIDE_VISION_HOST=0.0.0.0 HIDE_VISION_HTTP_PORT=8092 HIDE_VISION_GRPC_HOST=127.0.0.1 HIDE_VISION_GRPC_PORT=50061 HIDE_VISION_DATABASE_PATH="$HIDE_DEMO_VISION_ROOT/var/h-ide-vision-qwen.sqlite3" HIDE_VISION_EVIDENCE_DIR="$HIDE_DEMO_VISION_ROOT/var/evidence" HIDE_VISION_VLM_PROVIDER=qwen HIDE_VISION_SEGMENTATION_PROVIDER=sam2 HIDE_VISION_SAM2_DEVICE=cuda HIDE_VISION_QWEN_MODEL=qwen3-vl-plus HIDE_VISION_ALLOW_INSECURE_LOOPBACK=true; exec "$HIDE_DEMO_VISION_ROOT/.venv/bin/h-ide-vision" serve'
+
+  wait_for_qwen_vision 120
 else
-  "${compose[@]}" up -d
+  printf '%-28s skipped\n' 'H-IDE Compose/Vision startup'
 fi
-
-# A pinned host GPU service owns the only simulation RGB-D ingress and
-# Qwen/SAM 2 path. The default Compose profile contains no competing Vision
-# inference container; containers reach this product service through
-# host.docker.internal:8092.
-mkdir -p "${HIDE_DEMO_VISION_ROOT}/var/evidence" "${HIDE_DEMO_VISION_ROOT}/var/models"
-start_process \
-  h-ide-vision-qwen \
-  'h-ide-vision serve' \
-  "${HIDE_DEMO_VISION_ROOT}" \
-  'env_get() { sed -n "s/^$1=//p" "$HIDE_DEMO_H_IDE_ROOT/.env" | tail -n 1; }; agent_token="$(env_get HIDE_VISION_AGENT_TOKEN)"; control_token="$(env_get HIDE_VISION_CONTROL_TOKEN)"; export DASHSCOPE_API_KEY="$(env_get DASHSCOPE_API_KEY)" HIDE_VISION_AGENT_TOKEN="${agent_token:-dev-agent-token}" HIDE_VISION_CONTROL_TOKEN="${control_token:-dev-control-token}" HIDE_VISION_SAM2_CHECKPOINT="$(env_get HIDE_VISION_SAM2_CHECKPOINT)"; test -n "$DASHSCOPE_API_KEY"; test -f "$HIDE_VISION_SAM2_CHECKPOINT"; export HIDE_VISION_HOST=0.0.0.0 HIDE_VISION_HTTP_PORT=8092 HIDE_VISION_GRPC_HOST=127.0.0.1 HIDE_VISION_GRPC_PORT=50061 HIDE_VISION_DATABASE_PATH="$HIDE_DEMO_VISION_ROOT/var/h-ide-vision-qwen.sqlite3" HIDE_VISION_EVIDENCE_DIR="$HIDE_DEMO_VISION_ROOT/var/evidence" HIDE_VISION_VLM_PROVIDER=qwen HIDE_VISION_SEGMENTATION_PROVIDER=sam2 HIDE_VISION_SAM2_DEVICE=cuda HIDE_VISION_QWEN_MODEL=qwen3-vl-plus HIDE_VISION_ALLOW_INSECURE_LOOPBACK=true; exec "$HIDE_DEMO_VISION_ROOT/.venv/bin/h-ide-vision" serve'
-
-wait_for_qwen_vision 120
 
 nav2_image="h-ide-nav2-sim:jazzy"
 # Office V2's MuJoCo collision model and Nav2 occupancy map are generated from
@@ -632,6 +819,7 @@ if [[ "${HIDE_MUJOCO_ONSCREEN_VIEWER}" == "1" ]]; then
     'tools/live_first_person_viewer.py' \
     "${HIDE_DEMO_SIM_ROOT}" \
     'exec "$HIDE_DEMO_SIM_ROOT/.venv/bin/python" "$HIDE_DEMO_SIM_ROOT/tools/live_first_person_viewer.py"'
+  wait_for_first_person_viewer
 fi
 
 # Start ROS ingress only after the actuator-side controller is ready. This
@@ -685,6 +873,16 @@ if ! wait_for_nav2_active 60; then
     printf 'Nav2 lifecycle did not become active after the recovery attempt\n' >&2
     exit 1
   fi
+fi
+
+if [[ "${HIDE_DEMO_MOTION_CORE}" == "true" ]]; then
+  require_motion_core_isolation
+  printf '\nRuntime logs: %s\n' "${HIDE_DEMO_RUN_ROOT}"
+  printf 'MuJoCo native third-person viewer is enabled on DISPLAY=%s.\n' "${DISPLAY}"
+  printf '%s\n' \
+    'Motion-core is stationary and isolated: RobotAgent and simulation gateway are not running.' \
+    'No motion command has been sent. Run one explicit tools/strict_motion_runner.py --execute case at a time.'
+  exit 0
 fi
 
 start_process \

@@ -35,7 +35,10 @@ def block_live_driver_plant_writes(
         return reject
 
     for name in (
+        "clear_plant_motion_fault",
+        "latch_plant_motion_fault",
         "latch_plant_physics_fault",
+        "release_plant_fall_arrest",
         "rearm_plant_support",
         "set_plant_support",
     ):

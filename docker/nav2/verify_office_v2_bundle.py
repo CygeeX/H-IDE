@@ -77,6 +77,20 @@ def verify_bundle(
         raise ValueError("Office V2 runtime manifest names an unexpected map YAML")
     if image_contract.get("path") != "nav2/office_v2.pgm":
         raise ValueError("Office V2 runtime manifest names an unexpected map image")
+    expected_yaml_path = (
+        manifest_path.resolve().parent / yaml_contract["path"]
+    ).resolve()
+    expected_image_path = (
+        manifest_path.resolve().parent / image_contract["path"]
+    ).resolve()
+    if expected_yaml_path != map_yaml_path.resolve():
+        raise ValueError(
+            "Office V2 runtime manifest does not reference the exact supplied map YAML"
+        )
+    if expected_image_path != map_image_path.resolve():
+        raise ValueError(
+            "Office V2 runtime manifest does not reference the exact supplied map image"
+        )
     expected_yaml_sha = _require_sha256(
         yaml_contract.get("sha256"),
         "map YAML SHA-256",
@@ -93,6 +107,8 @@ def verify_bundle(
     map_yaml = map_yaml_path.read_text(encoding="utf-8")
     if not re.search(r"(?m)^image:\s*office_v2\.pgm\s*$", map_yaml):
         raise ValueError("Office V2 map YAML must reference office_v2.pgm by basename")
+    if (map_yaml_path.resolve().parent / "office_v2.pgm").resolve() != map_image_path.resolve():
+        raise ValueError("Office V2 map YAML does not reference the exact supplied PGM")
     width, height = _pgm_dimensions(map_image_path)
     if (
         width != map_contract.get("width_cells")

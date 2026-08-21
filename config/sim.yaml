@@ -23,8 +23,8 @@ sonic_health_probe_period_s: 0.025
 sonic_health_probe_timeout_s: 0.020
 plant_lowstate_stale_s: 0.10
 sonic_control_step_stale_s: 0.10
-max_linear_mps: 0.25
-min_walk_command_mps: 0.10
+max_linear_mps: 0.40
+min_walk_command_mps: 0.20
 max_angular_rps: 0.25
 max_facing_lead_rad: 0.15
 max_translation_facing_offset_rad: 0.05

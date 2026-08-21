@@ -90,6 +90,113 @@ def test_physics_fault_cannot_be_rearmed_online() -> None:
     assert support.state()["mode"] == "safety_stop"
 
 
+def test_motion_fault_keeps_physics_healthy_and_requires_explicit_reset() -> None:
+    support = PlantSupportController()
+    support.finish_startup()
+    reason = "gait_adapter/GAIT_ADAPTER_FAULT: reverse startup"
+
+    assert support.latch_motion_fault(reason) is True
+    state = support.state()
+    assert state["mode"] == "safety_stop"
+    assert state["fault"] is None
+    assert state["motionFault"] == reason
+    support.require_healthy()
+
+    with pytest.raises(ValueError, match="explicitly reset"):
+        support.rearm(1)
+    with pytest.raises(ValueError, match="identity mismatch"):
+        support.clear_motion_fault("another fault")
+
+    assert support.clear_motion_fault(reason) is True
+    assert support.clear_motion_fault(reason) is False
+    cleared = support.state()
+    assert cleared["mode"] == "safety_stop"
+    assert cleared["motionFault"] is None
+    assert support.rearm(1) == "idle"
+
+
+def test_fall_arrest_release_is_one_way_and_bound_to_activation_epoch() -> None:
+    support = PlantSupportController(fall_arrest_enabled=True)
+    support.finish_startup()
+
+    assert support.request_fall_arrest_release(17) is True
+    pending = support.state()
+    assert pending["fallArrestEnabled"] is True
+    assert pending["fallArrestReleaseRequestedEpoch"] == 17
+    assert pending["fallArrestReleaseConfirmedEpoch"] is None
+    assert pending["fallArrestReleaseRejectedEpoch"] is None
+
+    released: list[bool] = []
+    assert support.consume_fall_arrest_release(
+        lambda: released.append(True)
+    ) == 17
+    assert released == [True]
+    released = support.state()
+    assert released["fallArrestEnabled"] is False
+    assert released["fallArrestReleaseConfirmedEpoch"] == 17
+    assert support.request_fall_arrest_release(17) is False
+    assert support.consume_fall_arrest_release(lambda: None) is None
+
+    with pytest.raises(ValueError, match="another activation"):
+        support.request_fall_arrest_release(18)
+
+
+def test_fall_arrest_release_fails_closed_at_unsafe_boundaries() -> None:
+    support = PlantSupportController(fall_arrest_enabled=True)
+
+    with pytest.raises(ValueError, match="confirmed idle"):
+        support.request_fall_arrest_release(1)
+    support.finish_startup()
+    support.latch_motion_fault("injected motion fault")
+    with pytest.raises(ValueError, match="motion safety boundary"):
+        support.request_fall_arrest_release(1)
+
+
+def test_simulation_thread_rejects_release_that_races_safety_stop() -> None:
+    support = PlantSupportController(fall_arrest_enabled=True)
+    support.finish_startup()
+    assert support.request_fall_arrest_release(31) is True
+
+    support.set_mode("safety_stop")
+    assert support.consume_fall_arrest_release(lambda: None) is None
+    state = support.state()
+    assert state["fallArrestEnabled"] is True
+    assert state["fallArrestReleaseConfirmedEpoch"] is None
+    assert state["fallArrestReleaseRejectedEpoch"] == 31
+
+    assert support.rearm(1) == "idle"
+    assert support.consume_fall_arrest_release(lambda: None) is None
+    assert support.state()["fallArrestEnabled"] is True
+    with pytest.raises(ValueError, match="physics boundary"):
+        support.request_fall_arrest_release(31)
+
+
+def test_failed_physical_band_disable_rejects_epoch_without_false_confirmation() -> None:
+    support = PlantSupportController(fall_arrest_enabled=True)
+    support.finish_startup()
+    assert support.request_fall_arrest_release(41) is True
+
+    with pytest.raises(RuntimeError, match="injected band failure"):
+        support.consume_fall_arrest_release(
+            lambda: (_ for _ in ()).throw(RuntimeError("injected band failure"))
+        )
+
+    state = support.state()
+    assert state["fallArrestEnabled"] is True
+    assert state["fallArrestReleaseConfirmedEpoch"] is None
+    assert state["fallArrestReleaseRejectedEpoch"] == 41
+
+
+def test_plant_without_fall_arrest_reports_support_already_off() -> None:
+    support = PlantSupportController(fall_arrest_enabled=False)
+    support.finish_startup()
+
+    state = support.state()
+    assert state["fallArrestEnabled"] is False
+    assert state["fallArrestReleaseConfirmedEpoch"] == 0
+    assert support.request_fall_arrest_release(9) is False
+
+
 def test_physics_hot_path_never_waits_for_http_command_writer() -> None:
     support = PlantSupportController()
     support.finish_startup()

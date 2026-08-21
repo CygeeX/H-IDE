@@ -6,7 +6,7 @@ by the stock Nav2 BT navigator and behavior server.
 """
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, ExecuteProcess
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -26,7 +26,7 @@ def generate_launch_description():
     ]
     return LaunchDescription([
         DeclareLaunchArgument("params_file", default_value="/opt/h-ide-nav2/nav2_params.yaml"),
-        DeclareLaunchArgument("map", default_value="/opt/h-ide-nav2/maps/office_v2.yaml"),
+        DeclareLaunchArgument("map", default_value="/opt/h-ide-nav2/nav2/office_v2.yaml"),
         DeclareLaunchArgument("autostart", default_value="true"),
         DeclareLaunchArgument("use_sim_time", default_value="false"),
         Node(
@@ -49,6 +49,10 @@ def generate_launch_description():
             name="controller_server",
             output="screen",
             parameters=[params, {"use_sim_time": use_sim_time}],
+            # FollowPath is an unaccepted calibration candidate.  Even while
+            # its local costmap stays active, it must not own the production
+            # bridge topic or become a second /cmd_vel publisher.
+            remappings=[("cmd_vel", "/h_ide/unaccepted_follow_path/cmd_vel")],
         ),
         Node(
             package="nav2_behaviors",
@@ -56,6 +60,10 @@ def generate_launch_description():
             name="behavior_server",
             output="screen",
             parameters=[params, {"use_sim_time": use_sim_time}],
+            # The strict motion runner validates and relays official
+            # Spin/DriveOnHeading output.  It is the sole /cmd_vel publisher
+            # observed by the SONIC bridge during motion-core acceptance.
+            remappings=[("cmd_vel", "/h_ide/strict_motion/input")],
         ),
         Node(
             package="nav2_bt_navigator",
@@ -80,5 +88,10 @@ def generate_launch_description():
                 params,
                 {"use_sim_time": use_sim_time, "autostart": autostart, "node_names": lifecycle_nodes},
             ],
+        ),
+        ExecuteProcess(
+            cmd=["python3", "/opt/h-ide-nav2/nav2_runtime_health.py"],
+            name="h_ide_nav2_runtime_health",
+            output="screen",
         ),
     ])

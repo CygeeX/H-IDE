@@ -1893,20 +1893,27 @@ def test_normal_stop_phase_barrier_precedes_generic_ingress_mutation(
     "phase",
     ["BRAKING", "STATIONARY_ACK", "PLANT_CONFIRMED", "FAILED"],
 )
-def test_real_gait_fault_bypasses_normal_barrier_into_terminal_path(
+def test_real_gait_fault_bypasses_normal_barrier_into_recoverable_hold(
     phase: str,
+    monkeypatch,
 ) -> None:
     clock = Clock()
     driver = bare_driver(clock)
     enter_normal_phase(driver, clock, phase)
     snapshot = driver._normal_stop.snapshot
-    terminal_reasons: list[str] = []
-
-    def fake_terminal(reason: str, **_kwargs: object) -> None:
-        terminal_reasons.append(reason)
-        driver._fault_latched.set()
-
-    driver._latch_terminal_fault = fake_terminal  # type: ignore[method-assign]
+    recoverable_reasons: list[str] = []
+    monkeypatch.setattr(
+        "hide_mujoco_sonic.sonic_driver.latch_plant_motion_fault",
+        lambda _host, _port, reason, **_kwargs: (
+            recoverable_reasons.append(reason)
+            or {
+                "mode": "safety_stop",
+                "safetyStopLatched": True,
+                "fault": None,
+                "motionFault": reason,
+            }
+        ),
+    )
     sequence = driver._intent_ingress.sequence + 1
     payload = generic_gait_intent(
         clock,
@@ -1917,11 +1924,13 @@ def test_real_gait_fault_bypasses_normal_barrier_into_terminal_path(
 
     assert driver.accept_json(payload) is None
 
-    assert terminal_reasons == ["deterministic terminal gait fault"]
+    assert recoverable_reasons == ["deterministic terminal gait fault"]
     assert driver._fault_latched.is_set() is True
+    assert driver._recoverable_motion_fault is True
+    assert driver._stop.is_set() is False
     assert driver._normal_stop.snapshot is snapshot
     assert driver._intent_ingress.sequence == sequence
-    assert driver.guard.stops[-1] == "terminal_fault"
+    assert driver.guard.stops[-1] == "motion_fault"
 
 
 def test_control_arm_requires_current_driver_confirmed_identity_before_ingress() -> None:

@@ -8,6 +8,7 @@ import socket
 import threading
 import time
 import uuid
+from urllib.error import HTTPError
 
 import pytest
 
@@ -23,10 +24,49 @@ from hide_mujoco_sonic.render_workers import RenderedFrame
 from hide_mujoco_sonic.sonic_driver import _bind_command_server
 from hide_mujoco_sonic.telemetry import TelemetryState, TelemetryStore, serve_telemetry
 from hide_mujoco_sonic.runtime_diagnostics import PlantRuntimeDiagnostics
-from hide_mujoco_sonic.transport import latch_plant_physics_fault, request_json
+from hide_mujoco_sonic.transport import (
+    clear_plant_motion_fault,
+    latch_plant_motion_fault,
+    latch_plant_physics_fault,
+    read_plant_identity,
+    release_plant_fall_arrest,
+    request_json,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_read_plant_identity_requires_two_canonical_live_uuids() -> None:
+    payload = json.dumps(
+        {
+            "producerBootId": "11111111-1111-4111-8111-111111111111",
+            "sessionId": "22222222-2222-4222-8222-222222222222",
+        }
+    ).encode("utf-8")
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        @staticmethod
+        def read(_limit: int) -> bytes:
+            return payload
+
+    identity = read_plant_identity(
+        "127.0.0.1",
+        8794,
+        urlopen=lambda request, **_kwargs: Response(),
+    )
+    assert identity == {
+        "producerBootId": "11111111-1111-4111-8111-111111111111",
+        "sessionId": "22222222-2222-4222-8222-222222222222",
+    }
 
 
 def _docker_bridge(*, gateway: str = "172.31.0.1") -> dict[str, object]:
@@ -121,6 +161,7 @@ def _request_with_loopback_response(
     response: dict[str, object] | bytes,
     *,
     require_ok: bool = True,
+    max_response_bytes: int = 4096,
 ) -> dict[str, object]:
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.bind(("127.0.0.1", 0))
@@ -149,6 +190,7 @@ def _request_with_loopback_response(
             {"type": "test", "request_id": "request-8"},
             timeout=1.0,
             require_ok=require_ok,
+            max_response_bytes=max_response_bytes,
         )
     finally:
         worker.join(timeout=2.0)
@@ -193,6 +235,29 @@ def test_negative_truth_mode_keeps_identity_and_protocol_fail_closed() -> None:
             1,
             {"type": "test"},
             require_ok=0,  # type: ignore[arg-type]
+        )
+
+
+def test_loopback_transport_explicitly_bounds_large_evidence_responses() -> None:
+    response = {
+        "request_id": "request-8",
+        "ok": True,
+        "evidence": "x" * 8192,
+    }
+    with pytest.raises(RuntimeError, match="bounded limit"):
+        _request_with_loopback_response(response)
+    accepted = _request_with_loopback_response(
+        response,
+        max_response_bytes=16 * 1024,
+    )
+    assert accepted == response
+
+    with pytest.raises(ValueError, match="max_response_bytes"):
+        request_json(
+            "127.0.0.1",
+            1,
+            {"type": "test"},
+            max_response_bytes=True,  # type: ignore[arg-type]
         )
 
 
@@ -551,3 +616,148 @@ def test_terminal_motion_fault_latches_plant_without_a_reset_path() -> None:
         assert support.state()["fault"] == reason
     finally:
         store.close()
+
+
+def test_recoverable_motion_fault_keeps_observation_service_alive_until_reset() -> None:
+    port = _dual_loopback_port()
+    support = PlantSupportController()
+    support.finish_startup()
+    store = PlantFrameStore(
+        SimpleNamespace(robot_id="g1-sim", localization_epoch_id="test-epoch"),
+        support=support,
+        runtime_diagnostics=PlantRuntimeDiagnostics(stall_threshold_s=0.1),
+    )
+    store.serve("127.0.0.1", port, docker_observation_host="127.0.0.2")
+    try:
+        reason = "navigation_guard/NAVIGATION_GUARD_FAULT: no progress"
+        latched = latch_plant_motion_fault(
+            "127.0.0.1", port, reason, timeout=1.0
+        )
+        assert latched["fault"] is None
+        assert latched["motionFault"] == reason
+        assert support.physics_fault is None
+
+        # A reset only removes the named fault; it cannot create motion or
+        # release the safety-stop epoch.
+        cleared = clear_plant_motion_fault(
+            "127.0.0.1", port, reason, timeout=1.0
+        )
+        assert cleared["motionFault"] is None
+        assert cleared["mode"] == "safety_stop"
+        assert cleared["safetyStopLatched"] is True
+
+        # A lost reset response can be retried with the same fault identity.
+        replay = clear_plant_motion_fault(
+            "127.0.0.1", port, reason, timeout=1.0
+        )
+        assert replay == cleared
+
+        status, headers, body = _request(
+            "127.0.0.2",
+            port,
+            "POST",
+            "/support/motion-fault/reset",
+            json.dumps({"reason": reason}).encode("utf-8"),
+        )
+        assert status == 405
+        assert headers["Allow"] == "GET"
+        assert body == b""
+    finally:
+        store.close()
+
+
+def test_fall_arrest_release_waits_for_authoritative_simulation_confirmation() -> None:
+    port = _dual_loopback_port()
+    support = PlantSupportController(fall_arrest_enabled=True)
+    support.finish_startup()
+    store = PlantFrameStore(
+        SimpleNamespace(robot_id="g1-sim", localization_epoch_id="test-epoch"),
+        support=support,
+        runtime_diagnostics=PlantRuntimeDiagnostics(stall_threshold_s=0.1),
+    )
+    store.serve("127.0.0.1", port, docker_observation_host="127.0.0.2")
+    consumed: list[int] = []
+
+    def simulate_authoritative_release() -> None:
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            epoch = support.consume_fall_arrest_release(lambda: None)
+            if epoch is not None:
+                consumed.append(epoch)
+                return
+            time.sleep(0.001)
+
+    consumer = threading.Thread(target=simulate_authoritative_release, daemon=True)
+    consumer.start()
+    try:
+        confirmed = release_plant_fall_arrest(
+            "127.0.0.1",
+            port,
+            23,
+            timeout=1.0,
+            poll_interval=0.001,
+        )
+        consumer.join(timeout=1.0)
+        assert consumed == [23]
+        assert confirmed["fallArrestEnabled"] is False
+        assert confirmed["fallArrestReleaseConfirmedEpoch"] == 23
+
+        # A different activation cannot replay the already-consumed release.
+        with pytest.raises(HTTPError, match="422"):
+            release_plant_fall_arrest(
+                "127.0.0.1", port, 24, timeout=0.1
+            )
+
+        status, headers, body = _request(
+            "127.0.0.2",
+            port,
+            "POST",
+            "/support/fall-arrest/release",
+            json.dumps({"activationEpoch": 23}).encode("utf-8"),
+        )
+        assert status == 405
+        assert headers["Allow"] == "GET"
+        assert body == b""
+    finally:
+        store.close()
+
+
+def test_fall_arrest_release_rejects_legacy_epoch_zero_as_exact_proof() -> None:
+    payload = json.dumps(
+        {
+            "support": {
+                "fallArrestEnabled": False,
+                "fallArrestReleaseConfirmedEpoch": 0,
+                "fallArrestReleaseRejectedEpoch": None,
+                "fault": None,
+                "motionFault": None,
+            }
+        }
+    ).encode("utf-8")
+    calls: list[str] = []
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        @staticmethod
+        def read(_limit: int) -> bytes:
+            return payload
+
+    def urlopen(request, **_kwargs):
+        calls.append(request.full_url)
+        return Response()
+
+    clock_values = iter((0.0, 0.0, 0.2))
+    with pytest.raises(RuntimeError, match="did not confirm"):
+        release_plant_fall_arrest(
+            "127.0.0.1", 8794, 23,
+            timeout=0.1, poll_interval=0.01,
+            urlopen=urlopen, clock=lambda: next(clock_values), sleeper=lambda _s: None,
+        )
+    assert len(calls) == 2

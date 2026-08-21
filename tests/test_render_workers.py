@@ -73,6 +73,25 @@ ACTUATED_XML = """
   <actuator><motor joint="hinge"/></actuator>
 </mujoco>
 """
+CONTACT_XML = """
+<mujoco>
+  <option gravity="0 0 0"/>
+  <worldbody>
+    <geom name="office_v2_floor" type="plane" size="2 2 0.1"/>
+    <body name="office_fixture_001">
+      <geom name="office_fixture_001_collision_01" type="box"
+            pos="0.09 0 0.05" size="0.05 0.05 0.05"/>
+    </body>
+    <body name="pelvis" pos="0 0 0.195">
+      <freejoint/>
+      <geom name="pelvis_collision" type="sphere" size="0.04" mass="1"/>
+      <body name="left_ankle_roll_link" pos="0 0 -0.15">
+        <geom name="left_foot_collision" type="sphere" size="0.05" mass="0.1"/>
+      </body>
+    </body>
+  </worldbody>
+</mujoco>
+"""
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -125,6 +144,11 @@ def test_dynamics_evidence_is_complete_immutable_and_diagnostic_only() -> None:
     )
     assert len(state["rootState"]["qacc"]) == 6
     assert len(state["rootState"]["qaccWarmstart"]) == 6
+    assert state["robotCenterOfMass"]["frameId"] == "world"
+    assert state["robotCenterOfMass"]["positionOrder"] == ["x", "y", "z"]
+    assert state["robotCenterOfMass"]["positionM"] == pytest.approx(
+        data.subtree_com[pelvis_id]
+    )
     assert math.isfinite(state["energy"]["potentialJ"])
     assert math.isfinite(state["energy"]["kineticJ"])
     assert state["energy"]["totalJ"] == pytest.approx(
@@ -144,6 +168,86 @@ def test_dynamics_evidence_is_complete_immutable_and_diagnostic_only() -> None:
     unchanged = evidence.capture_state()
     assert unchanged["rootState"]["qpos"][0] == 0.25
     assert unchanged["lastAppliedWrench"]["values"][0] == 1.0
+    assert unchanged["robotCenterOfMass"] == state["robotCenterOfMass"]
+
+
+def test_dynamics_evidence_captures_brief_static_contacts_at_physics_rate() -> None:
+    mujoco = pytest.importorskip("mujoco")
+    model = mujoco.MjModel.from_xml_string(CONTACT_XML)
+    data = mujoco.MjData(model)
+    mujoco.mj_forward(model, data)
+    evidence = PlantDynamicsEvidence(mujoco, model, data)
+
+    for _ in range(5):
+        evidence.observe()
+    first = evidence.capture_state()["contacts"]
+    assert first["valid"] is True
+    assert first["footGroundSides"] == ["left"]
+    assert first["footGroundForceN"]["left"] >= 5.0
+    assert first["footTouchdownCount"] == {"left": 1, "right": 0}
+    assert first["footLiftoffCount"] == {"left": 0, "right": 0}
+    assert first["obstaclePairs"] == [
+        {
+            "robotBody": "left_ankle_roll_link",
+            "staticGeom": "office_fixture_001_collision_01",
+            "penetrationM": pytest.approx(0.01),
+        }
+    ]
+    assert first["nonFootGroundPairs"] == []
+    assert first["obstacleContactSampleCount"] == 5
+    assert first["obstacleContactEventCount"] == 1
+
+    # Lift for the five-sample force debounce window, then re-enter. The
+    # cumulative counters keep both short events visible to a slower HTTP
+    # acceptance poller while exposing a real touchdown/liftoff cycle.
+    data.qpos[0] = -1.0
+    data.qpos[2] = 0.3
+    mujoco.mj_forward(model, data)
+    for _ in range(5):
+        evidence.observe()
+    lifted = evidence.capture_state()["contacts"]
+    assert lifted["obstaclePairs"] == []
+    assert lifted["footGroundSides"] == []
+    assert lifted["footLiftoffCount"] == {"left": 1, "right": 0}
+
+    data.qpos[0] = 0.0
+    data.qpos[2] = 0.195
+    mujoco.mj_forward(model, data)
+    for _ in range(5):
+        evidence.observe()
+    replay = evidence.capture_state()["contacts"]
+    assert replay["footGroundSides"] == ["left"]
+    assert replay["footTouchdownCount"] == {"left": 2, "right": 0}
+    assert replay["obstacleContactSampleCount"] == 10
+    assert replay["obstacleContactEventCount"] == 2
+
+    data.qpos[0] = -1.0
+    data.qpos[2] = 0.035
+    mujoco.mj_forward(model, data)
+    evidence.observe()
+    fallen = evidence.capture_state()["contacts"]
+    assert any(
+        pair["robotBody"] == "pelvis"
+        and pair["groundGeom"] == "office_v2_floor"
+        for pair in fallen["nonFootGroundPairs"]
+    )
+    assert fallen["nonFootGroundContactSampleCount"] == 1
+    assert fallen["nonFootGroundContactEventCount"] == 1
+
+
+def test_unavailable_contact_evidence_marks_dynamics_invalid_without_raising() -> None:
+    mujoco, model, data = _model_data()
+    evidence = PlantDynamicsEvidence(mujoco, model, data)
+    evidence._contact_evidence = lambda: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        RuntimeError("injected contact decoder failure")
+    )
+
+    evidence.observe()
+    state = evidence.capture_state()
+    assert state["status"] == "invalid"
+    assert state["finite"] is False
+    assert state["contacts"]["valid"] is False
+    assert state["contacts"]["obstaclePairs"] == []
 
 
 def _slow_reader(mailbox, ready, release, output) -> None:
@@ -1586,6 +1690,8 @@ def test_frame_store_wall_clock_corrections_do_not_change_freshness(
     state = store.state()
 
     assert state["observationStatus"] == "running"
+    assert str(uuid.UUID(state["sessionId"])) == state["sessionId"]
+    assert store.state()["sessionId"] == state["sessionId"]
     assert 0.0 <= state["captureAgeMs"] <= 500.0
     assert state["renderLatencyMs"] == pytest.approx(20.0)
     assert state["capturedAtUnixNs"] == 10_000_000_000

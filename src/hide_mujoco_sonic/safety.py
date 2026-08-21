@@ -682,9 +682,32 @@ class NominalPolicyActivationDecision:
     """One immutable proposal in the policy activation ramp."""
 
     epoch: int
+    tick_ms: int
     targets: tuple[float, ...]
     ratio: float
     complete: bool
+
+
+@dataclass(frozen=True)
+class NominalPolicySettleObservation:
+    """Authoritative measured evidence for one post-INIT stability sample."""
+
+    stage: str
+    stable: bool
+    consecutive_samples: int
+    required_consecutive_samples: int
+    elapsed_s: float
+    max_joint_error_rad: float
+    max_joint_velocity_rps: float
+    max_gyro_rps: float
+    roll_rad: float
+    pitch_rad: float
+    stage_complete: bool
+    prepared: bool
+
+
+class NominalPolicyActivationFault(RuntimeError):
+    """Nominal INIT or measured stability evidence failed closed."""
 
 
 class NominalPolicyActivation:
@@ -702,9 +725,31 @@ class NominalPolicyActivation:
     manufacturing a completed activation.
     """
 
-    _PHASES = frozenset({"UNPREPARED", "PREPARING", "PREPARED"})
+    _PHASES = frozenset(
+        {
+            "UNPREPARED",
+            "UNPREPARED_SUPPORT_OFF",
+            "PREPARING",
+            "PREPARING_SUPPORT_OFF",
+            "SETTLING_TETHERED",
+            "WAITING_FOR_SUPPORT_RELEASE",
+            "SETTLING_UNSUPPORTED",
+            "PREPARED",
+        }
+    )
 
-    def __init__(self, *, joint_count: int = 29, duration_s: float = 3.0) -> None:
+    def __init__(
+        self,
+        *,
+        joint_count: int = 29,
+        duration_s: float = 3.0,
+        max_settle_joint_error_rad: float = 0.10,
+        max_settle_joint_velocity_rps: float = 0.20,
+        max_settle_gyro_rps: float = 0.15,
+        max_settle_roll_pitch_rad: float = 0.15,
+        settle_consecutive_samples: int = 10,
+        settle_timeout_s: float = 3.0,
+    ) -> None:
         if (
             isinstance(joint_count, bool)
             or not isinstance(joint_count, int)
@@ -712,10 +757,10 @@ class NominalPolicyActivation:
         ):
             raise ValueError("activation joint_count must be a positive integer")
         if isinstance(duration_s, bool):
-            raise ValueError("activation duration must be finite and at least 3s")
+            raise ValueError("activation duration must be exactly 3s")
         duration = float(duration_s)
-        if not math.isfinite(duration) or duration < 3.0:
-            raise ValueError("activation duration must be finite and at least 3s")
+        if not math.isfinite(duration) or duration != 3.0:
+            raise ValueError("activation duration must be exactly 3s")
         duration_ms = round(duration * 1_000.0)
         if duration_ms <= 0 or not math.isclose(
             duration_ms / 1_000.0,
@@ -727,11 +772,53 @@ class NominalPolicyActivation:
         self.joint_count = joint_count
         self.duration_s = duration
         self.duration_ms = int(duration_ms)
+        limits = {
+            "max_settle_joint_error_rad": max_settle_joint_error_rad,
+            "max_settle_joint_velocity_rps": max_settle_joint_velocity_rps,
+            "max_settle_gyro_rps": max_settle_gyro_rps,
+            "max_settle_roll_pitch_rad": max_settle_roll_pitch_rad,
+            "settle_timeout_s": settle_timeout_s,
+        }
+        normalized_limits: dict[str, float] = {}
+        for label, value in limits.items():
+            if isinstance(value, bool):
+                raise ValueError(f"{label} must be finite and positive")
+            normalized = float(value)
+            if not math.isfinite(normalized) or normalized <= 0.0:
+                raise ValueError(f"{label} must be finite and positive")
+            normalized_limits[label] = normalized
+        if (
+            isinstance(settle_consecutive_samples, bool)
+            or not isinstance(settle_consecutive_samples, int)
+            or settle_consecutive_samples <= 0
+        ):
+            raise ValueError("settle_consecutive_samples must be a positive integer")
+        self.max_settle_joint_error_rad = normalized_limits[
+            "max_settle_joint_error_rad"
+        ]
+        self.max_settle_joint_velocity_rps = normalized_limits[
+            "max_settle_joint_velocity_rps"
+        ]
+        self.max_settle_gyro_rps = normalized_limits["max_settle_gyro_rps"]
+        self.max_settle_roll_pitch_rad = normalized_limits[
+            "max_settle_roll_pitch_rad"
+        ]
+        self.settle_consecutive_samples = settle_consecutive_samples
+        self.settle_timeout_s = normalized_limits["settle_timeout_s"]
+        self.settle_timeout_ms = round(self.settle_timeout_s * 1_000.0)
+        self.settle_sample_period_ms = 20
         self._phase = "UNPREPARED"
         self._epoch = 0
         self._start_targets: tuple[float, ...] | None = None
         self._start_tick_ms: int | None = None
         self._ratio = 0.0
+        self._settle_start_tick_ms: int | None = None
+        self._settle_consecutive_samples = 0
+        self._last_settle_observation: NominalPolicySettleObservation | None = None
+        self._last_settle_tick_ms: int | None = None
+        self._support_release_tick_ms: int | None = None
+        self._support_release_epoch: int | None = None
+        self._activation_path: str | None = None
 
     @property
     def phase(self) -> str:
@@ -747,52 +834,105 @@ class NominalPolicyActivation:
 
     @property
     def preparing(self) -> bool:
-        return self._phase == "PREPARING"
+        return self._phase in {"PREPARING", "PREPARING_SUPPORT_OFF"}
+
+    @property
+    def settling(self) -> bool:
+        return self._phase in {"SETTLING_TETHERED", "SETTLING_UNSUPPORTED"}
+
+    @property
+    def waiting_for_support_release(self) -> bool:
+        return self._phase == "WAITING_FOR_SUPPORT_RELEASE"
 
     @property
     def prepared(self) -> bool:
         return self._phase == "PREPARED"
 
+    @property
+    def last_settle_observation(self) -> NominalPolicySettleObservation | None:
+        return self._last_settle_observation
+
+    @property
+    def support_release_confirmed(self) -> bool:
+        return self._support_release_epoch is not None
+
+    @property
+    def provenance(self) -> dict[str, object]:
+        return {
+            "schema_version": "h-ide.sonic-policy-activation/v2",
+            "source": "NVlabs/GR00T-WholeBodyControl::G1Deploy::InitControl",
+            "init_interpolation": "measured_current_to_nominal_each_tick",
+            "clock": "authoritative_mujoco_lowstate_tick_ms",
+            "duration_s": self.duration_s,
+            "activation_epoch": self._epoch,
+            "activation_path": self._activation_path,
+            "support_release": {
+                "one_way": True,
+                "confirmed_epoch": self._support_release_epoch,
+                "cancel_recovery": "support_off_reinit_then_settle",
+            },
+            "settle_gate": {
+                "max_joint_error_rad": self.max_settle_joint_error_rad,
+                "max_joint_velocity_rps": self.max_settle_joint_velocity_rps,
+                "max_gyro_rps": self.max_settle_gyro_rps,
+                "max_abs_roll_pitch_rad": self.max_settle_roll_pitch_rad,
+                "required_consecutive_samples": self.settle_consecutive_samples,
+                "sample_period_ms": self.settle_sample_period_ms,
+                "timeout_s": self.settle_timeout_s,
+                "stages": ["tethered", "support_off"],
+            },
+        }
+
     def begin(self, targets: Sequence[float], *, tick_ms: int) -> bool:
         """Begin once per process, preserving an already-running transition."""
 
-        if self.prepared or self.preparing:
+        if self._phase not in {"UNPREPARED", "UNPREPARED_SUPPORT_OFF"}:
             return False
+        support_off = self.support_release_confirmed
         boundary = self._validate_targets(targets, "activation boundary")
         start_tick = self._validate_tick(tick_ms)
         self._epoch += 1
-        self._phase = "PREPARING"
+        self._phase = "PREPARING_SUPPORT_OFF" if support_off else "PREPARING"
+        self._activation_path = (
+            "support_off_reinit" if support_off else "tethered_release"
+        )
         self._start_targets = boundary
         self._start_tick_ms = start_tick
         self._ratio = 0.0
+        self._settle_start_tick_ms = None
+        self._settle_consecutive_samples = 0
+        self._last_settle_observation = None
+        self._last_settle_tick_ms = None
+        if not support_off:
+            self._support_release_tick_ms = None
         return True
 
     def propose(
         self,
         nominal: Sequence[float],
         *,
+        measured: Sequence[float],
         tick_ms: int,
     ) -> NominalPolicyActivationDecision:
         if not self.preparing:
             raise RuntimeError("nominal policy activation is not preparing")
-        assert self._start_targets is not None
         assert self._start_tick_ms is not None
         current_tick = self._validate_tick(tick_ms)
         if current_tick < self._start_tick_ms:
             raise ValueError("activation MuJoCo tick moved backwards")
         nominal_targets = self._validate_targets(nominal, "nominal targets")
+        measured_targets = self._validate_targets(measured, "measured targets")
         elapsed_ms = current_tick - self._start_tick_ms
         ratio = min(1.0, elapsed_ms / self.duration_ms)
         targets = tuple(
-            start * (1.0 - ratio) + target * ratio
-            for start, target in zip(
-                self._start_targets,
-                nominal_targets,
-                strict=True,
+            current * (1.0 - ratio) + target * ratio
+            for current, target in zip(
+                measured_targets, nominal_targets, strict=True
             )
         )
         return NominalPolicyActivationDecision(
             epoch=self._epoch,
+            tick_ms=current_tick,
             targets=targets,
             ratio=ratio,
             complete=ratio >= 1.0,
@@ -821,23 +961,176 @@ class NominalPolicyActivation:
             raise RuntimeError("activation ratio moved backwards")
         self._ratio = decision.ratio
         if decision.complete:
-            self._phase = "PREPARED"
+            self._phase = (
+                "SETTLING_UNSUPPORTED"
+                if self.support_release_confirmed
+                else "SETTLING_TETHERED"
+            )
             self._start_targets = None
             self._start_tick_ms = None
             self._ratio = 1.0
+            self._settle_start_tick_ms = decision.tick_ms
+            self._settle_consecutive_samples = 0
+            self._last_settle_observation = None
+            self._last_settle_tick_ms = None
             return True
         return False
+
+    def observe_settling(
+        self,
+        *,
+        nominal: Sequence[float],
+        measured: Sequence[float],
+        velocities: Sequence[float],
+        gyroscope: Sequence[float],
+        roll_rad: float,
+        pitch_rad: float,
+        tick_ms: int,
+    ) -> NominalPolicySettleObservation:
+        if not self.settling:
+            raise RuntimeError("nominal policy activation is not settling")
+        assert self._settle_start_tick_ms is not None
+        current_tick = self._validate_tick(tick_ms)
+        if current_tick < self._settle_start_tick_ms:
+            raise ValueError("activation settling MuJoCo tick moved backwards")
+        elapsed_ms = current_tick - self._settle_start_tick_ms
+        if elapsed_ms > self.settle_timeout_ms:
+            raise NominalPolicyActivationFault(
+                f"nominal policy activation settling timeout in {self._phase}"
+            )
+        nominal_targets = self._validate_targets(nominal, "nominal targets")
+        measured_targets = self._validate_targets(measured, "measured targets")
+        velocity_targets = self._validate_targets(
+            velocities, "measured velocities"
+        )
+        gyro = tuple(float(value) for value in gyroscope)
+        if len(gyro) != 3 or not all(math.isfinite(value) for value in gyro):
+            raise ValueError("measured gyroscope must contain three finite values")
+        roll = float(roll_rad)
+        pitch = float(pitch_rad)
+        if not all(math.isfinite(value) for value in (roll, pitch)):
+            raise ValueError("measured roll/pitch must be finite")
+        previous_tick = self._last_settle_tick_ms
+        if previous_tick is not None:
+            sample_gap_ms = current_tick - previous_tick
+            if sample_gap_ms <= 0:
+                raise NominalPolicyActivationFault(
+                    "nominal policy activation requires a fresh settling sample"
+                )
+            if sample_gap_ms != self.settle_sample_period_ms:
+                self._settle_consecutive_samples = 0
+        self._last_settle_tick_ms = current_tick
+        max_joint_error = max(
+            abs(current - target)
+            for current, target in zip(
+                measured_targets, nominal_targets, strict=True
+            )
+        )
+        max_joint_velocity = max(abs(value) for value in velocity_targets)
+        max_gyro = max(abs(value) for value in gyro)
+        stable = bool(
+            max_joint_error <= self.max_settle_joint_error_rad
+            and max_joint_velocity <= self.max_settle_joint_velocity_rps
+            and max_gyro <= self.max_settle_gyro_rps
+            and max(abs(roll), abs(pitch)) <= self.max_settle_roll_pitch_rad
+        )
+        self._settle_consecutive_samples = (
+            self._settle_consecutive_samples + 1 if stable else 0
+        )
+        stage = (
+            "tethered"
+            if self._phase == "SETTLING_TETHERED"
+            else "support_off"
+        )
+        stage_complete = (
+            self._settle_consecutive_samples >= self.settle_consecutive_samples
+        )
+        if stage_complete and stage == "tethered":
+            self._phase = "WAITING_FOR_SUPPORT_RELEASE"
+            self._settle_start_tick_ms = None
+        elif stage_complete:
+            self._phase = "PREPARED"
+            self._settle_start_tick_ms = None
+        observation = NominalPolicySettleObservation(
+            stage=stage,
+            stable=stable,
+            consecutive_samples=self._settle_consecutive_samples,
+            required_consecutive_samples=self.settle_consecutive_samples,
+            elapsed_s=elapsed_ms / 1_000.0,
+            max_joint_error_rad=max_joint_error,
+            max_joint_velocity_rps=max_joint_velocity,
+            max_gyro_rps=max_gyro,
+            roll_rad=roll,
+            pitch_rad=pitch,
+            stage_complete=stage_complete,
+            prepared=self.prepared,
+        )
+        self._last_settle_observation = observation
+        return observation
+
+    def confirm_support_release(self, *, tick_ms: int) -> bool:
+        """Reset the evidence window only after authoritative Plant proof."""
+
+        if not self.waiting_for_support_release:
+            return False
+        current_tick = self._validate_tick(tick_ms)
+        if (
+            self._last_settle_tick_ms is not None
+            and current_tick < self._last_settle_tick_ms
+        ):
+            raise ValueError("support release tick predates tethered evidence")
+        self.record_support_release(self._epoch)
+        self._support_release_tick_ms = current_tick
+        self._phase = "SETTLING_UNSUPPORTED"
+        self._settle_start_tick_ms = current_tick
+        self._settle_consecutive_samples = 0
+        self._last_settle_observation = None
+        self._last_settle_tick_ms = None
+        return True
+
+    def record_support_release(self, activation_epoch: int) -> bool:
+        """Persist one-way Plant release proof, including after a stop race."""
+
+        if (
+            isinstance(activation_epoch, bool)
+            or not isinstance(activation_epoch, int)
+            or activation_epoch <= 0
+        ):
+            raise ValueError("support release epoch must be a positive integer")
+        previous = self._support_release_epoch
+        if previous is not None and previous != activation_epoch:
+            raise NominalPolicyActivationFault(
+                "Plant fall arrest cannot be released by two activation epochs"
+            )
+        self._support_release_epoch = activation_epoch
+        if self._phase == "UNPREPARED":
+            self._phase = "UNPREPARED_SUPPORT_OFF"
+        return previous is None
 
     def abort(self) -> bool:
         """Invalidate unfinished proposals while preserving process-level prep."""
 
-        if not self.preparing:
+        if self._phase in {
+            "UNPREPARED",
+            "UNPREPARED_SUPPORT_OFF",
+            "PREPARED",
+        }:
             return False
         self._epoch += 1
-        self._phase = "UNPREPARED"
+        self._phase = (
+            "UNPREPARED_SUPPORT_OFF"
+            if self.support_release_confirmed
+            else "UNPREPARED"
+        )
         self._start_targets = None
         self._start_tick_ms = None
         self._ratio = 0.0
+        self._settle_start_tick_ms = None
+        self._settle_consecutive_samples = 0
+        self._last_settle_observation = None
+        self._last_settle_tick_ms = None
+        if not self.support_release_confirmed:
+            self._support_release_tick_ms = None
         return True
 
     def _validate_targets(
@@ -1126,11 +1419,12 @@ class CmdVelGuard:
     def __init__(
         self,
         *,
-        max_linear_mps: float = 0.25,
-        min_walk_command_mps: float = 0.10,
+        max_linear_mps: float = 0.40,
+        min_walk_command_mps: float = 0.20,
         max_angular_rps: float = 0.5,
         max_facing_lead_rad: float = 0.05,
         max_translation_facing_offset_rad: float = 0.05,
+        max_integration_dt_s: float = 0.024,
         timeout_s: float = 0.25,
         smoothing_alpha: float = 0.35,
         clock=time.monotonic,
@@ -1140,6 +1434,7 @@ class CmdVelGuard:
             or max_angular_rps <= 0
             or max_facing_lead_rad <= 0
             or max_translation_facing_offset_rad <= 0
+            or max_integration_dt_s <= 0
             or timeout_s <= 0
         ):
             raise ValueError("guard limits must be positive")
@@ -1158,6 +1453,7 @@ class CmdVelGuard:
         self.max_translation_facing_offset_rad = float(
             max_translation_facing_offset_rad
         )
+        self.max_integration_dt_s = float(max_integration_dt_s)
         self.timeout_s = float(timeout_s)
         self.smoothing_alpha = float(smoothing_alpha)
         self._clock = clock
@@ -1166,10 +1462,14 @@ class CmdVelGuard:
         self._vy = 0.0
         self._wz = 0.0
         self._facing = 0.0
+        # This is the command-space goal.  It is advanced only by admitted
+        # angular velocity and authoritative simulation dt.  The emitted
+        # facing is a separately lead-limited view sent to SONIC; measured yaw
+        # must never be fed back into this integral.
+        self._command_facing = 0.0
         self._measured_heading: float | None = None
         self._heading_anchor: float | None = None
         self._action_facing_origin = 0.0
-        self._turn_sign = 0.0
 
     @property
     def last_received_at(self) -> float | None:
@@ -1179,6 +1479,12 @@ class CmdVelGuard:
     @property
     def measured_heading(self) -> float | None:
         return self._measured_heading
+
+    @property
+    def command_facing(self) -> float:
+        """Return the admitted command integral before measured-lead limiting."""
+
+        return self._command_facing
 
     @property
     def command_zero(self) -> bool:
@@ -1209,17 +1515,50 @@ class CmdVelGuard:
             raise ValueError("measured heading must be finite")
         self._measured_heading = self._wrap_angle(value)
 
-    def accept(self, vx: float, vy: float, wz: float, *, source: str = "nav2", received_at: float | None = None) -> CmdVel:
+    def accept(
+        self,
+        vx: float,
+        vy: float,
+        wz: float,
+        *,
+        source: str = "nav2",
+        received_at: float | None = None,
+    ) -> CmdVel:
         values = (float(vx), float(vy), float(wz))
         if not all(math.isfinite(value) for value in values):
             raise ValueError("cmd_vel values must be finite")
         norm = math.hypot(values[0], values[1])
+        # The pinned SONIC pipeline clamps SLOW_WALK to at least 0.20 m/s.
+        # Reject a sub-floor upstream command instead of silently changing a
+        # mixed curve into a pure turn. Numerical zero remains a normal braking
+        # command.
+        if 1e-6 < norm < self.min_walk_command_mps:
+            if not math.isclose(
+                norm,
+                self.min_walk_command_mps,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            ):
+                raise ValueError(
+                    "active translation speed "
+                    f"{norm:.6f}m/s is below SONIC SLOW_WALK floor "
+                    f"{self.min_walk_command_mps:.6f}m/s"
+                )
+            floor_scale = self.min_walk_command_mps / norm
+            values = (values[0] * floor_scale, values[1] * floor_scale, values[2])
+            norm = self.min_walk_command_mps
+        if norm <= 1e-6:
+            values = (0.0, 0.0, values[2])
+            norm = 0.0
         scale = min(1.0, self.max_linear_mps / norm) if norm else 1.0
+        accepted_at = self._clock() if received_at is None else float(received_at)
+        if not math.isfinite(accepted_at):
+            raise ValueError("cmd_vel receive time must be finite")
         target = CmdVel(
             values[0] * scale,
             values[1] * scale,
             max(-self.max_angular_rps, min(self.max_angular_rps, values[2])),
-            self._clock() if received_at is None else float(received_at),
+            accepted_at,
             source=source,
         )
         starting = self._is_nonzero(target) and not self._is_nonzero(self._last)
@@ -1231,19 +1570,9 @@ class CmdVelGuard:
             # decoder is re-anchored to the latest measured IMU pose.
             self._heading_anchor = self._measured_heading
             self._action_facing_origin = self._facing
-            self._turn_sign = 0.0
-            # SONIC plans asynchronously.  Starting a pure Spin from the first
-            # smoothed ~milliradian increment creates a near-static plan which
-            # can arrive after a newer turning plan and pull the body back.  A
-            # bounded look-ahead target gives the very first plan a meaningful
-            # turn while the direction and continued progression still come
-            # exclusively from Nav2's angular velocity.
-            if math.hypot(target.vx, target.vy) < self.min_walk_command_mps and abs(target.wz) >= 0.05:
-                self._turn_sign = math.copysign(1.0, target.wz)
-                self._facing = self._wrap_angle(
-                    self._action_facing_origin
-                    + self._turn_sign * self.max_facing_lead_rad
-                )
+            self._command_facing = self._facing
+        elif not self._is_nonzero(target):
+            self._freeze_facing_action()
         self._last = target
         return target
 
@@ -1252,62 +1581,82 @@ class CmdVelGuard:
 
     def intent(self, now: float | None = None, dt: float = 0.02) -> MovementIntent:
         current = self._clock() if now is None else float(now)
+        if not math.isfinite(current):
+            raise ValueError("cmd_vel watchdog time must be finite")
+        if isinstance(dt, bool):
+            raise ValueError("authoritative cmd_vel integration dt must be finite")
+        integration_dt = float(dt)
+        if (
+            not math.isfinite(integration_dt)
+            or integration_dt <= 0.0
+            or integration_dt > self.max_integration_dt_s
+        ):
+            raise ValueError(
+                "authoritative cmd_vel integration dt must be in "
+                f"(0, {self.max_integration_dt_s}]s"
+            )
+        if current < self._last.received_at:
+            raise ValueError("cmd_vel watchdog time moved backwards")
         stale = current - self._last.received_at > self.timeout_s
-        target = CmdVel(0.0, 0.0, 0.0, self._last.received_at, source="watchdog") if stale else self._last
+        target = (
+            CmdVel(0.0, 0.0, 0.0, self._last.received_at, source="watchdog")
+            if stale
+            else self._last
+        )
+        if stale:
+            self._last = target
         # A zero from Nav2 is a safety/terminal transition, not another noisy
         # velocity sample.  Applying the normal low-pass tail here kept SONIC
         # in SLOW_WALK after Nav2 had already completed or cancelled Spin.
         alpha = 1.0 if stale or not self._is_nonzero(target) else self.smoothing_alpha
-        self._vx += (target.vx - self._vx) * alpha
-        self._vy += (target.vy - self._vy) * alpha
+        target_speed = math.hypot(target.vx, target.vy)
+        if target_speed >= self.min_walk_command_mps:
+            # Filtering a legal 0.20m/s command from zero creates an illegal
+            # sub-floor tail (0.07, 0.1155, ...). Translation is therefore
+            # admitted atomically at the model's discrete floor.
+            self._vx = target.vx
+            self._vy = target.vy
+        else:
+            self._vx += (target.vx - self._vx) * alpha
+            self._vy += (target.vy - self._vy) * alpha
         self._wz += (target.wz - self._wz) * alpha
-        integrated_facing = self._wrap_angle(self._facing + self._wz * max(0.0, float(dt)))
         speed = math.hypot(self._vx, self._vy)
         moving = speed >= self.min_walk_command_mps and not stale
         rotating = abs(self._wz) >= 0.05 and not stale
-        if moving and not self._turn_sign:
-            # Mixed vx/wz from DWB is a small path-following correction, not
-            # permission to turn the humanoid arbitrarily while translating.
-            # Following measured yaw here formed a positive feedback loop:
-            # gait drift became the next SONIC facing target.  Keep the target
-            # in a tight band around the action's reviewed starting heading;
-            # larger orientation changes are performed by Nav2's pure Spin.
-            relative = self._wrap_angle(
-                integrated_facing - self._action_facing_origin
+        active = moving or rotating
+        if active:
+            # Only an admitted angular command and authoritative simulation dt
+            # advance this goal. Measured yaw is used below solely to cap the
+            # currently emitted lead; it is never fed back into the integral.
+            self._command_facing = self._wrap_angle(
+                self._command_facing + self._wz * integration_dt
             )
-            relative = max(
-                -self.max_translation_facing_offset_rad,
-                min(self.max_translation_facing_offset_rad, relative),
-            )
-            integrated_facing = self._wrap_angle(
-                self._action_facing_origin + relative
-            )
-        elif rotating and self._measured_heading is not None and self._heading_anchor is not None:
-            measured_progress = self._wrap_angle(self._measured_heading - self._heading_anchor)
-            relative_integrated = self._wrap_angle(
-                integrated_facing - self._action_facing_origin
-            )
-            if self._turn_sign:
-                signed_progress = max(0.0, self._turn_sign * measured_progress)
-                signed_target = max(
-                    self.max_facing_lead_rad,
-                    self._turn_sign * relative_integrated,
+            measured_facing = self._action_facing_origin
+            if (
+                self._measured_heading is not None
+                and self._heading_anchor is not None
+            ):
+                measured_facing = self._wrap_angle(
+                    self._action_facing_origin
+                    + self._wrap_angle(
+                        self._measured_heading - self._heading_anchor
+                    )
                 )
-                signed_target = min(signed_target, signed_progress + self.max_facing_lead_rad)
-                integrated_facing = self._wrap_angle(
-                    self._action_facing_origin + self._turn_sign * signed_target
-                )
-            else:
-                lead = self._wrap_angle(relative_integrated - measured_progress)
-                lead = max(-self.max_facing_lead_rad, min(self.max_facing_lead_rad, lead))
-                integrated_facing = self._wrap_angle(
-                    self._action_facing_origin + measured_progress + lead
-                )
-        self._facing = integrated_facing
-        # SONIC SLOW_WALK cannot faithfully execute Nav2's arbitrarily small
-        # terminal velocities: the model clamps them to at least 0.2 m/s.
-        # Stop below this command deadband instead of repeatedly overshooting
-        # the reviewed goal pose.
+            lead_limit = (
+                self.max_translation_facing_offset_rad
+                if moving
+                else self.max_facing_lead_rad
+            )
+            lead = self._wrap_angle(self._command_facing - measured_facing)
+            lead = max(-lead_limit, min(lead_limit, lead))
+            self._facing = self._wrap_angle(measured_facing + lead)
+        else:
+            # Explicit zero, watchdog expiry and revocation freeze both the
+            # emitted target and command integral. The next action gets a
+            # fresh measured anchor at this exact canonical boundary.
+            self._freeze_facing_action()
+        # Active sub-floor translation was rejected at admission, so speed is
+        # either zero or inside this runtime's reviewed SLOW_WALK envelope.
         # Nav2 Twist linear velocity is expressed in ``base_link``.  SONIC's
         # movement angle is expressed in the controller's heading frame (the
         # same convention used by its joystick adapter), so a base-forward
@@ -1331,6 +1680,11 @@ class CmdVelGuard:
     def _is_nonzero(command: CmdVel) -> bool:
         return any(abs(value) > 1e-6 for value in (command.vx, command.vy, command.wz))
 
+    def _freeze_facing_action(self) -> None:
+        self._command_facing = self._facing
+        self._heading_anchor = None
+        self._action_facing_origin = self._facing
+
     @staticmethod
     def _wrap_angle(value: float) -> float:
         return (float(value) + math.pi) % (2.0 * math.pi) - math.pi
@@ -1341,6 +1695,11 @@ class JointGuardResult:
     targets: tuple[float, ...]
     constrained_joints: int
     max_step_rad: float
+    # Arm-local immutable indices (0..13) and the complete per-joint running
+    # saturation durations at this exact actuator decision.  The driver maps
+    # indices to G1 global joints 15..28 when it records acceptance evidence.
+    constrained_joint_indices: tuple[int, ...]
+    continuous_saturation_s: tuple[float, ...]
 
 
 class NavigationArmGuard:
@@ -1428,6 +1787,7 @@ class NavigationArmGuard:
 
         projected_targets: list[float] = []
         saturation_durations: list[float] = []
+        constrained_joint_indices: list[int] = []
         constrained_joints = 0
         max_step = 0.0
         for index, raw in enumerate(raw_targets):
@@ -1458,6 +1818,7 @@ class NavigationArmGuard:
                         f"budget={self.max_continuous_saturation_s:.17g}s"
                     )
                 constrained_joints += 1
+                constrained_joint_indices.append(index)
             else:
                 projected = raw
                 saturated_for = 0.0
@@ -1471,6 +1832,8 @@ class NavigationArmGuard:
             self._last,
             constrained_joints,
             max_step,
+            tuple(constrained_joint_indices),
+            self._continuous_saturation_s,
         )
 
     def reset(self) -> None:

@@ -2,15 +2,115 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+from uuid import UUID
 
 from hide_mujoco_sonic.gait_adapter import GaitState, SonicIntent
+from hide_mujoco_sonic.motion_fault import SonicHealth
 from hide_mujoco_sonic.ros_bridge import (
+    _ActionStatusObservation,
+    _actions_confirmed_inactive_after,
     _create_safety_timers,
     _suppress_for_correlated_stop,
+    BridgeRuntimeHealth,
 )
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def ready_sonic_health() -> SonicHealth:
+    return SonicHealth(
+        request_id=UUID("11000000-0000-4000-8000-000000000001"),
+        robot_id="g1-sim",
+        driver_boot_id=UUID("21000000-0000-4000-8000-000000000002"),
+        driver_session_id=UUID("31000000-0000-4000-8000-000000000003"),
+        status="ready",
+        terminal_fault=False,
+        reason=None,
+        motion_ready=True,
+        last_lowstate_age_s=0.01,
+        last_control_step_age_s=0.01,
+        plant_support_mode="safety_stop",
+        plant_support_safety_latched=True,
+        plant_support_stop_pending=False,
+        static_hold_active=True,
+        navigation_task_active=False,
+        motion_authorized=False,
+        nav2_command_zero=True,
+        matched_reference_actuator_authority=False,
+        reference_authority_state="REVOKED",
+        reference_authority_generation=None,
+        reference_authority_source_sequence=None,
+        reference_authority_intent_generation=None,
+        reference_authority_epoch=0,
+        reference_authority_granted_at_monotonic_s=None,
+        reference_authority_granted_tick_ms=None,
+        reference_authority_dds_target_sequence=None,
+    )
+
+
+def bridge_health_snapshot(
+    evidence: BridgeRuntimeHealth,
+    *,
+    now_s: float,
+    pending: bool = False,
+    confirmed: bool = False,
+    health_pending: bool = False,
+    quarantined: bool = False,
+    fault: str | None = None,
+) -> dict[str, object]:
+    return evidence.snapshot(
+        gait_state=GaitState.IDLE,
+        control_generation=19,
+        bridge_fault=fault,
+        health_transport_pending=pending,
+        health_transport_confirmed=confirmed,
+        health_fault_pending=health_pending,
+        health_quarantined=quarantined,
+        now_s=now_s,
+    )
+
+
+def test_bridge_health_query_never_manufactures_progress() -> None:
+    evidence = BridgeRuntimeHealth(
+        boot_id=UUID("41000000-0000-4000-8000-000000000004"),
+        session_id=UUID("51000000-0000-4000-8000-000000000005"),
+    )
+
+    empty = bridge_health_snapshot(evidence, now_s=10.0)
+    assert empty["healthy"] is False
+    assert empty["sequence"] == 0
+    assert empty["lastProgressAtMonotonicS"] is None
+    assert bridge_health_snapshot(evidence, now_s=10.0)["sequence"] == 0
+
+    evidence.observe_sonic_probe(ready_sonic_health(), observed_at_s=10.0)
+    first = bridge_health_snapshot(evidence, now_s=10.05)
+    replay = bridge_health_snapshot(evidence, now_s=10.06)
+    assert first["healthy"] is True
+    assert first["sequence"] == 1
+    assert replay["sequence"] == 1
+    assert first["sonicDriverBootId"] == "21000000-0000-4000-8000-000000000002"
+    assert first["sonicDriverSessionId"] == "31000000-0000-4000-8000-000000000003"
+
+
+def test_bridge_health_fails_closed_for_every_fence_and_stale_progress() -> None:
+    evidence = BridgeRuntimeHealth(
+        boot_id=UUID("41000000-0000-4000-8000-000000000004"),
+        session_id=UUID("51000000-0000-4000-8000-000000000005"),
+    )
+    evidence.observe_sonic_probe(ready_sonic_health(), observed_at_s=10.0)
+
+    assert bridge_health_snapshot(evidence, now_s=10.100001)["healthy"] is False
+    assert bridge_health_snapshot(evidence, now_s=10.01, pending=True)["healthy"] is False
+    assert bridge_health_snapshot(evidence, now_s=10.01, confirmed=True)["healthy"] is False
+    assert bridge_health_snapshot(evidence, now_s=10.01, health_pending=True)["healthy"] is False
+    assert bridge_health_snapshot(evidence, now_s=10.01, quarantined=True)["healthy"] is False
+    assert bridge_health_snapshot(evidence, now_s=10.01, fault="latched")["healthy"] is False
+
+    evidence.observe_sonic_probe(ready_sonic_health(), observed_at_s=10.2)
+    recovered = bridge_health_snapshot(evidence, now_s=10.2)
+    assert recovered["healthy"] is True
+    assert recovered["sequence"] == 2
 
 
 def gait_intent(*, state: GaitState) -> SonicIntent:
@@ -104,6 +204,43 @@ def test_safety_timers_share_the_supplied_clock_and_state_group() -> None:
     ]
 
 
+def test_motion_fault_reset_requires_post_fault_inactive_action_evidence() -> None:
+    statuses = {
+        "navigate_to_pose": None,
+        "spin": None,
+        "drive_on_heading": None,
+    }
+    assert not _actions_confirmed_inactive_after(
+        statuses,
+        fault_latched_at_s=10.0,
+    )
+
+    statuses["navigate_to_pose"] = _ActionStatusObservation(False, 10.1)
+    statuses["spin"] = _ActionStatusObservation(False, 9.9)
+    assert not _actions_confirmed_inactive_after(
+        statuses,
+        fault_latched_at_s=10.0,
+    )
+
+    statuses["spin"] = _ActionStatusObservation(True, 10.2)
+    assert not _actions_confirmed_inactive_after(
+        statuses,
+        fault_latched_at_s=10.0,
+    )
+
+    statuses["spin"] = _ActionStatusObservation(False, 10.2)
+    assert not _actions_confirmed_inactive_after(
+        statuses,
+        fault_latched_at_s=10.0,
+    )
+
+    statuses["drive_on_heading"] = _ActionStatusObservation(False, 10.2)
+    assert _actions_confirmed_inactive_after(
+        statuses,
+        fault_latched_at_s=10.0,
+    )
+
+
 def _keyword_name(call: ast.Call, keyword: str) -> str | None:
     for item in call.keywords:
         if item.arg == keyword and isinstance(item.value, ast.Name):
@@ -161,7 +298,7 @@ def test_ros_bridge_assigns_every_callback_entity_and_uses_two_threads() -> None
         if isinstance(call.func, ast.Attribute)
         and call.func.attr == "create_guard_condition"
     ]
-    assert len(subscriptions) == 4
+    assert len(subscriptions) == 7
     assert len(timers) == 2
     assert len(guards) == 1
     assert all(
@@ -208,7 +345,9 @@ def test_ros_bridge_assigns_every_callback_entity_and_uses_two_threads() -> None
         and isinstance(call.args[1], ast.Constant)
     }
     assert services == {
+        "/h_ide/mujoco/bridge_health": "state_group",
         "/robot/control_arm": "state_group",
+        "/h_ide/mujoco/reset_motion_fault": "state_group",
         "/h_ide/mujoco/normal_stop": "normal_stop_group",
     }
 
@@ -245,6 +384,17 @@ def test_health_transport_fence_precedes_every_control_arm_side_effect() -> None
     driver_io = source.index("acknowledgement = request_json")
 
     assert fence < probe < generation < arm < driver_io
+
+
+def test_motion_fault_stop_binds_sonic_request_to_fault_event_identity() -> None:
+    path = ROOT / "src/hide_mujoco_sonic/ros_bridge.py"
+    source = ast.unparse(_nested_function(path, "latch_stop"))
+
+    assert "event = fault_latch.event" in source
+    assert "'request_id': str(event.event_id)" in source
+    assert source.index("event = fault_latch.event") < source.index(
+        "'type': 'motion_fault_latch'"
+    )
 
 
 def test_health_transport_fence_wires_command_auto_arm_and_delivery_paths() -> None:

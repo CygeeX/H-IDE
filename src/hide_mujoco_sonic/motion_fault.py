@@ -21,7 +21,7 @@ from .reference_authority import REFERENCE_AUTHORITY_PHASES
 
 
 MOTION_FAULT_SCHEMA_VERSION = "h-ide.motion-safety-fault/v1"
-SONIC_HEALTH_SCHEMA_VERSION = "h-ide.sonic-health/v2"
+SONIC_HEALTH_SCHEMA_VERSION = "h-ide.sonic-health/v3"
 MOTION_FAULT_MAX_BYTES = 4096
 STALE_HEALTH_CONFIRMATION_PROBES = 2
 SONIC_HEALTH_TRANSPORT_TIMEOUT_CONFIRMATION_PROBES = 2
@@ -78,6 +78,7 @@ _HEALTH_RESPONSE_FIELDS = frozenset(
         "schema_version",
         "robot_id",
         "driver_boot_id",
+        "driver_session_id",
         "status",
         "terminal_fault",
         "reason",
@@ -371,6 +372,28 @@ class MotionFaultLatch:
             raise RuntimeError(details)
         return event
 
+    def reset(self, event_id: UUID) -> MotionSafetyFault:
+        """Consume one completely enforced fault after explicit safe reset.
+
+        Publication sequence remains monotonic within the bridge boot.  A
+        partial publish/stop transaction can never be erased by reset.
+        """
+
+        if not isinstance(event_id, UUID):
+            raise TypeError("motion-fault reset event_id must be a UUID")
+        with self._lock:
+            event = self._event
+            if event is None:
+                raise RuntimeError("no motion fault is latched")
+            if event.event_id != event_id:
+                raise RuntimeError("motion-fault reset identity mismatch")
+            if not (self._published and self._stopped):
+                raise RuntimeError("incomplete motion fault cannot be reset")
+            self._event = None
+            self._published = False
+            self._stopped = False
+            return event
+
 
 def motion_fault_qos():
     """Return the latched reliable QoS used by both producer and consumer."""
@@ -431,6 +454,7 @@ class SonicHealth:
     request_id: UUID
     robot_id: str
     driver_boot_id: UUID
+    driver_session_id: UUID
     status: str
     terminal_fault: bool
     reason: str | None
@@ -669,6 +693,9 @@ class SonicHealth:
             request_id=request_id,
             robot_id=robot_id,
             driver_boot_id=_uuid(value.get("driver_boot_id"), "driver_boot_id"),
+            driver_session_id=_uuid(
+                value.get("driver_session_id"), "driver_session_id"
+            ),
             status=status,
             terminal_fault=terminal_fault,
             reason=reason_value,
@@ -765,7 +792,7 @@ class SonicHealthTransportGate:
     This gate is deliberately separate from :class:`SonicHealthFaultGate`.
     A missing reply is unknown transport state, not age-only health evidence,
     and it can never be quarantined as a healthy SAFE_HOLD sample.  The first
-    timeout fences all new motion authority.  A complete, correlated v2 reply
+    timeout fences all new motion authority.  A complete, correlated v3 reply
     may clear that fence before the deadline; a second consecutive timeout or
     any observation at/after the deadline is terminal.
 

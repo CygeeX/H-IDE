@@ -351,36 +351,213 @@ def test_static_joint_handoff_freezes_published_preload_without_reanchoring():
 
 
 def test_nominal_policy_activation_uses_simulation_ticks_and_exact_dds_commits():
-    activation = NominalPolicyActivation(joint_count=2, duration_s=3.0)
+    activation = NominalPolicyActivation(
+        joint_count=2,
+        duration_s=3.0,
+        settle_consecutive_samples=2,
+    )
     assert activation.begin([0.10, -0.20], tick_ms=1_000) is True
 
-    first = activation.propose([0.40, 0.10], tick_ms=1_000)
+    first = activation.propose(
+        [0.40, 0.10], measured=[0.10, -0.20], tick_ms=1_000,
+    )
     assert first.ratio == 0.0
     assert first.targets == (0.10, -0.20)
     assert activation.commit(first, first.targets) is False
 
-    middle = activation.propose([0.40, 0.10], tick_ms=2_500)
+    middle = activation.propose(
+        [0.40, 0.10], measured=[0.16, -0.14], tick_ms=2_500,
+    )
     assert middle.ratio == pytest.approx(0.5)
-    assert middle.targets == pytest.approx((0.25, -0.05))
+    assert middle.targets == pytest.approx((0.28, -0.02))
     # A target that did not cross DDS cannot advance the transaction.
     assert activation.commit(middle, first.targets) is False
     assert activation.ratio == 0.0
     assert activation.commit(middle, middle.targets) is False
 
-    final = activation.propose([0.40, 0.10], tick_ms=4_000)
+    final = activation.propose(
+        [0.40, 0.10], measured=[0.35, 0.05], tick_ms=4_000,
+    )
     assert final.complete is True
     assert activation.commit(final, final.targets) is True
-    assert activation.phase == "PREPARED"
+    assert activation.phase == "SETTLING_TETHERED"
     assert activation.ratio == 1.0
+    for tick_ms in (4_020, 4_040):
+        tethered = activation.observe_settling(
+            nominal=[0.40, 0.10],
+            measured=[0.40, 0.10],
+            velocities=[0.0, 0.0],
+            gyroscope=[0.0, 0.0, 0.0],
+            roll_rad=0.0,
+            pitch_rad=0.0,
+            tick_ms=tick_ms,
+        )
+    assert tethered.stage_complete is True
+    assert activation.phase == "WAITING_FOR_SUPPORT_RELEASE"
+    assert activation.confirm_support_release(tick_ms=4_040) is True
+    assert activation.phase == "SETTLING_UNSUPPORTED"
+    for tick_ms in (4_060, 4_080):
+        unsupported = activation.observe_settling(
+            nominal=[0.40, 0.10],
+            measured=[0.40, 0.10],
+            velocities=[0.0, 0.0],
+            gyroscope=[0.0, 0.0, 0.0],
+            roll_rad=0.0,
+            pitch_rad=0.0,
+            tick_ms=tick_ms,
+        )
+    assert unsupported.prepared is True
+    assert activation.phase == "PREPARED"
     # Official INIT is once per process, not once per Mission.
     assert activation.begin([9.0, 9.0], tick_ms=5_000) is False
 
 
-@pytest.mark.parametrize("invalid_duration", [True, 2.999, float("nan")])
-def test_nominal_policy_activation_rejects_short_or_non_finite_duration(
+def test_activation_cancel_after_one_way_release_restarts_support_off():
+    activation = NominalPolicyActivation(
+        joint_count=1,
+        duration_s=3.0,
+        settle_consecutive_samples=1,
+    )
+    assert activation.begin([0.1], tick_ms=0)
+    final = activation.propose([0.0], measured=[0.0], tick_ms=3_000)
+    assert activation.commit(final, final.targets)
+    tethered = activation.observe_settling(
+        nominal=[0.0], measured=[0.0], velocities=[0.0],
+        gyroscope=[0.0, 0.0, 0.0], roll_rad=0.0, pitch_rad=0.0,
+        tick_ms=3_020,
+    )
+    assert tethered.stage_complete
+    with pytest.raises(ValueError, match="predates tethered evidence"):
+        activation.confirm_support_release(tick_ms=3_019)
+    assert activation.confirm_support_release(tick_ms=3_020)
+    released_epoch = activation.epoch
+
+    assert activation.abort() is True
+    assert activation.phase == "UNPREPARED_SUPPORT_OFF"
+    assert activation.support_release_confirmed is True
+    assert activation.provenance["support_release"] == {
+        "one_way": True,
+        "confirmed_epoch": released_epoch,
+        "cancel_recovery": "support_off_reinit_then_settle",
+    }
+
+    assert activation.begin([0.05], tick_ms=4_000)
+    assert activation.phase == "PREPARING_SUPPORT_OFF"
+    assert activation.epoch != released_epoch
+    assert activation.provenance["activation_epoch"] == activation.epoch
+    assert activation.provenance["activation_path"] == "support_off_reinit"
+
+    retry = activation.propose([0.0], measured=[0.01], tick_ms=7_000)
+    assert activation.commit(retry, retry.targets)
+    assert activation.phase == "SETTLING_UNSUPPORTED"
+    unsupported = activation.observe_settling(
+        nominal=[0.0],
+        measured=[0.0],
+        velocities=[0.0],
+        gyroscope=[0.0, 0.0, 0.0],
+        roll_rad=0.0,
+        pitch_rad=0.0,
+        tick_ms=7_020,
+    )
+    assert unsupported.prepared
+    assert activation.provenance["activation_epoch"] != released_epoch
+    assert activation.provenance["support_release"]["confirmed_epoch"] == released_epoch
+
+
+def test_nominal_policy_activation_stability_gate_resets_and_times_out():
+    activation = NominalPolicyActivation(
+        joint_count=1,
+        duration_s=3.0,
+        settle_consecutive_samples=2,
+        settle_timeout_s=3.0,
+    )
+    assert activation.begin([0.0], tick_ms=0)
+    final = activation.propose([0.0], measured=[0.0], tick_ms=3_000)
+    assert activation.commit(final, final.targets) is True
+
+    stable = activation.observe_settling(
+        nominal=[0.0],
+        measured=[0.09],
+        velocities=[0.19],
+        gyroscope=[0.14, 0.0, 0.0],
+        roll_rad=0.14,
+        pitch_rad=0.0,
+        tick_ms=3_020,
+    )
+    assert stable.stable is True
+    assert stable.consecutive_samples == 1
+    with pytest.raises(RuntimeError, match="fresh settling sample"):
+        activation.observe_settling(
+            nominal=[0.0],
+            measured=[0.0],
+            velocities=[0.0],
+            gyroscope=[0.0, 0.0, 0.0],
+            roll_rad=0.0,
+            pitch_rad=0.0,
+            tick_ms=3_020,
+        )
+    unstable = activation.observe_settling(
+        nominal=[0.0],
+        measured=[0.100001],
+        velocities=[0.0],
+        gyroscope=[0.0, 0.0, 0.0],
+        roll_rad=0.0,
+        pitch_rad=0.0,
+        tick_ms=3_040,
+    )
+    assert unstable.stable is False
+    assert unstable.consecutive_samples == 0
+
+    activation.observe_settling(
+        nominal=[0.0], measured=[0.0], velocities=[0.0],
+        gyroscope=[0.0, 0.0, 0.0], roll_rad=0.0, pitch_rad=0.0,
+        tick_ms=3_060,
+    )
+    gap = activation.observe_settling(
+        nominal=[0.0], measured=[0.0], velocities=[0.0],
+        gyroscope=[0.0, 0.0, 0.0], roll_rad=0.0, pitch_rad=0.0,
+        tick_ms=3_100,
+    )
+    assert gap.consecutive_samples == 1
+
+    with pytest.raises(RuntimeError, match="settling timeout"):
+        activation.observe_settling(
+            nominal=[0.0],
+            measured=[0.2],
+            velocities=[0.0],
+            gyroscope=[0.0, 0.0, 0.0],
+            roll_rad=0.0,
+            pitch_rad=0.0,
+            tick_ms=6_001,
+        )
+
+
+def test_nominal_policy_activation_provenance_exposes_fixed_gate():
+    activation = NominalPolicyActivation(joint_count=1, duration_s=3.0)
+    provenance = activation.provenance
+    assert provenance["source"] == (
+        "NVlabs/GR00T-WholeBodyControl::G1Deploy::InitControl"
+    )
+    assert provenance["init_interpolation"] == (
+        "measured_current_to_nominal_each_tick"
+    )
+    assert provenance["settle_gate"] == {
+        "max_joint_error_rad": 0.10,
+        "max_joint_velocity_rps": 0.20,
+        "max_gyro_rps": 0.15,
+        "max_abs_roll_pitch_rad": 0.15,
+        "required_consecutive_samples": 10,
+        "timeout_s": 3.0,
+        "sample_period_ms": 20,
+        "stages": ["tethered", "support_off"],
+    }
+
+
+@pytest.mark.parametrize("invalid_duration", [True, 2.999, 3.001, float("nan")])
+def test_nominal_policy_activation_requires_exact_official_duration(
     invalid_duration,
 ) -> None:
-    with pytest.raises(ValueError, match="at least 3s"):
+    with pytest.raises(ValueError, match="exactly 3s"):
         NominalPolicyActivation(duration_s=invalid_duration)
 
 
@@ -395,7 +572,7 @@ def test_nominal_policy_activation_requires_exact_integer_joint_count(
 def test_nominal_policy_activation_abort_invalidates_inflight_decision():
     activation = NominalPolicyActivation(joint_count=1, duration_s=3.0)
     assert activation.begin([0.1], tick_ms=10_000) is True
-    stale = activation.propose([0.0], tick_ms=11_000)
+    stale = activation.propose([0.0], measured=[0.1], tick_ms=11_000)
     previous_epoch = stale.epoch
 
     assert activation.abort() is True
@@ -403,11 +580,11 @@ def test_nominal_policy_activation_abort_invalidates_inflight_decision():
     assert activation.epoch == previous_epoch + 1
     assert activation.commit(stale, stale.targets) is False
     with pytest.raises(RuntimeError, match="not preparing"):
-        activation.propose([0.0], tick_ms=12_000)
+        activation.propose([0.0], measured=[0.0], tick_ms=12_000)
 
     assert activation.begin([0.08], tick_ms=20_000) is True
     with pytest.raises(ValueError, match="moved backwards"):
-        activation.propose([0.0], tick_ms=19_999)
+        activation.propose([0.0], measured=[0.0], tick_ms=19_999)
 
 
 def test_official_nominal_ramp_preserves_captured_right_wrist_slew_limit():
@@ -431,12 +608,16 @@ def test_official_nominal_ramp_preserves_captured_right_wrist_slew_limit():
     )
     assert projected.targets == pytest.approx((boundary + 0.08,))
     assert projected.constrained_joints == 1
+    assert projected.constrained_joint_indices == (0,)
+    assert projected.continuous_saturation_s[0] == pytest.approx(0.02)
     assert projected.max_step_rad == pytest.approx(0.08)
 
     assert activation.begin([boundary], tick_ms=1_000) is True
     last = boundary
     for frame in range(151):
-        decision = activation.propose([0.0], tick_ms=1_000 + frame * 20)
+        decision = activation.propose(
+            [0.0], measured=[boundary], tick_ms=1_000 + frame * 20,
+        )
         guarded = guard.apply(
             decision.targets,
             measured=[boundary],
@@ -446,6 +627,7 @@ def test_official_nominal_ramp_preserves_captured_right_wrist_slew_limit():
         completed = activation.commit(decision, guarded.targets)
         last = guarded.targets[0]
     assert completed is True
+    assert activation.phase == "SETTLING_TETHERED"
     assert last == pytest.approx(0.0)
 
 
@@ -501,19 +683,31 @@ def test_command_zero_is_read_only_and_requires_the_filtered_tail_to_stop():
     assert guard.command_zero is True
 
 
-def test_sub_sonic_terminal_velocity_is_held_idle():
+@pytest.mark.parametrize(
+    ("vx", "vy", "wz"),
+    [
+        (0.199, 0.0, 0.0),
+        (0.19, 0.0, 0.25),
+    ],
+)
+def test_active_sub_sonic_translation_is_rejected(vx, vy, wz):
     now = [100.0]
     guard = CmdVelGuard(
-        max_linear_mps=0.35,
-        min_walk_command_mps=0.10,
         timeout_s=0.25,
         clock=lambda: now[0],
         smoothing_alpha=1.0,
     )
-    guard.accept(0.05, 0.0, 0.0)
+    with pytest.raises(ValueError, match="below SONIC SLOW_WALK floor"):
+        guard.accept(vx, vy, wz)
+    assert guard.command_zero is True
+
+
+def test_official_slow_walk_floor_is_reached_on_first_filtered_tick():
+    guard = CmdVelGuard(smoothing_alpha=0.35, clock=lambda: 100.0)
+    guard.accept(0.20, 0.0, 0.0)
     intent = guard.intent(now=100.01, dt=0.02)
-    assert intent.has_movement is False
-    assert intent.mode == "IDLE"
+    assert intent.speed_mps == pytest.approx(0.20)
+    assert intent.has_movement is True
 
 
 def test_angular_only_nav2_command_selects_sonic_turning_plan():
@@ -524,31 +718,36 @@ def test_angular_only_nav2_command_selects_sonic_turning_plan():
     assert intent.mode == "SLOW_WALK"
     assert intent.has_movement is False
     assert intent.speed_mps == pytest.approx(0.0)
-    assert intent.facing_angle_rad == pytest.approx(0.056)
+    assert intent.facing_angle_rad == pytest.approx(0.006)
 
 
-def test_angular_command_starts_from_measured_heading_and_caps_open_loop_lead():
+def test_angular_command_integral_caps_open_loop_lead():
     now = [100.0]
     guard = CmdVelGuard(
         max_angular_rps=0.5,
-        max_facing_lead_rad=0.35,
+        max_facing_lead_rad=0.05,
         clock=lambda: now[0],
         smoothing_alpha=1.0,
     )
     guard.observe_heading(0.6)
-    guard.accept(0.0, 0.0, 0.5)
-    initial = guard.intent(now=100.01, dt=0.2)
-    assert initial.facing_angle_rad == pytest.approx(0.35)
+    for frame in range(20):
+        now[0] += 0.02
+        guard.accept(0.0, 0.0, 0.5)
+        saturated = guard.intent(now=now[0], dt=0.02)
+    assert guard.command_facing == pytest.approx(0.20)
+    assert saturated.facing_angle_rad == pytest.approx(0.05)
 
-    saturated = guard.intent(now=100.02, dt=2.0)
-    assert saturated.facing_angle_rad == pytest.approx(0.35)
-
+    # Measured progress only moves the output lead window; it does not get
+    # added back into the command integral.
     guard.observe_heading(0.7)
-    progressed = guard.intent(now=100.03, dt=0.02)
-    assert progressed.facing_angle_rad == pytest.approx(0.36)
+    now[0] += 0.02
+    guard.accept(0.0, 0.0, 0.5)
+    progressed = guard.intent(now=now[0], dt=0.02)
+    assert guard.command_facing == pytest.approx(0.21)
+    assert progressed.facing_angle_rad == pytest.approx(0.15)
 
 
-def test_reverse_measured_spin_cannot_reverse_the_nav2_facing_target():
+def test_small_reverse_measured_spin_does_not_reverse_command_integral():
     now = [100.0]
     guard = CmdVelGuard(
         max_angular_rps=0.25,
@@ -558,13 +757,12 @@ def test_reverse_measured_spin_cannot_reverse_the_nav2_facing_target():
     )
     guard.observe_heading(0.4)
     guard.accept(0.0, 0.0, 0.2)
-    assert guard.intent(now=100.01, dt=0.02).facing_angle_rad == pytest.approx(0.05)
+    assert guard.intent(now=100.01, dt=0.02).facing_angle_rad == pytest.approx(0.004)
 
-    # A physical response in the wrong direction is observation evidence for
-    # the bridge interlock; it must never make a left Nav2 command become a
-    # right-facing SONIC target while that interlock is being delivered.
-    guard.observe_heading(0.3)
-    assert guard.intent(now=100.02, dt=0.02).facing_angle_rad == pytest.approx(0.05)
+    guard.observe_heading(0.39)
+    second = guard.intent(now=100.02, dt=0.02)
+    assert guard.command_facing == pytest.approx(0.008)
+    assert second.facing_angle_rad == pytest.approx(0.008)
 
 
 def test_new_nav2_action_preserves_the_planner_canonical_facing_after_idle():
@@ -572,13 +770,13 @@ def test_new_nav2_action_preserves_the_planner_canonical_facing_after_idle():
     guard = CmdVelGuard(clock=lambda: now[0], smoothing_alpha=1.0)
     guard.observe_heading(0.2)
     guard.accept(0.0, 0.0, 0.5)
-    guard.intent(now=100.01, dt=0.2)
+    guard.intent(now=100.01, dt=0.02)
     guard.accept(0.0, 0.0, 0.0)
     guard.observe_heading(-0.4)
     guard.accept(0.2, 0.0, 0.0)
     forward = guard.intent(now=100.02, dt=0.02)
-    assert forward.movement_angle_rad == pytest.approx(0.05)
-    assert forward.facing_angle_rad == pytest.approx(0.05)
+    assert forward.movement_angle_rad == pytest.approx(0.01)
+    assert forward.facing_angle_rad == pytest.approx(0.01)
 
 
 def test_sequential_spin_actions_accumulate_in_the_sonic_planner_frame():
@@ -590,28 +788,28 @@ def test_sequential_spin_actions_accumulate_in_the_sonic_planner_frame():
     )
     guard.observe_heading(0.2)
     guard.accept(0.0, 0.0, 0.2)
-    assert guard.intent(now=100.01, dt=0.02).facing_angle_rad == pytest.approx(0.15)
+    assert guard.intent(now=100.01, dt=0.02).facing_angle_rad == pytest.approx(0.004)
     guard.accept(0.0, 0.0, 0.0)
     guard.intent(now=100.02, dt=0.02)
 
     guard.observe_heading(0.35)
     guard.accept(0.0, 0.0, 0.2)
-    assert guard.intent(now=100.03, dt=0.02).facing_angle_rad == pytest.approx(0.30)
+    assert guard.intent(now=100.03, dt=0.02).facing_angle_rad == pytest.approx(0.008)
 
 
 def test_base_forward_command_tracks_accumulated_sonic_facing():
     now = [100.0]
     guard = CmdVelGuard(clock=lambda: now[0], smoothing_alpha=1.0)
     guard.accept(0.0, 0.0, 0.5)
-    turn = guard.intent(now=100.01, dt=0.4)
-    assert turn.facing_angle_rad == pytest.approx(0.25)
+    turn = guard.intent(now=100.01, dt=0.02)
+    assert turn.facing_angle_rad == pytest.approx(0.01)
     guard.accept(0.2, 0.0, 0.0)
     forward = guard.intent(now=100.02, dt=0.02)
-    assert forward.movement_angle_rad == pytest.approx(0.25)
-    assert forward.facing_angle_rad == pytest.approx(0.25)
+    assert forward.movement_angle_rad == pytest.approx(0.01)
+    assert forward.facing_angle_rad == pytest.approx(0.01)
 
 
-def test_translation_correction_does_not_follow_measured_yaw_drift():
+def test_translation_drift_does_not_feed_back_into_command_integral():
     now = [100.0]
     guard = CmdVelGuard(
         max_facing_lead_rad=0.15,
@@ -621,19 +819,109 @@ def test_translation_correction_does_not_follow_measured_yaw_drift():
     )
     guard.observe_heading(0.0)
     guard.accept(0.2, 0.0, 0.25)
-    initial = guard.intent(now=100.01, dt=1.0)
-    assert initial.facing_angle_rad == pytest.approx(0.05)
+    initial = guard.intent(now=100.01, dt=0.02)
+    assert initial.facing_angle_rad == pytest.approx(0.005)
 
-    # A large physical overshoot is evidence for a safety interlock; it must
-    # not become a new movement/facing target and create positive feedback.
+    # The emitted target remains within the measured-yaw lead bound, while the
+    # hidden command goal still advances only by the second admitted wz tick.
     guard.observe_heading(0.7)
-    drifted = guard.intent(now=100.02, dt=1.0)
-    assert drifted.facing_angle_rad == pytest.approx(0.05)
-    assert drifted.movement_angle_rad == pytest.approx(0.05)
+    drifted = guard.intent(now=100.02, dt=0.02)
+    assert guard.command_facing == pytest.approx(0.01)
+    assert drifted.facing_angle_rad == pytest.approx(0.65)
+    assert drifted.movement_angle_rad == pytest.approx(0.65)
 
     guard.accept(0.0, 0.0, 0.0)
     idle = guard.intent(now=100.03, dt=0.02)
-    assert idle.facing_angle_rad == pytest.approx(0.05)
+    assert idle.facing_angle_rad == pytest.approx(0.65)
+
+
+@pytest.mark.parametrize(
+    ("vy", "expected_angle"),
+    [(0.80, math.pi / 2.0), (-0.80, -math.pi / 2.0)],
+)
+def test_lateral_commands_are_mirrored_and_bounded_at_point_four(
+    vy,
+    expected_angle,
+):
+    guard = CmdVelGuard(clock=lambda: 100.0, smoothing_alpha=0.35)
+    guard.accept(0.0, vy, 0.0)
+    intent = guard.intent(now=100.01, dt=0.02)
+    assert intent.speed_mps == pytest.approx(0.40)
+    assert intent.movement_angle_rad == pytest.approx(expected_angle)
+    assert intent.facing_angle_rad == pytest.approx(0.0)
+
+
+def test_straight_translation_never_integrates_facing():
+    now = [100.0]
+    guard = CmdVelGuard(clock=lambda: now[0], smoothing_alpha=1.0)
+    guard.observe_heading(0.3)
+    guard.accept(0.20, 0.0, 0.0)
+    for _ in range(20):
+        now[0] += 0.02
+        guard.observe_heading(0.3)
+        guard.accept(0.20, 0.0, 0.0)
+        intent = guard.intent(now=now[0], dt=0.02)
+        assert intent.facing_angle_rad == pytest.approx(0.0)
+        assert guard.command_facing == pytest.approx(0.0)
+
+
+def test_mixed_curve_facing_integral_accumulates_and_mirrors_past_old_cap():
+    def run_curve(sign: float) -> tuple[float, float]:
+        now = [100.0]
+        guard = CmdVelGuard(clock=lambda: now[0], smoothing_alpha=1.0)
+        heading_origin = 0.3
+        guard.observe_heading(heading_origin)
+        guard.accept(0.20, 0.0, sign * 0.25)
+        intent = None
+        for frame in range(1, 31):
+            measured_progress = sign * (frame - 1) * 0.005
+            guard.observe_heading(heading_origin + measured_progress)
+            now[0] += 0.02
+            guard.accept(0.20, 0.0, sign * 0.25)
+            intent = guard.intent(now=now[0], dt=0.02)
+            emitted_lead = CmdVelGuard._wrap_angle(
+                intent.facing_angle_rad - measured_progress
+            )
+            assert abs(emitted_lead) <= 0.05 + 1e-12
+        assert intent is not None
+        return guard.command_facing, intent.facing_angle_rad
+
+    positive_goal, positive_output = run_curve(1.0)
+    negative_goal, negative_output = run_curve(-1.0)
+    assert positive_goal > 0.05
+    assert positive_goal == pytest.approx(0.15)
+    assert negative_goal == pytest.approx(-positive_goal)
+    assert negative_output == pytest.approx(-positive_output)
+
+
+@pytest.mark.parametrize("invalid_dt", [float("nan"), 0.0, 0.10])
+def test_invalid_integration_dt_fails_without_advancing_facing(invalid_dt):
+    guard = CmdVelGuard(clock=lambda: 100.0, smoothing_alpha=1.0)
+    guard.observe_heading(0.0)
+    guard.accept(0.20, 0.0, 0.25)
+    first = guard.intent(now=100.01, dt=0.02)
+    with pytest.raises(ValueError, match="integration dt"):
+        guard.intent(now=100.02, dt=invalid_dt)
+    assert guard.command_facing == pytest.approx(0.005)
+    assert first.facing_angle_rad == pytest.approx(0.005)
+
+
+def test_stop_freezes_and_next_action_reanchors_command_facing():
+    guard = CmdVelGuard(clock=lambda: 100.0, smoothing_alpha=1.0)
+    guard.observe_heading(0.0)
+    guard.accept(0.20, 0.0, 0.25)
+    moving = guard.intent(now=100.01, dt=0.02)
+    guard.stop(source="test_revoke")
+    guard.observe_heading(1.0)
+    stopped = guard.intent(now=100.02, dt=0.02)
+    assert stopped.facing_angle_rad == pytest.approx(moving.facing_angle_rad)
+    assert guard.command_facing == pytest.approx(moving.facing_angle_rad)
+
+    guard.accept(0.20, 0.0, -0.25)
+    restarted = guard.intent(now=100.03, dt=0.02)
+    assert restarted.facing_angle_rad == pytest.approx(0.0)
+    assert guard.command_facing == pytest.approx(0.0)
+
 
 
 def test_replan_gate_debounces_small_nav2_corrections_but_stops_immediately():
@@ -690,6 +978,7 @@ def test_cmd_vel_guard_uses_wall_age_but_simulation_dt_for_facing_integration():
     assert stale.stale is True
     assert stale.mode == "IDLE"
     assert stale.facing_angle_rad == pytest.approx(0.004)
+    assert guard.command_zero is True
 
 
 def test_navigation_arm_guard_passes_valid_policy_target_unchanged():

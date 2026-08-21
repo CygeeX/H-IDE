@@ -75,9 +75,10 @@ def health_response(
     return {
         "request_id": str(REQUEST_ID),
         "ok": True,
-        "schema_version": "h-ide.sonic-health/v2",
+        "schema_version": "h-ide.sonic-health/v3",
         "robot_id": "g1-sim",
         "driver_boot_id": str(driver_boot_id),
+        "driver_session_id": "31000000-0000-4000-8000-000000000003",
         "status": status,
         "terminal_fault": terminal_fault,
         "reason": reason,
@@ -219,6 +220,45 @@ def test_fault_latch_publishes_before_stop_and_deduplicates() -> None:
     assert first.control_generation == 42
     assert first.reason == "first cause"
     assert latch.complete is True
+
+
+def test_fault_latch_reset_requires_exact_completed_event_and_keeps_sequence() -> None:
+    event_ids = iter(
+        [
+            EVENT_ID,
+            UUID("10000000-0000-4000-8000-000000000002"),
+        ]
+    )
+    latch = MotionFaultLatch(
+        robot_id="g1-sim",
+        localization_epoch_id="epoch-1",
+        producer_boot_id=BRIDGE_BOOT_ID,
+        event_id_factory=lambda: next(event_ids),
+    )
+    first = latch.trip(
+        control_generation=7,
+        source="gait_adapter",
+        code="GAIT_ADAPTER_FAULT",
+        reason="first",
+        publish=lambda _event: None,
+        local_stop=lambda: None,
+    )
+    with pytest.raises(RuntimeError, match="identity mismatch"):
+        latch.reset(UUID("90000000-0000-4000-8000-000000000009"))
+    assert latch.reset(first.event_id) is first
+    assert latch.event is None
+    assert latch.complete is False
+
+    second = latch.trip(
+        control_generation=8,
+        source="navigation_guard",
+        code="NAVIGATION_GUARD_FAULT",
+        reason="second",
+        publish=lambda _event: None,
+        local_stop=lambda: None,
+    )
+    assert second.source_sequence == 2
+    assert second.event_id != first.event_id
 
 
 def test_failed_publication_still_stops_and_retries_the_same_event() -> None:

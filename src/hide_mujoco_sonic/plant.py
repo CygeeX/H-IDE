@@ -20,7 +20,7 @@ import signal
 import sys
 import threading
 import time
-from typing import Iterable
+from typing import Callable, Iterable
 from urllib.parse import parse_qs, urlparse
 import uuid
 
@@ -85,6 +85,9 @@ class _SupportCommandState:
     updated_at: float
     safety_stop_epoch: int
     last_rearm_generation: int
+    motion_fault: str | None
+    last_cleared_motion_fault: str | None
+    fall_arrest_release_epoch_requested: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +96,14 @@ class _SupportPhysicsState:
     fault_updated_at: float
     last_simulation_time: float | None
     safety_stop_epoch_floor: int
+
+
+@dataclass(frozen=True, slots=True)
+class _SupportBandState:
+    enabled: bool
+    release_epoch_confirmed: int | None
+    release_epoch_rejected: int | None
+    updated_at: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,9 +128,21 @@ class _PlantDynamicsSnapshot:
     root_qvel: tuple[float | None, ...]
     root_qacc: tuple[float | None, ...]
     root_qacc_warmstart: tuple[float | None, ...]
+    robot_center_of_mass_world_m: tuple[float | None, ...]
     potential_energy_j: float | None
     kinetic_energy_j: float | None
     warning_counts: tuple[tuple[str, int], ...]
+    foot_ground_sides: tuple[str, ...]
+    foot_ground_forces_n: tuple[tuple[str, float], ...]
+    foot_touchdown_counts: tuple[tuple[str, int], ...]
+    foot_liftoff_counts: tuple[tuple[str, int], ...]
+    obstacle_contact_pairs: tuple[tuple[str, str, float | None], ...]
+    nonfoot_ground_pairs: tuple[tuple[str, str, float | None], ...]
+    obstacle_contact_sample_count: int
+    obstacle_contact_event_count: int
+    nonfoot_ground_contact_sample_count: int
+    nonfoot_ground_contact_event_count: int
+    contact_evidence_valid: bool
 
 
 _PHYSICS_WARNING_NAMES = (
@@ -141,18 +164,23 @@ class PlantSupportController:
 
     MODES = frozenset({"startup", "idle", "locomotion", "safety_stop"})
 
-    def __init__(self) -> None:
+    def __init__(self, *, fall_arrest_enabled: bool = True) -> None:
         if sys.implementation.name != "cpython":
             raise RuntimeError("lock-free Plant support snapshots require CPython")
         gil_enabled = getattr(sys, "_is_gil_enabled", None)
         if callable(gil_enabled) and not gil_enabled():
             raise RuntimeError("lock-free Plant support snapshots require the GIL")
         now = time.time()
+        if not isinstance(fall_arrest_enabled, bool):
+            raise TypeError("fall_arrest_enabled must be a boolean")
         self._command_state = _SupportCommandState(
             mode="startup",
             updated_at=now,
             safety_stop_epoch=0,
             last_rearm_generation=-1,
+            motion_fault=None,
+            last_cleared_motion_fault=None,
+            fall_arrest_release_epoch_requested=None,
         )
         self._physics_state = _SupportPhysicsState(
             fault=None,
@@ -160,6 +188,18 @@ class PlantSupportController:
             last_simulation_time=None,
             safety_stop_epoch_floor=0,
         )
+        self._band_state = _SupportBandState(
+            enabled=fall_arrest_enabled,
+            # Epoch zero means this Plant has no elastic band to release.
+            # Positive epochs are reserved for an explicit SONIC activation.
+            release_epoch_confirmed=None if fall_arrest_enabled else 0,
+            release_epoch_rejected=None,
+            updated_at=now,
+        )
+        # Serializes the rare one-way band release with every stop/fault
+        # transition. It is deliberately separate from the HTTP writer lock:
+        # an urgent physics fault must never wait behind a slow request.
+        self._release_transition_lock = threading.Lock()
         # Only HTTP/background command writers use this lock.  Physics reads
         # immutable state references and publishes its own immutable state, so
         # an arbitrarily slow request can never delay mj_step/LowState.
@@ -182,7 +222,7 @@ class PlantSupportController:
             raise ValueError(
                 f"support mode must be one of {', '.join(sorted(self.MODES))}"
             )
-        with self._write_lock:
+        with self._write_lock, self._release_transition_lock:
             physics = self._physics_state
             command = self._command_state
             effective_mode = "safety_stop" if physics.fault is not None else command.mode
@@ -225,12 +265,16 @@ class PlantSupportController:
             or generation <= 0
         ):
             raise ValueError("rearm generation must be a positive integer")
-        with self._write_lock:
+        with self._write_lock, self._release_transition_lock:
             physics = self._physics_state
             command = self._command_state
             if physics.fault is not None:
                 raise ValueError(
                     f"plant physics fault is latched: {physics.fault}"
+                )
+            if command.motion_fault is not None:
+                raise ValueError(
+                    "plant motion fault must be explicitly reset before rearm"
                 )
             if command.mode != "safety_stop":
                 raise ValueError("plant rearm requires a latched safety_stop")
@@ -250,8 +294,168 @@ class PlantSupportController:
             )
             return self.mode
 
+    def latch_motion_fault(self, reason: str) -> bool:
+        """Hold a recoverable navigation fault without stopping MuJoCo."""
+
+        detail = str(reason).strip()
+        if not detail or len(detail) > 512:
+            raise ValueError("plant motion fault reason must contain 1..512 characters")
+        with self._write_lock, self._release_transition_lock:
+            if self._physics_state.fault is not None:
+                raise ValueError(
+                    f"plant physics fault is latched: {self._physics_state.fault}"
+                )
+            command = self._command_state
+            if command.motion_fault is not None:
+                if command.motion_fault != detail:
+                    raise ValueError("plant already carries another motion fault")
+                return False
+            self._command_state = replace(
+                command,
+                mode="safety_stop",
+                updated_at=time.time(),
+                safety_stop_epoch=command.safety_stop_epoch + 1,
+                motion_fault=detail,
+            )
+            return True
+
+    def clear_motion_fault(self, reason: str) -> bool:
+        """Clear only the named recoverable fault, retaining safety stop."""
+
+        detail = str(reason).strip()
+        if not detail or len(detail) > 512:
+            raise ValueError("plant motion fault reason must contain 1..512 characters")
+        with self._write_lock, self._release_transition_lock:
+            if self._physics_state.fault is not None:
+                raise ValueError(
+                    f"plant physics fault is latched: {self._physics_state.fault}"
+                )
+            command = self._command_state
+            if command.mode != "safety_stop":
+                raise ValueError("plant motion fault reset requires safety_stop")
+            if command.motion_fault is None:
+                if command.last_cleared_motion_fault == detail:
+                    return False
+                raise ValueError("plant has no recoverable motion fault")
+            if command.motion_fault != detail:
+                raise ValueError("plant motion fault identity mismatch")
+            self._command_state = replace(
+                command,
+                updated_at=time.time(),
+                motion_fault=None,
+                last_cleared_motion_fault=detail,
+            )
+            return True
+
+    def request_fall_arrest_release(self, activation_epoch: int) -> bool:
+        """Request a one-way elastic-band release at a safe boundary."""
+
+        if (
+            isinstance(activation_epoch, bool)
+            or not isinstance(activation_epoch, int)
+            or activation_epoch < 0
+        ):
+            raise ValueError(
+                "fall-arrest release activation epoch must be a non-negative integer"
+            )
+        with self._write_lock, self._release_transition_lock:
+            physics = self._physics_state
+            command = self._command_state
+            band = self._band_state
+            if physics.fault is not None:
+                raise ValueError(
+                    f"plant physics fault is latched: {physics.fault}"
+                )
+            if command.motion_fault is not None or command.mode == "safety_stop":
+                raise ValueError(
+                    "fall-arrest release is forbidden at a motion safety boundary"
+                )
+            # Epoch zero is reserved for the legacy bounded startup timer.
+            # Explicit SONIC activation release must happen only from IDLE.
+            if activation_epoch > 0 and command.mode != "idle":
+                raise ValueError(
+                    "fall-arrest release requires confirmed idle support"
+                )
+            if band.release_epoch_rejected is not None:
+                if band.release_epoch_rejected == activation_epoch:
+                    raise ValueError(
+                        "fall-arrest release was rejected at the physics boundary"
+                    )
+                raise ValueError(
+                    "fall-arrest release already belongs to another activation"
+                )
+            if not band.enabled:
+                if band.release_epoch_confirmed not in {0, activation_epoch}:
+                    raise ValueError(
+                        "fall-arrest release already belongs to another activation"
+                    )
+                return False
+            existing = command.fall_arrest_release_epoch_requested
+            if existing is not None:
+                if existing != activation_epoch:
+                    raise ValueError(
+                        "fall-arrest release already belongs to another activation"
+                    )
+                return False
+            self._command_state = replace(
+                command,
+                updated_at=time.time(),
+                fall_arrest_release_epoch_requested=activation_epoch,
+            )
+            return True
+
+    def consume_fall_arrest_release(
+        self,
+        release_band: Callable[[], None],
+    ) -> int | None:
+        """Disable and confirm the band on the authoritative simulation thread."""
+
+        if not callable(release_band):
+            raise TypeError("fall-arrest release callback must be callable")
+        with self._release_transition_lock:
+            command = self._command_state
+            physics = self._physics_state
+            band = self._band_state
+            epoch = command.fall_arrest_release_epoch_requested
+            if epoch is None or not band.enabled:
+                return None
+            if band.release_epoch_rejected == epoch:
+                return None
+            if (
+                physics.fault is not None
+                or command.motion_fault is not None
+                or command.mode == "safety_stop"
+                or (epoch > 0 and command.mode != "idle")
+            ):
+                # A request is only an intent. The simulation thread owns the
+                # final release boundary and permanently rejects an epoch that
+                # races a stop/fault/mode transition, so it cannot be consumed
+                # later after an unrelated reset.
+                self._band_state = replace(
+                    band,
+                    release_epoch_rejected=epoch,
+                    updated_at=time.time(),
+                )
+                return None
+            try:
+                release_band()
+            except Exception:
+                self._band_state = replace(
+                    band,
+                    release_epoch_rejected=epoch,
+                    updated_at=time.time(),
+                )
+                raise
+            self._band_state = replace(
+                band,
+                enabled=False,
+                release_epoch_confirmed=epoch,
+                updated_at=time.time(),
+            )
+            return epoch
+
     def finish_startup(self) -> str:
-        with self._write_lock:
+        with self._write_lock, self._release_transition_lock:
             command = self._command_state
             if self._physics_state.fault is None and command.mode == "startup":
                 self._command_state = replace(
@@ -265,25 +469,27 @@ class PlantSupportController:
         detail = str(reason).strip()
         if not detail:
             raise ValueError("plant physics fault requires a reason")
-        physics = self._physics_state
-        if physics.fault is not None:
-            return False
-        command = self._command_state
-        current_epoch = max(
-            command.safety_stop_epoch,
-            physics.safety_stop_epoch_floor,
-        )
-        # A new physics fault is a distinct stop authority even when an HTTP
-        # safety_stop/rearm races this lock-free publisher.  Advancing the
-        # floor unconditionally prevents a concurrent rearm from hiding it.
-        current_epoch += 1
-        self._physics_state = replace(
-            physics,
-            fault=detail,
-            fault_updated_at=time.time(),
-            safety_stop_epoch_floor=current_epoch,
-        )
-        return True
+        with self._release_transition_lock:
+            physics = self._physics_state
+            if physics.fault is not None:
+                return False
+            command = self._command_state
+            current_epoch = max(
+                command.safety_stop_epoch,
+                physics.safety_stop_epoch_floor,
+            )
+            # A new physics fault is a distinct stop authority even when an
+            # HTTP safety_stop/rearm races this lock-free publisher. Advancing
+            # the floor unconditionally prevents a concurrent rearm from
+            # hiding it.
+            current_epoch += 1
+            self._physics_state = replace(
+                physics,
+                fault=detail,
+                fault_updated_at=time.time(),
+                safety_stop_epoch_floor=current_epoch,
+            )
+            return True
 
     def observe_simulation_time(self, value: float) -> bool:
         """Latch an unrecoverable fault when MuJoCo implicitly resets time."""
@@ -329,19 +535,31 @@ class PlantSupportController:
         # CPython GIL.  This projection never acquires the HTTP writer lock.
         command = self._command_state
         physics = self._physics_state
+        band = self._band_state
         fault = physics.fault
         mode = "safety_stop" if fault is not None else command.mode
         generation = command.last_rearm_generation
         return {
             "mode": mode,
-            "updatedAt": max(command.updated_at, physics.fault_updated_at),
+            "updatedAt": max(
+                command.updated_at,
+                physics.fault_updated_at,
+                band.updated_at,
+            ),
             "fault": fault,
+            "motionFault": command.motion_fault,
             "safetyStopLatched": mode == "safety_stop",
             "safetyStopEpoch": max(
                 command.safety_stop_epoch,
                 physics.safety_stop_epoch_floor,
             ),
             "lastRearmGeneration": None if generation < 0 else generation,
+            "fallArrestEnabled": band.enabled,
+            "fallArrestReleaseRequestedEpoch": (
+                command.fall_arrest_release_epoch_requested
+            ),
+            "fallArrestReleaseConfirmedEpoch": band.release_epoch_confirmed,
+            "fallArrestReleaseRejectedEpoch": band.release_epoch_rejected,
         }
 
 
@@ -508,6 +726,8 @@ class PlantDynamicsEvidence:
     _ROOT_QPOS_ORDER = ("x", "y", "z", "qw", "qx", "qy", "qz")
     _ROOT_QVEL_ORDER = tuple(f"qvel[{index}]" for index in range(6))
     _ROOT_QACC_ORDER = tuple(f"qacc[{index}]" for index in range(6))
+    _FOOT_CONTACT_FORCE_THRESHOLD_N = 5.0
+    _FOOT_CONTACT_DEBOUNCE_SAMPLES = 5
 
     def __init__(
         self,
@@ -547,8 +767,94 @@ class PlantDynamicsEvidence:
                 raise ValueError("support attached body must have a stable name")
             self.attached_body_id = body_id
             self.attached_body_name = str(body_name)
+        body_parent_ids = tuple(int(value) for value in model.body_parentid)
+
+        def body_descends_from(body_id: int, ancestor_id: int) -> bool:
+            current = int(body_id)
+            while current > 0:
+                if current == ancestor_id:
+                    return True
+                current = body_parent_ids[current]
+            return current == ancestor_id
+
+        self._body_names = tuple(
+            str(
+                mujoco_api.mj_id2name(
+                    model,
+                    mujoco_api.mjtObj.mjOBJ_BODY,
+                    body_id,
+                )
+                or f"body#{body_id}"
+            )
+            for body_id in range(int(model.nbody))
+        )
+        self._geom_names = tuple(
+            str(
+                mujoco_api.mj_id2name(
+                    model,
+                    mujoco_api.mjtObj.mjOBJ_GEOM,
+                    geom_id,
+                )
+                or f"geom#{geom_id}"
+            )
+            for geom_id in range(int(model.ngeom))
+        )
+        self._robot_body_ids = frozenset(
+            body_id
+            for body_id in range(int(model.nbody))
+            if body_descends_from(body_id, self.root_body_id)
+        )
+        self._robot_geom_ids = frozenset(
+            geom_id
+            for geom_id in range(int(model.ngeom))
+            if int(model.geom_bodyid[geom_id]) in self._robot_body_ids
+        )
+        foot_side_by_body: dict[int, str] = {}
+        for side in ("left", "right"):
+            ankle_id = int(
+                mujoco_api.mj_name2id(
+                    model,
+                    mujoco_api.mjtObj.mjOBJ_BODY,
+                    f"{side}_ankle_roll_link",
+                )
+            )
+            if ankle_id < 0:
+                continue
+            for body_id in self._robot_body_ids:
+                if body_descends_from(body_id, ankle_id):
+                    foot_side_by_body[body_id] = side
+        self._foot_side_by_body = foot_side_by_body
+        plane_type = int(mujoco_api.mjtGeom.mjGEOM_PLANE)
+        self._floor_geom_ids = frozenset(
+            geom_id
+            for geom_id in range(int(model.ngeom))
+            if self._geom_names[geom_id] == "office_v2_floor"
+            or (
+                int(model.geom_type[geom_id]) == plane_type
+                and int(model.geom_bodyid[geom_id]) == 0
+            )
+        )
+        self._static_obstacle_geom_ids = frozenset(
+            geom_id
+            for geom_id in range(int(model.ngeom))
+            if geom_id not in self._robot_geom_ids
+            and geom_id not in self._floor_geom_ids
+            and int(model.geom_contype[geom_id]) != 0
+            and int(model.geom_conaffinity[geom_id]) != 0
+        )
         self._sequence = 0
         self._snapshot: _PlantDynamicsSnapshot | None = None
+        self._obstacle_contact_sample_count = 0
+        self._obstacle_contact_event_count = 0
+        self._nonfoot_ground_contact_sample_count = 0
+        self._nonfoot_ground_contact_event_count = 0
+        self._obstacle_contact_active = False
+        self._nonfoot_ground_contact_active = False
+        self._foot_contact_active = {"left": False, "right": False}
+        self._foot_contact_candidate = {"left": False, "right": False}
+        self._foot_contact_candidate_samples = {"left": 0, "right": 0}
+        self._foot_touchdown_counts = {"left": 0, "right": 0}
+        self._foot_liftoff_counts = {"left": 0, "right": 0}
 
     @staticmethod
     def _finite(value: object) -> float | None:
@@ -575,6 +881,84 @@ class PlantDynamicsEvidence:
             for name in _PHYSICS_WARNING_NAMES
         )
 
+    def _contact_evidence(
+        self,
+    ) -> tuple[
+        tuple[tuple[str, float], ...],
+        tuple[tuple[str, str, float | None], ...],
+        tuple[tuple[str, str, float | None], ...],
+    ]:
+        """Classify active contacts without feeding them back into control."""
+
+        foot_forces_n = {"left": 0.0, "right": 0.0}
+        obstacle_pairs: dict[tuple[str, str], float | None] = {}
+        nonfoot_ground_pairs: dict[tuple[str, str], float | None] = {}
+        for contact_index, contact in enumerate(self.data.contact):
+            first = int(contact.geom1)
+            second = int(contact.geom2)
+            if first in self._robot_geom_ids:
+                robot_geom, environment_geom = first, second
+            elif second in self._robot_geom_ids:
+                robot_geom, environment_geom = second, first
+            else:
+                continue
+            if environment_geom not in (
+                self._floor_geom_ids | self._static_obstacle_geom_ids
+            ):
+                continue
+            robot_body_id = int(self.model.geom_bodyid[robot_geom])
+            robot_body = self._body_names[robot_body_id]
+            environment_name = self._geom_names[environment_geom]
+            distance = self._finite(contact.dist)
+            penetration = (
+                None if distance is None else max(0.0, -distance)
+            )
+            key = (robot_body, environment_name)
+            if environment_geom in self._floor_geom_ids:
+                side = self._foot_side_by_body.get(robot_body_id)
+                if side is not None:
+                    force = np.zeros(6, dtype=float)
+                    self.mujoco.mj_contactForce(
+                        self.model,
+                        self.data,
+                        contact_index,
+                        force,
+                    )
+                    normal_force = self._finite(force[0])
+                    if normal_force is None:
+                        raise ValueError("foot contact force is non-finite")
+                    foot_forces_n[side] += max(0.0, normal_force)
+                else:
+                    previous = nonfoot_ground_pairs.get(key)
+                    nonfoot_ground_pairs[key] = (
+                        penetration
+                        if previous is None or penetration is None
+                        else max(previous, penetration)
+                    )
+            else:
+                previous = obstacle_pairs.get(key)
+                obstacle_pairs[key] = (
+                    penetration
+                    if previous is None or penetration is None
+                    else max(previous, penetration)
+                )
+
+        def frozen_pairs(
+            values: dict[tuple[str, str], float | None],
+        ) -> tuple[tuple[str, str, float | None], ...]:
+            return tuple(
+                (robot_body, environment_geom, penetration)
+                for (robot_body, environment_geom), penetration in sorted(
+                    values.items()
+                )
+            )
+
+        return (
+            tuple(sorted(foot_forces_n.items())),
+            frozen_pairs(obstacle_pairs),
+            frozen_pairs(nonfoot_ground_pairs),
+        )
+
     def observe(self, *, captured_at_unix_ns: int | None = None) -> None:
         """Capture the state after one authoritative step without any lock."""
 
@@ -594,6 +978,60 @@ class PlantDynamicsEvidence:
             wrench = self._finite_tuple(
                 self.data.xfrc_applied[self.attached_body_id]
             )
+        contact_evidence_valid = True
+        try:
+            (
+                foot_ground_forces_n,
+                obstacle_contact_pairs,
+                nonfoot_ground_pairs,
+            ) = self._contact_evidence()
+        except Exception:
+            # Contact evidence is diagnostic and must never become a new
+            # physics failure source. Mark the sample invalid so acceptance
+            # fails closed instead of reporting a fabricated zero-contact run.
+            contact_evidence_valid = False
+            foot_ground_forces_n = (("left", 0.0), ("right", 0.0))
+            obstacle_contact_pairs = ()
+            nonfoot_ground_pairs = ()
+        foot_force_map = dict(foot_ground_forces_n)
+        if contact_evidence_valid:
+            for side in ("left", "right"):
+                raw_active = (
+                    float(foot_force_map.get(side, 0.0))
+                    >= self._FOOT_CONTACT_FORCE_THRESHOLD_N
+                )
+                if raw_active == self._foot_contact_candidate[side]:
+                    self._foot_contact_candidate_samples[side] += 1
+                else:
+                    self._foot_contact_candidate[side] = raw_active
+                    self._foot_contact_candidate_samples[side] = 1
+                if (
+                    raw_active != self._foot_contact_active[side]
+                    and self._foot_contact_candidate_samples[side]
+                    >= self._FOOT_CONTACT_DEBOUNCE_SAMPLES
+                ):
+                    self._foot_contact_active[side] = raw_active
+                    if raw_active:
+                        self._foot_touchdown_counts[side] += 1
+                    else:
+                        self._foot_liftoff_counts[side] += 1
+        foot_ground_sides = tuple(
+            side
+            for side in ("left", "right")
+            if self._foot_contact_active[side]
+        )
+        obstacle_active = bool(obstacle_contact_pairs)
+        nonfoot_ground_active = bool(nonfoot_ground_pairs)
+        if obstacle_active:
+            self._obstacle_contact_sample_count += 1
+            if not self._obstacle_contact_active:
+                self._obstacle_contact_event_count += 1
+        if nonfoot_ground_active:
+            self._nonfoot_ground_contact_sample_count += 1
+            if not self._nonfoot_ground_contact_active:
+                self._nonfoot_ground_contact_event_count += 1
+        self._obstacle_contact_active = obstacle_active
+        self._nonfoot_ground_contact_active = nonfoot_ground_active
         self._sequence += 1
         self._snapshot = _PlantDynamicsSnapshot(
             sequence=self._sequence,
@@ -615,9 +1053,31 @@ class PlantDynamicsEvidence:
             root_qacc_warmstart=self._finite_tuple(
                 self.data.qacc_warmstart[:6]
             ),
+            robot_center_of_mass_world_m=self._finite_tuple(
+                self.data.subtree_com[self.root_body_id]
+            ),
             potential_energy_j=energy[0],
             kinetic_energy_j=energy[1],
             warning_counts=self._warning_counts(),
+            foot_ground_sides=foot_ground_sides,
+            foot_ground_forces_n=foot_ground_forces_n,
+            foot_touchdown_counts=tuple(
+                sorted(self._foot_touchdown_counts.items())
+            ),
+            foot_liftoff_counts=tuple(
+                sorted(self._foot_liftoff_counts.items())
+            ),
+            obstacle_contact_pairs=obstacle_contact_pairs,
+            nonfoot_ground_pairs=nonfoot_ground_pairs,
+            obstacle_contact_sample_count=self._obstacle_contact_sample_count,
+            obstacle_contact_event_count=self._obstacle_contact_event_count,
+            nonfoot_ground_contact_sample_count=(
+                self._nonfoot_ground_contact_sample_count
+            ),
+            nonfoot_ground_contact_event_count=(
+                self._nonfoot_ground_contact_event_count
+            ),
+            contact_evidence_valid=contact_evidence_valid,
         )
 
     def capture_state(self) -> dict[str, object]:
@@ -637,11 +1097,15 @@ class PlantDynamicsEvidence:
             *snapshot.root_qvel,
             *snapshot.root_qacc,
             *snapshot.root_qacc_warmstart,
+            *snapshot.robot_center_of_mass_world_m,
             snapshot.simulation_time_s,
             snapshot.potential_energy_j,
             snapshot.kinetic_energy_j,
         )
-        state_finite = all(value is not None for value in finite_values)
+        state_finite = bool(
+            snapshot.contact_evidence_valid
+            and all(value is not None for value in finite_values)
+        )
         total_energy = None
         if (
             snapshot.potential_energy_j is not None
@@ -678,10 +1142,63 @@ class PlantDynamicsEvidence:
                 "qacc": list(snapshot.root_qacc),
                 "qaccWarmstart": list(snapshot.root_qacc_warmstart),
             },
+            "robotCenterOfMass": {
+                "frameId": "world",
+                "positionOrder": ["x", "y", "z"],
+                "positionM": list(snapshot.robot_center_of_mass_world_m),
+            },
             "energy": {
                 "potentialJ": snapshot.potential_energy_j,
                 "kineticJ": snapshot.kinetic_energy_j,
                 "totalJ": total_energy,
+            },
+            "contacts": {
+                "schemaVersion": "h-ide.mujoco-contact-evidence/1",
+                "sampleSequence": snapshot.sequence,
+                "valid": snapshot.contact_evidence_valid,
+                "footGroundSides": list(snapshot.foot_ground_sides),
+                "footGroundForceN": dict(snapshot.foot_ground_forces_n),
+                "footContactThresholdN": (
+                    self._FOOT_CONTACT_FORCE_THRESHOLD_N
+                ),
+                "footContactDebounceSamples": (
+                    self._FOOT_CONTACT_DEBOUNCE_SAMPLES
+                ),
+                "footTouchdownCount": dict(snapshot.foot_touchdown_counts),
+                "footLiftoffCount": dict(snapshot.foot_liftoff_counts),
+                "obstaclePairs": [
+                    {
+                        "robotBody": robot_body,
+                        "staticGeom": static_geom,
+                        "penetrationM": penetration,
+                    }
+                    for robot_body, static_geom, penetration
+                    in snapshot.obstacle_contact_pairs
+                ],
+                "nonFootGroundPairs": [
+                    {
+                        "robotBody": robot_body,
+                        "groundGeom": ground_geom,
+                        "penetrationM": penetration,
+                    }
+                    for robot_body, ground_geom, penetration
+                    in snapshot.nonfoot_ground_pairs
+                ],
+                # Cumulative counters are sampled at the authoritative 250 Hz
+                # physics boundary, so a brief contact cannot disappear
+                # between slower HTTP acceptance polls.
+                "obstacleContactSampleCount": (
+                    snapshot.obstacle_contact_sample_count
+                ),
+                "obstacleContactEventCount": (
+                    snapshot.obstacle_contact_event_count
+                ),
+                "nonFootGroundContactSampleCount": (
+                    snapshot.nonfoot_ground_contact_sample_count
+                ),
+                "nonFootGroundContactEventCount": (
+                    snapshot.nonfoot_ground_contact_event_count
+                ),
             },
             "warningCounts": dict(snapshot.warning_counts),
             "finite": state_finite,
@@ -792,6 +1309,11 @@ class PlantFrameStore:
         self.config = config
         self.support = support
         self.runtime_diagnostics = runtime_diagnostics
+        # The RGB-D producer boot identifies one render stream.  Keep a
+        # separate process-local session identity for successful motion
+        # evidence so a collector cannot splice samples across two Plant
+        # lifetimes that happen to expose the same logical robot/configuration.
+        self.session_id = str(uuid.uuid4())
         # The collector is the sole writer.  HTTP readers load one immutable
         # window reference without touching this commit-only lock, so a slow
         # response can neither block a commit nor observe a torn latest/previous
@@ -998,6 +1520,7 @@ class PlantFrameStore:
             "physicsStatus": physics_status,
             "observationStatus": observation_status,
             "schemaVersion": "h-ide.mujoco-capture/2",
+            "sessionId": self.session_id,
             "robotId": self.config.robot_id,
             "sourceMode": "synthetic",
             "sourceId": f"mujoco:unitree-g1:{self.config.robot_id}",
@@ -1204,6 +1727,9 @@ class PlantFrameStore:
                         "/support",
                         "/support/rearm",
                         "/support/fault",
+                        "/support/motion-fault",
+                        "/support/motion-fault/reset",
+                        "/support/fall-arrest/release",
                     }:
                         self.send_error(404)
                         return
@@ -1229,7 +1755,7 @@ class PlantFrameStore:
                                     "support rearm request must contain only generation"
                                 )
                             store.support.rearm(payload.get("generation"))
-                        else:
+                        elif parsed.path == "/support/fault":
                             if set(payload) != {"reason"}:
                                 raise ValueError(
                                     "support fault request must contain only reason"
@@ -1240,6 +1766,31 @@ class PlantFrameStore:
                                     "support fault reason must contain 1..512 characters"
                                 )
                             store.support.latch_fault(reason)
+                        elif parsed.path in {
+                            "/support/motion-fault",
+                            "/support/motion-fault/reset",
+                        }:
+                            if set(payload) != {"reason"}:
+                                raise ValueError(
+                                    "motion fault request must contain only reason"
+                                )
+                            reason = str(payload.get("reason", "")).strip()
+                            if not reason or len(reason) > 512:
+                                raise ValueError(
+                                    "motion fault reason must contain 1..512 characters"
+                                )
+                            if parsed.path == "/support/motion-fault":
+                                store.support.latch_motion_fault(reason)
+                            else:
+                                store.support.clear_motion_fault(reason)
+                        else:
+                            if set(payload) != {"activationEpoch"}:
+                                raise ValueError(
+                                    "fall-arrest release must contain only activationEpoch"
+                                )
+                            store.support.request_fall_arrest_release(
+                                payload.get("activationEpoch")
+                            )
                         body = json.dumps(
                             store.support.state(),
                             separators=(",", ":"),
@@ -1370,11 +1921,17 @@ def run_plant(config: SimConfig) -> int:
     # complete /cmd_vel and produces the official lowcmd joint targets; this
     # shim does not write qpos or motor commands.
     support_band = getattr(sim_env, "elastic_band", None)
-    support_controller = PlantSupportController()
+    support_controller = PlantSupportController(
+        fall_arrest_enabled=support_band is not None
+    )
     if support_band is not None:
         original_band_advance = support_band.Advance
 
         def _fall_arrest_support(pose):
+            if support_controller.consume_fall_arrest_release(
+                lambda: setattr(support_band, "enable", False)
+            ) is not None:
+                return np.zeros(6, dtype=float)
             # Snapshot the mode before checking the terminal latch.  If an
             # HTTP fault arrives between these two reads, require_healthy()
             # aborts.  If it arrives immediately afterwards, this one in-flight
@@ -1474,7 +2031,23 @@ def run_plant(config: SimConfig) -> int:
             if bridge is None:
                 return
             time.sleep(config.startup_support_s)
-            support_band.enable = False
+            try:
+                support_controller.request_fall_arrest_release(0)
+            except ValueError:
+                # An explicit positive activation epoch may have already
+                # claimed or completed the one-way release. The legacy timer
+                # must never overwrite that identity or emit a daemon-thread
+                # traceback; any other rejection remains a real error.
+                release_state = support_controller.state()
+                if (
+                    release_state["fallArrestEnabled"] is False
+                    or release_state["fallArrestReleaseRequestedEpoch"] not in {
+                        None,
+                        0,
+                    }
+                ):
+                    return
+                raise
 
         support_release = threading.Thread(
             target=release_support_after_control_handoff,
@@ -1523,11 +2096,11 @@ def run_plant(config: SimConfig) -> int:
             unix_ns=time.time_ns(),
         )
         try:
-            # A terminal motion fault is latched by the bridge before it asks
-            # SONIC to freeze any joint target.  Check it before entering the
-            # upstream step so the Plant exits instead of integrating a
-            # dynamically unsupported posture.  The support callback repeats
-            # the check at the last safe point before mj_step.
+            # Only numerical/physics corruption terminates this authority
+            # process. Recoverable motion faults keep stepping a frozen DDS
+            # hold so both viewers and post-incident evidence remain alive.
+            # The support callback repeats this physics-health check at the
+            # last safe point before mj_step.
             support_controller.require_healthy()
             result = original_sim_step()
             # Capture the exact post-step evidence before the terminal monitor

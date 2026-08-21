@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass, replace
+import json
 import math
 import os
+import threading
 import time
 from typing import Callable, Iterable, Mapping, Protocol
 from uuid import UUID, uuid4
@@ -48,7 +50,7 @@ from .transport import (
     JsonResponseContractError,
     JsonResponseTimeoutError,
     JsonResponseUnavailableError,
-    latch_plant_physics_fault,
+    latch_plant_motion_fault,
     request_json,
     send_json,
     set_plant_support,
@@ -57,6 +59,155 @@ from .transport import (
 
 class RosBridgeUnavailable(RuntimeError):
     pass
+
+
+BRIDGE_HEALTH_SCHEMA_VERSION = "h-ide.ros-bridge-health/v1"
+BRIDGE_HEALTH_MAX_PROGRESS_AGE_S = 0.10
+
+
+class BridgeRuntimeHealth:
+    """Read-only evidence backed only by successful SONIC probe work.
+
+    Reading a health snapshot never advances ``sequence``.  That counter is
+    committed only after the bridge has received and parsed a strict,
+    correlated SONIC health response, so a diagnostics poll cannot manufacture
+    liveness while the bridge callback loop is stalled.
+    """
+
+    def __init__(
+        self,
+        *,
+        boot_id: UUID,
+        session_id: UUID,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if not isinstance(boot_id, UUID) or not isinstance(session_id, UUID):
+            raise TypeError("bridge health identities must be UUIDs")
+        self._boot_id = boot_id
+        self._session_id = session_id
+        self._clock = clock
+        self._lock = threading.RLock()
+        self._sequence = 0
+        self._last_progress_at_s: float | None = None
+        self._sonic_health: SonicHealth | None = None
+
+    @staticmethod
+    def _monotonic(value: float, field: str) -> float:
+        result = float(value)
+        if not math.isfinite(result) or result < 0.0:
+            raise ValueError(f"{field} must be finite and non-negative")
+        return result
+
+    def observe_sonic_probe(
+        self,
+        health: SonicHealth,
+        *,
+        observed_at_s: float | None = None,
+    ) -> None:
+        if not isinstance(health, SonicHealth):
+            raise TypeError("health must be a SonicHealth")
+        observed = self._monotonic(
+            self._clock() if observed_at_s is None else observed_at_s,
+            "observed_at_s",
+        )
+        with self._lock:
+            if (
+                self._last_progress_at_s is not None
+                and observed < self._last_progress_at_s
+            ):
+                raise ValueError("bridge health progress clock moved backwards")
+            self._sequence += 1
+            self._last_progress_at_s = observed
+            self._sonic_health = health
+
+    def snapshot(
+        self,
+        *,
+        gait_state: GaitState,
+        control_generation: int,
+        bridge_fault: str | None,
+        health_transport_pending: bool,
+        health_transport_confirmed: bool,
+        health_fault_pending: bool,
+        health_quarantined: bool,
+        now_s: float | None = None,
+    ) -> dict[str, object]:
+        if not isinstance(gait_state, GaitState):
+            raise TypeError("gait_state must be a GaitState")
+        if (
+            isinstance(control_generation, bool)
+            or not isinstance(control_generation, int)
+            or control_generation < 0
+        ):
+            raise ValueError("control_generation must be a non-negative integer")
+        if not all(
+            isinstance(value, bool)
+            for value in (
+                health_transport_pending,
+                health_transport_confirmed,
+                health_fault_pending,
+                health_quarantined,
+            )
+        ):
+            raise TypeError("bridge health state flags must be booleans")
+        if bridge_fault is not None:
+            bridge_fault = str(bridge_fault).strip()
+            if not bridge_fault:
+                raise ValueError("bridge_fault must be non-empty or null")
+        sampled = self._monotonic(
+            self._clock() if now_s is None else now_s,
+            "now_s",
+        )
+        with self._lock:
+            sequence = self._sequence
+            progressed = self._last_progress_at_s
+            health = self._sonic_health
+        progress_age_s = None if progressed is None else sampled - progressed
+        if progress_age_s is not None and progress_age_s < 0.0:
+            raise ValueError("bridge health sample preceded its latest progress")
+        stale = (
+            progress_age_s is None
+            or progress_age_s > BRIDGE_HEALTH_MAX_PROGRESS_AGE_S
+        )
+        sonic_fault = None
+        if health is not None and health.terminal_fault:
+            sonic_fault = health.reason or "SONIC terminal fault"
+        fault = bridge_fault or sonic_fault
+        healthy = bool(
+            sequence > 0
+            and health is not None
+            and health.motion_ready
+            and not health.terminal_fault
+            and not stale
+            and not health_transport_pending
+            and not health_transport_confirmed
+            and not health_fault_pending
+            and not health_quarantined
+            and fault is None
+        )
+        return {
+            "schemaVersion": BRIDGE_HEALTH_SCHEMA_VERSION,
+            "healthy": healthy,
+            "bootId": str(self._boot_id),
+            "sessionId": str(self._session_id),
+            "sequence": sequence,
+            "lastProgressAtMonotonicS": progressed,
+            "progressAgeS": progress_age_s,
+            "sonicDriverBootId": (
+                None if health is None else str(health.driver_boot_id)
+            ),
+            "sonicDriverSessionId": (
+                None if health is None else str(health.driver_session_id)
+            ),
+            "sonicStatus": None if health is None else health.status,
+            "gaitState": gait_state.value,
+            "controlGeneration": control_generation,
+            "healthTransportPending": health_transport_pending,
+            "healthTransportConfirmed": health_transport_confirmed,
+            "healthFaultPending": health_fault_pending,
+            "healthQuarantined": health_quarantined,
+            "fault": fault,
+        }
 
 
 class _SafetyTimerNode(Protocol):
@@ -78,6 +229,33 @@ class _HealthProbeAttempt:
     transport: HealthTransportDecision
     timeout_error: JsonResponseTimeoutError | None
     request_attempted: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _ActionStatusObservation:
+    active: bool
+    observed_at_s: float
+
+
+def _actions_confirmed_inactive_after(
+    statuses: Mapping[str, _ActionStatusObservation | None],
+    *,
+    fault_latched_at_s: float,
+) -> bool:
+    """Require post-fault negative evidence from every motion action server."""
+
+    boundary = float(fault_latched_at_s)
+    if not math.isfinite(boundary):
+        raise ValueError("fault latch timestamp must be finite")
+    if not statuses:
+        return False
+    return all(
+        isinstance(observation, _ActionStatusObservation)
+        and math.isfinite(observation.observed_at_s)
+        and observation.observed_at_s >= boundary
+        and not observation.active
+        for observation in statuses.values()
+    )
 
 
 def _health_transport_command_action(
@@ -352,6 +530,7 @@ def run_ros_bridge(config: SimConfig) -> None:
         )
     try:
         import rclpy
+        from action_msgs.msg import GoalStatusArray
         from geometry_msgs.msg import PoseWithCovarianceStamped, Twist
         from nav_msgs.msg import Odometry, Path
         from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
@@ -370,6 +549,11 @@ def run_ros_bridge(config: SimConfig) -> None:
     normal_stop_group = MutuallyExclusiveCallbackGroup()
     generation = {"value": _new_bridge_generation()}
     bridge_boot_id = uuid4()
+    bridge_session_id = uuid4()
+    bridge_runtime_health = BridgeRuntimeHealth(
+        boot_id=bridge_boot_id,
+        session_id=bridge_session_id,
+    )
     fault_latch = MotionFaultLatch(
         robot_id=config.robot_id,
         localization_epoch_id=config.localization_epoch_id,
@@ -402,7 +586,16 @@ def run_ros_bridge(config: SimConfig) -> None:
     gait.advance_generation(generation["value"])
     latest_heading = {"yaw": None}
     latest_observation: dict[str, BaseObservation | None] = {"value": None}
-    bridge_fault = {"reason": None}
+    action_statuses: dict[str, _ActionStatusObservation | None] = {
+        "navigate_to_pose": None,
+        "spin": None,
+        "drive_on_heading": None,
+    }
+    motion_fault_reset_request_id: dict[str, UUID | None] = {"value": None}
+    bridge_fault: dict[str, str | float | None] = {
+        "reason": None,
+        "latched_at_s": None,
+    }
     normal_stop_coordinator: dict[
         str, BridgeNormalStopCoordinator | None
     ] = {"value": None}
@@ -438,7 +631,7 @@ def run_ros_bridge(config: SimConfig) -> None:
         *,
         timeout_s: float | None = None,
     ) -> SonicHealth:
-        """Read one correlated, strict v2 health snapshot from SONIC."""
+        """Read one correlated, strict v3 health snapshot from SONIC."""
 
         response = request_json(
             config.command_host,
@@ -517,6 +710,7 @@ def run_ros_bridge(config: SimConfig) -> None:
         bounded_reason = str(reason).strip()[:512] or "motion safety fault"
         if bridge_fault["reason"] is None:
             bridge_fault["reason"] = f"{source}/{code}: {bounded_reason}"
+            bridge_fault["latched_at_s"] = time.monotonic()
         coordinator = normal_stop_coordinator["value"]
         if coordinator is not None:
             coordinator.notify_terminal(
@@ -526,20 +720,36 @@ def run_ros_bridge(config: SimConfig) -> None:
         def local_stop() -> None:
             errors: list[str] = []
             intent = stop_intent
-            # A motion-safety event is terminal for this Plant generation.
-            # Latch the physics fault before delivering any joint-level stop so
-            # the simulator cannot integrate a dynamically unsupported frozen
-            # pose.  Recovery is an explicit process restart; no reset or
-            # teleport path exists here.
+            fault_reason = f"{source}/{code}: {bounded_reason}"[:512]
+            # A navigation/gait safety event revokes actuator authority and
+            # latches Plant safety_stop, but it is not evidence that MuJoCo
+            # physics is corrupt. Keep the Plant and both viewers alive so an
+            # operator can inspect the stopped incident and explicitly reset.
             try:
-                latch_plant_physics_fault(
+                latch_plant_motion_fault(
                     "127.0.0.1",
                     config.plant_port,
-                    f"{source}/{code}: {bounded_reason}"[:512],
+                    fault_reason,
                     timeout=0.3,
                 )
             except Exception as exc:
-                errors.append(f"Plant terminal halt: {exc}")
+                errors.append(f"Plant motion-fault stop: {exc}")
+            try:
+                event = fault_latch.event
+                if event is None:
+                    raise RuntimeError("motion fault identity was not allocated")
+                request_json(
+                    config.command_host,
+                    config.command_port,
+                    {
+                        "type": "motion_fault_latch",
+                        "request_id": str(event.event_id),
+                        "reason": fault_reason,
+                    },
+                    timeout=0.5,
+                )
+            except Exception as exc:
+                errors.append(f"SONIC motion-fault latch: {exc}")
             try:
                 if intent is None:
                     now = time.monotonic()
@@ -1013,6 +1223,15 @@ def run_ros_bridge(config: SimConfig) -> None:
                 f"tracking Nav2 path endpoint ({float(endpoint.x):.3f}, {float(endpoint.y):.3f})"
             )
 
+    def on_action_status(name: str, message: GoalStatusArray) -> None:
+        action_statuses[name] = _ActionStatusObservation(
+            active=any(
+                int(item.status) in {1, 2, 3}
+                for item in message.status_list
+            ),
+            observed_at_s=time.monotonic(),
+        )
+
     def on_cmd(message: Twist):
         now = time.monotonic()
         vx = float(message.linear.x)
@@ -1098,7 +1317,8 @@ def run_ros_bridge(config: SimConfig) -> None:
         if bridge_fault["reason"] is not None:
             response.success = False
             response.message = (
-                "navigation safety interlock is latched; process restart is required"
+                "navigation safety interlock is latched; explicit motion-fault "
+                "reset is required before control can be acquired again"
             )
             return response
         if check_health_transport_fence(context="control_arm_admission"):
@@ -1289,10 +1509,179 @@ def run_ros_bridge(config: SimConfig) -> None:
         10,
         callback_group=state_group,
     )
+    node.create_subscription(
+        GoalStatusArray,
+        "/navigate_to_pose/_action/status",
+        lambda message: on_action_status("navigate_to_pose", message),
+        10,
+        callback_group=state_group,
+    )
+    node.create_subscription(
+        GoalStatusArray,
+        "/spin/_action/status",
+        lambda message: on_action_status("spin", message),
+        10,
+        callback_group=state_group,
+    )
+    node.create_subscription(
+        GoalStatusArray,
+        "/drive_on_heading/_action/status",
+        lambda message: on_action_status("drive_on_heading", message),
+        10,
+        callback_group=state_group,
+    )
+
+    def bridge_health(_request, response):
+        snapshot = bridge_runtime_health.snapshot(
+            gait_state=gait.state,
+            control_generation=generation["value"],
+            bridge_fault=(
+                None
+                if bridge_fault["reason"] is None
+                else str(bridge_fault["reason"])
+            ),
+            health_transport_pending=health_transport_gate.pending is not None,
+            health_transport_confirmed=(
+                health_transport_gate.confirmed_cause is not None
+            ),
+            health_fault_pending=health_fault_gate.pending is not None,
+            health_quarantined=health_quarantine["active"] is True,
+        )
+        response.success = bool(snapshot["healthy"])
+        response.message = json.dumps(
+            snapshot,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        return response
+
+    node.create_service(
+        Trigger,
+        "/h_ide/mujoco/bridge_health",
+        bridge_health,
+        callback_group=state_group,
+    )
     node.create_service(
         Trigger,
         "/robot/control_arm",
         control_arm,
+        callback_group=state_group,
+    )
+
+    def reset_motion_fault(_request, response):
+        """Clear one stopped fault; a later control_arm must reauthorize."""
+
+        nonlocal health_fault_gate, health_transport_gate
+        event = fault_latch.event
+        reason_value = bridge_fault["reason"]
+        reason = None if reason_value is None else str(reason_value)
+        latched_at_value = bridge_fault["latched_at_s"]
+        now = time.monotonic()
+        measured = latest_observation["value"]
+        if event is None or reason is None:
+            response.success = False
+            response.message = "no motion safety fault is latched"
+            return response
+        if not fault_latch.complete:
+            response.success = False
+            response.message = "motion fault stop transaction is incomplete"
+            return response
+        if (
+            latched_at_value is None
+            or not _actions_confirmed_inactive_after(
+                action_statuses,
+                fault_latched_at_s=float(latched_at_value),
+            )
+        ):
+            response.success = False
+            response.message = (
+                "motion fault reset requires post-fault confirmation that all "
+                "Nav2 actions are inactive"
+            )
+            return response
+        if (
+            measured is None
+            or now - measured.timestamp_s > gait.config.observation_timeout_s
+            or not gait._is_stationary(measured)
+            or max(abs(measured.roll), abs(measured.pitch)) > 0.15
+        ):
+            response.success = False
+            response.message = (
+                "motion fault reset requires fresh finite stationary upright odometry"
+            )
+            return response
+        request_id = motion_fault_reset_request_id["value"]
+        if request_id is None:
+            request_id = uuid4()
+            motion_fault_reset_request_id["value"] = request_id
+        try:
+            reset_result = request_json(
+                config.command_host,
+                config.command_port,
+                {
+                    "type": "motion_fault_reset",
+                    "request_id": str(request_id),
+                    "reason": reason,
+                },
+                timeout=0.75,
+            )
+            if (
+                reset_result.get("status") != "reset"
+                or reset_result.get("mode") != "safety_stop"
+                or reset_result.get("authority") != "REVOKED"
+                or int(reset_result.get("safe_hold_frames", 0)) < 2
+            ):
+                raise RuntimeError("SONIC did not confirm the reset boundary")
+
+            next_generation = max(
+                generation["value"] + 1,
+                _new_bridge_generation(),
+            )
+            generation["value"] = next_generation
+            gait.advance_generation(next_generation, now=now)
+            current_observation = replace(measured, generation=next_generation)
+            latest_observation["value"] = current_observation
+            gait.ingest_observation(current_observation, now=now)
+            if gait.state is not GaitState.DISARMED:
+                raise RuntimeError("gait reset did not remain DISARMED")
+            for guard in (
+                direction_guard,
+                goal_guard,
+                heading_guard,
+                rotation_guard,
+                stability_guard,
+            ):
+                guard.clear()
+            fault_latch.reset(event.event_id)
+            bridge_fault["reason"] = None
+            bridge_fault["latched_at_s"] = None
+            health_fault_gate = SonicHealthFaultGate(
+                plant_lowstate_stale_s=config.plant_lowstate_stale_s,
+                sonic_control_step_stale_s=config.sonic_control_step_stale_s,
+            )
+            health_transport_gate = SonicHealthTransportGate(
+                probe_period_s=config.sonic_health_probe_period_s,
+                probe_timeout_s=config.sonic_health_probe_timeout_s,
+            )
+            health_quarantine.update(active=False, code=None)
+            motion_fault_reset_request_id["value"] = None
+        except Exception as exc:
+            response.success = False
+            response.message = f"motion fault reset failed closed: {exc}"
+            return response
+        response.success = True
+        response.message = (
+            f"motion fault reset at generation {next_generation}; "
+            "control authority remains revoked"
+        )
+        return response
+
+    node.create_service(
+        Trigger,
+        "/h_ide/mujoco/reset_motion_fault",
+        reset_motion_fault,
         callback_group=state_group,
     )
 
@@ -1363,6 +1752,7 @@ def run_ros_bridge(config: SimConfig) -> None:
         if transport_blocked or attempt.health is None:
             return
         health = attempt.health
+        bridge_runtime_health.observe_sonic_probe(health)
 
         previous_pending = health_fault_gate.pending
         decision = health_fault_gate.observe(

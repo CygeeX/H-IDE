@@ -1,0 +1,30 @@
+{
+  "schema_version": "h-ide.nav2-motion-profile/1",
+  "product_motion_mode": "static_spin_drive_primitives",
+  "follow_path_motion_accepted": false,
+  "cmd_vel_ownership": {
+    "bridge_topic": "/cmd_vel",
+    "strict_runner_node": "/strict_motion_runner",
+    "nav2_behavior_input_topic": "/h_ide/strict_motion/input",
+    "unaccepted_follow_path_topic": "/h_ide/unaccepted_follow_path/cmd_vel",
+    "required_bridge_publisher_count": 1
+  },
+  "candidate_follow_path_controller": "nav2_rotation_shim_controller::RotationShimController -> nav2_graceful_controller::GracefulController",
+  "allowed_product_actions": [
+    "nav2_msgs/action/ComputePathToPose",
+    "nav2_msgs/action/Spin",
+    "nav2_msgs/action/DriveOnHeading"
+  ],
+  "primitive_action_contract": {
+    "drive_on_heading_speed_mps": 0.2,
+    "spin_min_angular_rps": 0.1,
+    "spin_max_angular_rps": 0.2,
+    "spin_angular_accel_rps2": 0.3
+  },
+  "forbidden_product_actions": [
+    "nav2_msgs/action/NavigateToPose",
+    "nav2_msgs/action/FollowPath",
+    "nav2_msgs/action/BackUp"
+  ],
+  "acceptance_note": "FollowPath remains an unvalidated calibration candidate. Product motion must use a provenance-bound static primitive plan and fail closed on any unapproved action."
+}

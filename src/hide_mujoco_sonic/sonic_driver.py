@@ -22,6 +22,12 @@ import time
 from typing import Any, Mapping
 from uuid import UUID, uuid4
 
+from .arm_limiter_evidence import (
+    ARM_JOINT_INDICES,
+    ArmLimiterEvidenceError,
+    ArmLimiterEvidenceRecorder,
+    source_bundle_sha256,
+)
 from .config import SimConfig
 from .motion_fault import (
     SONIC_HEALTH_SCHEMA_VERSION,
@@ -47,9 +53,11 @@ from .reference_authority import ReferenceAuthorityState
 from .runtime_diagnostics import SonicRuntimeDiagnostics
 from .safety import (
     CmdVelGuard,
+    JointGuardResult,
     NavigationArmGuard,
     NominalPolicyActivation,
     NominalPolicyActivationDecision,
+    NominalPolicyActivationFault,
     PlantControlClock,
     PlantControlClockFault,
     PlantControlStep,
@@ -64,9 +72,13 @@ from .telemetry import (
     serve_telemetry,
 )
 from .transport import (
+    clear_plant_motion_fault,
     latch_plant_physics_fault,
+    latch_plant_motion_fault,
     parse_lines,
+    read_plant_identity,
     rearm_plant_support,
+    release_plant_fall_arrest,
     set_plant_support,
 )
 
@@ -405,6 +417,11 @@ class SonicDriver:
         self.telemetry = telemetry
         self._runtime_diagnostics = runtime_diagnostics
         self._driver_boot_id = uuid4()
+        self._driver_session_id = uuid4()
+        self.telemetry.update(
+            driver_boot_id=str(self._driver_boot_id),
+            driver_session_id=str(self._driver_session_id),
+        )
         self.guard = CmdVelGuard(
             max_linear_mps=config.max_linear_mps,
             min_walk_command_mps=config.min_walk_command_mps,
@@ -445,6 +462,15 @@ class SonicDriver:
         self._terminal_fault_lock = threading.Lock()
         self._terminal_plant_halt_attempted = False
         self._terminal_fault_reason: str | None = None
+        self._recoverable_motion_fault = False
+        self._motion_fault_safe_hold_frames = 0
+        self._motion_fault_last_hold_tick_ms: int | None = None
+        self._motion_fault_reset_replays: dict[
+            UUID, tuple[str, dict[str, object]]
+        ] = {}
+        self._motion_fault_latch_replays: dict[
+            UUID, tuple[str, dict[str, object]]
+        ] = {}
         self._tick_guard = PlantTickGuard()
         self._intent_ingress = SonicIntentIngress(
             max_age_s=max(0.50, config.command_timeout_s * 2.0)
@@ -463,6 +489,12 @@ class SonicDriver:
             duration_s=config.policy_activation_s
         )
         self._policy_activation_requested = False
+        self._policy_activation_release_epoch: int | None = None
+        self._policy_activation_release_result: dict[str, Any] | None = None
+        self._policy_activation_release_error: Exception | None = None
+        self._policy_activation_release_thread: threading.Thread | None = None
+        self._policy_activation_release_confirmed_epoch: int | None = None
+        self._policy_activation_prepared_tick_ms: int | None = None
         self._static_hold_active = True
         self._plant_support_mode: str | None = None
         self._plant_support_stop_pending = False
@@ -487,6 +519,13 @@ class SonicDriver:
         self._reference_request_pending = False
         self._vendor_revoke_pending = False
         self._dds_target_sequence = 0
+        self._control_evidence_context = threading.local()
+        # Evidence control requests share this outer boundary with every DDS
+        # write.  It never participates in actuator/stop lock ordering; it
+        # merely prevents begin/finalize from slicing through a physical write.
+        self._arm_evidence_boundary_lock = threading.RLock()
+        self._arm_evidence_write_condition = threading.Condition()
+        self._arm_evidence_writes_inflight: set[object] = set()
 
         # These imports are intentionally lazy: `check` and safety tests must
         # work without ROS/Unitree SDK/ONNX installed.
@@ -521,6 +560,20 @@ class SonicDriver:
         self._kp = self._controller.kp
         self._kd = self._controller.kd
         self._arm_guard = self._new_arm_guard()
+        self._arm_evidence = ArmLimiterEvidenceRecorder(
+            sonic_driver_boot_id=str(self._driver_boot_id),
+            sonic_driver_session_id=str(self._driver_session_id),
+            sonic_driver_source_sha256=source_bundle_sha256(
+                (
+                    Path(__file__).resolve(),
+                    Path(__file__).with_name("safety.py").resolve(),
+                    Path(__file__).with_name("arm_limiter_evidence.py").resolve(),
+                )
+            ),
+        )
+        self._arm_evidence_request_replays: dict[
+            UUID, tuple[bytes, dict[str, object]]
+        ] = {}
         self._joint_names = tuple(self._joint_name(index) for index in range(29))
         self._fault_trace = JointFaultTraceBuffer(
             self._joint_names,
@@ -860,7 +913,10 @@ class SonicDriver:
         with self._control_condition:
             if (
                 not self._control_clock_armed
-                and not self._fault_latched.is_set()
+                and not (
+                    self._fault_latched.is_set()
+                    and not getattr(self, "_recoverable_motion_fault", False)
+                )
                 and not self._stop.is_set()
             ):
                 # This is the startup handshake.  The current LowState is only
@@ -893,7 +949,10 @@ class SonicDriver:
                 )
             if (
                 self._pending_control_sample is None
-                and not self._fault_latched.is_set()
+                and not (
+                    self._fault_latched.is_set()
+                    and not getattr(self, "_recoverable_motion_fault", False)
+                )
                 and not self._stop.is_set()
             ):
                 self._control_condition.wait(timeout=wait_timeout_s)
@@ -902,7 +961,10 @@ class SonicDriver:
             if (
                 sample is None
                 and self._control_clock_armed
-                and not self._fault_latched.is_set()
+                and not (
+                    self._fault_latched.is_set()
+                    and not getattr(self, "_recoverable_motion_fault", False)
+                )
                 and not self._stop.is_set()
             ):
                 source_at = (
@@ -982,6 +1044,13 @@ class SonicDriver:
         self,
         targets: tuple[float, ...],
     ) -> None:
+        with self._arm_evidence_boundary_lock:
+            self._publish_position_hold_unfenced(targets)
+
+    def _publish_position_hold_unfenced(
+        self,
+        targets: tuple[float, ...],
+    ) -> None:
         if len(targets) != 29 or not all(
             math.isfinite(float(value)) for value in targets
         ):
@@ -1034,8 +1103,14 @@ class SonicDriver:
                     for index in range(29):
                         self._msg.motor_cmd[index].q = float(selected[index])
                     self._msg.crc = self._crc.Crc(self._msg)
-            written = self._publisher.Write(self._msg)
+            evidence_write_token = self._begin_arm_evidence_write()
+            try:
+                written = self._publisher.Write(self._msg)
+            except BaseException:
+                self._finish_arm_evidence_write(evidence_write_token)
+                raise
             if written is not True:
+                self._finish_arm_evidence_write(evidence_write_token)
                 raise RuntimeError("Unitree DDS position-hold write failed")
             # A successful Write is physical fact.  Serialize its terminal
             # observation, vendor feedback, and local executed boundary with
@@ -1054,7 +1129,10 @@ class SonicDriver:
                     terminal_after_write or process_stop_after_write
                 )
                 if stopping_after_write:
-                    final_targets = self._record_successful_dds_target(selected)
+                    final_targets = self._record_successful_dds_target(
+                        selected,
+                        evidence_write_token=evidence_write_token,
+                    )
                     self._safe_hold_targets = final_targets
                     try:
                         if terminal_after_write:
@@ -1074,7 +1152,10 @@ class SonicDriver:
                         if terminal_error is None:
                             terminal_error = exc
                 else:
-                    self._commit_executed_target_if_pending(selected)
+                    self._commit_executed_target_if_pending(
+                        selected,
+                        evidence_write_token=evidence_write_token,
+                    )
                 if terminal_error is not None:
                     raise terminal_error
             assert self._last_published_targets is not None
@@ -1084,6 +1165,9 @@ class SonicDriver:
     def _commit_executed_target_if_pending(
         self,
         targets: tuple[float, ...],
+        *,
+        evidence_write_token: object | None = None,
+        arm_guard_result: JointGuardResult | None = None,
     ) -> bool:
         """Commit the exact target immediately after one successful DDS write.
 
@@ -1093,12 +1177,45 @@ class SonicDriver:
         reference cursor from advancing.
         """
 
-        final_targets = self._record_successful_dds_target(targets)
+        final_targets = self._record_successful_dds_target(
+            targets,
+            evidence_write_token=evidence_write_token,
+            arm_guard_result=arm_guard_result,
+        )
         return self._record_vendor_execution_feedback_if_pending(final_targets)
+
+    def _begin_arm_evidence_write(self) -> object:
+        """Fence an in-flight DDS write against evidence begin/finalize."""
+
+        token = object()
+        with self._arm_evidence_write_condition:
+            self._arm_evidence_writes_inflight.add(token)
+        return token
+
+    def _finish_arm_evidence_write(self, token: object) -> None:
+        with self._arm_evidence_write_condition:
+            if token not in self._arm_evidence_writes_inflight:
+                raise RuntimeError("arm evidence DDS write token is not active")
+            self._arm_evidence_writes_inflight.remove(token)
+            self._arm_evidence_write_condition.notify_all()
+
+    def _wait_for_arm_evidence_boundary(self, *, timeout_s: float = 1.0) -> None:
+        deadline = self._wall_clock() + float(timeout_s)
+        with self._arm_evidence_write_condition:
+            while self._arm_evidence_writes_inflight:
+                remaining = deadline - self._wall_clock()
+                if remaining <= 0.0:
+                    raise RuntimeError(
+                        "timed out waiting for the authoritative DDS evidence boundary"
+                    )
+                self._arm_evidence_write_condition.wait(timeout=remaining)
 
     def _record_successful_dds_target(
         self,
         targets: tuple[float, ...],
+        *,
+        evidence_write_token: object | None = None,
+        arm_guard_result: JointGuardResult | None = None,
     ) -> tuple[float, ...]:
         """Register the target that physically crossed a successful DDS Write."""
 
@@ -1109,7 +1226,55 @@ class SonicDriver:
             raise ValueError("executed DDS target requires 29 finite values")
         self._last_published_targets = final_targets
         self._dds_target_sequence += 1
-        return final_targets
+        try:
+            if self._arm_evidence.active:
+                if evidence_write_token is None:
+                    self._arm_evidence.fail_active(
+                        "successful DDS write was not fenced for arm evidence"
+                    )
+                control_step = getattr(
+                    self._control_evidence_context,
+                    "control_step",
+                    None,
+                )
+                if not isinstance(control_step, PlantControlStep):
+                    self._arm_evidence.fail_active(
+                        "successful DDS write has no authoritative Plant control step"
+                    )
+                if arm_guard_result is None:
+                    constrained_global: tuple[int, ...] = ()
+                    saturation_by_joint = {
+                        joint: 0.0 for joint in ARM_JOINT_INDICES
+                    }
+                else:
+                    if len(arm_guard_result.continuous_saturation_s) != len(
+                        ARM_JOINT_INDICES
+                    ):
+                        self._arm_evidence.fail_active(
+                            "arm limiter result has an invalid joint dimension"
+                        )
+                    constrained_global = tuple(
+                        ARM_JOINT_INDICES[index]
+                        for index in arm_guard_result.constrained_joint_indices
+                    )
+                    saturation_by_joint = dict(
+                        zip(
+                            ARM_JOINT_INDICES,
+                            arm_guard_result.continuous_saturation_s,
+                            strict=True,
+                        )
+                    )
+                self._arm_evidence.record(
+                    control_tick=self._dds_target_sequence,
+                    t_s=control_step.tick_ms / 1_000.0,
+                    dt_s=control_step.dt_s,
+                    constrained_joint_indices=constrained_global,
+                    continuous_saturation_by_joint_s=saturation_by_joint,
+                )
+            return final_targets
+        finally:
+            if evidence_write_token is not None:
+                self._finish_arm_evidence_write(evidence_write_token)
 
     def _record_vendor_execution_feedback_if_pending(
         self,
@@ -1204,6 +1369,10 @@ class SonicDriver:
                     abort_activation()
                 except Exception as exc:
                     failures.append(exc)
+            try:
+                self._reset_policy_activation_release_locked()
+            except Exception as exc:
+                failures.append(exc)
             self._policy_activation_requested = False
             # Even terminal/fault paths suppressing broader planner telemetry
             # must publish this local transaction fact; otherwise diagnostics
@@ -1266,8 +1435,12 @@ class SonicDriver:
             terminal_lock = threading.Lock()
             self._terminal_fault_lock = terminal_lock
         with terminal_lock:
-            if self._fault_latched.is_set() or getattr(
-                self, "_terminal_plant_halt_attempted", False
+            recoverable = bool(
+                getattr(self, "_recoverable_motion_fault", False)
+            )
+            if (
+                (self._fault_latched.is_set() and not recoverable)
+                or getattr(self, "_terminal_plant_halt_attempted", False)
             ):
                 return
             # This is the terminal linearization point shared with successful
@@ -1278,6 +1451,7 @@ class SonicDriver:
             self._terminal_fault_reason = (
                 str(reason).strip() or "SONIC terminal fault"
             )
+            self._recoverable_motion_fault = False
             # Latch before best-effort controller teardown.  A corrupt vendor
             # runtime must never strand this path between the once-only claim
             # and the Plant halt, nor make a later caller mistake it for
@@ -1404,6 +1578,243 @@ class SonicDriver:
                     condition.notify_all()
             except Exception:
                 logger.exception("failed to notify SONIC control loop of terminal fault")
+
+    def _latch_motion_fault(
+        self,
+        reason: str,
+        *,
+        boundary_already_stopped: bool = False,
+    ) -> None:
+        """Latch a recoverable navigation fault while keeping SONIC alive."""
+
+        detail = str(reason).strip() or "SONIC motion safety fault"
+        with self._terminal_fault_lock:
+            if self._fault_latched.is_set():
+                if (
+                    self._recoverable_motion_fault
+                    and self._terminal_fault_reason == detail
+                ):
+                    return
+                raise RuntimeError("SONIC already carries another motion fault")
+            self._terminal_fault_reason = detail
+            self._recoverable_motion_fault = True
+            self._motion_fault_safe_hold_frames = 0
+            self._motion_fault_last_hold_tick_ms = None
+            self._fault_latched.set()
+        self._startup_qualifying = False
+        motion_ready = getattr(self, "_motion_ready", None)
+        if motion_ready is not None:
+            motion_ready.clear()
+        boundary_error: Exception | None = None
+        if not boundary_already_stopped:
+            try:
+                self._stop_navigation_at_boundary(
+                    source="motion_fault",
+                    publish_telemetry=False,
+                )
+            except Exception as exc:
+                boundary_error = exc
+        try:
+            plant_state = latch_plant_motion_fault(
+                "127.0.0.1",
+                self.config.plant_port,
+                detail[:512],
+                timeout=0.30,
+            )
+        except Exception as exc:
+            # Losing the physical safety latch upgrades the incident to the
+            # existing unrecoverable process/physics fault path.
+            self._latch_terminal_fault(
+                f"{detail}; recoverable Plant motion-fault latch failed: {exc}",
+                boundary_already_stopped=(boundary_error is None),
+            )
+            return
+        with self._support_lock:
+            self._plant_support_mode = "safety_stop"
+            self._plant_support_safety_latched = True
+            self._plant_support_stop_pending = False
+        trace_path: str | None = None
+        trace_samples = 0
+        trace = getattr(self, "_fault_trace", None)
+        if trace is not None:
+            try:
+                payload = trace.snapshot(
+                    reason=detail,
+                    kp=tuple(float(value) for value in self._kp),
+                    kd=tuple(float(value) for value in self._kd),
+                )
+                trace_samples = int(payload["sample_count"])
+                trace_path = str(trace.persist(self._fault_trace_path, payload))
+            except Exception:
+                logger.exception("failed to persist recoverable motion-fault trace")
+        self.telemetry.update(
+            status="failed",
+            nav2_state="fault_latched",
+            sonic_mode="IDLE",
+            sonic_speed_mps=0.0,
+            static_hold_active=True,
+            motion_handoff_active=False,
+            motion_handoff_ratio=0.0,
+            navigation_task_active=False,
+            motion_ready=False,
+            control_clock_status="motion_fault_hold",
+            last_error=detail,
+            terminal_boundary_error=(
+                None if boundary_error is None else str(boundary_error)
+            ),
+            plant_terminal_halt_confirmed=False,
+            plant_terminal_halt_error=None,
+            plant_support_mode=str(plant_state["mode"]),
+            plant_support_safety_latched=True,
+            fault_trace_path=trace_path,
+            fault_trace_sample_count=trace_samples,
+            fault_joint_names=(
+                [] if trace is None else list(trace.joint_names)
+            ),
+            recoverable_motion_fault=True,
+            motion_fault_safe_hold_frames=0,
+        )
+        condition = getattr(self, "_control_condition", None)
+        if condition is not None:
+            with condition:
+                condition.notify_all()
+
+    def _record_motion_fault_hold_frame(self, tick_ms: int) -> None:
+        """Count coherent post-fault DDS holds for explicit-reset admission."""
+
+        with self._terminal_fault_lock:
+            if not (
+                self._fault_latched.is_set()
+                and self._recoverable_motion_fault
+            ):
+                return
+            previous = self._motion_fault_last_hold_tick_ms
+            control_hz = int(getattr(self.config, "control_hz", 50))
+            expected_tick_delta_ms = round(1_000.0 / control_hz)
+            if (
+                previous is not None
+                and tick_ms - previous != expected_tick_delta_ms
+            ):
+                self._motion_fault_safe_hold_frames = 0
+            self._motion_fault_last_hold_tick_ms = int(tick_ms)
+            self._motion_fault_safe_hold_frames += 1
+            frames = self._motion_fault_safe_hold_frames
+        self.telemetry.update(motion_fault_safe_hold_frames=frames)
+
+    def _handle_motion_fault_reset(
+        self,
+        payload: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Clear one recoverable fault without releasing actuator authority."""
+
+        if set(payload) != {"type", "request_id", "reason"}:
+            raise ValueError("motion fault reset fields do not match v1")
+        request_id = payload.get("request_id")
+        try:
+            parsed_request_id = UUID(str(request_id))
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise ValueError("motion fault reset request_id must be a UUID") from exc
+        if str(parsed_request_id) != str(request_id):
+            raise ValueError("motion fault reset request_id must be canonical")
+        reason = str(payload.get("reason", "")).strip()
+        replays = getattr(self, "_motion_fault_reset_replays", None)
+        if replays is None:
+            replays = {}
+            self._motion_fault_reset_replays = replays
+        replay = replays.get(parsed_request_id)
+        if replay is not None:
+            previous_reason, previous_response = replay
+            if previous_reason != reason:
+                raise RuntimeError(
+                    "motion fault reset request_id was reused with another reason"
+                )
+            return copy.deepcopy(previous_response)
+        with self._terminal_fault_lock:
+            if not self._fault_latched.is_set():
+                raise RuntimeError("SONIC has no latched motion fault")
+            if not self._recoverable_motion_fault:
+                raise RuntimeError(
+                    "unrecoverable SONIC fault requires an explicit process restart"
+                )
+            if reason != self._terminal_fault_reason:
+                raise RuntimeError("SONIC motion fault identity mismatch")
+            safe_hold_frames = self._motion_fault_safe_hold_frames
+        with self._control_condition:
+            lowstate = self._lowstate
+        if lowstate is None:
+            raise RuntimeError("motion fault reset requires current LowState")
+        joint_q = tuple(float(lowstate.motor_state[index].q) for index in range(29))
+        joint_dq = tuple(float(lowstate.motor_state[index].dq) for index in range(29))
+        gyroscope = tuple(float(value) for value in lowstate.imu_state.gyroscope)
+        rpy_raw = getattr(lowstate.imu_state, "rpy", None)
+        if rpy_raw is None or len(rpy_raw) != 3:
+            raise RuntimeError("motion fault reset requires Plant roll/pitch evidence")
+        rpy = tuple(float(value) for value in rpy_raw)
+        if not all(
+            math.isfinite(value)
+            for value in joint_q + joint_dq + gyroscope + rpy
+        ):
+            raise RuntimeError("motion fault reset requires finite Plant state")
+        with self._support_lock:
+            authority = self._reference_authority.snapshot
+            reset_allowed = bool(
+                safe_hold_frames >= 2
+                and not self._navigation_task_active
+                and not self._intent_ingress.armed
+                and self.guard.command_zero
+                and authority.phase == "REVOKED"
+                and self._safe_hold_targets is not None
+                and self._static_hold_active
+                and self._plant_support_safety_latched
+                and not self._plant_support_stop_pending
+                and max(abs(value) for value in joint_dq) <= 0.20
+                and max(abs(value) for value in gyroscope) <= 0.15
+                and max(abs(value) for value in rpy[:2]) <= 0.15
+            )
+        if not reset_allowed:
+            raise RuntimeError(
+                "motion fault reset requires two coherent safe-hold frames, "
+                "zero command, revoked authority, and finite stationary Plant"
+            )
+        clear_plant_motion_fault(
+            "127.0.0.1",
+            self.config.plant_port,
+            reason,
+            timeout=0.30,
+        )
+        with self._terminal_fault_lock:
+            if (
+                not self._fault_latched.is_set()
+                or not self._recoverable_motion_fault
+                or self._terminal_fault_reason != reason
+            ):
+                raise RuntimeError("SONIC motion fault changed during reset")
+            self._fault_latched.clear()
+            self._recoverable_motion_fault = False
+            self._terminal_fault_reason = None
+            self._motion_fault_safe_hold_frames = 0
+            self._motion_fault_last_hold_tick_ms = None
+        self._motion_ready.set()
+        self.telemetry.update(
+            status="running",
+            nav2_state="safety_stop",
+            control_clock_status="simulation_time_50hz_motion_ready",
+            motion_ready=True,
+            last_error=None,
+            recoverable_motion_fault=False,
+            motion_fault_safe_hold_frames=0,
+        )
+        response = {
+            "status": "reset",
+            "mode": "safety_stop",
+            "authority": "REVOKED",
+            "safe_hold_frames": safe_hold_frames,
+        }
+        replays[parsed_request_id] = (
+            reason,
+            copy.deepcopy(response),
+        )
+        return response
 
     def _latch_plant_support_stop(self, *, reason: str) -> int:
         """Synchronize an externally confirmed Plant stop into SONIC.
@@ -2165,13 +2576,34 @@ class SonicDriver:
         substitutes that stronger target and the activation commit fails.
         """
 
+        if not self._policy_activation_boundary_valid_locked(decision=decision):
+            return False
+        self._safe_hold_targets = None
+        return True
+
+    def _policy_activation_boundary_valid_locked(
+        self,
+        *,
+        decision: NominalPolicyActivationDecision | None = None,
+    ) -> bool:
         activation = self._policy_activation
         authority = self._reference_authority.snapshot
         identity = self._reference_source_identity
         ingress = self._intent_ingress
         controller = self._controller
-        valid = bool(
+        activation_current = (
             activation.is_current(decision)
+            if decision is not None
+            else activation.phase
+            in {
+                "SETTLING_TETHERED",
+                "WAITING_FOR_SUPPORT_RELEASE",
+                "SETTLING_UNSUPPORTED",
+                "PREPARED",
+            }
+        )
+        return bool(
+            activation_current
             and getattr(self, "_policy_activation_requested", False)
             and authority.phase == "REQUIRED"
             and identity is not None
@@ -2187,10 +2619,6 @@ class SonicDriver:
             and not self._normal_stop_fences_motion_locked()
             and not bool(getattr(controller, "execution_feedback_pending", False))
         )
-        if not valid:
-            return False
-        self._safe_hold_targets = None
-        return True
 
     def _policy_activation_telemetry_fields_locked(self) -> dict[str, object]:
         """Return activation facts while the caller owns ``_support_lock``."""
@@ -2198,13 +2626,182 @@ class SonicDriver:
         activation = getattr(self, "_policy_activation", None)
         if activation is None:
             return {
+                "policy_activation_epoch": 0,
+                "policy_activation_path": None,
                 "policy_activation_phase": "UNPREPARED",
                 "policy_activation_ratio": 0.0,
+                "policy_activation_provenance": None,
             }
+        observation = activation.last_settle_observation
+        release_error = getattr(
+            self, "_policy_activation_release_error", None
+        )
+        release_thread = getattr(
+            self, "_policy_activation_release_thread", None
+        )
         return {
+            "policy_activation_epoch": activation.epoch,
+            "policy_activation_path": activation.provenance["activation_path"],
             "policy_activation_phase": activation.phase,
             "policy_activation_ratio": activation.ratio,
+            "policy_activation_provenance": activation.provenance,
+            "policy_activation_settle_stage": (
+                None if observation is None else observation.stage
+            ),
+            "policy_activation_settle_stable": (
+                None if observation is None else observation.stable
+            ),
+            "policy_activation_settle_consecutive_samples": (
+                0 if observation is None else observation.consecutive_samples
+            ),
+            "policy_activation_settle_required_consecutive_samples": (
+                activation.settle_consecutive_samples
+            ),
+            "policy_activation_settle_elapsed_s": (
+                None if observation is None else observation.elapsed_s
+            ),
+            "policy_activation_settle_observed_max_joint_error_rad": (
+                None if observation is None else observation.max_joint_error_rad
+            ),
+            "policy_activation_settle_observed_max_joint_velocity_rps": (
+                None
+                if observation is None
+                else observation.max_joint_velocity_rps
+            ),
+            "policy_activation_settle_observed_max_gyro_rps": (
+                None if observation is None else observation.max_gyro_rps
+            ),
+            "policy_activation_settle_observed_roll_rad": (
+                None if observation is None else observation.roll_rad
+            ),
+            "policy_activation_settle_observed_pitch_rad": (
+                None if observation is None else observation.pitch_rad
+            ),
+            "policy_activation_settle_max_joint_error_rad": (
+                activation.max_settle_joint_error_rad
+            ),
+            "policy_activation_settle_max_joint_velocity_rps": (
+                activation.max_settle_joint_velocity_rps
+            ),
+            "policy_activation_settle_max_gyro_rps": (
+                activation.max_settle_gyro_rps
+            ),
+            "policy_activation_settle_max_abs_roll_pitch_rad": (
+                activation.max_settle_roll_pitch_rad
+            ),
+            "policy_activation_settle_timeout_s": activation.settle_timeout_s,
+            "policy_activation_release_epoch": getattr(
+                self, "_policy_activation_release_epoch", None
+            ),
+            "policy_activation_release_confirmed_epoch": getattr(
+                self, "_policy_activation_release_confirmed_epoch", None
+            ),
+            "policy_activation_release_pending": bool(
+                release_thread is not None and release_thread.is_alive()
+            ),
+            "policy_activation_release_error": (
+                None if release_error is None else str(release_error)
+            ),
+            "policy_activation_prepared_tick_ms": getattr(
+                self, "_policy_activation_prepared_tick_ms", None
+            ),
         }
+
+    def _reset_policy_activation_release_locked(self) -> None:
+        """Forget a local async release result without reviving its epoch."""
+
+        self._policy_activation_release_epoch = None
+        self._policy_activation_release_result = None
+        self._policy_activation_release_error = None
+        self._policy_activation_release_thread = None
+
+    def _start_policy_activation_release_locked(self) -> bool:
+        """Start the exact-epoch Plant proof outside the 50 Hz owner thread."""
+
+        activation = self._policy_activation
+        if not activation.waiting_for_support_release:
+            return False
+        epoch = activation.epoch
+        existing_epoch = getattr(
+            self, "_policy_activation_release_epoch", None
+        )
+        existing_thread = getattr(
+            self, "_policy_activation_release_thread", None
+        )
+        if existing_epoch == epoch and existing_thread is not None:
+            return False
+        if existing_thread is not None and existing_thread.is_alive():
+            raise NominalPolicyActivationFault(
+                "another Plant fall-arrest release is still pending"
+            )
+        self._policy_activation_release_epoch = epoch
+        self._policy_activation_release_result = None
+        self._policy_activation_release_error = None
+
+        def release_worker() -> None:
+            result: dict[str, Any] | None = None
+            error: Exception | None = None
+            try:
+                result = release_plant_fall_arrest(
+                    "127.0.0.1",
+                    self.config.plant_port,
+                    epoch,
+                )
+            except Exception as exc:
+                error = exc
+            with self._support_lock:
+                if error is None and result is not None:
+                    try:
+                        self._policy_activation.record_support_release(epoch)
+                    except Exception as exc:
+                        error = exc
+                        result = None
+                    else:
+                        self._policy_activation_release_confirmed_epoch = epoch
+                if self._policy_activation_release_epoch != epoch:
+                    return
+                self._policy_activation_release_result = result
+                self._policy_activation_release_error = error
+
+        thread = threading.Thread(
+            target=release_worker,
+            name=f"sonic-fall-arrest-release-{epoch}",
+            daemon=True,
+        )
+        self._policy_activation_release_thread = thread
+        thread.start()
+        return True
+
+    def _consume_policy_activation_release_locked(self, *, tick_ms: int) -> bool:
+        """Advance only from the async helper's authoritative Plant proof."""
+
+        activation = self._policy_activation
+        epoch = getattr(self, "_policy_activation_release_epoch", None)
+        if epoch != activation.epoch:
+            return False
+        error = getattr(self, "_policy_activation_release_error", None)
+        if error is not None:
+            self._policy_activation_release_thread = None
+            raise NominalPolicyActivationFault(
+                f"Plant fall-arrest release failed for activation epoch {epoch}: {error}"
+            )
+        result = getattr(self, "_policy_activation_release_result", None)
+        if result is None:
+            return False
+        confirmed_epoch = result.get("fallArrestReleaseConfirmedEpoch")
+        if confirmed_epoch != epoch or result.get("fallArrestEnabled") is not False:
+            raise NominalPolicyActivationFault(
+                "Plant fall-arrest release proof did not match activation epoch"
+            )
+        if not activation.confirm_support_release(tick_ms=tick_ms):
+            raise NominalPolicyActivationFault(
+                "Plant release proof arrived outside the activation wait phase"
+            )
+        self._policy_activation_release_confirmed_epoch = epoch
+        self._policy_activation_release_result = None
+        self._policy_activation_release_error = None
+        self._policy_activation_release_thread = None
+        return True
 
     def _commit_policy_activation_locked(
         self,
@@ -2213,7 +2810,7 @@ class SonicDriver:
         *,
         simulation_now_s: float,
     ) -> tuple[bool, bool]:
-        """Commit a DDS activation fact as ``(accepted, completed)``."""
+        """Commit a DDS INIT fact as ``(accepted, ramp_completed)``."""
 
         activation = self._policy_activation
         authority = self._reference_authority.snapshot
@@ -2238,11 +2835,30 @@ class SonicDriver:
             or tuple(published_targets) != decision.targets
         ):
             return False, False
-        completed = activation.commit(decision, published_targets)
-        if not completed:
-            return True, False
+        return True, activation.commit(decision, published_targets)
+
+    def _complete_policy_activation_locked(
+        self,
+        published_targets: tuple[float, ...],
+        expected_nominal: tuple[float, ...],
+        *,
+        tick_ms: int,
+        simulation_now_s: float,
+    ) -> bool:
+        """Open planning only after the second measured settle gate."""
+
+        activation = self._policy_activation
+        admitted_intent = getattr(self._intent_gate, "last", None)
+        if (
+            not activation.prepared
+            or not self._policy_activation_boundary_valid_locked()
+            or admitted_intent is None
+            or admitted_intent.mode == "IDLE"
+            or tuple(published_targets) != expected_nominal
+        ):
+            return False
         # Every policy-free waiting tick and the later binary policy handoff
-        # must now originate at the exact nominal DDS boundary.  Retaining the
+        # now originates at the exact nominal DDS boundary. Retaining the
         # pre-activation hold here would command a one-tick jump backwards.
         self._joint_handoff.freeze(published_targets)
         self._planner_evidence.observe_intent(
@@ -2250,9 +2866,39 @@ class SonicDriver:
             admitted=True,
             simulation_now_s=simulation_now_s,
         )
+        self._policy_activation_prepared_tick_ms = int(tick_ms)
         self._reference_request_pending = True
         self._policy_activation_requested = False
-        return True, True
+        return True
+
+    @staticmethod
+    def _policy_activation_stability_inputs(
+        lowstate: Any,
+    ) -> tuple[tuple[float, ...], tuple[float, float, float], float, float]:
+        states = getattr(lowstate, "motor_state", None)
+        if states is None or len(states) < 29:
+            raise NominalPolicyActivationFault(
+                "activation settling requires 29 measured joint states"
+            )
+        velocities = tuple(float(states[index].dq) for index in range(29))
+        imu = getattr(lowstate, "imu_state", None)
+        gyroscope_raw = None if imu is None else getattr(imu, "gyroscope", None)
+        rpy_raw = None if imu is None else getattr(imu, "rpy", None)
+        if gyroscope_raw is None or len(gyroscope_raw) != 3:
+            raise NominalPolicyActivationFault(
+                "activation settling requires measured IMU gyroscope"
+            )
+        if rpy_raw is None or len(rpy_raw) != 3:
+            raise NominalPolicyActivationFault(
+                "activation settling requires measured IMU roll/pitch"
+            )
+        gyroscope = tuple(float(value) for value in gyroscope_raw)
+        roll, pitch = float(rpy_raw[0]), float(rpy_raw[1])
+        if not all(math.isfinite(value) for value in velocities + gyroscope + (roll, pitch)):
+            raise NominalPolicyActivationFault(
+                "activation settling requires finite joint/IMU evidence"
+            )
+        return velocities, gyroscope, roll, pitch
 
     def _run_nominal_policy_activation(
         self,
@@ -2268,6 +2914,7 @@ class SonicDriver:
             DEFAULT_ANGLES,
         )
 
+        nominal_targets = tuple(float(value) for value in DEFAULT_ANGLES)
         activation = self._policy_activation
         with self._support_lock:
             authority = self._reference_authority.snapshot
@@ -2296,13 +2943,35 @@ class SonicDriver:
                     "nominal policy activation has no executed actuator boundary"
                 )
             activation.begin(boundary, tick_ms=control_step.tick_ms)
-            decision = activation.propose(
-                DEFAULT_ANGLES,
-                tick_ms=control_step.tick_ms,
-            )
-            released = self._release_safe_hold_for_policy_activation_locked(
-                decision
-            )
+            phase_at_tick = activation.phase
+            decision: NominalPolicyActivationDecision | None = None
+            settle_phase_to_observe: str | None = None
+            if activation.preparing:
+                decision = activation.propose(
+                    nominal_targets,
+                    measured=measured,
+                    tick_ms=control_step.tick_ms,
+                )
+                released = self._release_safe_hold_for_policy_activation_locked(
+                    decision
+                )
+                requested_targets = decision.targets
+            else:
+                released = self._policy_activation_boundary_valid_locked()
+                if released:
+                    self._safe_hold_targets = None
+                requested_targets = nominal_targets
+                if phase_at_tick == "WAITING_FOR_SUPPORT_RELEASE":
+                    self._consume_policy_activation_release_locked(
+                        tick_ms=control_step.tick_ms
+                    )
+                    if activation.waiting_for_support_release:
+                        self._start_policy_activation_release_locked()
+                elif phase_at_tick in {
+                    "SETTLING_TETHERED",
+                    "SETTLING_UNSUPPORTED",
+                }:
+                    settle_phase_to_observe = phase_at_tick
 
         support_ready = self._set_plant_support_mode("idle")
         with self._support_lock:
@@ -2311,7 +2980,7 @@ class SonicDriver:
             )
         with self._support_lock:
             output_targets = (
-                decision.targets
+                requested_targets
                 if released and support_ready and not effective_static_hold
                 else (
                     self._safe_hold_targets
@@ -2331,56 +3000,103 @@ class SonicDriver:
             constrain_arms=not effective_static_hold,
         )
         with self._support_lock:
-            activation_committed = False
+            # This flag proves the actuator/support boundary for this tick; it
+            # does not mean the multi-tick activation has completed. A stable
+            # sample below the consecutive threshold and an async release with
+            # no result yet are both successful, legal transaction ticks.
+            activation_tick_committed = False
             if released and support_ready and not effective_static_hold:
-                activation_committed, _ = (
-                    self._commit_policy_activation_locked(
-                        decision,
-                        published_targets,
-                        simulation_now_s=control_step.tick_ms / 1_000.0,
+                if decision is not None:
+                    activation_tick_committed, _ = (
+                        self._commit_policy_activation_locked(
+                            decision,
+                            published_targets,
+                            simulation_now_s=control_step.tick_ms / 1_000.0,
+                        )
                     )
-                )
-            if not activation_committed and activation.is_current(decision):
-                # Time must not advance across a failed support transition or
-                # a stop-overridden DDS target. Restart from the exact latest
-                # published boundary on the next authorized tick.
+                else:
+                    activation_tick_committed = bool(
+                        self._policy_activation_boundary_valid_locked()
+                        and tuple(published_targets) == nominal_targets
+                    )
+                    if (
+                        activation_tick_committed
+                        and settle_phase_to_observe is not None
+                        and activation.phase == settle_phase_to_observe
+                    ):
+                        velocities, gyroscope, roll, pitch = (
+                            self._policy_activation_stability_inputs(lowstate)
+                        )
+                        observation = activation.observe_settling(
+                            nominal=nominal_targets,
+                            measured=measured,
+                            velocities=velocities,
+                            gyroscope=gyroscope,
+                            roll_rad=roll,
+                            pitch_rad=pitch,
+                            tick_ms=control_step.tick_ms,
+                        )
+                        if activation.waiting_for_support_release:
+                            self._start_policy_activation_release_locked()
+                        if observation.prepared:
+                            activation_tick_committed = (
+                                self._complete_policy_activation_locked(
+                                    published_targets,
+                                    nominal_targets,
+                                    tick_ms=control_step.tick_ms,
+                                    simulation_now_s=(
+                                        control_step.tick_ms / 1_000.0
+                                    ),
+                                )
+                            )
+            if (
+                not activation_tick_committed
+                and self._policy_activation_requested
+                and not activation.prepared
+            ):
+                # Only an actual support/DDS/boundary failure reaches here.
+                # WAITING_FOR_SUPPORT_RELEASE and incomplete SETTLING samples
+                # retain their phase and epoch across arbitrarily many valid
+                # ticks while continuing to publish exact nominal hold.
                 activation.abort()
+                self._reset_policy_activation_release_locked()
 
         self._record_control_trace(
             lowstate=lowstate,
             control_step=control_step,
             intent=intent,
-            policy_targets=tuple(float(value) for value in DEFAULT_ANGLES),
-            handoff_targets=decision.targets,
+            policy_targets=nominal_targets,
+            handoff_targets=requested_targets,
             published_targets=published_targets,
-            handoff_ratio=decision.ratio,
+            handoff_ratio=(activation.ratio if decision is None else decision.ratio),
         )
         with self._support_lock:
             phase = activation.phase
             current_static_hold = self._static_hold_active
-            currently_preparing = bool(
-                phase == "PREPARING" and self._policy_activation_requested
+            activation_active = bool(
+                self._policy_activation_requested
+                and phase != "PREPARED"
             )
+            activation_status = {
+                "PREPARING": "simulation_time_50hz_preparing_nominal",
+                "PREPARING_SUPPORT_OFF": "simulation_time_50hz_repreparing_nominal_support_off",
+                "SETTLING_TETHERED": "simulation_time_50hz_settling_tethered",
+                "WAITING_FOR_SUPPORT_RELEASE": "waiting_for_exact_epoch_support_release",
+                "SETTLING_UNSUPPORTED": "simulation_time_50hz_settling_support_off",
+                "PREPARED": "simulation_time_50hz_nominal_prepared",
+            }.get(phase, "simulation_time_50hz_motion_ready")
             self.telemetry.update(
                 sonic_policy_speed_mps=0.0,
                 control_tick_ms=control_step.tick_ms,
                 control_dt_s=control_step.dt_s,
-                control_clock_status=(
-                    "simulation_time_50hz_nominal_prepared"
-                    if phase == "PREPARED"
-                    else (
-                        "simulation_time_50hz_preparing_nominal"
-                        if currently_preparing
-                        else "simulation_time_50hz_motion_ready"
-                    )
-                ),
+                control_clock_status=activation_status,
                 static_hold_active=current_static_hold,
                 motion_handoff_active=(
-                    currently_preparing and not current_static_hold
+                    activation_active and not current_static_hold
                 ),
                 motion_handoff_ratio=(
                     activation.ratio
-                    if currently_preparing and not current_static_hold
+                    if activation_active and not current_static_hold
                     else 0.0
                 ),
                 **self._policy_activation_telemetry_fields_locked(),
@@ -2547,6 +3263,24 @@ class SonicDriver:
         control_tick_ms: int | None = None,
         constrain_arms: bool = True,
     ) -> tuple[float, ...]:
+        with self._arm_evidence_boundary_lock:
+            return self._publish_unfenced(
+                action,
+                lowstate,
+                control_dt_s=control_dt_s,
+                control_tick_ms=control_tick_ms,
+                constrain_arms=constrain_arms,
+            )
+
+    def _publish_unfenced(
+        self,
+        action: dict[str, Any],
+        lowstate,
+        *,
+        control_dt_s: float,
+        control_tick_ms: int | None = None,
+        constrain_arms: bool = True,
+    ) -> tuple[float, ...]:
         # Populate the official Unitree lowcmd message.  The simulator consumes
         # this exact DDS message, just as a G1 hardware bridge would.
         self._msg.mode_machine = getattr(lowstate, "mode_machine", 0)
@@ -2672,8 +3406,14 @@ class SonicDriver:
                             published_targets[index]
                         )
                     self._msg.crc = self._crc.Crc(self._msg)
-            written = self._publisher.Write(self._msg)
+            evidence_write_token = self._begin_arm_evidence_write()
+            try:
+                written = self._publisher.Write(self._msg)
+            except BaseException:
+                self._finish_arm_evidence_write(evidence_write_token)
+                raise
             if written is not True:
+                self._finish_arm_evidence_write(evidence_write_token)
                 raise RuntimeError("Unitree DDS policy-target write failed")
             # The post-Write terminal check, exact executed feedback, and
             # possible first-DDS grant form one transaction against the
@@ -2690,7 +3430,9 @@ class SonicDriver:
                 )
                 if stopping_after_write:
                     final_targets = self._record_successful_dds_target(
-                        published_targets
+                        published_targets,
+                        evidence_write_token=evidence_write_token,
+                        arm_guard_result=guarded_arm,
                     )
                     self._safe_hold_targets = final_targets
                     try:
@@ -2715,7 +3457,9 @@ class SonicDriver:
                             terminal_error = exc
                 else:
                     feedback_committed = self._commit_executed_target_if_pending(
-                        published_targets
+                        published_targets,
+                        evidence_write_token=evidence_write_token,
+                        arm_guard_result=guarded_arm,
                     )
                 authority = self._reference_authority.snapshot
                 if not stopping_after_write and authority.phase == "PRIMED":
@@ -2971,6 +3715,20 @@ class SonicDriver:
         while not self._stop.is_set():
             sample = self._next_control_sample()
             if self._fault_latched.is_set():
+                if getattr(self, "_recoverable_motion_fault", False):
+                    if sample is None:
+                        continue
+                    lowstate, control_step, _sample_drop_generation = sample
+                    try:
+                        self._publish_frozen_hold(lowstate)
+                        self._record_motion_fault_hold_frame(
+                            control_step.tick_ms
+                        )
+                    except Exception as exc:
+                        self._latch_terminal_fault(
+                            "recoverable motion-fault hold failed: " + str(exc)
+                        )
+                    continue
                 with self._lowstate_lock:
                     lowstate = self._lowstate
                 try:
@@ -2982,6 +3740,7 @@ class SonicDriver:
             if sample is None:
                 continue
             lowstate, control_step, sample_drop_generation = sample
+            self._control_evidence_context.control_step = control_step
             try:
                 if self._startup_qualifying:
                     # Qualification is intentionally policy-free.  The plant is
@@ -3044,12 +3803,18 @@ class SonicDriver:
                     and getattr(self, "_policy_activation_requested", False)
                     and not activation.prepared
                 ):
-                    self._run_nominal_policy_activation(
-                        lowstate=lowstate,
-                        control_step=control_step,
-                        intent=intent,
-                        measured=measured,
-                    )
+                    try:
+                        self._run_nominal_policy_activation(
+                            lowstate=lowstate,
+                            control_step=control_step,
+                            intent=intent,
+                            measured=measured,
+                        )
+                    except NominalPolicyActivationFault as exc:
+                        self._latch_motion_fault(
+                            "policy_activation/POLICY_ACTIVATION_FAULT: "
+                            + str(exc)
+                        )
                     # Nominal preparation is policy-free: do not start the
                     # planner deadline, advance a reference cursor, or decode
                     # a candidate until its final DDS target is committed.
@@ -3215,6 +3980,8 @@ class SonicDriver:
                 finally:
                     self._stop.set()
                 break
+            finally:
+                self._control_evidence_context.control_step = None
         try:
             self._controller.shutdown()
         finally:
@@ -4000,7 +4767,329 @@ class SonicDriver:
                 f"normal-stop driver hold fault: {exc}"
             ) from exc
 
+    @staticmethod
+    def _arm_evidence_request_identity(
+        payload: Mapping[str, object],
+    ) -> tuple[UUID, bytes]:
+        request_id = payload.get("request_id")
+        try:
+            parsed = UUID(str(request_id))
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise ValueError("arm evidence request_id must be a UUID") from exc
+        if str(parsed) != request_id:
+            raise ValueError("arm evidence request_id must be canonical")
+        try:
+            canonical = json.dumps(
+                dict(payload),
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise ValueError("arm evidence request is not canonical JSON") from exc
+        return parsed, canonical
+
+    def _arm_evidence_activation_binding_locked(self) -> tuple[int, int]:
+        activation = self._policy_activation
+        if activation.phase not in {
+            "UNPREPARED",
+            "UNPREPARED_SUPPORT_OFF",
+            "PREPARED",
+        }:
+            raise RuntimeError(
+                "arm evidence cannot begin during a policy activation transition"
+            )
+        policy_epoch = (
+            activation.epoch
+            if activation.prepared
+            else activation.epoch + 1
+        )
+        support = activation.provenance["support_release"]
+        if not isinstance(support, Mapping):
+            raise RuntimeError("policy activation support provenance is unavailable")
+        confirmed_epoch = support.get("confirmed_epoch")
+        if confirmed_epoch is None:
+            support_epoch = policy_epoch
+        elif (
+            isinstance(confirmed_epoch, bool)
+            or not isinstance(confirmed_epoch, int)
+            or confirmed_epoch <= 0
+            or confirmed_epoch > policy_epoch
+        ):
+            raise RuntimeError("policy activation support epoch is invalid")
+        else:
+            support_epoch = confirmed_epoch
+        if activation.prepared and confirmed_epoch is None:
+            raise RuntimeError(
+                "prepared SONIC policy lacks a confirmed fall-arrest release"
+            )
+        return policy_epoch, support_epoch
+
+    def _require_arm_evidence_begin_locked(self) -> tuple[int, int]:
+        if self._fault_latched.is_set() or self._stop.is_set():
+            raise RuntimeError("arm evidence cannot begin while SONIC is stopping")
+        if not self._motion_ready.is_set():
+            raise RuntimeError("arm evidence requires a motion-ready SONIC driver")
+        checked_at = self._wall_clock()
+        for label, observed_at, threshold in (
+            ("LowState", self._last_lowstate_wall_s, self.config.plant_lowstate_stale_s),
+            (
+                "control step",
+                self._last_control_step_wall_s,
+                self.config.sonic_control_step_stale_s,
+            ),
+        ):
+            if observed_at is None or checked_at - observed_at > float(threshold):
+                raise RuntimeError(f"arm evidence requires a fresh {label}")
+        authority = self._reference_authority.snapshot
+        if (
+            not self._intent_ingress.armed
+            or self._intent_ingress.staged_control_arm_generation is not None
+            or self._plant_support_mode != "idle"
+            or self._plant_support_stop_pending
+            or self._plant_support_safety_latched
+            or not self._static_hold_active
+            or self._navigation_task_active
+            or not self.guard.command_zero
+            or self._normal_stop_fences_motion_locked()
+            or authority.phase != "REVOKED"
+            or authority.actuator_authority
+            or self._last_published_targets is None
+        ):
+            raise RuntimeError(
+                "arm evidence requires a freshly armed stationary IDLE boundary"
+            )
+        return self._arm_evidence_activation_binding_locked()
+
+    def _require_arm_evidence_finalize_locked(
+        self,
+        identity: Mapping[str, object],
+    ) -> None:
+        if self._fault_latched.is_set() or self._stop.is_set():
+            raise RuntimeError("faulted or stopping SONIC evidence cannot succeed")
+        normal_stop = self._normal_stop.snapshot
+        authority = self._reference_authority.snapshot
+        activation = self._policy_activation
+        support = activation.provenance["support_release"]
+        confirmed_epoch = (
+            support.get("confirmed_epoch")
+            if isinstance(support, Mapping)
+            else None
+        )
+        if (
+            normal_stop.phase != "DRIVER_CONFIRMED"
+            or self._intent_ingress.armed
+            or self._intent_ingress.staged_control_arm_generation is not None
+            or not self._plant_support_safety_latched
+            or self._plant_support_stop_pending
+            or self._plant_support_mode != "safety_stop"
+            or not self._static_hold_active
+            or self._navigation_task_active
+            or not self.guard.command_zero
+            or authority.phase != "REVOKED"
+            or authority.actuator_authority
+            or not activation.prepared
+            or identity.get("policyActivationEpoch") != activation.epoch
+            or identity.get("supportReleaseConfirmedEpoch") != confirmed_epoch
+        ):
+            raise RuntimeError(
+                "arm evidence requires an exact successful normal-stop boundary"
+            )
+
+    def _handle_arm_evidence_request(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, object]:
+        operation = payload.get("type")
+        fields = {
+            "arm_limiter_evidence_begin": {
+                "type",
+                "request_id",
+                "case_id",
+                "plant_boot_id",
+                "plant_session_id",
+            },
+            "arm_limiter_evidence_finalize": {
+                "type",
+                "request_id",
+                "case_id",
+            },
+            "arm_limiter_evidence_abort": {
+                "type",
+                "request_id",
+                "case_id",
+            },
+            "arm_limiter_evidence_get": {
+                "type",
+                "request_id",
+                "case_id",
+            },
+        }
+        expected_fields = fields.get(operation)
+        if expected_fields is None or set(payload) != expected_fields:
+            raise ValueError("arm evidence request fields do not match v1")
+        request_id, canonical = self._arm_evidence_request_identity(payload)
+        replays = self._arm_evidence_request_replays
+        replay = replays.get(request_id)
+        if replay is not None:
+            previous, response = replay
+            if previous != canonical:
+                raise RuntimeError(
+                    "arm evidence request_id was reused for another operation"
+                )
+            return copy.deepcopy(response)
+        if len(replays) >= 256:
+            raise RuntimeError("arm evidence replay ledger is full")
+
+        case_id = payload.get("case_id")
+        if operation == "arm_limiter_evidence_begin":
+            plant_identity = read_plant_identity(
+                "127.0.0.1",
+                self.config.plant_port,
+            )
+            if (
+                payload.get("plant_boot_id")
+                != plant_identity["producerBootId"]
+                or payload.get("plant_session_id")
+                != plant_identity["sessionId"]
+            ):
+                raise RuntimeError(
+                    "arm evidence Plant identity does not match the live process"
+                )
+            with self._arm_evidence_boundary_lock:
+                with self._control_condition:
+                    with self._support_lock:
+                        with self._terminal_fault_lock:
+                            policy_epoch, support_epoch = (
+                                self._require_arm_evidence_begin_locked()
+                            )
+                            self._arm_evidence.begin(
+                                case_id=case_id,
+                                policy_activation_epoch=policy_epoch,
+                                support_release_confirmed_epoch=support_epoch,
+                                plant_boot_id=plant_identity["producerBootId"],
+                                plant_session_id=plant_identity["sessionId"],
+                            )
+            response: dict[str, object] = {
+                "status": "recording",
+                "case_id": self._arm_evidence.active_case_id,
+                "policy_activation_epoch": policy_epoch,
+                "support_release_confirmed_epoch": support_epoch,
+                "plant_boot_id": plant_identity["producerBootId"],
+                "plant_session_id": plant_identity["sessionId"],
+                "sonic_driver_boot_id": str(self._driver_boot_id),
+                "sonic_driver_session_id": str(self._driver_session_id),
+            }
+        elif operation == "arm_limiter_evidence_finalize":
+            plant_identity = read_plant_identity(
+                "127.0.0.1",
+                self.config.plant_port,
+            )
+            with self._arm_evidence_boundary_lock:
+                identity = self._arm_evidence.active_identity
+                if identity is None or identity.get("caseId") != case_id:
+                    completed = self._arm_evidence.completed(case_id=case_id)
+                    if completed is None:
+                        raise ArmLimiterEvidenceError(
+                            "no matching arm evidence session is active"
+                        )
+                    response = {"status": "complete", "evidence": completed}
+                else:
+                    if (
+                        identity.get("plantBootId")
+                        != plant_identity["producerBootId"]
+                        or identity.get("plantSessionId")
+                        != plant_identity["sessionId"]
+                    ):
+                        self._arm_evidence.fail_active(
+                            "Plant identity changed during arm evidence"
+                        )
+                    with self._control_condition:
+                        with self._support_lock:
+                            with self._terminal_fault_lock:
+                                self._require_arm_evidence_finalize_locked(
+                                    identity
+                                )
+                                completed = self._arm_evidence.finalize(
+                                    case_id=case_id
+                                )
+                    response = {"status": "complete", "evidence": completed}
+        elif operation == "arm_limiter_evidence_abort":
+            with self._arm_evidence_boundary_lock:
+                aborted = self._arm_evidence.abort(case_id=case_id)
+            response = {"status": "aborted", "aborted": aborted}
+        else:
+            completed = self._arm_evidence.completed(case_id=case_id)
+            if completed is not None:
+                response = {"status": "complete", "evidence": completed}
+            elif self._arm_evidence.active_case_id == case_id:
+                response = {"status": "recording", "evidence": None}
+            else:
+                raise ArmLimiterEvidenceError(
+                    "no matching arm evidence session exists"
+                )
+
+        replays[request_id] = (canonical, copy.deepcopy(response))
+        return response
+
     def accept_json(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        if (
+            isinstance(payload.get("type"), str)
+            and str(payload["type"]).startswith("arm_limiter_evidence_")
+        ):
+            return self._handle_arm_evidence_request(payload)
+        if payload.get("type") == "motion_fault_latch":
+            if set(payload) != {"type", "request_id", "reason"}:
+                raise ValueError("motion fault latch fields do not match v1")
+            request_id = payload.get("request_id")
+            try:
+                parsed_request_id = UUID(str(request_id))
+            except (TypeError, ValueError, AttributeError) as exc:
+                raise ValueError(
+                    "motion fault latch request_id must be a UUID"
+                ) from exc
+            if str(parsed_request_id) != str(request_id):
+                raise ValueError(
+                    "motion fault latch request_id must be canonical"
+                )
+            reason = str(payload.get("reason", "")).strip()
+            if not reason or len(reason) > 512:
+                raise ValueError(
+                    "motion fault latch reason must contain 1..512 characters"
+                )
+            replays = getattr(self, "_motion_fault_latch_replays", None)
+            if replays is None:
+                replays = {}
+                self._motion_fault_latch_replays = replays
+            replay = replays.get(parsed_request_id)
+            if replay is not None:
+                previous_reason, previous_response = replay
+                if previous_reason != reason:
+                    raise RuntimeError(
+                        "motion fault latch request_id was reused with another reason"
+                    )
+                return copy.deepcopy(previous_response)
+            self._latch_motion_fault(reason)
+            with self._terminal_fault_lock:
+                if not (
+                    self._fault_latched.is_set()
+                    and self._recoverable_motion_fault
+                    and self._terminal_fault_reason == reason
+                ):
+                    raise RuntimeError(
+                        "SONIC did not confirm a recoverable motion fault"
+                    )
+            response: dict[str, object] = {
+                "status": "fault",
+                "mode": "safety_stop",
+                "recoverable": True,
+                "reason": reason,
+            }
+            replays[parsed_request_id] = (reason, copy.deepcopy(response))
+            return response
+        if payload.get("type") == "motion_fault_reset":
+            return self._handle_motion_fault_reset(payload)
         if payload.get("type") == "normal_stop_begin":
             return self._handle_normal_stop_begin(payload)
         if payload.get("type") == "normal_stop_stationary_ack":
@@ -4101,6 +5190,7 @@ class SonicDriver:
                 "schema_version": SONIC_HEALTH_SCHEMA_VERSION,
                 "robot_id": self.config.robot_id,
                 "driver_boot_id": str(self._driver_boot_id),
+                "driver_session_id": str(self._driver_session_id),
                 "status": status,
                 "terminal_fault": terminal_fault,
                 "reason": terminal_reason,
@@ -4163,7 +5253,11 @@ class SonicDriver:
         if self._fault_latched.is_set():
             if payload.get("control_arm") or payload.get("request_id"):
                 raise RuntimeError(
-                    "SONIC terminal fault requires an explicit process restart"
+                    (
+                        "SONIC motion fault requires explicit reset"
+                        if getattr(self, "_recoverable_motion_fault", False)
+                        else "SONIC terminal fault requires an explicit process restart"
+                    )
                 )
             return None
         if payload.get("type") == "stop":
@@ -4261,7 +5355,7 @@ class SonicDriver:
                         try:
                             self._stop_navigation_at_boundary(
                                 source=(
-                                    "terminal_fault"
+                                    "motion_fault"
                                     if decision.state == "FAULT"
                                     else "gait_adapter"
                                 ),
@@ -4298,10 +5392,16 @@ class SonicDriver:
                         f"{terminal_reason}; gait stop boundary fault: "
                         f"{stop_boundary_error}"
                     )
-                self._latch_terminal_fault(
-                    terminal_reason,
-                    boundary_already_stopped=True,
-                )
+                if decision.state == "FAULT" and stop_boundary_error is None:
+                    self._latch_motion_fault(
+                        terminal_reason,
+                        boundary_already_stopped=True,
+                    )
+                else:
+                    self._latch_terminal_fault(
+                        terminal_reason,
+                        boundary_already_stopped=True,
+                    )
                 return None
             with self._support_lock:
                 support_latched = (

@@ -527,6 +527,86 @@ def test_launcher_orders_the_semantic_gate_after_agent_health_before_status() ->
     assert "if support_safety_clue" in launcher
 
 
+def test_launcher_rejects_partial_motion_topology_before_startup_work() -> None:
+    launcher = (ROOT / "scripts" / "start-workstation-demo.sh").read_text(
+        encoding="utf-8"
+    )
+
+    topology_gate = launcher.index(
+        "Refusing to reuse a partial MuJoCo/SONIC/Nav2 motion topology"
+    )
+    model_lock = launcher.index("tools/verify_model_lock.py")
+    plant_start = launcher.index("start_process \\\n  mujoco-plant")
+    assert topology_gate < model_lock < plant_start
+    for unit in (
+        "mujoco-plant",
+        "sonic-driver",
+        "ros-cmd-vel-bridge",
+        "ros-observation-bridge",
+        "ros-safe-stop",
+        "sim-robot-agent-gateway",
+        "observation-gateway",
+        "robot-agent-g1-sim",
+        "robot-agent-diagnostics-proxy",
+    ):
+        assert f"  {unit}\n" in launcher
+    assert "HIDE_DEMO_NAV2_ACTIVE" in launcher
+    assert "Refusing to reuse a first-person viewer without its owning MuJoCo Plant" in launcher
+
+
+def test_launcher_has_a_cold_isolated_motion_core_mode() -> None:
+    launcher_path = ROOT / "scripts" / "start-workstation-demo.sh"
+    launcher = launcher_path.read_text(encoding="utf-8")
+
+    parser = launcher.index("--motion-core)")
+    viewer_requirement = launcher.index("--motion-core requires --viewer")
+    isolation_gate = launcher.index("require_motion_core_isolation()")
+    model_lock = launcher.index("tools/verify_model_lock.py")
+    nav2_ready = launcher.index("if ! wait_for_nav2_active 60")
+    isolated_exit = launcher.index("Motion-core is stationary and isolated")
+    robot_agent_start = launcher.index("start_process \\\n  robot-agent-g1-sim")
+    assert parser < viewer_requirement < isolation_gate < model_lock
+    assert nav2_ready < isolated_exit < robot_agent_start
+    assert 'for port in (8796, 8094):' in launcher
+    assert "HIDE_DEMO_MOTION_CORE_ISOLATED_UNITS=(" in launcher
+    assert "No motion command has been sent" in launcher
+
+    completed = subprocess.run(
+        ["bash", str(launcher_path), "--motion-core"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 2
+    assert "--motion-core requires --viewer" in completed.stderr
+
+
+def test_launcher_requires_mapped_fresh_first_person_frames_before_ros_ingress() -> None:
+    launcher = (ROOT / "scripts" / "start-workstation-demo.sh").read_text(
+        encoding="utf-8"
+    )
+
+    first_person_start = launcher.index("start_process \\\n    first-person-viewer")
+    first_person_gate = launcher.index(
+        "wait_for_first_person_viewer", first_person_start
+    )
+    ros_ingress = launcher.index("start_process \\\n  ros-cmd-vel-bridge")
+    assert first_person_start < first_person_gate < ros_ingress
+    gate_source = launcher[
+        launcher.index("wait_for_first_person_viewer()") : first_person_start
+    ]
+    for evidence in (
+        'payload.get("status") == "running"',
+        'payload.get("healthy") is True',
+        'payload.get("mapped") is True',
+        'payload.get("plantSessionId")',
+        'payload["sequence"] >= 2',
+        'payload["plantSequence"] > 0',
+        '0.0 <= success_age_s <= 2.0',
+    ):
+        assert evidence in gate_source
+
+
 def test_pre_agent_gate_cannot_use_empty_last_error_to_bypass_a_support_latch() -> None:
     launcher = (ROOT / "scripts" / "start-workstation-demo.sh").read_text(
         encoding="utf-8"

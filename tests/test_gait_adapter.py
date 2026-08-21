@@ -247,14 +247,13 @@ def test_repeated_starting_emissions_keep_first_admitted_authority_sequence() ->
     ) is True
 
 
-def test_health_probe_delay_does_not_erase_pre_authority_motion_anchor() -> None:
+def test_reference_authority_reanchors_after_preparation_drift() -> None:
     adapter = armed_adapter(config=GaitAdapterConfig(max_linear_mps=0.25))
     starting = adapter.ingest_twist(twist(10.02, vx=0.2), now=10.02)
-    # At the configured 0.25m/s limit the base may move about 6mm between the
-    # first DDS write and a 25ms health probe.  This sample must not replace the
-    # pre-motion admission pose.
+    # Policy INIT is not navigation motion.  Its base drift must be discarded
+    # when the correlated first DDS authority fact is observed.
     adapter.ingest_observation(
-        observation(10.05, vx=-0.08, x=-0.006),
+        observation(10.05, vx=-0.08, x=-0.060),
         now=10.05,
     )
     assert adapter.observe_reference_authority(
@@ -265,12 +264,12 @@ def test_health_probe_delay_does_not_erase_pre_authority_motion_anchor() -> None
         granted_at_monotonic_s=10.025,
         now=10.05,
     ) is True
-    fault = adapter.ingest_observation(
-        observation(10.28, vx=-0.08, x=-0.061),
+    transient = adapter.ingest_observation(
+        observation(10.28, vx=-0.08, x=-0.070),
         now=10.28,
     )
-    assert fault.state == "FAULT"
-    assert "opposes Nav2" in (fault.reason or "")
+    assert transient.state == "STARTING"
+    assert adapter._motion_anchor == pytest.approx((-0.060, 0.0, 0.0))
 
 
 def test_nav2_zero_waits_for_multiple_measured_stop_samples() -> None:
@@ -588,12 +587,91 @@ def test_cumulative_measured_reverse_translation_latches_fault() -> None:
     grant_reference(adapter, starting)
     adapter.ingest_observation(observation(10.03, vx=0.06, x=0.01), now=10.03)
     fault = adapter.ingest_observation(
-        observation(10.10, vx=-0.08, x=-0.07),
+        observation(10.10, vx=-0.08, x=-0.081),
         now=10.10,
     )
     assert fault.state == "FAULT"
     assert fault.velocity_x_mps == 0.0
     assert "opposes Nav2" in (fault.reason or "")
+
+
+def test_reverse_startup_transient_must_end_within_one_second() -> None:
+    adapter = armed_adapter(
+        config=GaitAdapterConfig(command_timeout_s=5.0, observation_timeout_s=5.0)
+    )
+    starting = adapter.ingest_twist(twist(10.02, vx=0.2), now=10.02)
+    grant_reference(adapter, starting, granted_at=10.025)
+
+    within_grace = adapter.ingest_observation(
+        observation(11.00, vx=-0.03, x=-0.02),
+        now=11.00,
+    )
+    assert within_grace.state == "STARTING"
+
+    fault = adapter.ingest_observation(
+        observation(11.03, vx=-0.03, x=-0.021),
+        now=11.03,
+    )
+    assert fault.state == "FAULT"
+    assert "startup grace" in (fault.reason or "")
+
+
+def test_authorized_walk_requires_net_positive_progress_within_two_seconds() -> None:
+    adapter = armed_adapter(
+        config=GaitAdapterConfig(command_timeout_s=5.0, observation_timeout_s=5.0)
+    )
+    starting = adapter.ingest_twist(twist(10.02, vx=0.2), now=10.02)
+    grant_reference(adapter, starting, granted_at=10.025)
+    # Positive velocity alone acknowledges the gait state, but millimetre-scale
+    # pose noise cannot satisfy the independent progress deadline.
+    walking = adapter.ingest_observation(
+        observation(10.05, vx=0.06, x=0.001),
+        now=10.05,
+    )
+    assert walking.state == "WALKING"
+    fault = adapter.ingest_observation(
+        observation(12.03, vx=0.03, x=0.005),
+        now=12.03,
+    )
+    assert fault.state == "FAULT"
+    assert "no net positive" in (fault.reason or "")
+
+
+def test_sub_threshold_pose_noise_does_not_become_reverse_motion() -> None:
+    adapter = armed_adapter(
+        config=GaitAdapterConfig(command_timeout_s=5.0, observation_timeout_s=5.0)
+    )
+    starting = adapter.ingest_twist(twist(10.02, vx=0.2), now=10.02)
+    grant_reference(adapter, starting, granted_at=10.025)
+
+    noisy = adapter.ingest_observation(
+        observation(11.03, vx=0.0, x=-1e-6),
+        now=11.03,
+    )
+    assert noisy.state == "STARTING"
+
+    fault = adapter.ingest_observation(
+        observation(12.03, vx=0.0, x=-1e-6),
+        now=12.03,
+    )
+    assert fault.state == "FAULT"
+    assert "no net positive" in (fault.reason or "")
+
+
+def test_positive_progress_before_deadline_disarms_startup_progress_fault() -> None:
+    adapter = armed_adapter(
+        config=GaitAdapterConfig(command_timeout_s=5.0, observation_timeout_s=5.0)
+    )
+    starting = adapter.ingest_twist(twist(10.02, vx=0.2), now=10.02)
+    grant_reference(adapter, starting, granted_at=10.025)
+    assert adapter.ingest_observation(
+        observation(10.20, vx=0.06, x=0.012),
+        now=10.20,
+    ).state == "WALKING"
+    assert adapter.ingest_observation(
+        observation(12.20, vx=0.03, x=0.013),
+        now=12.20,
+    ).state == "WALKING"
 
 
 def test_sustained_measured_reverse_turn_latches_fault() -> None:

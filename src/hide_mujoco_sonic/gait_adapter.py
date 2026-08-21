@@ -130,8 +130,14 @@ class GaitAdapterConfig:
     stop_ack_s: float = 0.15
     stop_ack_samples: int = 2
     stop_timeout_s: float = 2.0
-    reverse_translation_m: float = 0.04
-    reverse_min_travel_m: float = 0.06
+    # Humanoid stand-to-walk may briefly shift its base opposite the commanded
+    # direction.  The allowance is intentionally bounded in both distance and
+    # time, and is measured only after the first correlated DDS authority fact.
+    reverse_translation_m: float = 0.08
+    reverse_min_travel_m: float = 0.08
+    startup_reverse_grace_s: float = 1.0
+    startup_progress_deadline_s: float = 2.0
+    startup_min_progress_m: float = 0.01
     reverse_rotation_rad: float = 0.05
     max_tilt_rad: float = 0.55
     direction_restart_rad: float = math.radians(100.0)
@@ -156,6 +162,9 @@ class GaitAdapterConfig:
             self.stop_timeout_s,
             self.reverse_translation_m,
             self.reverse_min_travel_m,
+            self.startup_reverse_grace_s,
+            self.startup_progress_deadline_s,
+            self.startup_min_progress_m,
             self.reverse_rotation_rad,
             self.max_tilt_rad,
             self.direction_restart_rad,
@@ -184,6 +193,10 @@ class GaitAdapterConfig:
             raise ValueError("angular stop acknowledgement must be below the command limit")
         if self.direction_restart_rad > math.pi:
             raise ValueError("direction restart angle must not exceed pi")
+        if self.startup_reverse_grace_s >= self.startup_progress_deadline_s:
+            raise ValueError(
+                "startup reverse grace must be shorter than the progress deadline"
+            )
 
 
 class GaitAdapter:
@@ -220,6 +233,7 @@ class GaitAdapter:
         self._motion_started_in_generation = False
 
         self._start_at: float | None = None
+        self._motion_authority_granted_at: float | None = None
         self._reference_wait_started_at: float | None = None
         self._reference_authority_source_sequence: int | None = None
         self._reference_authority_epoch: int | None = None
@@ -231,6 +245,7 @@ class GaitAdapter:
         self._expected_map_direction: tuple[float, float] | None = None
         self._previous_yaw: float | None = None
         self._cumulative_yaw = 0.0
+        self._startup_positive_progress_seen = False
 
         self._stop_started_at: float | None = None
         self._stop_terminal = GaitState.IDLE
@@ -492,12 +507,18 @@ class GaitAdapter:
             )
 
         self._start_at = granted_at
+        self._motion_authority_granted_at = granted_at
         self._reference_authority_epoch = reference_epoch
         self._reference_authority_dds_sequence = dds_target_sequence
         self._motion_started_in_generation = True
         self.reason = "waiting for measured gait start"
         observation = self._observation
-        if self._motion_anchor is None and observation is not None:
+        # Navigation motion begins at the first correlated DDS authority fact,
+        # not when Nav2 first expresses intent.  In particular, the official
+        # policy INIT/settle phase may move the floating base while actuator
+        # authority is still REQUIRED.  Re-anchor unconditionally here so that
+        # preparation drift can neither trip nor satisfy the motion guards.
+        if observation is not None:
             self._motion_anchor = (
                 observation.x,
                 observation.y,
@@ -514,6 +535,11 @@ class GaitAdapter:
                     cosine * direction_x - sine * direction_y,
                     sine * direction_x + cosine * direction_y,
                 )
+        else:
+            self._motion_anchor = None
+            self._expected_map_direction = None
+            self._previous_yaw = None
+        self._startup_positive_progress_seen = False
         return True
 
     def _evaluate(self, now: float) -> None:
@@ -594,6 +620,7 @@ class GaitAdapter:
         self.state = GaitState.STARTING
         self.reason = "waiting for matched SONIC reference actuator authority"
         self._start_at = None
+        self._motion_authority_granted_at = None
         self._reference_wait_started_at = now
         self._reference_authority_source_sequence = None
         self._reference_authority_epoch = None
@@ -606,28 +633,13 @@ class GaitAdapter:
         else:
             self._active_direction = None
             self._active_turn_sign = math.copysign(1.0, command.wz)
-        observation = self._observation
-        if observation is None:
-            self._motion_anchor = None
-            self._expected_map_direction = None
-            self._previous_yaw = None
-        else:
-            # Capture the pre-authority pose.  Health polling can observe the
-            # first DDS grant up to one probe period later; re-anchoring at that
-            # point would erase the first physical displacement segment.
-            self._motion_anchor = (observation.x, observation.y, observation.yaw)
-            self._previous_yaw = observation.yaw
-            if self._active_direction is None:
-                self._expected_map_direction = None
-            else:
-                direction_x, direction_y = self._active_direction
-                cosine = math.cos(observation.yaw)
-                sine = math.sin(observation.yaw)
-                self._expected_map_direction = (
-                    cosine * direction_x - sine * direction_y,
-                    sine * direction_x + cosine * direction_y,
-                )
+        # This pre-authority state is deliberately not a motion baseline.  The
+        # correlated first DDS grant installs the only accepted baseline.
+        self._motion_anchor = None
+        self._expected_map_direction = None
+        self._previous_yaw = None
         self._cumulative_yaw = 0.0
+        self._startup_positive_progress_seen = False
         self._stop_acknowledged = False
 
     def _check_start_ack(self, observation: BaseObservation) -> None:
@@ -674,6 +686,14 @@ class GaitAdapter:
                 dx * self._expected_map_direction[0]
                 + dy * self._expected_map_direction[1]
             )
+            granted_at = self._motion_authority_granted_at
+            elapsed = (
+                0.0
+                if granted_at is None
+                else max(0.0, observation.timestamp_s - granted_at)
+            )
+            if projection >= self.config.startup_min_progress_m:
+                self._startup_positive_progress_seen = True
             if (
                 travel >= self.config.reverse_min_travel_m
                 and projection <= -self.config.reverse_translation_m
@@ -681,6 +701,30 @@ class GaitAdapter:
                 self._trip_fault(
                     "measured translation opposes Nav2 "
                     f"(travel={travel:.3f}m, reverse_projection={-projection:.3f}m)",
+                    now,
+                )
+                return
+            if (
+                granted_at is not None
+                and elapsed > self.config.startup_reverse_grace_s
+                and projection <= -self.config.startup_min_progress_m
+            ):
+                self._trip_fault(
+                    "measured translation remained opposite Nav2 beyond the "
+                    f"startup grace (elapsed={elapsed:.3f}s, "
+                    f"reverse_projection={-projection:.3f}m)",
+                    now,
+                )
+                return
+            if (
+                granted_at is not None
+                and elapsed > self.config.startup_progress_deadline_s
+                and not self._startup_positive_progress_seen
+            ):
+                self._trip_fault(
+                    "measured translation made no net positive Nav2 progress "
+                    f"after authority grant (elapsed={elapsed:.3f}s, "
+                    f"projection={projection:.3f}m)",
                     now,
                 )
             return
@@ -734,6 +778,7 @@ class GaitAdapter:
         reason = self.reason
         self.state = terminal
         self._start_at = None
+        self._motion_authority_granted_at = None
         self._reference_wait_started_at = None
         self._reference_authority_source_sequence = None
         self._reference_authority_epoch = None
@@ -745,6 +790,7 @@ class GaitAdapter:
         self._expected_map_direction = None
         self._previous_yaw = None
         self._cumulative_yaw = 0.0
+        self._startup_positive_progress_seen = False
         self._stop_started_at = None
         if terminal is GaitState.IDLE:
             self.reason = None
@@ -762,10 +808,12 @@ class GaitAdapter:
         self._requires_new_generation = True
         self._stop_started_at = now
         self._start_at = None
+        self._motion_authority_granted_at = None
         self._reference_wait_started_at = None
         self._reference_authority_source_sequence = None
         self._reference_authority_epoch = None
         self._reference_authority_dds_sequence = None
+        self._startup_positive_progress_seen = False
         self._safe_stop_requested = False
 
     def _observe_stop_ack(self, observation: BaseObservation, now: float) -> None:
@@ -827,6 +875,7 @@ class GaitAdapter:
         self._requires_new_generation = False
         self._motion_started_in_generation = False
         self._start_at = None
+        self._motion_authority_granted_at = None
         self._reference_wait_started_at = None
         self._reference_authority_source_sequence = None
         self._reference_authority_epoch = None
@@ -838,6 +887,7 @@ class GaitAdapter:
         self._expected_map_direction = None
         self._previous_yaw = None
         self._cumulative_yaw = 0.0
+        self._startup_positive_progress_seen = False
         self._stop_started_at = None
         self._stop_terminal = GaitState.IDLE
         self._safe_stop_requested = False

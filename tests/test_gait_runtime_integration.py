@@ -150,6 +150,7 @@ def reference_health(starting, *, granted_at: float) -> SonicHealth:
         request_id=UUID("40000000-0000-4000-8000-000000000004"),
         robot_id="g1-sim",
         driver_boot_id=UUID("30000000-0000-4000-8000-000000000003"),
+        driver_session_id=UUID("31000000-0000-4000-8000-000000000003"),
         status="ready",
         terminal_fault=False,
         reason=None,
@@ -387,7 +388,7 @@ def test_replay_terminal_events_never_reach_model_motion(terminal: str) -> None:
         )
         clock.value += 0.06
         intent = adapter.ingest_observation(
-            observation(clock, vx=-0.08, x=-0.07), now=clock.value
+            observation(clock, vx=-0.08, x=-0.081), now=clock.value
         )
     else:
         clock.value += 0.01
@@ -500,6 +501,7 @@ def bare_driver(clock: Clock) -> SonicDriver:
         sonic_control_step_stale_s=0.10,
     )
     driver._driver_boot_id = UUID("30000000-0000-4000-8000-000000000003")
+    driver._driver_session_id = UUID("31000000-0000-4000-8000-000000000003")
     driver.guard = FakeGuard()
     driver.telemetry = FakeTelemetry()
     driver._intent_ingress = SonicIntentIngress(clock=clock, max_age_s=0.5)
@@ -536,6 +538,12 @@ def bare_driver(clock: Clock) -> SonicDriver:
     driver._vendor_revoke_pending = False
     driver._intent_gate = None
     driver._dds_target_sequence = 0
+    driver._control_evidence_context = threading.local()
+    driver._arm_evidence_boundary_lock = threading.RLock()
+    driver._arm_evidence_write_condition = threading.Condition()
+    driver._arm_evidence_writes_inflight = set()
+    driver._arm_evidence = SimpleNamespace(active=False)
+    driver._arm_evidence_request_replays = {}
     driver._plant_support_mode = "idle"
     driver._plant_support_stop_pending = False
     driver._plant_support_safety_latched = False
@@ -938,7 +946,7 @@ def test_driver_keeps_first_starting_sequence_across_repeated_bridge_envelopes()
     assert driver._reference_source_identity == first_identity
 
 
-def test_gait_fault_freezes_target_and_latches_terminal_without_recoverable_support(
+def test_gait_fault_freezes_target_and_stays_alive_in_recoverable_support(
     monkeypatch,
 ) -> None:
     clock = Clock()
@@ -952,6 +960,7 @@ def test_gait_fault_freezes_target_and_latches_terminal_without_recoverable_supp
     )
     support_calls: list[str] = []
     terminal_halts: list[str] = []
+    motion_fault_latches: list[str] = []
 
     def confirm_support(_host, _port, mode, **_kwargs):
         support_calls.append(mode)
@@ -968,6 +977,18 @@ def test_gait_fault_freezes_target_and_latches_terminal_without_recoverable_supp
             or {"mode": "safety_stop", "safetyStopLatched": True, "fault": reason}
         ),
     )
+    monkeypatch.setattr(
+        "hide_mujoco_sonic.sonic_driver.latch_plant_motion_fault",
+        lambda _host, _port, reason, **_kwargs: (
+            motion_fault_latches.append(reason)
+            or {
+                "mode": "safety_stop",
+                "safetyStopLatched": True,
+                "fault": None,
+                "motionFault": reason,
+            }
+        ),
+    )
     driver.accept_json(
         _intent_payload(adapter.tick(now=clock.value), measured_heading_yaw=0.0)
     )
@@ -982,7 +1003,7 @@ def test_gait_fault_freezes_target_and_latches_terminal_without_recoverable_supp
     )
     clock.value += 0.01
     fault = adapter.ingest_observation(
-        observation(clock, vx=-0.10, x=-0.07),
+        observation(clock, vx=-0.10, x=-0.081),
         now=clock.value,
     )
 
@@ -992,14 +1013,181 @@ def test_gait_fault_freezes_target_and_latches_terminal_without_recoverable_supp
 
     assert fault.state == "FAULT"
     assert support_calls == []
-    assert terminal_halts == [fault.reason]
+    assert terminal_halts == []
+    assert motion_fault_latches == [fault.reason]
     assert driver._fault_latched.is_set()
+    assert driver._recoverable_motion_fault is True
     assert driver._terminal_fault_reason == fault.reason
-    assert driver._plant_support_safety_latched is False
+    assert driver._plant_support_safety_latched is True
+    assert driver._stop.is_set() is False
     assert driver.telemetry.values["status"] == "failed"
     assert driver.telemetry.values["nav2_state"] == "fault_latched"
     assert driver._safe_hold_targets == published
     assert frozen and all(targets == published for targets in frozen)
+
+
+def test_recoverable_motion_fault_reset_requires_two_safe_frames_and_stays_revoked(
+    monkeypatch,
+) -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    published = tuple(0.01 * index for index in range(29))
+    driver._last_published_targets = published
+    driver._safe_hold_targets = published
+    driver._static_hold_active = True
+    driver._plant_support_safety_latched = True
+    driver._plant_support_mode = "safety_stop"
+    driver._lowstate = SimpleNamespace(
+        motor_state=[
+            SimpleNamespace(q=value, dq=0.0, tau_est=0.0)
+            for value in published
+        ],
+        imu_state=SimpleNamespace(
+            gyroscope=(0.0, 0.0, 0.0),
+            rpy=(0.0, 0.0, 0.0),
+        ),
+    )
+    reason = "gait_adapter/GAIT_ADAPTER_FAULT: no forward progress"
+    monkeypatch.setattr(
+        "hide_mujoco_sonic.sonic_driver.latch_plant_motion_fault",
+        lambda *_args, **_kwargs: {
+            "mode": "safety_stop",
+            "safetyStopLatched": True,
+            "fault": None,
+            "motionFault": reason,
+        },
+    )
+    cleared: list[str] = []
+    monkeypatch.setattr(
+        "hide_mujoco_sonic.sonic_driver.clear_plant_motion_fault",
+        lambda _host, _port, value, **_kwargs: (
+            cleared.append(value)
+            or {
+                "mode": "safety_stop",
+                "safetyStopLatched": True,
+                "fault": None,
+                "motionFault": None,
+            }
+        ),
+    )
+    driver._latch_motion_fault(reason, boundary_already_stopped=True)
+    driver._record_motion_fault_hold_frame(100)
+    request = {
+        "type": "motion_fault_reset",
+        "request_id": "60000000-0000-4000-8000-000000000006",
+        "reason": reason,
+    }
+    with pytest.raises(RuntimeError, match="two coherent"):
+        driver.accept_json(request)
+
+    driver._record_motion_fault_hold_frame(120)
+    result = driver.accept_json(request)
+    assert result == {
+        "status": "reset",
+        "mode": "safety_stop",
+        "authority": "REVOKED",
+        "safe_hold_frames": 2,
+    }
+    assert cleared == [reason]
+    assert driver._fault_latched.is_set() is False
+    assert driver._recoverable_motion_fault is False
+    assert driver._intent_ingress.armed is False
+    assert driver._reference_authority.snapshot.phase == "REVOKED"
+    assert driver._safe_hold_targets == published
+    assert driver._plant_support_safety_latched is True
+    assert driver._motion_ready.is_set() is True
+
+    # Lost reply retry is a pure replay and never clears Plant twice.
+    assert driver.accept_json(request) == result
+    assert cleared == [reason]
+
+
+def test_motion_fault_reset_rejects_nonconsecutive_hold_frames_and_tilt(
+    monkeypatch,
+) -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    driver.config.control_hz = 50
+    published = tuple(0.01 * index for index in range(29))
+    driver._last_published_targets = published
+    driver._safe_hold_targets = published
+    driver._static_hold_active = True
+    driver._plant_support_safety_latched = True
+    driver._plant_support_mode = "safety_stop"
+    driver._lowstate = SimpleNamespace(
+        motor_state=[SimpleNamespace(q=value, dq=0.0) for value in published],
+        imu_state=SimpleNamespace(
+            gyroscope=(0.0, 0.0, 0.0),
+            rpy=(0.16, 0.0, 0.0),
+        ),
+    )
+    reason = "navigation_guard/NAVIGATION_GUARD_FAULT: unsafe direction"
+    monkeypatch.setattr(
+        "hide_mujoco_sonic.sonic_driver.latch_plant_motion_fault",
+        lambda *_args, **_kwargs: {
+            "mode": "safety_stop",
+            "safetyStopLatched": True,
+            "fault": None,
+            "motionFault": reason,
+        },
+    )
+    monkeypatch.setattr(
+        "hide_mujoco_sonic.sonic_driver.clear_plant_motion_fault",
+        lambda *_args, **_kwargs: pytest.fail("tilted reset reached Plant"),
+    )
+    driver._latch_motion_fault(reason, boundary_already_stopped=True)
+    driver._record_motion_fault_hold_frame(100)
+    driver._record_motion_fault_hold_frame(140)
+    request = {
+        "type": "motion_fault_reset",
+        "request_id": "80000000-0000-4000-8000-000000000008",
+        "reason": reason,
+    }
+    with pytest.raises(RuntimeError, match="two coherent"):
+        driver.accept_json(request)
+
+    driver._record_motion_fault_hold_frame(160)
+    assert driver._motion_fault_safe_hold_frames == 2
+    with pytest.raises(RuntimeError, match="finite stationary Plant"):
+        driver.accept_json(request)
+
+
+def test_motion_fault_latch_is_identity_bound_and_replay_safe(monkeypatch) -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    reason = "gait_adapter/GAIT_ADAPTER_FAULT: no forward progress"
+    latched: list[str] = []
+    monkeypatch.setattr(
+        "hide_mujoco_sonic.sonic_driver.latch_plant_motion_fault",
+        lambda _host, _port, value, **_kwargs: (
+            latched.append(value)
+            or {
+                "mode": "safety_stop",
+                "safetyStopLatched": True,
+                "fault": None,
+                "motionFault": value,
+            }
+        ),
+    )
+    request = {
+        "type": "motion_fault_latch",
+        "request_id": "70000000-0000-4000-8000-000000000007",
+        "reason": reason,
+    }
+
+    first = driver.accept_json(request)
+    assert first == {
+        "status": "fault",
+        "mode": "safety_stop",
+        "recoverable": True,
+        "reason": reason,
+    }
+    assert driver.accept_json(request) == first
+    assert latched == [reason]
+
+    rebound = dict(request, reason="another fault")
+    with pytest.raises(RuntimeError, match="reused with another reason"):
+        driver.accept_json(rebound)
 
 
 def test_terminal_fault_halts_plant_before_trace_even_if_vendor_revoke_fails(
@@ -1127,7 +1315,14 @@ def _lowstate(targets: tuple[float, ...], *, arm_lag_rad: float = 0.0):
     for index, target in enumerate(targets):
         measured = target - arm_lag_rad if index >= 15 else target
         states.append(SimpleNamespace(q=measured, dq=0.0, tau_est=0.0))
-    return SimpleNamespace(mode_machine=0, motor_state=states)
+    return SimpleNamespace(
+        mode_machine=0,
+        motor_state=states,
+        imu_state=SimpleNamespace(
+            gyroscope=(0.0, 0.0, 0.0),
+            rpy=(0.0, 0.0, 0.0),
+        ),
+    )
 
 
 def _action(driver: SonicDriver, targets: tuple[float, ...]) -> dict[str, float]:
@@ -1491,7 +1686,9 @@ def test_arm_guard_rejects_slew_valid_progress_beyond_physical_range(
         guard.apply(targets, dt=0.02)
 
 
-def test_nominal_policy_activation_restarts_after_support_failure_and_freezes_policy() -> None:
+def test_nominal_policy_activation_restarts_after_support_failure_and_freezes_policy(
+    monkeypatch,
+) -> None:
     from lerobot.robots.unitree_g1.controllers.sonic_pipeline import DEFAULT_ANGLES
 
     clock = Clock()
@@ -1526,6 +1723,21 @@ def test_nominal_policy_activation_restarts_after_support_failure_and_freezes_po
     )
     driver._planner_telemetry_fields = lambda: {}
     driver._record_control_trace = lambda **_kwargs: None
+    release_epochs: list[int] = []
+
+    def release_fall_arrest(_host: str, _port: int, epoch: int):
+        release_epochs.append(epoch)
+        return {
+            "fallArrestEnabled": False,
+            "fallArrestReleaseConfirmedEpoch": epoch,
+            "fault": None,
+            "motionFault": None,
+        }
+
+    monkeypatch.setattr(
+        "hide_mujoco_sonic.sonic_driver.release_plant_fall_arrest",
+        release_fall_arrest,
+    )
 
     support_modes: list[str] = []
     support_attempts = 0
@@ -1541,7 +1753,7 @@ def test_nominal_policy_activation_restarts_after_support_failure_and_freezes_po
 
     driver._set_plant_support_mode = set_support
 
-    for frame in range(202):
+    for frame in range(223):
         tick_ms = 1_000 + frame * 20
         sampled_intent = intent if frame < 201 else _movement_intent(0.15)
         driver._run_nominal_policy_activation(
@@ -1552,20 +1764,28 @@ def test_nominal_policy_activation_restarts_after_support_failure_and_freezes_po
         )
         # Preparation may publish actuator targets, but it cannot request or
         # install a policy reference before the final nominal DDS fact.
-        if frame < 201:
+        if frame < 222:
             assert driver._reference_request_pending is False
             assert observed_intents == []
             assert driver._reference_authority.snapshot.phase == "REQUIRED"
+        if frame == 211:
+            release_thread = driver._policy_activation_release_thread
+            assert release_thread is not None
+            release_thread.join(timeout=1.0)
+            assert not release_thread.is_alive()
 
-    assert len(writes) == 202
+    assert len(writes) == 223
     assert writes[0] == pytest.approx(boundary)
     assert writes[50] == pytest.approx(writes[49])
-    assert writes[51] == pytest.approx(writes[50])
+    # A restarted official INIT starts from the freshly measured joints,
+    # without carrying elapsed ratio or a stale pre-failure command target.
+    assert writes[51] == pytest.approx(boundary)
     assert writes[-1] == pytest.approx(nominal)
     assert driver._policy_activation.phase == "PREPARED"
     assert driver._policy_activation_requested is False
     assert driver._reference_request_pending is True
-    assert observed_intents == [(intent, True, 5.02)]
+    assert observed_intents == [(intent, True, 5.44)]
+    assert release_epochs == [3]
     assert set(support_modes) == {"idle"}
 
     # Planner waiting after INIT must hold nominal, never jump back to the
@@ -1578,6 +1798,144 @@ def test_nominal_policy_activation_restarts_after_support_failure_and_freezes_po
         now=4.02,
     )
     assert waiting.targets == pytest.approx(nominal)
+
+    # The first reference request happens on the next 50 Hz iteration and is
+    # seeded from that iteration's exact LowState, not the last settle sample.
+    requested_lowstates: list[object] = []
+    fresh_lowstate = _lowstate(tuple(value + 0.001 for value in nominal))
+    driver._controller = SimpleNamespace(
+        initialized=True,
+        execution_feedback_pending=False,
+        request_reference=requested_lowstates.append,
+        poll_reference=lambda: False,
+    )
+    assert driver._progress_reference_transaction(fresh_lowstate) is False
+    assert requested_lowstates == [fresh_lowstate]
+
+
+def test_activation_waits_across_async_release_ticks_without_aborting(
+    monkeypatch,
+) -> None:
+    from lerobot.robots.unitree_g1.controllers.sonic_pipeline import DEFAULT_ANGLES
+
+    clock = Clock()
+    driver, writes = _publishing_driver(clock)
+    nominal = tuple(float(value) for value in DEFAULT_ANGLES)
+    lowstate = _lowstate(nominal)
+    activation = NominalPolicyActivation(
+        joint_count=29,
+        duration_s=3.0,
+        settle_consecutive_samples=1,
+    )
+    assert activation.begin(nominal, tick_ms=0)
+    final = activation.propose(
+        nominal,
+        measured=nominal,
+        tick_ms=3_000,
+    )
+    assert activation.commit(final, final.targets)
+    activation.observe_settling(
+        nominal=nominal,
+        measured=nominal,
+        velocities=tuple(0.0 for _ in nominal),
+        gyroscope=(0.0, 0.0, 0.0),
+        roll_rad=0.0,
+        pitch_rad=0.0,
+        tick_ms=3_020,
+    )
+    assert activation.phase == "WAITING_FOR_SUPPORT_RELEASE"
+    activation_epoch = activation.epoch
+
+    driver._policy_activation = activation
+    driver._last_published_targets = nominal
+    driver._safe_hold_targets = nominal
+    driver._joint_handoff.freeze(nominal)
+    driver._arm_guard.anchor(nominal[15:29])
+    driver._policy_activation_requested = True
+    driver._navigation_task_active = True
+    driver._reference_source_identity = (42, 7)
+    driver._reference_authority.require(generation=42, source_sequence=7)
+    driver._intent_ingress = SimpleNamespace(armed=True, generation=42)
+    driver._controller = SimpleNamespace(execution_feedback_pending=False)
+    intent = _movement_intent(0.0)
+    driver._intent_gate = SimpleNamespace(last=intent)
+    observed_intents: list[tuple[MovementIntent, bool, float]] = []
+    driver._planner_evidence = SimpleNamespace(
+        observe_intent=lambda intent, *, admitted, simulation_now_s: (
+            observed_intents.append((intent, admitted, simulation_now_s))
+        )
+    )
+    driver._planner_telemetry_fields = lambda: {}
+    driver._record_control_trace = lambda **_kwargs: None
+    driver._set_plant_support_mode = lambda _mode: True
+
+    worker_entered = threading.Event()
+    release_worker = threading.Event()
+    release_epochs: list[int] = []
+
+    def blocking_release(_host: str, _port: int, epoch: int):
+        release_epochs.append(epoch)
+        worker_entered.set()
+        assert release_worker.wait(timeout=2.0)
+        return {
+            "fallArrestEnabled": False,
+            "fallArrestReleaseConfirmedEpoch": epoch,
+            "fault": None,
+            "motionFault": None,
+        }
+
+    monkeypatch.setattr(
+        "hide_mujoco_sonic.sonic_driver.release_plant_fall_arrest",
+        blocking_release,
+    )
+
+    for tick_ms in (3_040, 3_060, 3_080):
+        driver._run_nominal_policy_activation(
+            lowstate=lowstate,
+            control_step=PlantControlStep(tick_ms=tick_ms, dt_s=0.02),
+            intent=intent,
+            measured=nominal,
+        )
+        assert worker_entered.wait(timeout=1.0)
+        assert activation.phase == "WAITING_FOR_SUPPORT_RELEASE"
+        assert activation.epoch == activation_epoch
+        assert driver._policy_activation_requested is True
+        assert driver._reference_request_pending is False
+        assert observed_intents == []
+    assert release_epochs == [activation_epoch]
+
+    release_worker.set()
+    thread = driver._policy_activation_release_thread
+    assert thread is not None
+    thread.join(timeout=1.0)
+    assert not thread.is_alive()
+    driver._run_nominal_policy_activation(
+        lowstate=lowstate,
+        control_step=PlantControlStep(tick_ms=3_100, dt_s=0.02),
+        intent=intent,
+        measured=nominal,
+    )
+    assert activation.phase == "SETTLING_UNSUPPORTED"
+    assert driver._reference_request_pending is False
+
+    driver._run_nominal_policy_activation(
+        lowstate=lowstate,
+        control_step=PlantControlStep(tick_ms=3_120, dt_s=0.02),
+        intent=intent,
+        measured=nominal,
+    )
+    assert activation.phase == "PREPARED"
+    assert driver._reference_request_pending is True
+    assert observed_intents == [(intent, True, 3.12)]
+    assert len(writes) == 5
+    telemetry = driver.telemetry.values
+    assert telemetry["policy_activation_epoch"] == activation_epoch
+    assert telemetry["policy_activation_path"] == "tethered_release"
+    assert (
+        telemetry["policy_activation_release_confirmed_epoch"]
+        == activation_epoch
+    )
+
 
 
 def test_run_never_enters_reference_or_policy_during_nominal_activation() -> None:
@@ -1831,10 +2189,29 @@ def test_completed_nominal_activation_is_not_repeated_for_second_task() -> None:
     clock = Clock()
     driver = bare_driver(clock)
     driver._last_published_targets = tuple(0.0 for _ in range(29))
-    activation = NominalPolicyActivation(duration_s=3.0)
+    activation = NominalPolicyActivation(
+        duration_s=3.0,
+        settle_consecutive_samples=1,
+    )
     assert activation.begin(driver._last_published_targets, tick_ms=0) is True
-    final = activation.propose(driver._last_published_targets, tick_ms=3_000)
+    final = activation.propose(
+        driver._last_published_targets,
+        measured=driver._last_published_targets,
+        tick_ms=3_000,
+    )
     assert activation.commit(final, final.targets) is True
+    settle = dict(
+        nominal=driver._last_published_targets,
+        measured=driver._last_published_targets,
+        velocities=driver._last_published_targets,
+        gyroscope=(0.0, 0.0, 0.0),
+        roll_rad=0.0,
+        pitch_rad=0.0,
+    )
+    activation.observe_settling(**settle, tick_ms=3_020)
+    assert activation.confirm_support_release(tick_ms=3_020)
+    activation.observe_settling(**settle, tick_ms=3_040)
+    assert activation.prepared
     driver._policy_activation = activation
     driver._policy_activation_requested = False
     driver._reference_source_identity = (42, 7)

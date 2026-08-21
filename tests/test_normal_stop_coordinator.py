@@ -62,6 +62,7 @@ def fresh_safe_health() -> SonicHealth:
         request_id=UUID("40000000-0000-4000-8000-000000000004"),
         robot_id=ROBOT_ID,
         driver_boot_id=DRIVER_BOOT_ID,
+        driver_session_id=UUID("31000000-0000-4000-8000-000000000003"),
         status="ready",
         terminal_fault=False,
         reason=None,

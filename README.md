@@ -112,7 +112,7 @@ non-semantic integrity manifest.
   Robot Agent remains the sole Nav2 action owner and cancels only its correlated
   goal handle; the simulator never uses a global `CancelGoal(all)` operation.
 * The existing loopback-only port 8793 also accepts a strict, read-only
-  `h-ide.sonic-health/v2` probe. In addition to LowState/control-step ages and
+  `h-ide.sonic-health/v3` probe. In addition to LowState/control-step ages and
   the immutable driver boot ID, it carries typed Plant-support latch/pending,
   static-hold, Nav2-task, motion-authority and zero-command facts. Age-only
   faults require two consecutive 25 ms temporal-unhealthy probes with the same
@@ -152,20 +152,58 @@ scripts/start-workstation-demo.sh --rebuild
 # Add the local third-person window and live first-person companion:
 scripts/start-workstation-demo.sh --viewer
 
+# Cold-start only the isolated motion core used by strict locomotion tests.
+# RobotAgent, its gateways, H-IDE Compose and Vision are not started:
+scripts/start-workstation-demo.sh --motion-core --viewer
+
 # Read-only health summary:
 scripts/workstation-demo-status.sh
 ```
 
 Runtime logs are kept outside the repositories under
-`${XDG_RUNTIME_DIR:-/tmp}/h-ide-mujoco-demo-$UID`. The locked acceptance
-profile disables the optional native viewer;
-`http://127.0.0.1:8080/developer/simulation` shows the robot's first-person
-RGB-D view, root pose, Nav2/SONIC state and trajectory.
+`${XDG_RUNTIME_DIR:-/tmp}/h-ide-mujoco-demo-$UID`. The ordinary workstation
+profile may run without the native viewer; the isolated strict motion profile
+requires both viewers and binds them to the same Plant boot/session.
+`http://127.0.0.1:8080/developer/simulation` remains the full-workstation view
+when H-IDE Compose is running.
 
 `--viewer` preserves that exact reviewed configuration and adds a passive
 third-person viewer with a private model/data copy plus a read-only first-person
 RGB companion window. It requires the logged-in X11 session and can be selected
 only during a cold Plant start; neither window can write controller state.
+
+`--motion-core` is intentionally not an idempotent partial restart. It rejects
+surviving RobotAgent/gateway units and listening ports 8796/8094, then starts
+only Plant, SONIC, the ROS motion/observation/safe-stop bridges, Nav2, and the
+two passive viewers. It exits with the robot stationary and sends no motion.
+Run exactly one explicitly authorized case from a second terminal:
+
+```bash
+cd /home/phi/learn-projects/h-ide-mujoco-sonic
+source /opt/ros/jazzy/setup.bash
+source /home/phi/learn-projects/robotagent/tools/activate-local-nav2-jazzy.bash
+export ROS_DOMAIN_ID=232
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+export CYCLONEDDS_URI='<CycloneDDS><Domain><General><Interfaces><NetworkInterface name="lo"/></Interfaces><AllowMulticast>true</AllowMulticast></General></Domain></CycloneDDS>'
+export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
+mkdir -p var/acceptance
+
+/usr/bin/python3 tools/strict_motion_runner.py \
+  --mode forward \
+  --case-id forward-1m-run-1 \
+  --output "var/acceptance/forward-1m-run-1.json" \
+  --execute
+```
+
+The accepted standalone modes are `forward` (1 m), `forward_3m`, `reverse`
+(0.5 m), `lateral_left`, `lateral_right` (0.5 m), `turn_left`, and
+`turn_right` (90 degrees). `detour` additionally requires one of the two
+locked Office V2 waste-bin routes. DriveOnHeading uses NVIDIA/Nav2's reviewed
+0.20 m/s, true lateral uses NVIDIA's 0.40 m/s, and Spin stays within
+0.10–0.20 rad/s. A trace path is created only after its matching evaluated
+result is durable; any fault stops, cancels, aborts evidence, and never retries
+automatically. This proves the isolated `motion_core` tier only—not the H-IDE
+RobotAgent full chain.
 
 ## Manual component start (for debugging)
 

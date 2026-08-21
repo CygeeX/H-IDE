@@ -31,6 +31,7 @@ from hide_mujoco_sonic.transport import (
 
 BRIDGE_BOOT_ID = UUID("20000000-0000-4000-8000-000000000002")
 DRIVER_BOOT_ID = UUID("30000000-0000-4000-8000-000000000003")
+DRIVER_SESSION_ID = UUID("31000000-0000-4000-8000-000000000003")
 REQUEST_ID = UUID("40000000-0000-4000-8000-000000000004")
 NEXT_REQUEST_ID = UUID("50000000-0000-4000-8000-000000000005")
 
@@ -57,6 +58,7 @@ def health_response(request_id: UUID) -> dict[str, object]:
         "schema_version": SONIC_HEALTH_SCHEMA_VERSION,
         "robot_id": "g1-sim",
         "driver_boot_id": str(DRIVER_BOOT_ID),
+        "driver_session_id": str(DRIVER_SESSION_ID),
         "status": "ready",
         "terminal_fault": False,
         "reason": None,
