@@ -479,7 +479,8 @@ def test_supported_configs_all_select_the_same_verified_office_v2_bundle() -> No
         assert config.reset_policy == "explicit_process_restart"
         assert config.motion_fault_topic == "/h_ide/g1_sim/motion_safety_fault"
         assert config.sonic_health_probe_period_s == pytest.approx(0.025)
-        assert config.sonic_health_probe_timeout_s == pytest.approx(0.025)
+        assert config.sonic_health_probe_timeout_s == pytest.approx(0.040)
+        assert config.sonic_health_probe_timeout_s > config.sonic_health_probe_period_s
         assert config.plant_lowstate_stale_s == pytest.approx(0.10)
         assert config.sonic_control_step_stale_s == pytest.approx(0.10)
         assert config.planner_reference_timeout_s == pytest.approx(0.75)
@@ -496,7 +497,7 @@ def test_supported_configs_all_select_the_same_verified_office_v2_bundle() -> No
             SONIC_HEALTH_TRANSPORT_TIMEOUT_CONFIRMATION_PROBES
             * config.sonic_health_probe_period_s
             + config.sonic_health_probe_timeout_s
-            == pytest.approx(0.075)
+            == pytest.approx(0.090)
         )
         assert (
             max(
@@ -514,6 +515,21 @@ def test_supported_configs_all_select_the_same_verified_office_v2_bundle() -> No
         assert "h_ide_office_29dof.xml" not in (
             ROOT / "config" / name
         ).read_text(encoding="utf-8")
+
+
+def test_health_probe_timeout_may_span_two_ticks_but_not_exhaust_handoff(
+    tmp_path: Path,
+) -> None:
+    payload = yaml.safe_load(
+        (ROOT / "config" / "ros-headless.yaml").read_text(encoding="utf-8")
+    )
+    assert payload["sonic_health_probe_timeout_s"] > payload["sonic_health_probe_period_s"]
+
+    payload["sonic_health_probe_timeout_s"] = 0.05
+    candidate = tmp_path / "unsafe-health-budget.yaml"
+    candidate.write_text(yaml.safe_dump(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="confirmation must remain below"):
+        SimConfig.from_file(candidate)
 
 
 @pytest.mark.parametrize(

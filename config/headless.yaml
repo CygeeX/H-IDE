@@ -17,7 +17,7 @@ plant_port: 8794
 command_host: 127.0.0.1
 command_port: 8793
 sonic_health_probe_period_s: 0.025
-sonic_health_probe_timeout_s: 0.025
+sonic_health_probe_timeout_s: 0.040
 plant_lowstate_stale_s: 0.10
 sonic_control_step_stale_s: 0.10
 max_linear_mps: 0.40

@@ -124,10 +124,9 @@ class SimConfig:
         sonic_control_step_stale_s = float(raw["sonic_control_step_stale_s"])
         if not 0 < health_probe_period_s <= 0.05:
             raise ValueError("sonic_health_probe_period_s must be in (0, 0.05]")
-        if not 0 < health_probe_timeout_s <= min(0.05, health_probe_period_s):
+        if not 0 < health_probe_timeout_s <= 0.05:
             raise ValueError(
-                "sonic_health_probe_timeout_s must be positive and no greater "
-                "than the probe period"
+                "sonic_health_probe_timeout_s must be in (0, 0.05]"
             )
         control_hz = int(raw["control_hz"])
         if control_hz <= 0:
