@@ -1,6 +1,6 @@
 {
   "schema_version": "h-ide.sonic-model-lock/1",
-  "repository_revision_at_audit": "56fcaf19b47563a665502520df039ca0bb80bd75",
+  "repository_revision_at_audit": "cd5866e554dfcd563562f2a8831194b74534d6a8",
   "model_repository": {
     "repo_id": "nvidia/GEAR-SONIC",
     "revision": "9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2",
@@ -19,14 +19,14 @@
   "audited_runtime": {
     "config": {
       "path": "config/ros-headless.yaml",
-      "size": 3613,
-      "sha256": "1efe346ae737baeb170011524f92ff57180b6f2bed953d811c4a7b02af4f3ce9"
+      "size": 3652,
+      "sha256": "aaae2bddb1584367ce4ece738e54cb4a916125f038dda9c60671785c86e3cc6d"
     },
     "declared_model_revision": "9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2",
     "declared_lerobot_revision": "9d7c79701b04535b60463a8b5fbc99fb00c0e2a2",
     "observed_lerobot_revision": "9d7c79701b04535b60463a8b5fbc99fb00c0e2a2",
     "lock_safe": true,
-    "reason": "The reviewed ros-headless runtime selectors, SONIC model bundle, exact LeRobot cold-start history and control source, official direction-speed mapping, actuator handoff, and support-release state machine are reproducibly anchored by repository commit 56fcaf19b47563a665502520df039ca0bb80bd75."
+    "reason": "The reviewed ros-headless runtime selectors, SONIC model bundle, exact LeRobot cold-start history and control source, official direction-speed mapping, actuator handoff, and exact-epoch policy-owned fall-arrest release are reproducibly anchored by repository commit cd5866e554dfcd563562f2a8831194b74534d6a8."
   },
   "profiles": {
     "sonic-official-default": {
