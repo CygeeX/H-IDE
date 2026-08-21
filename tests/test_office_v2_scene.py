@@ -345,6 +345,9 @@ def test_runtime_bundle_loads_g1_at_the_verified_noncolliding_spawn() -> None:
     assert viewer.cam.trackbodyid == mujoco.mj_name2id(
         model, mujoco.mjtObj.mjOBJ_BODY, "pelvis"
     )
+    assert viewer.cam.azimuth == pytest.approx(135.0)
+    assert viewer.cam.elevation == pytest.approx(-10.0)
+    assert viewer.cam.distance == pytest.approx(2.5)
     assert tuple(viewer.cam.lookat[:2]) == pytest.approx(
         (runtime.spawn_x, runtime.spawn_y)
     )

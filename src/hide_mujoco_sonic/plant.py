@@ -697,8 +697,8 @@ def configure_tracking_viewer(mujoco, model, viewer, scene: RuntimeScene) -> Non
     viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
     viewer.cam.trackbodyid = pelvis_id
     viewer.cam.azimuth = 135.0
-    viewer.cam.elevation = -22.0
-    viewer.cam.distance = 3.8
+    viewer.cam.elevation = -10.0
+    viewer.cam.distance = 2.5
     viewer.cam.lookat = np.asarray(
         [scene.spawn_x, scene.spawn_y, float(model.qpos0[2])],
         dtype=float,

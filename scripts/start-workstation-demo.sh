@@ -237,7 +237,32 @@ export HIDE_DOCKER_OBSERVATION_BIND_HOST
 # never point control-api directly at the loopback-only 8796 endpoint.
 export SIMULATION_ROBOT_AGENT_DIAGNOSTICS_URL="http://host.docker.internal:8797"
 
-mkdir -p "${HIDE_DEMO_RUN_ROOT}"
+# Runtime evidence contains process/session identities and must not be writable
+# by another account.  Older launchers created this directory using the user's
+# ambient umask (commonly 0775); normalize an owned real directory before any
+# PID, log, or viewer-status file is opened, but never follow a symlink or take
+# ownership of somebody else's path.
+if [[ -L "${HIDE_DEMO_RUN_ROOT}" ]]; then
+  printf 'runtime directory must not be a symbolic link: %s\n' \
+    "${HIDE_DEMO_RUN_ROOT}" >&2
+  exit 2
+fi
+if [[ -e "${HIDE_DEMO_RUN_ROOT}" ]]; then
+  if [[ ! -d "${HIDE_DEMO_RUN_ROOT}" \
+    || "$(stat -c '%u' "${HIDE_DEMO_RUN_ROOT}")" != "${UID}" ]]; then
+    printf 'runtime directory is not an owned directory: %s\n' \
+      "${HIDE_DEMO_RUN_ROOT}" >&2
+    exit 2
+  fi
+  chmod 0700 -- "${HIDE_DEMO_RUN_ROOT}"
+else
+  mkdir -m 0700 -- "${HIDE_DEMO_RUN_ROOT}"
+fi
+if [[ "$(stat -c '%a' "${HIDE_DEMO_RUN_ROOT}")" != "700" ]]; then
+  printf 'runtime directory permissions are not 0700: %s\n' \
+    "${HIDE_DEMO_RUN_ROOT}" >&2
+  exit 2
+fi
 
 # The controller and its observation contract are one indivisible model bundle.
 # Refuse to start any motion-capable process when the config, source revision,

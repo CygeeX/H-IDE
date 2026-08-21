@@ -581,6 +581,21 @@ def test_launcher_has_a_cold_isolated_motion_core_mode() -> None:
     assert "--motion-core requires --viewer" in completed.stderr
 
 
+def test_launcher_secures_runtime_evidence_directory_before_model_lock() -> None:
+    launcher = (ROOT / "scripts" / "start-workstation-demo.sh").read_text(
+        encoding="utf-8"
+    )
+
+    symlink_gate = launcher.index(
+        "runtime directory must not be a symbolic link"
+    )
+    owner_gate = launcher.index("runtime directory is not an owned directory")
+    chmod = launcher.index('chmod 0700 -- "${HIDE_DEMO_RUN_ROOT}"')
+    mode_gate = launcher.index("runtime directory permissions are not 0700")
+    model_lock = launcher.index("tools/verify_model_lock.py")
+    assert symlink_gate < owner_gate < chmod < mode_gate < model_lock
+
+
 def test_launcher_requires_mapped_fresh_first_person_frames_before_ros_ingress() -> None:
     launcher = (ROOT / "scripts" / "start-workstation-demo.sh").read_text(
         encoding="utf-8"

@@ -440,9 +440,13 @@ def configure_tracking_viewer(mujoco_api, model, viewer, scene) -> None:
         raise RuntimeError("pinned G1 model does not define pelvis")
     viewer.cam.type = mujoco_api.mjtCamera.mjCAMERA_TRACKING
     viewer.cam.trackbodyid = pelvis_id
+    # A high/distant camera looks almost straight down over Office V2's
+    # corridor walls and visually collapses the humanoid into its head and
+    # shoulders.  Keep the same passive tracking authority boundary, but use a
+    # close three-quarter operator view that shows the complete body and feet.
     viewer.cam.azimuth = 135.0
-    viewer.cam.elevation = -22.0
-    viewer.cam.distance = 3.8
+    viewer.cam.elevation = -10.0
+    viewer.cam.distance = 2.5
     viewer.cam.lookat = np.asarray(
         [scene.spawn_x, scene.spawn_y, float(model.qpos0[2])],
         dtype=float,
