@@ -78,22 +78,22 @@ def test_plant_control_clock_admits_one_step_per_20ms_of_simulation_time():
     assert second.dt_s == pytest.approx(0.02)
 
 
-def test_plant_control_clock_accepts_long_running_4ms_mujoco_tick_stream():
+def test_plant_control_clock_accepts_long_running_rounded_4ms_mujoco_tick_stream():
     clock = PlantControlClock(control_hz=50)
     simulation_time_s = 0.0
     admitted = []
 
-    # The bridge uses int(simulation_time * 1000).  Repeated binary floating
-    # point addition occasionally produces a 3 ms or 5 ms tick increment even
-    # though MuJoCo's configured physics step is exactly 4 ms.
+    # The bridge rounds accumulated MuJoCo time to the nearest integer
+    # millisecond.  That keeps the integral 4 ms physics / 20 ms control
+    # cadence exact even after long-running floating-point accumulation.
     for _ in range(25_000):
-        step = clock.observe(int(simulation_time_s * 1_000))
+        step = clock.observe(int(round(simulation_time_s * 1_000)))
         if step is not None:
             admitted.append(step)
         simulation_time_s += 0.004
 
     assert len(admitted) == 5_000
-    assert {step.dt_s for step in admitted} <= {0.02, 0.021, 0.022, 0.023, 0.024}
+    assert {step.dt_s for step in admitted} == {0.02}
 
 
 @pytest.mark.parametrize(
