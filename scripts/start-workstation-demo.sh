@@ -669,6 +669,99 @@ demo_ros_command() {
   ' -- "$@"
 }
 
+wait_for_ros_motion_ingress() {
+  local timeout_seconds="${1:-30}"
+  local deadline=$((SECONDS + timeout_seconds))
+  local unit_suffix=""
+  local unit_name=""
+  local services=""
+  local health_response=""
+  local units_ready=false
+  local services_ready=false
+  local required_units=(
+    ros-cmd-vel-bridge
+    ros-observation-bridge
+    ros-safe-stop
+  )
+  local required_services=(
+    /h_ide/mujoco/bridge_health
+    /h_ide/mujoco/normal_stop
+    /robot/control_arm
+    /robot/safe_stop
+  )
+
+  while (( SECONDS < deadline )); do
+    units_ready=true
+    for unit_suffix in "${required_units[@]}"; do
+      unit_name="${HIDE_DEMO_SYSTEMD_PREFIX}-${unit_suffix}.service"
+      if ! systemctl --user is-active --quiet "${unit_name}"; then
+        units_ready=false
+        break
+      fi
+    done
+
+    services_ready=false
+    if [[ "${units_ready}" == "true" ]]; then
+      services="$(demo_ros_command timeout 4 ros2 service list -t 2>/dev/null || true)"
+      services_ready=true
+      for service_name in "${required_services[@]}"; do
+        if ! grep -Eq "^${service_name//\//\\/}[[:space:]]+\\[std_srvs/srv/Trigger\\]$" \
+          <<<"${services}"; then
+          services_ready=false
+          break
+        fi
+      done
+    fi
+
+    if [[ "${services_ready}" == "true" ]]; then
+      health_response="$(
+        demo_ros_command timeout 5 ros2 service call \
+          /h_ide/mujoco/bridge_health std_srvs/srv/Trigger '{}' 2>&1 || true
+      )"
+      if printf '%s' "${health_response}" \
+        | "${HIDE_DEMO_SIM_ROOT}/.venv/bin/python" -c '
+import ast
+import json
+import re
+import sys
+
+text = sys.stdin.read()
+match = re.search(
+    r"success=(True|False), message=(?P<message>.+)\)\s*$",
+    text,
+    flags=re.DOTALL,
+)
+if match is None or match.group(1) != "True":
+    raise SystemExit(1)
+try:
+    message = ast.literal_eval(match.group("message"))
+    payload = json.loads(message)
+except (SyntaxError, ValueError, TypeError, json.JSONDecodeError):
+    raise SystemExit(1)
+ready = (
+    isinstance(payload, dict)
+    and payload.get("healthy") is True
+    and payload.get("fault") is None
+)
+raise SystemExit(0 if ready else 1)
+'; then
+        printf '%-28s ready\n' 'ROS motion ingress'
+        return 0
+      fi
+    fi
+    sleep 1
+  done
+
+  printf 'ROS motion ingress did not become healthy within %ss\n' \
+    "${timeout_seconds}" >&2
+  if [[ -n "${health_response}" ]]; then
+    printf '%s\n' "${health_response}" >&2
+  elif [[ -n "${services}" ]]; then
+    printf '%s\n' "${services}" >&2
+  fi
+  return 1
+}
+
 wait_for_simulation_tf() {
   local timeout_seconds="${1:-45}"
   local deadline=$((SECONDS + timeout_seconds))
@@ -870,6 +963,7 @@ start_process \
   "${HIDE_DEMO_SIM_ROOT}" \
   'source /opt/ros/jazzy/setup.bash; export ROS_DOMAIN_ID=232 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp CYCLONEDDS_URI="$HIDE_DEMO_CYCLONE"; export PYTHONPATH="$HIDE_DEMO_SIM_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"; exec /usr/bin/python3 -u -m hide_mujoco_sonic safe-stop-service --config "$HIDE_DEMO_CONFIG"'
 
+wait_for_ros_motion_ingress 30
 wait_for_simulation_tf 60
 
 if [[ "${nav2_needs_start}" == "true" ]]; then

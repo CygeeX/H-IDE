@@ -51,6 +51,15 @@ def gate() -> SonicHealthTransportGate:
     )
 
 
+def test_transport_timeout_may_span_two_control_ticks_within_handoff_budget() -> None:
+    transport = SonicHealthTransportGate(
+        probe_period_s=0.025,
+        probe_timeout_s=0.040,
+    )
+
+    assert transport.confirmation_budget_s == pytest.approx(0.090)
+
+
 def health_response(request_id: UUID) -> dict[str, object]:
     return {
         "request_id": str(request_id),

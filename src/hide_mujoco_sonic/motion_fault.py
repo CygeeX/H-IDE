@@ -827,8 +827,6 @@ class SonicHealthTransportGate:
                 "required_timeout_samples is fixed at "
                 f"{SONIC_HEALTH_TRANSPORT_TIMEOUT_CONFIRMATION_PROBES}"
             )
-        if probe_timeout_s > probe_period_s:
-            raise ValueError("probe_timeout_s must not exceed probe_period_s")
         confirmation_budget_s = (
             required_timeout_samples * float(probe_period_s)
             + float(probe_timeout_s)

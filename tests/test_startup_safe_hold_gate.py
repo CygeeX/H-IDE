@@ -622,6 +622,37 @@ def test_launcher_requires_mapped_fresh_first_person_frames_before_ros_ingress()
         assert evidence in gate_source
 
 
+def test_launcher_requires_healthy_motion_services_before_tf_and_nav2() -> None:
+    launcher = (ROOT / "scripts" / "start-workstation-demo.sh").read_text(
+        encoding="utf-8"
+    )
+
+    safe_stop_start = launcher.index("start_process \\\n  ros-safe-stop")
+    ingress_gate = launcher.index("wait_for_ros_motion_ingress 30")
+    tf_gate = launcher.index("wait_for_simulation_tf 60")
+    nav2_start = launcher.index("docker start h-ide-nav2-sim")
+    assert safe_stop_start < ingress_gate < tf_gate < nav2_start
+
+    function_start = launcher.index("wait_for_ros_motion_ingress()")
+    function_end = launcher.index("wait_for_simulation_tf()", function_start)
+    gate_source = launcher[function_start:function_end]
+    for unit in (
+        "ros-cmd-vel-bridge",
+        "ros-observation-bridge",
+        "ros-safe-stop",
+    ):
+        assert unit in gate_source
+    for service in (
+        "/h_ide/mujoco/bridge_health",
+        "/h_ide/mujoco/normal_stop",
+        "/robot/control_arm",
+        "/robot/safe_stop",
+    ):
+        assert service in gate_source
+    assert 'payload.get("healthy") is True' in gate_source
+    assert 'payload.get("fault") is None' in gate_source
+
+
 def test_pre_agent_gate_cannot_use_empty_last_error_to_bypass_a_support_latch() -> None:
     launcher = (ROOT / "scripts" / "start-workstation-demo.sh").read_text(
         encoding="utf-8"
