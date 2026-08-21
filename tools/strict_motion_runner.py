@@ -2042,7 +2042,15 @@ class StrictMotionCaseExecutor:
             preflight = self.collector.collect_once()
             isolation = self.collector.isolation_manifest()
             plant_boot, plant_session = self._identities(preflight)
+            # A cold motion-core launch is deliberately stationary at IDLE,
+            # but control acquisition is authorized only from the exact,
+            # correlated DRIVER_CONFIRMED normal-stop boundary.  Establish
+            # that boundary here instead of relying on a previous case (or a
+            # failed case's cleanup) to have left one behind.
+            self.backend.normal_stop()
+            normal_stopped = True
             self.backend.control_arm()
+            normal_stopped = False
             binding = self.evidence.begin(
                 case_id=case_id,
                 plant_boot_id=plant_boot,
@@ -2226,7 +2234,14 @@ class StrictMotionCaseExecutor:
                 **self._static_plan_kwargs(),
             )
 
+            # As with standalone cases, the first primitive must acquire
+            # control from a freshly correlated safe-hold transaction.  Later
+            # primitives already receive this boundary from the preceding
+            # per-segment normal stop.
+            self.backend.normal_stop()
+            normal_stopped = True
             self.backend.control_arm()
+            normal_stopped = False
             binding = self.evidence.begin(
                 case_id=case_id,
                 plant_boot_id=plant_boot,

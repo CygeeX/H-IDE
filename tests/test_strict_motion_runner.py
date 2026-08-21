@@ -713,6 +713,7 @@ def test_standalone_executor_orders_authority_evidence_action_and_stop(
     assert trace["action"]["activationProvenance"] == "initial_support_release"
     assert backend.calls == [
         "ready",
+        "normal_stop",
         "arm",
         "begin:forward",
         "send_drive",
@@ -791,6 +792,7 @@ def test_detour_executor_uses_only_fresh_resolved_official_primitives(
         for item in trace["action"]["segments"]
     )
     assert "send_spin" in backend.calls and "send_drive" in backend.calls
+    assert backend.calls[:4] == ["ready", "compute_path", "normal_stop", "arm"]
     assert evidence.calls == ["begin", "finalize"]
 
 
