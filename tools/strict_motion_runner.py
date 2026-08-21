@@ -1518,11 +1518,18 @@ class RuntimeSnapshotCollector:
         }
 
     def collect_once(self) -> dict[str, Any]:
+        # Read the companion's durable status before the authoritative Plant
+        # snapshot.  The companion obtains its plantSequence from that same
+        # monotonically advancing Plant endpoint, so this order guarantees the
+        # later Plant sequence can bracket the displayed frame.  Reading Plant
+        # first creates a deterministic race where a perfectly healthy viewer
+        # may publish a newer sequence while the remaining ROS health calls are
+        # in flight and be rejected as if it belonged to another session.
+        first_person = read_secure_status(self.first_person_status)
         plant = self.reader.read(PLANT_STATE_URL)
         sonic = self.reader.read(SONIC_TELEMETRY_URL)
         bridge = self.ros.bridge_health()
         nav2 = self.ros.nav2_health()
-        first_person = read_secure_status(self.first_person_status)
         runtime = self._runtime_health(plant, sonic, bridge, nav2, first_person)
         isolation = self.isolation_manifest()
         isolation_hash = canonical_sha256(isolation)

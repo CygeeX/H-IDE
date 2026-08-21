@@ -428,6 +428,57 @@ def test_snapshot_collector_binds_every_runtime_identity_and_isolation(
     assert sample["command"] == {"vx": 0.2, "vy": 0.0, "wz": 0.0}
 
 
+def test_snapshot_collector_brackets_first_person_with_later_plant_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[str] = []
+    status = tmp_path / "first-person.json"
+    viewer = {
+        "schemaVersion": runner.FIRST_PERSON_STATUS_SCHEMA,
+        "bootId": "91000000-0000-4000-8000-000000000009",
+        "pid": 4242,
+        "status": "running",
+        "healthy": True,
+        "mapped": True,
+        "sequence": 41,
+        "plantBootId": "11000000-0000-4000-8000-000000000001",
+        "plantSessionId": "12000000-0000-4000-8000-000000000001",
+        "plantSequence": 101,
+        "simulationTimeS": 12.6,
+        "captureAgeMs": 5.0,
+        "lastSuccessAtUnixNs": 1_800_000_000_000_000_001,
+        "failureCount": 0,
+        "lastError": None,
+    }
+
+    def read_status(_path: Path) -> dict:
+        events.append("first-person")
+        return viewer
+
+    class RaceReader(FakeReader):
+        def read(self, url: str, *, timeout_s: float = 0.5) -> dict:
+            events.append(url)
+            value = super().read(url, timeout_s=timeout_s)
+            if url == runner.PLANT_STATE_URL:
+                value = {**value, "sequence": 102}
+            return value
+
+    monkeypatch.setattr(runner, "read_secure_status", read_status)
+    monkeypatch.setattr(runner, "_inactive_user_unit", lambda _unit: "inactive")
+    monkeypatch.setattr(runner, "_require_port_closed", lambda _port: None)
+    collector = runner.RuntimeSnapshotCollector(
+        FakeRos(),
+        reader=RaceReader(plant_state(), sonic_state()),
+        first_person_status=status,
+    )
+
+    sample = collector.collect_once()
+
+    assert events[:2] == ["first-person", runner.PLANT_STATE_URL]
+    assert sample["runtimeHealth"]["plant"]["sequence"] == 102
+    assert sample["runtimeHealth"]["firstPersonViewer"]["plantSequence"] == 101
+
+
 def test_snapshot_collector_rejects_bridge_sonic_identity_mismatch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
