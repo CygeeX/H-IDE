@@ -486,7 +486,12 @@ class SonicDriver:
             blend_s=config.motion_handoff_blend_s,
         )
         self._policy_activation = NominalPolicyActivation(
-            duration_s=config.policy_activation_s
+            duration_s=config.policy_activation_s,
+            # Zero is the explicit assisted simulation profile: keep only
+            # vertical and roll/pitch fall arrest.  Plant locomotion mode
+            # already removes world-X/Y force and yaw torque, so this support
+            # cannot manufacture translation or turning.
+            release_fall_arrest=config.startup_support_s > 0.0,
         )
         self._policy_activation_requested = False
         self._policy_activation_release_epoch: int | None = None
@@ -600,21 +605,45 @@ class SonicDriver:
 
         # H-IDE currently exposes navigation only, but SONIC is a whole-body
         # locomotion policy and relies on shoulder/elbow counter-swing for
-        # balance.  The earlier narrow envelope constrained most arm joints on
-        # every tick and turned a safety guard into an untrained policy rewrite.
-        # Keep a physical-range envelope and a high slew ceiling.  Brief
-        # reference seams are projected to that unchanged ceiling and fed
-        # back exactly; persistent saturation still fails closed in the guard.
-        # Shoulder pitch nominal is ~0.2 rad while the checked-in Unitree G1
-        # model's hard upper limit is 2.6704 rad.  Keep a small explicit margin
-        # (2.47 rather than 2.470399997...) so a slew-valid sequence can never
-        # walk the target past the MuJoCo joint range without saturation.
-        per_arm_deviation = (2.47, 1.40, 2.20, 1.45, 1.80, 1.50, 1.50)
+        # balance.  Enforce the checked-in Unitree G1 XML's authoritative,
+        # asymmetric arm joint ranges instead of inventing a symmetric range
+        # around DEFAULT_ANGLES.  The latter rejected policy-valid shoulder
+        # counter-swing before it reached MuJoCo.  The per-tick velocity bound
+        # remains unchanged.  Saturation duration is recorded as evidence but
+        # is not assigned an invented time-to-fault absent a vendor contract.
+        per_arm_lower = (
+            -3.0892,
+            -1.5882,
+            -2.618,
+            -1.0472,
+            -1.97222,
+            -1.61443,
+            -1.61443,
+        )
+        per_arm_upper = (
+            2.6704,
+            2.2515,
+            2.618,
+            2.0944,
+            1.97222,
+            1.61443,
+            1.61443,
+        )
         per_arm_velocity = (6.0, 6.0, 6.0, 6.0, 4.0, 4.0, 4.0)
         return NavigationArmGuard(
             DEFAULT_ANGLES[15:29],
-            max_deviation_rad=per_arm_deviation * 2,
+            lower_limits_rad=per_arm_lower + (
+                per_arm_lower[0],
+                -2.2515,
+                *per_arm_lower[2:],
+            ),
+            upper_limits_rad=per_arm_upper + (
+                per_arm_upper[0],
+                1.5882,
+                *per_arm_upper[2:],
+            ),
             max_velocity_rps=per_arm_velocity * 2,
+            max_continuous_saturation_s=None,
         )
 
     def _on_lowstate(self, message):
@@ -2710,6 +2739,9 @@ class SonicDriver:
             "policy_activation_release_pending": bool(
                 release_thread is not None and release_thread.is_alive()
             ),
+            "policy_activation_fall_arrest_retained": bool(
+                not activation.release_fall_arrest
+            ),
             "policy_activation_release_error": (
                 None if release_error is None else str(release_error)
             ),
@@ -2897,7 +2929,7 @@ class SonicDriver:
         *,
         tick_ms: int,
     ) -> bool:
-        """Release the simulation gantry only after the first policy DDS.
+        """Complete the configured support transition after first policy DDS.
 
         This is the software equivalent of NVIDIA's documented gantry
         sequence: the policy starts balancing while the robot is supported,
@@ -2925,6 +2957,11 @@ class SonicDriver:
                 self._consume_policy_activation_release_locked(tick_ms=tick_ms)
                 if activation.waiting_for_support_release:
                     self._start_policy_activation_release_locked()
+            elif activation.activation_path == "tethered_retained":
+                if not activation.confirm_supported_takeover(tick_ms=tick_ms):
+                    raise NominalPolicyActivationFault(
+                        "retained-support takeover left the activation wait phase"
+                    )
             else:
                 raise NominalPolicyActivationFault(
                     "policy activation path is unavailable after DDS grant"
@@ -2946,21 +2983,39 @@ class SonicDriver:
         velocities = tuple(float(states[index].dq) for index in range(29))
         imu = getattr(lowstate, "imu_state", None)
         gyroscope_raw = None if imu is None else getattr(imu, "gyroscope", None)
-        rpy_raw = None if imu is None else getattr(imu, "rpy", None)
+        quaternion_raw = (
+            None if imu is None else getattr(imu, "quaternion", None)
+        )
         if gyroscope_raw is None or len(gyroscope_raw) != 3:
             raise NominalPolicyActivationFault(
                 "activation settling requires measured IMU gyroscope"
             )
-        if rpy_raw is None or len(rpy_raw) != 3:
+        if quaternion_raw is None or len(quaternion_raw) != 4:
             raise NominalPolicyActivationFault(
-                "activation settling requires measured IMU roll/pitch"
+                "activation settling requires measured IMU quaternion"
             )
         gyroscope = tuple(float(value) for value in gyroscope_raw)
-        roll, pitch = float(rpy_raw[0]), float(rpy_raw[1])
-        if not all(math.isfinite(value) for value in velocities + gyroscope + (roll, pitch)):
+        quaternion = tuple(float(value) for value in quaternion_raw)
+        if not all(
+            math.isfinite(value)
+            for value in velocities + gyroscope + quaternion
+        ):
             raise NominalPolicyActivationFault(
                 "activation settling requires finite joint/IMU evidence"
             )
+        norm = math.sqrt(sum(value * value for value in quaternion))
+        if not 0.999 <= norm <= 1.001:
+            raise NominalPolicyActivationFault(
+                "activation settling requires a normalized IMU quaternion"
+            )
+        qw, qx, qy, qz = (value / norm for value in quaternion)
+        roll = math.atan2(
+            2.0 * (qw * qx + qy * qz),
+            1.0 - 2.0 * (qx * qx + qy * qy),
+        )
+        pitch = math.asin(
+            max(-1.0, min(1.0, 2.0 * (qw * qy - qz * qx)))
+        )
         return velocities, gyroscope, roll, pitch
 
     def _run_nominal_policy_activation(

@@ -34,6 +34,7 @@ SCENE_ROOT = ROOT / "scenes" / "office_v2"
 SCENE_SOURCE = SCENE_ROOT / "scene.yaml"
 GENERATED = SCENE_ROOT / "generated"
 EVALUATION = SCENE_ROOT / "evaluation" / "manifest.json"
+G1_MODEL = ROOT / "models" / "unitree-g1-mujoco" / "assets" / "g1_29dof_no_hand.xml"
 
 
 def _sha(path: Path) -> str:
@@ -279,6 +280,36 @@ def test_generated_preview_loads_with_mujoco() -> None:
     assert model.ngeom > len(scene["objects"]) * 2
     assert model.ntex == 1 + len(scene["textures"])
     assert model.ncam == len(scene["render"]["cameras"])
+
+
+def test_runtime_g1_uses_deterministic_full_sole_collision_geometry() -> None:
+    """Lock the Office V2 contact adapter without depending on external files.
+
+    NVIDIA's pinned MJCF uses four point contacts per foot.  The Office V2
+    dynamics adapter deliberately replaces those points with one thin sole box
+    per foot; this is a simulation contact-stability adaptation, not an
+    upstream SONIC model claim.
+    """
+
+    local_root = ET.parse(G1_MODEL).getroot()
+    for body_name in ("left_ankle_roll_link", "right_ankle_roll_link"):
+        local_body = local_root.find(f".//body[@name='{body_name}']")
+        assert local_body is not None
+        local_contacts = [
+            geom
+            for geom in local_body.findall("geom")
+            if geom.get("contype") != "0"
+        ]
+        assert len(local_contacts) == 1
+        local = local_contacts[0]
+        assert local.get("type") == "box"
+        assert local.get("size") == "0.085 0.03 0.005"
+        assert local.get("pos") == "0.035 0 -0.03"
+
+    assert not any(
+        (body.get("name") or "").startswith(("dummy_lf_", "dummy_rf_"))
+        for body in local_root.findall(".//body")
+    )
 
 
 def _standing_runtime_model():

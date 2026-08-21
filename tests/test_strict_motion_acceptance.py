@@ -157,17 +157,17 @@ def _point_on_path(path: list[tuple[float, float]], progress: float) -> tuple[fl
 
 def _goal(mode: str) -> dict[str, float]:
     if mode == "forward_probe":
-        return {"distanceM": 0.2, "speedMps": 0.2}
+        return {"distanceM": 0.2, "speedMps": 0.3}
     if mode == "forward":
-        return {"distanceM": 1.0, "speedMps": 0.2}
+        return {"distanceM": 1.0, "speedMps": 0.3}
     if mode == "forward_3m":
-        return {"distanceM": 3.0, "speedMps": 0.2}
+        return {"distanceM": 3.0, "speedMps": 0.3}
     if mode == "reverse":
         return {"distanceM": -0.5, "speedMps": 0.2}
     if mode == "lateral_left":
-        return {"lateralDistanceM": 0.5, "maxVyMps": 0.4}
+        return {"lateralDistanceM": 0.5, "maxVyMps": 0.35}
     if mode == "lateral_right":
-        return {"lateralDistanceM": -0.5, "maxVyMps": 0.4}
+        return {"lateralDistanceM": -0.5, "maxVyMps": 0.35}
     if mode == "turn_left":
         return {"targetYawRad": math.pi / 2.0}
     if mode == "turn_right":
@@ -209,18 +209,18 @@ def _command(mode: str, active: bool) -> dict[str, float]:
     if not active:
         return {"vx": 0.0, "vy": 0.0, "wz": 0.0}
     if mode in {"forward_probe", "forward", "forward_3m"}:
-        return {"vx": 0.2, "vy": 0.0, "wz": 0.0}
+        return {"vx": 0.3, "vy": 0.0, "wz": 0.0}
     if mode == "reverse":
         return {"vx": -0.2, "vy": 0.0, "wz": 0.0}
     if mode == "lateral_left":
-        return {"vx": 0.0, "vy": 0.4, "wz": 0.0}
+        return {"vx": 0.0, "vy": 0.35, "wz": 0.0}
     if mode == "lateral_right":
-        return {"vx": 0.0, "vy": -0.4, "wz": 0.0}
+        return {"vx": 0.0, "vy": -0.35, "wz": 0.0}
     if mode == "turn_left":
         return {"vx": 0.0, "vy": 0.0, "wz": 0.2}
     if mode == "turn_right":
         return {"vx": 0.0, "vy": 0.0, "wz": -0.2}
-    return {"vx": 0.2, "vy": 0.0, "wz": 0.2}
+    return {"vx": 0.3, "vy": 0.0, "wz": 0.2}
 
 
 def _feet(progress: float) -> tuple[dict[str, int], dict[str, int]]:
@@ -265,9 +265,13 @@ def _sample(mode: str, t_s: float, progress: float, active: bool, sequence: int)
     yaw = _yaw(mode, progress)
     touchdown, liftoff = _feet(progress)
     linear_speed = (
-        0.4
+        0.35
         if active and mode in {"lateral_left", "lateral_right"}
-        else (0.2 if active and mode not in {"turn_left", "turn_right"} else 0.0)
+        else (
+            (0.2 if mode == "reverse" else 0.3)
+            if active and mode not in {"turn_left", "turn_right"}
+            else 0.0
+        )
     )
     angular_speed = 0.2 if active and mode in {"turn_left", "turn_right", "detour"} else 0.0
     isolation_manifest = _isolation_manifest(mode)
@@ -464,7 +468,7 @@ def _rebuild_detour_trace(
         distance = math.dist(before, after)
         append_segment(
             "DriveOnHeading",
-            {"distanceM": distance, "speedMps": 0.2},
+            {"distanceM": distance, "speedMps": 0.3},
             (before[0], before[1], heading),
             (after[0], after[1], heading),
             distance,
@@ -519,8 +523,8 @@ def _rebuild_detour_trace(
             }
             segment_index: int | None = None
         elif active_segment["type"] == "DriveOnHeading":
-            command = {"vx": 0.2, "vy": 0.0, "wz": 0.0}
-            linear_speed, angular_speed = 0.2, 0.0
+            command = {"vx": 0.3, "vy": 0.0, "wz": 0.0}
+            linear_speed, angular_speed = 0.3, 0.0
             nav2_actions = {
                 "driveOnHeadingActive": True,
                 "navigateToPoseActive": False,
@@ -1444,7 +1448,7 @@ def test_confirmed_tilt_jump_and_turn_translation_thresholds_kill() -> None:
 @pytest.mark.parametrize(
     ("mode", "mutation", "expected_code"),
     [
-        ("forward", {"vx": 0.201}, "DRIVE_ON_HEADING_COMMAND_ENVELOPE"),
+        ("forward", {"vx": 0.301}, "DRIVE_ON_HEADING_COMMAND_ENVELOPE"),
         ("reverse", {"vy": 0.001}, "DRIVE_ON_HEADING_COMMAND_ENVELOPE"),
         ("turn_left", {"vx": 0.001}, "SPIN_COMMAND_ENVELOPE"),
         ("turn_right", {"wz": -0.201}, "SPIN_COMMAND_ENVELOPE"),
@@ -1471,7 +1475,7 @@ def test_detour_drive_segment_rejects_overspeed_and_mixed_axes() -> None:
         for sample in trace["samples"]
         if sample["nav2Actions"]["driveOnHeadingActive"]
     )
-    drive_sample["command"].update(vx=0.201, wz=0.001)
+    drive_sample["command"].update(vx=0.301, wz=0.001)
 
     assert "DRIVE_ON_HEADING_COMMAND_ENVELOPE" in _failure_codes(trace)
 

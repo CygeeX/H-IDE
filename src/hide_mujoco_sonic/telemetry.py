@@ -111,6 +111,7 @@ class TelemetryState:
     policy_activation_release_epoch: int | None = None
     policy_activation_release_confirmed_epoch: int | None = None
     policy_activation_release_pending: bool = False
+    policy_activation_fall_arrest_retained: bool = False
     policy_activation_release_error: str | None = None
     policy_activation_prepared_tick_ms: int | None = None
     plant_support_mode: str = "unknown"
@@ -132,6 +133,8 @@ class TelemetryState:
     navigation_arm_max_estimated_torque_nm: float = 0.0
     navigation_arm_worst_velocity_joint: str | None = None
     navigation_task_active: bool = False
+    recoverable_motion_fault: bool = False
+    motion_fault_safe_hold_frames: int = 0
     navigation_task_peak_arm_constrained_joints: int = 0
     navigation_task_peak_arm_raw_deviation_rad: float = 0.0
     navigation_task_peak_arm_tracking_error_rad: float = 0.0

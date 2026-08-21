@@ -33,8 +33,9 @@ RUNNER_SCHEMA_VERSION = "h-ide.strict-motion-runner/v1"
 STRICT_NODE_NAME = "strict_motion_runner"
 NAV2_INPUT_TOPIC = "/h_ide/strict_motion/input"
 BRIDGE_CMD_VEL_TOPIC = "/cmd_vel"
-OFFICIAL_DRIVE_SPEED_MPS = 0.20
-OFFICIAL_LATERAL_SPEED_MPS = 0.40
+OFFICIAL_DRIVE_SPEED_MPS = 0.30
+OFFICIAL_REVERSE_SPEED_MPS = 0.20
+OFFICIAL_LATERAL_SPEED_MPS = 0.35
 OFFICIAL_SPIN_MIN_RPS = 0.10
 OFFICIAL_SPIN_MAX_RPS = 0.20
 NAV2_COMMAND_STALE_S = 0.15
@@ -300,12 +301,17 @@ class StrictCommandRelay:
                     "DriveOnHeading emitted a mixed-axis command"
                 )
             signed = self._direction * command.vx
+            expected_speed = (
+                OFFICIAL_REVERSE_SPEED_MPS
+                if self._mode == "reverse"
+                else OFFICIAL_DRIVE_SPEED_MPS
+            )
             if not command.is_zero and (
                 signed <= 0.0
-                or abs(abs(command.vx) - OFFICIAL_DRIVE_SPEED_MPS) > _ZERO_EPS
+                or abs(abs(command.vx) - expected_speed) > _ZERO_EPS
             ):
                 raise StrictMotionRunnerError(
-                    "DriveOnHeading command is not the signed official 0.20 m/s"
+                    "DriveOnHeading command is not the signed NVIDIA direction speed"
                 )
         elif primitive == "Spin":
             if abs(command.vx) > _ZERO_EPS or abs(command.vy) > _ZERO_EPS:
@@ -944,7 +950,11 @@ class RosLiveBackend:
         goal.target.x = distance
         goal.target.y = 0.0
         goal.target.z = 0.0
-        goal.speed = OFFICIAL_DRIVE_SPEED_MPS
+        goal.speed = (
+            OFFICIAL_REVERSE_SPEED_MPS
+            if distance < 0.0
+            else OFFICIAL_DRIVE_SPEED_MPS
+        )
         _seconds_to_duration(goal.time_allowance, timeout_s)
         return self._send_goal(
             self._drive_client,
@@ -1664,7 +1674,7 @@ def motion_goal(mode: str) -> dict[str, float]:
         },
         "forward": {"distanceM": 1.0, "speedMps": OFFICIAL_DRIVE_SPEED_MPS},
         "forward_3m": {"distanceM": 3.0, "speedMps": OFFICIAL_DRIVE_SPEED_MPS},
-        "reverse": {"distanceM": -0.5, "speedMps": OFFICIAL_DRIVE_SPEED_MPS},
+        "reverse": {"distanceM": -0.5, "speedMps": OFFICIAL_REVERSE_SPEED_MPS},
         "lateral_left": {
             "lateralDistanceM": LATERAL_DISTANCE_M,
             "maxVyMps": OFFICIAL_LATERAL_SPEED_MPS,
@@ -1684,7 +1694,8 @@ def motion_goal(mode: str) -> dict[str, float]:
 
 def action_timeout_s(mode: str, goal: Mapping[str, Any]) -> float:
     if mode in StrictCommandRelay._DRIVE_MODES:
-        return abs(_finite(goal.get("distanceM"), "distanceM")) / OFFICIAL_DRIVE_SPEED_MPS + 10.0
+        speed = _finite(goal.get("speedMps"), "speedMps")
+        return abs(_finite(goal.get("distanceM"), "distanceM")) / speed + 10.0
     if mode in StrictCommandRelay._SPIN_MODES:
         return abs(_finite(goal.get("targetYawRad"), "targetYawRad")) / OFFICIAL_SPIN_MIN_RPS + 10.0
     if mode in StrictCommandRelay._LATERAL_MODES:

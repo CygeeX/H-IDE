@@ -625,6 +625,10 @@ def run_ros_bridge(config: SimConfig) -> None:
         translation_violation_s=config.spin_translation_violation_s,
     )
     stability_guard = BodyStabilityGuard()
+    navigation_guard_authority_identity: dict[
+        str,
+        tuple[int, int, int, int] | None,
+    ] = {"value": None}
 
     def request_sonic_health(
         request_id: UUID,
@@ -1783,6 +1787,18 @@ def run_ros_bridge(config: SimConfig) -> None:
                 )
             return
         if granted:
+            authority_identity = (
+                int(health.reference_authority_generation),
+                int(health.reference_authority_source_sequence),
+                int(health.reference_authority_epoch),
+                int(health.reference_authority_dds_target_sequence),
+            )
+            if navigation_guard_authority_identity["value"] != authority_identity:
+                direction_guard.reanchor_at_actuator_grant()
+                goal_guard.reanchor_at_actuator_grant()
+                heading_guard.reanchor_at_actuator_grant()
+                rotation_guard.reanchor_at_actuator_grant()
+                navigation_guard_authority_identity["value"] = authority_identity
             node.get_logger().info(
                 "matched SONIC reference obtained actuator authority "
                 f"generation={health.reference_authority_generation} "

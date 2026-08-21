@@ -28,9 +28,9 @@ def command(vx: float = 0.0, vy: float = 0.0, wz: float = 0.0):
 @pytest.mark.parametrize(
     ("mode", "vx"),
     (
-        ("forward_probe", 0.2),
-        ("forward", 0.2),
-        ("forward_3m", 0.2),
+        ("forward_probe", 0.3),
+        ("forward", 0.3),
+        ("forward_3m", 0.3),
         ("reverse", -0.2),
     ),
 )
@@ -42,8 +42,9 @@ def test_drive_on_heading_relays_only_the_exact_official_speed(mode: str, vx: fl
     assert relay.nav2_output(now_s=10.1) == command(vx=vx)
     assert relay.source_sequence == 1
 
-    with pytest.raises(runner.StrictMotionRunnerError, match="official 0.20"):
-        relay.observe_nav2(command(vx=math.copysign(0.199, vx)), observed_at_s=10.11)
+    wrong = 0.2 if vx > 0.0 else 0.3
+    with pytest.raises(runner.StrictMotionRunnerError, match="NVIDIA direction speed"):
+        relay.observe_nav2(command(vx=math.copysign(wrong, vx)), observed_at_s=10.11)
 
 
 def test_forward_probe_is_a_fixed_short_official_drive() -> None:
@@ -53,16 +54,16 @@ def test_forward_probe_is_a_fixed_short_official_drive() -> None:
     }
     assert runner.action_timeout_s(
         "forward_probe", runner.motion_goal("forward_probe")
-    ) == pytest.approx(11.0)
+    ) == pytest.approx(10.0 + 2.0 / 3.0)
 
 
 def test_drive_on_heading_rejects_wrong_sign_and_mixed_axes() -> None:
     relay = runner.StrictCommandRelay()
     relay.begin("forward")
-    with pytest.raises(runner.StrictMotionRunnerError, match="official 0.20"):
-        relay.observe_nav2(command(vx=-0.2), observed_at_s=10.0)
+    with pytest.raises(runner.StrictMotionRunnerError, match="NVIDIA direction speed"):
+        relay.observe_nav2(command(vx=-0.3), observed_at_s=10.0)
     with pytest.raises(runner.StrictMotionRunnerError, match="mixed-axis"):
-        relay.observe_nav2(command(vx=0.2, wz=0.01), observed_at_s=10.0)
+        relay.observe_nav2(command(vx=0.3, wz=0.01), observed_at_s=10.0)
 
 
 @pytest.mark.parametrize(
@@ -87,7 +88,7 @@ def test_spin_rejects_wrong_sign_subfloor_and_translation() -> None:
 def test_nav2_output_fails_closed_when_source_stalls() -> None:
     relay = runner.StrictCommandRelay()
     relay.begin("forward")
-    relay.observe_nav2(command(vx=0.2), observed_at_s=2.0)
+    relay.observe_nav2(command(vx=0.3), observed_at_s=2.0)
     with pytest.raises(runner.StrictMotionRunnerError, match="stale"):
         relay.nav2_output(now_s=2.151)
 
@@ -152,7 +153,7 @@ def test_lateral_step_is_measured_closed_loop_and_mirrored(mode: str, sign: floa
     relay.begin(mode, start_pose=runner.PlanarPose(1.0, 2.0, math.pi / 2.0))
 
     assert relay.lateral_output(runner.PlanarPose(1.0, 2.0, math.pi / 2.0)) == command(
-        vy=sign * 0.4
+        vy=sign * 0.35
     )
     # At yaw=+pi/2, body-left is world -X.
     near_goal = runner.PlanarPose(1.0 - sign * 0.48, 2.0, math.pi / 2.0)
@@ -277,7 +278,7 @@ class FakeReader:
 
 class FakeRos:
     def __init__(self) -> None:
-        self.command = command(vx=0.2)
+        self.command = command(vx=0.3)
 
     def bridge_health(self) -> dict:
         return {
@@ -460,7 +461,7 @@ def test_snapshot_collector_binds_every_runtime_identity_and_isolation(
     assert sample["isolationProof"]["cmdVelPublisher"]["nodeName"] == (
         "/strict_motion_runner"
     )
-    assert sample["command"] == {"vx": 0.2, "vy": 0.0, "wz": 0.0}
+    assert sample["command"] == {"vx": 0.3, "vy": 0.0, "wz": 0.0}
 
 
 def test_snapshot_collector_accepts_diagnostic_reason_at_exact_safe_hold(
@@ -619,7 +620,7 @@ class FakeExecutorBackend:
 
     def send_drive(self, distance_m: float, *, timeout_s: float):
         assert distance_m == 1.0
-        assert timeout_s == 15.0
+        assert timeout_s == pytest.approx(10.0 + 10.0 / 3.0)
         self.calls.append("send_drive")
         return SimpleNamespace(kind="DriveOnHeading")
 
@@ -733,7 +734,7 @@ class FakeDetourBackend(FakeExecutorBackend):
 
     def send_drive(self, distance_m: float, *, timeout_s: float):
         assert distance_m == 0.5
-        assert timeout_s == 12.5
+        assert timeout_s == pytest.approx(10.0 + 5.0 / 3.0)
         self.calls.append("send_drive")
         return SimpleNamespace(kind="DriveOnHeading")
 
@@ -784,7 +785,7 @@ class FakeStaticPlanner:
             "action_type": "nav2_msgs/action/DriveOnHeading",
             "action_goal": {
                 "target": {"x": 0.5, "y": 0.0, "z": 0.0},
-                "speed_mps": 0.2,
+                "speed_mps": 0.3,
             },
         }
 
@@ -830,7 +831,7 @@ def test_standalone_executor_orders_authority_evidence_action_and_stop(
     trace, result = executor.run_standalone(mode="forward", case_id="forward-run-1")
 
     assert result == {"pass": True}
-    assert trace["action"]["goal"] == {"distanceM": 1.0, "speedMps": 0.2}
+    assert trace["action"]["goal"] == {"distanceM": 1.0, "speedMps": 0.3}
     assert trace["action"]["activationProvenance"] == "initial_support_release"
     assert backend.calls == [
         "ready",
@@ -879,7 +880,7 @@ def test_detour_executor_uses_only_fresh_resolved_official_primitives(
     samples[1]["command"]["wz"] = -0.2
     samples[4]["motionIntentActive"] = True
     samples[4]["nav2Actions"]["driveOnHeadingActive"] = True
-    samples[4]["command"]["vx"] = 0.2
+    samples[4]["command"]["vx"] = 0.3
     collector = FakeExecutorCollector(samples)
     evidence = FakeDetourEvidence()
     planner = FakeStaticPlanner()

@@ -242,7 +242,7 @@ def test_official_primitive_actions_share_the_reviewed_sonic_envelope() -> None:
     )
 
     assert manifest["primitive_action_contract"] == {
-        "drive_on_heading_speed_mps": 0.2,
+        "drive_on_heading_speed_mps": 0.3,
         "spin_min_angular_rps": 0.1,
         "spin_max_angular_rps": 0.2,
         "spin_angular_accel_rps2": 0.3,

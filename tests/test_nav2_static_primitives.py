@@ -164,7 +164,8 @@ def _assert_primitive_plan(module, navfn_path, plan) -> None:
         CLEARANCE_RADIUS
     )
     # One map cell is the minimum geometric primitive. Its command speed is
-    # still exactly 0.20 m/s; segment distance is not a velocity floor.
+    # still exactly NVIDIA's 0.30 m/s forward Slow Walk command; segment
+    # distance is not a velocity floor.
     assert plan["segmenter"]["min_segment_m"] == 0.05
     assert plan["segmenter"]["max_segment_m"] == 0.75
     assert plan["execution_policy"] == {
@@ -173,7 +174,7 @@ def _assert_primitive_plan(module, navfn_path, plan) -> None:
         "revalidate_line_of_sight_before_drive": True,
         "endpoint_tolerance_m": 0.03,
         "heading_tolerance_rad": 0.05,
-        "drive_speed_mps": 0.20,
+        "drive_speed_mps": 0.30,
         "spin_min_angular_rps": 0.10,
         "spin_max_angular_rps": 0.20,
         "spin_angular_accel_rps2": 0.30,
@@ -239,7 +240,7 @@ def _assert_primitive_plan(module, navfn_path, plan) -> None:
         assert drive["segment_id"] == segment["id"]
         assert drive["end_map"] == segment["end_map"]
         assert drive["path_end_index"] == segment["path_end_index"]
-        assert drive["speed_mps"] == 0.20
+        assert drive["speed_mps"] == 0.30
     assert all(item["requires_fresh_odometry"] for item in plan["primitives"])
     # Stored checkpoints contain only absolute references. Relative action
     # goals are created by resolve_live_primitive from fresh odometry.
@@ -267,7 +268,7 @@ def test_locked_short_route_segments_bidirectionally_without_oracle_data() -> No
         "planner_source"
     ]["navfn_path_sha256"]
     # Both directions require a real one-cell-scale turn checkpoint. It remains
-    # legal because distance is not speed and DriveOnHeading is fixed at .20.
+    # legal because distance is not speed and DriveOnHeading is fixed at .30.
     assert any(
         0.05 <= segment["distance_m"] < 0.10
         for plan in plans
@@ -313,7 +314,7 @@ def test_live_resolver_uses_fresh_pose_and_never_emits_zero_or_subfloor_goals() 
     )
     assert drive["disposition"] == "send_action"
     assert drive["action_type"] == "nav2_msgs/action/DriveOnHeading"
-    assert drive["action_goal"]["speed_mps"] == 0.20
+    assert drive["action_goal"]["speed_mps"] == 0.30
     assert drive["action_goal"]["target"]["x"] == pytest.approx(
         segment["distance_m"]
     )
@@ -525,7 +526,7 @@ def test_schema_and_motion_manifest_forbid_unaccepted_follow_path_motion() -> No
         "nav2_msgs/action/DriveOnHeading",
     ]
     assert manifest["primitive_action_contract"] == {
-        "drive_on_heading_speed_mps": 0.2,
+        "drive_on_heading_speed_mps": 0.3,
         "spin_min_angular_rps": 0.1,
         "spin_max_angular_rps": 0.2,
         "spin_angular_accel_rps2": 0.3,
@@ -544,7 +545,7 @@ def test_schema_and_motion_manifest_forbid_unaccepted_follow_path_motion() -> No
         Draft202012Validator(schema).validate(plan)
 
 
-def test_runtime_rejects_graceful_subfloor_curve_instead_of_reinterpreting_it() -> None:
+def test_runtime_quantizes_nav2_ramp_to_official_forward_speed() -> None:
     guard = CmdVelGuard(
         max_linear_mps=0.40,
         min_walk_command_mps=0.20,
@@ -552,5 +553,6 @@ def test_runtime_rejects_graceful_subfloor_curve_instead_of_reinterpreting_it() 
         smoothing_alpha=1.0,
     )
 
-    with pytest.raises(ValueError, match="below SONIC SLOW_WALK floor"):
-        guard.accept(0.199, 0.0, 0.25)
+    intent = guard.accept(0.199, 0.0, 0.25)
+    assert intent.vx == pytest.approx(0.30)
+    assert intent.vy == pytest.approx(0.0)

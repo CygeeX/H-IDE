@@ -277,6 +277,14 @@ class MotionDirectionGuard:
         self._expected = expected
         return True
 
+    def reanchor_at_actuator_grant(self) -> bool:
+        """Discard pre-policy INIT drift at the first real motion boundary."""
+
+        if self.latched or self._pose is None or self._expected is None:
+            return False
+        self._anchor = (self._pose[0], self._pose[1])
+        return True
+
     def clear(self) -> None:
         self.latched = False
         self.reason = None
@@ -384,6 +392,16 @@ class GoalProgressGuard:
         if now - self._zero_since < self.clear_zero_s:
             return False
         self.clear()
+        return True
+
+    def reanchor_at_actuator_grant(self) -> bool:
+        """Start goal-progress accounting after policy authority is real."""
+
+        if self.latched or self._pose is None or self._goal is None:
+            return False
+        distance = math.dist(self._pose, self._goal)
+        self._initial_distance = distance
+        self._best_distance = distance
         return True
 
     def clear(self) -> None:
@@ -516,6 +534,17 @@ class TranslationHeadingGuard:
         self.reason = None
         self._zero_since = None
         self._reset_tracking()
+
+    def reanchor_at_actuator_grant(self) -> bool:
+        """Exclude policy preparation from translation-heading evidence."""
+
+        if self.latched or not self._active or self._latest_yaw is None:
+            return False
+        self._anchor_yaw = self._latest_yaw
+        self._expected_delta = 0.0
+        self._last_command_at = float(self._clock())
+        self._violation_since = None
+        return True
 
     def _reset_tracking(self) -> None:
         self._active = False
@@ -654,6 +683,17 @@ class RotationDirectionGuard:
         self.reason = reason
         self._zero_since = None
 
+    def reanchor_at_actuator_grant(self) -> bool:
+        """Exclude policy preparation drift from Spin displacement evidence."""
+
+        if self.latched or self._pose is None or not self._sign:
+            return False
+        self._anchor = self._pose
+        self._previous_yaw = self._pose[2]
+        self._cumulative_yaw = 0.0
+        self._translation_violation_since = None
+        return True
+
     def clear(self) -> None:
         self.latched = False
         self.reason = None
@@ -741,6 +781,7 @@ class NominalPolicyActivation:
         *,
         joint_count: int = 29,
         duration_s: float = 3.0,
+        release_fall_arrest: bool = True,
         max_settle_joint_error_rad: float = 0.10,
         max_settle_joint_velocity_rps: float = 0.20,
         max_settle_gyro_rps: float = 0.15,
@@ -770,6 +811,9 @@ class NominalPolicyActivation:
         self.joint_count = joint_count
         self.duration_s = duration
         self.duration_ms = int(duration_ms)
+        if not isinstance(release_fall_arrest, bool):
+            raise ValueError("release_fall_arrest must be boolean")
+        self.release_fall_arrest = release_fall_arrest
         limits = {
             "max_settle_joint_error_rad": max_settle_joint_error_rad,
             "max_settle_joint_velocity_rps": max_settle_joint_velocity_rps,
@@ -816,6 +860,7 @@ class NominalPolicyActivation:
         self._last_settle_tick_ms: int | None = None
         self._support_release_tick_ms: int | None = None
         self._support_release_epoch: int | None = None
+        self._policy_takeover_tick_ms: int | None = None
         self._activation_path: str | None = None
         self._ready_targets: tuple[float, ...] | None = None
 
@@ -876,7 +921,12 @@ class NominalPolicyActivation:
             "activation_epoch": self._epoch,
             "activation_path": self._activation_path,
             "support_release": {
-                "one_way": True,
+                "mode": (
+                    "one_way_release"
+                    if self.release_fall_arrest
+                    else "retained_vertical_attitude_fall_arrest"
+                ),
+                "one_way": self.release_fall_arrest,
                 "confirmed_epoch": self._support_release_epoch,
                 "cancel_recovery": "resume_policy_from_exact_frozen_boundary",
             },
@@ -892,7 +942,10 @@ class NominalPolicyActivation:
             },
             "policy_takeover": (
                 "first_successful_policy_dds_then_exact_epoch_support_release"
+                if self.release_fall_arrest
+                else "first_successful_policy_dds_with_fall_arrest_retained"
             ),
+            "policy_takeover_tick_ms": self._policy_takeover_tick_ms,
         }
 
     def begin(self, targets: Sequence[float], *, tick_ms: int) -> bool:
@@ -906,7 +959,13 @@ class NominalPolicyActivation:
         self._epoch += 1
         self._phase = "WAITING_FOR_SUPPORT_RELEASE" if support_off else "PREPARING"
         self._activation_path = (
-            "support_off_reinit" if support_off else "tethered_release"
+            "support_off_reinit"
+            if support_off
+            else (
+                "tethered_release"
+                if self.release_fall_arrest
+                else "tethered_retained"
+            )
         )
         self._start_targets = None if support_off else boundary
         self._start_tick_ms = None if support_off else start_tick
@@ -916,6 +975,7 @@ class NominalPolicyActivation:
         self._settle_consecutive_samples = 0
         self._last_settle_observation = None
         self._last_settle_tick_ms = None
+        self._policy_takeover_tick_ms = None
         if not support_off:
             self._support_release_tick_ms = None
         return True
@@ -1108,6 +1168,39 @@ class NominalPolicyActivation:
                 "policy activation path is unavailable at support release"
             )
         self._support_release_tick_ms = current_tick
+        self._policy_takeover_tick_ms = current_tick
+        self._phase = "PREPARED"
+        return True
+
+    def confirm_supported_takeover(self, *, tick_ms: int) -> bool:
+        """Complete CONTROL while retaining non-propulsive simulation support.
+
+        ``startup_support_s: 0`` is the explicit simulation profile which
+        keeps only vertical and roll/pitch fall arrest for the run.  That
+        support has no world-X/Y force or yaw torque in locomotion, so it
+        cannot manufacture translation or turning.  Requiring a successful
+        first policy DDS grant still preserves the official WAIT -> CONTROL
+        boundary without dropping a controller which has not yet demonstrated
+        unsupported balance.
+        """
+
+        if not self.waiting_for_support_release:
+            return False
+        if self._activation_path != "tethered_retained":
+            raise NominalPolicyActivationFault(
+                "retained-support takeover requires its explicit activation path"
+            )
+        if self.release_fall_arrest or self._support_release_epoch is not None:
+            raise NominalPolicyActivationFault(
+                "retained-support takeover conflicts with Plant release evidence"
+            )
+        current_tick = self._validate_tick(tick_ms)
+        if (
+            self._last_settle_tick_ms is not None
+            and current_tick < self._last_settle_tick_ms
+        ):
+            raise ValueError("policy takeover tick predates tethered evidence")
+        self._policy_takeover_tick_ms = current_tick
         self._phase = "PREPARED"
         return True
 
@@ -1165,6 +1258,7 @@ class NominalPolicyActivation:
         self._last_settle_observation = None
         self._last_settle_tick_ms = None
         self._ready_targets = None
+        self._policy_takeover_tick_ms = None
         if not self.support_release_confirmed:
             self._support_release_tick_ms = None
         return True
@@ -1446,11 +1540,21 @@ class BodyStabilityGuard:
 
 
 class CmdVelGuard:
-    """Clamp, smooth and expire Nav2 commands before they reach SONIC.
+    """Adapt, bound and expire Nav2 commands before they reach SONIC.
 
     The class contains no ROS or MuJoCo imports, making it independently
     testable and keeping the actuator boundary auditable.
     """
+
+    _OFFICIAL_DIRECTION_BIN_RAD = math.pi / 4.0
+    _OFFICIAL_TRANSLATION_DEADBAND_MPS = 0.01
+    _OFFICIAL_SLOW_WALK_SPEED_BY_ABS_BIN = {
+        0: 0.30,
+        1: 0.30,
+        2: 0.35,
+        3: 0.25,
+        4: 0.20,
+    }
 
     def __init__(
         self,
@@ -1564,35 +1668,35 @@ class CmdVelGuard:
         if not all(math.isfinite(value) for value in values):
             raise ValueError("cmd_vel values must be finite")
         norm = math.hypot(values[0], values[1])
-        # The pinned SONIC pipeline clamps SLOW_WALK to at least 0.20 m/s.
-        # Reject a sub-floor upstream command instead of silently changing a
-        # mixed curve into a pure turn. Numerical zero remains a normal braking
-        # command.
-        if 1e-6 < norm < self.min_walk_command_mps:
-            if not math.isclose(
-                norm,
-                self.min_walk_command_mps,
-                rel_tol=0.0,
-                abs_tol=1e-9,
-            ):
-                raise ValueError(
-                    "active translation speed "
-                    f"{norm:.6f}m/s is below SONIC SLOW_WALK floor "
-                    f"{self.min_walk_command_mps:.6f}m/s"
-                )
-            floor_scale = self.min_walk_command_mps / norm
-            values = (values[0] * floor_scale, values[1] * floor_scale, values[2])
-            norm = self.min_walk_command_mps
-        if norm <= 1e-6:
+        # Match NVIDIA's pinned ROS2 input adapter instead of interpreting a
+        # continuous Nav2 magnitude as a learned-policy speed.  SONIC's
+        # SLOW_WALK interface quantizes every active planar command to one of
+        # eight directions and assigns a direction-specific reviewed speed:
+        # forward/forward-diagonal=.30, lateral=.35,
+        # backward-diagonal=.25 and backward=.20 m/s.  The upstream adapter
+        # uses 0.01 m/s solely as its active/idle threshold.  Rejecting all
+        # Nav2 ramp samples below .20 was an H-IDE invention which could stop a
+        # valid controller before the official adapter would start walking.
+        if norm <= self._OFFICIAL_TRANSLATION_DEADBAND_MPS:
             values = (0.0, 0.0, values[2])
             norm = 0.0
-        scale = min(1.0, self.max_linear_mps / norm) if norm else 1.0
+        else:
+            binned_angle, official_speed = self._official_slow_walk_command(
+                values[0], values[1]
+            )
+            reviewed_speed = min(official_speed, self.max_linear_mps)
+            values = (
+                reviewed_speed * math.cos(binned_angle),
+                reviewed_speed * math.sin(binned_angle),
+                values[2],
+            )
+            norm = reviewed_speed
         accepted_at = self._clock() if received_at is None else float(received_at)
         if not math.isfinite(accepted_at):
             raise ValueError("cmd_vel receive time must be finite")
         target = CmdVel(
-            values[0] * scale,
-            values[1] * scale,
+            values[0],
+            values[1],
             max(-self.max_angular_rps, min(self.max_angular_rps, values[2])),
             accepted_at,
             source=source,
@@ -1712,6 +1816,26 @@ class CmdVelGuard:
             source=target.source,
         )
 
+    @classmethod
+    def _official_slow_walk_command(
+        cls,
+        vx: float,
+        vy: float,
+    ) -> tuple[float, float]:
+        """Return NVIDIA's exact 8-way direction bin and SLOW_WALK speed."""
+
+        angle = cls._wrap_angle(math.atan2(float(vy), float(vx)))
+        scaled = angle / cls._OFFICIAL_DIRECTION_BIN_RAD
+        bin_index = (
+            math.floor(scaled + 0.5)
+            if scaled >= 0.0
+            else math.ceil(scaled - 0.5)
+        )
+        bin_index = max(-4, min(4, int(bin_index)))
+        binned_angle = bin_index * cls._OFFICIAL_DIRECTION_BIN_RAD
+        speed = cls._OFFICIAL_SLOW_WALK_SPEED_BY_ABS_BIN[abs(bin_index)]
+        return binned_angle, speed
+
     @staticmethod
     def _is_nonzero(command: CmdVel) -> bool:
         return any(abs(value) > 1e-6 for value in (command.vx, command.vy, command.wz))
@@ -1742,18 +1866,19 @@ class NavigationArmGuard:
     """Bound SONIC arm targets and preserve the exact executed history.
 
     SONIC is a whole-body policy, so even a Nav2 walking command can produce
-    targets for all fourteen arm joints.  H-IDE's current simulation profile
-    has no manipulation capability; large upper-body excursions are therefore
-    neither required nor safe.  This guard rejects non-finite or
-    out-of-envelope policy targets and applies the configured per-joint slew
-    bound to short discontinuities.  The caller must feed the returned
+    targets for all fourteen arm joints.  This guard rejects non-finite policy
+    targets, projects finite targets into the authoritative physical joint
+    ranges, and applies the configured per-joint slew bound.  The caller must
+    feed the returned
     actuator target—not the raw candidate—through ``record_executed_target``
     so recurrent action history remains exactly equal to the DDS fact.
 
-    A brief projection closes reference/intent seams without weakening the
-    physical velocity limit.  Continuously saturated policy output is not a
-    normal gait: each joint has a bounded saturation budget and fails closed
-    when it remains constrained beyond that budget.
+    Projection closes reference/intent seams without weakening the physical
+    velocity limit.  Saturation duration remains authoritative evidence.  A
+    caller may configure a fail-closed duration budget, but the production
+    locomotion profile deliberately leaves it unset: no upstream SONIC or
+    Unitree contract defines such a deadline, and the projected actuator fact
+    is already bounded and fed back exactly to the recurrent policy.
 
     It deliberately runs *after* SONIC and before ``rt/lowcmd``.  The lower
     body and waist remain untouched, and this guard cannot create motion on its
@@ -1764,34 +1889,108 @@ class NavigationArmGuard:
         self,
         nominal: Sequence[float],
         *,
-        max_deviation_rad: Sequence[float],
+        max_deviation_rad: Sequence[float] | None = None,
+        lower_limits_rad: Sequence[float] | None = None,
+        upper_limits_rad: Sequence[float] | None = None,
         max_velocity_rps: Sequence[float],
-        max_continuous_saturation_s: float = 0.25,
+        max_continuous_saturation_s: float | None = None,
     ) -> None:
         self.nominal = tuple(float(value) for value in nominal)
-        self.max_deviation_rad = tuple(float(value) for value in max_deviation_rad)
         self.max_velocity_rps = tuple(float(value) for value in max_velocity_rps)
         if not self.nominal:
             raise ValueError("arm guard requires at least one joint")
-        if not (
-            len(self.nominal) == len(self.max_deviation_rad) == len(self.max_velocity_rps)
-        ):
+        if len(self.nominal) != len(self.max_velocity_rps):
             raise ValueError("arm guard vectors must have matching lengths")
         if not all(math.isfinite(value) for value in self.nominal):
             raise ValueError("arm nominal targets must be finite")
-        if not all(math.isfinite(value) and value > 0 for value in self.max_deviation_rad):
-            raise ValueError("arm deviations must be finite and positive")
+        explicit_limits = lower_limits_rad is not None or upper_limits_rad is not None
+        if explicit_limits:
+            if max_deviation_rad is not None:
+                raise ValueError(
+                    "arm guard accepts either deviations or explicit limits, not both"
+                )
+            if lower_limits_rad is None or upper_limits_rad is None:
+                raise ValueError(
+                    "arm guard explicit lower and upper limits must be provided together"
+                )
+            lower = tuple(float(value) for value in lower_limits_rad)
+            upper = tuple(float(value) for value in upper_limits_rad)
+            if len(lower) != len(self.nominal) or len(upper) != len(self.nominal):
+                raise ValueError("arm guard vectors must have matching lengths")
+            if not all(
+                math.isfinite(low)
+                and math.isfinite(high)
+                and low < high
+                for low, high in zip(lower, upper, strict=True)
+            ):
+                raise ValueError("arm hard limits must be finite and ordered")
+            if not all(
+                low <= center <= high
+                for center, low, high in zip(
+                    self.nominal,
+                    lower,
+                    upper,
+                    strict=True,
+                )
+            ):
+                raise ValueError("arm nominal targets must lie within hard limits")
+            self.lower_limits_rad = lower
+            self.upper_limits_rad = upper
+            # Retain the legacy diagnostic attribute without using it for
+            # enforcement.  Explicit limits are commonly asymmetric.
+            self.max_deviation_rad = tuple(
+                max(center - low, high - center)
+                for center, low, high in zip(
+                    self.nominal,
+                    lower,
+                    upper,
+                    strict=True,
+                )
+            )
+        else:
+            if max_deviation_rad is None:
+                raise ValueError(
+                    "arm guard requires deviations or explicit hard limits"
+                )
+            deviations = tuple(float(value) for value in max_deviation_rad)
+            if len(deviations) != len(self.nominal):
+                raise ValueError("arm guard vectors must have matching lengths")
+            if not all(
+                math.isfinite(value) and value > 0 for value in deviations
+            ):
+                raise ValueError("arm deviations must be finite and positive")
+            self.max_deviation_rad = deviations
+            self.lower_limits_rad = tuple(
+                center - radius
+                for center, radius in zip(
+                    self.nominal,
+                    deviations,
+                    strict=True,
+                )
+            )
+            self.upper_limits_rad = tuple(
+                center + radius
+                for center, radius in zip(
+                    self.nominal,
+                    deviations,
+                    strict=True,
+                )
+            )
         if not all(math.isfinite(value) and value > 0 for value in self.max_velocity_rps):
             raise ValueError("arm velocity limits must be finite and positive")
-        if isinstance(max_continuous_saturation_s, bool):
-            raise ValueError(
-                "arm saturation budget must be finite and positive"
-            )
-        saturation_budget = float(max_continuous_saturation_s)
-        if not math.isfinite(saturation_budget) or saturation_budget <= 0.0:
-            raise ValueError(
-                "arm saturation budget must be finite and positive"
-            )
+        saturation_budget: float | None
+        if max_continuous_saturation_s is None:
+            saturation_budget = None
+        else:
+            if isinstance(max_continuous_saturation_s, bool):
+                raise ValueError(
+                    "arm saturation budget must be finite and positive"
+                )
+            saturation_budget = float(max_continuous_saturation_s)
+            if not math.isfinite(saturation_budget) or saturation_budget <= 0.0:
+                raise ValueError(
+                    "arm saturation budget must be finite and positive"
+                )
         self.max_continuous_saturation_s = saturation_budget
         self._last: tuple[float, ...] | None = None
         self._continuous_saturation_s = tuple(0.0 for _ in self.nominal)
@@ -1827,24 +2026,30 @@ class NavigationArmGuard:
         constrained_joints = 0
         max_step = 0.0
         for index, raw in enumerate(raw_targets):
-            if not self._within_envelope_or_recovering(raw, anchor[index], index):
-                raise ValueError(
-                    "arm policy target "
-                    f"{index}={raw:.17g} exceeds the navigation envelope "
-                    f"around nominal={self.nominal[index]:.17g} "
-                    f"from anchor={anchor[index]:.17g}"
-                )
+            bounded = min(
+                self.upper_limits_rad[index],
+                max(self.lower_limits_rad[index], raw),
+            )
             allowed_step = self.max_velocity_rps[index] * float(dt)
-            step = raw - anchor[index]
-            if abs(step) > allowed_step + 1e-9:
+            step = bounded - anchor[index]
+            hard_limit_constrained = bounded != raw
+            slew_constrained = abs(step) > allowed_step + 1e-9
+            if slew_constrained:
                 projected = anchor[index] + math.copysign(
                     allowed_step,
                     step,
                 )
+            else:
+                projected = bounded
+            if hard_limit_constrained or slew_constrained:
                 saturated_for = (
                     self._continuous_saturation_s[index] + float(dt)
                 )
-                if saturated_for > self.max_continuous_saturation_s + 1e-12:
+                if (
+                    self.max_continuous_saturation_s is not None
+                    and saturated_for
+                    > self.max_continuous_saturation_s + 1e-12
+                ):
                     raise ValueError(
                         "arm policy target "
                         f"{index}={raw:.17g} persistently exceeds the per-tick "
@@ -1856,7 +2061,6 @@ class NavigationArmGuard:
                 constrained_joints += 1
                 constrained_joint_indices.append(index)
             else:
-                projected = raw
                 saturated_for = 0.0
             projected_targets.append(projected)
             saturation_durations.append(saturated_for)
@@ -1893,21 +2097,3 @@ class NavigationArmGuard:
             raise ValueError("arm anchor vector must be finite")
         self._last = values
         self._continuous_saturation_s = tuple(0.0 for _ in self.nominal)
-
-    def _within_envelope_or_recovering(
-        self,
-        value: float,
-        anchor: float,
-        index: int,
-    ) -> bool:
-        center = self.nominal[index]
-        radius = self.max_deviation_rad[index]
-        lower = center - radius
-        upper = center + radius
-        if lower <= value <= upper:
-            return True
-        if anchor > upper:
-            return upper < value <= anchor
-        if anchor < lower:
-            return anchor <= value < lower
-        return False

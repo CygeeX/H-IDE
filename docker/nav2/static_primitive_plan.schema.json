@@ -108,7 +108,7 @@
         "revalidate_line_of_sight_before_drive": {"const": true},
         "endpoint_tolerance_m": {"const": 0.03},
         "heading_tolerance_rad": {"const": 0.05},
-        "drive_speed_mps": {"const": 0.2},
+        "drive_speed_mps": {"const": 0.3},
         "spin_min_angular_rps": {"const": 0.1},
         "spin_max_angular_rps": {"const": 0.2},
         "spin_angular_accel_rps2": {"const": 0.3},
@@ -233,7 +233,7 @@
         "segment_id": {"type": "string", "pattern": "^segment-[0-9]{3,6}$"},
         "path_end_index": {"type": "integer", "minimum": 1, "maximum": 999999},
         "end_map": {"$ref": "#/$defs/point"},
-        "speed_mps": {"const": 0.2},
+        "speed_mps": {"const": 0.3},
         "requires_fresh_odometry": {"const": true}
       },
       "additionalProperties": false

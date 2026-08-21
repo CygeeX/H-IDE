@@ -80,6 +80,8 @@ def test_reference_transaction_and_terminal_fields_are_strict_schema_members():
         terminal_boundary_error="vendor revoke failed",
         plant_terminal_halt_confirmed=False,
         plant_terminal_halt_error="timeout",
+        recoverable_motion_fault=True,
+        motion_fault_safe_hold_frames=2,
     )
 
     assert updated.sonic_reference_authority_state == "GRANTED"
@@ -88,6 +90,8 @@ def test_reference_transaction_and_terminal_fields_are_strict_schema_members():
     assert updated.sonic_execution_feedback_pending is True
     assert updated.plant_terminal_halt_confirmed is False
     assert updated.plant_terminal_halt_error == "timeout"
+    assert updated.recoverable_motion_fault is True
+    assert updated.motion_fault_safe_hold_frames == 2
 
 
 def test_snapshot_json_adds_runtime_diagnostics_without_mutating_state():

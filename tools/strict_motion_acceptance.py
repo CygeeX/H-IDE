@@ -142,8 +142,8 @@ class FormalContract:
     arm_control_period_s: float = 0.02
     command_zero_epsilon: float = 1e-6
     steady_target_tolerance: float = 0.01
-    drive_on_heading_max_vx_mps: float = 0.20
-    lateral_step_max_vy_mps: float = 0.40
+    drive_on_heading_max_vx_mps: float = 0.30
+    lateral_step_max_vy_mps: float = 0.35
     spin_max_wz_rps: float = 0.20
     max_fresh_odometry_age_s: float = 0.10
     max_first_person_capture_age_ms: float = 2000.0
@@ -166,7 +166,10 @@ FORMAL_CONTRACTS: dict[str, FormalContract] = {
     ),
     "forward": FormalContract(expected_longitudinal_m=1.0),
     "forward_3m": FormalContract(expected_longitudinal_m=3.0),
-    "reverse": FormalContract(expected_longitudinal_m=-0.5),
+    "reverse": FormalContract(
+        expected_longitudinal_m=-0.5,
+        drive_on_heading_max_vx_mps=0.20,
+    ),
     "lateral_left": FormalContract(
         expected_lateral_m=0.5,
         final_position_tolerance_m=0.10,
@@ -1529,13 +1532,13 @@ class StrictMotionEvaluator:
                 ):
                     self._fail(
                         "DRIVE_ON_HEADING_COMMAND_ENVELOPE",
-                        "DriveOnHeading requires |vy|,|wz|<=1e-6 and |vx|<=0.20m/s",
+                        "DriveOnHeading exceeds the NVIDIA direction speed or mixes axes",
                         float(sample["t"]),
                     )
             if max(signed_commands) < self.contract.drive_on_heading_max_vx_mps - self.contract.steady_target_tolerance - _EPS:
                 self._fail(
                     "DRIVE_ON_HEADING_STEADY_TARGET_MISSING",
-                    "no signed 0.20m/s DriveOnHeading steady command was observed",
+                    "no signed NVIDIA DriveOnHeading steady command was observed",
                 )
         elif self.contract.expected_lateral_m is not None:
             expected = self.contract.expected_lateral_m
@@ -1562,12 +1565,12 @@ class StrictMotionEvaluator:
                 if abs(float(sample["vx"])) > self.contract.command_zero_epsilon + _EPS or abs(float(sample["wz"])) > self.contract.command_zero_epsilon + _EPS:
                     self._fail("LATERAL_COMMAND_ENVELOPE", "LateralStep requires |vx| and |wz| <= 1e-6", float(sample["t"]))
                 if abs(float(sample["vy"])) > self.contract.lateral_step_max_vy_mps + _EPS:
-                    self._fail("LATERAL_COMMAND_ENVELOPE", "LateralStep requires |vy| <= 0.40m/s", float(sample["t"]))
+                    self._fail("LATERAL_COMMAND_ENVELOPE", "LateralStep requires |vy| <= 0.35m/s", float(sample["t"]))
                 if any(sample["actions"].values()):
                     self._fail("NAV2_ACTION_ACTIVE_DURING_LATERAL", "all Nav2 actions must be inactive during LateralStep", float(sample["t"]))
             signed_vy = [(1.0 if expected > 0 else -1.0) * float(sample["vy"]) for sample in active]
             if not signed_vy or max(signed_vy) < self.contract.lateral_step_max_vy_mps - self.contract.steady_target_tolerance - _EPS:
-                self._fail("LATERAL_STEADY_TARGET_MISSING", "no signed 0.40m/s steady lateral command was observed")
+                self._fail("LATERAL_STEADY_TARGET_MISSING", "no signed 0.35m/s steady lateral command was observed")
         elif self.contract.expected_yaw_rad is not None:
             expected = self.contract.expected_yaw_rad
             direction = 1.0 if expected > 0 else -1.0
@@ -2086,7 +2089,7 @@ class StrictMotionEvaluator:
                 if distance <= 0 or abs(speed - self.contract.drive_on_heading_max_vx_mps) > _EPS:
                     self._fail(
                         "DETOUR_SEGMENT_GOAL_INVALID",
-                        "DriveOnHeading detour goals require positive distance and locked 0.20m/s speed",
+                        "DriveOnHeading detour goals require positive distance and locked 0.30m/s speed",
                     )
                 if line_of_sight is not True:
                     self._fail(
@@ -2290,7 +2293,7 @@ class StrictMotionEvaluator:
                 ):
                     self._fail(
                         "DRIVE_ON_HEADING_COMMAND_ENVELOPE",
-                        "detour DriveOnHeading requires 0<vx<=0.20m/s and zero vy/wz",
+                        "detour DriveOnHeading requires 0<vx<=0.30m/s and zero vy/wz",
                         float(sample["t"]),
                     )
             else:
@@ -2361,7 +2364,7 @@ class StrictMotionEvaluator:
             if steady < target - self.contract.steady_target_tolerance - _EPS:
                 self._fail(
                     "DETOUR_SEGMENT_STEADY_TARGET_MISSING",
-                    f"detour segment {index} never observed its locked 0.20 steady target",
+                    f"detour segment {index} never observed its locked 0.30 steady target",
                 )
             if index + 1 < len(self.detour_segments):
                 next_observed = observed_by_segment[index + 1]

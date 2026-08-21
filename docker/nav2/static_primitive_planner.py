@@ -28,6 +28,7 @@ MOTION_MODE = "static_spin_drive_primitives"
 COMPUTE_PATH_ACTION = "nav2_msgs/action/ComputePathToPose"
 SPIN_ACTION = "nav2_msgs/action/Spin"
 DRIVE_ACTION = "nav2_msgs/action/DriveOnHeading"
+OFFICIAL_FORWARD_SPEED_MPS = 0.30
 ALLOWED_PRODUCT_ACTIONS = [COMPUTE_PATH_ACTION, SPIN_ACTION, DRIVE_ACTION]
 FORBIDDEN_PRODUCT_ACTIONS = {
     "nav2_msgs/action/NavigateToPose",
@@ -389,7 +390,7 @@ def _validate_runtime_bindings(
         "motion profile primitive action contract",
     )
     expected_primitive_contract = {
-        "drive_on_heading_speed_mps": 0.20,
+        "drive_on_heading_speed_mps": OFFICIAL_FORWARD_SPEED_MPS,
         "spin_min_angular_rps": 0.10,
         "spin_max_angular_rps": 0.20,
         "spin_angular_accel_rps2": 0.30,
@@ -537,7 +538,7 @@ def build_primitive_plan(
     extra_clearance_m: float = 0.05,
     min_segment_m: float = 0.05,
     max_segment_m: float = 0.75,
-    drive_speed_mps: float = 0.20,
+    drive_speed_mps: float = OFFICIAL_FORWARD_SPEED_MPS,
     endpoint_tolerance_m: float = 0.03,
     heading_tolerance_rad: float = 0.05,
 ) -> dict[str, object]:
@@ -566,8 +567,12 @@ def build_primitive_plan(
     _require(0.0 < endpoint_tolerance_m < min_segment_m, "endpoint tolerance must be below minimum segment distance")
     _require(0.0 < heading_tolerance_rad <= 0.05, "heading tolerance must be in (0, 0.05]")
     _require(
-        math.isclose(drive_speed_mps, 0.20, abs_tol=1e-12),
-        "DriveOnHeading speed must equal SONIC Slow Walk 0.20 m/s",
+        math.isclose(
+            drive_speed_mps,
+            OFFICIAL_FORWARD_SPEED_MPS,
+            abs_tol=1e-12,
+        ),
+        "DriveOnHeading speed must equal NVIDIA's forward Slow Walk 0.30 m/s",
     )
     frame_id, poses = _normalise_path(navfn_path)
     static_map = StaticMap.load(map_yaml_path, map_image_path)
@@ -711,7 +716,7 @@ def verify_primitive_plan(
     extra_clearance_m: float = 0.05,
     min_segment_m: float = 0.05,
     max_segment_m: float = 0.75,
-    drive_speed_mps: float = 0.20,
+    drive_speed_mps: float = OFFICIAL_FORWARD_SPEED_MPS,
     endpoint_tolerance_m: float = 0.03,
     heading_tolerance_rad: float = 0.05,
 ) -> dict[str, object]:
@@ -807,7 +812,7 @@ def resolve_live_primitive(
     extra_clearance_m: float = 0.05,
     min_segment_m: float = 0.05,
     max_segment_m: float = 0.75,
-    drive_speed_mps: float = 0.20,
+    drive_speed_mps: float = OFFICIAL_FORWARD_SPEED_MPS,
     endpoint_tolerance_m: float = 0.03,
     heading_tolerance_rad: float = 0.05,
 ) -> dict[str, object]:
@@ -943,10 +948,10 @@ def resolve_live_primitive(
     _require(
         math.isclose(
             _finite_number(primitive.get("speed_mps"), "DriveOnHeading speed"),
-            0.20,
+            OFFICIAL_FORWARD_SPEED_MPS,
             abs_tol=1e-12,
         ),
-        "DriveOnHeading speed is outside the official SONIC floor",
+        "DriveOnHeading speed is not NVIDIA's forward Slow Walk command",
     )
     return {
         **result,
@@ -954,7 +959,7 @@ def resolve_live_primitive(
         "action_type": DRIVE_ACTION,
         "action_goal": {
             "target": {"x": distance, "y": 0.0, "z": 0.0},
-            "speed_mps": 0.20,
+            "speed_mps": OFFICIAL_FORWARD_SPEED_MPS,
         },
         "fresh_distance_to_endpoint_m": distance,
         "resolved_target_map_yaw_rad": target_heading,

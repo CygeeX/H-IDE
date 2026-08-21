@@ -289,6 +289,39 @@ def test_goal_progress_guard_ignores_small_detour_and_equivalent_replan():
     assert guard.latched is False
 
 
+def test_navigation_guards_reanchor_only_at_policy_actuator_grant() -> None:
+    now = [10.0]
+
+    direction = MotionDirectionGuard(clock=lambda: now[0])
+    direction.observe_pose(0.0, 0.0, 0.0)
+    direction.accept_command(0.30, 0.0, 0.0)
+    direction.observe_pose(-0.05, 0.0, 0.0)
+    assert direction.reanchor_at_actuator_grant() is True
+    assert direction.observe_pose(-0.09, 0.0, 0.0) is False
+
+    progress = GoalProgressGuard(clock=lambda: now[0])
+    progress.observe_pose(0.0, 0.0)
+    progress.observe_goal(1.0, 0.0)
+    progress.observe_pose(-0.10, 0.0)
+    assert progress.reanchor_at_actuator_grant() is True
+    assert progress.observe_pose(-0.14, 0.0) is False
+
+    heading = TranslationHeadingGuard(clock=lambda: now[0])
+    heading.observe_pose(0.0)
+    heading.accept_command(0.30, 0.0, 0.0)
+    heading.observe_pose(0.20)
+    assert heading.reanchor_at_actuator_grant() is True
+    now[0] += 0.30
+    assert heading.observe_pose(0.21) is False
+
+    rotation = RotationDirectionGuard(clock=lambda: now[0])
+    rotation.observe_pose(0.0, 0.0, 0.0)
+    rotation.accept_command(0.0, 0.0, 0.20)
+    rotation.observe_pose(0.02, 0.0, -0.04)
+    assert rotation.reanchor_at_actuator_grant() is True
+    assert rotation.observe_pose(0.03, 0.0, -0.06) is False
+
+
 def test_static_joint_handoff_is_binary_hold_or_exact_policy_authority():
     now = [1.0]
     handoff = StaticJointHandoff(joint_count=2, warmup_s=0.3, blend_s=0.4, clock=lambda: now[0])
@@ -429,11 +462,43 @@ def test_activation_stop_after_policy_grant_and_release_preserves_init():
     assert activation.phase == "PREPARED"
     assert activation.support_release_confirmed is True
     assert activation.provenance["support_release"] == {
+        "mode": "one_way_release",
         "one_way": True,
         "confirmed_epoch": released_epoch,
         "cancel_recovery": "resume_policy_from_exact_frozen_boundary",
     }
     assert activation.begin([0.05], tick_ms=4_000) is False
+
+
+def test_nominal_policy_activation_can_retain_nonpropulsive_fall_arrest():
+    activation = NominalPolicyActivation(
+        joint_count=1,
+        duration_s=3.0,
+        settle_consecutive_samples=1,
+        release_fall_arrest=False,
+    )
+    assert activation.begin([0.1], tick_ms=0)
+    final = activation.propose([0.0], measured=[0.0], tick_ms=3_000)
+    assert activation.commit(final, final.targets)
+    settled = activation.observe_settling(
+        nominal=[0.0], measured=[0.0], velocities=[0.0],
+        gyroscope=[0.0, 0.0, 0.0], roll_rad=0.0, pitch_rad=0.0,
+        tick_ms=3_020,
+    )
+    assert settled.stage_complete
+    assert activation.activation_path == "tethered_retained"
+    assert activation.support_release_confirmed is False
+    assert activation.confirm_supported_takeover(tick_ms=3_040)
+    assert activation.prepared
+    assert activation.provenance["support_release"] == {
+        "mode": "retained_vertical_attitude_fall_arrest",
+        "one_way": False,
+        "confirmed_epoch": None,
+        "cancel_recovery": "resume_policy_from_exact_frozen_boundary",
+    }
+    assert activation.provenance["policy_takeover"] == (
+        "first_successful_policy_dds_with_fall_arrest_retained"
+    )
 
 
 def test_legacy_support_off_recovery_skips_static_init():
@@ -685,31 +750,51 @@ def test_command_zero_is_read_only_and_requires_the_filtered_tail_to_stop():
     assert guard.command_zero is True
 
 
-@pytest.mark.parametrize(
-    ("vx", "vy", "wz"),
-    [
-        (0.199, 0.0, 0.0),
-        (0.19, 0.0, 0.25),
-    ],
-)
-def test_active_sub_sonic_translation_is_rejected(vx, vy, wz):
+@pytest.mark.parametrize("raw_speed", [0.011, 0.05, 0.199])
+def test_active_nav2_ramp_uses_official_forward_slow_walk_speed(raw_speed):
     now = [100.0]
     guard = CmdVelGuard(
         timeout_s=0.25,
         clock=lambda: now[0],
         smoothing_alpha=1.0,
     )
-    with pytest.raises(ValueError, match="below SONIC SLOW_WALK floor"):
-        guard.accept(vx, vy, wz)
-    assert guard.command_zero is True
+    accepted = guard.accept(raw_speed, 0.0, 0.0)
+    assert accepted.vx == pytest.approx(0.30)
+    intent = guard.intent(now=100.01, dt=0.02)
+    assert intent.speed_mps == pytest.approx(0.30)
+    assert intent.movement_angle_rad == pytest.approx(0.0)
 
 
-def test_official_slow_walk_floor_is_reached_on_first_filtered_tick():
+def test_official_forward_slow_walk_speed_is_reached_on_first_filtered_tick():
     guard = CmdVelGuard(smoothing_alpha=0.35, clock=lambda: 100.0)
     guard.accept(0.20, 0.0, 0.0)
     intent = guard.intent(now=100.01, dt=0.02)
-    assert intent.speed_mps == pytest.approx(0.20)
+    assert intent.speed_mps == pytest.approx(0.30)
     assert intent.has_movement is True
+
+
+@pytest.mark.parametrize(
+    ("angle", "expected_speed"),
+    (
+        (0.0, 0.30),
+        (math.pi / 4.0, 0.30),
+        (-math.pi / 4.0, 0.30),
+        (math.pi / 2.0, 0.35),
+        (-math.pi / 2.0, 0.35),
+        (3.0 * math.pi / 4.0, 0.25),
+        (-3.0 * math.pi / 4.0, 0.25),
+        (math.pi, 0.20),
+    ),
+)
+def test_official_ros2_eight_way_slow_walk_contract(angle, expected_speed):
+    guard = CmdVelGuard(smoothing_alpha=1.0, clock=lambda: 100.0)
+    accepted = guard.accept(math.cos(angle), math.sin(angle), 0.0)
+    assert math.hypot(accepted.vx, accepted.vy) == pytest.approx(expected_speed)
+    intent = guard.intent(now=100.01, dt=0.02)
+    assert intent.speed_mps == pytest.approx(expected_speed)
+    assert CmdVelGuard._wrap_angle(intent.movement_angle_rad - angle) == pytest.approx(
+        0.0
+    )
 
 
 def test_angular_only_nav2_command_selects_sonic_turning_plan():
@@ -841,14 +926,14 @@ def test_translation_drift_does_not_feed_back_into_command_integral():
     ("vy", "expected_angle"),
     [(0.80, math.pi / 2.0), (-0.80, -math.pi / 2.0)],
 )
-def test_lateral_commands_are_mirrored_and_bounded_at_point_four(
+def test_lateral_commands_are_mirrored_at_official_point_three_five(
     vy,
     expected_angle,
 ):
     guard = CmdVelGuard(clock=lambda: 100.0, smoothing_alpha=0.35)
     guard.accept(0.0, vy, 0.0)
     intent = guard.intent(now=100.01, dt=0.02)
-    assert intent.speed_mps == pytest.approx(0.40)
+    assert intent.speed_mps == pytest.approx(0.35)
     assert intent.movement_angle_rad == pytest.approx(expected_angle)
     assert intent.facing_angle_rad == pytest.approx(0.0)
 
@@ -1000,7 +1085,7 @@ def test_navigation_arm_guard_passes_valid_policy_target_unchanged():
     assert second.constrained_joints == 0
 
 
-def test_navigation_arm_guard_rejects_excursion_and_projects_slew():
+def test_navigation_arm_guard_projects_excursion_and_slew():
     guard = NavigationArmGuard(
         [0.2],
         max_deviation_rad=[0.4],
@@ -1008,12 +1093,55 @@ def test_navigation_arm_guard_rejects_excursion_and_projects_slew():
     )
     with pytest.raises(ValueError, match="finite"):
         guard.apply([float("nan")], measured=[0.2], dt=0.02)
-    with pytest.raises(ValueError, match="envelope"):
-        guard.apply([0.7], measured=[0.2], dt=0.02)
+    envelope_projected = guard.apply([0.7], measured=[0.2], dt=0.02)
+    assert envelope_projected.targets == pytest.approx((0.22,))
+    assert envelope_projected.constrained_joints == 1
+    guard.anchor([0.2])
     projected = guard.apply([0.3], measured=[0.2], dt=0.02)
     assert projected.targets == pytest.approx((0.22,))
     assert projected.constrained_joints == 1
     assert projected.max_step_rad == pytest.approx(0.02)
+
+
+def test_navigation_arm_guard_accepts_asymmetric_explicit_hard_limits():
+    guard = NavigationArmGuard(
+        [0.2],
+        lower_limits_rad=[-3.0],
+        upper_limits_rad=[2.6],
+        max_velocity_rps=[200.0],
+    )
+    guard.anchor([0.2])
+
+    assert guard.apply([2.5], dt=0.02).targets == pytest.approx((2.5,))
+    guard.anchor([0.2])
+    assert guard.apply([-2.9], dt=0.02).targets == pytest.approx((-2.9,))
+    guard.anchor([0.2])
+    upper = guard.apply([2.6000001], dt=0.02)
+    assert upper.targets == pytest.approx((2.6,))
+    assert upper.constrained_joint_indices == (0,)
+
+
+@pytest.mark.parametrize(
+    ("lower", "upper", "message"),
+    [
+        (None, [1.0], "provided together"),
+        ([0.0], None, "provided together"),
+        ([1.0], [0.0], "ordered"),
+        ([0.3], [1.0], "nominal"),
+    ],
+)
+def test_navigation_arm_guard_rejects_invalid_explicit_limits(
+    lower,
+    upper,
+    message,
+):
+    with pytest.raises(ValueError, match=message):
+        NavigationArmGuard(
+            [0.2],
+            lower_limits_rad=lower,
+            upper_limits_rad=upper,
+            max_velocity_rps=[1.0],
+        )
 
 
 def test_navigation_arm_guard_fails_closed_on_persistent_saturation():
@@ -1056,6 +1184,24 @@ def test_navigation_arm_guard_unconstrained_tick_resets_saturation_budget():
     second = guard.apply([0.13], dt=0.02)
     assert second.constrained_joints == 1
     assert second.targets == pytest.approx((0.05,))
+
+
+def test_navigation_arm_guard_can_record_saturation_without_invented_deadline():
+    guard = NavigationArmGuard(
+        [0.0],
+        max_deviation_rad=[10.0],
+        max_velocity_rps=[1.0],
+        max_continuous_saturation_s=None,
+    )
+    guard.anchor([0.0])
+
+    result = None
+    for _ in range(20):
+        anchor = guard._last[0]
+        result = guard.apply([anchor + 0.10], dt=0.02)
+    assert result is not None
+    assert result.targets == pytest.approx((0.40,))
+    assert result.continuous_saturation_s == pytest.approx((0.40,))
 
 
 @pytest.mark.parametrize(

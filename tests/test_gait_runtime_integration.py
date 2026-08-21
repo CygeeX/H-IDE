@@ -53,6 +53,7 @@ from hide_mujoco_sonic.sonic_driver import (
     _bind_command_server,
     _handle_command_connection,
 )
+from hide_mujoco_sonic.telemetry import TelemetryState, TelemetryStore
 from hide_mujoco_sonic.transport import request_json, send_json
 
 
@@ -952,6 +953,9 @@ def test_gait_fault_freezes_target_and_stays_alive_in_recoverable_support(
     clock = Clock()
     adapter, _ = runtime(clock)
     driver = bare_driver(clock)
+    # Exercise the production strict telemetry schema.  A fake mapping hid
+    # missing recoverable-fault fields and let a safe latch unwind the driver.
+    driver.telemetry = TelemetryStore(TelemetryState(robot_id="g1-sim"))
     published = tuple(0.01 * index for index in range(29))
     frozen: list[tuple[float, ...]] = []
     driver._last_published_targets = published
@@ -1020,8 +1024,11 @@ def test_gait_fault_freezes_target_and_stays_alive_in_recoverable_support(
     assert driver._terminal_fault_reason == fault.reason
     assert driver._plant_support_safety_latched is True
     assert driver._stop.is_set() is False
-    assert driver.telemetry.values["status"] == "failed"
-    assert driver.telemetry.values["nav2_state"] == "fault_latched"
+    telemetry = driver.telemetry.get()
+    assert telemetry.status == "failed"
+    assert telemetry.nav2_state == "fault_latched"
+    assert telemetry.recoverable_motion_fault is True
+    assert telemetry.motion_fault_safe_hold_frames == 0
     assert driver._safe_hold_targets == published
     assert frozen and all(targets == published for targets in frozen)
 
@@ -1044,6 +1051,7 @@ def test_recoverable_motion_fault_reset_requires_two_safe_frames_and_stays_revok
         ],
         imu_state=SimpleNamespace(
             gyroscope=(0.0, 0.0, 0.0),
+            quaternion=(1.0, 0.0, 0.0, 0.0),
             rpy=(0.0, 0.0, 0.0),
         ),
     )
@@ -1320,6 +1328,7 @@ def _lowstate(targets: tuple[float, ...], *, arm_lag_rad: float = 0.0):
         motor_state=states,
         imu_state=SimpleNamespace(
             gyroscope=(0.0, 0.0, 0.0),
+            quaternion=(1.0, 0.0, 0.0, 0.0),
             rpy=(0.0, 0.0, 0.0),
         ),
     )
@@ -1634,8 +1643,6 @@ def test_arm_slew_projection_is_the_exact_dds_feedback_and_grant_boundary() -> N
 
 
 def test_arm_guard_factory_envelopes_stay_inside_mujoco_hard_ranges() -> None:
-    from lerobot.robots.unitree_g1.controllers.sonic_pipeline import DEFAULT_ANGLES
-
     hard_ranges = (
         (-3.0892, 2.6704),
         (-1.5882, 2.2515),
@@ -1654,18 +1661,11 @@ def test_arm_guard_factory_envelopes_stay_inside_mujoco_hard_ranges() -> None:
     )
     guard = bare_driver(Clock())._new_arm_guard()
 
-    for nominal, deviation, (lower, upper) in zip(
-        DEFAULT_ANGLES[15:29],
-        guard.max_deviation_rad,
-        hard_ranges,
-        strict=True,
-    ):
-        assert float(nominal) - deviation >= lower
-        assert float(nominal) + deviation <= upper
+    assert tuple(zip(guard.lower_limits_rad, guard.upper_limits_rad)) == hard_ranges
 
 
 @pytest.mark.parametrize("arm_offset", [0, 7])
-def test_arm_guard_rejects_slew_valid_progress_beyond_physical_range(
+def test_arm_guard_projects_slew_valid_progress_at_physical_range(
     arm_offset: int,
 ) -> None:
     from lerobot.robots.unitree_g1.controllers.sonic_pipeline import DEFAULT_ANGLES
@@ -1682,8 +1682,13 @@ def test_arm_guard_rejects_slew_valid_progress_beyond_physical_range(
         decision = guard.apply(targets, dt=0.02)
         assert decision.constrained_joints == 0
     targets[arm_offset] = 2.68
-    with pytest.raises(ValueError, match="navigation envelope"):
-        guard.apply(targets, dt=0.02)
+    decision = guard.apply(targets, dt=0.02)
+    assert decision.constrained_joint_indices == (arm_offset,)
+    assert decision.targets[arm_offset] <= 2.6704
+    while decision.targets[arm_offset] < 2.6704:
+        decision = guard.apply(targets, dt=0.02)
+        assert decision.targets[arm_offset] <= 2.6704
+    assert decision.targets[arm_offset] == pytest.approx(2.6704)
 
 
 def test_nominal_policy_activation_restarts_after_support_failure_and_freezes_policy(
@@ -1953,6 +1958,66 @@ def test_activation_releases_only_after_policy_dds_grant_without_aborting(
         activation_fields["policy_activation_release_confirmed_epoch"]
         == activation_epoch
     )
+
+
+def test_assisted_profile_prepares_after_policy_grant_without_releasing_support(
+    monkeypatch,
+) -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    activation = NominalPolicyActivation(
+        joint_count=1,
+        duration_s=3.0,
+        settle_consecutive_samples=1,
+        release_fall_arrest=False,
+    )
+    assert activation.begin([0.0], tick_ms=0)
+    final = activation.propose([0.0], measured=[0.0], tick_ms=3_000)
+    assert activation.commit(final, final.targets)
+    assert activation.observe_settling(
+        nominal=[0.0], measured=[0.0], velocities=[0.0],
+        gyroscope=[0.0, 0.0, 0.0], roll_rad=0.0, pitch_rad=0.0,
+        tick_ms=3_020,
+    ).stage_complete
+    assert activation.activation_path == "tethered_retained"
+    driver._policy_activation = activation
+    driver._reference_authority.require(generation=1, source_sequence=1)
+    driver._reference_authority.mark_installed(
+        generation=1,
+        source_sequence=1,
+        planner_intent_generation=1,
+        reference_epoch=1,
+    )
+    driver._reference_authority.prime(
+        generation=1,
+        source_sequence=1,
+        reference_epoch=1,
+    )
+    driver._reference_authority.grant(
+        generation=1,
+        source_sequence=1,
+        reference_epoch=1,
+        granted_at_monotonic_s=clock.value,
+        granted_at_tick_ms=3_040,
+        dds_target_sequence=1,
+    )
+    monkeypatch.setattr(
+        "hide_mujoco_sonic.sonic_driver.release_plant_fall_arrest",
+        lambda *_args, **_kwargs: pytest.fail(
+            "assisted profile must retain Plant fall arrest"
+        ),
+    )
+
+    assert driver._advance_policy_activation_release_after_grant(
+        tick_ms=3_040
+    )
+    assert activation.prepared
+    assert activation.support_release_confirmed is False
+    assert getattr(driver, "_policy_activation_release_thread", None) is None
+    with driver._support_lock:
+        fields = driver._policy_activation_telemetry_fields_locked()
+    assert fields["policy_activation_fall_arrest_retained"] is True
+    assert fields["policy_activation_release_confirmed_epoch"] is None
 
 
 def test_run_writes_first_policy_dds_before_requesting_support_release(
@@ -3532,7 +3597,7 @@ def test_new_generation_same_motion_is_replanned_without_an_idle_control_tick() 
     assert controller.request_calls == controller.run_calls == 0
 
 
-def test_arm_verifier_runtime_fault_halts_plant_without_normal_safety_stop(
+def test_finite_arm_policy_overshoot_is_projected_without_halting_plant(
     monkeypatch,
 ) -> None:
     from lerobot.robots.unitree_g1.controllers.sonic_pipeline import DEFAULT_ANGLES
@@ -3546,7 +3611,12 @@ def test_arm_verifier_runtime_fault_halts_plant_without_normal_safety_stop(
     lowstate = _lowstate(boundary)
     driver._last_published_targets = boundary
     driver._arm_guard.anchor(boundary[15:29])
-    driver._fault_trace = None
+    driver._fault_trace = SimpleNamespace(record=lambda **_kwargs: driver._stop.set())
+    driver._policy_activation = SimpleNamespace(
+        prepared=True,
+        waiting_for_support_release=False,
+    )
+    driver._policy_activation_telemetry_fields_locked = lambda: {}
     driver._startup_qualifying = False
     driver._pending_decoder_heading_delta_rad = 0.0
     support_modes: list[str] = []
@@ -3637,14 +3707,18 @@ def test_arm_verifier_runtime_fault_halts_plant_without_normal_safety_stop(
 
     driver.run()
 
-    assert driver._fault_latched.is_set()
-    assert "arm policy target" in str(driver._terminal_fault_reason)
-    assert terminal_halts == [driver._terminal_fault_reason]
+    assert driver._fault_latched.is_set() is False
+    assert driver._terminal_fault_reason is None
+    assert terminal_halts == []
     assert "safety_stop" not in support_modes
     assert support_modes == ["locomotion"]
     assert static_decisions == [False]
     assert len(writes) == 1
-    assert writes[0] == pytest.approx(boundary)
+    # The raw shoulder target is finite but outside the model envelope.  Keep
+    # the physical hard limit and the exact 6rad/s per-tick rate projection;
+    # do not turn a recoverable policy candidate into a process-wide fault.
+    assert writes[0][15] == pytest.approx(boundary[15] + 6.0 * 0.02)
+    assert writes[0][15] <= 2.6704
     assert controller.shutdown_called is True
 
 
