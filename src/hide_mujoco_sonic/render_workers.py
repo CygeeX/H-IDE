@@ -929,8 +929,13 @@ def _viewer_worker_main(
                 viewer,
                 runtime_scene,
             )
-        # This is both the first coherent camera publication and a startup
-        # feature probe for the state-only sync contract used by the loop.
+        # Publish the operator camera and clean visualization profile exactly
+        # once. A state-only sync deliberately omits these objects and leaves
+        # the native window on MuJoCo's distant default free camera. Subsequent
+        # updates remain state-only so viewer-side controls never feed back
+        # into the worker's private simulation state.
+        viewer.sync()
+        # Probe the restricted steady-state contract before declaring ready.
         viewer.sync(state_only=True)
         if not viewer.is_running():
             raise RuntimeError("passive viewer closed during initialization")

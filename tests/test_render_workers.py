@@ -1753,4 +1753,8 @@ def test_viewer_worker_has_no_physics_step_or_input_callback_authority() -> None
     assert "_close_and_wait_for_passive_viewer(" in source
     assert "simulate_ref=native_lifetime_ref" in source
     assert "with viewer.lock():" in source
+    assert "viewer.sync()" in source
     assert "viewer.sync(state_only=True)" in source
+    assert source.index("viewer.sync()") < source.index(
+        "viewer.sync(state_only=True)"
+    )
