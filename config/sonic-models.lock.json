@@ -1,6 +1,6 @@
 {
   "schema_version": "h-ide.sonic-model-lock/1",
-  "repository_revision_at_audit": "931fb277b91beec6f2083f5a756ce418b108418b",
+  "repository_revision_at_audit": "56fcaf19b47563a665502520df039ca0bb80bd75",
   "model_repository": {
     "repo_id": "nvidia/GEAR-SONIC",
     "revision": "9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2",
@@ -9,7 +9,7 @@
   "source_repositories": {
     "lerobot-python": {
       "path": "vendor/lerobot",
-      "revision": "cab2c37a172c0101391d95f754123ed054f1b6e6"
+      "revision": "9d7c79701b04535b60463a8b5fbc99fb00c0e2a2"
     },
     "nvidia-groot-wbc": {
       "path": "/home/phi/learn-projects/systemed_study/GR00T-WholeBodyControl",
@@ -20,13 +20,13 @@
     "config": {
       "path": "config/ros-headless.yaml",
       "size": 3613,
-      "sha256": "e147b2cc7904e9d80030fa464495c4ca57422a0bc1f0876366bd159386486151"
+      "sha256": "1efe346ae737baeb170011524f92ff57180b6f2bed953d811c4a7b02af4f3ce9"
     },
     "declared_model_revision": "9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2",
-    "declared_lerobot_revision": "cab2c37a172c0101391d95f754123ed054f1b6e6",
-    "observed_lerobot_revision": "cab2c37a172c0101391d95f754123ed054f1b6e6",
+    "declared_lerobot_revision": "9d7c79701b04535b60463a8b5fbc99fb00c0e2a2",
+    "observed_lerobot_revision": "9d7c79701b04535b60463a8b5fbc99fb00c0e2a2",
     "lock_safe": true,
-    "reason": "The reviewed ros-headless runtime selectors, SONIC model bundle, exact LeRobot source, and policy-before-support-release handoff are reproducibly anchored by repository commit 931fb277b91beec6f2083f5a756ce418b108418b."
+    "reason": "The reviewed ros-headless runtime selectors, SONIC model bundle, exact LeRobot cold-start history and control source, official direction-speed mapping, actuator handoff, and support-release state machine are reproducibly anchored by repository commit 56fcaf19b47563a665502520df039ca0bb80bd75."
   },
   "profiles": {
     "sonic-official-default": {
@@ -280,16 +280,16 @@
           "role": "controller",
           "path": "vendor/lerobot/src/lerobot/robots/unitree_g1/controllers/sonic_whole_body.py",
           "present": true,
-          "size": 47530,
-          "sha256": "fb57c782475721f3cd0bd0f457b7e2eefe7535bfa9a7943fff976a8be28794cf"
+          "size": 55758,
+          "sha256": "338c9782090e18bff6567c6f935a9309846f3a4fe80a7fe01c2192621a2a87ff"
         },
         {
           "id": "python-pipeline",
           "role": "observation_config",
           "path": "vendor/lerobot/src/lerobot/robots/unitree_g1/controllers/sonic_pipeline.py",
           "present": true,
-          "size": 64827,
-          "sha256": "43b84ab29243d64fdefe38db93d5e2daaaf0368d04e447e681b9db19159bece9"
+          "size": 66440,
+          "sha256": "e89b93f0ead8dfe9e18aba4282b5450762095c029c66645b23a583ca666d1754"
         },
         {
           "id": "python-profile",
@@ -297,7 +297,7 @@
           "path": "profiles/sonic-python-experimental.yaml",
           "present": true,
           "size": 1280,
-          "sha256": "6cd54316b4e42f3706af83143330a752317c9be76b11d7f04aa6f55bca4e1e8e"
+          "sha256": "7b80928c22e47db6626f50dd9c5f7b3d7a058bd4c0d0b8db35e5d1887ce49978"
         }
       ]
     }
