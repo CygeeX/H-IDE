@@ -81,6 +81,25 @@ def test_nav2_health_process_has_no_motion_publisher_or_action_client() -> None:
     assert "ActionClient" not in source
 
 
+def test_nav2_health_does_not_shadow_rclpy_node_client_storage() -> None:
+    source = MODULE_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    assigned_attributes = {
+        target.attr
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Assign, ast.AnnAssign))
+        for target in (
+            node.targets if isinstance(node, ast.Assign) else [node.target]
+        )
+        if isinstance(target, ast.Attribute)
+        and isinstance(target.value, ast.Name)
+        and target.value.id == "self"
+    }
+
+    assert "_clients" not in assigned_attributes
+    assert "_lifecycle_clients" in assigned_attributes
+
+
 def test_nav2_image_launches_and_build_checks_the_health_process() -> None:
     dockerfile = (ROOT / "docker" / "nav2" / "Dockerfile").read_text(
         encoding="utf-8"

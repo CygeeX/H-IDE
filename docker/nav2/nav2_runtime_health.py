@@ -182,7 +182,10 @@ def run() -> None:
                 "/h_ide/nav2/runtime_health",
                 10,
             )
-            self._clients = {
+            # ``rclpy.node.Node`` owns the private ``_clients`` container.
+            # Shadowing it with a name->client dict corrupts executor scans
+            # and makes the health publisher die before its first heartbeat.
+            self._lifecycle_clients = {
                 name: self.create_client(GetState, f"/{name}/get_state")
                 for name in MANAGED_NODES
             }
@@ -204,7 +207,7 @@ def run() -> None:
             self._scan_token += 1
             token = self._scan_token
             self._scan_results = {token: {}}
-            for name, client in self._clients.items():
+            for name, client in self._lifecycle_clients.items():
                 if not client.service_is_ready():
                     self._evidence.observe_lifecycle_failure(
                         f"/{name}/get_state is unavailable"
