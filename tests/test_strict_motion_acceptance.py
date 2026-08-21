@@ -156,6 +156,8 @@ def _point_on_path(path: list[tuple[float, float]], progress: float) -> tuple[fl
 
 
 def _goal(mode: str) -> dict[str, float]:
+    if mode == "forward_probe":
+        return {"distanceM": 0.2, "speedMps": 0.2}
     if mode == "forward":
         return {"distanceM": 1.0, "speedMps": 0.2}
     if mode == "forward_3m":
@@ -174,6 +176,8 @@ def _goal(mode: str) -> dict[str, float]:
 
 
 def _root(mode: str, progress: float) -> tuple[float, float, float]:
+    if mode == "forward_probe":
+        return 0.2 * progress, 0.0, 0.78
     if mode == "forward":
         return progress, 0.0, 0.78
     if mode == "forward_3m":
@@ -204,7 +208,7 @@ def _yaw(mode: str, progress: float) -> float:
 def _command(mode: str, active: bool) -> dict[str, float]:
     if not active:
         return {"vx": 0.0, "vy": 0.0, "wz": 0.0}
-    if mode in {"forward", "forward_3m"}:
+    if mode in {"forward_probe", "forward", "forward_3m"}:
         return {"vx": 0.2, "vy": 0.0, "wz": 0.0}
     if mode == "reverse":
         return {"vx": -0.2, "vy": 0.0, "wz": 0.0}
@@ -326,7 +330,8 @@ def _sample(mode: str, t_s: float, progress: float, active: bool, sequence: int)
             "manifestSha256": strict.canonical_sha256(isolation_manifest),
         },
         "nav2Actions": {
-            "driveOnHeadingActive": active and mode in {"forward", "forward_3m", "reverse"},
+            "driveOnHeadingActive": active
+            and mode in {"forward_probe", "forward", "forward_3m", "reverse"},
             "navigateToPoseActive": False,
             "followPathActive": False,
             "spinActive": active and mode in {"turn_left", "turn_right"},
@@ -633,6 +638,7 @@ def _rebuild_detour_trace(
 
 def _trace(mode: str) -> dict[str, Any]:
     motion_duration = {
+        "forward_probe": 1.0,
         "forward": 5.0,
         "forward_3m": 15.0,
         "reverse": 2.5,

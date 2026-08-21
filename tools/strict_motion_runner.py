@@ -185,7 +185,9 @@ class StrictCommandRelay:
     terminal for the current case; the caller must publish zero and normal-stop.
     """
 
-    _DRIVE_MODES = frozenset({"forward", "forward_3m", "reverse"})
+    _DRIVE_MODES = frozenset(
+        {"forward_probe", "forward", "forward_3m", "reverse"}
+    )
     _SPIN_MODES = frozenset({"turn_left", "turn_right"})
     _LATERAL_MODES = frozenset({"lateral_left", "lateral_right"})
     _MODES = _DRIVE_MODES | _SPIN_MODES | _LATERAL_MODES | {"detour"}
@@ -1588,6 +1590,10 @@ class RuntimeSnapshotCollector:
 
 def motion_goal(mode: str) -> dict[str, float]:
     goals: dict[str, dict[str, float]] = {
+        "forward_probe": {
+            "distanceM": 0.20,
+            "speedMps": OFFICIAL_DRIVE_SPEED_MPS,
+        },
         "forward": {"distanceM": 1.0, "speedMps": OFFICIAL_DRIVE_SPEED_MPS},
         "forward_3m": {"distanceM": 3.0, "speedMps": OFFICIAL_DRIVE_SPEED_MPS},
         "reverse": {"distanceM": -0.5, "speedMps": OFFICIAL_DRIVE_SPEED_MPS},

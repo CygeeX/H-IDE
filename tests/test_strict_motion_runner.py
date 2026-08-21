@@ -27,7 +27,12 @@ def command(vx: float = 0.0, vy: float = 0.0, wz: float = 0.0):
 
 @pytest.mark.parametrize(
     ("mode", "vx"),
-    (("forward", 0.2), ("forward_3m", 0.2), ("reverse", -0.2)),
+    (
+        ("forward_probe", 0.2),
+        ("forward", 0.2),
+        ("forward_3m", 0.2),
+        ("reverse", -0.2),
+    ),
 )
 def test_drive_on_heading_relays_only_the_exact_official_speed(mode: str, vx: float) -> None:
     relay = runner.StrictCommandRelay()
@@ -39,6 +44,16 @@ def test_drive_on_heading_relays_only_the_exact_official_speed(mode: str, vx: fl
 
     with pytest.raises(runner.StrictMotionRunnerError, match="official 0.20"):
         relay.observe_nav2(command(vx=math.copysign(0.199, vx)), observed_at_s=10.11)
+
+
+def test_forward_probe_is_a_fixed_short_official_drive() -> None:
+    assert runner.motion_goal("forward_probe") == {
+        "distanceM": 0.20,
+        "speedMps": runner.OFFICIAL_DRIVE_SPEED_MPS,
+    }
+    assert runner.action_timeout_s(
+        "forward_probe", runner.motion_goal("forward_probe")
+    ) == pytest.approx(11.0)
 
 
 def test_drive_on_heading_rejects_wrong_sign_and_mixed_axes() -> None:

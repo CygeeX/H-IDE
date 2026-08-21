@@ -50,6 +50,7 @@ ARM_LIMITER_SCHEMA_VERSION = "h-ide.sonic-arm-limiter-success-trace/1"
 STATIC_PRIMITIVE_PLAN_SCHEMA_VERSION = "h-ide.nav2-static-primitives/1"
 ARM_JOINT_INDICES = tuple(range(15, 29))
 MODES = (
+    "forward_probe",
     "forward",
     "forward_3m",
     "reverse",
@@ -158,6 +159,11 @@ class FormalContract:
 
 
 FORMAL_CONTRACTS: dict[str, FormalContract] = {
+    "forward_probe": FormalContract(
+        expected_longitudinal_m=0.20,
+        final_position_tolerance_m=0.05,
+        min_linear_progress_m=0.03,
+    ),
     "forward": FormalContract(expected_longitudinal_m=1.0),
     "forward_3m": FormalContract(expected_longitudinal_m=3.0),
     "reverse": FormalContract(expected_longitudinal_m=-0.5),
@@ -177,6 +183,7 @@ FORMAL_CONTRACTS: dict[str, FormalContract] = {
 }
 
 _EXPECTED_ACTION_TYPE = {
+    "forward_probe": "DriveOnHeading",
     "forward": "DriveOnHeading",
     "forward_3m": "DriveOnHeading",
     "reverse": "DriveOnHeading",
@@ -1470,6 +1477,7 @@ class StrictMotionEvaluator:
             return
         first_intent = float(active[0]["t"])
         required_action = {
+            "forward_probe": "driveOnHeadingActive",
             "forward": "driveOnHeadingActive",
             "forward_3m": "driveOnHeadingActive",
             "reverse": "driveOnHeadingActive",
