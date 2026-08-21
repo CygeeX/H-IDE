@@ -371,6 +371,41 @@ def sonic_state() -> dict:
     }
 
 
+def sonic_safe_hold_state() -> dict:
+    return {
+        **sonic_state(),
+        "last_error": "Nav2 requested zero velocity",
+        "nav2_state": "safety_stop",
+        "sonic_mode": "IDLE",
+        "sonic_speed_mps": 0.0,
+        "sonic_policy_speed_mps": 0.0,
+        "static_hold_active": True,
+        "motion_handoff_active": False,
+        "motion_handoff_ratio": 0.0,
+        "navigation_task_active": False,
+        "last_cmd_vx": 0.0,
+        "last_cmd_vy": 0.0,
+        "last_cmd_wz": 0.0,
+        "sonic_planner_reference_ready": False,
+        "sonic_planner_required_pending": False,
+        "sonic_reference_authority_state": "REVOKED",
+        "sonic_reference_actuator_authority": False,
+        "sonic_reference_authority_dds_target_sequence": None,
+        "sonic_execution_feedback_pending": False,
+        "plant_support_mode": "safety_stop",
+        "plant_support_requested_mode": "safety_stop",
+        "plant_support_confirmed_mode": "safety_stop",
+        "plant_support_stop_pending": False,
+        "plant_support_safety_latched": True,
+        "plant_support_stop_generation": 42,
+        "fault_trace_path": None,
+        "fault_trace_sample_count": 0,
+        "terminal_boundary_error": None,
+        "plant_terminal_halt_error": None,
+        "recoverable_motion_fault": False,
+    }
+
+
 def first_person_status(path: Path) -> None:
     path.write_text(
         json.dumps(
@@ -426,6 +461,41 @@ def test_snapshot_collector_binds_every_runtime_identity_and_isolation(
         "/strict_motion_runner"
     )
     assert sample["command"] == {"vx": 0.2, "vy": 0.0, "wz": 0.0}
+
+
+def test_snapshot_collector_accepts_diagnostic_reason_at_exact_safe_hold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    status = tmp_path / "first-person.json"
+    first_person_status(status)
+    monkeypatch.setattr(runner, "_inactive_user_unit", lambda _unit: "inactive")
+    monkeypatch.setattr(runner, "_require_port_closed", lambda _port: None)
+    collector = runner.RuntimeSnapshotCollector(
+        FakeRos(),
+        reader=FakeReader(plant_state(), sonic_safe_hold_state()),
+        first_person_status=status,
+    )
+
+    assert collector.collect_once()["runtimeHealth"]["sonic"]["healthy"] is True
+
+
+def test_snapshot_collector_rejects_stop_reason_without_complete_safe_hold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    status = tmp_path / "first-person.json"
+    first_person_status(status)
+    monkeypatch.setattr(runner, "_inactive_user_unit", lambda _unit: "inactive")
+    monkeypatch.setattr(runner, "_require_port_closed", lambda _port: None)
+    sonic = sonic_safe_hold_state()
+    sonic["plant_support_stop_pending"] = True
+    collector = runner.RuntimeSnapshotCollector(
+        FakeRos(),
+        reader=FakeReader(plant_state(), sonic),
+        first_person_status=status,
+    )
+
+    with pytest.raises(runner.StrictMotionRunnerError, match="health failed: sonic"):
+        collector.collect_once()
 
 
 def test_snapshot_collector_brackets_first_person_with_later_plant_snapshot(

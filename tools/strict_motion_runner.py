@@ -1131,6 +1131,69 @@ def _identity(value: object, label: str) -> str:
     return value
 
 
+def _sonic_runtime_healthy(sonic: Mapping[str, Any]) -> bool:
+    """Accept an informational stop reason only at the exact safe boundary.
+
+    Normal-stop intentionally leaves its reason in ``last_error`` for
+    operator diagnostics.  Treating every non-empty reason as a component
+    failure makes both the next case's preflight and the preceding case's
+    final evidence impossible.  The exception is deliberately narrow: all
+    authority, command, task, support, fault-trace, and terminal-error facts
+    must prove the same settled safe hold that control acquisition requires.
+    """
+
+    if sonic.get("status") != "running" or sonic.get("motion_ready") is not True:
+        return False
+    last_error = sonic.get("last_error")
+    if last_error in {None, ""}:
+        return True
+    if not isinstance(last_error, str) or not last_error.strip():
+        return False
+    zero_fields = (
+        "sonic_speed_mps",
+        "sonic_policy_speed_mps",
+        "motion_handoff_ratio",
+        "last_cmd_vx",
+        "last_cmd_vy",
+        "last_cmd_wz",
+    )
+    try:
+        all_zero = all(
+            abs(_finite(sonic.get(name), f"SONIC {name}")) <= _ZERO_EPS
+            for name in zero_fields
+        )
+    except StrictMotionRunnerError:
+        return False
+    generation = sonic.get("plant_support_stop_generation")
+    return bool(
+        sonic.get("nav2_state") == "safety_stop"
+        and sonic.get("sonic_mode") == "IDLE"
+        and all_zero
+        and sonic.get("static_hold_active") is True
+        and sonic.get("motion_handoff_active") is False
+        and sonic.get("navigation_task_active") is False
+        and sonic.get("sonic_planner_reference_ready") is False
+        and sonic.get("sonic_planner_required_pending") is False
+        and sonic.get("sonic_reference_authority_state") == "REVOKED"
+        and sonic.get("sonic_reference_actuator_authority") is False
+        and sonic.get("sonic_reference_authority_dds_target_sequence") is None
+        and sonic.get("sonic_execution_feedback_pending") is False
+        and sonic.get("plant_support_mode") == "safety_stop"
+        and sonic.get("plant_support_requested_mode") == "safety_stop"
+        and sonic.get("plant_support_confirmed_mode") == "safety_stop"
+        and sonic.get("plant_support_stop_pending") is False
+        and sonic.get("plant_support_safety_latched") is True
+        and isinstance(generation, int)
+        and not isinstance(generation, bool)
+        and generation >= 0
+        and sonic.get("fault_trace_path") in {None, ""}
+        and sonic.get("fault_trace_sample_count") in {None, 0}
+        and sonic.get("terminal_boundary_error") in {None, ""}
+        and sonic.get("plant_terminal_halt_error") in {None, ""}
+        and sonic.get("recoverable_motion_fault") is not True
+    )
+
+
 def _rpy(pose: Mapping[str, Any]) -> tuple[float, float, float]:
     qw, qx, qy, qz = (
         _finite(pose.get(name), f"Plant pose.{name}")
@@ -1376,9 +1439,7 @@ class RuntimeSnapshotCollector:
                 and plant.get("observationStatus") == "running"
             ),
             "sonic": (
-                sonic.get("status") == "running"
-                and sonic.get("motion_ready") is True
-                and sonic.get("last_error") in {None, ""}
+                _sonic_runtime_healthy(sonic)
             ),
             "nav2": nav2.get("healthy") is True and nav2.get("fault") is None,
             "rosBridge": bridge.get("healthy") is True and bridge.get("fault") is None,
