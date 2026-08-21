@@ -123,8 +123,8 @@ non-semantic integrity manifest.
   an irreversible motion fault; a fresh probe recovers it, and `control.acquire`
   remains blocked until both ages are fresh. Terminal faults, unavailability,
   probe failures, and driver boot changes remain immediate. The 100 ms stale
-  bound plus two probe periods and the 20 ms timeout yields a 170 ms worst-case
-  detection budget. The 70 ms confirmation handoff leaves 30 ms for the
+  bound plus two probe periods and the 25 ms timeout yields a 175 ms worst-case
+  detection budget. The 75 ms confirmation handoff leaves 25 ms for the
   latched ROS event to begin Robot Agent cancellation within 100 ms; Robot
   Agent retains the 300 ms Nav2 terminal deadline, without placing ROS code
   inside SONIC.

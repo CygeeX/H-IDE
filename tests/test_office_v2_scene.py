@@ -479,7 +479,7 @@ def test_supported_configs_all_select_the_same_verified_office_v2_bundle() -> No
         assert config.reset_policy == "explicit_process_restart"
         assert config.motion_fault_topic == "/h_ide/g1_sim/motion_safety_fault"
         assert config.sonic_health_probe_period_s == pytest.approx(0.025)
-        assert config.sonic_health_probe_timeout_s == pytest.approx(0.020)
+        assert config.sonic_health_probe_timeout_s == pytest.approx(0.025)
         assert config.plant_lowstate_stale_s == pytest.approx(0.10)
         assert config.sonic_control_step_stale_s == pytest.approx(0.10)
         assert config.planner_reference_timeout_s == pytest.approx(0.75)
@@ -496,7 +496,7 @@ def test_supported_configs_all_select_the_same_verified_office_v2_bundle() -> No
             SONIC_HEALTH_TRANSPORT_TIMEOUT_CONFIRMATION_PROBES
             * config.sonic_health_probe_period_s
             + config.sonic_health_probe_timeout_s
-            == pytest.approx(0.070)
+            == pytest.approx(0.075)
         )
         assert (
             max(

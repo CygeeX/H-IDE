@@ -20,7 +20,7 @@ command_port: 8793
 # bounds leave ample time for Robot Agent to cancel its exact Nav2 goal within
 # the 300 ms end-to-end safety budget.
 sonic_health_probe_period_s: 0.025
-sonic_health_probe_timeout_s: 0.020
+sonic_health_probe_timeout_s: 0.025
 plant_lowstate_stale_s: 0.10
 sonic_control_step_stale_s: 0.10
 max_linear_mps: 0.40
