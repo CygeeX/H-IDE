@@ -433,6 +433,11 @@ def configure_tracking_viewer(mujoco_api, model, viewer, scene) -> None:
 
     if viewer is None:
         return
+    # Reset MuJoCo's native diagnostic overlays before the worker publishes
+    # readiness. Inertia ellipsoids, joint markers, BVHs and transparent
+    # collision geometry make the verified Office V2/G1 assets look like
+    # different models even though they do not alter physics.
+    mujoco_api.mjv_defaultOption(viewer.opt)
     pelvis_id = int(
         mujoco_api.mj_name2id(model, mujoco_api.mjtObj.mjOBJ_BODY, "pelvis")
     )
@@ -885,7 +890,12 @@ def _viewer_worker_main(
 
         # No key_callback is registered.  Mouse perturbations, pause state and
         # all viewer-side edits apply only to this worker-private MjData.
-        viewer = mujoco_viewer.launch_passive(model, data)
+        viewer = mujoco_viewer.launch_passive(
+            model,
+            data,
+            show_left_ui=False,
+            show_right_ui=False,
+        )
         try:
             native_lifetime_ref = _require_native_lifetime_ref(viewer)
         except RuntimeError as exc:

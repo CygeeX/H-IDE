@@ -1742,7 +1742,12 @@ def test_viewer_worker_has_no_physics_step_or_input_callback_authority() -> None
     source = inspect.getsource(_viewer_worker_main)
     assert "mj_step(" not in source
     assert "key_callback=" not in source
-    assert "launch_passive(model, data)" in source
+    assert "viewer = mujoco_viewer.launch_passive(" in source
+    assert "show_left_ui=False" in source
+    assert "show_right_ui=False" in source
+    assert "mujoco_api.mjv_defaultOption(viewer.opt)" in inspect.getsource(
+        render_workers.configure_tracking_viewer
+    )
     assert 'os.environ.pop("MUJOCO_GL", None)' in source
     assert 'os.environ["MUJOCO_GL"] = config.gl_backend' in source
     assert "_close_and_wait_for_passive_viewer(" in source

@@ -689,6 +689,7 @@ def configure_tracking_viewer(mujoco, model, viewer, scene: RuntimeScene) -> Non
 
     if viewer is None:
         return
+    mujoco.mjv_defaultOption(viewer.opt)
     pelvis_id = int(
         mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "pelvis")
     )

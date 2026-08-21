@@ -339,7 +339,12 @@ def test_runtime_bundle_loads_g1_at_the_verified_noncolliding_spawn() -> None:
             forbidden_contacts.append(sorted(names))
     assert forbidden_contacts == []
 
-    viewer = SimpleNamespace(cam=SimpleNamespace())
+    viewer = SimpleNamespace(cam=SimpleNamespace(), opt=mujoco.MjvOption())
+    viewer.opt.flags[int(mujoco.mjtVisFlag.mjVIS_INERTIA)] = 1
+    viewer.opt.flags[int(mujoco.mjtVisFlag.mjVIS_JOINT)] = 1
+    viewer.opt.flags[int(mujoco.mjtVisFlag.mjVIS_MESHBVH)] = 1
+    viewer.opt.flags[int(mujoco.mjtVisFlag.mjVIS_TRANSPARENT)] = 1
+    viewer.opt.geomgroup[:] = 1
     configure_tracking_viewer(mujoco, model, viewer, runtime)
     assert viewer.cam.type == mujoco.mjtCamera.mjCAMERA_TRACKING
     assert viewer.cam.trackbodyid == mujoco.mj_name2id(
@@ -348,6 +353,12 @@ def test_runtime_bundle_loads_g1_at_the_verified_noncolliding_spawn() -> None:
     assert viewer.cam.azimuth == pytest.approx(135.0)
     assert viewer.cam.elevation == pytest.approx(-10.0)
     assert viewer.cam.distance == pytest.approx(2.5)
+    assert list(viewer.opt.geomgroup) == [1, 1, 1, 0, 0, 0]
+    assert viewer.opt.flags[int(mujoco.mjtVisFlag.mjVIS_INERTIA)] == 0
+    assert viewer.opt.flags[int(mujoco.mjtVisFlag.mjVIS_JOINT)] == 0
+    assert viewer.opt.flags[int(mujoco.mjtVisFlag.mjVIS_MESHBVH)] == 0
+    assert viewer.opt.flags[int(mujoco.mjtVisFlag.mjVIS_TRANSPARENT)] == 0
+    assert viewer.opt.flags[int(mujoco.mjtVisFlag.mjVIS_TEXTURE)] == 1
     assert tuple(viewer.cam.lookat[:2]) == pytest.approx(
         (runtime.spawn_x, runtime.spawn_y)
     )
