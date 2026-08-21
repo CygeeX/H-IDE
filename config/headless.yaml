@@ -45,6 +45,7 @@ force_cpu: true
 onscreen: false
 offscreen: false
 startup_support_s: 3.5
+policy_release_fall_arrest: true
 startup_horizontal_support_s: 6.0
 reset_policy: explicit_process_restart
 model_scene: /home/phi/learn-projects/h-ide-mujoco-sonic/scenes/office_v2/generated/mujoco/office_v2.runtime.xml

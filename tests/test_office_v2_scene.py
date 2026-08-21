@@ -516,6 +516,7 @@ def test_supported_configs_all_select_the_same_verified_office_v2_bundle() -> No
         assert config.sonic_control_step_stale_s == pytest.approx(0.10)
         assert config.planner_reference_timeout_s == pytest.approx(0.75)
         assert config.policy_activation_s == pytest.approx(3.0)
+        assert config.policy_release_fall_arrest is True
         assert config.max_linear_mps == pytest.approx(0.40)
         assert config.min_walk_command_mps == pytest.approx(0.20)
         assert (
@@ -579,4 +580,23 @@ def test_policy_activation_duration_is_the_exact_official_init_budget(
     candidate.write_text(yaml.safe_dump(payload), encoding="utf-8")
 
     with pytest.raises(ValueError, match="policy_activation_s must be exactly 3.0"):
+        SimConfig.from_file(candidate)
+
+
+@pytest.mark.parametrize("invalid", [None, 0, 1, "true"])
+def test_policy_owned_fall_arrest_release_requires_a_real_boolean(
+    tmp_path: Path,
+    invalid,
+) -> None:
+    payload = yaml.safe_load(
+        (ROOT / "config" / "ros-headless.yaml").read_text(encoding="utf-8")
+    )
+    payload["policy_release_fall_arrest"] = invalid
+    candidate = tmp_path / "invalid-policy-release.yaml"
+    candidate.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    with pytest.raises(
+        ValueError,
+        match="policy_release_fall_arrest must be a boolean",
+    ):
         SimConfig.from_file(candidate)

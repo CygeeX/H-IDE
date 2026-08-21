@@ -68,6 +68,7 @@ class SimConfig:
     onscreen: bool
     offscreen: bool
     startup_support_s: float
+    policy_release_fall_arrest: bool
     startup_horizontal_support_s: float
     reset_policy: str
     model_scene: Path
@@ -101,7 +102,8 @@ class SimConfig:
             "policy_activation_s",
             "motion_handoff_warmup_s", "motion_handoff_blend_s",
             "control_hz", "camera_hz", "observation_hz",
-            "force_cpu", "onscreen", "offscreen", "startup_support_s", "startup_horizontal_support_s", "model_scene",
+            "force_cpu", "onscreen", "offscreen", "startup_support_s",
+            "policy_release_fall_arrest", "startup_horizontal_support_s", "model_scene",
             "scene_runtime_manifest",
             "reset_policy",
             "sonic_model_profile", "sonic_model_lock", "sonic_model_repo",
@@ -110,6 +112,9 @@ class SimConfig:
         missing = sorted(required - raw.keys())
         if missing:
             raise ValueError(f"simulation config is missing: {', '.join(missing)}")
+        policy_release_fall_arrest = raw["policy_release_fall_arrest"]
+        if not isinstance(policy_release_fall_arrest, bool):
+            raise ValueError("policy_release_fall_arrest must be a boolean")
         if raw["ros_domain_id"] == 231:
             raise ValueError("simulation ROS domain 232 must stay isolated from live domain 231")
         motion_fault_topic = str(raw["motion_fault_topic"])
@@ -317,6 +322,7 @@ class SimConfig:
             onscreen=bool(raw["onscreen"]),
             offscreen=bool(raw["offscreen"]),
             startup_support_s=float(raw["startup_support_s"]),
+            policy_release_fall_arrest=policy_release_fall_arrest,
             startup_horizontal_support_s=float(raw["startup_horizontal_support_s"]),
             reset_policy=str(raw["reset_policy"]),
             model_scene=model_scene,

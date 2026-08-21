@@ -2016,12 +2016,17 @@ def run_plant(config: SimConfig) -> int:
     else:
         support_controller.finish_startup()
 
-    # The official elastic band is useful only for the first few seconds of a
-    # cold-start stand-up.  Release it before navigation so it cannot pull a
-    # walking robot back to the origin.  A zero value keeps the support enabled
-    # for the whole run, which is useful for isolated controller diagnostics.
+    # The legacy standalone Plant timer is mutually exclusive with SONIC's
+    # exact-epoch policy handoff.  Product motion uses the latter: only the
+    # actuator owner may release fall arrest after a successful learned-policy
+    # DDS target.  The timer remains available solely for isolated Plant demos
+    # which explicitly disable policy-owned release.
     support_release = None
-    if config.startup_support_s > 0 and support_band is not None:
+    if (
+        config.startup_support_s > 0
+        and support_band is not None
+        and not config.policy_release_fall_arrest
+    ):
         def release_support_after_control_handoff():
             # Model loading can take longer than the configured stand-up ramp.
             # Start that ramp from the first valid lowcmd, not from plant launch,

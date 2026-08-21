@@ -407,6 +407,17 @@ def sonic_safe_hold_state() -> dict:
     }
 
 
+def sonic_nav2_zero_idle_state() -> dict:
+    return {
+        **sonic_safe_hold_state(),
+        "nav2_state": "idle",
+        "plant_support_mode": "idle",
+        "plant_support_requested_mode": "idle",
+        "plant_support_confirmed_mode": "idle",
+        "plant_support_safety_latched": False,
+    }
+
+
 def first_person_status(path: Path) -> None:
     path.write_text(
         json.dumps(
@@ -478,6 +489,41 @@ def test_snapshot_collector_accepts_diagnostic_reason_at_exact_safe_hold(
     )
 
     assert collector.collect_once()["runtimeHealth"]["sonic"]["healthy"] is True
+
+
+def test_snapshot_collector_accepts_nav2_terminal_zero_at_exact_idle_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    status = tmp_path / "first-person.json"
+    first_person_status(status)
+    monkeypatch.setattr(runner, "_inactive_user_unit", lambda _unit: "inactive")
+    monkeypatch.setattr(runner, "_require_port_closed", lambda _port: None)
+    collector = runner.RuntimeSnapshotCollector(
+        FakeRos(),
+        reader=FakeReader(plant_state(), sonic_nav2_zero_idle_state()),
+        first_person_status=status,
+    )
+
+    assert collector.collect_once()["runtimeHealth"]["sonic"]["healthy"] is True
+
+
+def test_snapshot_collector_rejects_unrecognized_reason_at_idle_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    status = tmp_path / "first-person.json"
+    first_person_status(status)
+    monkeypatch.setattr(runner, "_inactive_user_unit", lambda _unit: "inactive")
+    monkeypatch.setattr(runner, "_require_port_closed", lambda _port: None)
+    sonic = sonic_nav2_zero_idle_state()
+    sonic["last_error"] = "unexpected diagnostic"
+    collector = runner.RuntimeSnapshotCollector(
+        FakeRos(),
+        reader=FakeReader(plant_state(), sonic),
+        first_person_status=status,
+    )
+
+    with pytest.raises(runner.StrictMotionRunnerError, match="health failed: sonic"):
+        collector.collect_once()
 
 
 def test_snapshot_collector_rejects_stop_reason_without_complete_safe_hold(

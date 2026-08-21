@@ -61,10 +61,11 @@ force_cpu: false
 # remains enabled for H-IDE Vision and mission evidence.
 onscreen: false
 offscreen: true
-# Keep the simulation-only vertical/attitude support engaged for the complete
-# workstation demonstration.  A value of 0 means never release it; it does not
-# provide horizontal motion and does not replace SONIC/lowcmd control.
+# Disable the legacy time-based release. SONIC owns the only product release:
+# after INIT, tethered settle, and the first successful learned-policy DDS it
+# requests one exact activation epoch from Plant, then proves support is off.
 startup_support_s: 0.0
+policy_release_fall_arrest: true
 # Model/controller resynchronization is slower than a normal cold start. Keep
 # the root over its initial footprint until the new static hold is established;
 # horizontal support is removed before any navigation acceptance begins.

@@ -487,11 +487,12 @@ class SonicDriver:
         )
         self._policy_activation = NominalPolicyActivation(
             duration_s=config.policy_activation_s,
-            # Zero is the explicit assisted simulation profile: keep only
-            # vertical and roll/pitch fall arrest.  Plant locomotion mode
-            # already removes world-X/Y force and yaw torque, so this support
-            # cannot manufacture translation or turning.
-            release_fall_arrest=config.startup_support_s > 0.0,
+            # The product profile releases the fall-arrest only after the
+            # first learned-policy DDS target has succeeded.  This explicit
+            # flag is intentionally independent of the legacy standalone
+            # Plant timer: a duration must never substitute for a correlated
+            # actuator/activation epoch.
+            release_fall_arrest=config.policy_release_fall_arrest,
         )
         self._policy_activation_requested = False
         self._policy_activation_release_epoch: int | None = None

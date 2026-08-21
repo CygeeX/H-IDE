@@ -1142,14 +1142,17 @@ def _identity(value: object, label: str) -> str:
 
 
 def _sonic_runtime_healthy(sonic: Mapping[str, Any]) -> bool:
-    """Accept an informational stop reason only at the exact safe boundary.
+    """Accept informational stop reasons only at proved non-moving boundaries.
 
     Normal-stop intentionally leaves its reason in ``last_error`` for
     operator diagnostics.  Treating every non-empty reason as a component
-    failure makes both the next case's preflight and the preceding case's
-    final evidence impossible.  The exception is deliberately narrow: all
-    authority, command, task, support, fault-trace, and terminal-error facts
-    must prove the same settled safe hold that control acquisition requires.
+    failure makes both action completion and the following explicit normal
+    stop impossible.  Nav2's terminal zero command first produces a clean
+    actuator IDLE boundary while Plant support is still ``idle``; the runner
+    then promotes that boundary to the correlated ``safety_stop`` transaction.
+    Both exceptions are deliberately narrow: all command, task, reference,
+    handoff, fault-trace, and terminal-error facts must prove no executable
+    motion remains.
     """
 
     if sonic.get("status") != "running" or sonic.get("motion_ready") is not True:
@@ -1174,10 +1177,8 @@ def _sonic_runtime_healthy(sonic: Mapping[str, Any]) -> bool:
         )
     except StrictMotionRunnerError:
         return False
-    generation = sonic.get("plant_support_stop_generation")
-    return bool(
-        sonic.get("nav2_state") == "safety_stop"
-        and sonic.get("sonic_mode") == "IDLE"
+    common_stopped = bool(
+        sonic.get("sonic_mode") == "IDLE"
         and all_zero
         and sonic.get("static_hold_active") is True
         and sonic.get("motion_handoff_active") is False
@@ -1188,6 +1189,28 @@ def _sonic_runtime_healthy(sonic: Mapping[str, Any]) -> bool:
         and sonic.get("sonic_reference_actuator_authority") is False
         and sonic.get("sonic_reference_authority_dds_target_sequence") is None
         and sonic.get("sonic_execution_feedback_pending") is False
+        and sonic.get("fault_trace_path") in {None, ""}
+        and sonic.get("fault_trace_sample_count") in {None, 0}
+        and sonic.get("terminal_boundary_error") in {None, ""}
+        and sonic.get("plant_terminal_halt_error") in {None, ""}
+        and sonic.get("recoverable_motion_fault") is not True
+    )
+    if not common_stopped:
+        return False
+    if (
+        last_error == "Nav2 requested zero velocity"
+        and sonic.get("nav2_state") == "idle"
+    ):
+        return bool(
+            sonic.get("plant_support_mode") == "idle"
+            and sonic.get("plant_support_requested_mode") == "idle"
+            and sonic.get("plant_support_confirmed_mode") == "idle"
+            and sonic.get("plant_support_stop_pending") is False
+            and sonic.get("plant_support_safety_latched") is False
+        )
+    generation = sonic.get("plant_support_stop_generation")
+    return bool(
+        sonic.get("nav2_state") == "safety_stop"
         and sonic.get("plant_support_mode") == "safety_stop"
         and sonic.get("plant_support_requested_mode") == "safety_stop"
         and sonic.get("plant_support_confirmed_mode") == "safety_stop"
@@ -1196,11 +1219,6 @@ def _sonic_runtime_healthy(sonic: Mapping[str, Any]) -> bool:
         and isinstance(generation, int)
         and not isinstance(generation, bool)
         and generation >= 0
-        and sonic.get("fault_trace_path") in {None, ""}
-        and sonic.get("fault_trace_sample_count") in {None, 0}
-        and sonic.get("terminal_boundary_error") in {None, ""}
-        and sonic.get("plant_terminal_halt_error") in {None, ""}
-        and sonic.get("recoverable_motion_fault") is not True
     )
 
 
