@@ -148,6 +148,8 @@ def _runtime(*, auto_reference_authority: bool = False):
     runtime._policy_step_pending = False
     runtime._pending_reference_install_epoch = None
     runtime._pending_ref_cursor = None
+    runtime._has_committed_policy_target = False
+    runtime._initial_reference_acquired = False
     return runtime, planner, controller, encoder, decoder, raw_action
 
 
@@ -277,6 +279,162 @@ def test_initialization_is_measured_lazy_idempotent_and_policy_free():
     assert planner.started == 1
 
 
+def test_first_policy_authority_zero_pads_missing_official_history_only_once():
+    runtime, planner, controller, _encoder, _decoder, _raw_action = _runtime()
+    obs = _complete_obs(offset=0.07)
+    boundary = _initialize_and_acquire(runtime, planner, obs)
+
+    for history in (
+        controller.h_q_mj,
+        controller.h_dq_mj,
+        controller.h_ang,
+        controller.h_act_mj,
+        controller.h_quat,
+    ):
+        np.testing.assert_array_equal(np.asarray(history), 0.0)
+
+    first = runtime.tick(obs, debug=False, use_joystick=False)
+    measured = np.array(
+        [obs[f"{motor.name}.q"] for motor in G1_29_JointIndex],
+        np.float32,
+    )
+    measured_residual = measured[MUJOCO_TO_ISAACLAB] - DEFAULT_ANGLES_ISAACLAB
+    np.testing.assert_allclose(controller.h_q_mj[0], measured_residual, atol=1e-7)
+    np.testing.assert_array_equal(np.asarray(controller.h_q_mj[1:]), 0.0)
+    np.testing.assert_allclose(
+        controller.h_act_mj[0],
+        hardware_target_to_normalized_action(boundary),
+        atol=2e-6,
+    )
+    np.testing.assert_array_equal(np.asarray(controller.h_act_mj[1:]), 0.0)
+
+    published = _target_vector(first)
+    runtime.record_executed_target(published)
+    assert runtime._has_committed_policy_target is True
+
+    fresh_obs = _complete_obs(offset=0.03)
+    fresh_measured = np.array(
+        [fresh_obs[f"{motor.name}.q"] for motor in G1_29_JointIndex],
+        np.float32,
+    )
+    runtime.request_reference(fresh_obs)
+    planner.results.append((_motion_from_measured(fresh_measured), planner.gen_frame))
+    assert runtime.poll_reference()
+    runtime.acquire_reference(
+        fresh_obs,
+        executed_target=published,
+        expected_install_epoch=runtime.reference_install_epoch,
+    )
+    fresh_residual = (
+        fresh_measured[MUJOCO_TO_ISAACLAB] - DEFAULT_ANGLES_ISAACLAB
+    )
+    for history in controller.h_q_mj:
+        np.testing.assert_allclose(history, fresh_residual, atol=1e-7)
+
+
+def test_preloaded_idle_reference_has_an_explicit_first_control_acquisition():
+    runtime, planner, controller, _encoder, _decoder, _raw_action = _runtime()
+    obs = _complete_obs(offset=0.02)
+    runtime.initialize_from_observation(obs)
+    boundary = np.array(
+        [obs[f"{motor.name}.q"] for motor in G1_29_JointIndex],
+        np.float32,
+    )
+
+    runtime.acquire_initial_reference(
+        obs,
+        executed_target=boundary,
+        expected_install_epoch=runtime.reference_install_epoch,
+    )
+
+    assert planner.requests == []
+    assert runtime.reference_authority
+    assert controller.playing is True
+    for history in (
+        controller.h_q_mj,
+        controller.h_dq_mj,
+        controller.h_ang,
+        controller.h_act_mj,
+        controller.h_quat,
+    ):
+        np.testing.assert_array_equal(np.asarray(history), 0.0)
+    with pytest.raises(RuntimeError, match="only once"):
+        runtime.acquire_initial_reference(
+            obs,
+            executed_target=boundary,
+            expected_install_epoch=runtime.reference_install_epoch,
+        )
+
+
+def test_continuous_replan_freezes_cursor_and_preserves_executed_history():
+    runtime, planner, controller, _encoder, _decoder, _raw_action = _runtime()
+    obs = _complete_obs(offset=0.02)
+    runtime.initialize_from_observation(obs)
+    boundary = np.array(
+        [obs[f"{motor.name}.q"] for motor in G1_29_JointIndex],
+        np.float32,
+    )
+    runtime.acquire_initial_reference(
+        obs,
+        executed_target=boundary,
+        expected_install_epoch=runtime.reference_install_epoch,
+    )
+    idle = runtime.tick(obs, debug=False, use_joystick=False)
+    published = _target_vector(idle)
+    runtime.record_executed_target(published)
+    history_before = {
+        "q": np.asarray(controller.h_q_mj).copy(),
+        "dq": np.asarray(controller.h_dq_mj).copy(),
+        "ang": np.asarray(controller.h_ang).copy(),
+        "act": np.asarray(controller.h_act_mj).copy(),
+        "quat": np.asarray(controller.h_quat).copy(),
+    }
+    cursor_before = controller.ref_cursor
+    step_before = runtime.step
+
+    runtime.ms.mode = 1
+    runtime.ms.speed = 0.2
+    runtime.ms.has_movement = True
+    runtime.request_continuous_reference()
+
+    assert planner.requests[-1][0] == cursor_before
+    assert not runtime.reference_authority
+    assert controller.ref_cursor == cursor_before
+    assert runtime.step == step_before
+    assert runtime.tick(obs, debug=False, use_joystick=False) == {}
+    assert controller.ref_cursor == cursor_before
+    assert runtime.step == step_before
+
+    planner.results.append((_motion_from_measured(boundary), planner.gen_frame))
+    assert runtime.poll_reference()
+    runtime.acquire_continuous_reference(
+        executed_target=published,
+        expected_install_epoch=runtime.reference_install_epoch,
+    )
+
+    assert runtime.reference_authority
+    assert runtime.step == step_before
+    for label, actual in (
+        ("q", controller.h_q_mj),
+        ("dq", controller.h_dq_mj),
+        ("ang", controller.h_ang),
+        ("act", controller.h_act_mj),
+        ("quat", controller.h_quat),
+    ):
+        np.testing.assert_array_equal(np.asarray(actual), history_before[label])
+
+    tampered = published.copy()
+    tampered[0] += 0.01
+    runtime.request_continuous_reference()
+    planner.results.append((_motion_from_measured(boundary), planner.gen_frame))
+    assert runtime.poll_reference()
+    with pytest.raises(RuntimeError, match="executed actuator boundary"):
+        runtime.acquire_continuous_reference(
+            executed_target=tampered,
+            expected_install_epoch=runtime.reference_install_epoch,
+        )
+
+
 def test_publish_feedback_is_required_and_is_the_only_cursor_commit():
     runtime, planner, controller, encoder, decoder, _raw_action = _runtime()
     obs = _complete_obs()
@@ -308,6 +466,7 @@ def test_publish_feedback_is_required_and_is_the_only_cursor_commit():
     np.testing.assert_allclose(runtime.record_executed_target(published), expected_executed, atol=2e-6)
     np.testing.assert_allclose(controller.last_executed_action_il, expected_executed, atol=2e-6)
     assert controller.ref_cursor == 1
+    assert runtime._has_committed_policy_target is True
 
     runtime.tick(obs, debug=False, use_joystick=False)
     assert len(encoder.inputs) == len(decoder.inputs) == 2

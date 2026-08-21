@@ -58,6 +58,7 @@ from .sonic_pipeline import (
     apply_pico_loco_axes,
     clamp_mode_params,
     compute_kp_kd,
+    hardware_target_to_normalized_action,
     hardware_target_vector,
     make_ort_session_options,
     observation_state,
@@ -235,6 +236,8 @@ class SonicRuntime:
         self._policy_step_pending = False
         self._pending_reference_install_epoch: int | None = None
         self._pending_ref_cursor: int | None = None
+        self._has_committed_policy_target = False
+        self._initial_reference_acquired = False
 
     @property
     def pipeline(self):
@@ -349,6 +352,47 @@ class SonicRuntime:
         self.ms.needs_replan = False
         self.last_ms = snapshot_ms(self.ms)
 
+    def request_continuous_reference(self):
+        """Request a replan while freezing the last acknowledged policy state.
+
+        This path is used after the first IDLE balance has crossed the actuator
+        boundary.  Unlike a stop/recovery rebase, it preserves the rolling
+        measured/action history and current reference buffer.  The caller holds
+        the last successful target while the asynchronous planner works, so the
+        request cursor and blend point are independent of host scheduling.
+        """
+
+        if not self._initialized:
+            raise RuntimeError(
+                "SONIC must be initialized before a continuous reference request"
+            )
+        if not self._has_committed_policy_target:
+            raise RuntimeError(
+                "continuous SONIC replanning requires an acknowledged policy target"
+            )
+        if not self.reference_authority or not self._matching_reference_loaded:
+            raise RuntimeError(
+                "continuous SONIC replanning requires current reference authority"
+            )
+        if self._policy_step_pending or self.controller.execution_feedback_pending:
+            raise RuntimeError(
+                "cannot continuously replan with unpublished policy output"
+            )
+        if LM(self.ms.mode) == LM.IDLE or not bool(self.ms.has_movement):
+            raise RuntimeError(
+                "continuous SONIC replanning requires a non-IDLE movement intent"
+            )
+        cursor = int(self.controller.ref_cursor)
+        self.revoke_reference_authority(
+            discard_reference=True,
+            discard_pending_execution=True,
+        )
+        self._minimum_acquirable_epoch = self._reference_install_epoch + 1
+        self.planner.request_replan(cursor, self.ms)
+        self.replan_timer = 0.0
+        self.ms.needs_replan = False
+        self.last_ms = snapshot_ms(self.ms)
+
     def poll_reference(self) -> bool:
         """Poll and blend one accepted async plan without policy-state progress."""
 
@@ -389,7 +433,13 @@ class SonicRuntime:
             raise RuntimeError("SONIC cannot acquire authority with unpublished policy output")
         # Validate the boundary before mutating any recurrent state.
         boundary = hardware_target_vector(executed_target)
-        self.controller.seed_history(obs, executed_target=boundary)
+        if self._has_committed_policy_target:
+            self.controller.seed_history(obs, executed_target=boundary)
+        else:
+            self.controller.seed_cold_start_history(
+                obs,
+                executed_target=boundary,
+            )
         self.controller.reinit_heading = True
         self.controller.first_motion = True
         self.controller.playing = True
@@ -398,6 +448,120 @@ class SonicRuntime:
             matching_reference_ready=True,
         )
         self.step = 0
+        self.replan_timer = 0.0
+        self.last_ms = snapshot_ms(self.ms)
+        self._minimum_acquirable_epoch = None
+        self._initial_reference_acquired = True
+
+    def acquire_initial_reference(
+        self,
+        obs: dict,
+        *,
+        executed_target,
+        expected_install_epoch: int | None = None,
+    ):
+        """Enter first CONTROL on the preloaded IDLE plan exactly once.
+
+        Initialization already ran the planner synchronously with ``LM.IDLE``.
+        Requiring a second synthetic IDLE plan changes that official startup
+        reference and introduces an unnecessary asynchronous seam.  This method
+        makes the preloaded-plan authority explicit without weakening the exact
+        epoch or actuator-boundary checks.
+        """
+
+        if not self._initialized:
+            raise RuntimeError(
+                "SONIC must be initialized before initial reference acquisition"
+            )
+        if self._initial_reference_acquired or self._has_committed_policy_target:
+            raise RuntimeError("initial SONIC reference can be acquired only once")
+        if not self._matching_reference_loaded:
+            raise RuntimeError("initial SONIC reference is not loaded")
+        if self._minimum_acquirable_epoch is not None:
+            raise RuntimeError(
+                "initial SONIC reference cannot replace a requested plan"
+            )
+        if LM(self.ms.mode) != LM.IDLE or bool(self.ms.has_movement):
+            raise RuntimeError("initial SONIC reference must remain IDLE")
+        if expected_install_epoch is None or isinstance(expected_install_epoch, bool):
+            raise RuntimeError(
+                "initial SONIC authority requires an exact reference install epoch"
+            )
+        if int(expected_install_epoch) != self._reference_install_epoch:
+            raise RuntimeError(
+                "initial SONIC authority epoch does not identify the preloaded plan"
+            )
+        if self._policy_step_pending or self.controller.execution_feedback_pending:
+            raise RuntimeError(
+                "initial SONIC authority cannot replace unpublished policy output"
+            )
+        boundary = hardware_target_vector(executed_target)
+        self.controller.seed_cold_start_history(
+            obs,
+            executed_target=boundary,
+        )
+        self.controller.reinit_heading = True
+        self.controller.first_motion = True
+        self.controller.playing = True
+        self.controller.set_reference_authority(
+            actuator_authority=True,
+            matching_reference_ready=True,
+        )
+        self.step = 0
+        self.replan_timer = 0.0
+        self.last_ms = snapshot_ms(self.ms)
+        self._initial_reference_acquired = True
+
+    def acquire_continuous_reference(
+        self,
+        *,
+        executed_target,
+        expected_install_epoch: int | None = None,
+    ):
+        """Install a frozen-cursor replan without fabricating history samples."""
+
+        if not self._initialized or not self._has_committed_policy_target:
+            raise RuntimeError(
+                "continuous SONIC authority requires an acknowledged policy history"
+            )
+        if not self._matching_reference_loaded:
+            raise RuntimeError(
+                "continuous SONIC authority requires a loaded matching reference"
+            )
+        minimum = self._minimum_acquirable_epoch
+        if expected_install_epoch is None or isinstance(expected_install_epoch, bool):
+            raise RuntimeError(
+                "continuous SONIC authority requires an exact reference install epoch"
+            )
+        if (
+            minimum is None
+            or self._reference_install_epoch < minimum
+            or int(expected_install_epoch) != self._reference_install_epoch
+        ):
+            raise RuntimeError(
+                "continuous SONIC authority epoch does not identify the requested plan"
+            )
+        if self._policy_step_pending or self.controller.execution_feedback_pending:
+            raise RuntimeError(
+                "continuous SONIC authority cannot replace unpublished policy output"
+            )
+        boundary = hardware_target_vector(executed_target)
+        expected_action = hardware_target_to_normalized_action(boundary)
+        if not np.allclose(
+            self.controller.last_executed_action_il,
+            expected_action,
+            rtol=0.0,
+            atol=2e-6,
+        ):
+            raise RuntimeError(
+                "continuous SONIC authority lacks the exact executed actuator boundary"
+            )
+        self.controller.reinit_heading = True
+        self.controller.playing = True
+        self.controller.set_reference_authority(
+            actuator_authority=True,
+            matching_reference_ready=True,
+        )
         self.replan_timer = 0.0
         self.last_ms = snapshot_ms(self.ms)
         self._minimum_acquirable_epoch = None
@@ -418,6 +582,7 @@ class SonicRuntime:
         ):
             raise RuntimeError("pending SONIC candidate no longer matches its reference epoch/cursor")
         executed = self.controller.record_executed_target(target)
+        self._has_committed_policy_target = True
         self.controller.advance_cursor()
         self._policy_step_pending = False
         self._pending_reference_install_epoch = None
@@ -493,6 +658,8 @@ class SonicRuntime:
         self.last_ms = snapshot_ms(self.ms)
         self._initialized = False
         self._minimum_acquirable_epoch = None
+        self._has_committed_policy_target = False
+        self._initial_reference_acquired = False
 
     def shutdown(self):
         if self._planner_worker_started:
@@ -649,6 +816,11 @@ class SonicWholeBodyController:
             raise ValueError("SONIC reference request requires a LowState")
         self._runtime.request_reference(lowstate_to_obs(lowstate))
 
+    def request_continuous_reference(self) -> None:
+        """Freeze the current policy cursor and request the next movement plan."""
+
+        self._runtime.request_continuous_reference()
+
     def poll_reference(self) -> bool:
         """Poll/blend an async reference without running the policy."""
 
@@ -667,6 +839,32 @@ class SonicWholeBodyController:
             raise ValueError("SONIC authority acquisition requires a LowState")
         self._runtime.acquire_reference(
             lowstate_to_obs(lowstate),
+            executed_target=executed_target,
+            expected_install_epoch=expected_install_epoch,
+        )
+
+    def acquire_initial_reference(
+        self,
+        lowstate,
+        *,
+        executed_target,
+        expected_install_epoch: int | None = None,
+    ) -> None:
+        if lowstate is None:
+            raise ValueError("initial SONIC authority acquisition requires a LowState")
+        self._runtime.acquire_initial_reference(
+            lowstate_to_obs(lowstate),
+            executed_target=executed_target,
+            expected_install_epoch=expected_install_epoch,
+        )
+
+    def acquire_continuous_reference(
+        self,
+        *,
+        executed_target,
+        expected_install_epoch: int | None = None,
+    ) -> None:
+        self._runtime.acquire_continuous_reference(
             executed_target=executed_target,
             expected_install_epoch=expected_install_epoch,
         )

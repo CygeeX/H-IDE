@@ -728,6 +728,35 @@ class StandingEncoderDecoder:
         self._execution_feedback_pending = False
         return q, dq, ang, quat
 
+    def seed_cold_start_history(self, robot_obs, *, executed_target):
+        """Match the official C++ decoder history at first CONTROL entry.
+
+        ``StateLogger::GetLatest`` pads the unavailable nine older samples
+        with zero entries.  The first CONTROL tick then appends exactly one
+        current measured sample.  Repeating the current tilted/contact-loaded
+        pose into all ten slots is not equivalent: it can drive a large first
+        lower-body action and make a valid forward plan walk backwards.
+
+        Keep the exact published actuator boundary as ``last_executed`` so the
+        newest action slot remains truthful when :meth:`update_history` runs.
+        This method is only for the first policy authority of one runtime;
+        later reference reacquisitions retain the existing measured rebase.
+        """
+
+        q, dq, ang, quat = observation_state(robot_obs, require_complete=True)
+        target = hardware_target_vector(executed_target)
+        executed_action = hardware_target_to_normalized_action(target)
+        self.h_q_mj = [np.zeros(29, np.float32) for _ in range(10)]
+        self.h_dq_mj = [np.zeros(29, np.float32) for _ in range(10)]
+        self.h_ang = [np.zeros(3, np.float32) for _ in range(10)]
+        self.h_act_mj = [np.zeros(29, np.float32) for _ in range(10)]
+        self.h_quat = [np.zeros(4, np.float32) for _ in range(10)]
+        self.last_executed_action_il = executed_action.copy()
+        self.init_base_quat = quat.copy()
+        self._heading_init = True
+        self._execution_feedback_pending = False
+        return q, dq, ang, quat
+
     def record_executed_target(self, target):
         """Commit a successfully published actuator target to action history."""
 
