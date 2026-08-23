@@ -3266,7 +3266,15 @@ class SonicDriver:
                 else LM.SLOW_WALK
             )
             controller.ms.speed = intent.speed_mps if intent.has_movement else -1.0
-            controller.ms.movement_angle = intent.movement_angle_rad
+            # NVIDIA's continuous-IDLE request keeps facing independent from
+            # translation.  CmdVelGuard reports the frozen facing as the
+            # outer no-motion angle, but the planner contract requires the
+            # IDLE movement vector itself to be exactly zero.  Reusing the
+            # non-zero facing here made an otherwise successful Spin fault at
+            # the stop seam before the balanced reference could be planned.
+            controller.ms.movement_angle = (
+                0.0 if controlled_stop else intent.movement_angle_rad
+            )
             controller.ms.facing_angle = intent.facing_angle_rad
             controller.ms.has_movement = intent.has_movement
             # Manual authority requests every fresh reference explicitly on

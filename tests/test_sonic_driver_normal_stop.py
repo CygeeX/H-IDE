@@ -64,7 +64,12 @@ class Guard:
         self._target_zero = True
         self._command_zero = True
 
-    def stop_at_measured_heading(self, *, source: str) -> None:
+    def stop_at_measured_heading(
+        self,
+        *,
+        source: str,
+        facing_angle_rad: float | None = None,
+    ) -> None:
         self.measured_heading_stops.append(source)
         self.stop(source=source)
 
@@ -503,7 +508,10 @@ def test_granted_motion_rebases_idle_from_exact_boundary_before_braking() -> Non
     assert activation.confirm_support_release(tick_ms=3_020)
     assert activation.prepared
     driver._policy_activation = activation
-    driver._controller = SimpleNamespace(initialized=True)
+    driver._controller = SimpleNamespace(
+        initialized=True,
+        current_reference_facing_angle=lambda: 0.25,
+    )
     driver._intent_ingress.generation = 10
     driver._intent_ingress.sequence = 19
     driver._intent_ingress.armed = True
@@ -663,7 +671,10 @@ def test_generic_stopping_intent_is_health_visible_before_correlated_begin() -> 
     assert activation.confirm_support_release(tick_ms=3_020)
     assert activation.prepared
     driver._policy_activation = activation
-    driver._controller = SimpleNamespace(initialized=True)
+    driver._controller = SimpleNamespace(
+        initialized=True,
+        current_reference_facing_angle=lambda: 0.25,
+    )
     driver._intent_ingress.generation = 10
     driver._intent_ingress.sequence = 19
     driver._intent_ingress.armed = True
@@ -775,6 +786,7 @@ def test_generic_stationary_idle_keeps_fresh_policy_balance_authority() -> None:
     driver._controller = SimpleNamespace(
         initialized=True,
         ms=SimpleNamespace(mode=0, has_movement=False),
+        current_reference_facing_angle=lambda: 0.25,
     )
     driver._intent_ingress.generation = 10
     driver._intent_ingress.sequence = 19
@@ -932,6 +944,7 @@ def test_stationary_idle_ack_waits_for_first_controlled_policy_dds_grant() -> No
     driver._controller = SimpleNamespace(
         initialized=True,
         ms=SimpleNamespace(mode=0, has_movement=False),
+        current_reference_facing_angle=lambda: 0.25,
     )
     driver._intent_ingress.generation = 10
     driver._intent_ingress.sequence = 19

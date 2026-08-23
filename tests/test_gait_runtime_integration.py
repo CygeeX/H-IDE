@@ -2844,7 +2844,10 @@ def test_controlled_stop_watchdog_age_cannot_replan_the_same_source_sequence() -
     fresh_idle = MovementIntent(
         mode="IDLE",
         speed_mps=0.0,
-        movement_angle_rad=0.0,
+        # The outer guard freezes its no-motion angle at the live facing.
+        # The driver must still encode a zero planner movement vector while
+        # preserving that facing independently.
+        movement_angle_rad=0.22029595072884373,
         facing_angle_rad=0.22029595072884373,
         has_movement=False,
         stale=False,
@@ -2862,6 +2865,7 @@ def test_controlled_stop_watchdog_age_cannot_replan_the_same_source_sequence() -
     assert first_idle.source == "gait_adapter_controlled_stop"
     assert evidence.intent_generation == 2
     assert controller.ms.needs_replan is False
+    assert controller.ms.movement_angle == pytest.approx(0.0)
     assert controller.ms.facing_angle == pytest.approx(0.22029595072884373)
 
     # Planning-only request/poll never runs the moving clip. It acquires the
