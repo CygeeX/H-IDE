@@ -1217,6 +1217,7 @@ class SonicHealthFaultGate:
             health,
             plant_lowstate_stale_s=self._plant_lowstate_stale_s,
             sonic_control_step_stale_s=self._sonic_control_step_stale_s,
+            allow_static_pregrant_grace=(gait_state is GaitState.STARTING),
         )
         if cause is None:
             self._clear_pending(filtered=True)
@@ -1301,6 +1302,7 @@ def classify_sonic_health(
     *,
     plant_lowstate_stale_s: float,
     sonic_control_step_stale_s: float,
+    allow_static_pregrant_grace: bool = False,
 ) -> MotionFaultCause | None:
     """Map an authenticated health response to one fail-closed first cause."""
 
@@ -1310,6 +1312,8 @@ def classify_sonic_health(
     control_threshold = float(sonic_control_step_stale_s)
     if not math.isfinite(control_threshold) or control_threshold <= 0:
         raise ValueError("SONIC control stale threshold must be finite and positive")
+    if not isinstance(allow_static_pregrant_grace, bool):
+        raise TypeError("static pre-grant grace flag must be boolean")
     if health.terminal_fault:
         return MotionFaultCause(
             source="sonic_driver",
@@ -1339,9 +1343,35 @@ def classify_sonic_health(
                 f"{threshold:.6f}s safety bound"
             ),
         )
+    # A STARTING action has been admitted, but the learned reference has not
+    # crossed DDS yet.  In this exact shape the driver still publishes the
+    # prior static target, Plant fall-arrest remains engaged, and no actuator
+    # authority exists.  A loaded workstation can pause one Python scheduling
+    # slice beyond the 100 ms moving-control bound here.  Give only this
+    # authority-free phase a bounded 250 ms observation window; LowState
+    # freshness and every GRANTED/non-static phase keep the original limits.
+    static_pregrant = bool(
+        allow_static_pregrant_grace
+        and health.plant_support_mode == "idle"
+        and not health.plant_support_safety_latched
+        and not health.plant_support_stop_pending
+        and health.static_hold_active
+        and health.navigation_task_active
+        and health.motion_authorized
+        and not health.nav2_command_zero
+        and not health.controlled_policy_stop_active
+        and not health.matched_reference_actuator_authority
+        and health.reference_authority_state
+        in {"REVOKED", "REQUIRED", "MATCHED_INSTALLED", "PRIMED"}
+    )
+    effective_control_threshold = (
+        max(control_threshold, 0.250)
+        if static_pregrant
+        else control_threshold
+    )
     if (
         health.last_control_step_age_s is None
-        or health.last_control_step_age_s > control_threshold
+        or health.last_control_step_age_s > effective_control_threshold
     ):
         age = (
             "unavailable"
@@ -1353,7 +1383,7 @@ def classify_sonic_health(
             code="SONIC_CONTROL_STALE",
             reason=(
                 f"SONIC control-step age {age} exceeds the "
-                f"{control_threshold:.6f}s safety bound"
+                f"{effective_control_threshold:.6f}s safety bound"
             ),
         )
     return None

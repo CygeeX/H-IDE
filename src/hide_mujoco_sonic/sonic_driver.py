@@ -578,7 +578,7 @@ class SonicDriver:
 
         # These imports are intentionally lazy: `check` and safety tests must
         # work without ROS/Unitree SDK/ONNX installed.
-        from unitree_sdk2py.core.channel import ChannelFactory, ChannelPublisher, ChannelSubscriber
+        from unitree_sdk2py.core.channel import Channel, ChannelFactory, ChannelPublisher, ChannelSubscriber
         from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_, LowState_
         from unitree_sdk2py.utils.crc import CRC
         from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_
@@ -587,6 +587,7 @@ class SonicDriver:
         self._sdk = (ChannelPublisher, ChannelSubscriber, LowCmd_, LowState_, CRC, unitree_hg_msg_dds__LowCmd_)
         initialize_unitree_control_channel(
             ChannelFactory(),
+            Channel,
             domain_id=config.unitree_domain_id,
             interface=config.interface,
         )

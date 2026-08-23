@@ -2141,7 +2141,7 @@ def run_plant(config: SimConfig) -> int:
     sys.path.insert(0, str(simulator_root))
     from sim.simulator_factory import SimulatorFactory
     from sim.unitree_sdk2py_bridge import simulation_time_to_tick_ms
-    from unitree_sdk2py.core.channel import ChannelFactory
+    from unitree_sdk2py.core.channel import Channel, ChannelFactory
 
     model_config = {
         "ROBOT_TYPE": "g1_29dof",
@@ -2189,6 +2189,7 @@ def run_plant(config: SimConfig) -> int:
     }
     initialize_unitree_control_channel(
         ChannelFactory(),
+        Channel,
         domain_id=config.unitree_domain_id,
         interface=config.interface,
     )

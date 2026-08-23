@@ -1014,6 +1014,106 @@ def test_stale_health_gate_alternating_codes_share_one_unhealthy_streak() -> Non
     assert lowstate_again.pending.count == 3
 
 
+def test_starting_static_pregrant_has_bounded_control_jitter_grace() -> None:
+    gate = health_fault_gate()
+
+    pregrant = parse_health(
+        control_age=0.127784,
+        static_hold_active=True,
+        navigation_task_active=True,
+        motion_authorized=True,
+        nav2_command_zero=False,
+        matched_reference_actuator_authority=False,
+        reference_authority_state="REVOKED",
+    )
+    accepted = observe(gate, pregrant, gait_state=GaitState.STARTING)
+
+    assert accepted.confirmed_cause is None
+    assert accepted.pending is None
+
+    first_late = observe(
+        gate,
+        parse_health(
+            control_age=0.251,
+            static_hold_active=True,
+            navigation_task_active=True,
+            motion_authorized=True,
+            nav2_command_zero=False,
+            matched_reference_actuator_authority=False,
+            reference_authority_state="REQUIRED",
+        ),
+        gait_state=GaitState.STARTING,
+    )
+    second_late = observe(
+        gate,
+        parse_health(
+            control_age=0.276,
+            static_hold_active=True,
+            navigation_task_active=True,
+            motion_authorized=True,
+            nav2_command_zero=False,
+            matched_reference_actuator_authority=False,
+            reference_authority_state="REQUIRED",
+        ),
+        gait_state=GaitState.STARTING,
+    )
+
+    assert first_late.pending is not None
+    assert first_late.confirmed_cause is None
+    assert second_late.confirmed_cause is not None
+    assert second_late.confirmed_cause.code == "SONIC_CONTROL_STALE"
+    assert "0.250000s" in second_late.confirmed_cause.reason
+
+
+def test_pregrant_grace_never_applies_to_lowstate_or_granted_motion() -> None:
+    pregrant_lowstate_stale = parse_health(
+        age=0.101,
+        control_age=0.127784,
+        static_hold_active=True,
+        navigation_task_active=True,
+        motion_authorized=True,
+        nav2_command_zero=False,
+        matched_reference_actuator_authority=False,
+        reference_authority_state="REQUIRED",
+    )
+    lowstate_gate = health_fault_gate()
+    observe(
+        lowstate_gate,
+        pregrant_lowstate_stale,
+        gait_state=GaitState.STARTING,
+    )
+    lowstate = observe(
+        lowstate_gate,
+        pregrant_lowstate_stale,
+        gait_state=GaitState.STARTING,
+    )
+    assert lowstate.confirmed_cause is not None
+    assert lowstate.confirmed_cause.code == "PLANT_LOWSTATE_STALE"
+
+    granted = parse_health(
+        control_age=0.127784,
+        plant_support_mode="locomotion",
+        static_hold_active=False,
+        navigation_task_active=True,
+        motion_authorized=True,
+        nav2_command_zero=False,
+        matched_reference_actuator_authority=True,
+        reference_authority_state="GRANTED",
+        reference_authority_generation=42,
+        reference_authority_source_sequence=7,
+        reference_authority_intent_generation=3,
+        reference_authority_epoch=2,
+        reference_authority_granted_at_monotonic_s=100.25,
+        reference_authority_granted_tick_ms=2500,
+        reference_authority_dds_target_sequence=11,
+    )
+    granted_gate = health_fault_gate()
+    observe(granted_gate, granted, gait_state=GaitState.TURNING)
+    strict = observe(granted_gate, granted, gait_state=GaitState.TURNING)
+    assert strict.confirmed_cause is not None
+    assert strict.confirmed_cause.code == "SONIC_CONTROL_STALE"
+
+
 def test_safe_hold_quarantine_clears_an_active_temporal_streak() -> None:
     gate = health_fault_gate()
 
