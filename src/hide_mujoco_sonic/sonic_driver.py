@@ -489,6 +489,9 @@ class SonicDriver:
         self._control_clock_armed_at_wall_s: float | None = None
         self._last_lowstate_wall_s: float | None = None
         self._last_control_step_wall_s: float | None = None
+        self._control_loop_stage = "startup"
+        self._control_stall_diagnostic_armed = threading.Event()
+        self._control_stall_diagnostic_dumped = threading.Event()
         self._lowstate_stall_timeout_s = max(1.0, config.command_timeout_s * 4.0)
         self._stop = threading.Event()
         self._fault_latched = threading.Event()
@@ -1504,6 +1507,21 @@ class SonicDriver:
         if runtime_diagnostics is not None:
             runtime_diagnostics.observe_control_publish(published_at)
 
+    def _arm_control_stall_diagnostic(self) -> None:
+        """Enable one pre-fault stack capture for the current motion task."""
+
+        diagnostic = getattr(self, "_control_stall_diagnostic_dumped", None)
+        if diagnostic is not None:
+            diagnostic.clear()
+        armed = getattr(self, "_control_stall_diagnostic_armed", None)
+        if armed is not None:
+            armed.set()
+
+    def _disarm_control_stall_diagnostic(self) -> None:
+        armed = getattr(self, "_control_stall_diagnostic_armed", None)
+        if armed is not None:
+            armed.clear()
+
     def _publish_measured_hold(self, lowstate) -> None:
         self._publish_position_hold(
             tuple(float(lowstate.motor_state[index].q) for index in range(29))
@@ -1583,6 +1601,7 @@ class SonicDriver:
             except Exception as exc:
                 failures.append(exc)
             self._policy_activation_requested = False
+            self._disarm_control_stall_diagnostic()
             # Even terminal/fault paths suppressing broader planner telemetry
             # must publish this local transaction fact; otherwise diagnostics
             # can claim PREPARING after the activation epoch was invalidated.
@@ -4630,6 +4649,7 @@ class SonicDriver:
             )
         while not self._stop.is_set():
             loop_started_at = self._wall_clock()
+            self._control_loop_stage = "waiting_for_control_sample"
             sample = self._next_control_sample()
             if self._fault_latched.is_set():
                 if getattr(self, "_recoverable_motion_fault", False):
@@ -4660,6 +4680,7 @@ class SonicDriver:
             self._control_evidence_context.control_step = control_step
             try:
                 if self._startup_qualifying:
+                    self._control_loop_stage = "startup_qualification_hold"
                     # Qualification is intentionally policy-free.  The plant is
                     # stationary, obsolete samples may still be latest-only
                     # synchronized, and only a measured hold is published.
@@ -4668,6 +4689,7 @@ class SonicDriver:
                         sample_drop_generation=sample_drop_generation
                     )
                     continue
+                self._control_loop_stage = "intent_apply"
                 intent = self._apply_intent(
                     control_step.dt_s,
                     simulation_now_s=control_step.tick_ms / 1_000.0,
@@ -4680,6 +4702,7 @@ class SonicDriver:
                     and intent.mode == "IDLE"
                 )
                 if intent.mode == "IDLE" and not controlled_stop:
+                    self._control_loop_stage = "idle_position_hold"
                     with self._support_lock:
                         decision = self._joint_handoff.decide(
                             motion_active=False,
@@ -4724,6 +4747,7 @@ class SonicDriver:
                     and getattr(self, "_policy_activation_requested", False)
                     and not activation.prepared
                 ):
+                    self._control_loop_stage = "nominal_policy_activation"
                     try:
                         self._run_nominal_policy_activation(
                             lowstate=lowstate,
@@ -4742,7 +4766,9 @@ class SonicDriver:
                     # simulation fall arrest is released.
                     continue
 
+                self._control_loop_stage = "reference_transaction"
                 if not self._progress_reference_transaction(lowstate):
+                    self._control_loop_stage = "reference_wait_hold"
                     self._enforce_planner_reference_deadline(
                         simulation_now_s=control_step.tick_ms / 1_000.0
                     )
@@ -4799,6 +4825,7 @@ class SonicDriver:
                 # MovementState above and executes the official SONIC pipeline.
                 # Decode creates a pending candidate. Its action history and
                 # reference cursor commit only after the complete DDS write.
+                self._control_loop_stage = "policy_candidate"
                 policy_action = self._run_policy_candidate(lowstate)
                 self._update_telemetry_hot(
                     sonic_policy_speed_mps=(
@@ -4922,6 +4949,7 @@ class SonicDriver:
                     f"{self._joint_name(index)}.q": target
                     for index, target in enumerate(decision.targets)
                 }
+                self._control_loop_stage = "policy_publish"
                 published_targets = self._publish(
                     output_action,
                     lowstate,
@@ -4994,6 +5022,7 @@ class SonicDriver:
                         getattr(control_step, "tick_ms", "unavailable"),
                     )
                 self._control_evidence_context.control_step = None
+                self._control_loop_stage = "waiting_for_control_sample"
         try:
             self._controller.shutdown()
         finally:
@@ -6867,6 +6896,7 @@ class SonicDriver:
             # envelopes therefore cannot overwrite the first admitted identity.
             self.guard.accept(decision.vx, decision.vy, decision.wz, source="nav2")
         if new_navigation_task:
+            self._arm_control_stall_diagnostic()
             self._reset_navigation_task_peaks_hot()
             self._update_telemetry_hot(
                 navigation_task_active=True,
@@ -6882,47 +6912,135 @@ class SonicDriver:
         return None
 
 
+def _run_control_stall_diagnostic_watchdog(
+    driver: SonicDriver,
+    stop_event: threading.Event,
+) -> None:
+    """Capture one pre-fault stack snapshot without changing fault policy."""
+
+    threshold_s = max(
+        0.020,
+        0.60 * float(driver.config.sonic_control_step_stale_s),
+    )
+    armed = driver._control_stall_diagnostic_armed
+    dumped = driver._control_stall_diagnostic_dumped
+    while not stop_event.is_set():
+        if not armed.wait(timeout=0.25):
+            continue
+        if stop_event.wait(timeout=0.005):
+            return
+        if not armed.is_set() or dumped.is_set():
+            continue
+        last_published_at = driver._last_control_step_wall_s
+        if last_published_at is None:
+            continue
+        checked_at = driver._wall_clock()
+        age_s = max(0.0, checked_at - last_published_at)
+        if age_s < threshold_s:
+            continue
+        dumped.set()
+        logger.error(
+            "capturing all SONIC thread stacks before control stale fault "
+            "age_s=%.6f diagnostic_threshold_s=%.6f stage=%s",
+            age_s,
+            threshold_s,
+            str(getattr(driver, "_control_loop_stage", "unknown"))[:96],
+        )
+        faulthandler.dump_traceback(all_threads=True)
+
+
 def _handle_command_connection(driver: SonicDriver, conn) -> None:
     """Serve one bounded-lifetime 8793 client without changing its semantics."""
 
+    connection_started_at = time.monotonic()
+    receive_completed_at = connection_started_at
+    parse_completed_at = connection_started_at
+    accept_elapsed_s = 0.0
+    send_elapsed_s = 0.0
+    message_types: list[str] = []
     data = b""
-    while True:
-        chunk = conn.recv(4096)
-        if not chunk:
-            break
-        data += chunk
-    messages, _ = parse_lines(data + (b"" if data.endswith(b"\n") else b"\n"))
-    for message in messages:
-        request_id = message.get("request_id")
-        try:
-            response = driver.accept_json(message)
-            if request_id is not None:
-                acknowledgement = {
-                    "request_id": request_id,
-                    "ok": True,
-                    **(response or {}),
-                }
+    try:
+        while True:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        receive_completed_at = time.monotonic()
+        messages, _ = parse_lines(
+            data + (b"" if data.endswith(b"\n") else b"\n")
+        )
+        parse_completed_at = time.monotonic()
+        for message in messages:
+            message_type = str(message.get("type", "missing"))
+            message_types.append(
+                " ".join(message_type.replace("\x00", "").split())[:64]
+                or "empty"
+            )
+            request_id = message.get("request_id")
+            accept_started_at = time.monotonic()
+            try:
+                response = driver.accept_json(message)
+                accept_completed_at = time.monotonic()
+                accept_elapsed_s += max(
+                    0.0,
+                    accept_completed_at - accept_started_at,
+                )
+                if request_id is not None:
+                    acknowledgement = {
+                        "request_id": request_id,
+                        "ok": True,
+                        **(response or {}),
+                    }
+                    send_started_at = time.monotonic()
+                    conn.sendall(
+                        (
+                            json.dumps(acknowledgement, separators=(",", ":"))
+                            + "\n"
+                        ).encode("utf-8")
+                    )
+                    send_elapsed_s += max(
+                        0.0,
+                        time.monotonic() - send_started_at,
+                    )
+            except Exception as exc:
+                accept_completed_at = time.monotonic()
+                accept_elapsed_s += max(
+                    0.0,
+                    accept_completed_at - accept_started_at,
+                )
+                if request_id is None:
+                    raise
+                send_started_at = time.monotonic()
                 conn.sendall(
                     (
-                        json.dumps(acknowledgement, separators=(",", ":"))
+                        json.dumps(
+                            {
+                                "request_id": request_id,
+                                "ok": False,
+                                "error": str(exc)[:512],
+                            },
+                            separators=(",", ":"),
+                        )
                         + "\n"
                     ).encode("utf-8")
                 )
-        except Exception as exc:
-            if request_id is None:
-                raise
-            conn.sendall(
-                (
-                    json.dumps(
-                        {
-                            "request_id": request_id,
-                            "ok": False,
-                            "error": str(exc)[:512],
-                        },
-                        separators=(",", ":"),
-                    )
-                    + "\n"
-                ).encode("utf-8")
+                send_elapsed_s += max(
+                    0.0,
+                    time.monotonic() - send_started_at,
+                )
+    finally:
+        connection_completed_at = time.monotonic()
+        total_s = max(0.0, connection_completed_at - connection_started_at)
+        if total_s > 0.020:
+            logger.warning(
+                "slow SONIC command stages types=%s total_s=%.6f recv_s=%.6f "
+                "parse_s=%.6f accept_s=%.6f send_s=%.6f",
+                ",".join(message_types) or "unparsed",
+                total_s,
+                max(0.0, receive_completed_at - connection_started_at),
+                max(0.0, parse_completed_at - receive_completed_at),
+                accept_elapsed_s,
+                send_elapsed_s,
             )
 
 
@@ -6989,23 +7107,18 @@ def run_driver(config: SimConfig) -> None:
                     return
                 raise
             with conn:
-                request_started_at = time.monotonic()
                 try:
                     _handle_command_connection(driver, conn)
                 except Exception as exc:
                     logger.warning("invalid bridge command: %s", exc)
-                finally:
-                    request_elapsed_s = max(
-                        0.0,
-                        time.monotonic() - request_started_at,
-                    )
-                    if request_elapsed_s > 0.020:
-                        logger.warning(
-                            "slow SONIC command connection elapsed_s=%.6f",
-                            request_elapsed_s,
-                        )
 
     threading.Thread(target=accept_loop, daemon=True, name="sonic-command-server").start()
+    threading.Thread(
+        target=_run_control_stall_diagnostic_watchdog,
+        args=(driver, command_server_stop),
+        daemon=True,
+        name="sonic-control-stall-diagnostic",
+    ).start()
     try:
         driver.run()
     finally:
