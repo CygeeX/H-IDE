@@ -604,18 +604,36 @@ def test_granted_motion_rebases_idle_from_exact_boundary_before_braking() -> Non
         dds_target_sequence=8,
     )
     driver._controlled_stop_reference_installed = True
+    # The first learned IDLE policy target has crossed DDS.  The live control
+    # loop clears the temporary handoff hold at this same boundary.
+    driver._static_hold_active = False
     stationary = driver.accept_json(stationary_payload)
 
     assert stationary is not None
     assert driver._normal_stop.snapshot.phase == "STATIONARY_ACK"
+    assert driver._controlled_stop_active is True
+    assert getattr(driver, "_normal_stop_policy_braking", False) is True
+    assert driver._safe_hold_targets is None
+    assert driver._static_hold_active is False
+    assert driver._reference_authority.snapshot.phase == "GRANTED"
+    assert driver._plant_support_stop_pending is True
+    assert driver._normal_stop_static_boundary_locked() is False
+    assert driver._commit_static_hold_decision_locked(False) is False
+    assert driver.guard.stops == ["gait_adapter_controlled_stop"]
+
+    confirmed = driver.accept_json(plant_request(identity=identity))
+
+    assert confirmed is not None
+    assert driver._normal_stop.snapshot.phase == "DRIVER_CONFIRMED"
     assert driver._controlled_stop_active is False
     assert getattr(driver, "_normal_stop_policy_braking", False) is False
     assert driver._safe_hold_targets == tuple(0.0 for _ in range(29))
     assert driver._static_hold_active is True
     assert driver._reference_authority.snapshot.phase == "REVOKED"
+    assert driver._plant_support_safety_latched is True
     assert driver.guard.stops == [
         "gait_adapter_controlled_stop",
-        "normal_stop_stationary",
+        "normal_stop_plant_confirmed",
     ]
 
 
@@ -985,8 +1003,8 @@ def test_stationary_idle_ack_waits_for_first_controlled_policy_dds_grant() -> No
     assert driver._reference_authority.snapshot.phase == "GRANTED"
 
 
-def test_explicit_normal_stop_revokes_an_existing_balanced_idle_policy() -> None:
-    """An operator/emergency stop remains stronger than balanced IDLE."""
+def test_explicit_normal_stop_keeps_balanced_idle_until_plant_is_latched() -> None:
+    """A correlated stop must not create an unsupported humanoid interval."""
 
     clock = Clock()
     driver = bare_driver(clock)
@@ -1047,13 +1065,38 @@ def test_explicit_normal_stop_revokes_an_existing_balanced_idle_policy() -> None
 
     assert response is not None
     assert driver._normal_stop.snapshot.phase == "BRAKING"
-    assert driver._normal_stop_policy_braking is False
+    assert driver._normal_stop_policy_braking is True
     assert driver._balanced_policy_idle_active is False
-    assert driver._controlled_stop_active is False
+    assert driver._controlled_stop_active is True
+    assert driver._controlled_stop_source_identity == (10, 20)
     assert driver._intent_ingress.armed is False
+    assert driver._intent_ingress.braking is True
+    assert driver._safe_hold_targets is None
+    assert driver._static_hold_active is False
+    assert driver._reference_authority.snapshot.phase == "GRANTED"
+
+    identity = driver._normal_stop.snapshot.identity
+    assert identity is not None
+    clock.value += 0.02
+    driver.accept_json(stationary_request(clock, identity=identity))
+
+    assert driver._normal_stop.snapshot.phase == "STATIONARY_ACK"
+    assert driver._controlled_stop_active is True
+    assert driver._normal_stop_policy_braking is True
+    assert driver._safe_hold_targets is None
+    assert driver._static_hold_active is False
+    assert driver._reference_authority.snapshot.phase == "GRANTED"
+    assert driver._normal_stop_static_boundary_locked() is False
+
+    driver.accept_json(plant_request(identity=identity))
+
+    assert driver._normal_stop.snapshot.phase == "DRIVER_CONFIRMED"
+    assert driver._controlled_stop_active is False
+    assert driver._normal_stop_policy_braking is False
     assert driver._safe_hold_targets == targets
     assert driver._static_hold_active is True
     assert driver._reference_authority.snapshot.phase == "REVOKED"
+    assert driver._plant_support_safety_latched is True
 
 
 @pytest.mark.parametrize(
@@ -1871,6 +1914,60 @@ def test_failed_or_dynamically_invalid_plant_evidence_latches_normal_failure(
     assert driver._fault_latched.is_set() is False
     assert driver._terminal_plant_halt_attempted is False
     assert driver.accept_json(payload) == response
+
+
+def test_failed_plant_confirmation_keeps_exact_learned_idle_balance() -> None:
+    """A failed external latch must not turn policy IDLE into a joint freeze."""
+
+    clock = Clock()
+    driver = bare_driver(clock)
+    driver._normal_stop.begin(control_generation=10, gait_source_sequence=22)
+    identity = driver._normal_stop.snapshot.identity
+    assert identity is not None
+    driver._normal_stop.acknowledge_stationary(identity)
+    driver._normal_stop_bridge_boot_id = BRIDGE_BOOT_ID
+    driver._normal_stop_seen_bridge_boot_ids.add(BRIDGE_BOOT_ID)
+    driver._normal_stop_policy_braking = True
+    driver._controlled_stop_active = True
+    driver._controlled_stop_source_identity = (10, 20)
+    driver._controlled_stop_reference_installed = True
+    driver._reference_source_identity = (10, 20)
+    driver._reference_authority.require(generation=10, source_sequence=20)
+    driver._reference_authority.mark_installed(
+        generation=10,
+        source_sequence=20,
+        planner_intent_generation=2,
+        reference_epoch=2,
+    )
+    driver._reference_authority.prime(
+        generation=10,
+        source_sequence=20,
+        reference_epoch=2,
+    )
+    driver._reference_authority.grant(
+        generation=10,
+        source_sequence=20,
+        reference_epoch=2,
+        granted_at_monotonic_s=clock.value,
+        granted_at_tick_ms=10_020,
+        dds_target_sequence=8,
+    )
+    driver._plant_support_stop_pending = True
+
+    response = driver.accept_json(
+        plant_request(identity=identity, plant=plant_failure())
+    )
+
+    assert response is not None
+    assert driver._normal_stop.snapshot.phase == "FAILED"
+    assert driver._normal_stop_policy_braking is True
+    assert driver._controlled_stop_active is True
+    assert driver._safe_hold_targets is None
+    assert driver._static_hold_active is False
+    assert driver._reference_authority.snapshot.phase == "GRANTED"
+    assert driver._plant_support_stop_pending is True
+    assert driver._normal_stop_static_boundary_locked() is False
+    assert driver._commit_static_hold_decision_locked(False) is False
 
 
 def test_old_plant_identity_and_boot_are_rejected_before_state_consumption(

@@ -1640,10 +1640,29 @@ class SonicDriver:
                 or authority.source_sequence != identity[1]
             )
         ):
-            # Do not partially rewrite the active stop identity after an IDLE
-            # reference has already been installed.  Such a second correlated
-            # transaction must take the stronger static-stop fallback.
-            return False
+            # The regular gait channel can finish installing and granting its
+            # continuous IDLE reference just before the correlated normal-stop
+            # request arrives with the next source sequence. Do not rewrite an
+            # executable reference, but do not revoke learned balance either.
+            # The normal-stop wire identity remains the newer sequence while
+            # this exact controller identity keeps DDS until Plant confirms its
+            # safety-stop latch.
+            active_identity = getattr(
+                self, "_controlled_stop_source_identity", None
+            )
+            if (
+                not isinstance(active_identity, tuple)
+                or len(active_identity) != 2
+                or active_identity[0] != identity[0]
+                or active_identity[1] >= identity[1]
+                or authority.generation != active_identity[0]
+                or authority.source_sequence != active_identity[1]
+                or not self._controlled_stop_reference_installed
+            ):
+                return False
+            self._balanced_policy_idle_active = False
+            self._navigation_task_active = False
+            return True
         if not already_active:
             self.guard.stop_at_measured_heading(
                 source="gait_adapter_controlled_stop"
@@ -4406,19 +4425,40 @@ class SonicDriver:
         """Return the current recoverable stop's physical/local hold fence."""
 
         normal_stop = getattr(self, "_normal_stop", None)
-        policy_braking = bool(
-            getattr(self, "_normal_stop_policy_braking", False)
-            and isinstance(normal_stop, NormalStopState)
-            and normal_stop.snapshot.phase == "BRAKING"
+        phase = (
+            normal_stop.snapshot.phase
+            if isinstance(normal_stop, NormalStopState)
+            else "NONE"
         )
+        policy_transition = bool(
+            getattr(self, "_normal_stop_policy_braking", False)
+            and phase == "BRAKING"
+        )
+        policy_balance_until_plant = bool(
+            getattr(self, "_normal_stop_policy_braking", False)
+            and phase in {"STATIONARY_ACK", "FAILED"}
+            and getattr(self, "_controlled_stop_active", False)
+            and getattr(self, "_controlled_stop_reference_installed", False)
+            and self._reference_authority.snapshot.phase == "GRANTED"
+            and self._reference_authority.snapshot.actuator_authority
+            and self._safe_hold_targets is None
+            and self._plant_support_mode == "idle"
+            and not self._plant_support_safety_latched
+            and not self._process_stop_fences_motion_locked()
+            and not self._fault_latched.is_set()
+        )
+        policy_owned_stop = policy_transition or policy_balance_until_plant
         return (
             self._process_stop_fences_motion_locked()
-            or self._plant_support_stop_pending
+            or (
+                self._plant_support_stop_pending
+                and not policy_balance_until_plant
+            )
             or self._plant_support_safety_latched
             or self._safe_hold_targets is not None
             or (
                 self._normal_stop_fences_motion_locked()
-                and not policy_braking
+                and not policy_owned_stop
             )
         )
 
@@ -5244,10 +5284,18 @@ class SonicDriver:
                                     "normal-stop begin intent was not admitted exactly"
                                 )
                             if policy_braking:
-                                self._controlled_stop_source_identity = (
-                                    generation,
-                                    sequence,
+                                controlled_identity = (
+                                    self._controlled_stop_source_identity
                                 )
+                                if (
+                                    controlled_identity is None
+                                    or controlled_identity[0] != generation
+                                    or controlled_identity[1] > sequence
+                                ):
+                                    raise NormalStopWireError(
+                                        "normal-stop policy identity is not bound "
+                                        "to the braking generation"
+                                    )
                             else:
                                 self._intent_ingress.revoke()
                             snapshot = state.begin(
@@ -5357,34 +5405,35 @@ class SonicDriver:
                 )
             if getattr(self, "_normal_stop_policy_braking", False):
                 authority = self._reference_authority.snapshot
+                controlled_identity = getattr(
+                    self, "_controlled_stop_source_identity", None
+                )
                 if (
-                    not getattr(
+                    not isinstance(controlled_identity, tuple)
+                    or len(controlled_identity) != 2
+                    or controlled_identity[0] != identity.control_generation
+                    or controlled_identity[1] > identity.gait_source_sequence
+                    or not getattr(
                         self, "_controlled_stop_reference_installed", False
                     )
                     or authority.phase != "GRANTED"
-                    or authority.generation != identity.control_generation
-                    or authority.source_sequence != identity.gait_source_sequence
+                    or authority.generation != controlled_identity[0]
+                    or authority.source_sequence != controlled_identity[1]
                 ):
                     raise NormalStopWireError(
                         "stationary acknowledgement requires the fresh IDLE "
                         "reference to cross DDS"
                     )
-                # The freshly rebased IDLE reference owns actuator authority
-                # only through measured braking. Freeze its exact last
-                # successful DDS target now that GaitAdapter has proved
-                # stationarity.
-                try:
-                    self._stop_navigation_at_boundary(
-                        source="normal_stop_stationary",
-                        publish_telemetry=False,
-                    )
-                except Exception as exc:
-                    raise _NormalStopBoundaryError(str(exc)) from exc
-                self._static_hold_active = True
-            # Either begin (already-static path) or the measured stationary
-            # transition above established the physical/local hold boundary.
-            # Keep the remaining commit short so Plant halt never waits on
-            # planner work.
+                # GaitAdapter stationarity proves that the base stopped; it does
+                # not prove that an untethered humanoid can stand after learned
+                # control is removed. Keep the continuous IDLE policy on DDS
+                # until Plant independently confirms its safety-stop latch.
+                # Freezing here creates an unsupported interval between this RPC
+                # and the later Plant RPC, which made the live model fall even
+                # though the navigation action had stopped successfully.
+            # The startup/pre-grant branch already owns an exact static hold.
+            # The learned-policy branch deliberately remains dynamic until the
+            # correlated Plant acknowledgement reaches _handle_normal_stop_plant.
             with self._terminal_fault_lock:
                 if self._fault_latched.is_set():
                     raise RuntimeError(
@@ -5433,7 +5482,9 @@ class SonicDriver:
         The caller owns the support and terminal locks.  Plant evidence may
         establish the external support facts, but it cannot manufacture an
         actuator boundary, revoke a reference, or make a non-zero command
-        static.  Those facts must already be exact from the braking phase.
+        static.  For a learned-policy stop those facts are established only
+        after the Plant latch is externally confirmed; startup/pre-grant stops
+        may already carry them from the begin phase.
         """
 
         generation = identity.control_generation
@@ -5652,10 +5703,24 @@ class SonicDriver:
                     )
 
                 assert plant_epoch is not None
-                # Reference telemetry was already revoked at the braking
-                # boundary.  Snapshot it while support is serialized, before
-                # entering the terminal linearization lock; the short commit
-                # below performs no planner/guard/handoff calls.
+                if getattr(self, "_normal_stop_policy_braking", False):
+                    # Plant is already physically latched at this point. It is
+                    # now safe to replace the learned IDLE balance controller
+                    # with the exact last successful DDS target and revoke its
+                    # reference authority. Never perform this transition on the
+                    # earlier stationary acknowledgement: without the Plant
+                    # latch, a static joint target cannot balance the humanoid.
+                    try:
+                        self._stop_navigation_at_boundary(
+                            source="normal_stop_plant_confirmed",
+                            publish_telemetry=False,
+                        )
+                    except Exception as exc:
+                        raise _NormalStopLocalHoldError(str(exc)) from exc
+                    self._static_hold_active = True
+                # Snapshot the now-revoked reference telemetry while support is
+                # serialized, before entering the terminal linearization lock;
+                # the short commit below performs no planner/guard/handoff calls.
                 planner_telemetry = self._planner_telemetry_fields()
                 # The external Plant proof and every local authority fact form
                 # one short commit.  No boundary, network, planner, guard, or

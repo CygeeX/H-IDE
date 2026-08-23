@@ -75,7 +75,20 @@ def test_forward_probe_is_a_fixed_short_official_drive() -> None:
     }
     assert runner.action_timeout_s(
         "forward_probe", runner.motion_goal("forward_probe")
-    ) == pytest.approx(10.0 + 2.0 / 3.0)
+    ) == pytest.approx(15.0)
+
+
+def test_translation_deadline_uses_observed_progress_without_changing_command() -> None:
+    assert runner.motion_goal("reverse") == {
+        "distanceM": -0.5,
+        "speedMps": runner.OFFICIAL_REVERSE_SPEED_MPS,
+    }
+    assert runner.action_timeout_s(
+        "reverse", runner.motion_goal("reverse")
+    ) == pytest.approx(22.5)
+    assert runner.action_timeout_s(
+        "forward_3m", runner.motion_goal("forward_3m")
+    ) == pytest.approx(85.0)
 
 
 def test_drive_on_heading_goal_speed_has_the_same_sign_as_distance() -> None:
@@ -848,7 +861,7 @@ class FakeExecutorBackend:
 
     def send_drive(self, distance_m: float, *, timeout_s: float):
         assert distance_m == 1.0
-        assert timeout_s == pytest.approx(10.0 + 10.0 / 3.0)
+        assert timeout_s == pytest.approx(35.0)
         self.calls.append("send_drive")
         return SimpleNamespace(kind="DriveOnHeading")
 
@@ -974,7 +987,7 @@ class FakeDetourBackend(FakeExecutorBackend):
 
     def send_drive(self, distance_m: float, *, timeout_s: float):
         assert distance_m == 0.5
-        assert timeout_s == pytest.approx(10.0 + 5.0 / 3.0)
+        assert timeout_s == pytest.approx(22.5)
         self.calls.append("send_drive")
         return SimpleNamespace(kind="DriveOnHeading")
 

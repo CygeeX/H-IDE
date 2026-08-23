@@ -38,6 +38,15 @@ OFFICIAL_REVERSE_SPEED_MPS = 0.20
 OFFICIAL_LATERAL_SPEED_MPS = 0.35
 OFFICIAL_SPIN_MIN_RPS = 0.10
 OFFICIAL_SPIN_MAX_RPS = 0.20
+# The command values above are NVIDIA/Nav2 setpoints and remain unchanged. Live
+# r18 evidence measured 0.2913 m over 6.964 s of commanded reverse motion
+# (0.04183 m/s), while an earlier isolated physics run measured about 0.0507
+# m/s. Size action time allowances from the lower observed whole-body progress
+# rate instead of pretending that the command setpoint is achieved base speed.
+# This changes only the deadline; the relayed command is still the exact
+# official value and the independent progress/fall/contact gates remain active.
+OBSERVED_TRANSLATION_PROGRESS_FLOOR_MPS = 0.04
+TRANSLATION_STARTUP_STOP_MARGIN_S = 10.0
 NAV2_COMMAND_STALE_S = 0.15
 LATERAL_DISTANCE_M = 0.50
 LATERAL_STOP_TOLERANCE_M = 0.03
@@ -1871,12 +1880,26 @@ def motion_goal(mode: str) -> dict[str, float]:
 def action_timeout_s(mode: str, goal: Mapping[str, Any]) -> float:
     if mode in StrictCommandRelay._DRIVE_MODES:
         speed = _finite(goal.get("speedMps"), "speedMps")
-        return abs(_finite(goal.get("distanceM"), "distanceM")) / speed + 10.0
+        if speed <= 0.0:
+            raise ValueError("speedMps must be positive")
+        return translation_action_timeout_s(
+            abs(_finite(goal.get("distanceM"), "distanceM"))
+        )
     if mode in StrictCommandRelay._SPIN_MODES:
         return abs(_finite(goal.get("targetYawRad"), "targetYawRad")) / OFFICIAL_SPIN_MIN_RPS + 10.0
     if mode in StrictCommandRelay._LATERAL_MODES:
-        return LATERAL_DISTANCE_M / OFFICIAL_LATERAL_SPEED_MPS + 10.0
+        return translation_action_timeout_s(LATERAL_DISTANCE_M)
     raise ValueError("detour timeouts are resolved per primitive")
+
+
+def translation_action_timeout_s(distance_m: float) -> float:
+    distance = _finite(distance_m, "translation distance")
+    if distance < 0.0:
+        raise ValueError("translation distance must be non-negative")
+    return (
+        distance / OBSERVED_TRANSLATION_PROGRESS_FLOOR_MPS
+        + TRANSLATION_STARTUP_STOP_MARGIN_S
+    )
 
 
 def _load_file_module(name: str, path: Path) -> Any:
@@ -2607,7 +2630,7 @@ class StrictMotionCaseExecutor:
                     }
                     primitive_type = "DriveOnHeading"
                     direction = 1
-                    timeout_s = distance / OFFICIAL_DRIVE_SPEED_MPS + 10.0
+                    timeout_s = translation_action_timeout_s(distance)
                 elif action_type == "nav2_msgs/action/Spin":
                     target_yaw = _finite(
                         resolved_goal.get("target_yaw_rad"),
