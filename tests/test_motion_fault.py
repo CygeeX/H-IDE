@@ -1014,7 +1014,7 @@ def test_stale_health_gate_alternating_codes_share_one_unhealthy_streak() -> Non
     assert lowstate_again.pending.count == 3
 
 
-def test_starting_static_pregrant_has_bounded_control_jitter_grace() -> None:
+def test_starting_static_pregrant_control_stale_remains_strict() -> None:
     gate = health_fault_gate()
 
     pregrant = parse_health(
@@ -1026,46 +1026,17 @@ def test_starting_static_pregrant_has_bounded_control_jitter_grace() -> None:
         matched_reference_actuator_authority=False,
         reference_authority_state="REVOKED",
     )
-    accepted = observe(gate, pregrant, gait_state=GaitState.STARTING)
-
-    assert accepted.confirmed_cause is None
-    assert accepted.pending is None
-
-    first_late = observe(
-        gate,
-        parse_health(
-            control_age=0.251,
-            static_hold_active=True,
-            navigation_task_active=True,
-            motion_authorized=True,
-            nav2_command_zero=False,
-            matched_reference_actuator_authority=False,
-            reference_authority_state="REQUIRED",
-        ),
-        gait_state=GaitState.STARTING,
-    )
-    second_late = observe(
-        gate,
-        parse_health(
-            control_age=0.276,
-            static_hold_active=True,
-            navigation_task_active=True,
-            motion_authorized=True,
-            nav2_command_zero=False,
-            matched_reference_actuator_authority=False,
-            reference_authority_state="REQUIRED",
-        ),
-        gait_state=GaitState.STARTING,
-    )
+    first_late = observe(gate, pregrant, gait_state=GaitState.STARTING)
+    second_late = observe(gate, pregrant, gait_state=GaitState.STARTING)
 
     assert first_late.pending is not None
     assert first_late.confirmed_cause is None
     assert second_late.confirmed_cause is not None
     assert second_late.confirmed_cause.code == "SONIC_CONTROL_STALE"
-    assert "0.250000s" in second_late.confirmed_cause.reason
+    assert "0.100000s" in second_late.confirmed_cause.reason
 
 
-def test_pregrant_grace_never_applies_to_lowstate_or_granted_motion() -> None:
+def test_starting_lowstate_and_granted_control_stale_are_strict() -> None:
     pregrant_lowstate_stale = parse_health(
         age=0.101,
         control_age=0.127784,

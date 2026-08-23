@@ -2242,9 +2242,10 @@ def test_run_never_enters_reference_or_policy_during_nominal_activation() -> Non
     driver._policy_activation_requested = True
     activation_calls: list[int] = []
 
-    def activation_tick(**kwargs) -> None:
+    def activation_tick(**kwargs) -> bool:
         activation_calls.append(kwargs["control_step"].tick_ms)
         driver._stop.set()
+        return True
 
     driver._run_nominal_policy_activation = activation_tick
     driver._progress_reference_transaction = lambda _lowstate: (_ for _ in ()).throw(
@@ -2367,7 +2368,9 @@ def test_tiny_spin_ramp_keeps_proven_idle_until_yaw_request_is_meaningful() -> N
     driver._decoder_facing_rad = 0.0
     driver._pending_decoder_heading_delta_rad = 0.0
     driver._last_intent_signature = None
-    driver._policy_activation = SimpleNamespace(prepared=True)
+    # Cold-start activation must not be requested until this rotation intent
+    # actually crosses the planner's verified request floor.
+    driver._policy_activation = SimpleNamespace(prepared=False)
     driver._policy_activation_requested = False
     evidence = _TransactionalEvidence()
     driver._planner_evidence = evidence
@@ -2400,6 +2403,7 @@ def test_tiny_spin_ramp_keeps_proven_idle_until_yaw_request_is_meaningful() -> N
     assert driver._intent_gate.last is idle
     assert driver._reference_request_pending is False
     assert driver._reference_authority.snapshot.phase == "REVOKED"
+    assert driver._policy_activation_requested is False
     assert evidence.intent_generation == 0
     assert controller.ms.mode == 0
     assert controller.ms.facing_angle == pytest.approx(0.0)

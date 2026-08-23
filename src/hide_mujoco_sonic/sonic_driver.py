@@ -3161,7 +3161,14 @@ class SonicDriver:
         activation_prepared = bool(
             activation is None or getattr(activation, "prepared", False)
         )
-        if starting_motion and not activation_prepared:
+        # A pure-rotation ramp is deliberately held below the planner's
+        # verified 0.05-rad request floor.  That raw, not-yet-admitted intent
+        # does not own a reference transaction and therefore must not divert
+        # the 50 Hz loop into nominal activation.  Doing so used to make the
+        # activation precheck return (authority was still REVOKED) while the
+        # caller skipped the normal static DDS hold, creating a deterministic
+        # 250+ ms control-publish gap before every Spin.
+        if starting_motion and admitted and not activation_prepared:
             self._policy_activation_requested = True
         defer_planner_for_activation = bool(
             intent.mode != "IDLE"
@@ -3706,7 +3713,7 @@ class SonicDriver:
         control_step: PlantControlStep,
         intent: Any,
         measured: tuple[float, ...],
-    ) -> None:
+    ) -> bool:
         """Run one policy-free 50 Hz INIT tick at the actuator boundary."""
 
         from lerobot.robots.unitree_g1.controllers.sonic_pipeline import (
@@ -3736,7 +3743,7 @@ class SonicDriver:
                 or self._plant_support_safety_latched
                 or self._normal_stop_fences_motion_locked()
             ):
-                return
+                return False
             boundary = self._last_published_targets
             if boundary is None:
                 raise RuntimeError(
@@ -3910,6 +3917,7 @@ class SonicDriver:
                 max(0.0, completed_at - traced_at),
                 phase,
             )
+        return True
 
     def _progress_reference_transaction(self, lowstate) -> bool:
         """Plan, install, and prime one required reference without policy work."""
@@ -4835,22 +4843,26 @@ class SonicDriver:
                 ):
                     self._control_loop_stage = "nominal_policy_activation"
                     try:
-                        self._run_nominal_policy_activation(
-                            lowstate=lowstate,
-                            control_step=control_step,
-                            intent=intent,
-                            measured=measured,
+                        activation_tick_published = (
+                            self._run_nominal_policy_activation(
+                                lowstate=lowstate,
+                                control_step=control_step,
+                                intent=intent,
+                                measured=measured,
+                            )
                         )
                     except NominalPolicyActivationFault as exc:
                         self._latch_motion_fault(
                             "policy_activation/POLICY_ACTIVATION_FAULT: "
                             + str(exc)
                         )
+                        continue
                     # INIT and tethered settling are policy-free.  Their final
                     # exact DDS boundary opens reference planning; the learned
                     # controller then receives DDS authority before the
                     # simulation fall arrest is released.
-                    continue
+                    if activation_tick_published:
+                        continue
 
                 self._control_loop_stage = "reference_transaction"
                 if not self._progress_reference_transaction(lowstate):
