@@ -172,9 +172,9 @@ def test_controlled_stop_accepts_only_a_bounded_official_idle_reference() -> Non
     # 3 m gait (max frame speed 0.242 m/s, final 200 ms max 0.0058 m/s).
     # The first live stop produced 49.61 mm. This fixture brackets both while
     # retaining per-frame and terminal-settle proof.
-    # The exact 0.2 m live DriveOnHeading stop produced 0.037945 rad.  Preserve
-    # that locked-model behavior without widening beyond one 0.05 rad facing
-    # bin, while the independent translation/speed/settle gates remain active.
+    # The exact 0.2 m live DriveOnHeading stop produced 0.037945 rad. Preserve
+    # that locked-model behavior while the independent translation, speed, and
+    # settle gates remain active.
     accepted = (settled_idle_motion(0.050, last_yaw=0.038), 15)
     planner.result = accepted
 
@@ -198,11 +198,48 @@ def test_controlled_stop_accepts_only_a_bounded_official_idle_reference() -> Non
     ] == pytest.approx(0.0)
 
 
+def test_controlled_stop_accepts_captured_one_meter_idle_braking_yaw() -> None:
+    planner = FakePlanner()
+    gate = PlannerReferenceEvidenceGate()
+    gate.bind(planner, reference_owner=SimpleNamespace(ref_cursor=0))
+    gate.observe_intent(
+        idle_intent(),
+        admitted=True,
+        simulation_now_s=1.0,
+        allow_static_reference=True,
+    )
+    idle_state = FakeMovementState(
+        movement_angle=0.0,
+        has_movement=False,
+        mode=0,
+        speed=-1.0,
+    )
+    planner.request_replan(5, idle_state)
+    captured = (
+        settled_idle_motion(
+            0.06212649103626625,
+            last_yaw=0.06018299433422181,
+        ),
+        15,
+    )
+    planner.result = captured
+
+    assert planner.try_get_new_motion() == captured
+    assert gate.reference_ready is True
+    evidence = gate.telemetry_fields(ref_cursor=0)
+    assert evidence["sonic_planner_static_root_yaw_delta_rad"] == pytest.approx(
+        0.06018299433422181
+    )
+    assert evidence["sonic_planner_static_root_max_translation_m"] == pytest.approx(
+        0.06212649103626625
+    )
+
+
 @pytest.mark.parametrize(
     ("candidate", "reason"),
     [
         (settled_idle_motion(0.081), "translation"),
-        (settled_idle_motion(0.050, last_yaw=0.051), "yaw"),
+        (settled_idle_motion(0.050, last_yaw=0.151), "yaw"),
         (settled_idle_motion(0.050, approach_steps=6), "speed"),
         (settled_idle_motion(0.050, tail_speed_mps=0.026), "settle"),
         (motion(0.011), "usable root trajectory"),
