@@ -55,6 +55,7 @@ from .runtime_diagnostics import SonicRuntimeDiagnostics
 from .safety import (
     CmdVelGuard,
     JointGuardResult,
+    MovementIntent,
     NavigationArmGuard,
     NominalPolicyActivation,
     NominalPolicyActivationDecision,
@@ -3934,7 +3935,98 @@ class SonicDriver:
             )
         return True
 
-    def _progress_reference_transaction(self, lowstate) -> bool:
+    def _synchronize_controlled_stop_facing_at_request_locked(
+        self,
+        *,
+        simulation_now_s: float | None,
+    ) -> bool:
+        """Bind continuous IDLE to the cursor that is actually enqueued.
+
+        The command thread samples the live reference facing when STOPPING
+        first wins the outer support boundary.  A policy decode may already be
+        in flight at that instant.  Its successful DDS feedback is still an
+        authoritative fact and may advance the vendor cursor by one frame
+        before the 50 Hz owner reaches the planner-request boundary.  Reusing
+        the earlier facing then fails SONIC's exact continuous-IDLE contract.
+
+        Resample only here, after all pending execution feedback is complete
+        and immediately before the same owner thread calls the planner.  Keep
+        the strict 1e-9 vendor check; update every local/evidence representation
+        of the stop instead of introducing a tolerance or dropping history.
+        The caller owns ``_support_lock``.
+        """
+
+        if not (
+            getattr(self, "_controlled_stop_active", False)
+            and getattr(self, "_reference_request_continuous", False)
+            and getattr(self, "_reference_request_pending", False)
+        ):
+            return False
+        controller = self._controller
+        if controller.execution_feedback_pending:
+            raise RuntimeError(
+                "controlled-stop facing cannot be sampled with pending feedback"
+            )
+        reference_facing = getattr(
+            controller,
+            "current_reference_facing_angle",
+            None,
+        )
+        if not callable(reference_facing):
+            raise RuntimeError(
+                "controlled stop lacks live reference-facing evidence"
+            )
+        live_facing = float(reference_facing())
+        if not math.isfinite(live_facing):
+            raise RuntimeError("controlled stop live reference facing is not finite")
+        current_facing = float(getattr(controller.ms, "facing_angle", math.nan))
+        if math.isfinite(current_facing) and abs(
+            self._angular_delta(live_facing, current_facing)
+        ) <= 1e-9:
+            return False
+
+        self.guard.stop_at_measured_heading(
+            source="gait_adapter_controlled_stop",
+            facing_angle_rad=live_facing,
+        )
+        intent = MovementIntent(
+            mode="IDLE",
+            speed_mps=0.0,
+            movement_angle_rad=live_facing,
+            facing_angle_rad=live_facing,
+            has_movement=False,
+            stale=False,
+            source="gait_adapter_controlled_stop",
+        )
+        controller.ms.mode = 0
+        controller.ms.speed = -1.0
+        controller.ms.height = -1.0
+        controller.ms.movement_angle = 0.0
+        controller.ms.facing_angle = live_facing
+        controller.ms.has_movement = False
+        controller.ms.needs_replan = False
+        self._planner_evidence.observe_intent(
+            intent,
+            admitted=True,
+            simulation_now_s=simulation_now_s,
+            allow_static_reference=True,
+        )
+        self._last_intent_signature = (
+            False,
+            round(live_facing, 3),
+            round(live_facing, 3),
+            -1.0,
+        )
+        self._decoder_facing_rad = live_facing
+        self._pending_decoder_heading_delta_rad = 0.0
+        return True
+
+    def _progress_reference_transaction(
+        self,
+        lowstate,
+        *,
+        simulation_now_s: float | None = None,
+    ) -> bool:
         """Plan, install, and prime one required reference without policy work."""
 
         with self._support_lock:
@@ -3963,6 +4055,9 @@ class SonicDriver:
                 if controller.execution_feedback_pending:
                     return False
                 if continuous_stop:
+                    self._synchronize_controlled_stop_facing_at_request_locked(
+                        simulation_now_s=simulation_now_s,
+                    )
                     request_continuous_idle = getattr(
                         controller,
                         "request_continuous_idle_reference",
@@ -4886,7 +4981,10 @@ class SonicDriver:
                         continue
 
                 self._control_loop_stage = "reference_transaction"
-                if not self._progress_reference_transaction(lowstate):
+                if not self._progress_reference_transaction(
+                    lowstate,
+                    simulation_now_s=control_step.tick_ms / 1_000.0,
+                ):
                     self._control_loop_stage = "reference_wait_hold"
                     self._enforce_planner_reference_deadline(
                         simulation_now_s=control_step.tick_ms / 1_000.0

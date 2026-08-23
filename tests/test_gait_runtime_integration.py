@@ -2186,7 +2186,7 @@ def test_run_writes_first_policy_dds_before_requesting_support_release(
     driver._prepare_idle_startup = lambda: None
     driver._startup_qualifying = False
     driver._apply_intent = lambda *_args, **_kwargs: intent
-    driver._progress_reference_transaction = lambda _lowstate: True
+    driver._progress_reference_transaction = lambda _lowstate, **_kwargs: True
     driver._record_control_trace = lambda **_kwargs: None
     support_modes: list[str] = []
 
@@ -2258,9 +2258,9 @@ def test_run_never_enters_reference_or_policy_during_nominal_activation() -> Non
         return True
 
     driver._run_nominal_policy_activation = activation_tick
-    driver._progress_reference_transaction = lambda _lowstate: (_ for _ in ()).throw(
-        AssertionError("reference transaction ran during nominal activation")
-    )
+    driver._progress_reference_transaction = lambda _lowstate, **_kwargs: (
+        _ for _ in ()
+    ).throw(AssertionError("reference transaction ran during nominal activation"))
     driver._controller = SimpleNamespace(shutdown=lambda: None)
 
     driver.run()
@@ -2884,6 +2884,7 @@ def test_controlled_stop_watchdog_age_cannot_replan_the_same_source_sequence() -
     controller = _TransactionalController(evidence, target)
     controller.reference_install_epoch = 2
     controller.reference_authority = True
+    controller.reference_facing_angle = 0.22029595072884373
     driver._controller = controller
     driver._planner_evidence = evidence
     driver._last_published_targets = boundary
@@ -2920,6 +2921,7 @@ def test_controlled_stop_watchdog_age_cannot_replan_the_same_source_sequence() -
     driver.guard = SimpleNamespace(
         intent=lambda **_kwargs: current_intent[0],
         last_received_at=clock.value,
+        stop_at_measured_heading=lambda **_kwargs: None,
     )
 
     first_idle = driver._apply_intent(0.02, simulation_now_s=clock.value)
@@ -2995,6 +2997,83 @@ def test_controlled_stop_watchdog_age_cannot_replan_the_same_source_sequence() -
     )
     assert driver._reference_authority.snapshot.phase == "GRANTED"
     assert driver._reference_authority.snapshot.reference_epoch == 4
+
+
+def test_controlled_stop_resamples_facing_at_the_owner_request_boundary() -> None:
+    """An in-flight policy feedback may advance the cursor after STOPPING."""
+
+    from lerobot.robots.unitree_g1.controllers.sonic_pipeline import DEFAULT_ANGLES
+
+    clock = Clock()
+    driver, _writes = _publishing_driver(clock)
+    boundary = tuple(float(value) for value in DEFAULT_ANGLES)
+    lowstate = _lowstate(boundary)
+    evidence = _TransactionalEvidence()
+    old_facing = 0.870992738
+    new_facing = 0.896354899
+    old_idle = MovementIntent(
+        mode="IDLE",
+        speed_mps=0.0,
+        movement_angle_rad=old_facing,
+        facing_angle_rad=old_facing,
+        has_movement=False,
+        stale=False,
+        source="gait_adapter_controlled_stop",
+    )
+    evidence.observe_intent(
+        old_idle,
+        admitted=True,
+        simulation_now_s=1.0,
+        allow_static_reference=True,
+    )
+
+    class ExactFacingController(_TransactionalController):
+        def request_continuous_idle_reference(self) -> None:
+            facing_error = SonicDriver._angular_delta(
+                self.ms.facing_angle,
+                self.current_reference_facing_angle(),
+            )
+            if abs(facing_error) > 1e-9:
+                raise RuntimeError(
+                    "continuous SONIC IDLE stop requires the exact live-reference facing"
+                )
+            super().request_continuous_idle_reference()
+
+    controller = ExactFacingController(evidence, boundary)
+    controller.reference_authority = True
+    controller.reference_facing_angle = new_facing
+    controller.ms.mode = 0
+    controller.ms.speed = -1.0
+    controller.ms.height = -1.0
+    controller.ms.movement_angle = 0.0
+    controller.ms.facing_angle = old_facing
+    controller.ms.has_movement = False
+    driver._controller = controller
+    driver._planner_evidence = evidence
+    driver._last_published_targets = boundary
+    driver._controlled_stop_active = True
+    driver._controlled_stop_source_identity = (42, 9)
+    driver._controlled_stop_reference_installed = False
+    driver._reference_source_identity = (42, 9)
+    driver._reference_authority.require(generation=42, source_sequence=9)
+    driver._reference_request_pending = True
+    driver._reference_request_continuous = True
+
+    # Model the r54 race: STOPPING sampled ``old_facing`` while a candidate was
+    # in flight; successful DDS feedback moved the live reference one frame
+    # before the owner thread enqueued the continuous IDLE request.
+    assert driver._progress_reference_transaction(
+        lowstate,
+        simulation_now_s=1.02,
+    ) is False
+
+    assert controller.continuous_request_calls == 1
+    assert controller.ms.facing_angle == pytest.approx(new_facing)
+    assert controller.ms.movement_angle == pytest.approx(0.0)
+    assert driver._decoder_facing_rad == pytest.approx(new_facing)
+    assert evidence.intent_generation == 2
+    assert evidence.intent_signature is not None
+    assert driver._reference_request_pending is False
 
 
 def test_correlated_stop_takes_over_inflight_idle_request_without_requeue() -> None:
@@ -4162,7 +4241,7 @@ def test_finite_arm_policy_overshoot_is_projected_without_halting_plant(
     samples = [(lowstate, PlantControlStep(tick_ms=1_020, dt_s=0.02), 0)]
     driver._next_control_sample = lambda: samples.pop(0)
     driver._apply_intent = lambda *_args, **_kwargs: _movement_intent(0.0)
-    driver._progress_reference_transaction = lambda _lowstate: True
+    driver._progress_reference_transaction = lambda _lowstate, **_kwargs: True
     driver._prime_periodic_reference_refresh = lambda: None
     driver._joint_handoff = SimpleNamespace(
         decide=lambda **kwargs: SimpleNamespace(
