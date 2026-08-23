@@ -9,10 +9,44 @@ import numpy as np
 
 from hide_mujoco_sonic.plant import (
     PlantControlSynchronizer,
+    PlantLowStatePublishCadence,
     PlantPhysicsFault,
     PlantSupportController,
     stabilized_support_wrench,
 )
+
+
+def test_lowstate_publish_cadence_downsamples_physics_to_control_rate() -> None:
+    cadence = PlantLowStatePublishCadence(control_hz=50, physics_dt_s=0.004)
+
+    admitted = [tick for tick in range(0, 61, 4) if cadence.admit(tick)]
+
+    assert admitted == [0, 20, 40, 60]
+    assert cadence.period_ms == 20
+    assert cadence.physics_step_ms == 4
+
+
+def test_lowstate_publish_cadence_rejects_skipped_control_boundary() -> None:
+    cadence = PlantLowStatePublishCadence(control_hz=50, physics_dt_s=0.004)
+    assert cadence.admit(0) is True
+
+    with pytest.raises(PlantPhysicsFault, match="skipped a control period"):
+        cadence.admit(40)
+
+
+@pytest.mark.parametrize(
+    ("control_hz", "physics_dt_s"),
+    [(True, 0.004), (0, 0.004), (60, 0.004), (50, True), (50, 0.003)],
+)
+def test_lowstate_publish_cadence_rejects_incompatible_clocks(
+    control_hz: int,
+    physics_dt_s: float,
+) -> None:
+    with pytest.raises(ValueError):
+        PlantLowStatePublishCadence(
+            control_hz=control_hz,
+            physics_dt_s=physics_dt_s,
+        )
 
 
 def test_support_controller_finishes_startup_without_overriding_locomotion():

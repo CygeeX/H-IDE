@@ -770,6 +770,59 @@ class PlantControlSynchronizer:
             }
 
 
+class PlantLowStatePublishCadence:
+    """Admit one authoritative LowState per SONIC control period.
+
+    MuJoCo physics remains at its configured high rate, while the learned
+    controller consumes exactly one observation at 50 Hz. Publishing every
+    4 ms through the Python Unitree transport only creates replaceable DDS
+    samples and callback pressure; it cannot advance SONIC more quickly.
+    """
+
+    def __init__(self, *, control_hz: int, physics_dt_s: float) -> None:
+        if isinstance(control_hz, bool) or int(control_hz) <= 0:
+            raise ValueError("LowState control frequency must be positive")
+        if 1_000 % int(control_hz) != 0:
+            raise ValueError("LowState control frequency must divide 1000")
+        if isinstance(physics_dt_s, bool):
+            raise ValueError("MuJoCo physics period must be integral milliseconds")
+        step_ms_float = float(physics_dt_s) * 1_000.0
+        if not math.isfinite(step_ms_float):
+            raise ValueError("MuJoCo physics period must be integral milliseconds")
+        step_ms = int(round(step_ms_float))
+        if step_ms <= 0 or not math.isclose(
+            step_ms_float,
+            float(step_ms),
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise ValueError("MuJoCo physics period must be integral milliseconds")
+        period_ms = 1_000 // int(control_hz)
+        if period_ms % step_ms != 0:
+            raise ValueError("MuJoCo physics period must divide LowState period")
+        self.period_ms = period_ms
+        self.physics_step_ms = step_ms
+        self.last_published_tick_ms: int | None = None
+
+    def admit(self, tick_ms: int) -> bool:
+        if isinstance(tick_ms, bool) or not isinstance(tick_ms, int) or tick_ms < 0:
+            raise ValueError("LowState publish tick must be non-negative")
+        previous = self.last_published_tick_ms
+        if previous is not None and tick_ms < previous:
+            raise PlantPhysicsFault(
+                f"LowState publish clock rolled back: {previous}ms -> {tick_ms}ms"
+            )
+        if tick_ms % self.period_ms != 0 or tick_ms == previous:
+            return False
+        if previous is not None and tick_ms - previous != self.period_ms:
+            raise PlantPhysicsFault(
+                "LowState publish cadence skipped a control period: "
+                f"{previous}ms -> {tick_ms}ms"
+            )
+        self.last_published_tick_ms = tick_ms
+        return True
+
+
 def stabilized_support_wrench(
     raw_wrench,
     pose,
@@ -2086,6 +2139,7 @@ def run_plant(config: SimConfig) -> int:
         raise RuntimeError(f"pinned Unitree simulator is missing: {simulator_root}")
     sys.path.insert(0, str(simulator_root))
     from sim.simulator_factory import SimulatorFactory, init_channel
+    from sim.unitree_sdk2py_bridge import simulation_time_to_tick_ms
 
     model_config = {
         "ROBOT_TYPE": "g1_29dof",
@@ -2197,16 +2251,27 @@ def run_plant(config: SimConfig) -> int:
         wait_for_command_for_tick=unitree_bridge.WaitForLowCmdForTick,
     )
     original_publish_lowstate = unitree_bridge.PublishLowState
+    lowstate_publish_cadence = PlantLowStatePublishCadence(
+        control_hz=config.control_hz,
+        physics_dt_s=float(model_config["SIMULATE_DT"]),
+    )
 
     def publish_synchronized_lowstate(observation):
+        tick_ms = simulation_time_to_tick_ms(observation["time"])
+        if not lowstate_publish_cadence.admit(tick_ms):
+            return None
         # Snapshot before publish so a fast DDS response cannot race past the
         # waiter.  Once support is released there is exactly one controller
         # write per admitted 50 Hz LowState; an asynchronous stop write after
         # this boundary is also a valid fresh actuator decision.
         command_identity = control_synchronizer.command_identity_before_publish()
         result = original_publish_lowstate(observation)
+        if int(unitree_bridge.low_state.tick) != tick_ms:
+            raise PlantPhysicsFault(
+                "published LowState tick differs from admitted MuJoCo tick"
+            )
         control_synchronizer.wait_after_lowstate(
-            tick_ms=int(unitree_bridge.low_state.tick),
+            tick_ms=tick_ms,
             command_identity_before_publish=command_identity,
         )
         return result
