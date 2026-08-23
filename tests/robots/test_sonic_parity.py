@@ -576,11 +576,13 @@ def test_continuous_idle_stop_preserves_cursor_and_executed_history():
     runtime.ms.speed = -1.0
     runtime.ms.height = -1.0
     runtime.ms.movement_angle = 0.0
-    runtime.ms.facing_angle = 0.0
+    reference_facing = runtime.current_reference_facing_angle()
+    runtime.ms.facing_angle = reference_facing
     runtime.ms.has_movement = False
     runtime.request_continuous_idle_reference()
 
     assert planner.requests[-1][0] == cursor_before
+    assert planner.requests[-1][1].facing_angle == pytest.approx(reference_facing)
     assert not runtime.reference_authority
     assert controller.ref_cursor == cursor_before
     assert runtime.step == step_before
@@ -606,10 +608,14 @@ def test_continuous_idle_stop_preserves_cursor_and_executed_history():
     ):
         np.testing.assert_array_equal(np.asarray(actual), expected)
 
+    runtime.ms.facing_angle = runtime.current_reference_facing_angle() + 0.10
+    with pytest.raises(RuntimeError, match="exact live-reference facing"):
+        runtime.request_continuous_idle_reference()
+
     runtime.ms.mode = 1
     runtime.ms.speed = 0.2
     runtime.ms.has_movement = True
-    with pytest.raises(RuntimeError, match="exact heading-neutral IDLE intent"):
+    with pytest.raises(RuntimeError, match="exact live-reference facing"):
         runtime.request_continuous_idle_reference()
 
 

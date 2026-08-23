@@ -1309,6 +1309,24 @@ class PlannerController(StandingEncoderDecoder):
 
         return self.actuator_authority and self.matching_reference_ready
 
+    def current_reference_facing_angle(self) -> float:
+        """Return the yaw of the exact reference frame at the live cursor."""
+
+        with self.motion_lock:
+            cursor = int(self.ref_cursor)
+            if (
+                self.motion_timesteps <= 0
+                or cursor < 0
+                or cursor >= self.motion_timesteps
+            ):
+                raise RuntimeError(
+                    "SONIC current reference facing requires a live motion cursor"
+                )
+            facing = calc_heading(self.motion_body_quats[cursor])
+        if not np.isfinite(facing):
+            raise RuntimeError("SONIC current reference facing must be finite")
+        return float(facing)
+
     def set_reference_authority(self, *, actuator_authority, matching_reference_ready):
         """Set the two independent prerequisites for reference playback."""
 

@@ -269,6 +269,11 @@ class SonicRuntime:
 
         return self._matching_reference_loaded
 
+    def current_reference_facing_angle(self) -> float:
+        """Return the exact live planner-reference yaw at the current cursor."""
+
+        return self.controller.current_reference_facing_angle()
+
     def _start_planner_worker(self):
         if self._planner_worker_started:
             return
@@ -362,10 +367,11 @@ class SonicRuntime:
         request cursor and blend point are independent of host scheduling.
 
         A controlled IDLE stop is deliberately a separate public operation from
-        a moving replan.  It may preserve policy history only for the exact
-        heading-neutral IDLE intent; arbitrary static poses and pure-rotation
-        intents must use their normal transaction instead of borrowing this
-        braking seam.
+        a moving replan.  It may preserve policy history only for a stationary
+        IDLE intent, while retaining the already-admitted facing direction just
+        like NVIDIA's ROS2 input adapter does when angular velocity becomes
+        zero. Arbitrary static poses and active movement intents must use their
+        normal transaction instead of borrowing this braking seam.
         """
 
         if not self._initialized:
@@ -387,22 +393,25 @@ class SonicRuntime:
         is_idle = LM(self.ms.mode) == LM.IDLE
         has_movement = bool(self.ms.has_movement)
         if controlled_idle_stop:
-            neutral_values = (
-                float(self.ms.movement_angle),
-                float(self.ms.facing_angle),
+            movement_angle = float(self.ms.movement_angle)
+            facing_angle = float(self.ms.facing_angle)
+            reference_facing = self.current_reference_facing_angle()
+            facing_error = math.atan2(
+                math.sin(facing_angle - reference_facing),
+                math.cos(facing_angle - reference_facing),
             )
             if (
                 not is_idle
                 or has_movement
                 or float(self.ms.speed) != -1.0
                 or float(self.ms.height) != -1.0
-                or any(
-                    not math.isfinite(value) or value != 0.0
-                    for value in neutral_values
-                )
+                or not math.isfinite(movement_angle)
+                or movement_angle != 0.0
+                or not math.isfinite(facing_angle)
+                or abs(facing_error) > 1e-9
             ):
                 raise RuntimeError(
-                    "continuous SONIC IDLE stop requires the exact heading-neutral IDLE intent"
+                    "continuous SONIC IDLE stop requires the exact live-reference facing"
                 )
         elif is_idle or not has_movement:
             raise RuntimeError(
@@ -425,7 +434,7 @@ class SonicRuntime:
         self._request_continuous_reference(controlled_idle_stop=False)
 
     def request_continuous_idle_reference(self) -> None:
-        """Freeze policy history and request one heading-neutral IDLE stop."""
+        """Freeze policy history and request one facing-preserving IDLE stop."""
 
         self._request_continuous_reference(controlled_idle_stop=True)
 
@@ -843,6 +852,11 @@ class SonicWholeBodyController:
     def matching_reference_installed(self) -> bool:
         return self._runtime.matching_reference_installed
 
+    def current_reference_facing_angle(self) -> float:
+        """Return the exact live planner-reference yaw at the current cursor."""
+
+        return self._runtime.current_reference_facing_angle()
+
     def initialize_from_lowstate(self, lowstate) -> bool:
         """Initialize planner/history from LowState without a policy tick."""
 
@@ -863,7 +877,7 @@ class SonicWholeBodyController:
         self._runtime.request_continuous_reference()
 
     def request_continuous_idle_reference(self) -> None:
-        """Freeze policy history and request one heading-neutral IDLE stop."""
+        """Freeze policy history and request one facing-preserving IDLE stop."""
 
         self._runtime.request_continuous_idle_reference()
 
