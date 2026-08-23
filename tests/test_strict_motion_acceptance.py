@@ -275,6 +275,7 @@ def _sample(mode: str, t_s: float, progress: float, active: bool, sequence: int)
     )
     angular_speed = 0.2 if active and mode in {"turn_left", "turn_right", "detour"} else 0.0
     isolation_manifest = _isolation_manifest(mode)
+    dynamics_sequence = 10_000 + sequence
     return {
         "tS": t_s,
         "plantSequence": sequence,
@@ -356,7 +357,8 @@ def _sample(mode: str, t_s: float, progress: float, active: bool, sequence: int)
             "schemaVersion": "h-ide.mujoco-dynamics-evidence/1",
             "status": "running",
             "finite": True,
-            "sampleSequence": sequence,
+            "sampleSequence": dynamics_sequence,
+            "simulationTimeS": t_s,
             "supportBandEnabled": False,
             "rootState": {
                 "body": "pelvis",
@@ -384,7 +386,7 @@ def _sample(mode: str, t_s: float, progress: float, active: bool, sequence: int)
             "warningCounts": {"BADQACC": 0, "BADQPOS": 0, "BADQVEL": 0},
             "contacts": {
                 "schemaVersion": "h-ide.mujoco-contact-evidence/1",
-                "sampleSequence": sequence,
+                "sampleSequence": dynamics_sequence,
                 "valid": True,
                 "footGroundSides": ["left", "right"],
                 "footGroundForceN": {"left": 120.0, "right": 120.0},
@@ -1444,14 +1446,31 @@ def test_action_initiator_must_be_strict_runner() -> None:
     assert "ACTION_INITIATOR_INVALID" in _failure_codes(trace)
 
 
-def test_root_dynamics_and_contact_sequences_must_be_the_same_snapshot() -> None:
+def test_physics_sequence_must_advance_and_contacts_must_match_it() -> None:
     trace = _trace("forward")
-    trace["samples"][4]["plantDynamicsEvidence"]["sampleSequence"] += 1
+    previous = trace["samples"][3]["plantDynamicsEvidence"]["sampleSequence"]
+    trace["samples"][4]["plantDynamicsEvidence"]["sampleSequence"] = previous
+    trace["samples"][4]["plantDynamicsEvidence"]["contacts"][
+        "sampleSequence"
+    ] = previous
     trace["samples"][5]["plantDynamicsEvidence"]["contacts"]["sampleSequence"] += 1
 
     assert _failure_codes(trace).issuperset(
-        {"DYNAMICS_SEQUENCE_MISMATCH", "CONTACT_SEQUENCE_MISMATCH"}
+        {"DYNAMICS_SEQUENCE_NOT_ADVANCING", "CONTACT_SEQUENCE_MISMATCH"}
     )
+
+
+def test_render_and_physics_sequences_are_independent_but_time_is_exact() -> None:
+    trace = _trace("forward")
+    assert (
+        trace["samples"][0]["plantSequence"]
+        != trace["samples"][0]["plantDynamicsEvidence"]["sampleSequence"]
+    )
+    assert strict.evaluate_trace(trace)["pass"] is True
+
+    mismatched = copy.deepcopy(trace)
+    mismatched["samples"][4]["plantDynamicsEvidence"]["simulationTimeS"] += 0.001
+    assert "DYNAMICS_TIMESTAMP_MISMATCH" in _failure_codes(mismatched)
 
 
 def test_confirmed_tilt_jump_and_turn_translation_thresholds_kill() -> None:
@@ -1507,6 +1526,43 @@ def test_official_command_envelopes_reject_overspeed_and_mixed_axes(
     active["command"].update(mutation)
 
     assert expected_code in _failure_codes(trace)
+
+
+def test_ros_float32_command_roundoff_is_not_material_overspeed() -> None:
+    trace = _trace("forward")
+    for sample in trace["samples"]:
+        if sample["motionIntentActive"]:
+            sample["command"]["vx"] = 0.30000001192092896
+    assert strict.evaluate_trace(trace)["pass"] is True
+
+    overspeed = copy.deepcopy(trace)
+    active = next(
+        sample for sample in overspeed["samples"] if sample["motionIntentActive"]
+    )
+    active["command"]["vx"] = 0.3000011
+    assert "DRIVE_ON_HEADING_COMMAND_ENVELOPE" in _failure_codes(overspeed)
+
+
+def test_terminal_sampling_allows_5hz_but_not_a_larger_gap() -> None:
+    trace = _trace("forward")
+    terminal_indices = [
+        index
+        for index, sample in enumerate(trace["samples"])
+        if not sample["motionIntentActive"]
+    ]
+    # Preserve the terminal endpoints while turning one 100 ms pair into an
+    # exact 200 ms interval, matching the slowest authoritative viewer source.
+    del trace["samples"][terminal_indices[-3]]
+    assert strict.evaluate_trace(trace)["pass"] is True
+
+    too_sparse = _trace("forward")
+    terminal_indices = [
+        index
+        for index, sample in enumerate(too_sparse["samples"])
+        if not sample["motionIntentActive"]
+    ]
+    del too_sparse["samples"][terminal_indices[-4] : terminal_indices[-2]]
+    assert "TERMINAL_SETTLE_SAMPLE_GAP" in _failure_codes(too_sparse)
 
 
 def test_detour_drive_segment_rejects_overspeed_and_mixed_axes() -> None:

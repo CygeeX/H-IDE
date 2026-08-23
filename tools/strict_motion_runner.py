@@ -1350,6 +1350,68 @@ def _rpy(pose: Mapping[str, Any]) -> tuple[float, float, float]:
     return roll, pitch, yaw
 
 
+def _physics_root_sample(
+    dynamics: Mapping[str, Any],
+) -> tuple[float, dict[str, float]]:
+    """Normalize pose and speed from one authoritative MuJoCo physics sample.
+
+    ``Plant /state`` intentionally combines a rendered observation frame with
+    newer diagnostic physics evidence captured under the Plant lock.  Render
+    and physics sequence numbers are independent.  Motion acceptance therefore
+    takes pose, velocity, COM, contacts, and time from the latter, while the
+    rendered sequence remains dedicated to viewer freshness checks.
+    """
+
+    if dynamics.get("schemaVersion") != "h-ide.mujoco-dynamics-evidence/1":
+        raise StrictMotionRunnerError("Plant dynamics evidence schema is unsupported")
+    if dynamics.get("status") != "running" or dynamics.get("finite") is not True:
+        raise StrictMotionRunnerError("Plant dynamics evidence is not running and finite")
+    simulation_time_s = _finite(
+        dynamics.get("simulationTimeS"), "Plant dynamics simulation time"
+    )
+    root_state = _mapping(dynamics.get("rootState"), "Plant dynamics rootState")
+    if root_state.get("body") != "pelvis":
+        raise StrictMotionRunnerError("Plant dynamics root body is not pelvis")
+    if root_state.get("qposOrder") != ["x", "y", "z", "qw", "qx", "qy", "qz"]:
+        raise StrictMotionRunnerError("Plant dynamics qpos order is unsupported")
+    qpos = root_state.get("qpos")
+    if not isinstance(qpos, list) or len(qpos) != 7:
+        raise StrictMotionRunnerError("Plant dynamics qpos must contain seven values")
+    qpos_values = [
+        _finite(value, f"Plant dynamics qpos[{index}]")
+        for index, value in enumerate(qpos)
+    ]
+    if root_state.get("qvelOrder") != [f"qvel[{index}]" for index in range(6)]:
+        raise StrictMotionRunnerError("Plant dynamics qvel order is unsupported")
+    qvel = root_state.get("qvel")
+    if not isinstance(qvel, list) or len(qvel) != 6:
+        raise StrictMotionRunnerError("Plant dynamics qvel must contain six values")
+    qvel_values = [
+        _finite(value, f"Plant dynamics qvel[{index}]")
+        for index, value in enumerate(qvel)
+    ]
+    roll, pitch, yaw = _rpy(
+        {
+            "qw": qpos_values[3],
+            "qx": qpos_values[4],
+            "qy": qpos_values[5],
+            "qz": qpos_values[6],
+        }
+    )
+    return simulation_time_s, {
+        "x": qpos_values[0],
+        "y": qpos_values[1],
+        "z": qpos_values[2],
+        "roll": roll,
+        "pitch": pitch,
+        "yaw": yaw,
+        "linearSpeedMps": math.hypot(qvel_values[0], qvel_values[1]),
+        "angularSpeedRps": math.sqrt(
+            sum(value * value for value in qvel_values[3:])
+        ),
+    }
+
+
 class LoopbackJsonReader:
     """Bounded GET-only client with proxies and redirects absent."""
 
@@ -1729,27 +1791,13 @@ class RuntimeSnapshotCollector:
         runtime = self._runtime_health(plant, sonic, bridge, nav2, first_person)
         isolation = self.isolation_manifest()
         isolation_hash = canonical_sha256(isolation)
-        pose = _mapping(plant.get("pose"), "Plant pose")
-        velocity = _mapping(plant.get("rootVelocity"), "Plant rootVelocity")
+        dynamics = _mapping(plant.get("dynamicsEvidence"), "Plant dynamicsEvidence")
+        physics_time_s, physics_root = _physics_root_sample(dynamics)
         support = _mapping(plant.get("support"), "Plant support")
-        roll, pitch, yaw = _rpy(pose)
         sample: dict[str, Any] = {
-            "tS": _finite(plant.get("simulationTimeS"), "Plant simulation time"),
+            "tS": physics_time_s,
             "plantSequence": _integer(plant.get("sequence"), "Plant sequence", minimum=1),
-            "root": {
-                "x": _finite(pose.get("x"), "Plant pose.x"),
-                "y": _finite(pose.get("y"), "Plant pose.y"),
-                "z": _finite(pose.get("z"), "Plant pose.z"),
-                "roll": roll,
-                "pitch": pitch,
-                "yaw": yaw,
-                "linearSpeedMps": _finite(
-                    velocity.get("linearSpeedMps"), "Plant linear speed"
-                ),
-                "angularSpeedRps": _finite(
-                    velocity.get("angularSpeedRps"), "Plant angular speed"
-                ),
-            },
+            "root": physics_root,
             "motionIntentActive": sonic.get("navigation_task_active") is True,
             "sonicPolicyIdle": _sonic_policy_idle_evidence(sonic),
             "command": self.ros.last_published_command().to_json(),
@@ -1765,7 +1813,7 @@ class RuntimeSnapshotCollector:
             "runtimeHealth": runtime,
             "isolationProof": {**isolation, "manifestSha256": isolation_hash},
             "nav2Actions": self.ros.action_statuses(),
-            "plantDynamicsEvidence": plant.get("dynamicsEvidence"),
+            "plantDynamicsEvidence": dynamics,
         }
         return sample
 

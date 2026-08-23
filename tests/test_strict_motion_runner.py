@@ -377,7 +377,23 @@ def plant_state() -> dict:
             "keyCallbackRegistered": False,
             "lastError": None,
         },
-        "dynamicsEvidence": {"schemaVersion": "fixture"},
+        # Physics evidence intentionally has an independent sequence/time and
+        # a slightly newer pose than the rendered frame above.
+        "dynamicsEvidence": {
+            "schemaVersion": "h-ide.mujoco-dynamics-evidence/1",
+            "status": "running",
+            "finite": True,
+            "sampleSequence": 12_345,
+            "simulationTimeS": 12.52,
+            "rootState": {
+                "body": "pelvis",
+                "qposOrder": ["x", "y", "z", "qw", "qx", "qy", "qz"],
+                "qpos": [1.01, 2.02, 0.79, 1.0, 0.0, 0.0, 0.0],
+                "qvelOrder": [f"qvel[{index}]" for index in range(6)],
+                "qvel": [0.3, 0.4, 0.1, 0.1, 0.2, 0.2],
+            },
+            "supportBandEnabled": False,
+        },
     }
 
 
@@ -526,6 +542,31 @@ def test_snapshot_collector_binds_every_runtime_identity_and_isolation(
         "/strict_motion_runner"
     )
     assert sample["command"] == {"vx": 0.3, "vy": 0.0, "wz": 0.0}
+    assert sample["plantSequence"] == 100
+    assert sample["plantDynamicsEvidence"]["sampleSequence"] == 12_345
+    assert sample["tS"] == pytest.approx(12.52)
+    assert sample["root"] == {
+        "x": pytest.approx(1.01),
+        "y": pytest.approx(2.02),
+        "z": pytest.approx(0.79),
+        "roll": pytest.approx(0.0),
+        "pitch": pytest.approx(0.0),
+        "yaw": pytest.approx(0.0),
+        "linearSpeedMps": pytest.approx(0.5),
+        "angularSpeedRps": pytest.approx(0.3),
+    }
+
+
+def test_physics_root_sample_rejects_render_only_or_nonfinite_evidence() -> None:
+    missing = plant_state()["dynamicsEvidence"]
+    del missing["rootState"]
+    with pytest.raises(runner.StrictMotionRunnerError, match="rootState"):
+        runner._physics_root_sample(missing)
+
+    nonfinite = plant_state()["dynamicsEvidence"]
+    nonfinite["rootState"]["qvel"][0] = math.nan
+    with pytest.raises(runner.StrictMotionRunnerError, match="must be finite"):
+        runner._physics_root_sample(nonfinite)
 
 
 def test_snapshot_collector_accepts_diagnostic_reason_at_exact_safe_hold(

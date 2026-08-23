@@ -8,9 +8,12 @@ never imports H-IDE/Mission code and cannot arm, move, stop, or reset a robot.
 The trace contract intentionally separates collection from judgment:
 
 * ``samples`` contain root pose/velocity normalized from the Plant's verbatim
-  ``dynamicsEvidence.rootState`` at ``plantSequence``, its authoritative COM
-  and contact counters, confirmed support-off state, command/action state, and
-  continuously advancing health for the motion core and both viewers.
+  ``dynamicsEvidence.rootState`` at its own physics ``sampleSequence``, its
+  authoritative COM and contact counters, confirmed support-off state,
+  command/action state, and continuously advancing health for the motion core
+  and both viewers.  The independent render ``plantSequence`` remains the
+  first-person/native-viewer freshness boundary and is never conflated with
+  the physics-step sequence.
   RobotAgent/simGateway are instead proven inactive, with a single stable
   observed ``/cmd_vel`` publisher, at preflight and every sample.
 * ``armLimiterEvidence`` is a complete successful-session trace emitted by the
@@ -140,11 +143,20 @@ class FormalContract:
     # net pose drift remains millimetric.  This is an acceptance threshold,
     # not an actuator safety limit.
     terminal_angular_speed_rps: float = 0.02
-    max_terminal_sample_gap_s: float = 0.10
+    # The collector joins six independently scheduled health sources and the
+    # 5 Hz first-person viewer.  A 200 ms evidence cadence is still bounded and
+    # cannot hide the independently enforced 50 Hz actuator trace; requiring
+    # 100 ms made a healthy 160 ms scheduler interval fail after the fact.
+    max_terminal_sample_gap_s: float = 0.20
     max_arm_continuous_saturation_s: float = 0.24
     arm_must_clear_before_s: float = 0.25
     arm_control_period_s: float = 0.02
     command_zero_epsilon: float = 1e-6
+    # ROS Twist uses float64, but several official Nav2 behavior parameters and
+    # intermediate messages originate as float32.  Admit only serialization
+    # noise around a code-owned cap (0.3f is 0.30000001192092896), not a
+    # materially faster command.
+    command_serialization_tolerance: float = 1e-6
     steady_target_tolerance: float = 0.01
     drive_on_heading_max_vx_mps: float = 0.30
     lateral_step_max_vy_mps: float = 0.35
@@ -763,7 +775,12 @@ class StrictMotionEvaluator:
         normalized_root: tuple[float, float, float],
         normalized_rpy: tuple[float, float, float],
         normalized_speeds: tuple[float, float],
-    ) -> tuple[tuple[float, float, float], Mapping[str, Any], Mapping[str, int]]:
+    ) -> tuple[
+        tuple[float, float, float],
+        Mapping[str, Any],
+        Mapping[str, int],
+        int,
+    ]:
         label = f"samples[{index}].plantDynamicsEvidence"
         plant_sequence = _nonnegative_int(
             sample.get("plantSequence"), f"samples[{index}].plantSequence"
@@ -776,11 +793,15 @@ class StrictMotionEvaluator:
         dynamics_sequence = _nonnegative_int(
             dynamics.get("sampleSequence"), f"{label}.sampleSequence"
         )
-        if dynamics_sequence != plant_sequence:
+        dynamics_time_s = _finite(
+            dynamics.get("simulationTimeS"), f"{label}.simulationTimeS"
+        )
+        sample_time_s = _finite(sample.get("tS"), f"samples[{index}].tS")
+        if abs(dynamics_time_s - sample_time_s) > _EPS:
             self._fail(
-                "DYNAMICS_SEQUENCE_MISMATCH",
-                "root pose and Plant dynamics evidence are not from the same snapshot",
-                _finite(sample.get("tS"), f"samples[{index}].tS"),
+                "DYNAMICS_TIMESTAMP_MISMATCH",
+                "normalized motion sample is not timestamped by its Plant physics snapshot",
+                sample_time_s,
             )
         if dynamics.get("status") != "running" or dynamics.get("finite") is not True:
             self._fail("DYNAMICS_EVIDENCE_INVALID", "Plant dynamics evidence is not running and finite", _finite(sample.get("tS"), f"samples[{index}].tS"))
@@ -891,7 +912,7 @@ class StrictMotionEvaluator:
         }
         if not warnings:
             raise TraceContractError("Plant dynamics warningCounts cannot be empty")
-        return com_xyz, contacts, warnings
+        return com_xyz, contacts, warnings, dynamics_sequence
 
     def _evaluate_samples(self) -> None:
         assert self.contract is not None
@@ -911,6 +932,8 @@ class StrictMotionEvaluator:
         confirmed_release_epoch: int | None = None
         runtime_baseline: dict[str, dict[str, Any]] | None = None
         runtime_previous: dict[str, dict[str, Any]] | None = None
+        baseline_dynamics_sequence: int | None = None
+        previous_dynamics_sequence: int | None = None
 
         for index, sample in enumerate(self.samples):
             t_s = _finite(sample.get("tS"), f"samples[{index}].tS")
@@ -937,13 +960,24 @@ class StrictMotionEvaluator:
             if previous_root is not None and math.dist(root, previous_root) > self.contract.max_position_jump_m + _EPS:
                 self._fail("ROOT_POSITION_JUMP", f"root jumped {math.dist(root, previous_root):.4f}m", t_s)
 
-            com, contacts, warnings = self._sample_dynamics(
+            com, contacts, warnings, dynamics_sequence = self._sample_dynamics(
                 sample,
                 index,
                 normalized_root=root,
                 normalized_rpy=(roll, pitch, yaw),
                 normalized_speeds=(linear_speed, angular_speed),
             )
+            if baseline_dynamics_sequence is None:
+                baseline_dynamics_sequence = dynamics_sequence
+            if (
+                previous_dynamics_sequence is not None
+                and dynamics_sequence <= previous_dynamics_sequence
+            ):
+                self._fail(
+                    "DYNAMICS_SEQUENCE_NOT_ADVANCING",
+                    "Plant physics evidence sequence did not advance",
+                    t_s,
+                )
             dynamics = _mapping(
                 sample.get("plantDynamicsEvidence"),
                 f"samples[{index}].plantDynamicsEvidence",
@@ -1401,11 +1435,14 @@ class StrictMotionEvaluator:
             previous_counters, final_feet = counters, feet
             previous_warnings, final_warnings = warnings, warnings
             runtime_previous = runtime
+            previous_dynamics_sequence = dynamics_sequence
 
         assert baseline_counters is not None and previous_counters is not None
         assert baseline_feet is not None and final_feet is not None
         assert baseline_warnings is not None and final_warnings is not None
         assert runtime_baseline is not None and runtime_previous is not None
+        assert baseline_dynamics_sequence is not None
+        assert previous_dynamics_sequence is not None
         collision_deltas = {
             name: previous_counters[name] - baseline_counters[name]
             for name in baseline_counters
@@ -1439,6 +1476,9 @@ class StrictMotionEvaluator:
             "totalCompletedFootCyclesLowerBound": completed_foot_cycles,
         }
         self.metrics["supportReleaseConfirmedEpoch"] = confirmed_release_epoch
+        self.metrics["plantDynamicsSequenceDelta"] = (
+            previous_dynamics_sequence - baseline_dynamics_sequence
+        )
         runtime_sequence_deltas = {
             name: runtime_previous[name]["sequence"]
             - runtime_baseline[name]["sequence"]
@@ -1585,7 +1625,9 @@ class StrictMotionEvaluator:
                 if (
                     abs(float(sample["vy"])) > self.contract.command_zero_epsilon + _EPS
                     or abs(float(sample["wz"])) > self.contract.command_zero_epsilon + _EPS
-                    or abs(float(sample["vx"])) > self.contract.drive_on_heading_max_vx_mps + _EPS
+                    or abs(float(sample["vx"]))
+                    > self.contract.drive_on_heading_max_vx_mps
+                    + self.contract.command_serialization_tolerance
                 ):
                     self._fail(
                         "DRIVE_ON_HEADING_COMMAND_ENVELOPE",
@@ -1621,7 +1663,11 @@ class StrictMotionEvaluator:
             for sample in active:
                 if abs(float(sample["vx"])) > self.contract.command_zero_epsilon + _EPS or abs(float(sample["wz"])) > self.contract.command_zero_epsilon + _EPS:
                     self._fail("LATERAL_COMMAND_ENVELOPE", "LateralStep requires |vx| and |wz| <= 1e-6", float(sample["t"]))
-                if abs(float(sample["vy"])) > self.contract.lateral_step_max_vy_mps + _EPS:
+                if (
+                    abs(float(sample["vy"]))
+                    > self.contract.lateral_step_max_vy_mps
+                    + self.contract.command_serialization_tolerance
+                ):
                     self._fail("LATERAL_COMMAND_ENVELOPE", "LateralStep requires |vy| <= 0.35m/s", float(sample["t"]))
                 if any(sample["actions"].values()):
                     self._fail("NAV2_ACTION_ACTIVE_DURING_LATERAL", "all Nav2 actions must be inactive during LateralStep", float(sample["t"]))
@@ -1652,7 +1698,9 @@ class StrictMotionEvaluator:
                 if (
                     abs(float(sample["vx"])) > self.contract.command_zero_epsilon + _EPS
                     or abs(float(sample["vy"])) > self.contract.command_zero_epsilon + _EPS
-                    or abs(float(sample["wz"])) > self.contract.spin_max_wz_rps + _EPS
+                    or abs(float(sample["wz"]))
+                    > self.contract.spin_max_wz_rps
+                    + self.contract.command_serialization_tolerance
                 ):
                     self._fail(
                         "SPIN_COMMAND_ENVELOPE",
@@ -2349,7 +2397,9 @@ class StrictMotionEvaluator:
                     abs(float(sample["vy"])) > self.contract.command_zero_epsilon + _EPS
                     or abs(float(sample["wz"])) > self.contract.command_zero_epsilon + _EPS
                     or float(sample["vx"]) <= self.contract.command_zero_epsilon
-                    or float(sample["vx"]) > self.contract.drive_on_heading_max_vx_mps + _EPS
+                    or float(sample["vx"])
+                    > self.contract.drive_on_heading_max_vx_mps
+                    + self.contract.command_serialization_tolerance
                 ):
                     self._fail(
                         "DRIVE_ON_HEADING_COMMAND_ENVELOPE",
@@ -2363,7 +2413,9 @@ class StrictMotionEvaluator:
                     abs(float(sample["vx"])) > self.contract.command_zero_epsilon + _EPS
                     or abs(float(sample["vy"])) > self.contract.command_zero_epsilon + _EPS
                     or signed_wz <= self.contract.command_zero_epsilon
-                    or abs(float(sample["wz"])) > self.contract.spin_max_wz_rps + _EPS
+                    or abs(float(sample["wz"]))
+                    > self.contract.spin_max_wz_rps
+                    + self.contract.command_serialization_tolerance
                 ):
                     self._fail(
                         "SPIN_COMMAND_ENVELOPE",
