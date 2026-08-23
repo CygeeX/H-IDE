@@ -126,12 +126,12 @@ def test_forward_probe_is_a_fixed_short_official_drive() -> None:
 
 def test_translation_deadline_uses_observed_progress_without_changing_command() -> None:
     assert runner.motion_goal("reverse") == {
-        "distanceM": -0.5,
+        "distanceM": -1.0,
         "speedMps": runner.OFFICIAL_REVERSE_SPEED_MPS,
     }
     assert runner.action_timeout_s(
         "reverse", runner.motion_goal("reverse")
-    ) == pytest.approx(22.5)
+    ) == pytest.approx(35.0)
     assert runner.action_timeout_s(
         "forward_3m", runner.motion_goal("forward_3m")
     ) == pytest.approx(85.0)
@@ -1069,7 +1069,7 @@ def test_dynamic_idle_accepts_observed_balance_correction_but_not_motion() -> No
     assert runner._sample_settled(observed) is True
 
     moving = _executor_sample(1.1)
-    moving["root"]["angularSpeedRps"] = 0.030001
+    moving["root"]["angularSpeedRps"] = 0.040001
     assert runner._sample_settled(moving) is False
 
 
@@ -1101,7 +1101,7 @@ def test_segment_stop_allows_observed_turn_deceleration_before_full_idle_proof()
     for index in range(57):
         sample = _executor_sample(index / 10.0)
         if index <= 40:
-            sample["root"]["angularSpeedRps"] = 0.04
+            sample["root"]["angularSpeedRps"] = 0.05
         samples.append(sample)
 
     class TimedCollector(FakeExecutorCollector):

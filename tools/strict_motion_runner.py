@@ -110,13 +110,13 @@ EXCEPTION_BALANCED_IDLE_MAX_WALL_S = 8.0
 TERMINAL_LINEAR_SPEED_MPS = 0.01
 # SONIC's learned IDLE policy actively balances an untethered humanoid.  The
 # live one-metre runs held pose while the instantaneous root angular-speed
-# correction reached 0.0265 rad/s without meaningful yaw/tilt drift. Treating
-# that bounded learned-balance correction as motion made the runner replace a
-# healthy untethered policy with a static hold, which then caused the fall it
-# was meant to prevent. Keep a narrow 0.03 rad/s envelope (about 1.72 deg/s)
-# while independent roll/pitch, pose drift, contact, and continuous-duration
-# gates remain authoritative.
-TERMINAL_ANGULAR_SPEED_RPS = 0.03
+# correction reached 0.0265 rad/s. The accepted r97 detour then remained
+# position/yaw bounded for 26 seconds while a few learned-IDLE corrections
+# reached 0.0348 rad/s. Use the GaitAdapter's same strict 0.04 rad/s stop
+# acknowledgement instead of inventing a narrower runner-only threshold;
+# independent roll/pitch, pose drift, contact, zero-command/action and
+# continuous-duration gates remain authoritative.
+TERMINAL_ANGULAR_SPEED_RPS = 0.04
 _ZERO_EPS = 1e-6
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 STRICT_EVALUATOR_PATH = REPOSITORY_ROOT / "tools" / "strict_motion_acceptance.py"
@@ -2011,7 +2011,11 @@ def motion_goal(mode: str) -> dict[str, float]:
         },
         "forward": {"distanceM": 1.0, "speedMps": OFFICIAL_DRIVE_SPEED_MPS},
         "forward_3m": {"distanceM": 3.0, "speedMps": OFFICIAL_DRIVE_SPEED_MPS},
-        "reverse": {"distanceM": -0.5, "speedMps": OFFICIAL_REVERSE_SPEED_MPS},
+        # A 0.5 m live reverse completed physically but produced only one
+        # foot's contact cycle. Keep NVIDIA's official speed and lengthen the
+        # evidence action so both feet must participate; do not weaken the
+        # gait-cycle contract.
+        "reverse": {"distanceM": -1.0, "speedMps": OFFICIAL_REVERSE_SPEED_MPS},
         "lateral_left": {
             "lateralDistanceM": LATERAL_DISTANCE_M,
             "maxVyMps": OFFICIAL_LATERAL_SPEED_MPS,

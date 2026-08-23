@@ -161,7 +161,7 @@ def _goal(mode: str) -> dict[str, float]:
     if mode == "forward_3m":
         return {"distanceM": 3.0, "speedMps": 0.3}
     if mode == "reverse":
-        return {"distanceM": -0.5, "speedMps": 0.2}
+        return {"distanceM": -1.0, "speedMps": 0.2}
     if mode == "lateral_left":
         return {"lateralDistanceM": 0.5, "maxVyMps": 0.40}
     if mode == "lateral_right":
@@ -181,7 +181,7 @@ def _root(mode: str, progress: float) -> tuple[float, float, float]:
     if mode == "forward_3m":
         return 3.0 * progress, 0.0, 0.78
     if mode == "reverse":
-        return -0.5 * progress, 0.0, 0.78
+        return -1.0 * progress, 0.0, 0.78
     if mode == "lateral_left":
         return 0.0, 0.5 * progress, 0.78
     if mode == "lateral_right":
@@ -712,7 +712,7 @@ def _trace(mode: str) -> dict[str, Any]:
         "forward_probe": 1.0,
         "forward": 5.0,
         "forward_3m": 15.0,
-        "reverse": 2.5,
+        "reverse": 5.0,
         "lateral_left": 1.3,
         "lateral_right": 1.3,
         "turn_left": 8.0,
@@ -1243,8 +1243,8 @@ def test_detour_requires_nonoverlap_and_observed_physical_stop_between_segments(
     stop_sample = next(
         sample for sample in moving["samples"] if sample["sonicControlTick"] == first_end_tick
     )
-    stop_sample["root"]["angularSpeedRps"] = 0.0301
-    stop_sample["plantDynamicsEvidence"]["rootState"]["qvel"][5] = 0.0301
+    stop_sample["root"]["angularSpeedRps"] = 0.0401
+    stop_sample["plantDynamicsEvidence"]["rootState"]["qvel"][5] = 0.0401
     assert "DETOUR_STOP_NOT_SETTLED" in _failure_codes(moving)
 
 

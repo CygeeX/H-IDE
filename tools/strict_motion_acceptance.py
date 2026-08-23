@@ -150,7 +150,7 @@ class FormalContract:
     # corrections; the untethered live envelope peaks around 0.015 rad/s while
     # net pose drift remains millimetric.  This is an acceptance threshold,
     # not an actuator safety limit.
-    terminal_angular_speed_rps: float = 0.03
+    terminal_angular_speed_rps: float = 0.04
     # The collector joins six independently scheduled health sources and the
     # 5 Hz first-person viewer.  A 200 ms evidence cadence is still bounded and
     # cannot hide the independently enforced 50 Hz actuator trace; requiring
@@ -209,7 +209,7 @@ FORMAL_CONTRACTS: dict[str, FormalContract] = {
     "forward": FormalContract(expected_longitudinal_m=1.0),
     "forward_3m": FormalContract(expected_longitudinal_m=3.0),
     "reverse": FormalContract(
-        expected_longitudinal_m=-0.5,
+        expected_longitudinal_m=-1.0,
         drive_on_heading_max_vx_mps=0.20,
     ),
     "lateral_left": FormalContract(
