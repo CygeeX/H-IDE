@@ -327,6 +327,51 @@ def test_goal_progress_guard_suspends_and_reanchors_across_pure_spin() -> None:
     assert "regresses from Nav2 goal" in (guard.reason or "")
 
 
+def test_goal_progress_guard_does_not_apply_stale_goal_to_standalone_reverse() -> None:
+    guard = GoalProgressGuard(max_regression_m=0.15)
+    guard.observe_pose(0.0, 0.0)
+    guard.observe_goal(1.0, 0.0)
+    guard.accept_command(0.2, 0.0, 0.0)
+    assert guard.observe_pose(0.2, 0.0) is False
+
+    # DriveOnHeading owns this negative translation. Moving away from the
+    # retained global endpoint is intentional and remains covered by the
+    # command-direction guard instead of this global-goal transaction.
+    assert guard.accept_command(
+        -0.2,
+        0.0,
+        0.0,
+        tracking_enabled=False,
+    ) is True
+    assert guard.goal == (1.0, 0.0)
+    assert guard.observe_pose(-0.20, 0.0) is False
+    assert guard.observe_pose(-0.50, 0.0) is False
+    assert guard.latched is False
+
+    # A later global action establishes a fresh baseline and still detects a
+    # genuine regression; suspension is not a threshold bypass.
+    assert guard.accept_command(0.2, 0.0, 0.0, tracking_enabled=True) is True
+    assert guard.observe_pose(-0.35, 0.0) is False
+    assert guard.observe_pose(-0.70, 0.0) is True
+
+
+def test_goal_progress_guard_suspension_cannot_clear_a_latched_fault() -> None:
+    guard = GoalProgressGuard(max_regression_m=0.15)
+    guard.observe_pose(0.0, 0.0)
+    guard.observe_goal(1.0, 0.0)
+    guard.accept_command(0.2, 0.0, 0.0)
+    assert guard.observe_pose(-0.16, 0.0) is True
+
+    guard.suspend_tracking()
+    assert guard.latched is True
+    assert guard.accept_command(
+        -0.2,
+        0.0,
+        0.0,
+        tracking_enabled=False,
+    ) is False
+
+
 def test_navigation_guards_reanchor_only_at_policy_actuator_grant() -> None:
     now = [10.0]
 

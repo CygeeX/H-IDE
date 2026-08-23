@@ -260,6 +260,31 @@ class _ActionStatusObservation:
     observed_at_s: float
 
 
+def _global_goal_progress_active(
+    statuses: Mapping[str, _ActionStatusObservation | None],
+) -> bool:
+    """Bind global-goal regression checks to their owning Nav2 action.
+
+    ``/plan`` is transient evidence and commonly outlives NavigateToPose.  It
+    must never become authority over standalone behavior actions or the strict
+    lateral runner.  FollowPath is intentionally absent because this product
+    profile does not accept it for motion; NavigateToPose is the sole owner of
+    global endpoint progress here.
+    """
+
+    navigation = statuses.get("navigate_to_pose")
+    if (
+        not isinstance(navigation, _ActionStatusObservation)
+        or not navigation.active
+    ):
+        return False
+    for name in ("spin", "drive_on_heading"):
+        standalone = statuses.get(name)
+        if isinstance(standalone, _ActionStatusObservation) and standalone.active:
+            return False
+    return True
+
+
 def _actions_confirmed_inactive_after(
     statuses: Mapping[str, _ActionStatusObservation | None],
     *,
@@ -1268,13 +1293,15 @@ def run_ros_bridge(config: SimConfig) -> None:
             )
 
     def on_action_status(name: str, message: GoalStatusArray) -> None:
+        active = any(int(item.status) in {1, 2, 3} for item in message.status_list)
         action_statuses[name] = _ActionStatusObservation(
-            active=any(
-                int(item.status) in {1, 2, 3}
-                for item in message.status_list
-            ),
+            active=active,
             observed_at_s=time.monotonic(),
         )
+        if (name == "navigate_to_pose" and not active) or (
+            name in {"spin", "drive_on_heading"} and active
+        ):
+            goal_guard.suspend_tracking()
 
     def on_cmd(message: Twist):
         now = time.monotonic()
@@ -1322,7 +1349,12 @@ def run_ros_bridge(config: SimConfig) -> None:
             )
             return
         direction_admitted = direction_guard.accept_command(vx, vy, wz)
-        goal_admitted = goal_guard.accept_command(vx, vy, wz)
+        goal_admitted = goal_guard.accept_command(
+            vx,
+            vy,
+            wz,
+            tracking_enabled=_global_goal_progress_active(action_statuses),
+        )
         heading_admitted = heading_guard.accept_command(vx, vy, wz)
         rotation_admitted = rotation_guard.accept_command(vx, vy, wz)
         stability_admitted = stability_guard.admit_command(vx, vy, wz)

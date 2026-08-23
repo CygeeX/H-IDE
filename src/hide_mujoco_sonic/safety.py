@@ -328,12 +328,15 @@ class MotionDirectionGuard:
 
 
 class GoalProgressGuard:
-    """Fail closed when localization moves materially away from Nav2's goal.
+    """Fail closed when a global navigation action regresses from its goal.
 
     This guard consumes the endpoint of Nav2's global ``Path`` and an
     independently published map pose.  It is not a planner and does not judge
     small detours: only a conservative regression beyond a configured distance
-    latches the downstream SONIC stop interlock.
+    latches the downstream SONIC stop interlock.  A stored path endpoint is not
+    itself command authority: standalone Spin, DriveOnHeading, and lateral
+    primitives must suspend this transaction so a stale global goal cannot
+    reject their intentional motion.
     """
 
     def __init__(
@@ -408,11 +411,23 @@ class GoalProgressGuard:
         self._zero_since = None
         return True
 
-    def accept_command(self, vx: float, vy: float, wz: float) -> bool:
+    def accept_command(
+        self,
+        vx: float,
+        vy: float,
+        wz: float,
+        *,
+        tracking_enabled: bool = True,
+    ) -> bool:
         values = tuple(float(value) for value in (vx, vy, wz))
         if not all(math.isfinite(value) for value in values):
             raise ValueError("velocity command must be finite")
+        if not isinstance(tracking_enabled, bool):
+            raise TypeError("tracking_enabled must be a boolean")
         if not self.latched:
+            if not tracking_enabled:
+                self.suspend_tracking()
+                return True
             self._zero_since = None
             linear = math.hypot(values[0], values[1])
             if linear < 1e-6 and abs(values[2]) >= 1e-6:
@@ -446,6 +461,20 @@ class GoalProgressGuard:
             return False
         self.clear()
         return True
+
+    def suspend_tracking(self) -> None:
+        """End only the current global-goal transaction, preserving its goal.
+
+        A latched violation is deliberately not cleared here.  It still needs
+        the existing sustained-zero/reset path; changing action type cannot
+        erase a motion fault.
+        """
+
+        if self.latched:
+            return
+        self._translation_active = False
+        self._zero_since = None
+        self._reset_progress()
 
     def reanchor_at_actuator_grant(self) -> bool:
         """Start goal-progress accounting after policy authority is real."""

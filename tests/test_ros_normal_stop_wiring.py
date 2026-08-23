@@ -10,6 +10,7 @@ from hide_mujoco_sonic.ros_bridge import (
     _ActionStatusObservation,
     _actions_confirmed_inactive_after,
     _create_safety_timers,
+    _global_goal_progress_active,
     _suppress_for_correlated_stop,
     BridgeRuntimeHealth,
 )
@@ -239,6 +240,40 @@ def test_motion_fault_reset_requires_post_fault_inactive_action_evidence() -> No
         statuses,
         fault_latched_at_s=10.0,
     )
+
+
+def test_global_goal_progress_belongs_only_to_navigate_to_pose() -> None:
+    statuses = {
+        "navigate_to_pose": None,
+        "spin": None,
+        "drive_on_heading": None,
+    }
+    assert _global_goal_progress_active(statuses) is False
+
+    statuses["navigate_to_pose"] = _ActionStatusObservation(True, 10.0)
+    assert _global_goal_progress_active(statuses) is True
+
+    statuses["drive_on_heading"] = _ActionStatusObservation(True, 10.1)
+    assert _global_goal_progress_active(statuses) is False
+
+    statuses["drive_on_heading"] = _ActionStatusObservation(False, 10.2)
+    statuses["spin"] = _ActionStatusObservation(True, 10.3)
+    assert _global_goal_progress_active(statuses) is False
+
+    statuses["spin"] = _ActionStatusObservation(False, 10.4)
+    statuses["navigate_to_pose"] = _ActionStatusObservation(False, 10.5)
+    assert _global_goal_progress_active(statuses) is False
+
+
+def test_ros_command_wires_goal_progress_to_action_ownership() -> None:
+    path = ROOT / "src/hide_mujoco_sonic/ros_bridge.py"
+    command = ast.unparse(_nested_function(path, "on_cmd"))
+    status = ast.unparse(_nested_function(path, "on_action_status"))
+
+    assert (
+        "tracking_enabled=_global_goal_progress_active(action_statuses)" in command
+    )
+    assert "goal_guard.suspend_tracking()" in status
 
 
 def _keyword_name(call: ast.Call, keyword: str) -> str | None:
