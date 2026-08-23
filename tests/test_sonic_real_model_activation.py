@@ -715,6 +715,9 @@ def test_official_cold_boot_sequence_moves_in_requested_direction(
         # transition: rebuilding all history from one measured sample passed a
         # forward stop but destabilized the live reverse stop.
         stop_started_xy = np.asarray(data.qpos[:2], dtype=np.float64).copy()
+        stop_started_yaw = _yaw_from_wxyz(
+            np.asarray(data.qpos[3:7], dtype=np.float64)
+        )
         stop_started_epoch = controller.reference_install_epoch
         controller.ms.mode = LM.IDLE
         controller.ms.speed = -1.0
@@ -780,6 +783,10 @@ def test_official_cold_boot_sequence_moves_in_requested_direction(
             stop_peak_tilt = max(stop_peak_tilt, abs(roll), abs(pitch))
 
         stop_displacement = np.asarray(data.qpos[:2]) - stop_started_xy
+        stop_yaw_delta = _wrap_angle(
+            _yaw_from_wxyz(np.asarray(data.qpos[3:7], dtype=np.float64))
+            - stop_started_yaw
+        )
         stop_linear_speed = float(np.linalg.norm(data.qvel[:2]))
         stop_angular_speed = float(np.linalg.norm(data.qvel[3:6]))
         stop_diagnostic = {
@@ -787,6 +794,7 @@ def test_official_cold_boot_sequence_moves_in_requested_direction(
             "stop_displacement_xy_m": tuple(
                 float(value) for value in stop_displacement
             ),
+            "stop_yaw_delta_rad": stop_yaw_delta,
             "stop_minimum_z_m": stop_minimum_z,
             "stop_peak_tilt_rad": stop_peak_tilt,
             "stop_linear_speed_mps": stop_linear_speed,
@@ -802,6 +810,7 @@ def test_official_cold_boot_sequence_moves_in_requested_direction(
         assert stop_minimum_z >= 0.55, stop_diagnostic
         assert stop_peak_tilt < 0.30, stop_diagnostic
         assert float(np.linalg.norm(stop_displacement)) < 0.60, stop_diagnostic
+        assert abs(stop_yaw_delta) < 0.20, stop_diagnostic
         assert stop_linear_speed < 0.08, stop_diagnostic
         assert stop_angular_speed < 0.20, stop_diagnostic
         assert controller.controller.idle_readapt_stored is True, stop_diagnostic
