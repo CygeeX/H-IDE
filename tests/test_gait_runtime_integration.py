@@ -1015,6 +1015,30 @@ def test_gait_fault_freezes_target_and_stays_alive_in_recoverable_support(
     # missing recoverable-fault fields and let a safe latch unwind the driver.
     driver.telemetry = TelemetryStore(TelemetryState(robot_id="g1-sim"))
     published = tuple(0.01 * index for index in range(29))
+    activation = NominalPolicyActivation(
+        joint_count=29,
+        duration_s=3.0,
+        settle_consecutive_samples=1,
+    )
+    assert activation.begin(published, tick_ms=0)
+    final = activation.propose(
+        published,
+        measured=published,
+        tick_ms=3_000,
+    )
+    assert activation.commit(final, final.targets)
+    assert activation.observe_settling(
+        nominal=published,
+        measured=published,
+        velocities=tuple(0.0 for _ in published),
+        gyroscope=(0.0, 0.0, 0.0),
+        roll_rad=0.0,
+        pitch_rad=0.0,
+        tick_ms=3_020,
+    ).stage_complete
+    assert activation.record_support_release(activation.epoch)
+    assert activation.confirm_support_release(tick_ms=3_040)
+    driver._policy_activation = activation
     frozen: list[tuple[float, ...]] = []
     driver._last_published_targets = published
     driver._joint_handoff = SimpleNamespace(
@@ -1046,8 +1070,12 @@ def test_gait_fault_freezes_target_and_stays_alive_in_recoverable_support(
             or {
                 "mode": "safety_stop",
                 "safetyStopLatched": True,
+                "safetyStopEpoch": 1,
                 "fault": None,
                 "motionFault": reason,
+                "fallArrestAvailable": True,
+                "fallArrestEnabled": True,
+                "fallArrestReengagedSafetyStopEpoch": 1,
             }
         ),
     )
@@ -1089,6 +1117,8 @@ def test_gait_fault_freezes_target_and_stays_alive_in_recoverable_support(
     assert telemetry.motion_fault_safe_hold_frames == 0
     assert driver._safe_hold_targets == published
     assert frozen and all(targets == published for targets in frozen)
+    assert activation.phase == "UNPREPARED"
+    assert activation.support_release_confirmed is False
 
 
 def test_recoverable_motion_fault_reset_requires_two_safe_frames_and_stays_revoked(

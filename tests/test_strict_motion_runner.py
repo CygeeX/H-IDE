@@ -124,6 +124,14 @@ def test_forward_probe_is_a_fixed_short_official_drive() -> None:
     ) == pytest.approx(15.0)
 
 
+def test_paired_static_detour_routes_share_exact_terminal_poses() -> None:
+    forward = runner.DETOUR_ROUTES["office_waste_bin_s_to_g"]
+    reverse = runner.DETOUR_ROUTES["office_waste_bin_g_to_s"]
+
+    assert forward["goal"] == reverse["start"]
+    assert reverse["goal"] == forward["start"]
+
+
 def test_translation_deadline_uses_observed_progress_without_changing_command() -> None:
     assert runner.motion_goal("reverse") == {
         "distanceM": -1.0,

@@ -149,7 +149,10 @@ DETOUR_ROUTES = {
         "goal": (-7.30, -0.30, -2.50),
     },
     "office_waste_bin_g_to_s": {
-        "start": (-7.30, -0.30, 0.0),
+        # This is the exact terminal pose of the paired S->G route. Keeping
+        # the opposite route at yaw=0 made the two individually valid routes
+        # impossible to execute back-to-back without an unrecorded turn.
+        "start": (-7.30, -0.30, -2.50),
         "goal": (-6.45, 0.0, 0.0),
     },
 }

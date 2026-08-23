@@ -2258,6 +2258,31 @@ class SonicDriver:
                 boundary_already_stopped=(boundary_error is None),
             )
             return
+        if plant_state.get("fallArrestAvailable") is True:
+            reengaged_epoch = plant_state.get(
+                "fallArrestReengagedSafetyStopEpoch"
+            )
+            if (
+                isinstance(reengaged_epoch, bool)
+                or not isinstance(reengaged_epoch, int)
+                or reengaged_epoch <= 0
+            ):
+                self._latch_terminal_fault(
+                    f"{detail}; Plant fall-arrest re-engagement proof is invalid",
+                    boundary_already_stopped=(boundary_error is None),
+                )
+                return
+            try:
+                with self._support_lock:
+                    self._policy_activation.record_support_reengagement(
+                        reengaged_epoch
+                    )
+            except Exception as exc:
+                self._latch_terminal_fault(
+                    f"{detail}; SONIC could not invalidate released support: {exc}",
+                    boundary_already_stopped=(boundary_error is None),
+                )
+                return
         with self._support_lock:
             self._plant_support_mode = "safety_stop"
             self._plant_support_safety_latched = True

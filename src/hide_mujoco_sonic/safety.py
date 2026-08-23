@@ -919,6 +919,7 @@ class NominalPolicyActivation:
         self._last_settle_tick_ms: int | None = None
         self._support_release_tick_ms: int | None = None
         self._support_release_epoch: int | None = None
+        self._support_reengaged_safety_stop_epoch: int | None = None
         self._policy_takeover_tick_ms: int | None = None
         self._activation_path: str | None = None
         self._ready_targets: tuple[float, ...] | None = None
@@ -972,7 +973,7 @@ class NominalPolicyActivation:
     @property
     def provenance(self) -> dict[str, object]:
         return {
-            "schema_version": "h-ide.sonic-policy-activation/v3",
+            "schema_version": "h-ide.sonic-policy-activation/v4",
             "source": "NVlabs/GR00T-WholeBodyControl::G1Deploy::InitControl",
             "init_interpolation": "measured_current_to_nominal_each_tick",
             "clock": "authoritative_mujoco_lowstate_tick_ms",
@@ -981,12 +982,20 @@ class NominalPolicyActivation:
             "activation_path": self._activation_path,
             "support_release": {
                 "mode": (
-                    "one_way_release"
+                    "authority_epoch_release"
                     if self.release_fall_arrest
                     else "retained_vertical_attitude_fall_arrest"
                 ),
-                "one_way": self.release_fall_arrest,
+                "one_way": False,
                 "confirmed_epoch": self._support_release_epoch,
+                "reengaged_safety_stop_epoch": (
+                    self._support_reengaged_safety_stop_epoch
+                ),
+                "fault_recovery": (
+                    "reengage_then_require_newer_activation_epoch"
+                    if self.release_fall_arrest
+                    else "fall_arrest_already_retained"
+                ),
                 "cancel_recovery": "resume_policy_from_exact_frozen_boundary",
             },
             "settle_gate": {
@@ -1264,7 +1273,7 @@ class NominalPolicyActivation:
         return True
 
     def record_support_release(self, activation_epoch: int) -> bool:
-        """Persist one-way Plant release proof, including after a stop race."""
+        """Persist one activation-bound Plant release proof."""
 
         if (
             isinstance(activation_epoch, bool)
@@ -1281,6 +1290,47 @@ class NominalPolicyActivation:
         if self._phase == "UNPREPARED":
             self._phase = "UNPREPARED_SUPPORT_OFF"
         return previous is None
+
+    def record_support_reengagement(self, safety_stop_epoch: int) -> bool:
+        """Invalidate support-off authority after recoverable fault containment.
+
+        Plant re-engages only its non-propulsive simulation fall arrest. The
+        next explicit motion must nevertheless repeat measured INIT/settle and
+        obtain a strictly newer release proof; a previously PREPARED policy may
+        not silently run under newly restored support.
+        """
+
+        if (
+            isinstance(safety_stop_epoch, bool)
+            or not isinstance(safety_stop_epoch, int)
+            or safety_stop_epoch <= 0
+        ):
+            raise ValueError("support re-engagement epoch must be positive")
+        if not self.release_fall_arrest:
+            return False
+        previous_reengagement = self._support_reengaged_safety_stop_epoch
+        if previous_reengagement is not None:
+            if safety_stop_epoch < previous_reengagement:
+                raise NominalPolicyActivationFault(
+                    "Plant support re-engagement epoch moved backwards"
+                )
+            if safety_stop_epoch == previous_reengagement:
+                return False
+        self._support_reengaged_safety_stop_epoch = safety_stop_epoch
+        self._support_release_epoch = None
+        self._support_release_tick_ms = None
+        self._phase = "UNPREPARED"
+        self._activation_path = None
+        self._start_targets = None
+        self._start_tick_ms = None
+        self._ratio = 0.0
+        self._settle_start_tick_ms = None
+        self._settle_consecutive_samples = 0
+        self._last_settle_observation = None
+        self._last_settle_tick_ms = None
+        self._ready_targets = None
+        self._policy_takeover_tick_ms = None
+        return True
 
     def abort(self) -> bool:
         """Invalidate unfinished proposals while preserving process-level prep."""

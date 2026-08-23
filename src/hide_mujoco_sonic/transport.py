@@ -245,7 +245,14 @@ def _plant_motion_fault_request(
         or not isinstance(payload.get("fallArrestAvailable"), bool)
         or (
             payload.get("fallArrestAvailable") is True
-            and payload.get("fallArrestEnabled") is not True
+            and (
+                payload.get("fallArrestEnabled") is not True
+                or isinstance(payload.get("safetyStopEpoch"), bool)
+                or not isinstance(payload.get("safetyStopEpoch"), int)
+                or payload.get("safetyStopEpoch") <= 0
+                or payload.get("fallArrestReengagedSafetyStopEpoch")
+                != payload.get("safetyStopEpoch")
+            )
         )
     ):
         raise RuntimeError("plant did not confirm the recoverable motion fault state")

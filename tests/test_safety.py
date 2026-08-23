@@ -14,6 +14,7 @@ from hide_mujoco_sonic.safety import (
     MotionDirectionGuard,
     NavigationArmGuard,
     NominalPolicyActivation,
+    NominalPolicyActivationFault,
     PlantControlClock,
     PlantControlClockFault,
     PlantTickGuard,
@@ -500,9 +501,11 @@ def test_activation_stop_after_policy_grant_and_release_preserves_init():
     assert activation.phase == "PREPARED"
     assert activation.support_release_confirmed is True
     assert activation.provenance["support_release"] == {
-        "mode": "one_way_release",
-        "one_way": True,
+        "mode": "authority_epoch_release",
+        "one_way": False,
         "confirmed_epoch": released_epoch,
+        "reengaged_safety_stop_epoch": None,
+        "fault_recovery": "reengage_then_require_newer_activation_epoch",
         "cancel_recovery": "resume_policy_from_exact_frozen_boundary",
     }
     assert activation.begin([0.05], tick_ms=4_000) is False
@@ -532,11 +535,54 @@ def test_nominal_policy_activation_can_retain_nonpropulsive_fall_arrest():
         "mode": "retained_vertical_attitude_fall_arrest",
         "one_way": False,
         "confirmed_epoch": None,
+        "reengaged_safety_stop_epoch": None,
+        "fault_recovery": "fall_arrest_already_retained",
         "cancel_recovery": "resume_policy_from_exact_frozen_boundary",
     }
     assert activation.provenance["policy_takeover"] == (
         "first_successful_policy_dds_with_fall_arrest_retained"
     )
+
+
+def test_motion_fault_support_reengagement_requires_new_activation_release() -> None:
+    activation = NominalPolicyActivation(
+        joint_count=1,
+        duration_s=3.0,
+        settle_consecutive_samples=1,
+    )
+    assert activation.begin([0.1], tick_ms=0)
+    final = activation.propose([0.0], measured=[0.0], tick_ms=3_000)
+    assert activation.commit(final, final.targets)
+    assert activation.observe_settling(
+        nominal=[0.0],
+        measured=[0.0],
+        velocities=[0.0],
+        gyroscope=[0.0, 0.0, 0.0],
+        roll_rad=0.0,
+        pitch_rad=0.0,
+        tick_ms=3_020,
+    ).stage_complete
+    assert activation.record_support_release(activation.epoch)
+    assert activation.confirm_support_release(tick_ms=3_040)
+    assert activation.prepared
+
+    assert activation.record_support_reengagement(7) is True
+    assert activation.phase == "UNPREPARED"
+    assert activation.support_release_confirmed is False
+    assert activation.provenance["support_release"] == {
+        "mode": "authority_epoch_release",
+        "one_way": False,
+        "confirmed_epoch": None,
+        "reengaged_safety_stop_epoch": 7,
+        "fault_recovery": "reengage_then_require_newer_activation_epoch",
+        "cancel_recovery": "resume_policy_from_exact_frozen_boundary",
+    }
+    assert activation.record_support_reengagement(7) is False
+    with pytest.raises(NominalPolicyActivationFault, match="moved backwards"):
+        activation.record_support_reengagement(6)
+
+    assert activation.begin([0.05], tick_ms=4_000) is True
+    assert activation.epoch > 1
 
 
 def test_legacy_support_off_recovery_skips_static_init():
