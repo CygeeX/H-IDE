@@ -420,6 +420,20 @@ def test_health_transport_fence_wires_command_auto_arm_and_delivery_paths() -> N
     assert "deliver_intent(intent, context='gait watchdog')" in watchdog
 
 
+def test_odometry_intent_uses_the_same_sample_yaw_not_the_pose_callback_cache() -> None:
+    """A queued map-pose callback must not freeze SONIC's Spin heading feedback."""
+
+    path = ROOT / "src/hide_mujoco_sonic/ros_bridge.py"
+    odometry = ast.unparse(_nested_function(path, "on_odom"))
+
+    assert "latest_heading['yaw'] = yaw" in odometry
+    assert "measured_heading_yaw=yaw" in odometry
+    assert "measured_heading_yaw=latest_heading['yaw']" not in odometry
+    assert odometry.index("latest_heading['yaw'] = yaw") < odometry.index(
+        "gait.ingest_observation"
+    )
+
+
 def test_normal_stop_timeout_logs_and_reraises_without_mutating_transport_gate() -> None:
     path = ROOT / "src/hide_mujoco_sonic/ros_bridge.py"
     source = ast.unparse(_nested_function(path, "probe_normal_stop_health"))

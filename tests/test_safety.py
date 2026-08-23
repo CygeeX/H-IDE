@@ -989,6 +989,44 @@ def test_mixed_curve_facing_integral_accumulates_and_mirrors_past_old_cap():
     assert negative_output == pytest.approx(-positive_output)
 
 
+def test_spin_measured_progress_opens_the_next_planner_facing_segment():
+    """Fresh odometry must advance a long Spin beyond its first small clip."""
+
+    now = [100.0]
+    guard = CmdVelGuard(clock=lambda: now[0], smoothing_alpha=1.0)
+    gate = ReplanIntentGate()
+    idle = MovementIntent("IDLE", 0.0, 0.0, 0.0, False, False)
+    assert gate.admit(idle, now=0.0)
+
+    guard.observe_heading(0.0)
+    guard.accept(0.0, 0.0, 0.20)
+    first_segment = None
+    # Reproduce cold INIT: the command integral keeps advancing for 3 s while
+    # measured yaw remains near the starting pose and the emitted target is
+    # capped at the reviewed 0.05-rad lead.
+    for frame in range(150):
+        now[0] += 0.02
+        guard.observe_heading(0.0)
+        guard.accept(0.0, 0.0, 0.20)
+        candidate = guard.intent(now=now[0], dt=0.02)
+        if gate.admit(candidate, now=(frame + 1) * 0.02):
+            first_segment = candidate
+    assert first_segment is not None
+    assert first_segment.facing_angle_rad == pytest.approx(0.05)
+    assert guard.command_facing == pytest.approx(0.60)
+
+    # The same authoritative odometry sample that proves physical progress is
+    # enough to move the emitted lead and cross the 0.15-rad replan threshold.
+    # A stale separately-cached pose would leave the target at 0.05 forever.
+    now[0] += 0.40
+    guard.observe_heading(0.18)
+    guard.accept(0.0, 0.0, 0.20)
+    next_segment = guard.intent(now=now[0], dt=0.02)
+    assert next_segment.facing_angle_rad == pytest.approx(0.23)
+    assert gate.admit(next_segment, now=3.40)
+    assert gate.last is next_segment
+
+
 @pytest.mark.parametrize("invalid_dt", [float("nan"), 0.0, 0.10])
 def test_invalid_integration_dt_fails_without_advancing_facing(invalid_dt):
     guard = CmdVelGuard(clock=lambda: 100.0, smoothing_alpha=1.0)

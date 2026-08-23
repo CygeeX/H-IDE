@@ -3287,6 +3287,12 @@ class SonicDriver:
             sonic_speed_mps=intent.speed_mps,
             sonic_movement_angle_rad=intent.movement_angle_rad,
             sonic_facing_angle_rad=intent.facing_angle_rad,
+            sonic_command_facing_angle_rad=float(
+                getattr(self.guard, "command_facing", intent.facing_angle_rad)
+            ),
+            sonic_measured_heading_yaw_rad=getattr(
+                self.guard, "measured_heading", None
+            ),
             sonic_decoder_heading_delta_rad=float(decoder.delta_heading),
             cmd_vel_age_s=(None if received_at is None else max(0.0, time.monotonic() - received_at)),
             **self._planner_telemetry_fields(),
@@ -4532,6 +4538,12 @@ class SonicDriver:
                 "speed_mps": intent.speed_mps,
                 "movement_angle_rad": intent.movement_angle_rad,
                 "facing_angle_rad": intent.facing_angle_rad,
+                "command_facing_angle_rad": float(
+                    getattr(self.guard, "command_facing", intent.facing_angle_rad)
+                ),
+                "measured_heading_yaw_rad": getattr(
+                    self.guard, "measured_heading", None
+                ),
                 "has_movement": intent.has_movement,
                 "stale": intent.stale,
                 **planner_trace,

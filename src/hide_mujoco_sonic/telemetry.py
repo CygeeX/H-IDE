@@ -28,6 +28,8 @@ class TelemetryState:
     sonic_policy_speed_mps: float = 0.0
     sonic_movement_angle_rad: float = 0.0
     sonic_facing_angle_rad: float = 0.0
+    sonic_command_facing_angle_rad: float = 0.0
+    sonic_measured_heading_yaw_rad: float | None = None
     sonic_decoder_heading_delta_rad: float = 0.0
     sonic_intent_generation: int | None = None
     sonic_intent_signature: str | None = None

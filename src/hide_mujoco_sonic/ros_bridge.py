@@ -1213,6 +1213,17 @@ def run_ros_bridge(config: SimConfig) -> None:
             wz=float(twist.angular.z),
         )
         latest_observation["value"] = observation
+        # Bind the SONIC heading observation to this exact odometry sample.
+        # The observation bridge publishes odom immediately before the matching
+        # map pose.  Both subscriptions share the bridge's mutually-exclusive
+        # state group, and synchronous SONIC delivery from ``on_odom`` can keep
+        # the later pose callback queued behind newer odometry.  Using the
+        # separately cached pose yaw here therefore let a live Spin execute a
+        # stale ~0.016 rad heading while MuJoCo had already reached ~0.20 rad;
+        # the measured-lead limiter then held the planner request near 0.066 rad
+        # forever.  Odom carries the same capture quaternion, so make its yaw the
+        # authoritative value for the intent emitted from this callback.
+        latest_heading["yaw"] = yaw
         transport_fenced = check_health_transport_fence(
             context="odometry_auto_arm"
         )
@@ -1233,7 +1244,7 @@ def run_ros_bridge(config: SimConfig) -> None:
         coordinator.observe_stationary_intent(
             _intent_payload(
                 intent,
-                measured_heading_yaw=latest_heading["yaw"],
+                measured_heading_yaw=yaw,
             )
         )
         deliver_intent(intent, context="measured gait state")
