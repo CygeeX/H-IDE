@@ -288,6 +288,201 @@ def test_nav2_zero_waits_for_multiple_measured_stop_samples() -> None:
     assert adapter.state is GaitState.IDLE
 
 
+def test_normal_stop_accepts_bounded_humanoid_balance_window() -> None:
+    """Learned IDLE may balance without being instantaneously motionless."""
+
+    adapter = armed_adapter()
+    starting = adapter.ingest_twist(twist(10.02, wz=0.2), now=10.02)
+    grant_reference(adapter, starting)
+    adapter.ingest_observation(
+        observation(10.03, wz=0.12, yaw=0.01),
+        now=10.03,
+    )
+    assert adapter.ingest_twist(twist(10.04), now=10.04).state == "STOPPING"
+
+    # These samples reproduce the shape of the r50 learned-IDLE boundary:
+    # instantaneous balance corrections exceed the strict 0.04 rad/s fast
+    # path, while the base remains inside a small pose envelope and has almost
+    # no net displacement over the complete observation window.
+    # Exact rounded samples from the final 484 ms before the r50 timeout.
+    samples = (
+        (10.050, -6.445416, -0.094150, 1.515677, 0.037686, 0.105262),
+        (10.170, -6.444872, -0.097000, 1.503301, 0.005644, 0.155183),
+        (10.246, -6.444774, -0.096264, 1.490835, 0.021879, 0.095650),
+        (10.330, -6.444611, -0.094390, 1.488481, 0.013553, 0.033814),
+        (10.406, -6.444617, -0.094222, 1.494865, 0.005837, 0.134527),
+        (10.534, -6.443927, -0.094676, 1.511140, 0.002879, 0.089670),
+    )
+    result = None
+    for timestamp, x, y, yaw, vx, wz in samples:
+        result = adapter.ingest_observation(
+            observation(timestamp, x=x, y=y, yaw=yaw, vx=vx, wz=wz),
+            now=timestamp,
+        )
+
+    assert result is not None
+    assert result.state == "IDLE"
+    assert result.stop_acknowledged is True
+
+
+def test_normal_stop_balance_window_handles_wrapped_yaw() -> None:
+    adapter = armed_adapter()
+    starting = adapter.ingest_twist(twist(10.02, wz=0.2), now=10.02)
+    grant_reference(adapter, starting)
+    adapter.ingest_observation(
+        observation(10.03, wz=0.12, yaw=3.12),
+        now=10.03,
+    )
+    adapter.ingest_twist(twist(10.04), now=10.04)
+
+    samples = (
+        (10.05, 3.130, 0.12),
+        (10.15, 3.139, 0.09),
+        (10.25, -3.137, 0.07),
+        (10.35, 3.139, -0.07),
+        (10.45, 3.134, -0.06),
+        (10.55, 3.132, -0.05),
+    )
+    result = None
+    for timestamp, yaw, wz in samples:
+        result = adapter.ingest_observation(
+            observation(timestamp, yaw=yaw, vx=0.03, wz=wz),
+            now=timestamp,
+        )
+
+    assert result is not None
+    assert result.state == "IDLE"
+
+
+@pytest.mark.parametrize(
+    ("motion", "reason_fragment"),
+    [
+        ("translation", "stop before timeout"),
+        ("rotation", "stop before timeout"),
+    ],
+)
+def test_normal_stop_balance_window_rejects_continued_motion(
+    motion: str,
+    reason_fragment: str,
+) -> None:
+    config = GaitAdapterConfig(stop_timeout_s=0.80)
+    adapter = armed_adapter(config=config)
+    if motion == "translation":
+        starting = adapter.ingest_twist(twist(10.02, vx=0.2), now=10.02)
+        first_observation = observation(10.03, vx=0.06, x=0.001)
+    else:
+        starting = adapter.ingest_twist(twist(10.02, wz=0.2), now=10.02)
+        first_observation = observation(10.03, wz=0.08, yaw=0.001)
+    grant_reference(adapter, starting)
+    adapter.ingest_observation(first_observation, now=10.03)
+    adapter.ingest_twist(twist(10.04), now=10.04)
+
+    result = None
+    for index in range(1, 8):
+        timestamp = 10.04 + 0.10 * index
+        if motion == "translation":
+            measured = observation(
+                timestamp,
+                x=0.004 * index,
+                vx=0.04,
+            )
+        else:
+            measured = observation(
+                timestamp,
+                yaw=0.008 * index,
+                wz=0.08,
+            )
+        result = adapter.ingest_observation(measured, now=timestamp)
+        assert result.state == "STOPPING"
+
+    fault = adapter.tick(now=10.85)
+    assert fault.state == "FAULT"
+    assert reason_fragment in (fault.reason or "")
+
+
+def test_normal_stop_balance_window_restarts_after_gap_or_large_correction() -> None:
+    adapter = armed_adapter()
+    starting = adapter.ingest_twist(twist(10.02, wz=0.2), now=10.02)
+    grant_reference(adapter, starting)
+    adapter.ingest_observation(observation(10.03, wz=0.12), now=10.03)
+    adapter.ingest_twist(twist(10.04), now=10.04)
+
+    for timestamp in (10.05, 10.15, 10.25):
+        adapter.ingest_observation(
+            observation(timestamp, wz=0.08),
+            now=timestamp,
+        )
+    # A >200 ms capture gap cannot be bridged, and a correction beyond the
+    # bounded learned-balance speed clears the newly-started window again.
+    assert adapter.ingest_observation(
+        observation(10.50, wz=0.08),
+        now=10.50,
+    ).state == "STOPPING"
+    assert adapter.ingest_observation(
+        observation(10.60, wz=0.21),
+        now=10.60,
+    ).state == "STOPPING"
+
+    result = None
+    for index, timestamp in enumerate((10.70, 10.80, 10.90, 11.00, 11.10, 11.20)):
+        result = adapter.ingest_observation(
+            observation(
+                timestamp,
+                yaw=0.002 * (index % 3),
+                vx=0.03,
+                wz=0.08 if index % 2 == 0 else -0.08,
+            ),
+            now=timestamp,
+        )
+    assert result is not None
+    assert result.state == "IDLE"
+
+
+def test_safe_stop_does_not_use_normal_balanced_idle_window() -> None:
+    adapter = armed_adapter()
+    starting = adapter.ingest_twist(twist(10.02, wz=0.2), now=10.02)
+    grant_reference(adapter, starting)
+    adapter.ingest_observation(observation(10.03, wz=0.12), now=10.03)
+    assert adapter.request_safe_stop(1, now=10.04).state == "STOPPING"
+
+    result = None
+    for index, timestamp in enumerate((10.05, 10.15, 10.25, 10.35, 10.45, 10.55)):
+        result = adapter.ingest_observation(
+            observation(
+                timestamp,
+                yaw=0.002 * (index % 3),
+                vx=0.03,
+                wz=0.08 if index % 2 == 0 else -0.08,
+            ),
+            now=timestamp,
+        )
+    assert result is not None
+    assert result.state == "STOPPING"
+    assert result.stop_acknowledged is False
+
+    first_strict = adapter.ingest_observation(observation(10.65), now=10.65)
+    assert first_strict.state == "STOPPING"
+    confirmed = adapter.ingest_observation(observation(10.81), now=10.81)
+    assert confirmed.state == "DISARMED"
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"balanced_idle_stop_samples": True},
+        {"balanced_idle_stop_window_s": 2.0},
+        {"balanced_idle_stop_max_sample_gap_s": 0.45},
+        {"balanced_idle_stop_max_linear_mps": 0.025},
+        {"balanced_idle_stop_max_angular_rps": 0.60},
+    ],
+)
+def test_balanced_idle_stop_config_rejects_unsafe_or_impossible_limits(
+    kwargs: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match="balanced IDLE|balanced_idle"):
+        GaitAdapterConfig(**kwargs)
+
+
 def test_cancel_stops_then_requires_a_new_generation() -> None:
     adapter = armed_adapter()
     adapter.ingest_twist(twist(10.02, vx=0.2), now=10.02)

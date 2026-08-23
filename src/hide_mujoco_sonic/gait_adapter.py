@@ -16,12 +16,14 @@ MuJoCo.  A typical integration performs the following steps::
 
 An explicit Nav2 zero, cancel, stale input, generation change, or safety fault
 always produces a zero-motion intent.  A normal stop does not become ``IDLE``
-until multiple fresh base observations acknowledge that measured linear and
-angular velocity are below the configured thresholds.
+until fresh base observations either acknowledge strict instantaneous rest or
+prove a bounded learned-IDLE balance window.  The latter is needed because an
+untethered humanoid actively balances even when its commanded motion is zero.
 """
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 import math
@@ -130,6 +132,18 @@ class GaitAdapterConfig:
     stop_ack_s: float = 0.15
     stop_ack_samples: int = 2
     stop_timeout_s: float = 2.0
+    # The official learned IDLE remains an active whole-body policy. Permit a
+    # normal Nav2 zero to complete when its instantaneous balance corrections
+    # exceed the rigid-body thresholds above, but only while a continuous pose
+    # window proves bounded oscillation and strict near-zero net motion. This
+    # path is never used for cancel, safe-stop, or fault acknowledgement.
+    balanced_idle_stop_window_s: float = 0.45
+    balanced_idle_stop_max_sample_gap_s: float = 0.20
+    balanced_idle_stop_linear_excursion_m: float = 0.015
+    balanced_idle_stop_yaw_excursion_rad: float = 0.035
+    balanced_idle_stop_max_linear_mps: float = 0.05
+    balanced_idle_stop_max_angular_rps: float = 0.20
+    balanced_idle_stop_samples: int = 5
     # Humanoid stand-to-walk may briefly shift its base opposite the commanded
     # direction.  The allowance is intentionally bounded in both distance and
     # time, and is measured only after the first correlated DDS authority fact.
@@ -160,6 +174,12 @@ class GaitAdapterConfig:
             self.stop_angular_ack_rps,
             self.stop_ack_s,
             self.stop_timeout_s,
+            self.balanced_idle_stop_window_s,
+            self.balanced_idle_stop_max_sample_gap_s,
+            self.balanced_idle_stop_linear_excursion_m,
+            self.balanced_idle_stop_yaw_excursion_rad,
+            self.balanced_idle_stop_max_linear_mps,
+            self.balanced_idle_stop_max_angular_rps,
             self.reverse_translation_m,
             self.reverse_min_travel_m,
             self.startup_reverse_grace_s,
@@ -179,6 +199,14 @@ class GaitAdapterConfig:
             or self.stop_ack_samples < 2
         ):
             raise ValueError("stop_ack_samples must be an integer of at least two")
+        if (
+            isinstance(self.balanced_idle_stop_samples, bool)
+            or not isinstance(self.balanced_idle_stop_samples, int)
+            or self.balanced_idle_stop_samples < 3
+        ):
+            raise ValueError(
+                "balanced_idle_stop_samples must be an integer of at least three"
+            )
         if self.linear_deadband_mps >= self.max_linear_mps:
             raise ValueError("linear deadband must be below the command limit")
         if self.angular_deadband_rps >= self.max_angular_rps:
@@ -191,6 +219,39 @@ class GaitAdapterConfig:
             raise ValueError("linear stop acknowledgement must be below the command limit")
         if self.stop_angular_ack_rps >= self.max_angular_rps:
             raise ValueError("angular stop acknowledgement must be below the command limit")
+        if not (
+            self.stop_linear_ack_mps
+            < self.balanced_idle_stop_max_linear_mps
+            < self.max_linear_mps
+        ):
+            raise ValueError(
+                "balanced IDLE linear speed must be between the strict stop and command limits"
+            )
+        if not (
+            self.stop_angular_ack_rps
+            < self.balanced_idle_stop_max_angular_rps
+            < self.max_angular_rps
+        ):
+            raise ValueError(
+                "balanced IDLE angular speed must be between the strict stop and command limits"
+            )
+        if self.balanced_idle_stop_window_s >= self.stop_timeout_s:
+            raise ValueError("balanced IDLE stop window must be shorter than stop timeout")
+        if (
+            self.balanced_idle_stop_max_sample_gap_s
+            >= self.balanced_idle_stop_window_s
+        ):
+            raise ValueError(
+                "balanced IDLE sample gap must be shorter than its stop window"
+            )
+        if (
+            (self.balanced_idle_stop_samples - 1)
+            * self.balanced_idle_stop_max_sample_gap_s
+            < self.balanced_idle_stop_window_s
+        ):
+            raise ValueError(
+                "balanced IDLE sample count and gap cannot span its stop window"
+            )
         if self.direction_restart_rad > math.pi:
             raise ValueError("direction restart angle must not exceed pi")
         if self.startup_reverse_grace_s >= self.startup_progress_deadline_s:
@@ -253,6 +314,11 @@ class GaitAdapter:
         self._stationary_samples = 0
         self._last_stop_observation_timestamp: float | None = None
         self._stop_acknowledged = False
+        self._balanced_idle_stop_window: deque[
+            tuple[float, float, float, float]
+        ] = deque()
+        self._balanced_idle_stop_last_raw_yaw: float | None = None
+        self._balanced_idle_stop_last_unwrapped_yaw: float | None = None
         self._safe_stop_requested = False
 
     def advance_generation(self, generation: int, *, now: float | None = None) -> SonicIntent:
@@ -835,6 +901,7 @@ class GaitAdapter:
             self._stationary_samples = 0
             self._last_stop_observation_timestamp = observation.timestamp_s
             self._stop_acknowledged = False
+            self._reset_balanced_idle_stop_window()
             return
         if (
             self._last_stop_observation_timestamp is not None
@@ -842,20 +909,113 @@ class GaitAdapter:
         ):
             return
         self._last_stop_observation_timestamp = observation.timestamp_s
+        balanced_idle_ack = self._observe_balanced_idle_stop(observation)
         if not self._is_stationary(observation):
             self._stationary_since = None
             self._stationary_samples = 0
-            self._stop_acknowledged = False
+            self._stop_acknowledged = balanced_idle_ack
             return
         if self._stationary_since is None:
             self._stationary_since = observation.timestamp_s
             self._stationary_samples = 1
         else:
             self._stationary_samples += 1
-        self._stop_acknowledged = (
+        strict_ack = (
             self._stationary_samples >= self.config.stop_ack_samples
             and observation.timestamp_s - self._stationary_since
             >= self.config.stop_ack_s
+        )
+        self._stop_acknowledged = strict_ack or balanced_idle_ack
+
+    def _observe_balanced_idle_stop(self, observation: BaseObservation) -> bool:
+        """Prove bounded learned-IDLE balance without accepting real motion."""
+
+        if (
+            self.state is not GaitState.STOPPING
+            or self._stop_terminal is not GaitState.IDLE
+        ):
+            self._reset_balanced_idle_stop_window()
+            return False
+
+        linear_speed = math.hypot(observation.vx_body, observation.vy_body)
+        if (
+            linear_speed > self.config.balanced_idle_stop_max_linear_mps
+            or abs(observation.wz)
+            > self.config.balanced_idle_stop_max_angular_rps
+        ):
+            self._reset_balanced_idle_stop_window()
+            return False
+
+        window = self._balanced_idle_stop_window
+        if (
+            window
+            and observation.timestamp_s - window[-1][0]
+            > self.config.balanced_idle_stop_max_sample_gap_s
+        ):
+            self._reset_balanced_idle_stop_window()
+            window = self._balanced_idle_stop_window
+
+        if self._balanced_idle_stop_last_raw_yaw is None:
+            unwrapped_yaw = observation.yaw
+        else:
+            assert self._balanced_idle_stop_last_unwrapped_yaw is not None
+            unwrapped_yaw = (
+                self._balanced_idle_stop_last_unwrapped_yaw
+                + self._wrap_angle(
+                    observation.yaw - self._balanced_idle_stop_last_raw_yaw
+                )
+            )
+        self._balanced_idle_stop_last_raw_yaw = observation.yaw
+        self._balanced_idle_stop_last_unwrapped_yaw = unwrapped_yaw
+        window.append(
+            (
+                observation.timestamp_s,
+                observation.x,
+                observation.y,
+                unwrapped_yaw,
+            )
+        )
+
+        required_span = self.config.balanced_idle_stop_window_s
+        # Retain one capture on or immediately before the left edge. This
+        # proves the full span despite discrete 10 Hz odometry samples.
+        while (
+            len(window) >= 2
+            and observation.timestamp_s - window[1][0] >= required_span
+        ):
+            window.popleft()
+        if (
+            len(window) < self.config.balanced_idle_stop_samples
+            or observation.timestamp_s - window[0][0] < required_span
+        ):
+            return False
+
+        samples = tuple(window)
+        linear_diameter = max(
+            math.hypot(left[1] - right[1], left[2] - right[2])
+            for index, left in enumerate(samples)
+            for right in samples[index:]
+        )
+        if linear_diameter > self.config.balanced_idle_stop_linear_excursion_m:
+            return False
+        yaw_values = tuple(sample[3] for sample in samples)
+        if (
+            max(yaw_values) - min(yaw_values)
+            > self.config.balanced_idle_stop_yaw_excursion_rad
+        ):
+            return False
+
+        elapsed = samples[-1][0] - samples[0][0]
+        if elapsed <= 0.0:
+            return False
+        net_linear_speed = math.hypot(
+            samples[-1][1] - samples[0][1],
+            samples[-1][2] - samples[0][2],
+        ) / elapsed
+        net_angular_speed = abs(samples[-1][3] - samples[0][3]) / elapsed
+        return (
+            net_linear_speed <= self.config.stop_linear_ack_mps
+            and net_angular_speed <= self.config.stop_angular_ack_rps
         )
 
     def _reset_stop_ack(self) -> None:
@@ -863,6 +1023,12 @@ class GaitAdapter:
         self._stationary_samples = 0
         self._last_stop_observation_timestamp = None
         self._stop_acknowledged = False
+        self._reset_balanced_idle_stop_window()
+
+    def _reset_balanced_idle_stop_window(self) -> None:
+        self._balanced_idle_stop_window.clear()
+        self._balanced_idle_stop_last_raw_yaw = None
+        self._balanced_idle_stop_last_unwrapped_yaw = None
 
     def _select_generation(self, generation: int) -> None:
         self.generation = generation
