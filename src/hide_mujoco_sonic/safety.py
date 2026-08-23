@@ -1475,7 +1475,15 @@ class ReplanIntentGate:
             return False
         if self._last is not None and self._last.mode != "IDLE":
             return False
-        origin = 0.0 if self._last is None else self._last.facing_angle_rad
+        # Every ordinary zero->motion transaction asks SONIC for a fresh
+        # measured reference.  That request deliberately rebases the vendor
+        # planner context to a heading-neutral local frame.  The preceding
+        # learned-IDLE reference may retain a non-zero facing so the humanoid
+        # can balance at the completed pose, but it is not the origin of the
+        # next planner request.  Comparing a new Spin against that old facing
+        # admitted milliradian ramps immediately and could invert a subsequent
+        # turn after a completed action.
+        origin = 0.0
         return (
             self._angular_distance(intent.facing_angle_rad, origin) + 1e-12
             < self.min_rotation_start_angle_rad
@@ -1761,14 +1769,17 @@ class CmdVelGuard:
         )
         starting = self._is_nonzero(target) and not self._is_nonzero(self._last)
         if starting:
-            # SONIC's movement/facing vectors live in the controller frame
-            # accumulated since this controller was initialized.  Preserve that
-            # canonical heading across Nav2 actions: the async planner's context
-            # still contains the preceding motion heading even when the physical
-            # decoder is re-anchored to the latest measured IMU pose.
+            # An ordinary SONIC reference request calls
+            # ``load_measured_reference()``, whose planner root quaternion is
+            # explicitly heading-neutral.  Rebase every new Nav2 action to that
+            # same local frame while retaining measured yaw only as the
+            # observation anchor used by curve lead limiting.  Carrying the
+            # preceding action's learned-IDLE facing into this new request made
+            # a right turn following a left turn ask the planner to turn left.
             self._heading_anchor = self._measured_heading
-            self._action_facing_origin = self._facing
-            self._command_facing = self._facing
+            self._action_facing_origin = 0.0
+            self._facing = 0.0
+            self._command_facing = 0.0
         elif not self._is_nonzero(target):
             self._freeze_facing_action()
         self._last = target

@@ -874,7 +874,7 @@ def test_small_reverse_measured_spin_does_not_reverse_command_integral():
     assert second.facing_angle_rad == pytest.approx(0.008)
 
 
-def test_new_nav2_action_preserves_the_planner_canonical_facing_after_idle():
+def test_new_nav2_action_rebases_to_heading_neutral_planner_context_after_idle():
     now = [100.0]
     guard = CmdVelGuard(clock=lambda: now[0], smoothing_alpha=1.0)
     guard.observe_heading(0.2)
@@ -884,11 +884,11 @@ def test_new_nav2_action_preserves_the_planner_canonical_facing_after_idle():
     guard.observe_heading(-0.4)
     guard.accept(0.2, 0.0, 0.0)
     forward = guard.intent(now=100.02, dt=0.02)
-    assert forward.movement_angle_rad == pytest.approx(0.01)
-    assert forward.facing_angle_rad == pytest.approx(0.01)
+    assert forward.movement_angle_rad == pytest.approx(0.0)
+    assert forward.facing_angle_rad == pytest.approx(0.0)
 
 
-def test_sequential_spin_actions_accumulate_in_the_sonic_planner_frame():
+def test_sequential_spin_actions_each_start_in_a_local_planner_frame():
     now = [100.0]
     guard = CmdVelGuard(
         max_facing_lead_rad=0.15,
@@ -903,7 +903,27 @@ def test_sequential_spin_actions_accumulate_in_the_sonic_planner_frame():
 
     guard.observe_heading(0.35)
     guard.accept(0.0, 0.0, 0.2)
-    assert guard.intent(now=100.03, dt=0.02).facing_angle_rad == pytest.approx(0.008)
+    assert guard.intent(now=100.03, dt=0.02).facing_angle_rad == pytest.approx(0.004)
+
+
+def test_right_spin_after_live_facing_stop_does_not_reuse_the_left_turn_goal():
+    """Reproduce the r52 left-then-right planner-frame incident exactly."""
+
+    now = [100.0]
+    guard = CmdVelGuard(clock=lambda: now[0], smoothing_alpha=1.0)
+    guard.observe_heading(1.6006)
+    guard.stop_at_measured_heading(
+        source="gait_adapter_controlled_stop",
+        facing_angle_rad=0.870992738,
+    )
+    idle = guard.intent(now=100.01, dt=0.02)
+    assert idle.facing_angle_rad == pytest.approx(0.870992738)
+
+    guard.accept(0.0, 0.0, -0.2)
+    right = guard.intent(now=100.02, dt=0.02)
+    assert right.facing_angle_rad == pytest.approx(-0.004)
+    assert right.movement_angle_rad == pytest.approx(-0.004)
+    assert guard.command_facing == pytest.approx(-0.004)
 
 
 def test_base_forward_command_tracks_accumulated_sonic_facing():
@@ -1060,8 +1080,8 @@ def test_stop_freezes_and_next_action_reanchors_command_facing():
 
     guard.accept(0.20, 0.0, -0.25)
     restarted = guard.intent(now=100.03, dt=0.02)
-    assert restarted.facing_angle_rad == pytest.approx(0.0)
-    assert guard.command_facing == pytest.approx(0.0)
+    assert restarted.facing_angle_rad == pytest.approx(-0.005)
+    assert guard.command_facing == pytest.approx(-0.005)
 
 
 def test_controlled_stop_preserves_official_ros2_planner_facing():
@@ -1133,8 +1153,8 @@ def test_replan_gate_waits_for_verified_pure_rotation_request_size(sign):
     tiny = MovementIntent(
         "SLOW_WALK",
         0.0,
-        0.40 + sign * 0.0014,
-        0.40 + sign * 0.0014,
+        sign * 0.0014,
+        sign * 0.0014,
         False,
         False,
     )
@@ -1144,8 +1164,8 @@ def test_replan_gate_waits_for_verified_pure_rotation_request_size(sign):
     verified = MovementIntent(
         "SLOW_WALK",
         0.0,
-        0.40 + sign * 0.05,
-        0.40 + sign * 0.05,
+        sign * 0.05,
+        sign * 0.05,
         False,
         False,
     )

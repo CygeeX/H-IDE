@@ -40,6 +40,7 @@ from hide_mujoco_sonic.planner_evidence import (
 )
 from hide_mujoco_sonic.reference_authority import ReferenceAuthorityState
 from hide_mujoco_sonic.safety import (
+    CmdVelGuard,
     MovementIntent,
     NominalPolicyActivation,
     PlantControlClock,
@@ -2419,6 +2420,67 @@ def test_tiny_spin_ramp_keeps_proven_idle_until_yaw_request_is_meaningful() -> N
     assert evidence.intent_generation == 0
     assert controller.ms.mode == 0
     assert controller.ms.facing_angle == pytest.approx(0.0)
+
+
+def test_right_spin_after_completed_left_turn_requests_a_negative_local_reference() -> None:
+    """The r52 follow-up action must not inherit r51's planner-facing goal."""
+
+    from lerobot.robots.unitree_g1.controllers.sonic_pipeline import LM
+
+    clock = Clock(100.0)
+    driver = bare_driver(clock)
+    driver._last_published_targets = tuple(0.0 for _ in range(29))
+    driver._reference_source_identity = (42, 7)
+    driver._navigation_task_active = True
+    driver._intent_gate = ReplanIntentGate()
+    driver._decoder_facing_rad = 0.0
+    driver._pending_decoder_heading_delta_rad = 0.0
+    driver._last_intent_signature = None
+    driver._policy_activation = SimpleNamespace(prepared=True)
+    driver._policy_activation_requested = False
+    evidence = _TransactionalEvidence()
+    driver._planner_evidence = evidence
+    controller = _TransactionalController(
+        evidence,
+        tuple(0.0 for _ in range(29)),
+    )
+    driver._controller = controller
+
+    guard = CmdVelGuard(clock=clock, smoothing_alpha=1.0)
+    guard.observe_heading(1.6006)
+    guard.stop_at_measured_heading(
+        source="gait_adapter_controlled_stop",
+        facing_angle_rad=0.870992738,
+    )
+    idle = guard.intent(now=clock.value, dt=0.02)
+    assert driver._intent_gate.admit(idle, now=0.0)
+    driver.guard = guard
+
+    # Nav2 ramps a right Spin to -0.2rad/s.  The command integral is local to
+    # the new measured-reference transaction: frames below 0.05rad keep the
+    # proven learned-IDLE policy, then the first planner request is negative.
+    observed = idle
+    for frame in range(1, 14):
+        clock.value += 0.02
+        guard.accept(0.0, 0.0, -0.2)
+        observed = driver._apply_intent(
+            0.02,
+            simulation_now_s=frame * 0.02,
+        )
+        if frame < 13:
+            assert driver._intent_gate.last is idle
+            assert driver._reference_authority.snapshot.phase == "REVOKED"
+            assert controller.ms.facing_angle == pytest.approx(0.0)
+
+    assert observed.facing_angle_rad == pytest.approx(-0.052)
+    assert driver._intent_gate.last is observed
+    assert controller.ms.mode == LM.IDLE
+    assert controller.ms.has_movement is False
+    assert controller.ms.facing_angle == pytest.approx(-0.052)
+    assert driver._decoder_facing_rad == pytest.approx(-0.052)
+    assert driver._reference_authority.snapshot.phase == "REQUIRED"
+    assert driver._reference_request_pending is True
+    assert evidence.intent_generation == 1
 
 
 def test_activation_rechecks_stop_before_begin_and_stop_wins_before_telemetry() -> None:
