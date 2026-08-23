@@ -55,6 +55,7 @@ from .runtime_diagnostics import SonicRuntimeDiagnostics
 from .safety import (
     CmdVelGuard,
     JointGuardResult,
+    LateralHeadingCorrection,
     MovementIntent,
     NavigationArmGuard,
     NominalPolicyActivation,
@@ -522,6 +523,10 @@ class SonicDriver:
         self._last_intent_signature: tuple[bool, float, float, float] | None = None
         self._decoder_facing_rad: float | None = None
         self._pending_decoder_heading_delta_rad = 0.0
+        self._lateral_heading_hold_active = False
+        self._lateral_heading_hold_identity: tuple[int, int] | None = None
+        self._lateral_heading_error_rad = 0.0
+        self._lateral_heading_correction_rad = 0.0
         self._intent_gate = ReplanIntentGate()
         self._joint_handoff = StaticJointHandoff(
             warmup_s=config.motion_handoff_warmup_s,
@@ -638,8 +643,12 @@ class SonicDriver:
             ),
         )
         self._arm_evidence_request_replays: dict[
-            UUID, tuple[bytes, dict[str, object]]
+            UUID, tuple[bytes, dict[str, object] | None]
         ] = {}
+        self._arm_evidence_materialization_lock = threading.Lock()
+        self._arm_evidence_materialization_case_id: str | None = None
+        self._arm_evidence_materialization_error: str | None = None
+        self._arm_evidence_materialization_thread: threading.Thread | None = None
         self._joint_names = tuple(self._joint_name(index) for index in range(29))
         self._fault_trace = JointFaultTraceBuffer(
             self._joint_names,
@@ -1661,6 +1670,7 @@ class SonicDriver:
         failures: list[Exception] = []
         frozen = False
         with self._support_lock:
+            self._clear_lateral_heading_hold_locked()
             self._controlled_stop_active = False
             self._balanced_policy_idle_active = False
             self._controlled_stop_source_identity = None
@@ -1744,6 +1754,7 @@ class SonicDriver:
             return False
         if not self._controlled_policy_stop_eligible_locked(decision.generation):
             return False
+        self._clear_lateral_heading_hold_locked()
         identity = (decision.generation, decision.sequence)
         already_active = bool(getattr(self, "_controlled_stop_active", False))
         authority = self._reference_authority.snapshot
@@ -4262,20 +4273,110 @@ class SonicDriver:
                 reference_epoch=epoch,
             )
 
-    def _run_policy_candidate(self, lowstate) -> dict[str, Any]:
+    def _clear_lateral_heading_hold_locked(self) -> None:
+        """Clear only the driver-owned pure-strafe decoder correction."""
+
+        controller = getattr(self, "_controller", None)
+        decoder = getattr(controller, "controller", None)
+        if (
+            bool(getattr(self, "_lateral_heading_hold_active", False))
+            and decoder is not None
+        ):
+            decoder.delta_heading = 0.0
+        self._lateral_heading_hold_active = False
+        self._lateral_heading_hold_identity = None
+        self._lateral_heading_error_rad = 0.0
+        self._lateral_heading_correction_rad = 0.0
+
+    def _apply_lateral_heading_hold_locked(
+        self,
+        intent: MovementIntent,
+    ) -> LateralHeadingCorrection | None:
+        """Bind measured-yaw feedback to the currently executable action."""
+
+        correction_for = getattr(self.guard, "lateral_heading_correction", None)
+        correction = correction_for(intent) if callable(correction_for) else None
+        if correction is None:
+            self._clear_lateral_heading_hold_locked()
+            return None
+        identity = self._reference_source_identity
+        authority = self._reference_authority.snapshot
+        if (
+            identity is None
+            or authority.generation != identity[0]
+            or authority.source_sequence != identity[1]
+            or authority.phase not in {"PRIMED", "GRANTED"}
+        ):
+            raise RuntimeError(
+                "lateral heading hold lacks matching actuator authority"
+            )
+        values = (
+            float(correction.heading_error_rad),
+            float(correction.decoder_delta_heading_rad),
+        )
+        if not all(math.isfinite(value) for value in values):
+            raise RuntimeError("lateral heading hold produced a non-finite correction")
+        decoder = self._controller.controller
+        decoder.delta_heading = values[1]
+        self._lateral_heading_hold_active = True
+        self._lateral_heading_hold_identity = identity
+        self._lateral_heading_error_rad = values[0]
+        self._lateral_heading_correction_rad = values[1]
+        return correction
+
+    def _lateral_heading_telemetry_fields(self) -> dict[str, object]:
+        with self._support_lock:
+            return {
+                "sonic_lateral_heading_hold_active": bool(
+                    getattr(self, "_lateral_heading_hold_active", False)
+                ),
+                "sonic_lateral_heading_error_rad": float(
+                    getattr(self, "_lateral_heading_error_rad", 0.0)
+                ),
+                "sonic_lateral_heading_correction_rad": float(
+                    getattr(self, "_lateral_heading_correction_rad", 0.0)
+                ),
+            }
+
+    def _run_policy_candidate(
+        self,
+        lowstate,
+        *,
+        intent: MovementIntent | None = None,
+    ) -> dict[str, Any]:
         """Decode and project any installed refresh as one authority snapshot."""
 
+        lateral_correction: LateralHeadingCorrection | None = None
         with self._support_lock:
             if self._enforce_terminal_boundary_locked():
                 return {}
             self._consume_vendor_revoke_locked()
             if not self._reference_authority.executable:
                 return {}
+            if intent is not None:
+                lateral_correction = self._apply_lateral_heading_hold_locked(intent)
         action = self._controller.run_step({}, lowstate)
         with self._support_lock:
             if self._enforce_terminal_boundary_locked():
                 return {}
             self._consume_vendor_revoke_locked()
+            if lateral_correction is not None:
+                # ``run_step`` may consume ``reinit_heading`` and reset the
+                # decoder offset. Restore the same bounded action correction
+                # only if the source identity still owns actuator authority.
+                identity = self._lateral_heading_hold_identity
+                authority = self._reference_authority.snapshot
+                if (
+                    identity is None
+                    or authority.generation != identity[0]
+                    or authority.source_sequence != identity[1]
+                    or authority.phase not in {"PRIMED", "GRANTED"}
+                ):
+                    self._clear_lateral_heading_hold_locked()
+                    return {}
+                self._controller.controller.delta_heading = (
+                    self._lateral_heading_correction_rad
+                )
             self._prime_periodic_reference_refresh()
         return action
 
@@ -4648,6 +4749,15 @@ class SonicDriver:
                 "measured_heading_yaw_rad": getattr(
                     self.guard, "measured_heading", None
                 ),
+                "lateral_heading_hold_active": bool(
+                    getattr(self, "_lateral_heading_hold_active", False)
+                ),
+                "lateral_heading_error_rad": float(
+                    getattr(self, "_lateral_heading_error_rad", 0.0)
+                ),
+                "lateral_heading_correction_rad": float(
+                    getattr(self, "_lateral_heading_correction_rad", 0.0)
+                ),
                 "has_movement": intent.has_movement,
                 "stale": intent.stale,
                 **planner_trace,
@@ -4729,6 +4839,40 @@ class SonicDriver:
         stop_event = getattr(self, "_stop", None)
         return bool(stop_event is not None and stop_event.is_set())
 
+    def _normal_stop_policy_balance_pending_locked(self) -> bool:
+        """Whether learned IDLE owns balance until Plant confirms its latch.
+
+        After the correlated stationary acknowledgement, ingress is revoked
+        and the Plant stop is marked pending, but the exact granted IDLE
+        reference deliberately remains on DDS.  Freezing the humanoid before
+        the Plant latch is confirmed removes its dynamic balance controller.
+        This predicate is the single provenance check shared by the control
+        fence and the health snapshot for that bounded transaction window.
+        The caller owns ``_support_lock``.
+        """
+
+        normal_stop = getattr(self, "_normal_stop", None)
+        phase = (
+            normal_stop.snapshot.phase
+            if isinstance(normal_stop, NormalStopState)
+            else "NONE"
+        )
+        authority = self._reference_authority.snapshot
+        return bool(
+            getattr(self, "_normal_stop_policy_braking", False)
+            and phase in {"STATIONARY_ACK", "FAILED"}
+            and getattr(self, "_controlled_stop_active", False)
+            and getattr(self, "_controlled_stop_reference_installed", False)
+            and authority.phase == "GRANTED"
+            and authority.actuator_authority
+            and self._safe_hold_targets is None
+            and self._plant_support_mode == "idle"
+            and self._plant_support_stop_pending
+            and not self._plant_support_safety_latched
+            and not self._process_stop_fences_motion_locked()
+            and not self._fault_latched.is_set()
+        )
+
     def _normal_stop_static_boundary_locked(self) -> bool:
         """Return the current recoverable stop's physical/local hold fence."""
 
@@ -4742,18 +4886,8 @@ class SonicDriver:
             getattr(self, "_normal_stop_policy_braking", False)
             and phase == "BRAKING"
         )
-        policy_balance_until_plant = bool(
-            getattr(self, "_normal_stop_policy_braking", False)
-            and phase in {"STATIONARY_ACK", "FAILED"}
-            and getattr(self, "_controlled_stop_active", False)
-            and getattr(self, "_controlled_stop_reference_installed", False)
-            and self._reference_authority.snapshot.phase == "GRANTED"
-            and self._reference_authority.snapshot.actuator_authority
-            and self._safe_hold_targets is None
-            and self._plant_support_mode == "idle"
-            and not self._plant_support_safety_latched
-            and not self._process_stop_fences_motion_locked()
-            and not self._fault_latched.is_set()
+        policy_balance_until_plant = (
+            self._normal_stop_policy_balance_pending_locked()
         )
         policy_owned_stop = policy_transition or policy_balance_until_plant
         return (
@@ -5043,11 +5177,18 @@ class SonicDriver:
                 # Decode creates a pending candidate. Its action history and
                 # reference cursor commit only after the complete DDS write.
                 self._control_loop_stage = "policy_candidate"
-                policy_action = self._run_policy_candidate(lowstate)
+                policy_action = self._run_policy_candidate(
+                    lowstate,
+                    intent=intent,
+                )
                 self._update_telemetry_hot(
                     sonic_policy_speed_mps=(
                         max(0.0, float(self._controller.ms.speed))
                     ),
+                    sonic_decoder_heading_delta_rad=float(
+                        self._controller.controller.delta_heading
+                    ),
+                    **self._lateral_heading_telemetry_fields(),
                     **self._planner_telemetry_fields(),
                 )
                 if self._pending_decoder_heading_delta_rad:
@@ -6319,6 +6460,75 @@ class SonicDriver:
                 "(normal-stop boundary or balanced-policy IDLE boundary)"
             )
 
+    def _arm_evidence_materialization_status(
+        self,
+        case_id: object,
+    ) -> dict[str, object]:
+        completed = self._arm_evidence._completed_transport_payload(
+            case_id=str(case_id),
+        )
+        if completed is not None:
+            return {"status": "complete", "evidence": completed}
+        with self._arm_evidence_materialization_lock:
+            active_case = self._arm_evidence_materialization_case_id
+            error = self._arm_evidence_materialization_error
+            thread = self._arm_evidence_materialization_thread
+        if active_case != case_id:
+            raise ArmLimiterEvidenceError(
+                "no matching arm evidence materialization exists"
+            )
+        if error is not None:
+            raise ArmLimiterEvidenceError(
+                f"arm evidence materialization failed: {error}"
+            )
+        if thread is None or not thread.is_alive():
+            raise ArmLimiterEvidenceError(
+                "arm evidence materialization ended without an artifact"
+            )
+        return {"status": "materializing", "evidence": None}
+
+    def _start_arm_evidence_materialization(self, case_id: object) -> None:
+        requested_case = str(case_id)
+        if (
+            self._arm_evidence._completed_transport_payload(
+                case_id=requested_case,
+            )
+            is not None
+        ):
+            return
+        with self._arm_evidence_materialization_lock:
+            thread = self._arm_evidence_materialization_thread
+            if thread is not None and thread.is_alive():
+                if self._arm_evidence_materialization_case_id != requested_case:
+                    raise ArmLimiterEvidenceError(
+                        "another arm evidence artifact is materializing"
+                    )
+                return
+            self._arm_evidence_materialization_case_id = requested_case
+            self._arm_evidence_materialization_error = None
+
+            def materialize() -> None:
+                try:
+                    self._arm_evidence.materialize(case_id=requested_case)
+                except Exception as exc:
+                    message = " ".join(
+                        (str(exc).strip() or type(exc).__name__).split()
+                    )[:512]
+                    with self._arm_evidence_materialization_lock:
+                        if (
+                            self._arm_evidence_materialization_case_id
+                            == requested_case
+                        ):
+                            self._arm_evidence_materialization_error = message
+
+            thread = threading.Thread(
+                target=materialize,
+                daemon=True,
+                name="sonic-arm-evidence-materializer",
+            )
+            self._arm_evidence_materialization_thread = thread
+            thread.start()
+
     def _handle_arm_evidence_request(
         self,
         payload: dict[str, Any],
@@ -6359,6 +6569,10 @@ class SonicDriver:
             if previous != canonical:
                 raise RuntimeError(
                     "arm evidence request_id was reused for another operation"
+                )
+            if response is None:
+                return self._arm_evidence_materialization_status(
+                    payload.get("case_id")
                 )
             return copy.deepcopy(response)
         if len(replays) >= 256:
@@ -6408,16 +6622,23 @@ class SonicDriver:
                 "127.0.0.1",
                 self.config.plant_port,
             )
+            materialize = False
             with self._arm_evidence_boundary_lock:
                 identity = self._arm_evidence.active_identity
-                if identity is None or identity.get("caseId") != case_id:
-                    completed = self._arm_evidence.completed(case_id=case_id)
-                    if completed is None:
+                if identity is None:
+                    if (
+                        case_id != self._arm_evidence.sealed_case_id
+                        and case_id != self._arm_evidence.completed_case_id
+                    ):
                         raise ArmLimiterEvidenceError(
                             "no matching arm evidence session is active"
                         )
-                    response = {"status": "complete", "evidence": completed}
+                    materialize = True
                 else:
+                    if identity.get("caseId") != case_id:
+                        raise ArmLimiterEvidenceError(
+                            "arm evidence case identity does not match"
+                        )
                     if (
                         identity.get("plantBootId")
                         != plant_identity["producerBootId"]
@@ -6433,26 +6654,48 @@ class SonicDriver:
                                 self._require_arm_evidence_finalize_locked(
                                     identity
                                 )
-                                completed = self._arm_evidence.finalize(
+                                self._arm_evidence.seal(
                                     case_id=case_id
                                 )
-                    response = {"status": "complete", "evidence": completed}
+                    materialize = True
+            # The exact end tick and ownership facts were sealed above while
+            # the actuator boundary locks were held.  Building/hashing several
+            # thousand JSON records must happen after releasing every live
+            # control, LowState and support lock; r81 demonstrated that doing
+            # this work inside the boundary can starve the 50 Hz balance loop.
+            if not materialize:
+                raise RuntimeError("arm evidence finalization was not admitted")
+            self._start_arm_evidence_materialization(case_id)
+            # Always keep the admission response small. The client polls the
+            # idempotent get operation; once complete, only one bounded JSON
+            # transport remains on the single command connection.
+            response = {"status": "materializing", "evidence": None}
         elif operation == "arm_limiter_evidence_abort":
             with self._arm_evidence_boundary_lock:
                 aborted = self._arm_evidence.abort(case_id=case_id)
             response = {"status": "aborted", "aborted": aborted}
         else:
-            completed = self._arm_evidence.completed(case_id=case_id)
+            completed = self._arm_evidence._completed_transport_payload(
+                case_id=case_id,
+            )
             if completed is not None:
                 response = {"status": "complete", "evidence": completed}
             elif self._arm_evidence.active_case_id == case_id:
                 response = {"status": "recording", "evidence": None}
+            elif self._arm_evidence.sealed_case_id == case_id:
+                response = self._arm_evidence_materialization_status(case_id)
             else:
                 raise ArmLimiterEvidenceError(
                     "no matching arm evidence session exists"
                 )
 
-        replays[request_id] = (canonical, copy.deepcopy(response))
+        if operation == "arm_limiter_evidence_get" and response.get("status") == "complete":
+            # ``None`` is an internal replay marker: regenerate the transport
+            # view from the immutable completed artifact without a 50+ ms deep
+            # copy on the probe-serving command thread.
+            replays[request_id] = (canonical, None)
+        else:
+            replays[request_id] = (canonical, copy.deepcopy(response))
         return response
 
     def accept_json(self, payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -6583,16 +6826,22 @@ class SonicDriver:
                     and not static_hold_active
                     and plant_support_mode == "idle"
                 )
+                normal_stop_policy_balance_pending = (
+                    self._normal_stop_policy_balance_pending_locked()
+                )
                 controlled_policy_stop_active = bool(
-                    getattr(self, "_controlled_stop_active", False)
-                    and not navigation_task_active
-                    and nav2_command_zero
-                    and (
-                        (
-                            self._intent_ingress.braking
-                            and not self._intent_ingress.armed
+                    normal_stop_policy_balance_pending
+                    or (
+                        getattr(self, "_controlled_stop_active", False)
+                        and not navigation_task_active
+                        and nav2_command_zero
+                        and (
+                            (
+                                self._intent_ingress.braking
+                                and not self._intent_ingress.armed
+                            )
+                            or balanced_policy_idle_active
                         )
-                        or balanced_policy_idle_active
                     )
                 )
             terminal_fault = self._fault_latched.is_set()

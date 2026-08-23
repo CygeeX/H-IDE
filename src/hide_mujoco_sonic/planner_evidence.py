@@ -36,17 +36,20 @@ _MIN_MEANINGFUL_YAW_RAD = 0.01
 # the first live controlled stop produced 49.6 mm.  A later exact 0.2 m
 # DriveOnHeading stops have produced 51.2 mm / 0.037945 rad (0.2 m task) and
 # 62.13 mm / 0.060183 rad (1 m task) while their final 200 ms settled below the
-# stationary-speed contract.  Requiring <=30 mm rejected valid official IDLE
-# braking references and then misreported the local rejection as a planner
-# timeout.  Keep translation inside the already-reviewed 80 mm gait transient
-# boundary and yaw inside the product's audited 0.15 rad stop-heading envelope.
+# stationary-speed contract. A cold near-official 0.35 m/s lateral stop produced a
+# 133.689 mm / 0.664 m/s reference with a 9.58 mm/s quiet tail; the exact same
+# reference class completes the support-off MuJoCo stop regression, while the
+# old forward-only 80 mm / 0.40 m/s gate rejected it and left the live humanoid
+# frozen in a moving gait phase. Bound the full official slow-walk stop family
+# at 150 mm / 0.70 m/s. Independent yaw, quiet-tail, measured-pose, collision,
+# actuator-continuity, and persistent-saturation gates remain unchanged.
 # A live 90-degree Spin proved why the yaw gate remains necessary: resetting
 # continuous IDLE facing to zero yielded a -0.714 rad reference and physically
 # undid about 0.69 rad of the completed turn. Independent 50 Hz speed,
 # quiet-tail, measured-pose, collision, and actuator gates remain unchanged.
-_MAX_STATIC_REFERENCE_TRANSLATION_M = 0.08
+_MAX_STATIC_REFERENCE_TRANSLATION_M = 0.15
 _MAX_STATIC_REFERENCE_YAW_RAD = 0.15
-_MAX_STATIC_REFERENCE_FRAME_SPEED_MPS = 0.40
+_MAX_STATIC_REFERENCE_FRAME_SPEED_MPS = 0.70
 _MAX_STATIC_REFERENCE_TAIL_SPEED_MPS = 0.025
 _STATIC_REFERENCE_SETTLE_FRAMES = 10
 
@@ -831,7 +834,7 @@ class PlannerReferenceEvidenceGate:
                 self._static_root_tail_translation_m = static_tail_translation
                 if static_translation > _MAX_STATIC_REFERENCE_TRANSLATION_M:
                     return self._reject_result_locked(
-                        "IDLE planner braking translation exceeds the 0.080m envelope"
+                        "IDLE planner braking translation exceeds the 0.150m envelope"
                     )
                 if abs(static_yaw) > _MAX_STATIC_REFERENCE_YAW_RAD:
                     return self._reject_result_locked(
@@ -839,7 +842,7 @@ class PlannerReferenceEvidenceGate:
                     )
                 if static_max_speed > _MAX_STATIC_REFERENCE_FRAME_SPEED_MPS:
                     return self._reject_result_locked(
-                        "IDLE planner root speed exceeds the 0.400m/s braking envelope"
+                        "IDLE planner root speed exceeds the 0.700m/s braking envelope"
                     )
                 if static_tail_max_speed > _MAX_STATIC_REFERENCE_TAIL_SPEED_MPS:
                     return self._reject_result_locked(

@@ -1682,6 +1682,85 @@ def _movement_intent(angle_rad: float) -> MovementIntent:
     )
 
 
+def test_policy_candidate_applies_and_restores_pure_lateral_heading_feedback() -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    guard = CmdVelGuard(clock=clock, smoothing_alpha=1.0)
+    guard.observe_heading(0.30)
+    guard.accept(0.0, 0.8, 0.0)
+    intent = guard.intent(now=clock.value, dt=0.02)
+    guard.observe_heading(0.34)
+    driver.guard = guard
+    driver._reference_source_identity = (42, 7)
+    driver._reference_authority.require(generation=42, source_sequence=7)
+    driver._reference_authority.mark_installed(
+        generation=42,
+        source_sequence=7,
+        planner_intent_generation=1,
+        reference_epoch=1,
+    )
+    driver._reference_authority.prime(
+        generation=42,
+        source_sequence=7,
+        reference_epoch=1,
+    )
+    driver._reference_authority.grant(
+        generation=42,
+        source_sequence=7,
+        reference_epoch=1,
+        granted_at_monotonic_s=clock.value,
+        granted_at_tick_ms=1_000,
+        dds_target_sequence=1,
+    )
+    decoder = SimpleNamespace(delta_heading=0.0)
+
+    def run_step(_action, _lowstate):
+        # Reproduce the vendor decoder consuming reinit_heading and clearing
+        # its operator offset during the same policy call.
+        assert decoder.delta_heading == pytest.approx(-0.03)
+        decoder.delta_heading = 0.0
+        return {"candidate": True}
+
+    driver._controller = SimpleNamespace(
+        controller=decoder,
+        run_step=run_step,
+    )
+    driver._enforce_terminal_boundary_locked = lambda: False
+    driver._consume_vendor_revoke_locked = lambda: None
+    driver._prime_periodic_reference_refresh = lambda: None
+
+    action = driver._run_policy_candidate(object(), intent=intent)
+
+    assert action == {"candidate": True}
+    assert decoder.delta_heading == pytest.approx(-0.03)
+    assert driver._lateral_heading_hold_active is True
+    assert driver._lateral_heading_hold_identity == (42, 7)
+    assert driver._lateral_heading_error_rad == pytest.approx(0.04)
+
+
+def test_policy_candidate_clears_lateral_feedback_for_forward_motion() -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    decoder = SimpleNamespace(delta_heading=-0.03)
+    driver._controller = SimpleNamespace(controller=decoder)
+    driver._lateral_heading_hold_active = True
+    driver._lateral_heading_hold_identity = (42, 7)
+    driver._lateral_heading_error_rad = 0.04
+    driver._lateral_heading_correction_rad = -0.03
+    guard = CmdVelGuard(clock=clock, smoothing_alpha=1.0)
+    guard.observe_heading(0.30)
+    guard.accept(0.8, 0.0, 0.0)
+    forward = guard.intent(now=clock.value, dt=0.02)
+    driver.guard = guard
+
+    with driver._support_lock:
+        assert driver._apply_lateral_heading_hold_locked(forward) is None
+
+    assert decoder.delta_heading == pytest.approx(0.0)
+    assert driver._lateral_heading_hold_active is False
+    assert driver._lateral_heading_hold_identity is None
+
+
 def test_arm_slew_projection_is_the_exact_dds_feedback_and_grant_boundary() -> None:
     from lerobot.robots.unitree_g1.controllers.sonic_pipeline import DEFAULT_ANGLES
 

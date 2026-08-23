@@ -23,7 +23,7 @@ RUNTIME_MANIFEST = GENERATED / "runtime_manifest.json"
 MOTION_PROFILE_MANIFEST = ROOT / "docker" / "nav2" / "motion_profile_manifest.json"
 SCHEMA_PATH = ROOT / "docker" / "nav2" / "static_primitive_plan.schema.json"
 START = (-6.45, 0.0)
-GOAL = (-7.40, -0.45)
+GOAL = (-7.30, -0.30)
 CLEARANCE_RADIUS = 0.35 + 0.02 + 0.05
 FIXTURE_PLANNING_CLEARANCE = 0.445
 
@@ -163,22 +163,25 @@ def _assert_primitive_plan(module, navfn_path, plan) -> None:
     assert plan["segmenter"]["clearance_radius_m"] == pytest.approx(
         CLEARANCE_RADIUS
     )
-    # One map cell is the minimum geometric primitive. Its command speed is
-    # still exactly NVIDIA's 0.30 m/s forward Slow Walk command; segment
-    # distance is not a velocity floor.
-    assert plan["segmenter"]["min_segment_m"] == 0.05
+    # Residuals within the measured whole-body braking envelope are complete;
+    # any new motion segment must be longer than that endpoint envelope. Its
+    # command speed remains NVIDIA's exact 0.30 m/s Slow Walk command.
+    assert plan["segmenter"]["min_segment_m"] == 0.16
     assert plan["segmenter"]["max_segment_m"] == 0.75
     assert plan["execution_policy"] == {
         "fresh_odometry_required": True,
         "fresh_pose_frame": "map",
         "revalidate_line_of_sight_before_drive": True,
-        "endpoint_tolerance_m": 0.03,
-        "heading_tolerance_rad": 0.05,
+        "endpoint_tolerance_m": 0.15,
+        "heading_tolerance_rad": 0.06,
         "drive_speed_mps": 0.30,
         "spin_min_angular_rps": 0.10,
         "spin_max_angular_rps": 0.20,
         "spin_angular_accel_rps2": 0.30,
         "zero_spin_policy": "skip_within_heading_tolerance",
+        "final_heading_policy": (
+            "omit_checkpoint_if_within_heading_tolerance"
+        ),
         "short_residual_policy": (
             "skip_within_endpoint_tolerance_else_fail_below_min_segment"
         ),
@@ -211,7 +214,7 @@ def _assert_primitive_plan(module, navfn_path, plan) -> None:
         if previous_end is not None:
             assert segment["start_map"] == previous_end
         previous_end = segment["end_map"]
-        assert 0.05 <= segment["distance_m"] <= 0.75
+        assert 0.16 <= segment["distance_m"] <= 0.75
         assert static_map.segment_is_clear(
             (source_start["x"], source_start["y"]),
             (source_end["x"], source_end["y"]),
@@ -267,10 +270,11 @@ def test_locked_short_route_segments_bidirectionally_without_oracle_data() -> No
     assert plans[0]["planner_source"]["navfn_path_sha256"] != plans[1][
         "planner_source"
     ]["navfn_path_sha256"]
-    # Both directions require a real one-cell-scale turn checkpoint. It remains
-    # legal because distance is not speed and DriveOnHeading is fixed at .30.
-    assert any(
-        0.05 <= segment["distance_m"] < 0.10
+    # Both directions remain multi-segment detours at the reviewed goal; no
+    # segment may be manufactured inside the 15 cm braking envelope.
+    assert all(len(plan["segments"]) >= 2 for plan in plans)
+    assert all(
+        segment["distance_m"] >= 0.16
         for plan in plans
         for segment in plan["segments"]
     )
@@ -286,10 +290,9 @@ def test_live_resolver_uses_fresh_pose_and_never_emits_zero_or_subfloor_goals() 
     module = _planner()
     navfn_path = _astar_fixture_navfn_path(module, START, GOAL)
     plan = _build(module, navfn_path)
-    short_segment_index = next(
-        index
-        for index, segment in enumerate(plan["segments"])
-        if segment["distance_m"] < 0.10
+    short_segment_index = min(
+        range(len(plan["segments"])),
+        key=lambda index: plan["segments"][index]["distance_m"],
     )
     segment = plan["segments"][short_segment_index]
     heading = segment["heading_map_yaw_rad"]
@@ -318,7 +321,67 @@ def test_live_resolver_uses_fresh_pose_and_never_emits_zero_or_subfloor_goals() 
     assert drive["action_goal"]["target"]["x"] == pytest.approx(
         segment["distance_m"]
     )
-    assert drive["action_goal"]["target"]["x"] < 0.10
+
+    misaligned_pose = {**segment["start_map"], "yaw": heading + 0.20}
+    realignment = module.resolve_live_primitive(
+        plan,
+        2 * short_segment_index + 1,
+        navfn_path,
+        misaligned_pose,
+        **_plan_kwargs(),
+    )
+    assert realignment == {
+        "primitive_sequence": 2 * short_segment_index + 1,
+        "plan_sha256": plan["plan_sha256"],
+        "fresh_odometry_used": True,
+        "disposition": "realign_spin_required",
+        "action_goal": None,
+        "fresh_distance_to_endpoint_m": pytest.approx(segment["distance_m"]),
+        "resolved_target_map_yaw_rad": pytest.approx(heading),
+        "heading_error_rad": pytest.approx(-0.20),
+        "realignment_primitive_sequence": 2 * short_segment_index,
+    }
+    correction = module.resolve_live_primitive(
+        plan,
+        realignment["realignment_primitive_sequence"],
+        navfn_path,
+        misaligned_pose,
+        **_plan_kwargs(),
+    )
+    assert correction["disposition"] == "send_action"
+    assert correction["action_type"] == "nav2_msgs/action/Spin"
+    assert correction["action_goal"]["target_yaw_rad"] == pytest.approx(-0.20)
+
+    # A residual at the reviewed whole-body resolution is skipped instead of
+    # asking the official >=0.10 rad/s Spin to execute a one-step correction.
+    # The maximum 0.75 m segment then drifts <0.05 m, inside the independently
+    # inflated clearance reserve. Anything just outside remains a Spin.
+    within_resolution = {
+        **segment["start_map"],
+        "yaw": heading - 0.06,
+    }
+    resolved_within = module.resolve_live_primitive(
+        plan,
+        2 * short_segment_index + 1,
+        navfn_path,
+        within_resolution,
+        **_plan_kwargs(),
+    )
+    assert resolved_within["disposition"] == "send_action"
+    assert resolved_within["action_type"] == "nav2_msgs/action/DriveOnHeading"
+
+    outside_resolution = {
+        **segment["start_map"],
+        "yaw": heading - 0.0601,
+    }
+    resolved_outside = module.resolve_live_primitive(
+        plan,
+        2 * short_segment_index + 1,
+        navfn_path,
+        outside_resolution,
+        **_plan_kwargs(),
+    )
+    assert resolved_outside["disposition"] == "realign_spin_required"
 
     endpoint = segment["end_map"]
     near_pose = {
@@ -337,8 +400,8 @@ def test_live_resolver_uses_fresh_pose_and_never_emits_zero_or_subfloor_goals() 
     assert skipped["action_goal"] is None
 
     unsafe_residual_pose = {
-        "x": endpoint["x"] - 0.04 * math.cos(heading),
-        "y": endpoint["y"] - 0.04 * math.sin(heading),
+        "x": endpoint["x"] - 0.155 * math.cos(heading),
+        "y": endpoint["y"] - 0.155 * math.sin(heading),
         "yaw": heading,
     }
     with pytest.raises(ValueError, match="below minimum segment"):
@@ -361,6 +424,39 @@ def test_live_resolver_uses_fresh_pose_and_never_emits_zero_or_subfloor_goals() 
     )
     assert final["disposition"] == "skip_within_heading_tolerance"
     assert final["action_goal"] is None
+
+
+def test_heading_tolerance_cannot_consume_reserved_path_clearance() -> None:
+    module = _planner()
+    navfn_path = _astar_fixture_navfn_path(module, START, GOAL)
+    plan_kwargs = _plan_kwargs()
+    plan_kwargs["max_segment_m"] = 0.84
+
+    with pytest.raises(
+        ValueError,
+        match="heading tolerance can consume the reserved path clearance",
+    ):
+        module.build_primitive_plan(navfn_path, **plan_kwargs)
+
+
+def test_final_spin_is_omitted_when_last_segment_already_meets_goal_yaw() -> None:
+    module = _planner()
+    navfn_path = _astar_fixture_navfn_path(module, START, GOAL)
+    baseline = _build(module, navfn_path)
+    final_heading = baseline["segments"][-1]["heading_map_yaw_rad"]
+    navfn_path["poses"][-1]["yaw"] = final_heading + 0.059
+
+    plan = _build(module, navfn_path)
+
+    assert len(plan["primitives"]) == 2 * len(plan["segments"])
+    assert plan["primitives"][-1]["checkpoint_role"] == (
+        "reach_segment_endpoint"
+    )
+    assert module.verify_primitive_plan(
+        plan,
+        navfn_path,
+        **_plan_kwargs(),
+    ) == plan
 
 
 def test_live_resolver_rejects_fresh_pose_that_invalidates_the_planned_chord() -> None:

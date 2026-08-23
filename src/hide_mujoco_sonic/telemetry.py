@@ -31,6 +31,9 @@ class TelemetryState:
     sonic_command_facing_angle_rad: float = 0.0
     sonic_measured_heading_yaw_rad: float | None = None
     sonic_decoder_heading_delta_rad: float = 0.0
+    sonic_lateral_heading_hold_active: bool = False
+    sonic_lateral_heading_error_rad: float = 0.0
+    sonic_lateral_heading_correction_rad: float = 0.0
     sonic_intent_generation: int | None = None
     sonic_intent_signature: str | None = None
     sonic_planner_request_generation: int | None = None

@@ -707,15 +707,33 @@ class SonicHealth:
             and actuator_authority
             and not value["static_hold_active"]
         )
+        # A correlated normal stop revokes ingress after measured stationarity
+        # but intentionally keeps the granted learned-IDLE controller on DDS
+        # until the Plant independently confirms its safety-stop latch.  This
+        # is the only accepted support-pending authority shape: it cannot carry
+        # a navigation task, motion authorization, a non-zero command, static
+        # hold, locomotion support, or a latched Plant.
+        pending_plant_latch_policy_balance_shape = bool(
+            support_pending
+            and not motion_authorized
+            and support_mode == "idle"
+            and actuator_authority
+            and not value["static_hold_active"]
+        )
         controlled_policy_stop_shape = bool(
             controlled_policy_stop_active
             and not support_latched
-            and not support_pending
             and not navigation_task_active
             and nav2_command_zero
             and (
-                controlled_policy_braking_shape
-                or balanced_policy_idle_shape
+                (
+                    not support_pending
+                    and (
+                        controlled_policy_braking_shape
+                        or balanced_policy_idle_shape
+                    )
+                )
+                or pending_plant_latch_policy_balance_shape
             )
         )
         if controlled_policy_stop_active and not controlled_policy_stop_shape:

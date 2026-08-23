@@ -200,6 +200,20 @@ def test_motion_direction_guard_ignores_in_place_rotation():
     assert guard.latched is False
 
 
+def test_motion_direction_guard_pure_spin_ends_previous_translation_anchor():
+    guard = MotionDirectionGuard()
+    guard.observe_pose(0.0, 0.0, 0.0)
+    assert guard.accept_command(0.0, 0.2, 0.0) is True
+    assert guard.observe_pose(0.0, 0.03, 0.0) is False
+
+    # Starting a distinct pure-rotation action must not project its normal
+    # pelvis sway onto the preceding lateral direction.  Spin has its own yaw
+    # and translation-envelope guard.
+    assert guard.accept_command(0.0, 0.0, 0.2) is True
+    assert guard.observe_pose(0.0, -0.20, 0.5) is False
+    assert guard.latched is False
+
+
 def test_motion_direction_guard_keeps_anchor_through_nav2_turn_transient():
     guard = MotionDirectionGuard()
     guard.observe_pose(0.0, 0.0, 0.0)
@@ -269,6 +283,7 @@ def test_goal_progress_guard_latches_after_progress_is_reversed():
     guard = GoalProgressGuard(clock=lambda: now[0])
     guard.observe_pose(0.0, 0.0)
     assert guard.observe_goal(1.0, 0.0) is True
+    assert guard.accept_command(0.2, 0.0, 0.0) is True
     assert guard.observe_pose(0.2, 0.0) is False
     assert guard.observe_pose(0.03, 0.0) is True
     assert guard.latched is True
@@ -283,10 +298,32 @@ def test_goal_progress_guard_ignores_small_detour_and_equivalent_replan():
     guard = GoalProgressGuard()
     guard.observe_pose(0.0, 0.0)
     assert guard.observe_goal(1.0, 0.0) is True
+    assert guard.accept_command(0.2, 0.0, 0.0) is True
     assert guard.observe_pose(0.2, 0.0) is False
     assert guard.observe_goal(1.04, 0.02) is False
     assert guard.observe_pose(0.08, 0.0) is False
     assert guard.latched is False
+
+
+def test_goal_progress_guard_suspends_and_reanchors_across_pure_spin() -> None:
+    guard = GoalProgressGuard(max_regression_m=0.15)
+    guard.observe_pose(0.0, 0.0)
+    guard.observe_goal(1.0, 0.0)
+    guard.accept_command(0.2, 0.0, 0.0)
+    assert guard.observe_pose(0.2, 0.0) is False
+
+    # A separate Spin may sway farther from the final goal than the linear
+    # regression budget, but it is governed by RotationDirectionGuard.
+    guard.accept_command(0.0, 0.0, math.pi / 5.0)
+    assert guard.observe_pose(-0.20, 0.0) is False
+    assert guard.observe_pose(-0.40, 0.0) is False
+
+    # The next translational primitive gets a fresh local baseline; genuine
+    # regression after that point remains a hard failure.
+    guard.accept_command(0.2, 0.0, 0.0)
+    assert guard.observe_pose(-0.30, 0.0) is False
+    assert guard.observe_pose(-0.58, 0.0) is True
+    assert "regresses from Nav2 goal" in (guard.reason or "")
 
 
 def test_navigation_guards_reanchor_only_at_policy_actuator_grant() -> None:
@@ -302,6 +339,7 @@ def test_navigation_guards_reanchor_only_at_policy_actuator_grant() -> None:
     progress = GoalProgressGuard(clock=lambda: now[0])
     progress.observe_pose(0.0, 0.0)
     progress.observe_goal(1.0, 0.0)
+    progress.accept_command(0.30, 0.0, 0.0)
     progress.observe_pose(-0.10, 0.0)
     assert progress.reanchor_at_actuator_grant() is True
     assert progress.observe_pose(-0.14, 0.0) is False
@@ -978,6 +1016,78 @@ def test_lateral_commands_are_mirrored_at_official_point_three_five(
     assert intent.speed_mps == pytest.approx(0.35)
     assert intent.movement_angle_rad == pytest.approx(expected_angle)
     assert intent.facing_angle_rad == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize(
+    ("vy", "yaw_drift", "expected_correction"),
+    (
+        (0.8, 0.04, -0.03),
+        (-0.8, -0.04, 0.03),
+        (0.8, 0.20, -0.08),
+        (-0.8, -0.20, 0.08),
+    ),
+)
+def test_pure_lateral_heading_feedback_is_mirrored_and_bounded(
+    vy,
+    yaw_drift,
+    expected_correction,
+):
+    guard = CmdVelGuard(clock=lambda: 100.0, smoothing_alpha=1.0)
+    guard.observe_heading(0.30)
+    guard.accept(0.0, vy, 0.0)
+    intent = guard.intent(now=100.01, dt=0.02)
+    guard.observe_heading(0.30 + yaw_drift)
+
+    correction = guard.lateral_heading_correction(intent)
+
+    assert correction is not None
+    assert correction.heading_error_rad == pytest.approx(yaw_drift)
+    assert correction.decoder_delta_heading_rad == pytest.approx(
+        expected_correction
+    )
+
+
+@pytest.mark.parametrize(
+    ("command", "heading"),
+    (
+        ((0.8, 0.0, 0.0), 0.4),
+        ((0.8, 0.0, 0.2), 0.4),
+        ((0.0, 0.8, 0.2), 0.4),
+        ((0.0, 0.0, 0.2), 0.4),
+    ),
+)
+def test_lateral_heading_feedback_does_not_modify_other_motion_types(
+    command,
+    heading,
+):
+    guard = CmdVelGuard(clock=lambda: 100.0, smoothing_alpha=1.0)
+    guard.observe_heading(0.30)
+    guard.accept(*command)
+    intent = guard.intent(now=100.01, dt=0.02)
+    guard.observe_heading(heading)
+    assert guard.lateral_heading_correction(intent) is None
+
+
+def test_lateral_heading_feedback_reanchors_after_stop():
+    guard = CmdVelGuard(clock=lambda: 100.0, smoothing_alpha=1.0)
+    guard.observe_heading(0.20)
+    guard.accept(0.0, 0.8, 0.0)
+    first = guard.intent(now=100.01, dt=0.02)
+    guard.observe_heading(0.25)
+    assert guard.lateral_heading_correction(first).heading_error_rad == pytest.approx(
+        0.05
+    )
+
+    guard.stop(source="test")
+    stopped = guard.intent(now=100.02, dt=0.02)
+    assert guard.lateral_heading_correction(stopped) is None
+    guard.observe_heading(-0.40)
+    guard.accept(0.0, -0.8, 0.0)
+    second = guard.intent(now=100.03, dt=0.02)
+    correction = guard.lateral_heading_correction(second)
+    assert correction is not None
+    assert correction.heading_error_rad == pytest.approx(0.0)
+    assert correction.decoder_delta_heading_rad == pytest.approx(0.0)
 
 
 def test_straight_translation_never_integrates_facing():

@@ -80,6 +80,10 @@ def _driver() -> SonicDriver:
         sonic_driver_source_sha256="a" * 64,
     )
     driver._arm_evidence_request_replays = {}
+    driver._arm_evidence_materialization_lock = threading.Lock()
+    driver._arm_evidence_materialization_case_id = None
+    driver._arm_evidence_materialization_error = None
+    driver._arm_evidence_materialization_thread = None
     return driver
 
 
@@ -99,6 +103,23 @@ def _prepared_activation(epoch: int = 1) -> SimpleNamespace:
         epoch=epoch,
         provenance={"support_release": {"confirmed_epoch": epoch}},
     )
+
+
+def _wait_completed_evidence(
+    driver: SonicDriver,
+    *,
+    request_id: str,
+) -> dict[str, object]:
+    thread = driver._arm_evidence_materialization_thread
+    assert thread is not None
+    thread.join(timeout=2.0)
+    assert not thread.is_alive()
+    completed = driver.accept_json(
+        _request("arm_limiter_evidence_get", request_id)
+    )
+    assert completed is not None
+    assert completed["status"] == "complete"
+    return completed
 
 
 def _configure_balanced_policy_idle(driver: SonicDriver, *, epoch: int = 1) -> None:
@@ -202,14 +223,17 @@ def test_driver_records_global_arm_indices_at_each_successful_dds_fact(
     driver._normal_stop = SimpleNamespace(
         snapshot=SimpleNamespace(phase="DRIVER_CONFIRMED")
     )
-    completed = driver.accept_json(
+    admitted = driver.accept_json(
         _request(
             "arm_limiter_evidence_finalize",
             "66666666-6666-4666-8666-666666666666",
         )
     )
-    assert completed is not None
-    assert completed["status"] == "complete"
+    assert admitted == {"status": "materializing", "evidence": None}
+    completed = _wait_completed_evidence(
+        driver,
+        request_id="66666666-6666-4666-8666-666666666667",
+    )
     evidence = completed["evidence"]
     assert evidence["records"][0]["constrainedJointIndices"] == [15]
     assert evidence["records"][0]["continuousSaturationByJointS"]["15"] == 0.02
@@ -246,15 +270,86 @@ def test_evidence_can_begin_and_finalize_at_exact_balanced_policy_idle(
             evidence_write_token=token,
         )
 
-    completed = driver.accept_json(
+    admitted = driver.accept_json(
         _request(
             "arm_limiter_evidence_finalize",
             "99999999-9999-4999-8999-999999999992",
         )
     )
-    assert completed is not None
-    assert completed["status"] == "complete"
+    assert admitted == {"status": "materializing", "evidence": None}
+    completed = _wait_completed_evidence(
+        driver,
+        request_id="99999999-9999-4999-8999-999999999998",
+    )
     assert completed["evidence"]["taskEndControlTick"] == 2
+
+
+def test_large_evidence_materialization_holds_no_live_control_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = _driver()
+    _configure_balanced_policy_idle(driver)
+    monkeypatch.setattr(
+        "hide_mujoco_sonic.sonic_driver.read_plant_identity",
+        lambda *_args, **_kwargs: dict(PLANT_IDENTITY),
+    )
+    driver.accept_json(
+        _request(
+            "arm_limiter_evidence_begin",
+            "99999999-9999-4999-8999-999999999996",
+            plant_boot_id=PLANT_IDENTITY["producerBootId"],
+            plant_session_id=PLANT_IDENTITY["sessionId"],
+        )
+    )
+    for tick in (1000, 1020):
+        driver._control_evidence_context.control_step = PlantControlStep(tick, 0.02)
+        token = driver._begin_arm_evidence_write()
+        driver._record_successful_dds_target(
+            tuple(0.0 for _ in range(29)),
+            evidence_write_token=token,
+        )
+
+    materialization_entered = threading.Event()
+    release_materialization = threading.Event()
+    original_materialize = driver._arm_evidence.materialize
+
+    def blocking_materialize(*, case_id: str):
+        materialization_entered.set()
+        assert release_materialization.wait(timeout=2.0)
+        return original_materialize(case_id=case_id)
+
+    monkeypatch.setattr(
+        driver._arm_evidence,
+        "materialize",
+        blocking_materialize,
+    )
+    response = driver.accept_json(
+        _request(
+            "arm_limiter_evidence_finalize",
+            "99999999-9999-4999-8999-999999999997",
+        )
+    )
+    assert response == {"status": "materializing", "evidence": None}
+    assert materialization_entered.wait(timeout=1.0)
+    assert driver._arm_evidence.active is False
+    assert driver._arm_evidence.sealed_case_id == "forward-1m-run-1"
+
+    locks = (
+        driver._arm_evidence_boundary_lock,
+        driver._control_condition,
+        driver._support_lock,
+        driver._terminal_fault_lock,
+    )
+    for lock in locks:
+        assert lock.acquire(timeout=0.20), "evidence JSON blocked a live control lock"
+        lock.release()
+
+    release_materialization.set()
+    completed = _wait_completed_evidence(
+        driver,
+        request_id="99999999-9999-4999-8999-999999999990",
+    )
+    assert completed["status"] == "complete"
 
 
 def test_evidence_rejects_balanced_idle_flag_without_exact_controller_ownership(

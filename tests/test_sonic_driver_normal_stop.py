@@ -629,6 +629,32 @@ def test_granted_motion_rebases_idle_from_exact_boundary_before_braking() -> Non
     assert driver._commit_static_hold_decision_locked(False) is False
     assert driver.guard.stops == ["gait_adapter_controlled_stop"]
 
+    # This was the live r83 race: the periodic bridge probe can land after
+    # stationary ingress is revoked and support is marked pending, but before
+    # Plant returns its correlated latch.  The exact learned-IDLE transaction
+    # remains a valid health shape and must not be terminalized.
+    configure_control_arm_health(driver, clock)
+    request_id = UUID("40000000-0000-4000-8000-000000000014")
+    health_payload = driver.accept_json(
+        sonic_health_probe(
+            robot_id=ROBOT_ID,
+            producer_boot_id=BRIDGE_BOOT_ID,
+            request_id=request_id,
+        )
+    )
+    assert health_payload is not None
+    health = SonicHealth.from_response(
+        {"request_id": str(request_id), "ok": True, **health_payload},
+        expected_request_id=request_id,
+        expected_robot_id=ROBOT_ID,
+    )
+    assert health.plant_support_stop_pending is True
+    assert health.controlled_policy_stop_active is True
+    assert health.matched_reference_actuator_authority is True
+    assert health.motion_authorized is False
+    assert health.navigation_task_active is False
+    assert health.nav2_command_zero is True
+
     confirmed = driver.accept_json(plant_request(identity=identity))
 
     assert confirmed is not None

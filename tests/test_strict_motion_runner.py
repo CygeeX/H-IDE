@@ -47,6 +47,51 @@ def test_sonic_evidence_client_preserves_bounded_server_rejection_detail() -> No
     assert calls == 2
 
 
+def test_sonic_evidence_client_polls_async_materialization_to_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    operations: list[str] = []
+    get_count = 0
+
+    def request(_host, _port, payload, **_kwargs):
+        nonlocal get_count
+        operation = payload["type"]
+        operations.append(operation)
+        if operation == "arm_limiter_evidence_begin":
+            return {
+                "status": "recording",
+                "case_id": "case-async",
+                "policy_activation_epoch": 3,
+                "support_release_confirmed_epoch": 3,
+                "plant_boot_id": "11000000-0000-4000-8000-000000000001",
+                "plant_session_id": "12000000-0000-4000-8000-000000000001",
+                "sonic_driver_boot_id": "13000000-0000-4000-8000-000000000001",
+                "sonic_driver_session_id": "14000000-0000-4000-8000-000000000001",
+            }
+        if operation == "arm_limiter_evidence_finalize":
+            return {"status": "materializing", "evidence": None}
+        get_count += 1
+        if get_count == 1:
+            return {"status": "materializing", "evidence": None}
+        return {"status": "complete", "evidence": {"caseId": "case-async"}}
+
+    monkeypatch.setattr(runner.time, "sleep", lambda _seconds: None)
+    client = runner.SonicEvidenceClient(request=request)
+    client.begin(
+        case_id="case-async",
+        plant_boot_id="11000000-0000-4000-8000-000000000001",
+        plant_session_id="12000000-0000-4000-8000-000000000001",
+    )
+
+    assert client.finalize(case_id="case-async") == {"caseId": "case-async"}
+    assert operations == [
+        "arm_limiter_evidence_begin",
+        "arm_limiter_evidence_finalize",
+        "arm_limiter_evidence_get",
+        "arm_limiter_evidence_get",
+    ]
+
+
 @pytest.mark.parametrize(
     ("mode", "vx"),
     (
@@ -168,6 +213,118 @@ def test_inactive_strict_backend_is_silent_until_a_primitive_owns_cmd_vel() -> N
     assert runner.STRICT_RELAY_PERIOD_S == pytest.approx(0.05)
 
 
+def test_faulted_relay_quiesces_for_balanced_idle_evidence_without_rearming() -> None:
+    backend = runner.RosLiveBackend.__new__(runner.RosLiveBackend)
+    backend._lock = threading.RLock()
+    backend._fatal = "LateralStep yaw drift exceeded"
+    backend._quiesced_case_fault = None
+    backend._relay = runner.StrictCommandRelay(clock=lambda: 1.0)
+    backend._relay.begin("turn_left")
+    published: list[runner.TwistCommand] = []
+    backend._publish = published.append
+
+    backend.stop_relay()
+
+    assert published == [runner.ZERO_COMMAND]
+    assert backend._fatal is None
+    assert backend._quiesced_case_fault == "LateralStep yaw drift exceeded"
+    backend.raise_if_faulted()
+    with pytest.raises(runner.StrictMotionRunnerError, match="cannot admit another"):
+        backend.begin_relay("turn_left")
+
+
+def test_lateral_odom_freshness_matches_the_observed_ten_hertz_source() -> None:
+    now = [1.0]
+    backend = runner.RosLiveBackend.__new__(runner.RosLiveBackend)
+    backend._clock = lambda: now[0]
+    backend._lock = threading.RLock()
+    backend._fatal = None
+    backend._relay = runner.StrictCommandRelay(clock=lambda: now[0])
+    backend._relay.begin(
+        "lateral_left",
+        start_pose=runner.PlanarPose(0.0, 0.0, 0.0),
+    )
+    backend._latest_odom = runner.PoseObservation(
+        runner.PlanarPose(0.0, 0.0, 0.0),
+        "odom",
+        0.851,
+    )
+    published: list[runner.TwistCommand] = []
+    backend._publish = published.append
+
+    backend._publish_control_tick()
+    assert published == [command(vy=runner.OFFICIAL_LATERAL_SPEED_MPS)]
+    assert backend._fatal is None
+
+    backend._latest_odom = runner.PoseObservation(
+        runner.PlanarPose(0.0, 0.0, 0.0),
+        "odom",
+        0.849,
+    )
+    backend._publish_control_tick()
+    assert published[-1] == runner.ZERO_COMMAND
+    assert backend._fatal == "LateralStep lost fresh authoritative odometry"
+
+
+def test_map_checkpoint_waits_for_new_sample_without_accepting_stale_pose(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [1.0]
+    backend = runner.RosLiveBackend.__new__(runner.RosLiveBackend)
+    backend._clock = lambda: now[0]
+    backend._lock = threading.RLock()
+    backend._fatal = None
+    backend._latest_map_pose = runner.PoseObservation(
+        runner.PlanarPose(-6.0, 0.0, 0.0),
+        "map",
+        0.80,
+    )
+    sleeps = 0
+
+    def publish_next(_duration: float) -> None:
+        nonlocal sleeps
+        sleeps += 1
+        with backend._lock:
+            backend._latest_map_pose = runner.PoseObservation(
+                runner.PlanarPose(-6.45, 0.0, 0.0),
+                "map",
+                now[0],
+            )
+
+    monkeypatch.setattr(runner.time, "sleep", publish_next)
+
+    observed = backend.wait_fresh_map_pose(max_age_s=0.10, timeout_s=0.50)
+
+    assert sleeps == 1
+    assert observed.pose == runner.PlanarPose(-6.45, 0.0, 0.0)
+
+
+def test_map_checkpoint_fails_closed_when_freshness_never_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [1.0]
+    backend = runner.RosLiveBackend.__new__(runner.RosLiveBackend)
+    backend._clock = lambda: now[0]
+    backend._lock = threading.RLock()
+    backend._fatal = None
+    backend._latest_map_pose = runner.PoseObservation(
+        runner.PlanarPose(-6.0, 0.0, 0.0),
+        "map",
+        0.0,
+    )
+    monkeypatch.setattr(
+        runner.time,
+        "sleep",
+        lambda duration: now.__setitem__(0, now[0] + max(duration, 0.05)),
+    )
+
+    with pytest.raises(
+        runner.StrictMotionRunnerError,
+        match="fresh map localization is unavailable",
+    ):
+        backend.wait_fresh_map_pose(max_age_s=0.10, timeout_s=0.20)
+
+
 def test_nav2_action_contracts_are_version_and_field_pinned() -> None:
     def action(fields: dict[str, str]):
         return SimpleNamespace(
@@ -228,12 +385,66 @@ def test_lateral_step_is_measured_closed_loop_and_mirrored(mode: str, sign: floa
     relay.begin(mode, start_pose=runner.PlanarPose(1.0, 2.0, math.pi / 2.0))
 
     assert relay.lateral_output(runner.PlanarPose(1.0, 2.0, math.pi / 2.0)) == command(
-        vy=sign * 0.35
+        vy=sign * 0.40
     )
     # At yaw=+pi/2, body-left is world -X.
     near_goal = runner.PlanarPose(1.0 - sign * 0.48, 2.0, math.pi / 2.0)
     assert relay.lateral_output(near_goal).is_zero
     assert relay.lateral_complete is True
+
+
+@pytest.mark.parametrize(
+    ("mode", "sign"),
+    (("lateral_left", 1.0), ("lateral_right", -1.0)),
+)
+def test_lateral_step_predicts_dynamic_idle_stop_from_authoritative_twist(
+    mode: str,
+    sign: float,
+) -> None:
+    relay = runner.StrictCommandRelay()
+    relay.begin(mode, start_pose=runner.PlanarPose(0.0, 0.0, 0.0))
+
+    pose = runner.PlanarPose(0.0, sign * 0.408, 0.0)
+    assert relay.lateral_output(
+        pose,
+        body_vy_mps=sign * 0.34,
+    ).is_zero
+    assert relay.lateral_complete is True
+
+    slow = runner.StrictCommandRelay()
+    slow.begin(mode, start_pose=runner.PlanarPose(0.0, 0.0, 0.0))
+    assert slow.lateral_output(
+        pose,
+        body_vy_mps=sign * 0.10,
+    ) == command(vy=sign * runner.OFFICIAL_LATERAL_SPEED_MPS)
+
+
+def test_lateral_predictive_stop_rotates_base_link_twist_into_start_frame() -> None:
+    relay = runner.StrictCommandRelay()
+    relay.begin(
+        "lateral_left",
+        start_pose=runner.PlanarPose(0.0, 0.0, math.pi / 2.0),
+    )
+
+    # At yaw=+pi/2, body-left remains the start-frame lateral direction.
+    assert relay.lateral_output(
+        runner.PlanarPose(-0.408, 0.0, math.pi / 2.0),
+        body_vy_mps=0.34,
+    ).is_zero
+
+
+def test_right_lateral_uses_measured_asymmetric_idle_coast_horizon() -> None:
+    pose = runner.PlanarPose(0.0, -0.351, 0.0)
+    right = runner.StrictCommandRelay()
+    right.begin("lateral_right", start_pose=runner.PlanarPose(0.0, 0.0, 0.0))
+    assert right.lateral_output(pose, body_vy_mps=-0.348).is_zero
+
+    left = runner.StrictCommandRelay()
+    left.begin("lateral_left", start_pose=runner.PlanarPose(0.0, 0.0, 0.0))
+    assert left.lateral_output(
+        runner.PlanarPose(0.0, 0.351, 0.0),
+        body_vy_mps=0.348,
+    ) == command(vy=runner.OFFICIAL_LATERAL_SPEED_MPS)
 
 
 def test_lateral_step_rejects_opposite_drift_yaw_and_overshoot() -> None:
@@ -884,6 +1095,42 @@ def test_exception_cleanup_waits_for_delayed_balanced_idle_before_static_stop() 
     assert "normal_stop" not in backend.calls
 
 
+def test_segment_stop_allows_observed_turn_deceleration_before_full_idle_proof() -> None:
+    now = [0.0]
+    samples = []
+    for index in range(57):
+        sample = _executor_sample(index / 10.0)
+        if index <= 40:
+            sample["root"]["angularSpeedRps"] = 0.04
+        samples.append(sample)
+
+    class TimedCollector(FakeExecutorCollector):
+        def wait_next(self) -> dict:
+            sample = super().wait_next()
+            now[0] = sample["tS"]
+            return sample
+
+    executor = runner.StrictMotionCaseExecutor(
+        FakeExecutorBackend(),
+        TimedCollector(samples),
+        FakeExecutorEvidence(),
+        clock=lambda: now[0],
+    )
+    observed: list[dict] = []
+
+    terminal = executor._collect_one_idle_sample(
+        observed,
+        support_epoch=17,
+        detour=True,
+        detour_segment_index=0,
+    )
+
+    assert terminal["tS"] == pytest.approx(5.6)
+    assert observed[-1]["tS"] - observed[41]["tS"] == pytest.approx(1.5)
+    assert all(sample["detourSegmentIndex"] == 0 for sample in observed)
+    assert runner.SEGMENT_BALANCED_IDLE_MAX_WALL_S == pytest.approx(10.0)
+
+
 class FakeExecutorBackend:
     def __init__(self) -> None:
         self.calls: list[str] = []
@@ -1006,6 +1253,9 @@ class FakeDetourBackend(FakeExecutorBackend):
             1.0,
         )
 
+    def wait_fresh_map_pose(self):
+        return self.latest_map_pose()
+
     def compute_path(self, _goal) -> dict:
         self.calls.append("compute_path")
         return {
@@ -1013,7 +1263,7 @@ class FakeDetourBackend(FakeExecutorBackend):
             "poses": [
                 {"x": -6.45, "y": 0.0, "yaw": 0.0},
                 {"x": -7.0, "y": -0.3, "yaw": -2.6},
-                {"x": -7.4, "y": -0.45, "yaw": 0.0},
+                {"x": -7.3, "y": -0.3, "yaw": 0.0},
             ],
         }
 
@@ -1040,8 +1290,16 @@ class FakeDetourBackend(FakeExecutorBackend):
 
 
 class FakeStaticPlanner:
-    def __init__(self, *, skip: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        skip: bool = False,
+        realign_once: bool = False,
+    ) -> None:
         self.skip = skip
+        self.realign_once = realign_once
+        self.spin_resolutions = 0
+        self.drive_resolutions = 0
 
     def build_primitive_plan(self, _path, **_kwargs) -> dict:
         return {
@@ -1063,13 +1321,29 @@ class FakeStaticPlanner:
                 "action_goal": None,
             }
         if index == 0:
+            self.spin_resolutions += 1
             return {
                 "primitive_sequence": 0,
                 "plan_sha256": "a" * 64,
                 "fresh_odometry_used": True,
                 "disposition": "send_action",
                 "action_type": "nav2_msgs/action/Spin",
-                "action_goal": {"target_yaw_rad": -0.5},
+                "action_goal": {
+                    "target_yaw_rad": -0.5
+                    if self.spin_resolutions == 1
+                    else -0.2
+                },
+            }
+        self.drive_resolutions += 1
+        if self.realign_once and self.drive_resolutions == 1:
+            return {
+                "primitive_sequence": 1,
+                "plan_sha256": "a" * 64,
+                "fresh_odometry_used": True,
+                "disposition": "realign_spin_required",
+                "action_goal": None,
+                "realignment_primitive_sequence": 0,
+                "heading_error_rad": 0.20,
             }
         return {
             "primitive_sequence": 1,
@@ -1261,6 +1535,224 @@ def test_detour_executor_uses_only_fresh_resolved_official_primitives(
     assert "send_spin" in backend.calls and "send_drive" in backend.calls
     assert backend.calls[:4] == ["ready", "compute_path", "normal_stop", "arm"]
     assert evidence.calls == ["begin", "finalize"]
+
+
+def test_detour_executor_realigns_drive_from_fresh_pose_with_bounded_spin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = FakeDetourBackend()
+    samples = [_executor_sample(index / 10.0) for index in range(120)]
+    for index, primitive in ((1, "spin"), (19, "spin"), (37, "drive")):
+        samples[index]["motionIntentActive"] = True
+        if primitive == "spin":
+            samples[index]["nav2Actions"]["spinActive"] = True
+            samples[index]["command"]["wz"] = -0.2
+        else:
+            samples[index]["nav2Actions"]["driveOnHeadingActive"] = True
+            samples[index]["command"]["vx"] = 0.3
+    collector = FakeExecutorCollector(samples)
+    evidence = FakeDetourEvidence()
+    planner = FakeStaticPlanner(realign_once=True)
+
+    def load(name: str, _path: Path):
+        if "planner" in name:
+            return planner
+        return SimpleNamespace(
+            evaluate_trace=lambda trace: {
+                "pass": [
+                    (item["primitiveSequence"], item["type"])
+                    for item in trace["action"]["segments"]
+                ]
+                == [(0, "Spin"), (0, "Spin"), (1, "DriveOnHeading")]
+            }
+        )
+
+    monkeypatch.setattr(runner, "_load_file_module", load)
+    executor = runner.StrictMotionCaseExecutor(
+        backend,
+        collector,
+        evidence,
+        clock=lambda: 1.0,
+    )
+
+    trace, result = executor.run_detour(
+        case_id="detour-realign-1",
+        route_id="office_waste_bin_s_to_g",
+    )
+
+    assert result == {"pass": True}
+    assert [
+        (item["primitiveSequence"], item["type"])
+        for item in trace["action"]["segments"]
+    ] == [(0, "Spin"), (0, "Spin"), (1, "DriveOnHeading")]
+    assert planner.spin_resolutions == 2
+    assert planner.drive_resolutions == 2
+    assert backend.calls.count("send_spin") == 2
+    assert backend.calls.count("send_drive") == 1
+
+
+def test_detour_executor_fails_closed_after_four_drive_realignment_spins(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class AlwaysRealignPlanner(FakeStaticPlanner):
+        def resolve_live_primitive(
+            self,
+            plan,
+            index,
+            path,
+            pose,
+            **kwargs,
+        ):
+            if index == 1:
+                self.drive_resolutions += 1
+                errors = (0.50, 0.40, 0.30, 0.20, 0.10)
+                return {
+                    "primitive_sequence": 1,
+                    "plan_sha256": "a" * 64,
+                    "fresh_odometry_used": True,
+                    "disposition": "realign_spin_required",
+                    "action_goal": None,
+                    "realignment_primitive_sequence": 0,
+                    "heading_error_rad": errors[
+                        min(self.drive_resolutions - 1, len(errors) - 1)
+                    ],
+                }
+            return super().resolve_live_primitive(
+                plan,
+                index,
+                path,
+                pose,
+                **kwargs,
+            )
+
+    backend = FakeDetourBackend()
+    samples = [_executor_sample(index / 10.0) for index in range(100)]
+    for index in (1, 19, 37, 55, 73):
+        samples[index]["motionIntentActive"] = True
+        samples[index]["nav2Actions"]["spinActive"] = True
+        samples[index]["command"]["wz"] = -0.2
+    collector = FakeExecutorCollector(samples)
+    evidence = FakeDetourEvidence()
+    planner = AlwaysRealignPlanner()
+    monkeypatch.setattr(runner, "_load_file_module", lambda *_args: planner)
+    executor = runner.StrictMotionCaseExecutor(
+        backend,
+        collector,
+        evidence,
+        clock=lambda: 1.0,
+    )
+
+    with pytest.raises(
+        runner.StrictMotionRunnerError,
+        match="bounded correction Spins",
+    ):
+        executor.run_detour(
+            case_id="detour-realign-budget",
+            route_id="office_waste_bin_s_to_g",
+        )
+
+    assert backend.calls.count("send_spin") == 5
+    assert backend.calls.count("send_drive") == 0
+    assert evidence.calls == ["begin", "abort"]
+
+
+def test_detour_executor_fails_closed_when_realignment_error_does_not_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StalledRealignPlanner(FakeStaticPlanner):
+        def resolve_live_primitive(self, plan, index, path, pose, **kwargs):
+            if index == 1:
+                self.drive_resolutions += 1
+                return {
+                    "primitive_sequence": 1,
+                    "plan_sha256": "a" * 64,
+                    "fresh_odometry_used": True,
+                    "disposition": "realign_spin_required",
+                    "action_goal": None,
+                    "realignment_primitive_sequence": 0,
+                    "heading_error_rad": 0.20,
+                }
+            return super().resolve_live_primitive(plan, index, path, pose, **kwargs)
+
+    backend = FakeDetourBackend()
+    samples = [_executor_sample(index / 10.0) for index in range(80)]
+    for index in (1, 19):
+        samples[index]["motionIntentActive"] = True
+        samples[index]["nav2Actions"]["spinActive"] = True
+        samples[index]["command"]["wz"] = -0.2
+    collector = FakeExecutorCollector(samples)
+    evidence = FakeDetourEvidence()
+    planner = StalledRealignPlanner()
+    monkeypatch.setattr(runner, "_load_file_module", lambda *_args: planner)
+    executor = runner.StrictMotionCaseExecutor(
+        backend,
+        collector,
+        evidence,
+        clock=lambda: 1.0,
+    )
+
+    with pytest.raises(
+        runner.StrictMotionRunnerError,
+        match="did not contract by at least 10%",
+    ):
+        executor.run_detour(
+            case_id="detour-realign-stalled",
+            route_id="office_waste_bin_s_to_g",
+        )
+
+    assert backend.calls.count("send_spin") == 2
+    assert backend.calls.count("send_drive") == 0
+    assert evidence.calls == ["begin", "abort"]
+
+
+def test_detour_planning_rejection_preserves_preexisting_balanced_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = FakeDetourBackend()
+
+    class BalancedPreflightCollector(FakeExecutorCollector):
+        def collect_once(self) -> dict:
+            sample = _executor_sample(10.0)
+            sample["runtimeHealth"] = {
+                "plant": {
+                    "bootId": "11000000-0000-4000-8000-000000000001",
+                    "sessionId": "12000000-0000-4000-8000-000000000001",
+                }
+            }
+            return sample
+
+    class RejectingPlanner(FakeStaticPlanner):
+        def build_primitive_plan(self, _path, **_kwargs) -> dict:
+            raise runner.StrictMotionRunnerError(
+                "NavFn path edge violates inflated clearance"
+            )
+
+    collector = BalancedPreflightCollector([])
+    evidence = FakeDetourEvidence()
+    monkeypatch.setattr(
+        runner,
+        "_load_file_module",
+        lambda *_args: RejectingPlanner(),
+    )
+    executor = runner.StrictMotionCaseExecutor(
+        backend,
+        collector,
+        evidence,
+        clock=lambda: 1.0,
+    )
+
+    with pytest.raises(
+        runner.StrictMotionRunnerError,
+        match="inflated clearance",
+    ):
+        executor.run_detour(
+            case_id="detour-planning-rejected",
+            route_id="office_waste_bin_s_to_g",
+        )
+
+    assert backend.calls == ["ready", "compute_path", "cancel", "zero"]
+    assert "normal_stop" not in backend.calls
+    assert evidence.calls == []
 
 
 def test_detour_executor_rejects_resolver_skip_and_stops(

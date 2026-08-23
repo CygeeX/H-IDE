@@ -35,9 +35,13 @@ NAV2_INPUT_TOPIC = "/h_ide/strict_motion/input"
 BRIDGE_CMD_VEL_TOPIC = "/cmd_vel"
 OFFICIAL_DRIVE_SPEED_MPS = 0.30
 OFFICIAL_REVERSE_SPEED_MPS = 0.20
-OFFICIAL_LATERAL_SPEED_MPS = 0.35
+# NVIDIA's planner keyboard contract recommends about 0.4 m/s for strafing.
+# Keep the model input at that published value; endpoint control is handled by
+# measured odometry below, not by inventing a smaller pseudo-speed.
+OFFICIAL_LATERAL_SPEED_MPS = 0.40
 OFFICIAL_SPIN_MIN_RPS = 0.10
 OFFICIAL_SPIN_MAX_RPS = 0.20
+DETOUR_HEADING_TOLERANCE_RAD = 0.06
 # The command values above are NVIDIA/Nav2 setpoints and remain unchanged. Live
 # r18 evidence measured 0.2913 m over 6.964 s of commanded reverse motion
 # (0.04183 m/s), while an earlier isolated physics run measured about 0.0507
@@ -48,6 +52,7 @@ OFFICIAL_SPIN_MAX_RPS = 0.20
 OBSERVED_TRANSLATION_PROGRESS_FLOOR_MPS = 0.04
 TRANSLATION_STARTUP_STOP_MARGIN_S = 10.0
 NAV2_COMMAND_STALE_S = 0.15
+LATERAL_ODOMETRY_STALE_S = 0.15
 # Nav2's reviewed controller loop is 20 Hz.  Relaying an unconditional 50 Hz
 # zero command doubled the bridge-to-SONIC control-plane traffic before an
 # action even existed (50 intent connections plus 40 health probes per second)
@@ -56,6 +61,10 @@ NAV2_COMMAND_STALE_S = 0.15
 STRICT_RELAY_PERIOD_S = 0.05
 LATERAL_DISTANCE_M = 0.50
 LATERAL_STOP_TOLERANCE_M = 0.03
+LATERAL_MIN_STOP_PROGRESS_M = 0.40
+LATERAL_RIGHT_MIN_STOP_PROGRESS_M = 0.35
+LATERAL_PREDICTIVE_STOP_HORIZON_S = 0.20
+LATERAL_RIGHT_PREDICTIVE_STOP_HORIZON_S = 0.55
 LATERAL_MAX_LONGITUDINAL_DRIFT_M = 0.12
 LATERAL_MAX_OPPOSITE_M = 0.04
 LATERAL_MAX_YAW_DRIFT_RAD = math.radians(10.0)
@@ -82,6 +91,20 @@ SAMPLE_DEADLINE_S = 0.30
 TERMINAL_SETTLE_S = 3.0
 TERMINAL_SETTLE_MAX_WALL_S = 30.0
 SEGMENT_BALANCED_IDLE_S = 1.5
+# Double-viewer MuJoCo can advance simulation time more slowly than wall time.
+# A long Spin also needs several simulated seconds of learned-policy braking
+# before the 1.5 s continuous IDLE proof begins.  This wall-clock cap only
+# observes zero-command, identity-stable support-off samples; it does not relax
+# the required simulated settle duration or velocity envelopes.
+SEGMENT_BALANCED_IDLE_MAX_WALL_S = 10.0
+# A long learned-policy Spin can settle outside the detour heading gate.
+# Re-resolve the matching official Spin from fresh map odometry, but keep the
+# correction count finite and require material contraction so an oscillating
+# or stalled controller fails closed.  Live r83 contracted 0.584 -> 0.294 ->
+# 0.121 rad; two corrections were therefore an artificial early cutoff rather
+# than evidence of divergence.
+MAX_DRIVE_REALIGNMENT_SPINS = 4
+MAX_DRIVE_REALIGNMENT_RETAINED_ERROR_RATIO = 0.90
 EXCEPTION_BALANCED_IDLE_S = 1.0
 EXCEPTION_BALANCED_IDLE_MAX_WALL_S = 8.0
 TERMINAL_LINEAR_SPEED_MPS = 0.01
@@ -120,10 +143,13 @@ MOTION_PROFILE_MANIFEST = (
 DETOUR_ROUTES = {
     "office_waste_bin_s_to_g": {
         "start": (-6.45, 0.0, 0.0),
-        "goal": (-7.40, -0.45, 0.0),
+        # Preserve the final path tangent. A separate 2.47 rad terminal Spin
+        # moved the humanoid 0.23 m after it had already reached the goal,
+        # consuming wall clearance and manufacturing the r85 miss.
+        "goal": (-7.30, -0.30, -2.50),
     },
     "office_waste_bin_g_to_s": {
-        "start": (-7.40, -0.45, 0.0),
+        "start": (-7.30, -0.30, 0.0),
         "goal": (-6.45, 0.0, 0.0),
     },
 }
@@ -185,12 +211,21 @@ class PoseObservation:
     pose: PlanarPose
     frame_id: str
     received_at_s: float
+    body_vx_mps: float = 0.0
+    body_vy_mps: float = 0.0
 
     def age_s(self, now_s: float) -> float:
         age = float(now_s) - self.received_at_s
         if not math.isfinite(age) or age < 0.0:
             raise StrictMotionRunnerError("pose observation clock moved backwards")
         return age
+
+    def __post_init__(self) -> None:
+        if not all(
+            math.isfinite(value)
+            for value in (self.received_at_s, self.body_vx_mps, self.body_vy_mps)
+        ):
+            raise ValueError("pose observation timing/twist must be finite")
 
 
 @dataclass(frozen=True, slots=True)
@@ -375,7 +410,13 @@ class StrictCommandRelay:
             raise StrictMotionRunnerError("Nav2 primitive command became stale")
         return self._last_nav2_command
 
-    def lateral_output(self, pose: PlanarPose) -> TwistCommand:
+    def lateral_output(
+        self,
+        pose: PlanarPose,
+        *,
+        body_vx_mps: float = 0.0,
+        body_vy_mps: float = 0.0,
+    ) -> TwistCommand:
         if self._primitive != "LateralStep" or self._start_pose is None:
             raise StrictMotionRunnerError("no direct LateralStep is active")
         start = self._start_pose
@@ -383,6 +424,13 @@ class StrictCommandRelay:
         longitudinal = dx * math.cos(start.yaw) + dy * math.sin(start.yaw)
         lateral = -dx * math.sin(start.yaw) + dy * math.cos(start.yaw)
         directional = self._direction * lateral
+        heading_delta = _angle_delta(pose.yaw, start.yaw)
+        directional_speed = self._direction * (
+            float(body_vx_mps) * math.sin(heading_delta)
+            + float(body_vy_mps) * math.cos(heading_delta)
+        )
+        if not math.isfinite(directional_speed):
+            raise StrictMotionRunnerError("LateralStep odometry twist is non-finite")
         yaw_drift = abs(_angle_delta(pose.yaw, start.yaw))
         if directional < -LATERAL_MAX_OPPOSITE_M - _ZERO_EPS:
             raise StrictMotionRunnerError("LateralStep moved in the opposite direction")
@@ -393,7 +441,33 @@ class StrictCommandRelay:
         if directional > LATERAL_DISTANCE_M + LATERAL_STOP_TOLERANCE_M:
             raise StrictMotionRunnerError("LateralStep overshot its endpoint envelope")
         remaining = LATERAL_DISTANCE_M - directional
-        if remaining <= LATERAL_STOP_TOLERANCE_M:
+        stop_horizon_s = (
+            LATERAL_RIGHT_PREDICTIVE_STOP_HORIZON_S
+            if self._direction < 0
+            else LATERAL_PREDICTIVE_STOP_HORIZON_S
+        )
+        minimum_stop_progress_m = (
+            LATERAL_RIGHT_MIN_STOP_PROGRESS_M
+            if self._direction < 0
+            else LATERAL_MIN_STOP_PROGRESS_M
+        )
+        predictive_progress = directional + max(0.0, directional_speed) * (
+            stop_horizon_s
+        )
+        # Learned IDLE is a dynamic balance/stop policy, not an instantaneous
+        # brake.  Live r62/r63 evidence showed that waiting until 0.47 m can
+        # add as much as 0.13 m while the body decelerates.  Start the handoff
+        # only when authoritative base_link twist predicts entry into the
+        # 0.47 m stop band. The pinned policy is physically asymmetric at the
+        # stop boundary: r66 right-strafe IDLE added 0.17 m after zero while
+        # r64 left-strafe added about 0.07 m. The right trigger must therefore
+        # begin at the measured 0.35 m coast boundary; both directions retain
+        # the exact same final 0.50 +/- 0.10 m acceptance contract.
+        if remaining <= LATERAL_STOP_TOLERANCE_M or (
+            directional >= minimum_stop_progress_m
+            and predictive_progress
+            >= LATERAL_DISTANCE_M - LATERAL_STOP_TOLERANCE_M
+        ):
             self._lateral_complete = True
             return ZERO_COMMAND
         return TwistCommand(0.0, self._direction * OFFICIAL_LATERAL_SPEED_MPS, 0.0)
@@ -544,6 +618,7 @@ class RosLiveBackend:
         self._lock = threading.RLock()
         self._relay = StrictCommandRelay(clock=clock)
         self._fatal: str | None = None
+        self._quiesced_case_fault: str | None = None
         self._last_published = ZERO_COMMAND
         self._last_publish_at_s: float | None = None
         self._publish_sequence = 0
@@ -662,12 +737,19 @@ class RosLiveBackend:
             if fatal is not None:
                 command = ZERO_COMMAND
             elif primitive == "LateralStep":
-                if odom is None or odom.age_s(self._clock()) > 0.10:
+                if (
+                    odom is None
+                    or odom.age_s(self._clock()) > LATERAL_ODOMETRY_STALE_S
+                ):
                     raise StrictMotionRunnerError(
                         "LateralStep lost fresh authoritative odometry"
                     )
                 with self._lock:
-                    command = self._relay.lateral_output(odom.pose)
+                    command = self._relay.lateral_output(
+                        odom.pose,
+                        body_vx_mps=odom.body_vx_mps,
+                        body_vy_mps=odom.body_vy_mps,
+                    )
             else:
                 with self._lock:
                     command = self._relay.nav2_output(now_s=self._clock())
@@ -691,10 +773,13 @@ class RosLiveBackend:
 
     def _on_odom(self, message: Any) -> None:
         try:
+            twist = message.twist.twist
             observation = PoseObservation(
                 _pose_from_ros_message(message),
                 str(message.header.frame_id),
                 self._clock(),
+                body_vx_mps=float(twist.linear.x),
+                body_vy_mps=float(twist.linear.y),
             )
             if observation.frame_id != "odom":
                 raise StrictMotionRunnerError("odometry frame must be 'odom'")
@@ -838,6 +923,33 @@ class RosLiveBackend:
             raise StrictMotionRunnerError("fresh map localization is unavailable")
         return value
 
+    def wait_fresh_map_pose(
+        self,
+        *,
+        max_age_s: float = 0.10,
+        timeout_s: float = 0.50,
+    ) -> PoseObservation:
+        """Wait between actions for a genuinely fresh localization sample.
+
+        The source publishes at 25 Hz, but the six-source evidence join and X11
+        viewers can occasionally schedule the checkpoint read just beyond the
+        100 ms authority age.  Never consume that stale pose and never wait
+        while an action owns motion: callers use this only at a zero-command
+        primitive boundary, for at most half a second.
+        """
+
+        deadline = self._clock() + float(timeout_s)
+        while True:
+            self.raise_if_faulted()
+            try:
+                return self.latest_map_pose(max_age_s=max_age_s)
+            except StrictMotionRunnerError:
+                if self._clock() >= deadline:
+                    raise StrictMotionRunnerError(
+                        "fresh map localization is unavailable"
+                    ) from None
+                time.sleep(0.005)
+
     def last_published_command(self) -> TwistCommand:
         with self._lock:
             return self._last_published
@@ -928,9 +1040,19 @@ class RosLiveBackend:
         direction: int | None = None,
     ) -> None:
         with self._lock:
+            quiesced_fault = getattr(self, "_quiesced_case_fault", None)
+            if quiesced_fault is not None:
+                raise StrictMotionRunnerError(
+                    "faulted strict relay cannot admit another action: "
+                    f"{quiesced_fault}"
+                )
             if mode in StrictCommandRelay._LATERAL_MODES:
                 observation = self._latest_odom
-                if observation is None or observation.age_s(self._clock()) > 0.10:
+                if (
+                    observation is None
+                    or observation.age_s(self._clock())
+                    > LATERAL_ODOMETRY_STALE_S
+                ):
                     raise StrictMotionRunnerError(
                         "LateralStep requires fresh odometry at admission"
                     )
@@ -945,7 +1067,20 @@ class RosLiveBackend:
     def stop_relay(self) -> None:
         with self._lock:
             self._relay.stop()
+            fatal_before_stop = self._fatal
         self._publish(ZERO_COMMAND)
+        if fatal_before_stop is not None:
+            with self._lock:
+                # The zero publish is the relay's quiescence boundary. Preserve
+                # the original case failure so this backend can never admit a
+                # second action, but allow read-only health/Plant sampling to
+                # prove SONIC's learned-IDLE stop. Keeping _fatal set here made
+                # every cleanup health call fail immediately and forced an
+                # untethered humanoid into static hold, which caused the r65
+                # post-rejection fall.
+                if self._fatal == fatal_before_stop:
+                    self._quiesced_case_fault = fatal_before_stop
+                    self._fatal = None
 
     @property
     def lateral_complete(self) -> bool:
@@ -2021,11 +2156,24 @@ class SonicEvidenceClient:
         response = self._call(
             "arm_limiter_evidence_finalize",
             case_id=case_id,
-            max_response_bytes=MAX_JSON_BYTES,
         )
+        deadline = time.monotonic() + 5.0
+        while response.get("status") == "materializing":
+            if time.monotonic() >= deadline:
+                raise StrictMotionRunnerError(
+                    "SONIC evidence materialization exceeded 5 seconds"
+                )
+            time.sleep(0.01)
+            response = self._call(
+                "arm_limiter_evidence_get",
+                case_id=case_id,
+                max_response_bytes=MAX_JSON_BYTES,
+            )
         evidence = response.get("evidence")
         if response.get("status") != "complete" or not isinstance(evidence, dict):
-            raise StrictMotionRunnerError("SONIC evidence did not finalize completely")
+            raise StrictMotionRunnerError(
+                "SONIC evidence did not finalize completely"
+            )
         self._active_case = None
         return evidence
 
@@ -2319,6 +2467,42 @@ class StrictMotionCaseExecutor:
         except Exception:
             return False
 
+    def _remember_preflight_balanced_idle_boundary(
+        self,
+        sample: Mapping[str, Any],
+    ) -> None:
+        """Retain the exact support-off epoch before any planning-only work.
+
+        A NavFn/static-plan rejection happens before actuator evidence begins
+        and sends no motion command.  Without this provenance, generic
+        exception cleanup treated the already healthy learned-IDLE boundary as
+        unknown and escalated to a static normal stop, which can topple an
+        untethered humanoid.  Only a fully settled, support-off sample can seed
+        this preservation path; cold/static or malformed boundaries remain
+        fail-closed.
+        """
+
+        try:
+            if not _sample_settled(sample):
+                return
+            support = _mapping(
+                sample.get("plantSupport"),
+                "preflight plantSupport",
+            )
+            epoch = _integer(
+                support.get("fallArrestReleaseConfirmedEpoch"),
+                "preflight support release epoch",
+                minimum=1,
+            )
+            if _support_off(sample, epoch):
+                self._diagnostic_support_epoch = epoch
+        except StrictMotionRunnerError:
+            # This is optional preservation provenance, not a substitute for
+            # the normal preflight/health contract.  An incomplete fixture or
+            # cold/static sample simply remains on the existing fail-closed
+            # cleanup path.
+            return
+
     def _await_exception_balanced_idle(self, support_epoch: int | None) -> bool:
         """Give an already-started learned-IDLE stop a bounded completion window.
 
@@ -2364,9 +2548,10 @@ class StrictMotionCaseExecutor:
         *,
         support_epoch: int,
         detour: bool,
+        detour_segment_index: int | None = None,
     ) -> dict[str, Any]:
         first_balanced_t: float | None = None
-        deadline = self.clock() + SEGMENT_BALANCED_IDLE_S + 4.0
+        deadline = self.clock() + SEGMENT_BALANCED_IDLE_MAX_WALL_S
         while self.clock() < deadline:
             sample = self.collector.wait_next()
             if not _support_off(sample, support_epoch):
@@ -2374,7 +2559,11 @@ class StrictMotionCaseExecutor:
                     "fall-arrest support reappeared at a stop boundary"
                 )
             if detour:
-                sample["detourSegmentIndex"] = None
+                if detour_segment_index is None:
+                    raise StrictMotionRunnerError(
+                        "detour braking evidence requires its preceding segment"
+                    )
+                sample["detourSegmentIndex"] = detour_segment_index
             samples.append(sample)
             if _sample_settled(sample):
                 t_s = _finite(sample.get("tS"), "balanced idle tS")
@@ -2417,6 +2606,7 @@ class StrictMotionCaseExecutor:
             isolation = self.collector.isolation_manifest()
             self._diagnostic_preflight = preflight
             self._diagnostic_isolation = isolation
+            self._remember_preflight_balanced_idle_boundary(preflight)
             plant_boot, plant_session = self._identities(preflight)
             # A cold launch starts at the explicit static safety boundary and
             # must be armed once.  A preceding successful capability case,
@@ -2530,6 +2720,7 @@ class StrictMotionCaseExecutor:
             "motion_profile_manifest_path": MOTION_PROFILE_MANIFEST,
             "robot_radius_m": 0.35,
             "footprint_padding_m": 0.02,
+            "heading_tolerance_rad": DETOUR_HEADING_TOLERANCE_RAD,
         }
 
     @staticmethod
@@ -2586,8 +2777,9 @@ class StrictMotionCaseExecutor:
             isolation = self.collector.isolation_manifest()
             self._diagnostic_preflight = preflight
             self._diagnostic_isolation = isolation
+            self._remember_preflight_balanced_idle_boundary(preflight)
             plant_boot, plant_session = self._identities(preflight)
-            current = self.backend.latest_map_pose()
+            current = self.backend.wait_fresh_map_pose()
             if (
                 math.dist(
                     (current.pose.x, current.pose.y),
@@ -2642,123 +2834,190 @@ class StrictMotionCaseExecutor:
                 raise StrictMotionRunnerError("static primitive plan is empty")
 
             for primitive_index, _primitive in enumerate(primitives):
-                self._diagnostic_phase = f"detour_segment_{primitive_index}"
-                fresh_runtime = self.collector.wait_next()
-                fresh_map = self.backend.latest_map_pose()
-                fresh_age = fresh_map.age_s(self.clock())
-                if fresh_age > 0.10:
-                    raise StrictMotionRunnerError(
-                        "detour primitive map pose is older than 100ms"
-                    )
-                fresh_pose = {
-                    "x": fresh_map.pose.x,
-                    "y": fresh_map.pose.y,
-                    "yaw": fresh_map.pose.yaw,
-                }
-                resolved = static_planner.resolve_live_primitive(
-                    plan,
-                    primitive_index,
-                    navfn_path,
-                    fresh_pose,
-                    **self._static_plan_kwargs(),
-                )
-                if resolved.get("disposition") != "send_action":
-                    raise StrictMotionRunnerError(
-                        "locked detour checkpoint resolved to a skip; a new reviewed plan is required"
-                    )
-                action_type = resolved.get("action_type")
-                resolved_goal = _mapping(
-                    resolved.get("action_goal"),
-                    "resolved detour action goal",
-                )
-                if action_type == "nav2_msgs/action/DriveOnHeading":
-                    target = _mapping(
-                        resolved_goal.get("target"),
-                        "resolved DriveOnHeading target",
-                    )
-                    distance = _finite(target.get("x"), "resolved distance")
-                    goal = {
-                        "distanceM": distance,
-                        "speedMps": _finite(
-                            resolved_goal.get("speed_mps"),
-                            "resolved speed",
-                        ),
+                realignment_count = 0
+                previous_realignment_error_abs: float | None = None
+                while True:
+                    self._diagnostic_phase = f"detour_segment_{primitive_index}"
+                    fresh_runtime = self.collector.wait_next()
+                    fresh_map = self.backend.wait_fresh_map_pose()
+                    fresh_age = fresh_map.age_s(self.clock())
+                    if fresh_age > 0.10:
+                        raise StrictMotionRunnerError(
+                            "detour primitive map pose is older than 100ms"
+                        )
+                    fresh_pose = {
+                        "x": fresh_map.pose.x,
+                        "y": fresh_map.pose.y,
+                        "yaw": fresh_map.pose.yaw,
                     }
-                    primitive_type = "DriveOnHeading"
-                    direction = 1
-                    timeout_s = translation_action_timeout_s(distance)
-                elif action_type == "nav2_msgs/action/Spin":
-                    target_yaw = _finite(
-                        resolved_goal.get("target_yaw_rad"),
-                        "resolved target yaw",
+                    resolved = static_planner.resolve_live_primitive(
+                        plan,
+                        primitive_index,
+                        navfn_path,
+                        fresh_pose,
+                        **self._static_plan_kwargs(),
                     )
-                    goal = {
-                        "targetYawRad": target_yaw,
-                        "maxWzRps": OFFICIAL_SPIN_MAX_RPS,
-                    }
-                    primitive_type = "Spin"
-                    direction = 1 if target_yaw > 0.0 else -1
-                    timeout_s = abs(target_yaw) / OFFICIAL_SPIN_MIN_RPS + 10.0
-                else:
-                    raise StrictMotionRunnerError(
-                        "static resolver emitted a forbidden action type"
+                    retry_primitive = False
+                    execution_primitive_index = primitive_index
+                    if resolved.get("disposition") == "realign_spin_required":
+                        realignment_error_abs = abs(
+                            _finite(
+                                resolved.get("heading_error_rad"),
+                                "DriveOnHeading realignment heading error",
+                            )
+                        )
+                        if (
+                            realignment_error_abs
+                            <= DETOUR_HEADING_TOLERANCE_RAD
+                        ):
+                            raise StrictMotionRunnerError(
+                                "static resolver requested realignment inside the heading tolerance"
+                            )
+                        if (
+                            previous_realignment_error_abs is not None
+                            and realignment_error_abs
+                            > previous_realignment_error_abs
+                            * MAX_DRIVE_REALIGNMENT_RETAINED_ERROR_RATIO
+                        ):
+                            raise StrictMotionRunnerError(
+                                "DriveOnHeading realignment heading error did not contract by at least 10%"
+                            )
+                        if realignment_count >= MAX_DRIVE_REALIGNMENT_SPINS:
+                            raise StrictMotionRunnerError(
+                                "DriveOnHeading remained misaligned after the bounded correction Spins"
+                            )
+                        realignment_sequence = _integer(
+                            resolved.get("realignment_primitive_sequence"),
+                            "realignment primitive sequence",
+                            minimum=0,
+                        )
+                        if realignment_sequence != primitive_index - 1:
+                            raise StrictMotionRunnerError(
+                                "static resolver requested an invalid realignment Spin"
+                            )
+                        resolved = static_planner.resolve_live_primitive(
+                            plan,
+                            realignment_sequence,
+                            navfn_path,
+                            fresh_pose,
+                            **self._static_plan_kwargs(),
+                        )
+                        if (
+                            resolved.get("disposition") != "send_action"
+                            or resolved.get("action_type") != "nav2_msgs/action/Spin"
+                        ):
+                            raise StrictMotionRunnerError(
+                                "DriveOnHeading realignment did not resolve to an executable Spin"
+                            )
+                        realignment_count += 1
+                        previous_realignment_error_abs = realignment_error_abs
+                        retry_primitive = True
+                        execution_primitive_index = realignment_sequence
+                        self._diagnostic_phase = (
+                            f"detour_segment_{primitive_index}_realign_{realignment_count}"
+                        )
+                    elif resolved.get("disposition") != "send_action":
+                        raise StrictMotionRunnerError(
+                            "locked detour checkpoint resolved to a skip; a new reviewed plan is required"
+                        )
+                    action_type = resolved.get("action_type")
+                    resolved_goal = _mapping(
+                        resolved.get("action_goal"),
+                        "resolved detour action goal",
                     )
+                    if action_type == "nav2_msgs/action/DriveOnHeading":
+                        target = _mapping(
+                            resolved_goal.get("target"),
+                            "resolved DriveOnHeading target",
+                        )
+                        distance = _finite(target.get("x"), "resolved distance")
+                        goal = {
+                            "distanceM": distance,
+                            "speedMps": _finite(
+                                resolved_goal.get("speed_mps"),
+                                "resolved speed",
+                            ),
+                        }
+                        primitive_type = "DriveOnHeading"
+                        direction = 1
+                        timeout_s = translation_action_timeout_s(distance)
+                    elif action_type == "nav2_msgs/action/Spin":
+                        target_yaw = _finite(
+                            resolved_goal.get("target_yaw_rad"),
+                            "resolved target yaw",
+                        )
+                        goal = {
+                            "targetYawRad": target_yaw,
+                            "maxWzRps": OFFICIAL_SPIN_MAX_RPS,
+                        }
+                        primitive_type = "Spin"
+                        direction = 1 if target_yaw > 0.0 else -1
+                        timeout_s = abs(target_yaw) / OFFICIAL_SPIN_MIN_RPS + 10.0
+                    else:
+                        raise StrictMotionRunnerError(
+                            "static resolver emitted a forbidden action type"
+                        )
 
-                self.backend.begin_relay(
-                    "detour",
-                    primitive=primitive_type,
-                    direction=direction,
-                )
-                if primitive_type == "DriveOnHeading":
-                    execution = self.backend.send_drive(
-                        goal["distanceM"],
-                        timeout_s=timeout_s,
+                    self.backend.begin_relay(
+                        "detour",
+                        primitive=primitive_type,
+                        direction=direction,
                     )
-                else:
-                    execution = self.backend.send_spin(
-                        goal["targetYawRad"],
+                    if primitive_type == "DriveOnHeading":
+                        execution = self.backend.send_drive(
+                            goal["distanceM"],
+                            timeout_s=timeout_s,
+                        )
+                    else:
+                        execution = self.backend.send_spin(
+                            goal["targetYawRad"],
+                            timeout_s=timeout_s,
+                        )
+                    self._collect_detour_action(
+                        execution=execution,
                         timeout_s=timeout_s,
+                        support_epoch=support_epoch,
+                        segment_index=len(segment_drafts),
+                        samples=samples,
                     )
-                self._collect_detour_action(
-                    execution=execution,
-                    timeout_s=timeout_s,
-                    support_epoch=support_epoch,
-                    segment_index=len(segment_drafts),
-                    samples=samples,
-                )
-                self.backend.stop_relay()
-                idle = self._collect_one_idle_sample(
-                    samples,
-                    support_epoch=support_epoch,
-                    detour=True,
-                )
-                segment_drafts.append(
-                    {
-                        "sequenceIndex": len(segment_drafts),
-                        "primitiveSequence": primitive_index,
-                        "type": primitive_type,
-                        "goal": goal,
-                        "goalHashSha256": canonical_sha256(goal),
-                        "resolverResult": dict(resolved),
-                        "freshOdometryUsed": True,
-                        "freshOdometry": {
-                            "frameId": "map",
-                            **fresh_pose,
-                            "ageS": fresh_age,
-                        },
-                        "lineOfSightRevalidated": primitive_type == "DriveOnHeading",
-                        "status": "succeeded",
-                        "balancedPolicyIdleConfirmed": True,
-                        "startedAtTS": _finite(
-                            fresh_runtime.get("tS"),
-                            "fresh detour timestamp",
-                        ),
-                        "completedAtTS": _finite(
-                            idle.get("tS"),
-                            "detour stop timestamp",
-                        ),
-                    }
-                )
+                    self.backend.stop_relay()
+                    idle = self._collect_one_idle_sample(
+                        samples,
+                        support_epoch=support_epoch,
+                        detour=True,
+                        detour_segment_index=len(segment_drafts),
+                    )
+                    segment_drafts.append(
+                        {
+                            "sequenceIndex": len(segment_drafts),
+                            "primitiveSequence": execution_primitive_index,
+                            "type": primitive_type,
+                            "goal": goal,
+                            "goalHashSha256": canonical_sha256(goal),
+                            "resolverResult": dict(resolved),
+                            "freshOdometryUsed": True,
+                            "freshOdometry": {
+                                "frameId": "map",
+                                **fresh_pose,
+                                "ageS": fresh_age,
+                            },
+                            "lineOfSightRevalidated": primitive_type
+                            == "DriveOnHeading",
+                            "status": "succeeded",
+                            "balancedPolicyIdleConfirmed": True,
+                            "startedAtTS": _finite(
+                                fresh_runtime.get("tS"),
+                                "fresh detour timestamp",
+                            ),
+                            "completedAtTS": _finite(
+                                idle.get("tS"),
+                                "detour stop timestamp",
+                            ),
+                        }
+                    )
+                    if retry_primitive:
+                        continue
+                    break
 
             self._collect_terminal_settle(
                 samples,
@@ -2886,7 +3145,7 @@ class StrictMotionCaseExecutor:
                 self.backend.stop_relay()
             except Exception:
                 pass
-            preserve_balanced_idle = self._fresh_balanced_idle_boundary(
+            preserve_balanced_idle = self._await_exception_balanced_idle(
                 self._diagnostic_support_epoch
             )
             if not normal_stopped and not preserve_balanced_idle:

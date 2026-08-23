@@ -711,6 +711,48 @@ def test_health_accepts_only_the_explicit_driver_owned_policy_braking_shape() ->
     assert balanced.navigation_task_active is False
     assert balanced.confirmed_safe_hold is False
 
+    awaiting_plant_latch = parse_health(
+        plant_support_mode="idle",
+        plant_support_stop_pending=True,
+        static_hold_active=False,
+        navigation_task_active=False,
+        motion_authorized=False,
+        nav2_command_zero=True,
+        controlled_policy_stop_active=True,
+        matched_reference_actuator_authority=True,
+        reference_authority_state="GRANTED",
+        reference_authority_generation=42,
+        reference_authority_source_sequence=7,
+        reference_authority_intent_generation=3,
+        reference_authority_epoch=2,
+        reference_authority_granted_at_monotonic_s=100.25,
+        reference_authority_granted_tick_ms=2500,
+        reference_authority_dds_target_sequence=11,
+    )
+    assert awaiting_plant_latch.plant_support_stop_pending is True
+    assert awaiting_plant_latch.controlled_policy_stop_active is True
+    assert awaiting_plant_latch.confirmed_safe_hold is False
+
+    with pytest.raises(ValueError, match="controlled SONIC policy stop"):
+        parse_health(
+            plant_support_mode="locomotion",
+            plant_support_stop_pending=True,
+            static_hold_active=False,
+            navigation_task_active=False,
+            motion_authorized=False,
+            nav2_command_zero=True,
+            controlled_policy_stop_active=True,
+            matched_reference_actuator_authority=True,
+            reference_authority_state="GRANTED",
+            reference_authority_generation=42,
+            reference_authority_source_sequence=7,
+            reference_authority_intent_generation=3,
+            reference_authority_epoch=2,
+            reference_authority_granted_at_monotonic_s=100.25,
+            reference_authority_granted_tick_ms=2500,
+            reference_authority_dds_target_sequence=11,
+        )
+
     with pytest.raises(ValueError, match="controlled SONIC policy stop"):
         parse_health(
             plant_support_mode="locomotion",

@@ -53,13 +53,11 @@ _MOTION_PROFILE_MANIFEST = (
 _OFFICE_FORWARD_PATH = [
     (-6.45, 0.0),
     (-7.075, -0.125),
-    (-7.425, -0.375),
-    (-7.40, -0.45),
+    (-7.30, -0.30),
 ]
 _OFFICE_REVERSE_PATH = [
-    (-7.40, -0.45),
-    (-7.425, -0.375),
-    (-7.175, -0.175),
+    (-7.30, -0.30),
+    (-7.075, -0.125),
     (-6.45, 0.0),
 ]
 _OFFICE_OBSTACLES = [
@@ -165,14 +163,14 @@ def _goal(mode: str) -> dict[str, float]:
     if mode == "reverse":
         return {"distanceM": -0.5, "speedMps": 0.2}
     if mode == "lateral_left":
-        return {"lateralDistanceM": 0.5, "maxVyMps": 0.35}
+        return {"lateralDistanceM": 0.5, "maxVyMps": 0.40}
     if mode == "lateral_right":
-        return {"lateralDistanceM": -0.5, "maxVyMps": 0.35}
+        return {"lateralDistanceM": -0.5, "maxVyMps": 0.40}
     if mode == "turn_left":
         return {"targetYawRad": math.pi / 2.0}
     if mode == "turn_right":
         return {"targetYawRad": -math.pi / 2.0}
-    return {"x": -7.40, "y": -0.45, "yaw": 0.0}
+    return {"x": -7.30, "y": -0.30, "yaw": -2.50}
 
 
 def _root(mode: str, progress: float) -> tuple[float, float, float]:
@@ -213,9 +211,9 @@ def _command(mode: str, active: bool) -> dict[str, float]:
     if mode == "reverse":
         return {"vx": -0.2, "vy": 0.0, "wz": 0.0}
     if mode == "lateral_left":
-        return {"vx": 0.0, "vy": 0.35, "wz": 0.0}
+        return {"vx": 0.0, "vy": 0.40, "wz": 0.0}
     if mode == "lateral_right":
-        return {"vx": 0.0, "vy": -0.35, "wz": 0.0}
+        return {"vx": 0.0, "vy": -0.40, "wz": 0.0}
     if mode == "turn_left":
         return {"vx": 0.0, "vy": 0.0, "wz": 0.2}
     if mode == "turn_right":
@@ -265,7 +263,7 @@ def _sample(mode: str, t_s: float, progress: float, active: bool, sequence: int)
     yaw = _yaw(mode, progress)
     touchdown, liftoff = _feet(progress)
     linear_speed = (
-        0.35
+        0.40
         if active and mode in {"lateral_left", "lateral_right"}
         else (
             (0.2 if mode == "reverse" else 0.3)
@@ -422,14 +420,18 @@ def _rebuild_detour_trace(
     path: list[tuple[float, float]],
     *,
     initial_yaw: float = 0.0,
-    final_yaw: float = 0.0,
+    final_yaw: float | None = None,
+    first_drive_realignment_spins: int = 0,
 ) -> None:
+    if final_yaw is None:
+        final_yaw = float(trace["action"]["goal"]["yaw"])
     task_start_tick = 80_000
     cursor_tick = task_start_tick
     current_yaw = initial_yaw
     execution: list[dict[str, Any]] = []
 
     def append_segment(
+        primitive_sequence: int,
         segment_type: str,
         goal: dict[str, float],
         start_pose: tuple[float, float, float],
@@ -444,7 +446,7 @@ def _rebuild_detour_trace(
         execution.append(
             {
                 "sequenceIndex": index,
-                "primitiveSequence": index,
+                "primitiveSequence": primitive_sequence,
                 "type": segment_type,
                 "goal": goal,
                 "goalHashSha256": strict.canonical_sha256(goal),
@@ -468,19 +470,62 @@ def _rebuild_detour_trace(
         )
         cursor_tick = completed_tick
 
-    for before, after in zip(path, path[1:]):
+    for path_segment_index, (before, after) in enumerate(zip(path, path[1:])):
         heading = math.atan2(after[1] - before[1], after[0] - before[0])
         spin_delta = _angle_delta(heading, current_yaw)
+        spin_sequence = 2 * path_segment_index
+        drive_sequence = spin_sequence + 1
         if abs(spin_delta) > 1e-6:
+            correction_count = (
+                first_drive_realignment_spins if path_segment_index == 0 else 0
+            )
+            overshoot_sign = math.copysign(1.0, spin_delta)
+            settled_spin_yaw = (
+                math.atan2(
+                    math.sin(
+                        heading
+                        + overshoot_sign * 0.1 * (correction_count + 1)
+                    ),
+                    math.cos(
+                        heading
+                        + overshoot_sign * 0.1 * (correction_count + 1)
+                    ),
+                )
+                if correction_count
+                else heading
+            )
             append_segment(
+                spin_sequence,
                 "Spin",
                 {"targetYawRad": spin_delta, "maxWzRps": 0.2},
                 (before[0], before[1], current_yaw),
-                (before[0], before[1], heading),
+                (before[0], before[1], settled_spin_yaw),
                 abs(spin_delta),
             )
+            current_yaw = settled_spin_yaw
+            for correction_index in range(correction_count):
+                correction = _angle_delta(heading, current_yaw)
+                remaining = correction_count - correction_index - 1
+                corrected_yaw = (
+                    math.atan2(
+                        math.sin(heading + overshoot_sign * 0.1 * remaining),
+                        math.cos(heading + overshoot_sign * 0.1 * remaining),
+                    )
+                    if remaining
+                    else heading
+                )
+                append_segment(
+                    spin_sequence,
+                    "Spin",
+                    {"targetYawRad": correction, "maxWzRps": 0.2},
+                    (before[0], before[1], current_yaw),
+                    (before[0], before[1], corrected_yaw),
+                    abs(correction),
+                )
+                current_yaw = corrected_yaw
         distance = math.dist(before, after)
         append_segment(
+            drive_sequence,
             "DriveOnHeading",
             {"distanceM": distance, "speedMps": 0.3},
             (before[0], before[1], heading),
@@ -489,9 +534,10 @@ def _rebuild_detour_trace(
         )
         current_yaw = heading
     final_spin = _angle_delta(final_yaw, current_yaw)
-    if abs(final_spin) > 1e-6:
+    if abs(final_spin) > strict.FormalContract().detour_heading_tolerance_rad:
         endpoint = path[-1]
         append_segment(
+            2 * (len(path) - 1),
             "Spin",
             {"targetYawRad": final_spin, "maxWzRps": 0.2},
             (endpoint[0], endpoint[1], current_yaw),
@@ -505,6 +551,7 @@ def _rebuild_detour_trace(
     for sample_index, tick in enumerate(range(task_start_tick, task_end_tick + 1, 5)):
         x, y, yaw = path[0][0], path[0][1], initial_yaw
         active_segment: dict[str, Any] | None = None
+        completed_segment: dict[str, Any] | None = None
         for segment in execution:
             start_pose = segment["startPose"]
             end_pose = segment["endPose"]
@@ -514,6 +561,8 @@ def _rebuild_detour_trace(
                 break
             if tick >= completed_tick:
                 x, y, yaw = end_pose
+                if tick == completed_tick:
+                    completed_segment = segment
                 continue
             active_segment = segment
             ratio = (tick - started_tick) / (completed_tick - started_tick)
@@ -535,7 +584,11 @@ def _rebuild_detour_trace(
                 "followPathActive": False,
                 "spinActive": False,
             }
-            segment_index: int | None = None
+            segment_index = (
+                completed_segment["sequenceIndex"]
+                if completed_segment is not None
+                else None
+            )
         elif active_segment["type"] == "DriveOnHeading":
             command = {"vx": 0.3, "vy": 0.0, "wz": 0.0}
             linear_speed, angular_speed = 0.3, 0.0
@@ -734,7 +787,10 @@ def _trace(mode: str) -> dict[str, Any]:
     }
     _refresh_arm_trace_hash(result)
     if mode == "detour":
-        navfn_path, static_plan = _production_static_plan(_OFFICE_FORWARD_PATH)
+        navfn_path, static_plan = _production_static_plan(
+            _OFFICE_FORWARD_PATH,
+            final_yaw=-2.50,
+        )
         poses = navfn_path["poses"]
         obstacles = copy.deepcopy(_OFFICE_OBSTACLES)
         result["nav2Plan"] = {
@@ -752,26 +808,35 @@ def _trace(mode: str) -> dict[str, Any]:
             "mapResolutionM": 0.05,
         }
         result["staticPrimitivePlan"] = static_plan
-        _rebuild_detour_trace(result, _OFFICE_FORWARD_PATH)
+        _rebuild_detour_trace(
+            result,
+            _OFFICE_FORWARD_PATH,
+            final_yaw=-2.50,
+        )
     return result
 
 
 def _office_detour_trace(reverse: bool = False) -> dict[str, Any]:
     start = (-6.45, 0.0)
-    goal = (-7.40, -0.45)
+    goal = (-7.30, -0.30)
     path = list(_OFFICE_FORWARD_PATH)
     route_id = "office_waste_bin_s_to_g"
+    final_yaw = -2.50
     if reverse:
         start, goal = goal, start
         path = list(_OFFICE_REVERSE_PATH)
         route_id = "office_waste_bin_g_to_s"
+        final_yaw = 0.0
     trace = _trace("detour")
     trace["caseId"] = route_id
     trace["routeId"] = route_id
-    action_goal = {"x": goal[0], "y": goal[1], "yaw": 0.0}
+    action_goal = {"x": goal[0], "y": goal[1], "yaw": final_yaw}
     trace["action"]["goal"] = action_goal
     trace["action"]["goalHashSha256"] = strict.canonical_sha256(action_goal)
-    navfn_path, static_plan = _production_static_plan(path)
+    navfn_path, static_plan = _production_static_plan(
+        path,
+        final_yaw=final_yaw,
+    )
     poses = navfn_path["poses"]
     obstacles = copy.deepcopy(_OFFICE_OBSTACLES)
     trace["nav2Plan"].update(
@@ -782,7 +847,7 @@ def _office_detour_trace(reverse: bool = False) -> dict[str, Any]:
         obstacleSetHashSha256=strict.canonical_sha256(obstacles),
     )
     trace["staticPrimitivePlan"] = static_plan
-    _rebuild_detour_trace(trace, path)
+    _rebuild_detour_trace(trace, path, final_yaw=final_yaw)
     return trace
 
 
@@ -965,6 +1030,26 @@ def test_arm_per_joint_duration_and_task_tick_boundaries_are_verified() -> None:
     assert "ARM_TRACE_BINDING_MISMATCH" in _failure_codes(boundary)
 
 
+def test_arm_trace_allows_only_one_control_tick_of_baseline_sampling_skew() -> None:
+    between_ticks = _trace("lateral_left")
+    for record in between_ticks["armLimiterEvidence"]["records"]:
+        record["tS"] += 0.008
+    _refresh_arm_trace_hash(between_ticks)
+    assert strict.evaluate_trace(between_ticks)["pass"] is True
+
+    missing_tick = _trace("lateral_left")
+    for record in missing_tick["armLimiterEvidence"]["records"]:
+        record["tS"] += 0.020001
+    _refresh_arm_trace_hash(missing_tick)
+    assert "ARM_TRACE_INCOMPLETE" in _failure_codes(missing_tick)
+
+    missing_terminal = _trace("lateral_left")
+    for record in missing_terminal["armLimiterEvidence"]["records"]:
+        record["tS"] -= 0.000001
+    _refresh_arm_trace_hash(missing_terminal)
+    assert "ARM_TRACE_INCOMPLETE" in _failure_codes(missing_terminal)
+
+
 def test_lateral_requires_true_vy_only_and_no_nav2_action() -> None:
     trace = _trace("lateral_left")
     active = next(sample for sample in trace["samples"] if sample["motionIntentActive"])
@@ -999,6 +1084,66 @@ def test_detour_uses_only_ordered_official_primitives_bound_to_plan() -> None:
     assert result["metrics"]["detourPrimitiveSequence"]["plannerPlanSha256"] == (
         result["metrics"]["staticPrimitivePlan"]["planSha256"]
     )
+
+
+def test_detour_accepts_one_fresh_resolved_drive_realignment_spin() -> None:
+    trace = _trace("detour")
+    _rebuild_detour_trace(
+        trace,
+        list(_OFFICE_FORWARD_PATH),
+        first_drive_realignment_spins=1,
+    )
+
+    result = strict.evaluate_trace(trace)
+
+    assert result["pass"] is True, result["failures"]
+    assert result["metrics"]["detourDriveRealignmentSpinCount"] == 1
+    assert [
+        (segment["primitiveSequence"], segment["type"])
+        for segment in trace["action"]["segments"][:3]
+    ] == [(0, "Spin"), (0, "Spin"), (1, "DriveOnHeading")]
+
+
+def test_detour_accepts_four_converging_drive_realignment_spins() -> None:
+    trace = _trace("detour")
+    _rebuild_detour_trace(
+        trace,
+        list(_OFFICE_FORWARD_PATH),
+        first_drive_realignment_spins=4,
+    )
+
+    result = strict.evaluate_trace(trace)
+
+    assert result["pass"] is True, result["failures"]
+    assert result["metrics"]["detourDriveRealignmentSpinCount"] == 4
+
+
+def test_detour_rejects_more_than_four_drive_realignment_spins() -> None:
+    trace = _trace("detour")
+    _rebuild_detour_trace(
+        trace,
+        list(_OFFICE_FORWARD_PATH),
+        first_drive_realignment_spins=5,
+    )
+
+    assert "DETOUR_REALIGNMENT_BUDGET_EXCEEDED" in _failure_codes(trace)
+
+
+def test_detour_rejects_non_converging_drive_realignment_spins() -> None:
+    trace = _trace("detour")
+    _rebuild_detour_trace(
+        trace,
+        list(_OFFICE_FORWARD_PATH),
+        first_drive_realignment_spins=2,
+    )
+    correction = trace["action"]["segments"][1]
+    preceding = trace["action"]["segments"][0]
+    correction["goal"]["targetYawRad"] = (
+        preceding["goal"]["targetYawRad"] * 0.95
+    )
+    correction["goalHashSha256"] = strict.canonical_sha256(correction["goal"])
+
+    assert "DETOUR_REALIGNMENT_NOT_CONVERGING" in _failure_codes(trace)
 
 
 def test_detour_rejects_forbidden_nav_actions_and_failed_segment_results() -> None:
@@ -1130,6 +1275,42 @@ def test_detour_arm_trace_may_start_before_first_support_off_sample() -> None:
     assert "DETOUR_SAMPLE_TICK_BINDING_MISMATCH" in _failure_codes(escaped)
 
 
+def test_detour_arm_trace_allows_only_two_real_finalization_ticks() -> None:
+    trace = _trace("detour")
+    evidence = trace["armLimiterEvidence"]
+    original_end_tick = evidence["taskEndControlTick"]
+    original_last = copy.deepcopy(evidence["records"][-1])
+    for offset in (1, 2):
+        evidence["records"].append(
+            {
+                **copy.deepcopy(original_last),
+                "controlTick": original_end_tick + offset,
+                "tS": round(original_last["tS"] + 0.02 * offset, 10),
+            }
+        )
+    evidence["taskEndControlTick"] = original_end_tick + 2
+    _refresh_arm_trace_hash(trace)
+
+    result = strict.evaluate_trace(trace)
+
+    assert result["pass"] is True, result["failures"]
+
+    escaped = copy.deepcopy(trace)
+    escaped_evidence = escaped["armLimiterEvidence"]
+    escaped_last = copy.deepcopy(escaped_evidence["records"][-1])
+    escaped_evidence["records"].append(
+        {
+            **escaped_last,
+            "controlTick": original_end_tick + 3,
+            "tS": round(escaped_last["tS"] + 0.02, 10),
+        }
+    )
+    escaped_evidence["taskEndControlTick"] = original_end_tick + 3
+    _refresh_arm_trace_hash(escaped)
+
+    assert "DETOUR_SAMPLE_TICK_BINDING_MISMATCH" in _failure_codes(escaped)
+
+
 def test_detour_plan_and_realized_clearance_are_independent_hard_gates() -> None:
     trace = _trace("detour")
     poses = trace["nav2Plan"]["poses"]
@@ -1157,6 +1338,35 @@ def test_detour_plan_and_realized_clearance_are_independent_hard_gates() -> None
     ]
 
     assert "REALIZED_CLEARANCE_FAILED" in _failure_codes(trace)
+
+
+def test_detour_realized_clearance_uses_continuous_footprint_not_map_cell() -> None:
+    obstacle_x, obstacle_y, obstacle_radius = -6.85, -0.78, 0.22
+
+    def place_closest_sample(trace: dict[str, Any], boundary_clearance: float) -> None:
+        sample = min(
+            trace["samples"],
+            key=lambda item: abs(item["root"]["x"] - obstacle_x),
+        )
+        root_y = obstacle_y + obstacle_radius + boundary_clearance
+        sample["root"]["x"] = obstacle_x
+        sample["root"]["y"] = root_y
+        sample["plantDynamicsEvidence"]["rootState"]["qpos"][:2] = [
+            obstacle_x,
+            root_y,
+        ]
+        sample["plantDynamicsEvidence"]["robotCenterOfMass"]["positionM"][:2] = [
+            obstacle_x + 0.01,
+            root_y + 0.01,
+        ]
+
+    above_physical = _trace("detour")
+    place_closest_sample(above_physical, 0.371)
+    assert "REALIZED_CLEARANCE_FAILED" not in _failure_codes(above_physical)
+
+    below_physical = _trace("detour")
+    place_closest_sample(below_physical, 0.369)
+    assert "REALIZED_CLEARANCE_FAILED" in _failure_codes(below_physical)
 
 
 def test_terminal_settle_requires_full_one_second_dense_zero_speed_tail() -> None:
@@ -1268,10 +1478,11 @@ def test_canonical_waste_bin_short_detour_is_clear_and_direct_route_is_blocked(
 
     assert result["pass"] is True, result["failures"]
     nav = result["metrics"]["nav2Plan"]
-    assert nav["directBoundaryClearanceM"] == pytest.approx(0.3136809764)
+    assert nav["directBoundaryClearanceM"] == pytest.approx(0.3824044131)
     assert nav["directBoundaryClearanceM"] < nav["requiredBoundaryClearanceM"]
     assert nav["minimumPlanBoundaryClearanceM"] >= 0.42
-    assert nav["minimumRealizedBoundaryClearanceM"] >= 0.42
+    assert nav["requiredRealizedBoundaryClearanceM"] == pytest.approx(0.37)
+    assert nav["minimumRealizedBoundaryClearanceM"] >= 0.37
 
 
 def test_confirmed_support_off_is_a_hard_gate() -> None:
@@ -1298,6 +1509,38 @@ def test_at_least_one_complete_cycle_per_foot_is_required() -> None:
         contacts["footLiftoffCount"]["right"] = 20
 
     assert "INCOMPLETE_FOOT_CYCLES" in _failure_codes(trace)
+
+
+def test_spin_requires_continuous_foot_support_not_translation_gait_cycles() -> None:
+    trace = _trace("turn_right")
+    baseline = trace["samples"][0]["plantDynamicsEvidence"]["contacts"]
+    for sample in trace["samples"]:
+        contacts = sample["plantDynamicsEvidence"]["contacts"]
+        for field in ("footTouchdownCount", "footLiftoffCount"):
+            contacts[field] = dict(baseline[field])
+
+    result = strict.evaluate_trace(trace)
+
+    assert result["pass"] is True, result["failures"]
+    assert result["metrics"]["footCycleEvidence"]["requiredForMode"] is False
+    assert result["metrics"]["spinFootSupportEvidence"] == {
+        "derivation": "authoritative-contact-snapshot",
+        "activeSampleCount": sum(
+            sample["motionIntentActive"] for sample in trace["samples"]
+        ),
+        "minimumSupportedFeet": 2,
+        "supportSidesObserved": ["left", "right"],
+    }
+
+
+def test_spin_fails_closed_when_authoritative_foot_support_is_lost() -> None:
+    trace = _trace("turn_left")
+    active = next(sample for sample in trace["samples"] if sample["motionIntentActive"])
+    contacts = active["plantDynamicsEvidence"]["contacts"]
+    contacts["footGroundSides"] = []
+    contacts["footGroundForceN"] = {"left": 0.0, "right": 0.0}
+
+    assert "TURN_FOOT_SUPPORT_LOST" in _failure_codes(trace)
 
 
 @pytest.mark.parametrize(
@@ -1481,7 +1724,7 @@ def test_confirmed_tilt_jump_and_turn_translation_thresholds_kill() -> None:
     jump = _trace("forward")
     jump["samples"][5]["root"]["y"] = 0.081
     jump["samples"][5]["plantDynamicsEvidence"]["rootState"]["qpos"][1] = 0.081
-    jump["samples"][5]["plantDynamicsEvidence"]["robotCenterOfMass"]["positionM"][1] = 0.091
+    jump["samples"][5]["plantDynamicsEvidence"]["robotCenterOfMass"]["positionM"][1] = 0.172
     assert _failure_codes(jump).issuperset({"ROOT_POSITION_JUMP", "COM_POSITION_JUMP"})
 
     turn = _trace("turn_left")
@@ -1503,6 +1746,50 @@ def test_confirmed_tilt_jump_and_turn_translation_thresholds_kill() -> None:
         math.sin(0.201 / 2.0),
     ]
     assert "ROOT_YAW_JUMP" in _failure_codes(yaw_jump)
+
+
+def test_measured_high_angular_speed_can_explain_a_large_sampled_yaw_step() -> None:
+    trace = _trace("turn_left")
+    for index in (0, 1, 2):
+        sample = trace["samples"][index]
+        sample["root"]["angularSpeedRps"] = 2.0
+        sample["plantDynamicsEvidence"]["rootState"]["qvel"][5] = 2.0
+    sample = trace["samples"][1]
+    sample["root"]["yaw"] = 0.25
+    sample["plantDynamicsEvidence"]["rootState"]["qpos"][3:] = [
+        math.cos(0.25 / 2.0),
+        0.0,
+        0.0,
+        math.sin(0.25 / 2.0),
+    ]
+
+    assert "ROOT_YAW_JUMP" not in _failure_codes(trace)
+
+
+def test_normal_fast_motion_is_not_misclassified_as_a_pose_jump() -> None:
+    trace = _trace("forward")
+    # The collector is synchronized to the slower viewer/runtime evidence, so
+    # a healthy official-speed gait can move more than 8 cm between retained
+    # samples. Move this and every later exact Plant/COM pose together; the
+    # displacement remains consistent with the authoritative qvel envelope.
+    for sample in trace["samples"][5:]:
+        sample["root"]["x"] += 0.061
+        sample["plantDynamicsEvidence"]["rootState"]["qpos"][0] += 0.061
+        sample["plantDynamicsEvidence"]["robotCenterOfMass"]["positionM"][0] += 0.061
+    for index in (4, 5):
+        sample = trace["samples"][index]
+        sample["root"]["linearSpeedMps"] = 0.81
+        sample["plantDynamicsEvidence"]["rootState"]["qvel"][0] = 0.81
+
+    result = strict.evaluate_trace(trace)
+
+    assert result["pass"] is True, result["failures"]
+    assert result["metrics"]["kinematicContinuity"]["maxRawRootStepM"] > 0.08
+    assert (
+        result["metrics"]["kinematicContinuity"]
+        ["maxRootQvelIntegrationResidualM"]
+        < 0.08
+    )
 
 
 @pytest.mark.parametrize(

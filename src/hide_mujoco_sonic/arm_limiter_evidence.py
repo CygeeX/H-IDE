@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import re
 import threading
+import time
 from typing import Any
 
 
@@ -42,6 +43,31 @@ def canonical_sha256(value: object) -> str:
         allow_nan=False,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _cooperative_canonical_sha256(value: object) -> str:
+    """Hash a large canonical document without monopolising the Python GIL.
+
+    Successful motion traces contain several thousand 50 Hz records.  A single
+    ``json.dumps`` of that document previously occupied the SONIC command
+    thread long enough for two health probes to time out and falsely latch a
+    terminal motion fault.  ``iterencode`` preserves the exact canonical byte
+    representation while yielding periodically so the small health/probe path
+    and the learned-IDLE balance loop keep making progress.
+    """
+
+    encoder = json.JSONEncoder(
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    digest = hashlib.sha256()
+    for index, chunk in enumerate(encoder.iterencode(value), start=1):
+        digest.update(chunk.encode("utf-8"))
+        if index % 4096 == 0:
+            time.sleep(0)
+    return digest.hexdigest()
 
 
 def source_bundle_sha256(paths: Sequence[str | Path]) -> str:
@@ -139,6 +165,14 @@ class _Record:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class _SealedSession:
+    """Immutable actuator boundary detached from the live 50 Hz recorder."""
+
+    identity: _SessionIdentity
+    records: tuple[_Record, ...]
+
+
 class ArmLimiterEvidenceRecorder:
     """Record one complete acceptance case from authoritative control ticks.
 
@@ -175,6 +209,7 @@ class ArmLimiterEvidenceRecorder:
         self._lock = threading.RLock()
         self._identity: _SessionIdentity | None = None
         self._records: list[_Record] = []
+        self._sealed: _SealedSession | None = None
         self._failed_reason: str | None = None
         self._completed: dict[str, Any] | None = None
 
@@ -203,6 +238,16 @@ class ArmLimiterEvidenceRecorder:
                 "plantBootId": identity.plant_boot_id,
                 "plantSessionId": identity.plant_session_id,
             }
+
+    @property
+    def sealed_case_id(self) -> str | None:
+        with self._lock:
+            return None if self._sealed is None else self._sealed.identity.case_id
+
+    @property
+    def completed_case_id(self) -> str | None:
+        with self._lock:
+            return None if self._completed is None else str(self._completed["caseId"])
 
     @property
     def failed_reason(self) -> str | None:
@@ -237,6 +282,10 @@ class ArmLimiterEvidenceRecorder:
         with self._lock:
             if self._identity is not None:
                 raise ArmLimiterEvidenceError("an arm evidence session is already active")
+            if self._sealed is not None:
+                raise ArmLimiterEvidenceError(
+                    "a sealed arm evidence session is awaiting finalization"
+                )
             self._identity = identity
             self._records = []
             self._failed_reason = None
@@ -307,13 +356,29 @@ class ArmLimiterEvidenceRecorder:
                 self._failed_reason = str(exc)
                 raise ArmLimiterEvidenceError(self._failed_reason) from exc
 
-    def finalize(self, *, case_id: str) -> dict[str, Any]:
+    def seal(self, *, case_id: str) -> None:
+        """Close the live recorder at an exact actuator/control boundary.
+
+        This method intentionally performs only bounded validation and an O(1)
+        list detach.  Callers may therefore invoke it while holding the SONIC
+        actuator locks, then release those locks before materializing thousands
+        of JSON records and hashing the evidence payload.
+        """
+
         requested_case = _identifier(case_id, "case_id")
         with self._lock:
             identity = self._identity
             if identity is None:
-                if self._completed is not None and self._completed["caseId"] == requested_case:
-                    return json.loads(json.dumps(self._completed))
+                if (
+                    self._completed is not None
+                    and self._completed["caseId"] == requested_case
+                ):
+                    return
+                if (
+                    self._sealed is not None
+                    and self._sealed.identity.case_id == requested_case
+                ):
+                    return
                 raise ArmLimiterEvidenceError("no matching arm evidence session is active")
             if requested_case != identity.case_id:
                 raise ArmLimiterEvidenceError("arm evidence case identity does not match")
@@ -327,37 +392,117 @@ class ArmLimiterEvidenceRecorder:
                 raise ArmLimiterEvidenceError(
                     "arm evidence cannot complete while a joint remains constrained"
                 )
-            records = [record.to_json() for record in self._records]
-            payload: dict[str, Any] = {
-                "schemaVersion": SCHEMA_VERSION,
-                "caseId": identity.case_id,
-                "source": "sonic_authoritative_control_loop",
-                "complete": True,
-                "interpolated": False,
-                "repeatedTelemetry": False,
-                "policyActivationEpoch": identity.policy_activation_epoch,
-                "supportReleaseConfirmedEpoch": (
-                    identity.support_release_confirmed_epoch
-                ),
-                "plantBootId": identity.plant_boot_id,
-                "plantSessionId": identity.plant_session_id,
-                "sonicDriverBootId": self.sonic_driver_boot_id,
-                "sonicDriverSessionId": self.sonic_driver_session_id,
-                "sonicDriverSourceSha256": self.sonic_driver_source_sha256,
-                "taskStartControlTick": self._records[0].control_tick,
-                "taskEndControlTick": self._records[-1].control_tick,
-                "records": records,
-            }
-            payload["traceSha256"] = canonical_sha256(payload)
-            self._completed = payload
+            self._sealed = _SealedSession(identity, tuple(self._records))
             self._identity = None
             self._records = []
-            return json.loads(json.dumps(payload))
+
+    def materialize(self, *, case_id: str) -> None:
+        """Build and seal the JSON artifact without making a defensive copy.
+
+        The driver invokes this method on a background control-plane worker.
+        Public/test callers should continue to use :meth:`finalize`, which
+        returns an isolated copy.
+        """
+
+        requested_case = _identifier(case_id, "case_id")
+        self.seal(case_id=requested_case)
+        with self._lock:
+            if (
+                self._completed is not None
+                and self._completed["caseId"] == requested_case
+            ):
+                return
+            sealed = self._sealed
+            if sealed is None or sealed.identity.case_id != requested_case:
+                raise ArmLimiterEvidenceError(
+                    "no matching sealed arm evidence session exists"
+                )
+            identity = sealed.identity
+            records_snapshot = sealed.records
+
+        # Deliberately outside the recorder lock.  More importantly, the SONIC
+        # driver calls this only after releasing its control/support locks, so a
+        # large successful trace cannot stall LowState delivery or actuator
+        # cadence while Python builds and hashes the JSON document.
+        records: list[dict[str, Any]] = []
+        for index, record in enumerate(records_snapshot, start=1):
+            records.append(record.to_json())
+            if index % 64 == 0:
+                time.sleep(0)
+        payload: dict[str, Any] = {
+            "schemaVersion": SCHEMA_VERSION,
+            "caseId": identity.case_id,
+            "source": "sonic_authoritative_control_loop",
+            "complete": True,
+            "interpolated": False,
+            "repeatedTelemetry": False,
+            "policyActivationEpoch": identity.policy_activation_epoch,
+            "supportReleaseConfirmedEpoch": (
+                identity.support_release_confirmed_epoch
+            ),
+            "plantBootId": identity.plant_boot_id,
+            "plantSessionId": identity.plant_session_id,
+            "sonicDriverBootId": self.sonic_driver_boot_id,
+            "sonicDriverSessionId": self.sonic_driver_session_id,
+            "sonicDriverSourceSha256": self.sonic_driver_source_sha256,
+            "taskStartControlTick": records_snapshot[0].control_tick,
+            "taskEndControlTick": records_snapshot[-1].control_tick,
+            "records": records,
+        }
+        payload["traceSha256"] = _cooperative_canonical_sha256(payload)
+
+        with self._lock:
+            if (
+                self._completed is not None
+                and self._completed["caseId"] == requested_case
+            ):
+                return
+            if self._sealed is not sealed:
+                raise ArmLimiterEvidenceError(
+                    "sealed arm evidence changed during finalization"
+                )
+            self._completed = payload
+            self._sealed = None
+            self._failed_reason = None
+
+    def finalize(self, *, case_id: str) -> dict[str, Any]:
+        self.materialize(case_id=case_id)
+        completed = self.completed(case_id=case_id)
+        if completed is None:  # pragma: no cover - guarded by materialize
+            raise ArmLimiterEvidenceError(
+                "arm evidence materialization did not produce a completed artifact"
+            )
+        return completed
+
+    def _completed_transport_payload(
+        self,
+        *,
+        case_id: str,
+    ) -> dict[str, Any] | None:
+        """Return the immutable-by-convention command-transport payload.
+
+        This deliberately avoids a 50+ ms deep copy on SONIC's probe-serving
+        command thread.  The only caller serializes the mapping immediately and
+        never mutates it; ordinary callers retain the copying ``completed`` API.
+        """
+
+        requested_case = _identifier(case_id, "case_id")
+        with self._lock:
+            if self._completed is None or self._completed["caseId"] != requested_case:
+                return None
+            return self._completed
 
     def abort(self, *, case_id: str) -> bool:
         requested_case = _identifier(case_id, "case_id")
         with self._lock:
             if self._identity is None:
+                if (
+                    self._sealed is not None
+                    and self._sealed.identity.case_id == requested_case
+                ):
+                    self._sealed = None
+                    self._failed_reason = None
+                    return True
                 return False
             if self._identity.case_id != requested_case:
                 raise ArmLimiterEvidenceError("arm evidence case identity does not match")
@@ -397,13 +542,17 @@ class ArmLimiterEvidenceRecorder:
         message = message[:512]
         with self._lock:
             identity = self._identity
-            if identity is None:
+            sealed = self._sealed
+            if identity is None and sealed is None:
                 return None
             if self._failed_reason is None:
                 self._failed_reason = message
-            failed_case_id = identity.case_id
+            failed_case_id = (
+                identity.case_id if identity is not None else sealed.identity.case_id
+            )
             self._identity = None
             self._records = []
+            self._sealed = None
             return failed_case_id
 
     def completed(self, *, case_id: str) -> dict[str, Any] | None:

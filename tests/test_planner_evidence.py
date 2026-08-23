@@ -235,12 +235,52 @@ def test_controlled_stop_accepts_captured_one_meter_idle_braking_yaw() -> None:
     )
 
 
+def test_controlled_stop_accepts_captured_official_lateral_braking_envelope() -> None:
+    planner = FakePlanner()
+    gate = PlannerReferenceEvidenceGate()
+    gate.bind(planner, reference_owner=SimpleNamespace(ref_cursor=0))
+    gate.observe_intent(
+        idle_intent(),
+        admitted=True,
+        simulation_now_s=1.0,
+        allow_static_reference=True,
+    )
+    planner.request_replan(
+        5,
+        FakeMovementState(
+            movement_angle=0.0,
+            has_movement=False,
+            mode=0,
+            speed=-1.0,
+        ),
+    )
+    captured = (
+        settled_idle_motion(
+            0.1336889357,
+            last_yaw=0.00968,
+            tail_speed_mps=0.00958,
+        ),
+        15,
+    )
+    planner.result = captured
+
+    assert planner.try_get_new_motion() == captured
+    evidence = gate.telemetry_fields(ref_cursor=0)
+    assert evidence["sonic_planner_static_root_max_translation_m"] == pytest.approx(
+        0.1336889357
+    )
+    assert evidence["sonic_planner_static_root_max_speed_mps"] < 0.70
+    assert evidence["sonic_planner_static_root_tail_max_speed_mps"] == pytest.approx(
+        0.00958
+    )
+
+
 @pytest.mark.parametrize(
     ("candidate", "reason"),
     [
-        (settled_idle_motion(0.081), "translation"),
+        (settled_idle_motion(0.151), "translation"),
         (settled_idle_motion(0.050, last_yaw=0.151), "yaw"),
-        (settled_idle_motion(0.050, approach_steps=6), "speed"),
+        (settled_idle_motion(0.150, approach_steps=10), "speed"),
         (settled_idle_motion(0.050, tail_speed_mps=0.026), "settle"),
         (motion(0.011), "usable root trajectory"),
     ],

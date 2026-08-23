@@ -120,6 +120,43 @@ def test_success_trace_is_exact_bound_hashed_and_idempotently_readable() -> None
     assert recorder.completed(case_id="case-1") == result
 
 
+def test_seal_detaches_the_live_boundary_before_json_materialization() -> None:
+    recorder = _recorder()
+    _begin(recorder)
+    _record(recorder, 100)
+    _record(recorder, 101)
+
+    recorder.seal(case_id="case-1")
+
+    assert recorder.active is False
+    assert recorder.sealed_case_id == "case-1"
+    assert recorder.completed_case_id is None
+    # A later control tick cannot extend the already sealed actuator fact.
+    _record(recorder, 102)
+    completed = recorder.finalize(case_id="case-1")
+    assert completed["taskEndControlTick"] == 101
+    assert recorder.sealed_case_id is None
+    assert recorder.completed_case_id == "case-1"
+
+
+def test_fault_while_sealed_invalidates_materialization_and_allows_recovery() -> None:
+    recorder = _recorder()
+    _begin(recorder)
+    _record(recorder, 100)
+    _record(recorder, 101)
+    recorder.seal(case_id="case-1")
+
+    assert recorder.close_failed_active("balance lost after seal") == "case-1"
+    assert recorder.sealed_case_id is None
+    with pytest.raises(ArmLimiterEvidenceError, match="no matching"):
+        recorder.finalize(case_id="case-1")
+
+    _begin(recorder, case_id="case-2")
+    _record(recorder, 200)
+    _record(recorder, 201)
+    assert recorder.finalize(case_id="case-2")["caseId"] == "case-2"
+
+
 @pytest.mark.parametrize(
     ("tick", "t_s", "indices", "durations", "match"),
     [

@@ -28,6 +28,14 @@ class MovementIntent:
     source: str = "nav2"
 
 
+@dataclass(frozen=True)
+class LateralHeadingCorrection:
+    """Bounded decoder correction for a pure lateral SONIC action."""
+
+    heading_error_rad: float
+    decoder_delta_heading_rad: float
+
+
 class PlantTickGuard:
     """Detect a restarted MuJoCo publisher from Unitree ``LowState.tick``.
 
@@ -268,6 +276,17 @@ class MotionDirectionGuard:
             self._anchor = None
             self._expected = None
             return True
+        if linear < 1e-6 and abs(values[2]) >= 1e-6:
+            # A pure Spin owns no translational direction.  Retaining a
+            # previous DriveOnHeading/lateral anchor makes ordinary humanoid
+            # pelvis sway during the new action look like reverse travel.  The
+            # dedicated RotationDirectionGuard already rejects wrong-way yaw
+            # and persistent translation during Spin, so end the stale
+            # translation transaction here.  A mixed turn with non-zero
+            # linear intent deliberately keeps the existing anchor below.
+            self._anchor = None
+            self._expected = None
+            return True
         if linear < self.min_linear_mps or abs(values[2]) > self.max_angular_rps:
             # A Nav2 controller commonly inserts a turn while following one
             # global goal.  Keep an existing straight-motion anchor through
@@ -338,6 +357,7 @@ class GoalProgressGuard:
         self._pose: tuple[float, float] | None = None
         self._initial_distance: float | None = None
         self._best_distance: float | None = None
+        self._translation_active = False
         self._zero_since: float | None = None
         self.latched = False
         self.reason: str | None = None
@@ -365,7 +385,7 @@ class GoalProgressGuard:
         if not all(math.isfinite(value) for value in pose):
             raise ValueError("localization pose must be finite")
         self._pose = pose
-        if self.latched or self._goal is None:
+        if self.latched or self._goal is None or not self._translation_active:
             return False
 
         distance = math.dist(pose, self._goal)
@@ -394,6 +414,24 @@ class GoalProgressGuard:
             raise ValueError("velocity command must be finite")
         if not self.latched:
             self._zero_since = None
+            linear = math.hypot(values[0], values[1])
+            if linear < 1e-6 and abs(values[2]) >= 1e-6:
+                # Pure Spin has no monotonic Euclidean-distance contract to a
+                # global path endpoint.  Humanoid pelvis sway can temporarily
+                # move away from that endpoint while yaw progresses correctly.
+                # End the preceding translation transaction; the dedicated
+                # rotation guard owns reverse-yaw and translation-envelope
+                # safety until a new linear command establishes a fresh goal
+                # progress baseline.
+                self._translation_active = False
+                self._reset_progress()
+            elif linear >= 1e-6 and not self._translation_active:
+                self._translation_active = True
+                self._reset_progress()
+                if self._pose is not None and self._goal is not None:
+                    distance = math.dist(self._pose, self._goal)
+                    self._initial_distance = distance
+                    self._best_distance = distance
             return True
 
         now = float(self._clock())
@@ -412,7 +450,12 @@ class GoalProgressGuard:
     def reanchor_at_actuator_grant(self) -> bool:
         """Start goal-progress accounting after policy authority is real."""
 
-        if self.latched or self._pose is None or self._goal is None:
+        if (
+            self.latched
+            or not self._translation_active
+            or self._pose is None
+            or self._goal is None
+        ):
             return False
         distance = math.dist(self._pose, self._goal)
         self._initial_distance = distance
@@ -422,6 +465,7 @@ class GoalProgressGuard:
     def clear(self) -> None:
         self.latched = False
         self.reason = None
+        self._translation_active = False
         self._zero_since = None
         self._reset_progress()
 
@@ -1606,6 +1650,16 @@ class CmdVelGuard:
         3: 0.25,
         4: 0.20,
     }
+    # The default SONIC navigation model has a repeatable lateral torso-yaw
+    # bias in untethered Office V2 MuJoCo.  A gain sweep against the pinned
+    # cached model plus the r65 sequential live rejection showed that the
+    # original gain=2/cap=.15 correction was under-damped: it recovered an
+    # initial right-strafe yaw error, then overshot through the fixed heading.
+    # Gain=.75/cap=.08 keeps both mirrored cached-model strafes below 5 degrees
+    # while retaining margin inside the product's 10-degree endpoint contract.
+    # It never alters Nav2 cmd_vel or the immutable facing goal.
+    _LATERAL_HEADING_HOLD_GAIN = 0.75
+    _LATERAL_HEADING_HOLD_MAX_RAD = 0.08
 
     def __init__(
         self,
@@ -1927,6 +1981,59 @@ class CmdVelGuard:
             has_movement=moving,
             stale=stale,
             source=target.source,
+        )
+
+    def lateral_heading_correction(
+        self,
+        intent: MovementIntent,
+    ) -> LateralHeadingCorrection | None:
+        """Return decoder feedback only for an explicitly pure strafe.
+
+        NVIDIA exposes movement and facing as independent planner inputs.  A
+        pure lateral command therefore has a fixed facing goal even while its
+        movement direction is +/- pi/2.  This method compares measured yaw to
+        the immutable action-start heading; measured drift never changes the
+        command integral or authorizes rotation.  Every other motion type is
+        left untouched.
+        """
+
+        pure_lateral = bool(
+            intent.mode == "SLOW_WALK"
+            and intent.has_movement
+            and abs(self._last.vx) <= 1e-6
+            and abs(self._last.vy) > 1e-6
+            and abs(self._last.wz) <= 1e-9
+            and abs(
+                abs(
+                    self._wrap_angle(
+                        intent.movement_angle_rad - intent.facing_angle_rad
+                    )
+                )
+                - math.pi / 2.0
+            )
+            <= 1e-6
+        )
+        if not pure_lateral:
+            return None
+        if self._measured_heading is None or self._heading_anchor is None:
+            return LateralHeadingCorrection(
+                heading_error_rad=0.0,
+                decoder_delta_heading_rad=0.0,
+            )
+        measured_action_facing = self._current_measured_facing()
+        error = self._wrap_angle(
+            measured_action_facing - intent.facing_angle_rad
+        )
+        correction = max(
+            -self._LATERAL_HEADING_HOLD_MAX_RAD,
+            min(
+                self._LATERAL_HEADING_HOLD_MAX_RAD,
+                -self._LATERAL_HEADING_HOLD_GAIN * error,
+            ),
+        )
+        return LateralHeadingCorrection(
+            heading_error_rad=error,
+            decoder_delta_heading_rad=correction,
         )
 
     @classmethod

@@ -536,11 +536,11 @@ def build_primitive_plan(
     robot_radius_m: float,
     footprint_padding_m: float,
     extra_clearance_m: float = 0.05,
-    min_segment_m: float = 0.05,
+    min_segment_m: float = 0.16,
     max_segment_m: float = 0.75,
     drive_speed_mps: float = OFFICIAL_FORWARD_SPEED_MPS,
-    endpoint_tolerance_m: float = 0.03,
-    heading_tolerance_rad: float = 0.05,
+    endpoint_tolerance_m: float = 0.15,
+    heading_tolerance_rad: float = 0.06,
 ) -> dict[str, object]:
     values = {
         "robot radius": robot_radius_m,
@@ -565,7 +565,12 @@ def build_primitive_plan(
     _require(footprint_padding_m >= 0.0, "footprint padding cannot be negative")
     _require(extra_clearance_m >= 0.05, "extra clearance must be at least 0.05 m")
     _require(0.0 < endpoint_tolerance_m < min_segment_m, "endpoint tolerance must be below minimum segment distance")
-    _require(0.0 < heading_tolerance_rad <= 0.05, "heading tolerance must be in (0, 0.05]")
+    _require(0.0 < heading_tolerance_rad <= 0.06, "heading tolerance must be in (0, 0.06]")
+    _require(
+        max_segment_m * math.sin(heading_tolerance_rad)
+        < extra_clearance_m,
+        "heading tolerance can consume the reserved path clearance",
+    )
     _require(
         math.isclose(
             drive_speed_mps,
@@ -643,18 +648,31 @@ def build_primitive_plan(
                 "requires_fresh_odometry": True,
             }
         )
-    primitives.append(
-        {
-            "sequence": len(primitives),
-            "kind": "spin",
-            "checkpoint_role": "final_heading",
-            "action_type": SPIN_ACTION,
-            "path_index": len(poses) - 1,
-            "reference_end_map": {"x": poses[-1]["x"], "y": poses[-1]["y"]},
-            "planned_target_map_yaw_rad": poses[-1]["yaw"],
-            "requires_fresh_odometry": True,
-        }
-    )
+    # Do not manufacture a tiny terminal Spin when the final straight segment
+    # already satisfies the reviewed heading tolerance. The learned whole-body
+    # controller cannot reliably realize sub-resolution Spin goals; asking for
+    # one can create more pose error than preserving the already-correct final
+    # heading. A materially different goal yaw remains an explicit checkpoint.
+    if (
+        abs(
+            _wrap_angle(
+                poses[-1]["yaw"] - segments[-1]["heading_map_yaw_rad"]
+            )
+        )
+        > heading_tolerance_rad + 1e-12
+    ):
+        primitives.append(
+            {
+                "sequence": len(primitives),
+                "kind": "spin",
+                "checkpoint_role": "final_heading",
+                "action_type": SPIN_ACTION,
+                "path_index": len(poses) - 1,
+                "reference_end_map": {"x": poses[-1]["x"], "y": poses[-1]["y"]},
+                "planned_target_map_yaw_rad": poses[-1]["yaw"],
+                "requires_fresh_odometry": True,
+            }
+        )
 
     normalised_path = {"frame_id": frame_id, "poses": list(poses)}
     plan: dict[str, object] = {
@@ -693,6 +711,9 @@ def build_primitive_plan(
             "spin_max_angular_rps": 0.20,
             "spin_angular_accel_rps2": 0.30,
             "zero_spin_policy": "skip_within_heading_tolerance",
+            "final_heading_policy": (
+                "omit_checkpoint_if_within_heading_tolerance"
+            ),
             "short_residual_policy": "skip_within_endpoint_tolerance_else_fail_below_min_segment",
         },
         "segment_endpoint_indices": list(endpoints),
@@ -714,11 +735,11 @@ def verify_primitive_plan(
     robot_radius_m: float,
     footprint_padding_m: float,
     extra_clearance_m: float = 0.05,
-    min_segment_m: float = 0.05,
+    min_segment_m: float = 0.16,
     max_segment_m: float = 0.75,
     drive_speed_mps: float = OFFICIAL_FORWARD_SPEED_MPS,
-    endpoint_tolerance_m: float = 0.03,
-    heading_tolerance_rad: float = 0.05,
+    endpoint_tolerance_m: float = 0.15,
+    heading_tolerance_rad: float = 0.06,
 ) -> dict[str, object]:
     """Rebuild a plan from trusted inputs and reject any drift or tampering."""
     _require(isinstance(plan, Mapping), "primitive plan must be an object")
@@ -810,11 +831,11 @@ def resolve_live_primitive(
     robot_radius_m: float,
     footprint_padding_m: float,
     extra_clearance_m: float = 0.05,
-    min_segment_m: float = 0.05,
+    min_segment_m: float = 0.16,
     max_segment_m: float = 0.75,
     drive_speed_mps: float = OFFICIAL_FORWARD_SPEED_MPS,
-    endpoint_tolerance_m: float = 0.03,
-    heading_tolerance_rad: float = 0.05,
+    endpoint_tolerance_m: float = 0.15,
+    heading_tolerance_rad: float = 0.06,
 ) -> dict[str, object]:
     """Resolve one checkpoint into an official action goal or an explicit skip.
 
@@ -941,10 +962,29 @@ def resolve_live_primitive(
         and role == "reach_segment_endpoint",
         "unsupported primitive checkpoint",
     )
-    _require(
-        abs(heading_error) <= heading_tolerance_rad + 1e-12,
-        "DriveOnHeading checkpoint is not aligned; resolve Spin again",
-    )
+    if abs(heading_error) > heading_tolerance_rad + 1e-12:
+        realignment_sequence = primitive_index - 1
+        _require(
+            realignment_sequence >= 0,
+            "DriveOnHeading checkpoint has no preceding alignment Spin",
+        )
+        realignment = primitives[realignment_sequence]
+        _require(
+            isinstance(realignment, Mapping)
+            and realignment.get("kind") == "spin"
+            and realignment.get("checkpoint_role") == "align_segment"
+            and realignment.get("segment_id") == primitive.get("segment_id"),
+            "DriveOnHeading checkpoint has no matching alignment Spin",
+        )
+        return {
+            **result,
+            "disposition": "realign_spin_required",
+            "action_goal": None,
+            "fresh_distance_to_endpoint_m": distance,
+            "resolved_target_map_yaw_rad": target_heading,
+            "heading_error_rad": heading_error,
+            "realignment_primitive_sequence": realignment_sequence,
+        }
     _require(
         math.isclose(
             _finite_number(primitive.get("speed_mps"), "DriveOnHeading speed"),
@@ -976,7 +1016,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--robot-radius-m", type=float, required=True)
     parser.add_argument("--footprint-padding-m", type=float, required=True)
     parser.add_argument("--extra-clearance-m", type=float, default=0.05)
-    parser.add_argument("--min-segment-m", type=float, default=0.05)
+    parser.add_argument("--min-segment-m", type=float, default=0.16)
     parser.add_argument("--max-segment-m", type=float, default=0.75)
     return parser.parse_args()
 

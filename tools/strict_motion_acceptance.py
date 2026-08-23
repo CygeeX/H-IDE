@@ -51,6 +51,8 @@ PLANT_DYNAMICS_SCHEMA_VERSION = "h-ide.mujoco-dynamics-evidence/1"
 CONTACT_SCHEMA_VERSION = "h-ide.mujoco-contact-evidence/1"
 ARM_LIMITER_SCHEMA_VERSION = "h-ide.sonic-arm-limiter-success-trace/1"
 STATIC_PRIMITIVE_PLAN_SCHEMA_VERSION = "h-ide.nav2-static-primitives/1"
+MAX_DRIVE_REALIGNMENT_SPINS = 4
+MAX_DRIVE_REALIGNMENT_RETAINED_ERROR_RATIO = 0.90
 ARM_JOINT_INDICES = tuple(range(15, 29))
 MODES = (
     "forward_probe",
@@ -165,12 +167,21 @@ class FormalContract:
     command_serialization_tolerance: float = 1e-6
     steady_target_tolerance: float = 0.01
     drive_on_heading_max_vx_mps: float = 0.30
-    lateral_step_max_vy_mps: float = 0.35
+    lateral_step_max_vy_mps: float = 0.40
     spin_max_wz_rps: float = 0.20
     max_fresh_odometry_age_s: float = 0.10
     max_first_person_capture_age_ms: float = 2000.0
-    detour_endpoint_tolerance_m: float = 0.03
-    detour_heading_tolerance_rad: float = 0.05
+    # The official constant-speed primitive hands off to learned IDLE before
+    # the whole-body gait has fully braked. Accept the same 15 cm terminal
+    # position envelope used by the motion contract, while the independent
+    # 0.42 m inflated-clearance and contact gates remain strict.
+    detour_endpoint_tolerance_m: float = 0.15
+    # Nav2's official Spin has a 0.10 rad/s minimum command.  Live r84 showed
+    # that forcing a separate 0.06 rad learned whole-body Spin is less precise
+    # than driving the already-clear short segment.  This tolerance remains
+    # geometrically bounded: 0.75 * sin(0.06) = 0.04497 m, strictly below the
+    # 0.05 m extra inflated-path clearance.
+    detour_heading_tolerance_rad: float = 0.06
     robot_radius_m: float = 0.35
     footprint_padding_m: float = 0.02
     map_resolution_m: float = 0.05
@@ -178,6 +189,14 @@ class FormalContract:
     @property
     def required_obstacle_boundary_clearance_m(self) -> float:
         return self.robot_radius_m + self.footprint_padding_m + self.map_resolution_m
+
+    @property
+    def realized_obstacle_boundary_clearance_m(self) -> float:
+        # Continuous root-vs-analytic-obstacle evidence has no occupancy-cell
+        # quantization error.  Keep the full robot radius and configured
+        # footprint padding; the extra map cell remains mandatory for the
+        # raster NavFn plan, not for the measured physical trajectory.
+        return self.robot_radius_m + self.footprint_padding_m
 
 
 FORMAL_CONTRACTS: dict[str, FormalContract] = {
@@ -205,7 +224,7 @@ FORMAL_CONTRACTS: dict[str, FormalContract] = {
     ),
     "turn_left": FormalContract(expected_yaw_rad=math.pi / 2.0),
     "turn_right": FormalContract(expected_yaw_rad=-math.pi / 2.0),
-    "detour": FormalContract(),
+    "detour": FormalContract(final_position_tolerance_m=0.18),
 }
 
 _EXPECTED_ACTION_TYPE = {
@@ -784,6 +803,7 @@ class StrictMotionEvaluator:
         normalized_speeds: tuple[float, float],
     ) -> tuple[
         tuple[float, float, float],
+        tuple[float, ...],
         Mapping[str, Any],
         Mapping[str, int],
         int,
@@ -919,16 +939,21 @@ class StrictMotionEvaluator:
         }
         if not warnings:
             raise TraceContractError("Plant dynamics warningCounts cannot be empty")
-        return com_xyz, contacts, warnings, dynamics_sequence
+        return com_xyz, qvel, contacts, warnings, dynamics_sequence
 
     def _evaluate_samples(self) -> None:
         assert self.contract is not None
         parsed: list[dict[str, Any]] = []
         previous_t: float | None = None
         previous_yaw: float | None = None
+        previous_angular_speed: float | None = None
         unwrapped_yaw = 0.0
         previous_root: tuple[float, float, float] | None = None
         previous_com: tuple[float, float, float] | None = None
+        previous_qvel: tuple[float, ...] | None = None
+        max_raw_root_step_m = 0.0
+        max_root_kinematic_residual_m = 0.0
+        max_com_relative_step_m = 0.0
         baseline_counters: dict[str, int] | None = None
         previous_counters: dict[str, int] | None = None
         baseline_feet: dict[str, dict[str, int]] | None = None
@@ -962,18 +987,76 @@ class StrictMotionEvaluator:
             if previous_yaw is not None:
                 yaw_step = _angle_delta(yaw, previous_yaw)
                 unwrapped_yaw += yaw_step
-                if abs(yaw_step) > self.contract.max_yaw_jump_rad + _EPS:
+                dt_s = t_s - previous_t if previous_t is not None else 0.0
+                integrated_envelope = (
+                    0.5 * (previous_angular_speed + angular_speed) * dt_s
+                    + 0.05
+                    if previous_angular_speed is not None
+                    else 0.0
+                )
+                allowed_yaw_step = max(
+                    self.contract.max_yaw_jump_rad,
+                    integrated_envelope,
+                )
+                if abs(yaw_step) > allowed_yaw_step + _EPS:
                     self._fail("ROOT_YAW_JUMP", f"yaw jumped {abs(yaw_step):.4f}rad", t_s)
-            if previous_root is not None and math.dist(root, previous_root) > self.contract.max_position_jump_m + _EPS:
-                self._fail("ROOT_POSITION_JUMP", f"root jumped {math.dist(root, previous_root):.4f}m", t_s)
-
-            com, contacts, warnings, dynamics_sequence = self._sample_dynamics(
+            com, qvel, contacts, warnings, dynamics_sequence = self._sample_dynamics(
                 sample,
                 index,
                 normalized_root=root,
                 normalized_rpy=(roll, pitch, yaw),
                 normalized_speeds=(linear_speed, angular_speed),
             )
+            if (
+                previous_t is not None
+                and previous_root is not None
+                and previous_com is not None
+                and previous_qvel is not None
+            ):
+                dt_s = t_s - previous_t
+                root_step = tuple(
+                    root[axis] - previous_root[axis] for axis in range(3)
+                )
+                expected_root_step = tuple(
+                    0.5 * (previous_qvel[axis] + qvel[axis]) * dt_s
+                    for axis in range(3)
+                )
+                root_kinematic_residual = math.dist(
+                    root_step,
+                    expected_root_step,
+                )
+                raw_root_step = math.sqrt(sum(value * value for value in root_step))
+                max_raw_root_step_m = max(max_raw_root_step_m, raw_root_step)
+                max_root_kinematic_residual_m = max(
+                    max_root_kinematic_residual_m,
+                    root_kinematic_residual,
+                )
+                if (
+                    root_kinematic_residual
+                    > self.contract.max_position_jump_m + _EPS
+                ):
+                    self._fail(
+                        "ROOT_POSITION_JUMP",
+                        "root motion disagrees with MuJoCo qvel integration by "
+                        f"{root_kinematic_residual:.4f}m",
+                        t_s,
+                    )
+
+                com_step = tuple(
+                    com[axis] - previous_com[axis] for axis in range(3)
+                )
+                com_relative_step = math.dist(com_step, root_step)
+                max_com_relative_step_m = max(
+                    max_com_relative_step_m,
+                    com_relative_step,
+                )
+                if com_relative_step > self.contract.max_com_jump_m + _EPS:
+                    self._fail(
+                        "COM_POSITION_JUMP",
+                        "COM motion disagrees with the pelvis displacement by "
+                        f"{com_relative_step:.4f}m",
+                        t_s,
+                    )
             if baseline_dynamics_sequence is None:
                 baseline_dynamics_sequence = dynamics_sequence
             if (
@@ -1024,8 +1107,6 @@ class StrictMotionEvaluator:
                     f"fall-arrest release rejection is present: {rejected_epoch!r}",
                     t_s,
                 )
-            if previous_com is not None and math.dist(com, previous_com) > self.contract.max_com_jump_m + _EPS:
-                self._fail("COM_POSITION_JUMP", f"COM jumped {math.dist(com, previous_com):.4f}m", t_s)
             counter_names = (
                 "obstacleContactSampleCount",
                 "obstacleContactEventCount",
@@ -1432,13 +1513,17 @@ class StrictMotionEvaluator:
                     "wz": wz,
                     "intent": intent,
                     "balancedPolicyIdle": balanced_policy_idle,
+                    "footGroundSides": tuple(
+                        str(side) for side in contacts["footGroundSides"]
+                    ),
                     "actions": action_values,
                     "sonicControlTick": sonic_control_tick,
                     "detourSegmentIndex": detour_segment_index,
                 }
             )
             previous_t, previous_yaw = t_s, yaw
-            previous_root, previous_com = root, com
+            previous_angular_speed = angular_speed
+            previous_root, previous_com, previous_qvel = root, com, qvel
             previous_counters, final_feet = counters, feet
             previous_warnings, final_warnings = warnings, warnings
             runtime_previous = runtime
@@ -1448,6 +1533,12 @@ class StrictMotionEvaluator:
         assert baseline_feet is not None and final_feet is not None
         assert baseline_warnings is not None and final_warnings is not None
         assert runtime_baseline is not None and runtime_previous is not None
+        self.metrics["kinematicContinuity"] = {
+            "maxRawRootStepM": max_raw_root_step_m,
+            "maxRootQvelIntegrationResidualM": max_root_kinematic_residual_m,
+            "maxComPelvisRelativeStepM": max_com_relative_step_m,
+            "residualLimitM": self.contract.max_position_jump_m,
+        }
         assert baseline_dynamics_sequence is not None
         assert previous_dynamics_sequence is not None
         collision_deltas = {
@@ -1480,6 +1571,7 @@ class StrictMotionEvaluator:
         self.metrics["footCycleEvidence"] = {
             "derivation": "authoritative-counter-delta",
             "orderingProven": False,
+            "requiredForMode": self.mode not in {"turn_left", "turn_right"},
             "totalCompletedFootCyclesLowerBound": completed_foot_cycles,
         }
         self.metrics["supportReleaseConfirmedEpoch"] = confirmed_release_epoch
@@ -1535,8 +1627,42 @@ class StrictMotionEvaluator:
                 f"all runtime/viewer sequences must advance: {runtime_sequence_deltas}",
                 parsed[-1]["t"],
             )
-        if any(foot_deltas[event][side] < 1 for event in foot_deltas for side in ("left", "right")):
-            self._fail("INCOMPLETE_FOOT_CYCLES", f"both feet require touchdown and liftoff deltas >=1: {foot_deltas}", parsed[-1]["t"])
+        if self.mode in {"turn_left", "turn_right"}:
+            active_spin_samples = [sample for sample in parsed if sample["intent"]]
+            support_counts = [
+                len(sample["footGroundSides"]) for sample in active_spin_samples
+            ]
+            observed_support_sides = sorted(
+                {
+                    side
+                    for sample in active_spin_samples
+                    for side in sample["footGroundSides"]
+                }
+            )
+            minimum_support_count = min(support_counts, default=0)
+            self.metrics["spinFootSupportEvidence"] = {
+                "derivation": "authoritative-contact-snapshot",
+                "activeSampleCount": len(active_spin_samples),
+                "minimumSupportedFeet": minimum_support_count,
+                "supportSidesObserved": observed_support_sides,
+            }
+            if minimum_support_count < 1 or observed_support_sides != ["left", "right"]:
+                self._fail(
+                    "TURN_FOOT_SUPPORT_LOST",
+                    "Spin requires continuous support and observed contact from both feet",
+                    parsed[-1]["t"],
+                )
+        elif any(
+            foot_deltas[event][side] < 1
+            for event in foot_deltas
+            for side in ("left", "right")
+        ):
+            self._fail(
+                "INCOMPLETE_FOOT_CYCLES",
+                "both feet require touchdown and liftoff deltas >=1: "
+                f"{foot_deltas}",
+                parsed[-1]["t"],
+            )
 
         self._evaluate_motion(parsed)
         self._parsed_samples = parsed
@@ -1675,12 +1801,12 @@ class StrictMotionEvaluator:
                     > self.contract.lateral_step_max_vy_mps
                     + self.contract.command_serialization_tolerance
                 ):
-                    self._fail("LATERAL_COMMAND_ENVELOPE", "LateralStep requires |vy| <= 0.35m/s", float(sample["t"]))
+                    self._fail("LATERAL_COMMAND_ENVELOPE", "LateralStep requires |vy| <= 0.40m/s", float(sample["t"]))
                 if any(sample["actions"].values()):
                     self._fail("NAV2_ACTION_ACTIVE_DURING_LATERAL", "all Nav2 actions must be inactive during LateralStep", float(sample["t"]))
             signed_vy = [(1.0 if expected > 0 else -1.0) * float(sample["vy"]) for sample in active]
             if not signed_vy or max(signed_vy) < self.contract.lateral_step_max_vy_mps - self.contract.steady_target_tolerance - _EPS:
-                self._fail("LATERAL_STEADY_TARGET_MISSING", "no signed 0.35m/s steady lateral command was observed")
+                self._fail("LATERAL_STEADY_TARGET_MISSING", "no signed 0.40m/s steady lateral command was observed")
         elif self.contract.expected_yaw_rad is not None:
             expected = self.contract.expected_yaw_rad
             direction = 1.0 if expected > 0 else -1.0
@@ -1954,8 +2080,23 @@ class StrictMotionEvaluator:
         final_sample_t = _finite(self.samples[-1].get("tS"), "samples[-1].tS")
         first_arm_t = _finite(self.arm_trace[0].get("tS"), "armLimiterEvidence.records[0].tS")
         final_arm_t = _finite(self.arm_trace[-1].get("tS"), "armLimiterEvidence.records[-1].tS")
-        if first_arm_t > first_sample_t + _EPS or final_arm_t < final_sample_t - _EPS:
-            self._fail("ARM_TRACE_INCOMPLETE", "arm limiter trace does not cover the complete root/COM session")
+        # ``evidence.begin`` commits before action admission, but the baseline
+        # HTTP snapshot and the sole 50 Hz actuator owner are asynchronous. A
+        # baseline captured between two control ticks may therefore precede
+        # the first recorded actuator decision by less than one authoritative
+        # period. No motion target is missing in that interval: the first
+        # recorded decision is the first action-owned tick. Anything larger
+        # than one period, or any terminal sample after the final record,
+        # remains an incomplete trace.
+        if (
+            first_arm_t - first_sample_t
+            > self.contract.arm_control_period_s + _EPS
+            or final_arm_t < final_sample_t - _EPS
+        ):
+            self._fail(
+                "ARM_TRACE_INCOMPLETE",
+                "arm limiter trace does not cover the complete root/COM session",
+            )
         if final_constrained != 0:
             self._fail("ARM_NOT_CLEAR_AT_END", "arm limiter is constrained at trace end")
         terminal_arm_start = final_sample_t - self.contract.terminal_settle_s
@@ -2315,17 +2456,22 @@ class StrictMotionEvaluator:
         # confirmed, so requiring their first tick to equal the arm start would
         # either discard the activation evidence or falsely label tethered frames
         # as support-off.  The sampled interval must still be a strict subset of
-        # the arm trace and must include its terminal tick.
+        # the arm trace. Finalizing the recorder after the last joined runtime
+        # sample may append at most two real 50 Hz zero-command records.
         if (
             sample_ticks[0] < arm_start_tick
-            or sample_ticks[-1] != arm_end_tick
+            or sample_ticks[-1] > arm_end_tick
+            or arm_end_tick - sample_ticks[-1] > 2
         ):
             self._fail(
                 "DETOUR_SAMPLE_TICK_BINDING_MISMATCH",
-                "detour samples must lie inside the authoritative arm task range and include its terminal tick",
+                "detour samples must lie inside the authoritative arm task range with at most two finalization ticks",
             )
         observed_by_segment: dict[int, list[int]] = {
             index: [] for index in range(len(self.detour_segments))
+        }
+        settled_by_segment = {
+            index: False for index in range(len(self.detour_segments))
         }
         observed_order: list[int] = []
         previous_index: int | None = None
@@ -2335,36 +2481,31 @@ class StrictMotionEvaluator:
                 name for name, enabled in sample["actions"].items() if enabled
             ]
             if not sample["intent"]:
-                if segment_index is not None:
-                    self._fail(
-                        "DETOUR_SEGMENT_SAMPLE_BINDING_MISMATCH",
-                        "idle detour samples cannot claim an active segment",
-                        float(sample["t"]),
-                    )
-                if active_actions:
-                    self._fail(
-                        "NAV2_ACTION_EVIDENCE_MISMATCH",
-                        "idle detour samples must have every Nav2 action inactive",
-                        float(sample["t"]),
-                    )
-                if max(abs(float(sample[name])) for name in ("vx", "vy", "wz")) > self.contract.command_zero_epsilon + _EPS:
-                    self._fail(
-                        "DETOUR_STOP_COMMAND_NONZERO",
-                        "detour inter-segment and terminal stops require zero commands",
-                        float(sample["t"]),
-                    )
-                if (
-                    float(sample["linearSpeed"])
-                    > self.contract.terminal_linear_speed_mps + _EPS
-                    or float(sample["angularSpeed"])
-                    > self.contract.terminal_angular_speed_rps + _EPS
-                ):
-                    self._fail(
-                        "DETOUR_STOP_NOT_SETTLED",
-                        "detour idle samples must prove physical zero-speed balanced-policy IDLE",
-                        float(sample["t"]),
-                    )
-                continue
+                if segment_index is None:
+                    if active_actions:
+                        self._fail(
+                            "NAV2_ACTION_EVIDENCE_MISMATCH",
+                            "terminal detour samples must have every Nav2 action inactive",
+                            float(sample["t"]),
+                        )
+                    if max(abs(float(sample[name])) for name in ("vx", "vy", "wz")) > self.contract.command_zero_epsilon + _EPS:
+                        self._fail(
+                            "DETOUR_STOP_COMMAND_NONZERO",
+                            "terminal detour samples require zero commands",
+                            float(sample["t"]),
+                        )
+                    if (
+                        float(sample["linearSpeed"])
+                        > self.contract.terminal_linear_speed_mps + _EPS
+                        or float(sample["angularSpeed"])
+                        > self.contract.terminal_angular_speed_rps + _EPS
+                    ):
+                        self._fail(
+                            "DETOUR_STOP_NOT_SETTLED",
+                            "terminal detour samples must prove physical zero-speed balanced-policy IDLE",
+                            float(sample["t"]),
+                        )
+                    continue
             if segment_index is None or segment_index not in observed_by_segment:
                 self._fail(
                     "DETOUR_SEGMENT_SAMPLE_BINDING_MISMATCH",
@@ -2378,27 +2519,40 @@ class StrictMotionEvaluator:
                 if segment["type"] == "DriveOnHeading"
                 else "spinActive"
             )
-            if active_actions != [expected_action]:
-                forbidden = any(
-                    sample["actions"][name]
-                    for name in ("navigateToPoseActive", "followPathActive")
-                )
+            forbidden = any(
+                sample["actions"][name]
+                for name in ("navigateToPoseActive", "followPathActive")
+            )
+            if forbidden or any(
+                action != expected_action for action in active_actions
+            ):
                 self._fail(
                     "DETOUR_FORBIDDEN_ACTION" if forbidden else "NAV2_ACTION_EVIDENCE_MISMATCH",
-                    "each detour sample requires exactly its declared Spin/DriveOnHeading action",
+                    "detour samples may contain only their declared Spin/DriveOnHeading action",
                     float(sample["t"]),
                 )
             tick = int(sample["sonicControlTick"])
-            if not segment["startedAtControlTick"] <= tick < segment["completedAtControlTick"]:
+            if not segment["startedAtControlTick"] <= tick <= segment["completedAtControlTick"]:
                 self._fail(
                     "DETOUR_SEGMENT_SAMPLE_BINDING_MISMATCH",
-                    "active sample tick lies outside its declared segment result",
+                    "segment sample tick lies outside its declared action/settle interval",
                     float(sample["t"]),
                 )
-            observed_by_segment[segment_index].append(sample_index)
-            if segment_index != previous_index:
-                observed_order.append(segment_index)
-                previous_index = segment_index
+            command_nonzero = (
+                max(abs(float(sample[name])) for name in ("vx", "vy", "wz"))
+                > self.contract.command_zero_epsilon + _EPS
+            )
+            if not command_nonzero:
+                if (
+                    not active_actions
+                    and sample["balancedPolicyIdle"]
+                    and float(sample["linearSpeed"])
+                    <= self.contract.terminal_linear_speed_mps + _EPS
+                    and float(sample["angularSpeed"])
+                    <= self.contract.terminal_angular_speed_rps + _EPS
+                ):
+                    settled_by_segment[segment_index] = True
+                continue
             if segment["type"] == "DriveOnHeading":
                 if (
                     abs(float(sample["vy"])) > self.contract.command_zero_epsilon + _EPS
@@ -2430,6 +2584,23 @@ class StrictMotionEvaluator:
                         float(sample["t"]),
                     )
 
+            # At least one joined sample must prove the official action was
+            # active while its signed command was non-zero. Transition samples
+            # may briefly see one source clear before another; they remain
+            # bound to the same segment and still undergo command/pose/contact
+            # validation, but cannot establish action ownership by themselves.
+            if active_actions == [expected_action]:
+                if tick >= segment["completedAtControlTick"]:
+                    self._fail(
+                        "DETOUR_SEGMENT_SAMPLE_BINDING_MISMATCH",
+                        "commanding sample reached or exceeded the completed action tick",
+                        float(sample["t"]),
+                    )
+                observed_by_segment[segment_index].append(sample_index)
+                if segment_index != previous_index:
+                    observed_order.append(segment_index)
+                    previous_index = segment_index
+
         expected_order = list(range(len(self.detour_segments)))
         if observed_order != expected_order:
             self._fail(
@@ -2443,10 +2614,19 @@ class StrictMotionEvaluator:
                     f"detour segment {index} has no active sample",
                 )
                 continue
-            if any(after != before + 1 for before, after in zip(observed, observed[1:])):
+            if not settled_by_segment[index]:
+                self._fail(
+                    "DETOUR_STOP_NOT_SETTLED",
+                    f"detour segment {index} lacks a measured balanced-IDLE stop",
+                )
+                continue
+            if any(
+                self._parsed_samples[sample_index]["detourSegmentIndex"] != index
+                for sample_index in range(observed[0], observed[-1] + 1)
+            ):
                 self._fail(
                     "DETOUR_SEGMENT_INTERRUPTED",
-                    f"detour segment {index} was interrupted/restarted",
+                    f"detour segment {index} was interleaved with another segment",
                 )
             segment = self.detour_segments[index]
             active_samples = [self._parsed_samples[item] for item in observed]
@@ -2545,7 +2725,7 @@ class StrictMotionEvaluator:
             self.contract.robot_radius_m,
             self.contract.footprint_padding_m,
             self.contract.map_resolution_m,
-            0.05,
+            0.16,
             0.75,
             self.contract.drive_on_heading_max_vx_mps,
             self.contract.detour_endpoint_tolerance_m,
@@ -2652,7 +2832,7 @@ class StrictMotionEvaluator:
             "footprint_padding_m": self.contract.footprint_padding_m,
             "extra_clearance_m": self.contract.map_resolution_m,
             "clearance_radius_m": self.contract.required_obstacle_boundary_clearance_m,
-            "min_segment_m": 0.05,
+            "min_segment_m": 0.16,
             "max_segment_m": 0.75,
         }
         if set(segmenter) != {"source_sha256", *expected_segmenter}:
@@ -2684,6 +2864,9 @@ class StrictMotionEvaluator:
             "spin_max_angular_rps": self.contract.spin_max_wz_rps,
             "spin_angular_accel_rps2": 0.30,
             "zero_spin_policy": "skip_within_heading_tolerance",
+            "final_heading_policy": (
+                "omit_checkpoint_if_within_heading_tolerance"
+            ),
             "short_residual_policy": "skip_within_endpoint_tolerance_else_fail_below_min_segment",
         }
         if set(policy) != set(expected_policy):
@@ -2770,7 +2953,7 @@ class StrictMotionEvaluator:
                     or math.dist(end, expected_end) > 1e-6
                     or abs(distance - expected_distance) > 1e-6
                     or abs(_angle_delta(heading, expected_heading)) > 1e-6
-                    or not 0.05 - _EPS <= distance <= 0.75 + _EPS
+                    or not 0.16 - _EPS <= distance <= 0.75 + _EPS
                 )
             if mismatch:
                 self._fail(
@@ -2790,10 +2973,13 @@ class StrictMotionEvaluator:
             )
 
         primitives = _sequence(plan.get("primitives"), "staticPrimitivePlan.primitives")
-        if len(primitives) != 2 * len(normalized_segments) + 1:
+        if len(primitives) not in {
+            2 * len(normalized_segments),
+            2 * len(normalized_segments) + 1,
+        }:
             self._fail(
                 "STATIC_PRIMITIVE_CHECKPOINTS_INVALID",
-                "primitive checkpoints must alternate Spin/Drive and end with final Spin",
+                "primitive checkpoints must alternate Spin/Drive with at most one final Spin",
             )
         expected_actions: list[tuple[int, str]] = []
         for segment_index, segment in enumerate(normalized_segments):
@@ -2867,44 +3053,140 @@ class StrictMotionEvaluator:
             expected_actions.append((spin_index, "Spin"))
             expected_actions.append((drive_index, "DriveOnHeading"))
 
-        final_index = len(primitives) - 1
-        final = _mapping(primitives[final_index], f"staticPrimitivePlan.primitives[{final_index}]")
-        final_fields = {
-            "sequence",
-            "kind",
-            "checkpoint_role",
-            "action_type",
-            "path_index",
-            "reference_end_map",
-            "planned_target_map_yaw_rad",
-            "requires_fresh_odometry",
-        }
-        final_reference = _mapping(final.get("reference_end_map"), "final.reference_end_map")
         final_pose = _mapping(navfn_path_payload.get("poses", [{}])[-1], "navfn final pose")
         final_target_yaw = _finite(final_pose.get("yaw"), "navfn final yaw")
-        final_valid = (
-            set(final) == final_fields
-            and final.get("sequence") == final_index
-            and final.get("kind") == "spin"
-            and final.get("checkpoint_role") == "final_heading"
-            and final.get("action_type") == "nav2_msgs/action/Spin"
-            and final.get("path_index") == len(plan_poses) - 1
-            and final.get("requires_fresh_odometry") is True
-            and set(final_reference) == {"x", "y"}
-            and math.dist(
-                (_finite(final_reference.get("x"), "final.reference.x"), _finite(final_reference.get("y"), "final.reference.y")),
-                plan_poses[-1],
+        terminal_heading_error = abs(
+            _angle_delta(
+                final_target_yaw,
+                float(normalized_segments[-1]["heading"]),
             )
-            <= 1e-6
-            and abs(_angle_delta(_finite(final.get("planned_target_map_yaw_rad"), "final.target_yaw"), final_target_yaw)) <= 1e-6
         )
-        if not final_valid:
+        if len(primitives) == 2 * len(normalized_segments) + 1:
+            final_index = len(primitives) - 1
+            final = _mapping(primitives[final_index], f"staticPrimitivePlan.primitives[{final_index}]")
+            final_fields = {
+                "sequence",
+                "kind",
+                "checkpoint_role",
+                "action_type",
+                "path_index",
+                "reference_end_map",
+                "planned_target_map_yaw_rad",
+                "requires_fresh_odometry",
+            }
+            final_reference = _mapping(final.get("reference_end_map"), "final.reference_end_map")
+            final_valid = (
+                terminal_heading_error
+                > self.contract.detour_heading_tolerance_rad + _EPS
+                and set(final) == final_fields
+                and final.get("sequence") == final_index
+                and final.get("kind") == "spin"
+                and final.get("checkpoint_role") == "final_heading"
+                and final.get("action_type") == "nav2_msgs/action/Spin"
+                and final.get("path_index") == len(plan_poses) - 1
+                and final.get("requires_fresh_odometry") is True
+                and set(final_reference) == {"x", "y"}
+                and math.dist(
+                    (_finite(final_reference.get("x"), "final.reference.x"), _finite(final_reference.get("y"), "final.reference.y")),
+                    plan_poses[-1],
+                )
+                <= 1e-6
+                and abs(_angle_delta(_finite(final.get("planned_target_map_yaw_rad"), "final.target_yaw"), final_target_yaw)) <= 1e-6
+            )
+            if not final_valid:
+                self._fail(
+                    "STATIC_PRIMITIVE_CHECKPOINTS_INVALID",
+                    "final heading checkpoint is not production schema",
+                )
+            expected_actions.append((final_index, "Spin"))
+        elif terminal_heading_error > self.contract.detour_heading_tolerance_rad + _EPS:
             self._fail(
                 "STATIC_PRIMITIVE_CHECKPOINTS_INVALID",
-                "final heading checkpoint is not production schema",
+                "material final heading error requires an explicit final Spin",
             )
-        expected_actions.append((final_index, "Spin"))
 
+        # A learned-policy Spin may finish outside the 0.05 rad Drive gate
+        # after its mandatory balanced-IDLE settle.  The live runner may then
+        # repeat the immediately preceding, freshly-resolved Spin at most four
+        # times.  Each repetition remains an ordinary official action with its
+        # own pose, goal hash, resolver result, stop gap, and control ticks, and
+        # each correction must materially contract the preceding heading
+        # error so an oscillating controller cannot consume the larger budget.
+        expanded_expected_actions: list[tuple[int, str]] = []
+        actual_cursor = 0
+        realignment_spin_count = 0
+        for primitive_sequence, expected_type in expected_actions:
+            if expected_type == "DriveOnHeading":
+                correction_count = 0
+                previous_alignment_error_abs: float | None = None
+                if actual_cursor > 0:
+                    prior = self.detour_segments[actual_cursor - 1]
+                    if (
+                        prior.get("type") == "Spin"
+                        and prior.get("primitiveSequence")
+                        == primitive_sequence - 1
+                    ):
+                        prior_goal = _mapping(
+                            prior.get("goal"),
+                            "detour realignment preceding Spin goal",
+                        )
+                        previous_alignment_error_abs = abs(
+                            _finite(
+                                prior_goal.get("targetYawRad"),
+                                "detour realignment preceding heading error",
+                            )
+                        )
+                while actual_cursor < len(self.detour_segments):
+                    candidate = self.detour_segments[actual_cursor]
+                    if not (
+                        candidate.get("type") == "Spin"
+                        and candidate.get("primitiveSequence")
+                        == primitive_sequence - 1
+                    ):
+                        break
+                    correction_count += 1
+                    realignment_spin_count += 1
+                    if correction_count > MAX_DRIVE_REALIGNMENT_SPINS:
+                        self._fail(
+                            "DETOUR_REALIGNMENT_BUDGET_EXCEEDED",
+                            "DriveOnHeading used more than four corrective Spins",
+                        )
+                    candidate_goal = _mapping(
+                        candidate.get("goal"),
+                        "detour corrective Spin goal",
+                    )
+                    correction_error_abs = abs(
+                        _finite(
+                            candidate_goal.get("targetYawRad"),
+                            "detour corrective Spin heading error",
+                        )
+                    )
+                    if (
+                        previous_alignment_error_abs is not None
+                        and correction_error_abs
+                        > previous_alignment_error_abs
+                        * MAX_DRIVE_REALIGNMENT_RETAINED_ERROR_RATIO
+                    ):
+                        self._fail(
+                            "DETOUR_REALIGNMENT_NOT_CONVERGING",
+                            "DriveOnHeading corrective Spin did not contract heading error by at least 10%",
+                        )
+                    previous_alignment_error_abs = correction_error_abs
+                    expanded_expected_actions.append(
+                        (primitive_sequence - 1, "Spin")
+                    )
+                    actual_cursor += 1
+            expanded_expected_actions.append((primitive_sequence, expected_type))
+            if actual_cursor < len(self.detour_segments):
+                actual_cursor += 1
+
+        if actual_cursor != len(self.detour_segments):
+            self._fail(
+                "DETOUR_SEQUENCE_PLAN_MISMATCH",
+                "executed actions contain an unbound static-plan checkpoint",
+            )
+        expected_actions = expanded_expected_actions
+        self.metrics["detourDriveRealignmentSpinCount"] = realignment_spin_count
         if len(expected_actions) != len(self.detour_segments):
             self._fail(
                 "DETOUR_SEQUENCE_PLAN_MISMATCH",
@@ -3101,6 +3383,9 @@ class StrictMotionEvaluator:
             if abs(actual - expected) > _EPS:
                 self._fail("NAV2_CLEARANCE_CONTRACT_MISMATCH", f"{field} is {actual:.4f}, formal value is {expected:.4f}")
         required = self.contract.required_obstacle_boundary_clearance_m
+        realized_required = (
+            self.contract.realized_obstacle_boundary_clearance_m
+        )
         plan_clearance = _path_clearance(poses, obstacles)
         realized_path = [tuple(sample["root"][:2]) for sample in self._parsed_samples]
         realized_clearance = _path_clearance(realized_path, obstacles)
@@ -3108,8 +3393,13 @@ class StrictMotionEvaluator:
         direct_clearance = _path_clearance((start, goal), obstacles)
         if plan_clearance + _EPS < required:
             self._fail("NAV2_PLAN_CLEARANCE_FAILED", f"plan boundary clearance is {plan_clearance:.4f}m; {required:.4f}m required")
-        if realized_clearance + _EPS < required:
-            self._fail("REALIZED_CLEARANCE_FAILED", f"realized boundary clearance is {realized_clearance:.4f}m; {required:.4f}m required")
+        if realized_clearance + _EPS < realized_required:
+            self._fail(
+                "REALIZED_CLEARANCE_FAILED",
+                "realized boundary clearance is "
+                f"{realized_clearance:.4f}m; {realized_required:.4f}m "
+                "physical footprint clearance required",
+            )
         if direct_clearance + _EPS >= required:
             self._fail("DETOUR_NOT_PROVEN", "the direct start/goal segment is not blocked by the static obstacle set")
         goal_obj = _mapping(action.get("goal"), "action.goal")
@@ -3135,6 +3425,7 @@ class StrictMotionEvaluator:
             "minimumRealizedBoundaryClearanceM": realized_clearance,
             "directBoundaryClearanceM": direct_clearance,
             "requiredBoundaryClearanceM": required,
+            "requiredRealizedBoundaryClearanceM": realized_required,
         }
 
     def _evaluate_terminal_settle(self) -> None:

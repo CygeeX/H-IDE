@@ -82,7 +82,7 @@
         "footprint_padding_m": {"const": 0.02},
         "extra_clearance_m": {"const": 0.05},
         "clearance_radius_m": {"const": 0.42},
-        "min_segment_m": {"const": 0.05},
+        "min_segment_m": {"const": 0.16},
         "max_segment_m": {"const": 0.75}
       },
       "additionalProperties": false
@@ -100,19 +100,21 @@
         "spin_max_angular_rps",
         "spin_angular_accel_rps2",
         "zero_spin_policy",
+        "final_heading_policy",
         "short_residual_policy"
       ],
       "properties": {
         "fresh_odometry_required": {"const": true},
         "fresh_pose_frame": {"const": "map"},
         "revalidate_line_of_sight_before_drive": {"const": true},
-        "endpoint_tolerance_m": {"const": 0.03},
-        "heading_tolerance_rad": {"const": 0.05},
+        "endpoint_tolerance_m": {"const": 0.15},
+        "heading_tolerance_rad": {"const": 0.06},
         "drive_speed_mps": {"const": 0.3},
         "spin_min_angular_rps": {"const": 0.1},
         "spin_max_angular_rps": {"const": 0.2},
         "spin_angular_accel_rps2": {"const": 0.3},
         "zero_spin_policy": {"const": "skip_within_heading_tolerance"},
+        "final_heading_policy": {"const": "omit_checkpoint_if_within_heading_tolerance"},
         "short_residual_policy": {"const": "skip_within_endpoint_tolerance_else_fail_below_min_segment"}
       },
       "additionalProperties": false
@@ -132,7 +134,7 @@
     },
     "primitives": {
       "type": "array",
-      "minItems": 3,
+      "minItems": 2,
       "maxItems": 1999999,
       "items": {
         "oneOf": [

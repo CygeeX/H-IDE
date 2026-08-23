@@ -10,6 +10,7 @@ import pytest
 from huggingface_hub import try_to_load_from_cache
 
 from hide_mujoco_sonic.plant import stabilized_support_wrench
+from hide_mujoco_sonic.safety import CmdVelGuard
 from hide_mujoco_sonic.sonic_driver import SonicDriver
 from lerobot.robots.unitree_g1.controllers import sonic_whole_body
 from lerobot.robots.unitree_g1.controllers.sonic_pipeline import (
@@ -32,6 +33,7 @@ _MODEL_FILES = (
     "model_encoder.onnx",
     "model_decoder.onnx",
 )
+
 
 def _cached_model_paths() -> dict[str, Path]:
     """Resolve a complete local SONIC bundle without permitting a download."""
@@ -326,28 +328,6 @@ def _wrap_angle(value: float) -> float:
             15.0,
         ),
         (
-            "left_strafe",
-            0.35,
-            math.pi / 2.0,
-            0.0,
-            True,
-            (0.0, 1.0),
-            0,
-            0.5,
-            30.0,
-        ),
-        (
-            "right_strafe",
-            0.35,
-            -math.pi / 2.0,
-            0.0,
-            True,
-            (0.0, -1.0),
-            0,
-            0.5,
-            30.0,
-        ),
-        (
             "left_turn",
             -1.0,
             0.0,
@@ -368,6 +348,39 @@ def _wrap_angle(value: float) -> float:
             -1,
             math.pi / 2.0,
             20.0,
+        ),
+        (
+            "heading_hold_left_strafe",
+            0.40,
+            math.pi / 2.0,
+            0.0,
+            True,
+            (0.0, 1.0),
+            0,
+            0.5,
+            30.0,
+        ),
+        (
+            "heading_hold_right_strafe",
+            0.40,
+            -math.pi / 2.0,
+            0.0,
+            True,
+            (0.0, -1.0),
+            0,
+            0.5,
+            30.0,
+        ),
+        (
+            "heading_hold_forward_1m",
+            0.30,
+            0.0,
+            0.0,
+            True,
+            (1.0, 0.0),
+            0,
+            1.0,
+            30.0,
         ),
     ),
 )
@@ -445,6 +458,10 @@ def test_official_cold_boot_sequence_moves_in_requested_direction(
         enable_startup_blend=False,
         allow_operator_intent=False,
     )
+    heading_hold_enabled = label.startswith("heading_hold_")
+    heading_guard: CmdVelGuard | None = None
+    heading_intent = None
+    heading_hold_applied_frames = 0
     try:
         assert controller.initialize_from_lowstate(lowstate()) is True
         controller.ms.mode = LM.IDLE
@@ -529,6 +546,22 @@ def test_official_cold_boot_sequence_moves_in_requested_direction(
                         np.asarray(data.qpos[3:7], dtype=np.float64)
                     )
                     reference_installed_s = float(data.time)
+                    if heading_hold_enabled:
+                        heading_guard = CmdVelGuard(
+                            clock=lambda: float(data.time),
+                            smoothing_alpha=1.0,
+                        )
+                        heading_guard.observe_heading(motion_initial_yaw)
+                        heading_guard.accept(
+                            math.cos(movement_angle) if has_movement else 0.0,
+                            math.sin(movement_angle) if has_movement else 0.0,
+                            0.0,
+                            received_at=float(data.time),
+                        )
+                        heading_intent = heading_guard.intent(
+                            now=float(data.time),
+                            dt=CONTROL_DT,
+                        )
                 if (
                     reference_acquired
                     and expected_yaw_sign
@@ -549,6 +582,18 @@ def test_official_cold_boot_sequence_moves_in_requested_direction(
                         expected_install_epoch=controller.reference_install_epoch,
                     )
                     turn_reference_refreshes += 1
+                if heading_guard is not None and heading_intent is not None:
+                    heading_guard.observe_heading(
+                        _yaw_from_wxyz(np.asarray(data.qpos[3:7]))
+                    )
+                    heading_correction = heading_guard.lateral_heading_correction(
+                        heading_intent
+                    )
+                    if heading_correction is not None:
+                        controller.controller.delta_heading = (
+                            heading_correction.decoder_delta_heading_rad
+                        )
+                        heading_hold_applied_frames += 1
                 policy_action = (
                     controller.run_step({}, lowstate())
                     if reference_acquired
@@ -680,6 +725,7 @@ def test_official_cold_boot_sequence_moves_in_requested_direction(
                 if positive_progress_index is None
                 else positive_progress_index * float(model.opt.timestep)
             ),
+            "heading_hold_applied_frames": heading_hold_applied_frames,
         }
         assert target_reached, diagnostic
         if expected_yaw_sign:
@@ -699,6 +745,19 @@ def test_official_cold_boot_sequence_moves_in_requested_direction(
             assert cross < 0.30, diagnostic
             max_open_loop_yaw = 15.0 if label == "forward_3m" else 10.0
             assert abs(final_yaw_delta) < math.radians(max_open_loop_yaw), diagnostic
+            if label in {
+                "heading_hold_left_strafe",
+                "heading_hold_right_strafe",
+            }:
+                # Keep a two-times margin inside the product's 10-degree
+                # lateral endpoint contract.  The pinned ONNX/MuJoCo path has
+                # small CPU-kernel variation; tuning harder for a cosmetic
+                # 2-degree target over-corrects the mirrored direction without
+                # improving path safety.
+                assert abs(final_yaw_delta) < math.radians(5.0), diagnostic
+                assert heading_hold_applied_frames > 0, diagnostic
+            if label == "heading_hold_forward_1m":
+                assert heading_hold_applied_frames == 0, diagnostic
             # The official learned gait may shift its centre of mass before
             # the first requested step. Bound that startup transient without
             # weakening the sustained direction or final-target checks.
