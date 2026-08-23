@@ -352,7 +352,7 @@ class SonicRuntime:
         self.ms.needs_replan = False
         self.last_ms = snapshot_ms(self.ms)
 
-    def request_continuous_reference(self):
+    def _request_continuous_reference(self, *, controlled_idle_stop: bool) -> None:
         """Request a replan while freezing the last acknowledged policy state.
 
         This path is used after the first IDLE balance has crossed the actuator
@@ -360,6 +360,12 @@ class SonicRuntime:
         measured/action history and current reference buffer.  The caller holds
         the last successful target while the asynchronous planner works, so the
         request cursor and blend point are independent of host scheduling.
+
+        A controlled IDLE stop is deliberately a separate public operation from
+        a moving replan.  It may preserve policy history only for the exact
+        heading-neutral IDLE intent; arbitrary static poses and pure-rotation
+        intents must use their normal transaction instead of borrowing this
+        braking seam.
         """
 
         if not self._initialized:
@@ -378,7 +384,27 @@ class SonicRuntime:
             raise RuntimeError(
                 "cannot continuously replan with unpublished policy output"
             )
-        if LM(self.ms.mode) == LM.IDLE or not bool(self.ms.has_movement):
+        is_idle = LM(self.ms.mode) == LM.IDLE
+        has_movement = bool(self.ms.has_movement)
+        if controlled_idle_stop:
+            neutral_values = (
+                float(self.ms.movement_angle),
+                float(self.ms.facing_angle),
+            )
+            if (
+                not is_idle
+                or has_movement
+                or float(self.ms.speed) != -1.0
+                or float(self.ms.height) != -1.0
+                or any(
+                    not math.isfinite(value) or value != 0.0
+                    for value in neutral_values
+                )
+            ):
+                raise RuntimeError(
+                    "continuous SONIC IDLE stop requires the exact heading-neutral IDLE intent"
+                )
+        elif is_idle or not has_movement:
             raise RuntimeError(
                 "continuous SONIC replanning requires a non-IDLE movement intent"
             )
@@ -392,6 +418,16 @@ class SonicRuntime:
         self.replan_timer = 0.0
         self.ms.needs_replan = False
         self.last_ms = snapshot_ms(self.ms)
+
+    def request_continuous_reference(self) -> None:
+        """Freeze policy history and request the next moving reference."""
+
+        self._request_continuous_reference(controlled_idle_stop=False)
+
+    def request_continuous_idle_reference(self) -> None:
+        """Freeze policy history and request one heading-neutral IDLE stop."""
+
+        self._request_continuous_reference(controlled_idle_stop=True)
 
     def poll_reference(self) -> bool:
         """Poll and blend one accepted async plan without policy-state progress."""
@@ -825,6 +861,11 @@ class SonicWholeBodyController:
         """Freeze the current policy cursor and request the next movement plan."""
 
         self._runtime.request_continuous_reference()
+
+    def request_continuous_idle_reference(self) -> None:
+        """Freeze policy history and request one heading-neutral IDLE stop."""
+
+        self._runtime.request_continuous_idle_reference()
 
     def poll_reference(self) -> bool:
         """Poll/blend an async reference without running the policy."""

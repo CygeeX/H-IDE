@@ -543,6 +543,76 @@ def test_continuous_replan_freezes_cursor_and_preserves_executed_history():
         )
 
 
+def test_continuous_idle_stop_preserves_cursor_and_executed_history():
+    runtime, planner, controller, _encoder, _decoder, _raw_action = _runtime()
+    obs = _complete_obs(offset=0.02)
+    runtime.initialize_from_observation(obs)
+    boundary = np.array(
+        [obs[f"{motor.name}.q"] for motor in G1_29_JointIndex],
+        np.float32,
+    )
+    runtime.acquire_initial_reference(
+        obs,
+        executed_target=boundary,
+        expected_install_epoch=runtime.reference_install_epoch,
+    )
+    idle = runtime.tick(obs, debug=False, use_joystick=False)
+    published = _target_vector(idle)
+    runtime.record_executed_target(published)
+    history_before = tuple(
+        np.asarray(history).copy()
+        for history in (
+            controller.h_q_mj,
+            controller.h_dq_mj,
+            controller.h_ang,
+            controller.h_act_mj,
+            controller.h_quat,
+        )
+    )
+    cursor_before = controller.ref_cursor
+    step_before = runtime.step
+
+    runtime.ms.mode = 0
+    runtime.ms.speed = -1.0
+    runtime.ms.height = -1.0
+    runtime.ms.movement_angle = 0.0
+    runtime.ms.facing_angle = 0.0
+    runtime.ms.has_movement = False
+    runtime.request_continuous_idle_reference()
+
+    assert planner.requests[-1][0] == cursor_before
+    assert not runtime.reference_authority
+    assert controller.ref_cursor == cursor_before
+    assert runtime.step == step_before
+    planner.results.append((_motion_from_measured(boundary), planner.gen_frame))
+    assert runtime.poll_reference()
+    runtime.acquire_continuous_reference(
+        executed_target=published,
+        expected_install_epoch=runtime.reference_install_epoch,
+    )
+
+    assert runtime.reference_authority
+    assert runtime.step == step_before
+    for actual, expected in zip(
+        (
+            controller.h_q_mj,
+            controller.h_dq_mj,
+            controller.h_ang,
+            controller.h_act_mj,
+            controller.h_quat,
+        ),
+        history_before,
+        strict=True,
+    ):
+        np.testing.assert_array_equal(np.asarray(actual), expected)
+
+    runtime.ms.mode = 1
+    runtime.ms.speed = 0.2
+    runtime.ms.has_movement = True
+    with pytest.raises(RuntimeError, match="exact heading-neutral IDLE intent"):
+        runtime.request_continuous_idle_reference()
+
+
 def test_publish_feedback_is_required_and_is_the_only_cursor_commit():
     runtime, planner, controller, encoder, decoder, _raw_action = _runtime()
     obs = _complete_obs()
