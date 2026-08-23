@@ -19,7 +19,7 @@ stale or cancelled.
 
 ## What is vendored and what is downloaded
 
-* `vendor/lerobot` is pinned to `7790eb79b184627e9b8488c2698f115001f2e5a4`.
+* `vendor/lerobot` is pinned to `f5fdcb61cda272b866ca81f72ce6f1f76b87fad9`.
   The source is Apache-2.0.
 * `models/unitree-g1-mujoco` is the public `lerobot/unitree-g1-mujoco`
   repository. Its simulator bridge and no-hand G1 asset match NVIDIA's current
