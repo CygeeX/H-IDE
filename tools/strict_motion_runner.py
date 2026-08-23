@@ -60,11 +60,12 @@ NAV2_HEALTH_TOPIC = "/h_ide/nav2/runtime_health"
 FIRST_PERSON_STATUS_SCHEMA = "h-ide.first-person-viewer-health/1"
 NAV2_HEALTH_SCHEMA = "h-ide.nav2-runtime-health/v1"
 BRIDGE_HEALTH_SCHEMA = "h-ide.ros-bridge-health/v1"
-TRACE_SCHEMA_VERSION = "h-ide.strict-motion-trace/1"
+TRACE_SCHEMA_VERSION = "h-ide.strict-motion-trace/2"
 PINNED_NAV2_MSGS_VERSION = "1.3.12"
 MAX_JSON_BYTES = 32 * 1024 * 1024
 SAMPLE_DEADLINE_S = 0.30
-TERMINAL_SETTLE_S = 1.0
+TERMINAL_SETTLE_S = 3.0
+SEGMENT_BALANCED_IDLE_S = 1.5
 _ZERO_EPS = 1e-6
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 STRICT_EVALUATOR_PATH = REPOSITORY_ROOT / "tools" / "strict_motion_acceptance.py"
@@ -183,7 +184,8 @@ class StrictCommandRelay:
     Nav2 input topic and are checked without modification.  True lateral
     motion is the sole direct primitive and is closed-loop on measured odom.
     Any stale, mixed-axis, sub-floor, wrong-sign, or out-of-envelope command is
-    terminal for the current case; the caller must publish zero and normal-stop.
+    terminal for the current case; the caller must publish zero and enter a
+    measured balanced-policy IDLE boundary.
     """
 
     _DRIVE_MODES = frozenset(
@@ -1268,6 +1270,56 @@ def _sonic_runtime_healthy(sonic: Mapping[str, Any]) -> bool:
     )
 
 
+def _sonic_policy_idle_evidence(
+    sonic: Mapping[str, Any],
+) -> dict[str, object]:
+    """Copy the exact dynamic-IDLE facts needed by offline acceptance."""
+
+    command_zero = all(
+        abs(_finite(sonic.get(name), f"SONIC {name}")) <= _ZERO_EPS
+        for name in ("last_cmd_vx", "last_cmd_vy", "last_cmd_wz")
+    )
+    return {
+        "active": sonic.get("balanced_policy_idle_active") is True,
+        "mode": sonic.get("sonic_mode"),
+        "referenceAuthorityState": sonic.get(
+            "sonic_reference_authority_state"
+        ),
+        "actuatorAuthority": sonic.get(
+            "sonic_reference_actuator_authority"
+        ),
+        "staticHoldActive": sonic.get("static_hold_active"),
+        "plantSupportMode": sonic.get("plant_support_mode"),
+        "plantSupportStopPending": sonic.get(
+            "plant_support_stop_pending"
+        ),
+        "plantSupportSafetyLatched": sonic.get(
+            "plant_support_safety_latched"
+        ),
+        "navigationTaskActive": sonic.get("navigation_task_active"),
+        "commandZero": command_zero,
+    }
+
+
+def _sample_balanced_policy_idle(sample: Mapping[str, Any]) -> bool:
+    evidence = _mapping(
+        sample.get("sonicPolicyIdle"),
+        "sonicPolicyIdle",
+    )
+    return bool(
+        evidence.get("active") is True
+        and evidence.get("mode") == "IDLE"
+        and evidence.get("referenceAuthorityState") == "GRANTED"
+        and evidence.get("actuatorAuthority") is True
+        and evidence.get("staticHoldActive") is False
+        and evidence.get("plantSupportMode") == "idle"
+        and evidence.get("plantSupportStopPending") is False
+        and evidence.get("plantSupportSafetyLatched") is False
+        and evidence.get("navigationTaskActive") is False
+        and evidence.get("commandZero") is True
+    )
+
+
 def _rpy(pose: Mapping[str, Any]) -> tuple[float, float, float]:
     qw, qx, qy, qz = (
         _finite(pose.get(name), f"Plant pose.{name}")
@@ -1690,6 +1742,7 @@ class RuntimeSnapshotCollector:
                 ),
             },
             "motionIntentActive": sonic.get("navigation_task_active") is True,
+            "sonicPolicyIdle": _sonic_policy_idle_evidence(sonic),
             "command": self.ros.last_published_command().to_json(),
             "plantSupport": {
                 "fallArrestEnabled": support.get("fallArrestEnabled"),
@@ -1913,7 +1966,8 @@ def _sample_settled(sample: Mapping[str, Any]) -> bool:
     root = _mapping(sample.get("root"), "terminal root")
     actions = _mapping(sample.get("nav2Actions"), "terminal Nav2 actions")
     return (
-        sample.get("motionIntentActive") is False
+        _sample_balanced_policy_idle(sample)
+        and sample.get("motionIntentActive") is False
         and max(
             abs(_finite(command.get(name), f"terminal command.{name}"))
             for name in ("vx", "vy", "wz")
@@ -2113,7 +2167,7 @@ class StrictMotionCaseExecutor:
         support_epoch: int,
     ) -> None:
         first_terminal_t: float | None = None
-        deadline = self.clock() + 4.0
+        deadline = self.clock() + TERMINAL_SETTLE_S + 5.0
         while self.clock() < deadline:
             sample = self.collector.wait_next()
             if not _support_off(sample, support_epoch):
@@ -2135,34 +2189,9 @@ class StrictMotionCaseExecutor:
             ):
                 return
         raise StrictMotionRunnerError(
-            "terminal physical settle did not produce 1.0s of advancing evidence"
+            "terminal physical settle did not produce "
+            f"{TERMINAL_SETTLE_S:.1f}s of advancing balanced-IDLE evidence"
         )
-
-    def _normal_stop_while_collecting(
-        self,
-        samples: list[dict[str, Any]],
-        *,
-        support_epoch: int,
-        detour_segment_index: int | None = None,
-    ) -> None:
-        future = self.backend.begin_normal_stop()
-        deadline = self.clock() + 8.0
-        while not self.backend.normal_stop_done(future):
-            if self.clock() >= deadline:
-                raise StrictMotionRunnerError("normal stop timed out")
-            sample = self.collector.wait_next()
-            if not _support_off(sample, support_epoch):
-                raise StrictMotionRunnerError(
-                    "fall-arrest support reappeared during normal stop"
-                )
-            if detour_segment_index is not None:
-                sample["detourSegmentIndex"] = (
-                    detour_segment_index
-                    if sample.get("motionIntentActive") is True
-                    else None
-                )
-            samples.append(sample)
-        self.backend.finish_normal_stop(future)
 
     def _collect_one_idle_sample(
         self,
@@ -2171,7 +2200,8 @@ class StrictMotionCaseExecutor:
         support_epoch: int,
         detour: bool,
     ) -> dict[str, Any]:
-        deadline = self.clock() + 2.0
+        first_balanced_t: float | None = None
+        deadline = self.clock() + SEGMENT_BALANCED_IDLE_S + 4.0
         while self.clock() < deadline:
             sample = self.collector.wait_next()
             if not _support_off(sample, support_epoch):
@@ -2182,8 +2212,16 @@ class StrictMotionCaseExecutor:
                 sample["detourSegmentIndex"] = None
             samples.append(sample)
             if _sample_settled(sample):
-                return sample
-        raise StrictMotionRunnerError("normal stop lacked an observed idle sample")
+                t_s = _finite(sample.get("tS"), "balanced idle tS")
+                if first_balanced_t is None:
+                    first_balanced_t = t_s
+                if t_s - first_balanced_t >= SEGMENT_BALANCED_IDLE_S - 1e-6:
+                    return sample
+            else:
+                first_balanced_t = None
+        raise StrictMotionRunnerError(
+            "action stop lacked a continuous balanced-policy IDLE boundary"
+        )
 
     @staticmethod
     def _action_type(mode: str) -> str:
@@ -2215,15 +2253,15 @@ class StrictMotionCaseExecutor:
             self._diagnostic_preflight = preflight
             self._diagnostic_isolation = isolation
             plant_boot, plant_session = self._identities(preflight)
-            # A cold motion-core launch is deliberately stationary at IDLE,
-            # but control acquisition is authorized only from the exact,
-            # correlated DRIVER_CONFIRMED normal-stop boundary.  Establish
-            # that boundary here instead of relying on a previous case (or a
-            # failed case's cleanup) to have left one behind.
-            self.backend.normal_stop()
-            normal_stopped = True
-            self.backend.control_arm()
-            normal_stopped = False
+            # A cold launch starts at the explicit static safety boundary and
+            # must be armed once.  A preceding successful capability case,
+            # however, remains on SONIC's measured stationary IDLE policy;
+            # freezing it merely to re-arm would remove humanoid balance.
+            if not _sample_balanced_policy_idle(preflight):
+                self.backend.normal_stop()
+                normal_stopped = True
+                self.backend.control_arm()
+                normal_stopped = False
             binding = self.evidence.begin(
                 case_id=case_id,
                 plant_boot_id=plant_boot,
@@ -2243,13 +2281,7 @@ class StrictMotionCaseExecutor:
                 support_epoch=support_epoch,
             )
             self.backend.stop_relay()
-            self._diagnostic_phase = "normal_stop"
-            self._normal_stop_while_collecting(
-                samples,
-                support_epoch=support_epoch,
-            )
-            normal_stopped = True
-            self._diagnostic_phase = "terminal_settle"
+            self._diagnostic_phase = "balanced_idle_settle"
             self._collect_terminal_settle(
                 samples,
                 support_epoch=support_epoch,
@@ -2276,7 +2308,7 @@ class StrictMotionCaseExecutor:
                     "initiator": STRICT_NODE_NAME,
                     "type": self._action_type(mode),
                     "status": "succeeded",
-                    "normalStopConfirmed": True,
+                    "balancedPolicyIdleConfirmed": True,
                     "policyActivationEpoch": policy_epoch,
                     "supportReleaseConfirmedEpoch": confirmed_epoch,
                     "activationProvenance": (
@@ -2414,14 +2446,14 @@ class StrictMotionCaseExecutor:
                 **self._static_plan_kwargs(),
             )
 
-            # As with standalone cases, the first primitive must acquire
-            # control from a freshly correlated safe-hold transaction.  Later
-            # primitives already receive this boundary from the preceding
-            # per-segment normal stop.
-            self.backend.normal_stop()
-            normal_stopped = True
-            self.backend.control_arm()
-            normal_stopped = False
+            # Acquire from a cold/static boundary once.  If the previous case
+            # already left a proven balanced-policy IDLE, retain that dynamic
+            # authority and avoid a destabilizing freeze/re-arm cycle.
+            if not _sample_balanced_policy_idle(preflight):
+                self.backend.normal_stop()
+                normal_stopped = True
+                self.backend.control_arm()
+                normal_stopped = False
             binding = self.evidence.begin(
                 case_id=case_id,
                 plant_boot_id=plant_boot,
@@ -2443,9 +2475,6 @@ class StrictMotionCaseExecutor:
 
             for primitive_index, _primitive in enumerate(primitives):
                 self._diagnostic_phase = f"detour_segment_{primitive_index}"
-                if primitive_index > 0:
-                    self.backend.control_arm()
-                    normal_stopped = False
                 fresh_runtime = self.collector.wait_next()
                 fresh_map = self.backend.latest_map_pose()
                 fresh_age = fresh_map.age_s(self.clock())
@@ -2530,12 +2559,6 @@ class StrictMotionCaseExecutor:
                     samples=samples,
                 )
                 self.backend.stop_relay()
-                self._normal_stop_while_collecting(
-                    samples,
-                    support_epoch=support_epoch,
-                    detour_segment_index=len(segment_drafts),
-                )
-                normal_stopped = True
                 idle = self._collect_one_idle_sample(
                     samples,
                     support_epoch=support_epoch,
@@ -2557,7 +2580,7 @@ class StrictMotionCaseExecutor:
                         },
                         "lineOfSightRevalidated": primitive_type == "DriveOnHeading",
                         "status": "succeeded",
-                        "normalStopConfirmed": True,
+                        "balancedPolicyIdleConfirmed": True,
                         "startedAtTS": _finite(
                             fresh_runtime.get("tS"),
                             "fresh detour timestamp",
@@ -2620,7 +2643,7 @@ class StrictMotionCaseExecutor:
                 {
                     key: value
                     for key, value in segment.items()
-                    if key not in {"status", "normalStopConfirmed"}
+                    if key not in {"status", "balancedPolicyIdleConfirmed"}
                 }
                 for segment in segments
             ]
@@ -2642,7 +2665,7 @@ class StrictMotionCaseExecutor:
                     "initiator": STRICT_NODE_NAME,
                     "type": "StaticDetourPrimitives",
                     "status": "succeeded",
-                    "normalStopConfirmed": True,
+                    "balancedPolicyIdleConfirmed": True,
                     "policyActivationEpoch": policy_epoch,
                     "supportReleaseConfirmedEpoch": confirmed_epoch,
                     "activationProvenance": (

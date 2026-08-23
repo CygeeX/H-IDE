@@ -686,13 +686,8 @@ class SonicHealth:
             raise ValueError(
                 "SONIC health response active task must carry a non-zero Nav2 command"
             )
-        controlled_policy_stop_shape = bool(
-            controlled_policy_stop_active
-            and not support_latched
-            and not support_pending
-            and not motion_authorized
-            and not navigation_task_active
-            and nav2_command_zero
+        controlled_policy_braking_shape = bool(
+            not motion_authorized
             and (
                 (
                     actuator_authority
@@ -704,6 +699,23 @@ class SonicHealth:
                     and authority_state
                     in {"REVOKED", "REQUIRED", "MATCHED_INSTALLED", "PRIMED"}
                 )
+            )
+        )
+        balanced_policy_idle_shape = bool(
+            motion_authorized
+            and support_mode == "idle"
+            and actuator_authority
+            and not value["static_hold_active"]
+        )
+        controlled_policy_stop_shape = bool(
+            controlled_policy_stop_active
+            and not support_latched
+            and not support_pending
+            and not navigation_task_active
+            and nav2_command_zero
+            and (
+                controlled_policy_braking_shape
+                or balanced_policy_idle_shape
             )
         )
         if controlled_policy_stop_active and not controlled_policy_stop_shape:

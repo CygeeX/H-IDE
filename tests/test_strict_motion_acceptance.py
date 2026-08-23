@@ -289,6 +289,18 @@ def _sample(mode: str, t_s: float, progress: float, active: bool, sequence: int)
             "angularSpeedRps": angular_speed,
         },
         "motionIntentActive": active,
+        "sonicPolicyIdle": {
+            "active": not active,
+            "mode": "SLOW_WALK" if active else "IDLE",
+            "referenceAuthorityState": "GRANTED",
+            "actuatorAuthority": True,
+            "staticHoldActive": False,
+            "plantSupportMode": "locomotion" if active else "idle",
+            "plantSupportStopPending": False,
+            "plantSupportSafetyLatched": False,
+            "navigationTaskActive": active,
+            "commandZero": not active,
+        },
         "command": _command(mode, active),
         "plantSupport": {
             "fallArrestEnabled": False,
@@ -445,7 +457,7 @@ def _rebuild_detour_trace(
                 },
                 "lineOfSightRevalidated": segment_type == "DriveOnHeading",
                 "status": "succeeded",
-                "normalStopConfirmed": True,
+                "balancedPolicyIdleConfirmed": True,
                 "startedAtControlTick": started_tick,
                 "completedAtControlTick": completed_tick,
                 "startPose": start_pose,
@@ -676,7 +688,7 @@ def _trace(mode: str) -> dict[str, Any]:
     ]
     goal = _goal(mode)
     result: dict[str, Any] = {
-        "schemaVersion": "h-ide.strict-motion-trace/1",
+        "schemaVersion": "h-ide.strict-motion-trace/2",
         "tier": "motion_core",
         "caseId": f"fixture-{mode}",
         "mode": mode,
@@ -684,7 +696,7 @@ def _trace(mode: str) -> dict[str, Any]:
             "initiator": "strict_motion_runner",
             "type": strict._EXPECTED_ACTION_TYPE[mode],
             "status": "succeeded",
-            "normalStopConfirmed": True,
+            "balancedPolicyIdleConfirmed": True,
             "policyActivationEpoch": 17,
             "supportReleaseConfirmedEpoch": 17,
             "activationProvenance": "initial_support_release",
@@ -996,9 +1008,12 @@ def test_detour_rejects_forbidden_nav_actions_and_failed_segment_results() -> No
 
     failed = _trace("detour")
     failed["action"]["segments"][1]["status"] = "failed"
-    failed["action"]["segments"][1]["normalStopConfirmed"] = False
+    failed["action"]["segments"][1]["balancedPolicyIdleConfirmed"] = False
     assert _failure_codes(failed).issuperset(
-        {"DETOUR_SEGMENT_NOT_SUCCEEDED", "DETOUR_SEGMENT_NORMAL_STOP_MISSING"}
+        {
+            "DETOUR_SEGMENT_NOT_SUCCEEDED",
+            "DETOUR_SEGMENT_BALANCED_IDLE_MISSING",
+        }
     )
 
 
@@ -1155,6 +1170,32 @@ def test_terminal_settle_requires_full_one_second_dense_zero_speed_tail() -> Non
     ]["records"][-1]["controlTick"]
 
     assert "TERMINAL_SETTLE_TOO_SHORT" in _failure_codes(trace)
+
+
+def test_terminal_settle_rejects_static_pose_hold_without_idle_policy() -> None:
+    trace = _trace("forward")
+    for sample in trace["samples"]:
+        if sample["motionIntentActive"] is False:
+            sample["sonicPolicyIdle"].update(
+                active=False,
+                referenceAuthorityState="REVOKED",
+                actuatorAuthority=False,
+                staticHoldActive=True,
+            )
+
+    assert "TERMINAL_SETTLE_TOO_SHORT" in _failure_codes(trace)
+
+
+def test_balanced_idle_claim_requires_exact_executable_support_shape() -> None:
+    trace = _trace("forward")
+    terminal = next(
+        sample
+        for sample in reversed(trace["samples"])
+        if sample["motionIntentActive"] is False
+    )
+    terminal["sonicPolicyIdle"]["plantSupportMode"] = "safety_stop"
+
+    assert "BALANCED_POLICY_IDLE_AUTHORITY_INVALID" in _failure_codes(trace)
 
 
 def test_formal_contract_cannot_be_weakened_by_input_fields() -> None:

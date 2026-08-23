@@ -502,6 +502,7 @@ class SonicDriver:
         )
         self._navigation_task_active = False
         self._controlled_stop_active = False
+        self._balanced_policy_idle_active = False
         self._controlled_stop_source_identity: tuple[int, int] | None = None
         self._controlled_stop_reference_installed = False
         self._input_buffer = b""
@@ -1513,6 +1514,7 @@ class SonicDriver:
         frozen = False
         with self._support_lock:
             self._controlled_stop_active = False
+            self._balanced_policy_idle_active = False
             self._controlled_stop_source_identity = None
             self._controlled_stop_reference_installed = False
             self._normal_stop_policy_braking = False
@@ -1543,6 +1545,7 @@ class SonicDriver:
             # can claim PREPARING after the activation epoch was invalidated.
             try:
                 self.telemetry.update(
+                    balanced_policy_idle_active=False,
                     **self._policy_activation_telemetry_fields_locked()
                 )
             except Exception as exc:
@@ -1571,10 +1574,10 @@ class SonicDriver:
         must not, however, blend a moving gait clip directly into IDLE.  That
         path completed a live one-metre walk and then destabilized the model
         during braking.  Freeze the exact last successful DDS target, withdraw
-        the moving reference, and let the correlated normal-stop transaction
-        request a fresh measured IDLE reference.  A generic STOPPING envelope
-        establishes the hold immediately but deliberately defers planner I/O
-        until the strict begin request supplies its durable source identity.
+        the moving reference, and request a fresh measured IDLE reference from
+        the first admitted STOPPING envelope.  The regular gait channel owns
+        that exact source identity; a later explicit normal-stop transaction
+        may join it, but action completion does not depend on a second RPC.
 
         Fault, process-stop, support-latch, startup, and pre-grant paths still
         fall back to the stronger static boundary.  The caller owns
@@ -1618,9 +1621,16 @@ class SonicDriver:
             )
             self._static_hold_active = True
             self._controlled_stop_active = True
+            self._balanced_policy_idle_active = False
             self._controlled_stop_source_identity = identity
             self._controlled_stop_reference_installed = False
-        if correlated:
+            self._reference_authority.require(
+                generation=identity[0],
+                source_sequence=identity[1],
+            )
+            self._reference_source_identity = identity
+            self._reference_request_pending = True
+        elif correlated:
             authority = self._reference_authority.snapshot
             if authority.phase in {"MATCHED_INSTALLED", "PRIMED", "GRANTED"}:
                 self._controlled_stop_reference_installed = True
@@ -1636,6 +1646,73 @@ class SonicDriver:
                 self._reference_authority.snapshot.phase == "REQUIRED"
             )
         self._navigation_task_active = False
+        return True
+
+    def _complete_balanced_policy_idle_locked(
+        self,
+        decision: IngressDecision,
+    ) -> bool:
+        """Commit a measured stationary IDLE without revoking balance.
+
+        GaitAdapter's acknowledged ``IDLE`` proves that the base stopped.  It
+        does not prove that an untethered humanoid can remain upright after
+        dynamic control is removed.  Keep the freshly rebased IDLE reference
+        on DDS and retain Plant ``idle`` support; only the explicit correlated
+        normal-stop/fault/shutdown paths may freeze and revoke it.
+
+        The caller owns ``_support_lock`` and has already admitted the terminal
+        gait envelope through :class:`SonicIntentIngress`.
+        """
+
+        identity = getattr(self, "_controlled_stop_source_identity", None)
+        authority = self._reference_authority.snapshot
+        controller = getattr(self, "_controller", None)
+        activation = getattr(self, "_policy_activation", None)
+        already_balanced = bool(
+            getattr(self, "_balanced_policy_idle_active", False)
+        )
+        valid = bool(
+            decision.action == "stop"
+            and decision.state == "IDLE"
+            and decision.generation is not None
+            and decision.sequence is not None
+            and identity is not None
+            and decision.generation == identity[0]
+            and decision.sequence > identity[1]
+            and getattr(self, "_controlled_stop_active", False)
+            and getattr(self, "_controlled_stop_reference_installed", False)
+            and (decision.arm_acknowledged or already_balanced)
+            and self._intent_ingress.armed
+            and not self._intent_ingress.braking
+            and not self._navigation_task_active
+            and self.guard.target_zero
+            and self.guard.command_zero
+            and authority.phase == "GRANTED"
+            and authority.actuator_authority
+            and authority.generation == identity[0]
+            and authority.source_sequence == identity[1]
+            and self._reference_source_identity == identity
+            and self._reference_request_pending is False
+            and controller is not None
+            and int(getattr(controller.ms, "mode", -1)) == 0
+            and not bool(getattr(controller.ms, "has_movement", True))
+            and activation is not None
+            and bool(getattr(activation, "prepared", False))
+            and self._safe_hold_targets is None
+            and self._static_hold_active is False
+            and self._plant_support_mode == "idle"
+            and not self._plant_support_stop_pending
+            and not self._plant_support_safety_latched
+            and not self._normal_stop_fences_motion_locked()
+            and not self._process_stop_fences_motion_locked()
+            and not self._fault_latched.is_set()
+        )
+        if not valid:
+            return False
+        if decision.heading_yaw is not None:
+            self.guard.observe_heading(decision.heading_yaw)
+        self._balanced_policy_idle_active = True
+        self._normal_stop_policy_braking = False
         return True
 
     def _controlled_policy_stop_eligible_locked(self, generation: int) -> bool:
@@ -4962,6 +5039,23 @@ class SonicDriver:
                                     correlated=True,
                                 )
                             )
+                            if policy_candidate and not policy_braking:
+                                # A regular STOPPING envelope may already own
+                                # a newer installed/GRANTED IDLE identity.  An
+                                # explicit correlated normal-stop is the
+                                # stronger operator boundary: if it cannot
+                                # join that exact identity, freeze/revoke now
+                                # instead of leaving an untracked policy active.
+                                try:
+                                    self._stop_navigation_at_boundary(
+                                        source="normal_stop_begin",
+                                        publish_telemetry=False,
+                                    )
+                                except Exception as exc:
+                                    raise _NormalStopBoundaryError(
+                                        str(exc)
+                                    ) from exc
+                                self._static_hold_active = True
                             admitted_action = (
                                 decision.action == "brake"
                                 if policy_braking
@@ -5850,12 +5944,26 @@ class SonicDriver:
                 # requiring that second transaction here creates an impossible
                 # GRANTED + zero-command health snapshot during the legitimate
                 # policy-braking interval.
+                balanced_policy_idle_active = bool(
+                    getattr(self, "_balanced_policy_idle_active", False)
+                    and self._intent_ingress.armed
+                    and not self._intent_ingress.braking
+                    and authority.phase == "GRANTED"
+                    and authority.actuator_authority
+                    and not static_hold_active
+                    and plant_support_mode == "idle"
+                )
                 controlled_policy_stop_active = bool(
                     getattr(self, "_controlled_stop_active", False)
-                    and self._intent_ingress.braking
-                    and not self._intent_ingress.armed
                     and not navigation_task_active
                     and nav2_command_zero
+                    and (
+                        (
+                            self._intent_ingress.braking
+                            and not self._intent_ingress.armed
+                        )
+                        or balanced_policy_idle_active
+                    )
                 )
             terminal_fault = self._fault_latched.is_set()
             motion_ready = (
@@ -6039,6 +6147,7 @@ class SonicDriver:
         )
         stop_boundary_applied = False
         controlled_brake_applied = False
+        balanced_idle_applied = False
         stop_boundary_error: Exception | None = None
         try:
             if control_arm:
@@ -6088,18 +6197,37 @@ class SonicDriver:
                                 stop_boundary_error = exc
                             stop_boundary_applied = True
                     elif decision.action == "stop":
-                        try:
-                            self._stop_navigation_at_boundary(
-                                source=(
-                                    "motion_fault"
-                                    if decision.state == "FAULT"
-                                    else "gait_adapter"
-                                ),
-                                publish_telemetry=False,
+                        controlled_idle_completion = bool(
+                            decision.state == "IDLE"
+                            and getattr(self, "_controlled_stop_active", False)
+                        )
+                        if controlled_idle_completion:
+                            balanced_idle_applied = (
+                                self._complete_balanced_policy_idle_locked(
+                                    decision
+                                )
                             )
-                        except Exception as exc:
-                            stop_boundary_error = exc
-                        stop_boundary_applied = True
+                        if not balanced_idle_applied:
+                            try:
+                                self._stop_navigation_at_boundary(
+                                    source=(
+                                        "motion_fault"
+                                        if decision.state == "FAULT"
+                                        else "gait_adapter"
+                                    ),
+                                    publish_telemetry=False,
+                                )
+                            except Exception as exc:
+                                stop_boundary_error = exc
+                            if (
+                                stop_boundary_error is None
+                                and controlled_idle_completion
+                            ):
+                                stop_boundary_error = RuntimeError(
+                                    "acknowledged IDLE lacked an executable "
+                                    "balanced-policy boundary"
+                                )
+                            stop_boundary_applied = True
         except (KeyError, TypeError, ValueError) as exc:
             self._stop_navigation_at_boundary(source="invalid_gait_intent")
             self._ensure_plant_support_stopped(
@@ -6133,6 +6261,7 @@ class SonicDriver:
                 last_cmd_vy=0.0,
                 last_cmd_wz=0.0,
                 static_hold_active=self._static_hold_active,
+                balanced_policy_idle_active=False,
                 last_error=decision.reason,
                 **self._planner_telemetry_fields(),
             )
@@ -6141,6 +6270,20 @@ class SonicDriver:
             # Ingress acceptance and the in-memory actuator/reference stop are
             # one support-lock transaction. Plant/telemetry I/O follows only
             # after control can no longer consume the accepted stale intent.
+            if balanced_idle_applied:
+                self.telemetry.update(
+                    nav2_state="idle",
+                    sonic_mode="IDLE",
+                    navigation_task_active=False,
+                    last_cmd_vx=0.0,
+                    last_cmd_vy=0.0,
+                    last_cmd_wz=0.0,
+                    static_hold_active=False,
+                    balanced_policy_idle_active=True,
+                    last_error=None,
+                    **self._planner_telemetry_fields(),
+                )
+                return None
             assert stop_boundary_applied
             if decision.state == "FAULT" or stop_boundary_error is not None:
                 terminal_reason = decision.reason or "gait adapter entered FAULT"
@@ -6175,6 +6318,7 @@ class SonicDriver:
                 last_cmd_vx=0.0,
                 last_cmd_vy=0.0,
                 last_cmd_wz=0.0,
+                balanced_policy_idle_active=False,
                 last_error=decision.reason,
                 **self._planner_telemetry_fields(),
             )
@@ -6276,6 +6420,24 @@ class SonicDriver:
             if not self._navigation_task_active:
                 if decision.generation is None or decision.sequence is None:
                     raise RuntimeError("motion intent lacks generation/sequence identity")
+                if getattr(self, "_balanced_policy_idle_active", False):
+                    authority = self._reference_authority.snapshot
+                    idle_identity = self._controlled_stop_source_identity
+                    if (
+                        idle_identity is None
+                        or decision.generation != idle_identity[0]
+                        or authority.phase != "GRANTED"
+                        or authority.generation != idle_identity[0]
+                        or authority.source_sequence != idle_identity[1]
+                        or not self._controlled_stop_reference_installed
+                    ):
+                        raise RuntimeError(
+                            "balanced IDLE authority changed before motion admission"
+                        )
+                    self._balanced_policy_idle_active = False
+                    self._controlled_stop_active = False
+                    self._controlled_stop_source_identity = None
+                    self._controlled_stop_reference_installed = False
                 self._reference_source_identity = (
                     decision.generation,
                     decision.sequence,
@@ -6297,7 +6459,10 @@ class SonicDriver:
             self.guard.accept(decision.vx, decision.vy, decision.wz, source="nav2")
         if new_navigation_task:
             self.telemetry.reset_navigation_task_peaks()
-            self.telemetry.update(navigation_task_active=True)
+            self.telemetry.update(
+                navigation_task_active=True,
+                balanced_policy_idle_active=False,
+            )
         self.telemetry.update(
             nav2_state="commanding",
             last_cmd_vx=decision.vx,

@@ -369,6 +369,17 @@ def sonic_state() -> dict:
         "driver_session_id": "31000000-0000-4000-8000-000000000003",
         "control_tick_ms": 12_500,
         "navigation_task_active": True,
+        "balanced_policy_idle_active": False,
+        "sonic_mode": "SLOW_WALK",
+        "sonic_reference_authority_state": "GRANTED",
+        "sonic_reference_actuator_authority": True,
+        "static_hold_active": False,
+        "plant_support_mode": "locomotion",
+        "plant_support_stop_pending": False,
+        "plant_support_safety_latched": False,
+        "last_cmd_vx": 0.3,
+        "last_cmd_vy": 0.0,
+        "last_cmd_wz": 0.0,
     }
 
 
@@ -696,6 +707,18 @@ def _executor_sample(t_s: float) -> dict:
     return {
         "tS": t_s,
         "motionIntentActive": False,
+        "sonicPolicyIdle": {
+            "active": True,
+            "mode": "IDLE",
+            "referenceAuthorityState": "GRANTED",
+            "actuatorAuthority": True,
+            "staticHoldActive": False,
+            "plantSupportMode": "idle",
+            "plantSupportStopPending": False,
+            "plantSupportSafetyLatched": False,
+            "navigationTaskActive": False,
+            "commandZero": True,
+        },
         "command": {"vx": 0.0, "vy": 0.0, "wz": 0.0},
         "root": {"linearSpeedMps": 0.0, "angularSpeedRps": 0.0},
         "nav2Actions": {
@@ -773,6 +796,18 @@ class FakeExecutorCollector:
 
     def collect_once(self) -> dict:
         return {
+            "sonicPolicyIdle": {
+                "active": False,
+                "mode": "IDLE",
+                "referenceAuthorityState": "REVOKED",
+                "actuatorAuthority": False,
+                "staticHoldActive": True,
+                "plantSupportMode": "safety_stop",
+                "plantSupportStopPending": False,
+                "plantSupportSafetyLatched": True,
+                "navigationTaskActive": False,
+                "commandZero": True,
+            },
             "runtimeHealth": {
                 "plant": {
                     "bootId": "11000000-0000-4000-8000-000000000001",
@@ -909,7 +944,7 @@ class FakeDetourEvidence(FakeExecutorEvidence):
                 "controlTick": 1000 + index,
                 "tS": round(index * 0.1, 10),
             }
-            for index in range(30)
+            for index in range(200)
         ]
         return {
             "policyActivationEpoch": 17,
@@ -922,7 +957,7 @@ def test_standalone_executor_orders_authority_evidence_action_and_stop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     backend = FakeExecutorBackend()
-    samples = [_executor_sample(value / 10.0) for value in range(13)]
+    samples = [_executor_sample(value / 10.0) for value in range(60)]
     collector = FakeExecutorCollector(samples)
     evidence = FakeExecutorEvidence()
     monkeypatch.setattr(
@@ -952,8 +987,6 @@ def test_standalone_executor_orders_authority_evidence_action_and_stop(
         "send_drive",
         "finish",
         "zero",
-        "normal_stop_begin",
-        "normal_stop_finish",
     ]
     assert evidence.calls == ["begin", "finalize"]
 
@@ -997,14 +1030,14 @@ def test_detour_executor_uses_only_fresh_resolved_official_primitives(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     backend = FakeDetourBackend()
-    samples = [_executor_sample(index / 10.0) for index in range(17)]
+    samples = [_executor_sample(index / 10.0) for index in range(90)]
     # Each primitive has one active sample; the remaining samples are stops.
     samples[1]["motionIntentActive"] = True
     samples[1]["nav2Actions"]["spinActive"] = True
     samples[1]["command"]["wz"] = -0.2
-    samples[4]["motionIntentActive"] = True
-    samples[4]["nav2Actions"]["driveOnHeadingActive"] = True
-    samples[4]["command"]["vx"] = 0.3
+    samples[19]["motionIntentActive"] = True
+    samples[19]["nav2Actions"]["driveOnHeadingActive"] = True
+    samples[19]["command"]["vx"] = 0.3
     collector = FakeExecutorCollector(samples)
     evidence = FakeDetourEvidence()
     planner = FakeStaticPlanner()

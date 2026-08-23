@@ -42,7 +42,7 @@ import sys
 from typing import Any
 
 
-SCHEMA_VERSION = "h-ide.strict-motion-trace/1"
+SCHEMA_VERSION = "h-ide.strict-motion-trace/2"
 RESULT_SCHEMA_VERSION = "h-ide.strict-motion-acceptance/1"
 PLANT_DYNAMICS_SCHEMA_VERSION = "h-ide.mujoco-dynamics-evidence/1"
 CONTACT_SCHEMA_VERSION = "h-ide.mujoco-contact-evidence/1"
@@ -1292,6 +1292,58 @@ class StrictMotionEvaluator:
                 _finite(command.get(name), f"samples[{index}].command.{name}")
                 for name in ("vx", "vy", "wz")
             )
+            policy_idle = _mapping(
+                sample.get("sonicPolicyIdle"),
+                f"samples[{index}].sonicPolicyIdle",
+            )
+            expected_policy_idle_fields = {
+                "active",
+                "mode",
+                "referenceAuthorityState",
+                "actuatorAuthority",
+                "staticHoldActive",
+                "plantSupportMode",
+                "plantSupportStopPending",
+                "plantSupportSafetyLatched",
+                "navigationTaskActive",
+                "commandZero",
+            }
+            if set(policy_idle) != expected_policy_idle_fields:
+                raise TraceContractError(
+                    f"samples[{index}].sonicPolicyIdle must contain exactly "
+                    "the dynamic balance authority fields"
+                )
+            for field in (
+                "active",
+                "actuatorAuthority",
+                "staticHoldActive",
+                "plantSupportStopPending",
+                "plantSupportSafetyLatched",
+                "navigationTaskActive",
+                "commandZero",
+            ):
+                if not isinstance(policy_idle.get(field), bool):
+                    raise TraceContractError(
+                        f"samples[{index}].sonicPolicyIdle.{field} must be boolean"
+                    )
+            balanced_policy_idle = bool(
+                policy_idle.get("active") is True
+                and policy_idle.get("mode") == "IDLE"
+                and policy_idle.get("referenceAuthorityState") == "GRANTED"
+                and policy_idle.get("actuatorAuthority") is True
+                and policy_idle.get("staticHoldActive") is False
+                and policy_idle.get("plantSupportMode") == "idle"
+                and policy_idle.get("plantSupportStopPending") is False
+                and policy_idle.get("plantSupportSafetyLatched") is False
+                and policy_idle.get("navigationTaskActive") is False
+                and policy_idle.get("commandZero") is True
+            )
+            if bool(policy_idle["active"]) != balanced_policy_idle:
+                self._fail(
+                    "BALANCED_POLICY_IDLE_AUTHORITY_INVALID",
+                    "SONIC balanced IDLE claim lacks executable policy/support authority",
+                    t_s,
+                )
             if not isinstance(sample.get("motionIntentActive"), bool):
                 raise TraceContractError(f"samples[{index}].motionIntentActive must be boolean")
             intent = bool(sample["motionIntentActive"])
@@ -1334,6 +1386,7 @@ class StrictMotionEvaluator:
                     "vy": vy,
                     "wz": wz,
                     "intent": intent,
+                    "balancedPolicyIdle": balanced_policy_idle,
                     "actions": action_values,
                     "sonicControlTick": sonic_control_tick,
                     "detourSegmentIndex": detour_segment_index,
@@ -1887,8 +1940,11 @@ class StrictMotionEvaluator:
             self._fail("ACTION_TYPE_MISMATCH", f"{self.mode} requires {expected_type}")
         if action.get("status") != "succeeded":
             self._fail("ACTION_NOT_SUCCEEDED", "action status is not succeeded")
-        if action.get("normalStopConfirmed") is not True:
-            self._fail("NORMAL_STOP_NOT_CONFIRMED", "terminal zero-speed normal-stop was not confirmed")
+        if action.get("balancedPolicyIdleConfirmed") is not True:
+            self._fail(
+                "BALANCED_POLICY_IDLE_NOT_CONFIRMED",
+                "terminal zero-speed balanced-policy IDLE was not confirmed",
+            )
         policy_activation_epoch = _nonnegative_int(
             action.get("policyActivationEpoch"), "action.policyActivationEpoch"
         )
@@ -1971,7 +2027,7 @@ class StrictMotionEvaluator:
             "freshOdometry",
             "lineOfSightRevalidated",
             "status",
-            "normalStopConfirmed",
+            "balancedPolicyIdleConfirmed",
             "startedAtControlTick",
             "completedAtControlTick",
         }
@@ -2006,10 +2062,10 @@ class StrictMotionEvaluator:
                     "DETOUR_SEGMENT_NOT_SUCCEEDED",
                     f"detour segment {index} did not succeed",
                 )
-            if segment.get("normalStopConfirmed") is not True:
+            if segment.get("balancedPolicyIdleConfirmed") is not True:
                 self._fail(
-                    "DETOUR_SEGMENT_NORMAL_STOP_MISSING",
-                    f"detour segment {index} lacks a confirmed normal stop",
+                    "DETOUR_SEGMENT_BALANCED_IDLE_MISSING",
+                    f"detour segment {index} lacks confirmed balanced-policy IDLE",
                 )
             started_tick = _nonnegative_int(
                 segment.get("startedAtControlTick"),
@@ -2246,7 +2302,7 @@ class StrictMotionEvaluator:
                 ):
                     self._fail(
                         "DETOUR_STOP_NOT_SETTLED",
-                        "detour idle samples must prove a physical zero-speed normal stop",
+                        "detour idle samples must prove physical zero-speed balanced-policy IDLE",
                         float(sample["t"]),
                     )
                 continue
@@ -2371,7 +2427,7 @@ class StrictMotionEvaluator:
                 if next_observed and next_observed[0] <= observed[-1] + 1:
                     self._fail(
                         "DETOUR_SEGMENT_STOP_GAP_MISSING",
-                        f"detour segment {index} lacks an observed idle normal-stop sample",
+                        f"detour segment {index} lacks an observed balanced-IDLE sample",
                     )
 
     def _evaluate_static_primitive_plan(
@@ -3025,6 +3081,7 @@ class StrictMotionEvaluator:
         def settled(sample: Mapping[str, Any]) -> bool:
             return (
                 not sample["intent"]
+                and sample["balancedPolicyIdle"]
                 and float(sample["linearSpeed"]) <= self.contract.terminal_linear_speed_mps + _EPS
                 and float(sample["angularSpeed"]) <= self.contract.terminal_angular_speed_rps + _EPS
                 and max(abs(float(sample[name])) for name in ("vx", "vy", "wz")) <= self.contract.command_zero_epsilon + _EPS

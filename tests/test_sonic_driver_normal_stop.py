@@ -47,6 +47,7 @@ class Guard:
     def __init__(self) -> None:
         self.stops: list[str] = []
         self.measured_heading_stops: list[str] = []
+        self.accepted: list[tuple[float, float, float, str]] = []
         self._target_zero = True
         self._command_zero = True
 
@@ -70,6 +71,13 @@ class Guard:
     def observe_heading(self, _heading_yaw: float) -> None:
         return None
 
+    def accept(self, vx: float, vy: float, wz: float, *, source: str) -> None:
+        self.accepted.append((vx, vy, wz, source))
+        self._target_zero = not any(
+            abs(value) > 1e-9 for value in (vx, vy, wz)
+        )
+        self._command_zero = self._target_zero
+
 
 class Telemetry:
     def __init__(self) -> None:
@@ -77,6 +85,9 @@ class Telemetry:
 
     def update(self, **values: object) -> None:
         self.values.update(values)
+
+    def reset_navigation_task_peaks(self) -> None:
+        return None
 
 
 class ObservedLock:
@@ -211,6 +222,24 @@ def stationary_intent(
     intent["state"] = "DISARMED"
     intent["stop_acknowledged"] = True
     intent["reason"] = "fresh stationary odometry acknowledged"
+    return intent
+
+
+def balanced_idle_intent(
+    clock: Clock,
+    *,
+    generation: int,
+    sequence: int,
+) -> dict[str, object]:
+    intent = stopping_intent(
+        clock,
+        generation=generation,
+        sequence=sequence,
+    )
+    intent["state"] = "IDLE"
+    intent["stop_requested"] = False
+    intent["stop_acknowledged"] = True
+    intent["reason"] = None
     return intent
 
 
@@ -649,8 +678,9 @@ def test_generic_stopping_intent_is_health_visible_before_correlated_begin() -> 
     assert driver._normal_stop.snapshot.phase == "NONE"
     assert driver._controlled_stop_active is True
     assert getattr(driver, "_normal_stop_policy_braking", False) is False
-    assert driver._reference_authority.snapshot.phase == "REVOKED"
-    assert driver._reference_request_pending is False
+    assert driver._reference_authority.snapshot.phase == "REQUIRED"
+    assert driver._reference_authority.snapshot.source_sequence == 20
+    assert driver._reference_request_pending is True
 
     # The health probe may run after the zero target is admitted but before
     # the next 50 Hz control tick consumes the previous filtered command.
@@ -694,6 +724,225 @@ def test_generic_stopping_intent_is_health_visible_before_correlated_begin() -> 
     assert driver._reference_authority.snapshot.phase == "REQUIRED"
     assert driver._reference_authority.snapshot.source_sequence == 21
     assert driver._reference_request_pending is True
+
+
+def test_generic_stationary_idle_keeps_fresh_policy_balance_authority() -> None:
+    """A successful action stops locomotion without freezing the humanoid."""
+
+    clock = Clock()
+    driver = bare_driver(clock)
+    activation = NominalPolicyActivation(
+        duration_s=3.0,
+        settle_consecutive_samples=1,
+    )
+    targets = tuple(0.0 for _ in range(29))
+    assert activation.begin(targets, tick_ms=0)
+    final = activation.propose(targets, measured=targets, tick_ms=3_000)
+    assert activation.commit(final, final.targets)
+    activation.observe_settling(
+        nominal=targets,
+        measured=targets,
+        velocities=targets,
+        gyroscope=(0.0, 0.0, 0.0),
+        roll_rad=0.0,
+        pitch_rad=0.0,
+        tick_ms=3_020,
+    )
+    assert activation.record_support_release(activation.epoch)
+    assert activation.confirm_support_release(tick_ms=3_020)
+    driver._policy_activation = activation
+    driver._controller = SimpleNamespace(
+        initialized=True,
+        ms=SimpleNamespace(mode=0, has_movement=False),
+    )
+    driver._intent_ingress.generation = 10
+    driver._intent_ingress.sequence = 19
+    driver._intent_ingress.armed = True
+    driver._navigation_task_active = True
+    driver.guard._target_zero = False
+    driver.guard._command_zero = False
+    driver._reference_authority.require(generation=10, source_sequence=19)
+    driver._reference_authority.mark_installed(
+        generation=10,
+        source_sequence=19,
+        planner_intent_generation=1,
+        reference_epoch=1,
+    )
+    driver._reference_authority.prime(
+        generation=10,
+        source_sequence=19,
+        reference_epoch=1,
+    )
+    driver._reference_authority.grant(
+        generation=10,
+        source_sequence=19,
+        reference_epoch=1,
+        granted_at_monotonic_s=clock.value,
+        granted_at_tick_ms=10_000,
+        dds_target_sequence=7,
+    )
+
+    driver.accept_json(stopping_intent(clock, generation=10, sequence=20))
+    assert driver._reference_authority.snapshot.phase == "REQUIRED"
+    driver._reference_authority.mark_installed(
+        generation=10,
+        source_sequence=20,
+        planner_intent_generation=2,
+        reference_epoch=2,
+    )
+    driver._reference_authority.prime(
+        generation=10,
+        source_sequence=20,
+        reference_epoch=2,
+    )
+    driver._reference_authority.grant(
+        generation=10,
+        source_sequence=20,
+        reference_epoch=2,
+        granted_at_monotonic_s=clock.value,
+        granted_at_tick_ms=10_020,
+        dds_target_sequence=8,
+    )
+    driver._controlled_stop_reference_installed = True
+    driver._reference_request_pending = False
+    driver._static_hold_active = False
+    driver.guard._target_zero = True
+    driver.guard._command_zero = True
+
+    clock.value += 0.40
+    assert (
+        driver.accept_json(
+            balanced_idle_intent(clock, generation=10, sequence=21)
+        )
+        is None
+    )
+
+    assert driver._balanced_policy_idle_active is True
+    assert driver._controlled_stop_active is True
+    assert driver._intent_ingress.armed is True
+    assert driver._intent_ingress.braking is False
+    assert driver._navigation_task_active is False
+    assert driver._safe_hold_targets is None
+    assert driver._static_hold_active is False
+    assert driver._plant_support_mode == "idle"
+    assert driver._reference_authority.snapshot.phase == "GRANTED"
+    assert driver.guard.stops == ["gait_adapter_controlled_stop"]
+    assert driver.telemetry.values["balanced_policy_idle_active"] is True
+
+    configure_control_arm_health(driver, clock)
+    request_id = UUID("40000000-0000-4000-8000-000000000006")
+    health_payload = driver.accept_json(
+        sonic_health_probe(
+            robot_id=ROBOT_ID,
+            producer_boot_id=BRIDGE_BOOT_ID,
+            request_id=request_id,
+        )
+    )
+    assert health_payload is not None
+    health = SonicHealth.from_response(
+        {"request_id": str(request_id), "ok": True, **health_payload},
+        expected_request_id=request_id,
+        expected_robot_id=ROBOT_ID,
+    )
+    assert health.controlled_policy_stop_active is True
+    assert health.motion_authorized is True
+    assert health.navigation_task_active is False
+    assert health.nav2_command_zero is True
+    assert health.matched_reference_actuator_authority is True
+    assert health.confirmed_safe_hold is False
+
+    clock.value += 0.02
+    motion = stopping_intent(clock, generation=10, sequence=22)
+    motion.update(
+        state="STARTING",
+        mode="SLOW_WALK",
+        velocity_x_mps=0.30,
+        linear_speed_mps=0.30,
+        motion_enabled=True,
+        stop_requested=False,
+        stop_acknowledged=False,
+        reason=None,
+    )
+    assert driver.accept_json(motion) is None
+    assert driver._balanced_policy_idle_active is False
+    assert driver._controlled_stop_active is False
+    assert driver._controlled_stop_source_identity is None
+    assert driver._controlled_stop_reference_installed is False
+    assert driver._navigation_task_active is True
+    assert driver._reference_source_identity == (10, 22)
+    assert driver.guard.accepted == [(0.30, 0.0, 0.0, "nav2")]
+    assert driver.telemetry.values["balanced_policy_idle_active"] is False
+
+
+def test_explicit_normal_stop_revokes_an_existing_balanced_idle_policy() -> None:
+    """An operator/emergency stop remains stronger than balanced IDLE."""
+
+    clock = Clock()
+    driver = bare_driver(clock)
+    activation = NominalPolicyActivation(
+        duration_s=3.0,
+        settle_consecutive_samples=1,
+    )
+    targets = tuple(0.0 for _ in range(29))
+    assert activation.begin(targets, tick_ms=0)
+    final = activation.propose(targets, measured=targets, tick_ms=3_000)
+    assert activation.commit(final, final.targets)
+    activation.observe_settling(
+        nominal=targets,
+        measured=targets,
+        velocities=targets,
+        gyroscope=(0.0, 0.0, 0.0),
+        roll_rad=0.0,
+        pitch_rad=0.0,
+        tick_ms=3_020,
+    )
+    assert activation.record_support_release(activation.epoch)
+    assert activation.confirm_support_release(tick_ms=3_020)
+    driver._policy_activation = activation
+    driver._controller = SimpleNamespace(
+        initialized=True,
+        ms=SimpleNamespace(mode=0, has_movement=False),
+    )
+    driver._intent_ingress.generation = 10
+    driver._intent_ingress.sequence = 21
+    driver._intent_ingress.armed = True
+    driver._controlled_stop_active = True
+    driver._balanced_policy_idle_active = True
+    driver._controlled_stop_source_identity = (10, 20)
+    driver._controlled_stop_reference_installed = True
+    driver._reference_source_identity = (10, 20)
+    driver._reference_authority.require(generation=10, source_sequence=20)
+    driver._reference_authority.mark_installed(
+        generation=10,
+        source_sequence=20,
+        planner_intent_generation=2,
+        reference_epoch=2,
+    )
+    driver._reference_authority.prime(
+        generation=10,
+        source_sequence=20,
+        reference_epoch=2,
+    )
+    driver._reference_authority.grant(
+        generation=10,
+        source_sequence=20,
+        reference_epoch=2,
+        granted_at_monotonic_s=clock.value,
+        granted_at_tick_ms=10_020,
+        dds_target_sequence=8,
+    )
+
+    response = driver.accept_json(begin_request(clock, sequence=22))
+
+    assert response is not None
+    assert driver._normal_stop.snapshot.phase == "BRAKING"
+    assert driver._normal_stop_policy_braking is False
+    assert driver._balanced_policy_idle_active is False
+    assert driver._controlled_stop_active is False
+    assert driver._intent_ingress.armed is False
+    assert driver._safe_hold_targets == targets
+    assert driver._static_hold_active is True
+    assert driver._reference_authority.snapshot.phase == "REVOKED"
 
 
 @pytest.mark.parametrize(

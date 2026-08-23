@@ -94,6 +94,7 @@ class TelemetryState:
     motion_ready: bool = False
     controller_resync_count: int = 0
     static_hold_active: bool = True
+    balanced_policy_idle_active: bool = False
     motion_handoff_active: bool = False
     motion_handoff_ratio: float = 0.0
     policy_activation_epoch: int = 0
