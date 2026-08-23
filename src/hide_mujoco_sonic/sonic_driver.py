@@ -1712,9 +1712,6 @@ class SonicDriver:
         authority = self._reference_authority.snapshot
         controller = getattr(self, "_controller", None)
         activation = getattr(self, "_policy_activation", None)
-        already_balanced = bool(
-            getattr(self, "_balanced_policy_idle_active", False)
-        )
         valid = bool(
             decision.action == "stop"
             and decision.state == "IDLE"
@@ -1725,7 +1722,12 @@ class SonicDriver:
             and decision.sequence > identity[1]
             and getattr(self, "_controlled_stop_active", False)
             and getattr(self, "_controlled_stop_reference_installed", False)
-            and (decision.arm_acknowledged or already_balanced)
+            # ``armed`` is the durable result of an acknowledged stationary
+            # IDLE envelope.  ``arm_acknowledged`` is only its one-envelope
+            # rising edge.  The edge may arrive while the async IDLE reference
+            # is still PRIMED; requiring it here makes the next envelope
+            # impossible to commit and used to collapse an untethered robot
+            # into a static joint hold after one policy frame.
             and self._intent_ingress.armed
             and not self._intent_ingress.braking
             and not self._navigation_task_active
@@ -1758,6 +1760,63 @@ class SonicDriver:
         self._balanced_policy_idle_active = True
         self._normal_stop_policy_braking = False
         return True
+
+    def _balanced_policy_idle_completion_pending_locked(
+        self,
+        decision: IngressDecision,
+    ) -> bool:
+        """Recognize a valid stationary acknowledgement awaiting DDS grant.
+
+        GaitAdapter stationarity and SONIC planner/reference readiness are
+        independent asynchronous facts.  A valid IDLE acknowledgement can
+        therefore overtake the first controlled-policy DDS write.  This state
+        is recoverable and remains bounded by the existing planner deadline,
+        control-step watchdog, process-stop, normal-stop, and terminal-fault
+        fences.  It must not be converted to a static joint hold while the
+        Plant fall-arrest support is released.
+
+        The caller owns ``_support_lock``.
+        """
+
+        identity = getattr(self, "_controlled_stop_source_identity", None)
+        authority = self._reference_authority.snapshot
+        controller = getattr(self, "_controller", None)
+        activation = getattr(self, "_policy_activation", None)
+        return bool(
+            decision.action == "stop"
+            and decision.state == "IDLE"
+            and decision.generation is not None
+            and decision.sequence is not None
+            and identity is not None
+            and decision.generation == identity[0]
+            and decision.sequence > identity[1]
+            and getattr(self, "_controlled_stop_active", False)
+            and self._intent_ingress.armed
+            and not self._intent_ingress.braking
+            and not self._navigation_task_active
+            and self.guard.target_zero
+            and self.guard.command_zero
+            # GRANTED is not transitional: if the full completion predicate
+            # still fails there, retain the stronger terminal fallback rather
+            # than masking an inconsistent executable authority state.
+            and authority.phase in {"REQUIRED", "MATCHED_INSTALLED", "PRIMED"}
+            and authority.generation == identity[0]
+            and authority.source_sequence == identity[1]
+            and self._reference_source_identity == identity
+            and controller is not None
+            and bool(getattr(controller, "initialized", False))
+            and int(getattr(controller.ms, "mode", -1)) == 0
+            and not bool(getattr(controller.ms, "has_movement", True))
+            and activation is not None
+            and bool(getattr(activation, "prepared", False))
+            and self._safe_hold_targets is None
+            and self._plant_support_mode == "idle"
+            and not self._plant_support_stop_pending
+            and not self._plant_support_safety_latched
+            and not self._normal_stop_fences_motion_locked()
+            and not self._process_stop_fences_motion_locked()
+            and not self._fault_latched.is_set()
+        )
 
     def _controlled_policy_stop_eligible_locked(self, generation: int) -> bool:
         """Check whether STOPPING may rebase the current learned controller."""
@@ -6320,6 +6379,7 @@ class SonicDriver:
         stop_boundary_applied = False
         controlled_brake_applied = False
         balanced_idle_applied = False
+        balanced_idle_pending = False
         stop_boundary_error: Exception | None = None
         try:
             if control_arm:
@@ -6379,7 +6439,13 @@ class SonicDriver:
                                     decision
                                 )
                             )
-                        if not balanced_idle_applied:
+                            if not balanced_idle_applied:
+                                balanced_idle_pending = (
+                                    self._balanced_policy_idle_completion_pending_locked(
+                                        decision
+                                    )
+                                )
+                        if not balanced_idle_applied and not balanced_idle_pending:
                             try:
                                 self._stop_navigation_at_boundary(
                                     source=(
@@ -6452,6 +6518,25 @@ class SonicDriver:
                     last_cmd_wz=0.0,
                     static_hold_active=False,
                     balanced_policy_idle_active=True,
+                    last_error=None,
+                    **self._planner_telemetry_fields(),
+                )
+                return None
+            if balanced_idle_pending:
+                # Stationarity won the race with the first executable IDLE
+                # policy DDS fact.  Keep the continuous learned controller
+                # transaction alive; the next validated IDLE envelope will
+                # commit once GRANTED.  Existing planner/gait/terminal
+                # deadlines retain the bounded fail-closed behavior.
+                self.telemetry.update(
+                    nav2_state="braking",
+                    sonic_mode="IDLE",
+                    navigation_task_active=False,
+                    last_cmd_vx=0.0,
+                    last_cmd_vy=0.0,
+                    last_cmd_wz=0.0,
+                    static_hold_active=self._static_hold_active,
+                    balanced_policy_idle_active=False,
                     last_error=None,
                     **self._planner_telemetry_fields(),
                 )

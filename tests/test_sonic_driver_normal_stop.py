@@ -877,6 +877,114 @@ def test_generic_stationary_idle_keeps_fresh_policy_balance_authority() -> None:
     assert driver.telemetry.values["balanced_policy_idle_active"] is False
 
 
+def test_stationary_idle_ack_waits_for_first_controlled_policy_dds_grant() -> None:
+    """A ROS acknowledgement may race the first executable IDLE policy tick.
+
+    The GaitAdapter proves base stationarity independently from SONIC's async
+    planner/reference transaction.  If that acknowledgement arrives while the
+    controlled IDLE reference is only PRIMED, freezing the last joint target
+    removes learned balance from an untethered humanoid.  Keep the controlled
+    stop alive; a later IDLE envelope must commit after the first DDS grant
+    even though the ingress arm edge was already consumed by the earlier
+    acknowledgement.
+    """
+
+    clock = Clock()
+    driver = bare_driver(clock)
+    activation = NominalPolicyActivation(
+        duration_s=3.0,
+        settle_consecutive_samples=1,
+    )
+    targets = tuple(0.0 for _ in range(29))
+    assert activation.begin(targets, tick_ms=0)
+    final = activation.propose(targets, measured=targets, tick_ms=3_000)
+    assert activation.commit(final, final.targets)
+    activation.observe_settling(
+        nominal=targets,
+        measured=targets,
+        velocities=targets,
+        gyroscope=(0.0, 0.0, 0.0),
+        roll_rad=0.0,
+        pitch_rad=0.0,
+        tick_ms=3_020,
+    )
+    assert activation.record_support_release(activation.epoch)
+    assert activation.confirm_support_release(tick_ms=3_020)
+    driver._policy_activation = activation
+    driver._controller = SimpleNamespace(
+        initialized=True,
+        ms=SimpleNamespace(mode=0, has_movement=False),
+    )
+    driver._intent_ingress.generation = 10
+    driver._intent_ingress.sequence = 19
+    driver._intent_ingress.armed = True
+    driver._navigation_task_active = True
+    driver.guard._target_zero = False
+    driver.guard._command_zero = False
+    driver._reference_authority.require(generation=10, source_sequence=19)
+    driver._reference_authority.mark_installed(
+        generation=10,
+        source_sequence=19,
+        planner_intent_generation=1,
+        reference_epoch=1,
+    )
+    driver._reference_authority.prime(
+        generation=10,
+        source_sequence=19,
+        reference_epoch=1,
+    )
+    driver._reference_authority.grant(
+        generation=10,
+        source_sequence=19,
+        reference_epoch=1,
+        granted_at_monotonic_s=clock.value,
+        granted_at_tick_ms=10_000,
+        dds_target_sequence=7,
+    )
+
+    driver.accept_json(stopping_intent(clock, generation=10, sequence=20))
+    driver._reference_authority.mark_installed(
+        generation=10,
+        source_sequence=20,
+        planner_intent_generation=2,
+        reference_epoch=2,
+    )
+    driver._reference_authority.prime(
+        generation=10,
+        source_sequence=20,
+        reference_epoch=2,
+    )
+    driver._controlled_stop_reference_installed = True
+    driver._reference_request_pending = False
+    driver.guard._target_zero = True
+    driver.guard._command_zero = True
+
+    clock.value += 0.40
+    driver.accept_json(balanced_idle_intent(clock, generation=10, sequence=21))
+
+    assert driver._controlled_stop_active is True
+    assert driver._balanced_policy_idle_active is False
+    assert driver._safe_hold_targets is None
+    assert driver._fault_latched.is_set() is False
+
+    driver._reference_authority.grant(
+        generation=10,
+        source_sequence=20,
+        reference_epoch=2,
+        granted_at_monotonic_s=clock.value,
+        granted_at_tick_ms=10_020,
+        dds_target_sequence=8,
+    )
+    driver._static_hold_active = False
+    clock.value += 0.02
+    driver.accept_json(balanced_idle_intent(clock, generation=10, sequence=22))
+
+    assert driver._controlled_stop_active is True
+    assert driver._balanced_policy_idle_active is True
+    assert driver._safe_hold_targets is None
+    assert driver._reference_authority.snapshot.phase == "GRANTED"
+
+
 def test_explicit_normal_stop_revokes_an_existing_balanced_idle_policy() -> None:
     """An operator/emergency stop remains stronger than balanced IDLE."""
 
