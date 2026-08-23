@@ -66,6 +66,15 @@ MAX_JSON_BYTES = 32 * 1024 * 1024
 SAMPLE_DEADLINE_S = 0.30
 TERMINAL_SETTLE_S = 3.0
 SEGMENT_BALANCED_IDLE_S = 1.5
+TERMINAL_LINEAR_SPEED_MPS = 0.01
+# SONIC's learned IDLE policy actively balances an untethered humanoid.  The
+# live one-metre run held its pose within 4 mm for more than six seconds while
+# the instantaneous root angular-speed correction periodically reached
+# 0.0151 rad/s.  Treating that bounded correction as motion made the runner
+# invoke an emergency static stop on a healthy robot.  Keep a narrow 0.02
+# rad/s envelope (about 1.15 deg/s) while the independent roll/pitch, pose
+# drift, contact, and continuous-duration gates remain authoritative.
+TERMINAL_ANGULAR_SPEED_RPS = 0.02
 _ZERO_EPS = 1e-6
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 STRICT_EVALUATOR_PATH = REPOSITORY_ROOT / "tools" / "strict_motion_acceptance.py"
@@ -1973,8 +1982,10 @@ def _sample_settled(sample: Mapping[str, Any]) -> bool:
             for name in ("vx", "vy", "wz")
         )
         <= _ZERO_EPS
-        and _finite(root.get("linearSpeedMps"), "terminal linear speed") <= 0.01
-        and _finite(root.get("angularSpeedRps"), "terminal angular speed") <= 0.01
+        and _finite(root.get("linearSpeedMps"), "terminal linear speed")
+        <= TERMINAL_LINEAR_SPEED_MPS
+        and _finite(root.get("angularSpeedRps"), "terminal angular speed")
+        <= TERMINAL_ANGULAR_SPEED_RPS
         and not any(value is True for value in actions.values())
     )
 

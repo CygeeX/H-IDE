@@ -736,6 +736,16 @@ def _executor_sample(t_s: float) -> dict:
     }
 
 
+def test_dynamic_idle_accepts_observed_balance_correction_but_not_motion() -> None:
+    observed = _executor_sample(1.0)
+    observed["root"]["angularSpeedRps"] = 0.0151
+    assert runner._sample_settled(observed) is True
+
+    moving = _executor_sample(1.1)
+    moving["root"]["angularSpeedRps"] = 0.020001
+    assert runner._sample_settled(moving) is False
+
+
 class FakeExecutorBackend:
     def __init__(self) -> None:
         self.calls: list[str] = []

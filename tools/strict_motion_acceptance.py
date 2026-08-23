@@ -135,7 +135,11 @@ class FormalContract:
     max_root_com_delta_disagreement_m: float = 0.15
     terminal_settle_s: float = 1.0
     terminal_linear_speed_mps: float = 0.01
-    terminal_angular_speed_rps: float = 0.01
+    # Dynamic SONIC IDLE retains actuator authority and makes small balance
+    # corrections; the untethered live envelope peaks around 0.015 rad/s while
+    # net pose drift remains millimetric.  This is an acceptance threshold,
+    # not an actuator safety limit.
+    terminal_angular_speed_rps: float = 0.02
     max_terminal_sample_gap_s: float = 0.10
     max_arm_continuous_saturation_s: float = 0.24
     arm_must_clear_before_s: float = 0.25
