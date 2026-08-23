@@ -560,6 +560,7 @@ class SonicDriver:
         self._reference_authority = ReferenceAuthorityState()
         self._reference_source_identity: tuple[int, int] | None = None
         self._reference_request_pending = False
+        self._reference_request_continuous = False
         self._vendor_revoke_pending = False
         self._dds_target_sequence = 0
         self._control_evidence_context = threading.local()
@@ -1602,14 +1603,15 @@ class SonicDriver:
     ) -> bool:
         """Rebase IDLE at the executed boundary while rejecting new motion.
 
-        STOPPING is recoverable deceleration, not a terminal safety event.  It
-        must not, however, blend a moving gait clip directly into IDLE.  That
-        path completed a live one-metre walk and then destabilized the model
-        during braking.  Freeze the exact last successful DDS target, withdraw
-        the moving reference, and request a fresh measured IDLE reference from
-        the first admitted STOPPING envelope.  The regular gait channel owns
-        that exact source identity; a later explicit normal-stop transaction
-        may join it, but action completion does not depend on a second RPC.
+        STOPPING is recoverable deceleration, not a terminal safety event.
+        Freeze the exact last successful DDS target, withdraw only the outer
+        actuator authority, and request a heading-neutral IDLE reference while
+        preserving SONIC's acknowledged recurrent history and reference
+        cursor.  Rebuilding history from one measured sample worked for a
+        forward stop but destabilized the live reverse stop.  The regular gait
+        channel owns this exact source identity; a later explicit normal-stop
+        transaction may join it, but action completion does not depend on a
+        second RPC.
 
         Fault, process-stop, support-latch, startup, and pre-grant paths still
         fall back to the stronger static boundary.  The caller owns
@@ -1648,9 +1650,11 @@ class SonicDriver:
             )
             if not self._freeze_planner_handoff_boundary():
                 return False
-            self._revoke_planner_reference_locked(
-                "controlled stop requires a fresh measured IDLE reference"
+            failures = self._withdraw_external_planner_authority_locked(
+                "controlled stop requires a continuous IDLE reference"
             )
+            if failures:
+                raise failures[0]
             self._static_hold_active = True
             self._controlled_stop_active = True
             self._balanced_policy_idle_active = False
@@ -1662,9 +1666,10 @@ class SonicDriver:
             )
             self._reference_source_identity = identity
             self._reference_request_pending = True
+            self._reference_request_continuous = True
         elif correlated:
             # A regular STOPPING envelope may already have enqueued the
-            # measured IDLE planner request.  The later correlated
+            # continuous IDLE planner request. The later correlated
             # normal-stop envelope takes ownership of the source identity,
             # but it must not turn an in-flight request back into a pending
             # enqueue.  Doing so creates two requests with the same upstream
@@ -2761,7 +2766,18 @@ class SonicDriver:
             self._revoke_planner_reference_locked(reason)
         self.telemetry.update(**self._planner_telemetry_fields())
 
-    def _revoke_planner_reference_locked(self, reason: str) -> None:
+    def _withdraw_external_planner_authority_locked(
+        self,
+        reason: str,
+    ) -> list[Exception]:
+        """Withdraw driver/evidence authority without resetting vendor history.
+
+        Controlled braking needs the vendor controller's acknowledged cursor
+        and recurrent histories until its dedicated continuous request has
+        captured them.  Terminal stops and ordinary measured rebases use the
+        stronger ``_revoke_planner_reference_locked`` operation below.
+        """
+
         failures: list[Exception] = []
         authority = getattr(self, "_reference_authority", None)
         if authority is not None:
@@ -2775,6 +2791,10 @@ class SonicDriver:
                 evidence.revoke(reason)
             except Exception as exc:
                 failures.append(exc)
+        return failures
+
+    def _revoke_planner_reference_locked(self, reason: str) -> None:
+        failures = self._withdraw_external_planner_authority_locked(reason)
         controller = getattr(self, "_controller", None)
         revoke = getattr(controller, "revoke_reference_authority", None)
         if callable(revoke):
@@ -2783,6 +2803,7 @@ class SonicDriver:
             # this request after inference and before any feedback or publish.
             self._vendor_revoke_pending = True
         self._reference_request_pending = False
+        self._reference_request_continuous = False
         if failures:
             raise failures[0]
 
@@ -3351,6 +3372,7 @@ class SonicDriver:
             admitted=True,
             simulation_now_s=simulation_now_s,
         )
+        self._reference_request_continuous = False
         self._reference_request_pending = True
         self._policy_activation_requested = False
         return True
@@ -3645,17 +3667,43 @@ class SonicDriver:
         """Plan, install, and prime one required reference without policy work."""
 
         with self._support_lock:
+            continuous_stop = bool(
+                getattr(self, "_reference_request_continuous", False)
+            )
+            if continuous_stop and self._vendor_revoke_pending:
+                raise RuntimeError(
+                    "continuous IDLE reference cannot consume a vendor revoke"
+                )
             self._consume_vendor_revoke_locked()
             authority = self._reference_authority.snapshot
             if authority.phase != "REQUIRED":
                 return self._reference_authority.executable
+            controlled_stop = bool(
+                getattr(self, "_controlled_stop_active", False)
+            )
+            if controlled_stop != continuous_stop:
+                raise RuntimeError(
+                    "controlled-stop reference lost its continuous-history identity"
+                )
             controller = self._controller
             if not controller.initialized:
                 raise RuntimeError("manual SONIC reference requested before initialization")
             if self._reference_request_pending:
                 if controller.execution_feedback_pending:
                     return False
-                controller.request_reference(lowstate)
+                if continuous_stop:
+                    request_continuous_idle = getattr(
+                        controller,
+                        "request_continuous_idle_reference",
+                        None,
+                    )
+                    if not callable(request_continuous_idle):
+                        raise RuntimeError(
+                            "SONIC controller lacks continuous IDLE reference support"
+                        )
+                    request_continuous_idle()
+                else:
+                    controller.request_reference(lowstate)
                 self._reference_request_pending = False
             if controller.execution_feedback_pending:
                 raise RuntimeError(
@@ -3689,11 +3737,26 @@ class SonicDriver:
                 raise RuntimeError(
                     "matching SONIC reference has no executed actuator boundary"
                 )
-            controller.acquire_reference(
-                lowstate,
-                executed_target=executed_target,
-                expected_install_epoch=epoch,
-            )
+            if continuous_stop:
+                acquire_continuous = getattr(
+                    controller,
+                    "acquire_continuous_reference",
+                    None,
+                )
+                if not callable(acquire_continuous):
+                    raise RuntimeError(
+                        "SONIC controller lacks continuous reference acquisition"
+                    )
+                acquire_continuous(
+                    executed_target=executed_target,
+                    expected_install_epoch=epoch,
+                )
+            else:
+                controller.acquire_reference(
+                    lowstate,
+                    executed_target=executed_target,
+                    expected_install_epoch=epoch,
+                )
             self._reference_authority.prime(
                 generation=authority.generation,
                 source_sequence=authority.source_sequence,
@@ -3713,10 +3776,21 @@ class SonicDriver:
                     raise RuntimeError(
                         "fresh controlled-stop reference lacks exact IDLE identity"
                     )
+                # The continuous acquisition has installed a heading-neutral
+                # planner context and armed the decoder's own heading
+                # reinitialization without replacing recurrent histories. Keep
+                # the driver's bookkeeping in that same local frame. Retaining
+                # the previous action's absolute controller angle here makes
+                # the next motion compute a compensating turn toward the old
+                # frame.
+                self._decoder_facing_rad = 0.0
+                self._pending_decoder_heading_delta_rad = 0.0
                 self._reference_source_identity = controlled_identity
                 self._controlled_stop_reference_installed = True
-            # An earlier stop hold may be released only after the measured
-            # history and exact executed boundary have been atomically rebased.
+                self._reference_request_continuous = False
+            # An earlier stop hold may be released only after the preserved
+            # history and exact executed boundary have been atomically bound to
+            # the newly accepted reference.
             self._safe_hold_targets = None
             return True
 

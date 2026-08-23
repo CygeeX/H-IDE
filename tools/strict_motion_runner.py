@@ -964,7 +964,7 @@ class RosLiveBackend:
         goal.target.y = 0.0
         goal.target.z = 0.0
         goal.speed = (
-            OFFICIAL_REVERSE_SPEED_MPS
+            -OFFICIAL_REVERSE_SPEED_MPS
             if distance < 0.0
             else OFFICIAL_DRIVE_SPEED_MPS
         )

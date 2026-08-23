@@ -144,6 +144,7 @@ def bare_driver(clock: Clock) -> SonicDriver:
     driver._plant_support_stop_generation = None
     driver._reference_authority = ReferenceAuthorityState()
     driver._reference_request_pending = False
+    driver._reference_request_continuous = False
     driver._vendor_revoke_pending = False
     driver._normal_stop = NormalStopState()
     driver._normal_stop_bridge_boot_id = None
@@ -538,14 +539,14 @@ def test_granted_motion_rebases_idle_from_exact_boundary_before_braking() -> Non
     assert driver._intent_ingress.braking is True
     assert driver._safe_hold_targets is None
     assert driver._static_hold_active is True
-    # A live gait clip must not blend directly into IDLE.  The production
-    # failure on 2026-08-23 walked the requested metre, then fell while that
-    # continuous blend was braking.  Correlated STOPPING now withdraws the
-    # old clip and requires a fresh measured IDLE reference at the exact last
-    # successful DDS boundary before another policy target may be published.
+    # Correlated STOPPING withdraws outer actuator authority but preserves the
+    # acknowledged vendor history/cursor until its continuous IDLE request has
+    # captured them.  No deferred vendor revoke may erase that history.
     assert driver._reference_authority.snapshot.phase == "REQUIRED"
     assert driver._reference_authority.snapshot.source_sequence == 20
     assert driver._reference_request_pending is True
+    assert driver._reference_request_continuous is True
+    assert driver._vendor_revoke_pending is False
     assert driver.guard.stops == ["gait_adapter_controlled_stop"]
     assert driver.guard.measured_heading_stops == [
         "gait_adapter_controlled_stop"
@@ -681,6 +682,8 @@ def test_generic_stopping_intent_is_health_visible_before_correlated_begin() -> 
     assert driver._reference_authority.snapshot.phase == "REQUIRED"
     assert driver._reference_authority.snapshot.source_sequence == 20
     assert driver._reference_request_pending is True
+    assert driver._reference_request_continuous is True
+    assert driver._vendor_revoke_pending is False
 
     # The health probe may run after the zero target is admitted but before
     # the next 50 Hz control tick consumes the previous filtered command.

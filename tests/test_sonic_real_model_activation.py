@@ -315,6 +315,17 @@ def _wrap_angle(value: float) -> float:
         ("forward_3m", 0.30, 0.0, 0.0, True, (1.0, 0.0), 0, 3.0, 60.0),
         ("reverse", 0.20, math.pi, 0.0, True, (-1.0, 0.0), 0, 0.5, 30.0),
         (
+            "reverse_early_stop",
+            0.20,
+            math.pi,
+            0.0,
+            True,
+            (-1.0, 0.0),
+            0,
+            0.20,
+            15.0,
+        ),
+        (
             "left_strafe",
             0.35,
             math.pi / 2.0,
@@ -699,32 +710,31 @@ def test_official_cold_boot_sequence_moves_in_requested_direction(
         assert last_constrained_control_frame >= 0, diagnostic
 
         # A successful motion action is not complete until the learned
-        # controller has transitioned to NVIDIA's bounded IDLE reference.  A
-        # static snapshot of a live gait pose cannot balance the untethered
-        # model and was the cause of the first live 1 m post-goal fall.
+        # controller has transitioned to NVIDIA's bounded IDLE reference.
+        # Preserve the acknowledged recurrent history and cursor across that
+        # transition: rebuilding all history from one measured sample passed a
+        # forward stop but destabilized the live reverse stop.
         stop_started_xy = np.asarray(data.qpos[:2], dtype=np.float64).copy()
-        stop_started_yaw = _yaw_from_wxyz(
-            np.asarray(data.qpos[3:7], dtype=np.float64)
-        )
         stop_started_epoch = controller.reference_install_epoch
         controller.ms.mode = LM.IDLE
         controller.ms.speed = -1.0
         controller.ms.movement_angle = 0.0
-        controller.ms.facing_angle = stop_started_yaw
+        # The controlled-stop planner context is heading-neutral.  Reusing a
+        # world/controller yaw here applies it a second time and reproduced the
+        # 0.1919 rad rejected-IDLE incident.
+        controller.ms.facing_angle = 0.0
         controller.ms.has_movement = False
-        controller.ms.needs_replan = True
+        controller.ms.needs_replan = False
         # Reference planning is a wall-clock worker while this fixture can run
         # MuJoCo much faster than real time.  Resolve and install the stop
         # reference against one frozen LowState so CPU scheduling cannot invent
         # an unreviewed actuator dwell before IDLE starts.
-        controller.request_reference(lowstate())
+        controller.request_continuous_idle_reference()
         _wait_for_matching_reference(controller)
-        controller.acquire_reference(
-            lowstate(),
+        controller.acquire_continuous_reference(
             executed_target=tuple(published),
             expected_install_epoch=controller.reference_install_epoch,
         )
-        controller.ms.needs_replan = False
         stop_minimum_z = float(data.qpos[2])
         stop_peak_tilt = 0.0
         stop_peak_idle_readapt_error = 0.0

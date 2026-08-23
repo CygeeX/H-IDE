@@ -585,6 +585,7 @@ def bare_driver(clock: Clock) -> SonicDriver:
     driver._reference_authority = ReferenceAuthorityState()
     driver._reference_source_identity = None
     driver._reference_request_pending = False
+    driver._reference_request_continuous = False
     driver._vendor_revoke_pending = False
     driver._intent_gate = None
     driver._dds_target_sequence = 0
@@ -1515,8 +1516,10 @@ class _TransactionalController:
         self.install_ready = False
         self.refresh_ready = False
         self.request_calls = 0
+        self.continuous_request_calls = 0
         self.poll_calls = 0
         self.acquire_calls = []
+        self.continuous_acquire_calls = []
         self.run_calls = 0
         self.commits = []
         self.revoke_calls: list[tuple[bool, bool]] = []
@@ -1555,6 +1558,13 @@ class _TransactionalController:
         self.matching_reference_installed = False
         self.reference_authority = False
 
+    def request_continuous_idle_reference(self) -> None:
+        assert self.execution_feedback_pending is False
+        assert self.reference_authority is True
+        self.continuous_request_calls += 1
+        self.matching_reference_installed = False
+        self.reference_authority = False
+
     def poll_reference(self) -> bool:
         assert self.execution_feedback_pending is False
         self.poll_calls += 1
@@ -1578,6 +1588,19 @@ class _TransactionalController:
         self.reference_authority = True
         self.controller.playing = True
         self.controller.ref_cursor = 0
+
+    def acquire_continuous_reference(
+        self,
+        *,
+        executed_target,
+        expected_install_epoch,
+    ) -> None:
+        assert expected_install_epoch == self.reference_install_epoch
+        self.continuous_acquire_calls.append(
+            tuple(float(value) for value in executed_target)
+        )
+        self.reference_authority = True
+        self.controller.playing = True
 
     def run_step(self, _action, _lowstate):
         assert self.reference_authority is True
@@ -2707,12 +2730,12 @@ def test_reference_execution_is_transactional_across_grant_refresh_and_stop_race
 
 
 def test_controlled_stop_watchdog_age_cannot_replan_the_same_source_sequence() -> None:
-    """The fresh measured IDLE rebase has one planner/source identity.
+    """The continuous IDLE transition has one planner/source identity.
 
-    A controlled stop withdraws the moving clip and plans from current
-    LowState while publishing the exact previous DDS boundary.  CmdVelGuard
-    later changing the same zero from fresh to stale must neither repeat that
-    measured rebase nor manufacture a second reference identity.
+    A controlled stop preserves acknowledged history/cursor while publishing
+    the exact previous DDS boundary. CmdVelGuard later changing the same zero
+    from fresh to stale must neither repeat that request nor manufacture a
+    second reference identity.
     """
 
     from lerobot.robots.unitree_g1.controllers.sonic_pipeline import DEFAULT_ANGLES
@@ -2728,6 +2751,7 @@ def test_controlled_stop_watchdog_age_cannot_replan_the_same_source_sequence() -
     evidence.accept_current()
     controller = _TransactionalController(evidence, target)
     controller.reference_install_epoch = 2
+    controller.reference_authority = True
     driver._controller = controller
     driver._planner_evidence = evidence
     driver._last_published_targets = boundary
@@ -2740,6 +2764,11 @@ def test_controlled_stop_watchdog_age_cannot_replan_the_same_source_sequence() -
     driver._reference_source_identity = (42, 9)
     driver._reference_authority.require(generation=42, source_sequence=9)
     driver._reference_request_pending = True
+    driver._reference_request_continuous = True
+    # Reproduce a completed turn before the stop. The continuous IDLE plan is
+    # heading-neutral and must retire both pieces of old driver bookkeeping.
+    driver._decoder_facing_rad = 0.22029595072884373
+    driver._pending_decoder_heading_delta_rad = 0.03
 
     fresh_idle = MovementIntent(
         mode="IDLE",
@@ -2763,21 +2792,26 @@ def test_controlled_stop_watchdog_age_cannot_replan_the_same_source_sequence() -
     assert evidence.intent_generation == 2
     assert controller.ms.needs_replan is False
 
-    # Planning-only request/poll never runs the moving clip.  It acquires the
-    # accepted IDLE clip from fresh LowState and the exact actuator boundary.
+    # Planning-only request/poll never runs the moving clip. It acquires the
+    # accepted IDLE clip against the exact actuator boundary without reseeding
+    # the recurrent history from one LowState sample.
     assert driver._progress_reference_transaction(lowstate) is False
-    assert controller.request_calls == 1
+    assert controller.request_calls == 0
+    assert controller.continuous_request_calls == 1
     assert controller.acquire_calls == []
     assert driver._reference_authority.snapshot.phase == "REQUIRED"
     controller.install_ready = True
     assert driver._progress_reference_transaction(lowstate) is True
-    assert controller.acquire_calls == [pytest.approx(boundary)]
+    assert controller.acquire_calls == []
+    assert controller.continuous_acquire_calls == [pytest.approx(boundary)]
     assert driver._controlled_stop_reference_installed is True
     transitioned = driver._reference_authority.snapshot
     assert transitioned.phase == "PRIMED"
     assert transitioned.source_sequence == 9
     assert transitioned.planner_intent_generation == 2
     assert controller.controller.ref_cursor == 0
+    assert driver._decoder_facing_rad == pytest.approx(0.0)
+    assert driver._pending_decoder_heading_delta_rad == pytest.approx(0.0)
 
     policy_action = driver._run_policy_candidate(lowstate)
     assert policy_action
@@ -2800,8 +2834,10 @@ def test_controlled_stop_watchdog_age_cannot_replan_the_same_source_sequence() -
     assert second_idle.source == "gait_adapter_controlled_stop"
     assert evidence.intent_generation == 2
     assert controller.ms.needs_replan is False
-    assert controller.request_calls == 1
-    assert controller.acquire_calls == [pytest.approx(boundary)]
+    assert controller.request_calls == 0
+    assert controller.continuous_request_calls == 1
+    assert controller.acquire_calls == []
+    assert controller.continuous_acquire_calls == [pytest.approx(boundary)]
 
     # A true same-intent periodic epoch is still legal and remains bound to the
     # already-installed STOPPING source sequence.
@@ -2843,6 +2879,7 @@ def test_correlated_stop_takes_over_inflight_idle_request_without_requeue() -> N
     evidence.intent_generation = 1
     evidence.intent_signature = "idle-intent-1"
     controller = _TransactionalController(evidence, boundary)
+    controller.reference_authority = True
     driver._controller = controller
     driver._planner_evidence = evidence
     driver._policy_activation = SimpleNamespace(prepared=True)
@@ -2855,11 +2892,13 @@ def test_correlated_stop_takes_over_inflight_idle_request_without_requeue() -> N
     driver._reference_source_identity = (42, 9)
     driver._reference_authority.require(generation=42, source_sequence=9)
     driver._reference_request_pending = True
+    driver._reference_request_continuous = True
 
-    # The uncorrelated STOPPING path has already put one measured IDLE request
-    # in flight.  It has not returned yet.
+    # The uncorrelated STOPPING path has already put one history-preserving
+    # IDLE request in flight.  It has not returned yet.
     assert driver._progress_reference_transaction(lowstate) is False
-    assert controller.request_calls == 1
+    assert controller.request_calls == 0
+    assert controller.continuous_request_calls == 1
     assert driver._reference_request_pending is False
 
     correlated = IngressDecision(
@@ -2882,8 +2921,10 @@ def test_correlated_stop_takes_over_inflight_idle_request_without_requeue() -> N
     # ownership; it never issues a duplicate planner request.
     controller.install_ready = True
     assert driver._progress_reference_transaction(lowstate) is True
-    assert controller.request_calls == 1
-    assert controller.acquire_calls == [pytest.approx(boundary)]
+    assert controller.request_calls == 0
+    assert controller.continuous_request_calls == 1
+    assert controller.acquire_calls == []
+    assert controller.continuous_acquire_calls == [pytest.approx(boundary)]
     assert driver._reference_authority.snapshot.phase == "PRIMED"
     assert driver._reference_authority.snapshot.source_sequence == 10
 

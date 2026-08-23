@@ -947,12 +947,16 @@ def test_straight_translation_never_integrates_facing():
     guard = CmdVelGuard(clock=lambda: now[0], smoothing_alpha=1.0)
     guard.observe_heading(0.3)
     guard.accept(0.20, 0.0, 0.0)
-    for _ in range(20):
+    for frame in range(20):
         now[0] += 0.02
-        guard.observe_heading(0.3)
+        # Reproduce the second-action incident: the torso yaws progressively
+        # even though DriveOnHeading continues to command exactly zero wz.
+        # Measured drift must not drag SONIC's facing goal with it.
+        guard.observe_heading(0.3 + (frame + 1) * 0.015)
         guard.accept(0.20, 0.0, 0.0)
         intent = guard.intent(now=now[0], dt=0.02)
         assert intent.facing_angle_rad == pytest.approx(0.0)
+        assert intent.movement_angle_rad == pytest.approx(0.0)
         assert guard.command_facing == pytest.approx(0.0)
 
 
@@ -1014,16 +1018,16 @@ def test_stop_freezes_and_next_action_reanchors_command_facing():
     assert guard.command_facing == pytest.approx(0.0)
 
 
-def test_controlled_stop_reanchors_idle_to_latest_measured_heading():
+def test_controlled_stop_rebases_latest_measured_heading_as_local_zero():
     guard = CmdVelGuard(clock=lambda: 100.0, smoothing_alpha=1.0)
     guard.observe_heading(0.40)
     guard.accept(0.20, 0.0, 0.10)
     moving = guard.intent(now=100.01, dt=0.02)
     assert moving.facing_angle_rad == pytest.approx(0.002)
 
-    # The body makes more yaw progress after the last policy intent.  The
-    # controlled IDLE plan must start from that physical boundary, not from the
-    # older command-facing value.
+    # The body makes more yaw progress after the last policy intent.  The fresh
+    # measured planner reference already contains that physical orientation,
+    # so its local IDLE facing must be zero rather than the old relative angle.
     guard.observe_heading(0.46)
     stopped_target = guard.stop_at_measured_heading(source="controlled_stop")
     assert stopped_target.source == "controlled_stop"
@@ -1032,8 +1036,8 @@ def test_controlled_stop_reanchors_idle_to_latest_measured_heading():
 
     idle = guard.intent(now=100.02, dt=0.02)
     assert idle.mode == "IDLE"
-    assert idle.facing_angle_rad == pytest.approx(0.06)
-    assert guard.command_facing == pytest.approx(0.06)
+    assert idle.facing_angle_rad == pytest.approx(0.0)
+    assert guard.command_facing == pytest.approx(0.0)
     assert guard.command_zero is True
 
 

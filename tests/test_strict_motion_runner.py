@@ -78,6 +78,28 @@ def test_forward_probe_is_a_fixed_short_official_drive() -> None:
     ) == pytest.approx(10.0 + 2.0 / 3.0)
 
 
+def test_drive_on_heading_goal_speed_has_the_same_sign_as_distance() -> None:
+    class Goal:
+        def __init__(self) -> None:
+            self.target = SimpleNamespace(x=0.0, y=0.0, z=0.0)
+            self.speed = 0.0
+            self.time_allowance = SimpleNamespace(sec=0, nanosec=0)
+
+    backend = runner.RosLiveBackend.__new__(runner.RosLiveBackend)
+    backend._DriveOnHeading = SimpleNamespace(Goal=Goal)
+    backend._drive_client = object()
+    captured: list[object] = []
+    backend._send_goal = lambda _client, goal, **_kwargs: captured.append(goal) or goal
+
+    backend.send_drive(1.0, timeout_s=20.0)
+    backend.send_drive(-0.5, timeout_s=20.0)
+
+    assert captured[0].target.x == pytest.approx(1.0)
+    assert captured[0].speed == pytest.approx(runner.OFFICIAL_DRIVE_SPEED_MPS)
+    assert captured[1].target.x == pytest.approx(-0.5)
+    assert captured[1].speed == pytest.approx(-runner.OFFICIAL_REVERSE_SPEED_MPS)
+
+
 def test_drive_on_heading_rejects_wrong_sign_and_mixed_axes() -> None:
     relay = runner.StrictCommandRelay()
     relay.begin("forward")

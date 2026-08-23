@@ -1754,21 +1754,24 @@ class CmdVelGuard:
         *,
         source: str = "gait_adapter_controlled_stop",
     ) -> CmdVel:
-        """Stop while holding the latest measured facing in SONIC's frame.
+        """Rebase the latest measured heading as controlled IDLE's local zero.
 
-        The learned IDLE reference brakes from the current physical heading.
-        Freezing the preceding command goal instead can ask the planner to
-        correct yaw while it is trying to settle the gait.  Reconstruct the
-        controller-frame measured facing before ``accept(0)`` clears the
-        action's measurement anchor.  Terminal/fault stops deliberately keep
-        using :meth:`stop`; this re-anchor is only for the recoverable learned
-        controlled-stop transaction.
+        ``request_reference(lowstate)`` starts a fresh planner context whose
+        measured body orientation is the identity.  Carrying the preceding
+        controller-frame angle into that new context applies the physical yaw
+        twice: once in ``lowstate`` and once as a non-zero IDLE facing request.
+        The 2026-08-23 repeated-task incident did exactly that (0.2203 rad in,
+        0.1919 rad predicted) and the otherwise valid static result was
+        rejected by the IDLE yaw envelope.  Holding the current physical
+        heading in the fresh local frame is therefore exactly zero.
+
+        Terminal/fault stops deliberately keep using :meth:`stop`; this frame
+        reset belongs only to the recoverable measured-reference transaction.
         """
 
-        measured_facing = self._current_measured_facing()
-        self._facing = measured_facing
-        self._command_facing = measured_facing
-        self._action_facing_origin = measured_facing
+        self._facing = 0.0
+        self._command_facing = 0.0
+        self._action_facing_origin = 0.0
         self._heading_anchor = None
         return self.accept(0.0, 0.0, 0.0, source=source)
 
@@ -1824,15 +1827,30 @@ class CmdVelGuard:
             self._command_facing = self._wrap_angle(
                 self._command_facing + self._wz * integration_dt
             )
-            measured_facing = self._current_measured_facing()
-            lead_limit = (
-                self.max_translation_facing_offset_rad
-                if moving
-                else self.max_facing_lead_rad
-            )
-            lead = self._wrap_angle(self._command_facing - measured_facing)
-            lead = max(-lead_limit, min(lead_limit, lead))
-            self._facing = self._wrap_angle(measured_facing + lead)
+            if moving and abs(self._wz) <= 1e-9:
+                # DriveOnHeading and a pure lateral step require an absolute
+                # facing target for the complete action.  Following measured
+                # yaw here creates positive feedback: a normal humanoid torso
+                # oscillation moves the target with the body, so the policy is
+                # never asked to recover the original heading.  NVIDIA's
+                # planner contract keeps movement and facing directions
+                # independent; a zero angular command therefore holds the
+                # command-space facing exactly.
+                self._facing = self._command_facing
+            else:
+                # During an explicitly commanded turn, bound how far the
+                # emitted planner target may lead measured progress.  This is
+                # a rate/lag guard for the authorized angular command, not a
+                # mechanism for measured drift to redefine a straight goal.
+                measured_facing = self._current_measured_facing()
+                lead_limit = (
+                    self.max_translation_facing_offset_rad
+                    if moving
+                    else self.max_facing_lead_rad
+                )
+                lead = self._wrap_angle(self._command_facing - measured_facing)
+                lead = max(-lead_limit, min(lead_limit, lead))
+                self._facing = self._wrap_angle(measured_facing + lead)
         else:
             # Explicit zero, watchdog expiry and revocation freeze both the
             # emitted target and command integral. The next action gets a
