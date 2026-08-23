@@ -1882,8 +1882,10 @@ class SonicEvidenceClient:
                 return response
             except Exception as exc:
                 last_error = exc
+        detail = str(last_error or "unknown rejection").strip().replace("\x00", "")
+        detail = " ".join(detail.split())[:512] or "unknown rejection"
         raise StrictMotionRunnerError(
-            f"SONIC evidence operation {operation} failed"
+            f"SONIC evidence operation {operation} failed: {detail}"
         ) from last_error
 
     def begin(

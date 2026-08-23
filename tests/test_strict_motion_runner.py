@@ -25,6 +25,27 @@ def command(vx: float = 0.0, vy: float = 0.0, wz: float = 0.0):
     return runner.TwistCommand(vx, vy, wz)
 
 
+def test_sonic_evidence_client_preserves_bounded_server_rejection_detail() -> None:
+    calls = 0
+
+    def reject(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("exact balanced boundary rejected\nwith detail")
+
+    client = runner.SonicEvidenceClient(request=reject)
+    with pytest.raises(
+        runner.StrictMotionRunnerError,
+        match="exact balanced boundary rejected with detail",
+    ):
+        client.begin(
+            case_id="case-1",
+            plant_boot_id="11000000-0000-4000-8000-000000000001",
+            plant_session_id="12000000-0000-4000-8000-000000000001",
+        )
+    assert calls == 2
+
+
 @pytest.mark.parametrize(
     ("mode", "vx"),
     (

@@ -5642,24 +5642,75 @@ class SonicDriver:
             if observed_at is None or checked_at - observed_at > float(threshold):
                 raise RuntimeError(f"arm evidence requires a fresh {label}")
         authority = self._reference_authority.snapshot
-        if (
-            not self._intent_ingress.armed
-            or self._intent_ingress.staged_control_arm_generation is not None
-            or self._plant_support_mode != "idle"
-            or self._plant_support_stop_pending
-            or self._plant_support_safety_latched
-            or not self._static_hold_active
-            or self._navigation_task_active
-            or not self.guard.command_zero
-            or self._normal_stop_fences_motion_locked()
-            or authority.phase != "REVOKED"
-            or authority.actuator_authority
-            or self._last_published_targets is None
+        static_idle_boundary = bool(
+            self._intent_ingress.armed
+            and self._intent_ingress.staged_control_arm_generation is None
+            and self._plant_support_mode == "idle"
+            and not self._plant_support_stop_pending
+            and not self._plant_support_safety_latched
+            and self._static_hold_active
+            and not self._navigation_task_active
+            and self.guard.command_zero
+            and not self._normal_stop_fences_motion_locked()
+            and authority.phase == "REVOKED"
+            and not authority.actuator_authority
+            and self._last_published_targets is not None
+        )
+        if not (
+            static_idle_boundary
+            or self._arm_evidence_balanced_idle_boundary_locked()
         ):
             raise RuntimeError(
                 "arm evidence requires a freshly armed stationary IDLE boundary"
             )
         return self._arm_evidence_activation_binding_locked()
+
+    def _arm_evidence_balanced_idle_boundary_locked(self) -> bool:
+        """Prove that learned IDLE still owns the stationary actuator boundary.
+
+        Successful humanoid actions remain on the learned IDLE controller so
+        the untethered model keeps balancing.  Evidence archival must not
+        require a static joint freeze merely to declare that action complete.
+        This predicate mirrors the driver-owned facts committed by
+        :meth:`_complete_balanced_policy_idle_locked`; it is intentionally
+        stronger than the telemetry flag sampled by the acceptance runner.
+        """
+
+        authority = self._reference_authority.snapshot
+        activation = self._policy_activation
+        controller = getattr(self, "_controller", None)
+        identity = getattr(self, "_controlled_stop_source_identity", None)
+        return bool(
+            getattr(self, "_balanced_policy_idle_active", False)
+            and self._intent_ingress.armed
+            and not self._intent_ingress.braking
+            and self._intent_ingress.staged_control_arm_generation is None
+            and not self._normal_stop_fences_motion_locked()
+            and not self._process_stop_fences_motion_locked()
+            and self._plant_support_mode == "idle"
+            and not self._plant_support_stop_pending
+            and not self._plant_support_safety_latched
+            and not self._static_hold_active
+            and getattr(self, "_safe_hold_targets", None) is None
+            and not self._navigation_task_active
+            and self.guard.target_zero
+            and self.guard.command_zero
+            and authority.phase == "GRANTED"
+            and authority.actuator_authority
+            and isinstance(identity, tuple)
+            and len(identity) == 2
+            and authority.generation == identity[0]
+            and authority.source_sequence == identity[1]
+            and getattr(self, "_reference_source_identity", None) == identity
+            and getattr(self, "_reference_request_pending", True) is False
+            and getattr(self, "_controlled_stop_active", False)
+            and getattr(self, "_controlled_stop_reference_installed", False)
+            and controller is not None
+            and int(getattr(controller.ms, "mode", -1)) == 0
+            and not bool(getattr(controller.ms, "has_movement", True))
+            and activation.prepared
+            and self._last_published_targets is not None
+        )
 
     def _require_arm_evidence_finalize_locked(
         self,
@@ -5676,24 +5727,31 @@ class SonicDriver:
             if isinstance(support, Mapping)
             else None
         )
+        static_normal_stop_boundary = bool(
+            normal_stop.phase == "DRIVER_CONFIRMED"
+            and not self._intent_ingress.armed
+            and self._intent_ingress.staged_control_arm_generation is None
+            and self._plant_support_safety_latched
+            and not self._plant_support_stop_pending
+            and self._plant_support_mode == "safety_stop"
+            and self._static_hold_active
+            and not self._navigation_task_active
+            and self.guard.command_zero
+            and authority.phase == "REVOKED"
+            and not authority.actuator_authority
+        )
         if (
-            normal_stop.phase != "DRIVER_CONFIRMED"
-            or self._intent_ingress.armed
-            or self._intent_ingress.staged_control_arm_generation is not None
-            or not self._plant_support_safety_latched
-            or self._plant_support_stop_pending
-            or self._plant_support_mode != "safety_stop"
-            or not self._static_hold_active
-            or self._navigation_task_active
-            or not self.guard.command_zero
-            or authority.phase != "REVOKED"
-            or authority.actuator_authority
-            or not activation.prepared
+            not activation.prepared
             or identity.get("policyActivationEpoch") != activation.epoch
             or identity.get("supportReleaseConfirmedEpoch") != confirmed_epoch
+            or not (
+                static_normal_stop_boundary
+                or self._arm_evidence_balanced_idle_boundary_locked()
+            )
         ):
             raise RuntimeError(
-                "arm evidence requires an exact successful normal-stop boundary"
+                "arm evidence requires an exact successful stationary boundary "
+                "(normal-stop boundary or balanced-policy IDLE boundary)"
             )
 
     def _handle_arm_evidence_request(

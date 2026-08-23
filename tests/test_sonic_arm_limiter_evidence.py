@@ -101,6 +101,45 @@ def _prepared_activation(epoch: int = 1) -> SimpleNamespace:
     )
 
 
+def _configure_balanced_policy_idle(driver: SonicDriver, *, epoch: int = 1) -> None:
+    identity = (10, 20)
+    driver._policy_activation = _prepared_activation(epoch)
+    driver._balanced_policy_idle_active = True
+    driver._controlled_stop_active = True
+    driver._controlled_stop_source_identity = identity
+    driver._controlled_stop_reference_installed = True
+    driver._reference_source_identity = identity
+    driver._reference_request_pending = False
+    driver._safe_hold_targets = None
+    driver._static_hold_active = False
+    driver._controller = SimpleNamespace(
+        ms=SimpleNamespace(mode=0, has_movement=False),
+    )
+    driver._reference_authority.require(
+        generation=identity[0],
+        source_sequence=identity[1],
+    )
+    driver._reference_authority.mark_installed(
+        generation=identity[0],
+        source_sequence=identity[1],
+        planner_intent_generation=2,
+        reference_epoch=2,
+    )
+    driver._reference_authority.prime(
+        generation=identity[0],
+        source_sequence=identity[1],
+        reference_epoch=2,
+    )
+    driver._reference_authority.grant(
+        generation=identity[0],
+        source_sequence=identity[1],
+        reference_epoch=2,
+        granted_at_monotonic_s=10.0,
+        granted_at_tick_ms=1_000,
+        dds_target_sequence=7,
+    )
+
+
 def test_driver_records_global_arm_indices_at_each_successful_dds_fact(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -175,6 +214,104 @@ def test_driver_records_global_arm_indices_at_each_successful_dds_fact(
     assert evidence["records"][0]["constrainedJointIndices"] == [15]
     assert evidence["records"][0]["continuousSaturationByJointS"]["15"] == 0.02
     assert evidence["records"][1]["constrainedJoints"] == 0
+
+
+def test_evidence_can_begin_and_finalize_at_exact_balanced_policy_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = _driver()
+    _configure_balanced_policy_idle(driver)
+    monkeypatch.setattr(
+        "hide_mujoco_sonic.sonic_driver.read_plant_identity",
+        lambda *_args, **_kwargs: dict(PLANT_IDENTITY),
+    )
+
+    started = driver.accept_json(
+        _request(
+            "arm_limiter_evidence_begin",
+            "99999999-9999-4999-8999-999999999991",
+            plant_boot_id=PLANT_IDENTITY["producerBootId"],
+            plant_session_id=PLANT_IDENTITY["sessionId"],
+        )
+    )
+    assert started is not None
+    assert started["status"] == "recording"
+    assert started["policy_activation_epoch"] == 1
+
+    for tick in (1000, 1020):
+        driver._control_evidence_context.control_step = PlantControlStep(tick, 0.02)
+        token = driver._begin_arm_evidence_write()
+        driver._record_successful_dds_target(
+            tuple(0.0 for _ in range(29)),
+            evidence_write_token=token,
+        )
+
+    completed = driver.accept_json(
+        _request(
+            "arm_limiter_evidence_finalize",
+            "99999999-9999-4999-8999-999999999992",
+        )
+    )
+    assert completed is not None
+    assert completed["status"] == "complete"
+    assert completed["evidence"]["taskEndControlTick"] == 2
+
+
+def test_evidence_rejects_balanced_idle_flag_without_exact_controller_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = _driver()
+    _configure_balanced_policy_idle(driver)
+    driver._controller.ms.has_movement = True
+    monkeypatch.setattr(
+        "hide_mujoco_sonic.sonic_driver.read_plant_identity",
+        lambda *_args, **_kwargs: dict(PLANT_IDENTITY),
+    )
+
+    with pytest.raises(RuntimeError, match="stationary IDLE boundary"):
+        driver.accept_json(
+            _request(
+                "arm_limiter_evidence_begin",
+                "99999999-9999-4999-8999-999999999993",
+                plant_boot_id=PLANT_IDENTITY["producerBootId"],
+                plant_session_id=PLANT_IDENTITY["sessionId"],
+            )
+        )
+
+
+def test_evidence_finalize_rejects_lost_balanced_policy_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = _driver()
+    monkeypatch.setattr(
+        "hide_mujoco_sonic.sonic_driver.read_plant_identity",
+        lambda *_args, **_kwargs: dict(PLANT_IDENTITY),
+    )
+    driver.accept_json(
+        _request(
+            "arm_limiter_evidence_begin",
+            "99999999-9999-4999-8999-999999999994",
+            plant_boot_id=PLANT_IDENTITY["producerBootId"],
+            plant_session_id=PLANT_IDENTITY["sessionId"],
+        )
+    )
+    for tick in (1000, 1020):
+        driver._control_evidence_context.control_step = PlantControlStep(tick, 0.02)
+        token = driver._begin_arm_evidence_write()
+        driver._record_successful_dds_target(
+            tuple(0.0 for _ in range(29)),
+            evidence_write_token=token,
+        )
+
+    _configure_balanced_policy_idle(driver)
+    driver._reference_request_pending = True
+    with pytest.raises(RuntimeError, match="balanced-policy IDLE boundary"):
+        driver.accept_json(
+            _request(
+                "arm_limiter_evidence_finalize",
+                "99999999-9999-4999-8999-999999999995",
+            )
+        )
 
 
 def test_evidence_begin_and_finalize_fail_closed_on_identity_or_state_drift(
