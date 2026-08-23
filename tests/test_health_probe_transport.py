@@ -81,6 +81,7 @@ def health_response(request_id: UUID) -> dict[str, object]:
         "navigation_task_active": False,
         "motion_authorized": False,
         "nav2_command_zero": True,
+        "controlled_policy_stop_active": False,
         "matched_reference_actuator_authority": False,
         "reference_authority_state": "REVOKED",
         "reference_authority_generation": None,

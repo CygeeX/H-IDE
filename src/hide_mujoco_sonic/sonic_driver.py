@@ -10,7 +10,7 @@ from __future__ import annotations
 import argparse
 from collections import deque
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import logging
@@ -201,6 +201,7 @@ class SonicIntentIngress:
         self.generation: int | None = None
         self.sequence = 0
         self.armed = False
+        self.braking = False
         self.support_stop_generation: int | None = None
         self.staged_control_arm_generation: int | None = None
 
@@ -208,6 +209,7 @@ class SonicIntentIngress:
         """Drop motion authority without manufacturing a new generation."""
 
         self.armed = False
+        self.braking = False
         self.staged_control_arm_generation = None
 
     def latch_support_stop(self) -> int:
@@ -221,6 +223,7 @@ class SonicIntentIngress:
                 self.support_stop_generation, stopped
             )
         self.armed = False
+        self.braking = False
         self.staged_control_arm_generation = None
         return self.support_stop_generation
 
@@ -254,6 +257,7 @@ class SonicIntentIngress:
                 "staged support rearm does not match the validated generation"
             )
         self.armed = True
+        self.braking = False
         self.support_stop_generation = None
         self.staged_control_arm_generation = None
 
@@ -329,6 +333,7 @@ class SonicIntentIngress:
             self.generation = generation
             self.sequence = 0
             self.armed = False
+            self.braking = False
             self.staged_control_arm_generation = None
         if sequence <= self.sequence:
             return IngressDecision(
@@ -358,14 +363,24 @@ class SonicIntentIngress:
                     arm_candidate = False
                     reason = "control rearm requires a strictly newer generation"
             was_armed = self.armed
+            controlled_brake = bool(
+                state == "STOPPING"
+                and stop_requested
+                and not motion_enabled
+                and not stop_acknowledged
+                and not control_arm
+                and self.support_stop_generation is None
+                and (self.armed or self.braking)
+            )
             if defer_control_arm and control_arm and arm_candidate:
                 self.armed = False
                 self.staged_control_arm_generation = generation
             else:
                 self.armed = arm_candidate
                 self.staged_control_arm_generation = None
+            self.braking = controlled_brake
             return IngressDecision(
-                "stop",
+                "brake" if controlled_brake else "stop",
                 generation,
                 sequence,
                 state,
@@ -399,6 +414,7 @@ class SonicIntentIngress:
             raise ValueError("intent linear speed does not match its velocity vector")
         if not any(abs(value) > 1e-6 for value in (vx, vy, wz)):
             raise ValueError("motion-enabled intent contains no Nav2 motion")
+        self.braking = False
         return IngressDecision(
             "motion", generation, sequence, state, vx, vy, wz, heading
         )
@@ -476,6 +492,9 @@ class SonicDriver:
             max_age_s=max(0.50, config.command_timeout_s * 2.0)
         )
         self._navigation_task_active = False
+        self._controlled_stop_active = False
+        self._controlled_stop_source_identity: tuple[int, int] | None = None
+        self._controlled_stop_reference_installed = False
         self._input_buffer = b""
         self._last_intent_signature: tuple[bool, float, float, float] | None = None
         self._decoder_facing_rad: float | None = None
@@ -515,6 +534,7 @@ class SonicDriver:
         self._normal_stop_plant_safety_stop_epoch: int | None = None
         self._normal_stop_last_confirmed_plant_epoch = 0
         self._normal_stop_begin_intent: bytes | None = None
+        self._normal_stop_policy_braking = False
         self._normal_stop_seen_request_ids: set[UUID] = set()
         self._normal_stop_replays: dict[
             UUID,
@@ -669,11 +689,34 @@ class SonicDriver:
                     "MuJoCo plant tick rolled back; explicit process restart required"
                 )
             elif self._control_clock_armed:
-                try:
-                    control_step = self._control_clock.observe(tick)
-                except PlantControlClockFault as exc:
-                    clock_fault = str(exc)
+                previous_tick = self._control_clock.last_observed_tick_ms
+                startup_forward_gap = bool(
+                    self._startup_qualifying
+                    and previous_tick is not None
+                    and tick - previous_tick
+                    > self._control_clock.max_source_gap_ms
+                )
+                if startup_forward_gap:
+                    # ONNX/GPU warmup may hold the Python DDS callback while
+                    # Plant continues to publish a stationary measured hold.
+                    # No controller state, policy cursor, or actuator motion
+                    # exists during qualification, so invalidate all pending
+                    # credit and require a fresh consecutive 50 Hz window.
+                    # The identical gap after motion_ready remains terminal.
+                    self._control_clock.rebase_stationary_qualification(tick)
+                    self._pending_control_sample = None
+                    self._startup_qualification_dropped_samples += 1
+                    self._startup_qualification_drop_generation += 1
+                    self._startup_qualification_consecutive_steps = 0
+                    self._control_condition.notify_all()
+                    control_step = None
                 else:
+                    try:
+                        control_step = self._control_clock.observe(tick)
+                    except PlantControlClockFault as exc:
+                        clock_fault = str(exc)
+                        control_step = None
+                if clock_fault is None:
                     if control_step is not None:
                         if self._pending_control_sample is not None:
                             if self._startup_qualifying:
@@ -1038,7 +1081,17 @@ class SonicDriver:
             if (
                 sample_drop_generation
                 != self._startup_qualification_drop_generation
+                or self._pending_control_sample is not None
             ):
+                # Qualification may transition to runtime only at a clean
+                # producer/consumer boundary.  A newer stationary sample can
+                # legitimately arrive while the measured hold for this sample
+                # is being published.  If it is already pending, completing
+                # qualification here would reclassify that queued startup
+                # sample as a runtime policy step; one further callback could
+                # then report a false runtime overrun before the consumer gets
+                # scheduled.  Keep the latest sample, discard all accumulated
+                # qualification credit, and require a fresh clean window.
                 self._startup_qualification_consecutive_steps = 0
             else:
                 self._startup_qualification_consecutive_steps += 1
@@ -1382,6 +1435,10 @@ class SonicDriver:
         failures: list[Exception] = []
         frozen = False
         with self._support_lock:
+            self._controlled_stop_active = False
+            self._controlled_stop_source_identity = None
+            self._controlled_stop_reference_installed = False
+            self._normal_stop_policy_braking = False
             try:
                 frozen = self._freeze_last_published_hold(
                     publish_telemetry=publish_telemetry
@@ -1424,6 +1481,63 @@ class SonicDriver:
         if failures:
             raise failures[0]
         return frozen
+
+    def _begin_controlled_policy_stop_locked(
+        self,
+        decision: IngressDecision,
+    ) -> bool:
+        """Retain learned-control continuity while rejecting new locomotion.
+
+        STOPPING is recoverable deceleration, not a terminal safety event.  It
+        may keep the already-GRANTED SONIC reference running while the official
+        IDLE reference is planned.  Fault, process-stop, support-latch, startup,
+        and pre-grant paths deliberately fall back to the exact static boundary.
+        The caller owns ``_support_lock``.
+        """
+
+        if (
+            decision.action != "brake"
+            or decision.state != "STOPPING"
+            or decision.generation is None
+            or decision.sequence is None
+        ):
+            return False
+        if not self._controlled_policy_stop_eligible_locked(decision.generation):
+            return False
+        self.guard.stop_at_measured_heading(
+            source="gait_adapter_controlled_stop"
+        )
+        self._controlled_stop_active = True
+        self._controlled_stop_source_identity = (
+            decision.generation,
+            decision.sequence,
+        )
+        self._controlled_stop_reference_installed = False
+        self._navigation_task_active = False
+        return True
+
+    def _controlled_policy_stop_eligible_locked(self, generation: int) -> bool:
+        """Check whether STOPPING may retain the current learned controller."""
+
+        authority = self._reference_authority.snapshot
+        activation = getattr(self, "_policy_activation", None)
+        controller = getattr(self, "_controller", None)
+        return not (
+            authority.phase != "GRANTED"
+            or authority.generation != generation
+            or self._last_published_targets is None
+            or activation is None
+            or not bool(getattr(activation, "prepared", False))
+            or controller is None
+            or not bool(getattr(controller, "initialized", False))
+            or not bool(
+                self._intent_ingress.armed or self._intent_ingress.braking
+            )
+            or self._fault_latched.is_set()
+            or self._process_stop_fences_motion_locked()
+            or self._plant_support_stop_pending
+            or self._plant_support_safety_latched
+        )
 
     def _freeze_planner_handoff_boundary(self) -> bool:
         """Start a new planner generation from the last actuator target.
@@ -2368,6 +2482,22 @@ class SonicDriver:
                 ),
             )
         controller = getattr(self, "_controller", None)
+        pipeline = getattr(controller, "controller", None)
+        readapt_state = getattr(pipeline, "idle_readapt_state", None)
+        readapt_state_name = getattr(readapt_state, "name", None)
+        fields.update(
+            sonic_idle_readapt_state=(
+                readapt_state_name
+                if isinstance(readapt_state_name, str)
+                else "IDLE"
+            ),
+            sonic_idle_readapt_stored=bool(
+                getattr(pipeline, "idle_readapt_stored", False)
+            ),
+            sonic_idle_readapt_average_error_rad=float(
+                getattr(pipeline, "idle_readapt_average_error_rad", 0.0)
+            ),
+        )
         fields["sonic_execution_feedback_pending"] = bool(
             getattr(controller, "execution_feedback_pending", False)
         )
@@ -2475,6 +2605,24 @@ class SonicDriver:
         intent = self.guard.intent(dt=dt)
         controller = self._controller
         decoder = controller.controller
+        controlled_stop = bool(
+            getattr(self, "_controlled_stop_active", False)
+            and intent.mode == "IDLE"
+        )
+        if controlled_stop:
+            # Once the correlated STOPPING transaction owns deceleration, the
+            # zero command is driver-owned rather than a live Nav2 command.
+            # CmdVelGuard will eventually mark that same zero stale and change
+            # its source to ``watchdog``.  Those freshness fields do not alter
+            # the IDLE planner request, and treating them as a new intent makes
+            # a second planner generation reuse the same gait source sequence.
+            # Keep one canonical planner identity for the entire controlled
+            # stop; cmd_vel age remains independently visible in telemetry.
+            intent = replace(
+                intent,
+                stale=False,
+                source="gait_adapter_controlled_stop",
+            )
         # This is the sole ROS/Nav2 -> SONIC mapping.  It changes SONIC's
         # high-level MovementState; it never writes qpos or a motor command.
         from lerobot.robots.unitree_g1.controllers.sonic_pipeline import LM
@@ -2498,7 +2646,7 @@ class SonicDriver:
         # The IDLE branch matters when the local cmd_vel watchdog fires before
         # an explicit Robot Agent stop arrives: StaticJointHandoff must not
         # replace the gravity-balancing target with lagging measured angles.
-        requires_actuator_boundary = admitted and (
+        requires_actuator_boundary = admitted and not controlled_stop and (
             intent.mode != "IDLE"
             or (previous is not None and previous.mode != "IDLE")
         )
@@ -2534,19 +2682,26 @@ class SonicDriver:
                 )
                 self._reference_request_pending = not defer_planner_for_activation
         elif admitted and intent.mode == "IDLE":
-            self._revoke_planner_reference("Nav2 intent is IDLE")
-            abort_activation = getattr(activation, "abort", None)
-            if callable(abort_activation):
-                abort_activation()
-            self._policy_activation_requested = False
+            if controlled_stop:
+                if not self._reference_authority.executable:
+                    raise RuntimeError(
+                        "controlled stop lost its granted SONIC reference"
+                    )
+            else:
+                self._revoke_planner_reference("Nav2 intent is IDLE")
+                abort_activation = getattr(activation, "abort", None)
+                if callable(abort_activation):
+                    abort_activation()
+                self._policy_activation_requested = False
         if not defer_planner_for_activation:
             self._planner_evidence.observe_intent(
                 intent,
                 admitted=admitted,
                 simulation_now_s=simulation_now_s,
+                allow_static_reference=controlled_stop,
             )
         if intent.mode == "IDLE":
-            if previous is None or previous.mode != "IDLE":
+            if not controlled_stop and (previous is None or previous.mode != "IDLE"):
                 # Re-anchor SONIC's decoder to the measured IMU heading while
                 # the actuator side is held static.  The next Nav2 action then
                 # starts from the robot's real orientation rather than a stale
@@ -2579,21 +2734,32 @@ class SonicDriver:
                 decoder.delta_heading += delta
             self._decoder_facing_rad = intent.facing_angle_rad
         if admitted:
-            controller.ms.mode = LM.SLOW_WALK if intent.mode == "SLOW_WALK" else LM.IDLE
+            # Official SONIC ROS2 maps angular-only navigation to an IDLE
+            # planner motion whose facing direction changes. Keep the outer
+            # intent active for authority/watchdog semantics, but do not ask
+            # the planner for a zero-translation SLOW_WALK clip: that clip
+            # reaches only a partial turn and then plateaus in the deployment
+            # MuJoCo model.
+            pure_rotation = intent.mode == "SLOW_WALK" and not intent.has_movement
+            controller.ms.mode = (
+                LM.IDLE
+                if pure_rotation or intent.mode == "IDLE"
+                else LM.SLOW_WALK
+            )
             controller.ms.speed = intent.speed_mps if intent.has_movement else -1.0
             controller.ms.movement_angle = intent.movement_angle_rad
             controller.ms.facing_angle = intent.facing_angle_rad
             controller.ms.has_movement = intent.has_movement
             # Manual authority requests the reference explicitly on the
             # planning-only path; the policy tick must not issue a duplicate.
-            controller.ms.needs_replan = False
+            controller.ms.needs_replan = bool(controlled_stop)
             self._last_intent_signature = (
                 intent.has_movement,
                 round(intent.movement_angle_rad, 3),
                 round(intent.facing_angle_rad, 3),
                 round(intent.speed_mps if intent.has_movement else -1.0, 3),
             )
-        else:
+        elif not controlled_stop:
             controller.ms.needs_replan = False
         received_at = self.guard.last_received_at
         self.telemetry.update(
@@ -3302,17 +3468,73 @@ class SonicDriver:
             proof = self._planner_evidence.authority_evidence
             if (
                 not proof.reference_ready
-                or proof.accepted_intent_generation
-                != authority.planner_intent_generation
                 or proof.accepted_intent_signature != proof.intent_signature
                 or not controller.matching_reference_installed
             ):
                 raise RuntimeError(
-                    "periodic SONIC refresh lacks same-intent authority evidence"
+                    "installed SONIC refresh lacks matching authority evidence"
                 )
             assert authority.generation is not None
             assert authority.source_sequence is not None
             assert authority.planner_intent_generation is not None
+            controlled_stop_identity = getattr(
+                self, "_controlled_stop_source_identity", None
+            )
+            if getattr(self, "_controlled_stop_active", False):
+                controlled_stop_reference_installed = bool(
+                    getattr(self, "_controlled_stop_reference_installed", False)
+                )
+                if (
+                    controlled_stop_identity is None
+                    or controlled_stop_identity[0] != authority.generation
+                    or int(getattr(controller.ms, "mode", -1)) != 0
+                    or bool(getattr(controller.ms, "has_movement", True))
+                ):
+                    raise RuntimeError(
+                        "controlled-stop IDLE reference lacks exact transition identity"
+                    )
+                if controlled_stop_reference_installed:
+                    if (
+                        controlled_stop_identity[1] != authority.source_sequence
+                        or proof.accepted_intent_generation
+                        != authority.planner_intent_generation
+                    ):
+                        raise RuntimeError(
+                            "installed controlled-stop reference changed identity"
+                        )
+                    self._reference_authority.refresh(
+                        generation=authority.generation,
+                        source_sequence=authority.source_sequence,
+                        planner_intent_generation=(
+                            authority.planner_intent_generation
+                        ),
+                        reference_epoch=epoch,
+                    )
+                    return
+                if (
+                    proof.accepted_intent_generation is None
+                    or proof.accepted_intent_generation
+                    == authority.planner_intent_generation
+                ):
+                    raise RuntimeError(
+                        "controlled-stop IDLE reference lacks a new planner identity"
+                    )
+                self._reference_authority.transition(
+                    generation=controlled_stop_identity[0],
+                    source_sequence=controlled_stop_identity[1],
+                    planner_intent_generation=proof.accepted_intent_generation,
+                    reference_epoch=epoch,
+                )
+                self._reference_source_identity = controlled_stop_identity
+                self._controlled_stop_reference_installed = True
+                return
+            if (
+                proof.accepted_intent_generation
+                != authority.planner_intent_generation
+            ):
+                raise RuntimeError(
+                    "periodic SONIC refresh changed planner intent generation"
+                )
             self._reference_authority.refresh(
                 generation=authority.generation,
                 source_sequence=authority.source_sequence,
@@ -3718,6 +3940,50 @@ class SonicDriver:
             "FAILED",
         }
 
+    @staticmethod
+    def _desired_policy_support_mode(
+        *,
+        intent_mode: str,
+        controlled_stop: bool,
+        decision_static_hold: bool,
+        activation_waiting_for_release: bool,
+        handoff_ratio: float,
+    ) -> str:
+        """Select Plant support without treating learned braking as locomotion.
+
+        A correlated normal stop keeps SONIC's already-granted controller only
+        long enough to run the official IDLE policy to measured stationarity.
+        The Plant transaction deliberately owns the ``idle`` support state
+        throughout that interval.  Asking for ``locomotion`` here contradicts
+        :meth:`_set_plant_support_mode`, which rejects new locomotion as soon
+        as BRAKING owns the boundary.
+        """
+
+        if (
+            controlled_stop
+            or decision_static_hold
+            or activation_waiting_for_release
+        ):
+            return "idle"
+        if intent_mode != "IDLE" and float(handoff_ratio) > 0.0:
+            return "locomotion"
+        return "idle"
+
+    def _old_locomotion_tick_lost_to_controlled_stop_locked(
+        self,
+        *,
+        controlled_stop_at_tick_start: bool,
+    ) -> bool:
+        """Recognize only a pre-BRAKING locomotion decision that lost its race."""
+
+        normal_stop = getattr(self, "_normal_stop", None)
+        return bool(
+            not controlled_stop_at_tick_start
+            and getattr(self, "_normal_stop_policy_braking", False)
+            and isinstance(normal_stop, NormalStopState)
+            and normal_stop.snapshot.phase == "BRAKING"
+        )
+
     def _process_stop_fences_motion_locked(self) -> bool:
         stop_event = getattr(self, "_stop", None)
         return bool(stop_event is not None and stop_event.is_set())
@@ -3725,12 +3991,21 @@ class SonicDriver:
     def _normal_stop_static_boundary_locked(self) -> bool:
         """Return the current recoverable stop's physical/local hold fence."""
 
+        normal_stop = getattr(self, "_normal_stop", None)
+        policy_braking = bool(
+            getattr(self, "_normal_stop_policy_braking", False)
+            and isinstance(normal_stop, NormalStopState)
+            and normal_stop.snapshot.phase == "BRAKING"
+        )
         return (
             self._process_stop_fences_motion_locked()
             or self._plant_support_stop_pending
             or self._plant_support_safety_latched
             or self._safe_hold_targets is not None
-            or self._normal_stop_fences_motion_locked()
+            or (
+                self._normal_stop_fences_motion_locked()
+                and not policy_braking
+            )
         )
 
     def _rejected_locomotion_is_static_boundary_locked(self) -> bool:
@@ -3866,7 +4141,11 @@ class SonicDriver:
                 measured = tuple(
                     float(lowstate.motor_state[index].q) for index in range(29)
                 )
-                if intent.mode == "IDLE":
+                controlled_stop = bool(
+                    getattr(self, "_controlled_stop_active", False)
+                    and intent.mode == "IDLE"
+                )
+                if intent.mode == "IDLE" and not controlled_stop:
                     with self._support_lock:
                         decision = self._joint_handoff.decide(
                             motion_active=False,
@@ -3966,6 +4245,11 @@ class SonicDriver:
                     )
                     continue
 
+                if controlled_stop:
+                    self._enforce_planner_reference_deadline(
+                        simulation_now_s=control_step.tick_ms / 1_000.0
+                    )
+
                 try:
                     self._advance_policy_activation_release_after_grant(
                         tick_ms=control_step.tick_ms
@@ -4012,23 +4296,62 @@ class SonicDriver:
                     and not activation.prepared
                     and activation.waiting_for_support_release
                 )
-                if decision.static_hold_active or activation_waiting_for_release:
-                    desired_support_mode = "idle"
-                elif intent.mode != "IDLE" and decision.handoff_ratio > 0.0:
-                    desired_support_mode = "locomotion"
-                else:
-                    desired_support_mode = "idle"
+                desired_support_mode = self._desired_policy_support_mode(
+                    intent_mode=intent.mode,
+                    controlled_stop=controlled_stop,
+                    decision_static_hold=decision.static_hold_active,
+                    activation_waiting_for_release=(
+                        activation_waiting_for_release
+                    ),
+                    handoff_ratio=decision.handoff_ratio,
+                )
                 support_ready = self._set_plant_support_mode(
                     desired_support_mode
                 )
                 if not support_ready and desired_support_mode == "locomotion":
                     with self._support_lock:
+                        old_tick_lost_to_controlled_stop = (
+                            self._old_locomotion_tick_lost_to_controlled_stop_locked(
+                                controlled_stop_at_tick_start=controlled_stop,
+                            )
+                        )
                         expected_safety_stop = (
                             self._rejected_locomotion_is_static_boundary_locked()
                         )
                         rejected_transition_token = (
                             self._support_transition_token_locked()
                         )
+                    if old_tick_lost_to_controlled_stop:
+                        # This tick sampled motion before the correlated stop
+                        # acquired the boundary.  The next 50 Hz tick will run
+                        # the already-granted IDLE policy under Plant idle
+                        # support.  A policy candidate already exists, so
+                        # publish the exact prior actuator target once and
+                        # feed that physical fact back to SONIC.  Skipping DDS
+                        # here would strand unpublished execution feedback;
+                        # publishing the obsolete motion proposal would cross
+                        # the newly-owned stop boundary.
+                        with self._support_lock:
+                            controlled_hold_targets = (
+                                self._safe_hold_targets
+                                or self._last_published_targets
+                            )
+                        if controlled_hold_targets is None:
+                            raise RuntimeError(
+                                "controlled stop has no executed actuator boundary"
+                            )
+                        self._publish_position_hold(controlled_hold_targets)
+                        assert self._last_published_targets is not None
+                        self._record_control_trace(
+                            lowstate=lowstate,
+                            control_step=control_step,
+                            intent=intent,
+                            policy_targets=policy_targets,
+                            handoff_targets=decision.targets,
+                            published_targets=self._last_published_targets,
+                            handoff_ratio=decision.handoff_ratio,
+                        )
+                        continue
                     if expected_safety_stop:
                         # A lease release/cancel can race a policy tick that
                         # was already computing.  Publish only measured hold
@@ -4172,6 +4495,8 @@ class SonicDriver:
             self._normal_stop_last_confirmed_plant_epoch = 0
         if not hasattr(self, "_normal_stop_begin_intent"):
             self._normal_stop_begin_intent = None
+        if not hasattr(self, "_normal_stop_policy_braking"):
+            self._normal_stop_policy_braking = False
         if not hasattr(self, "_normal_stop_seen_request_ids"):
             self._normal_stop_seen_request_ids = set()
         if not hasattr(self, "_normal_stop_replays"):
@@ -4440,53 +4765,86 @@ class SonicDriver:
                             raise NormalStopWireError(
                                 "same bridge boot requires a newer gait source sequence"
                             )
-                    # Revoke and freeze before the normal-stop transaction is
-                    # made visible.  These are one-way safety strengthenings:
-                    # a concurrent shutdown/fault may win after this point and
-                    # leave the ingress sequence and normal-stop identity
-                    # untouched.  Never retain the terminal lock while the
-                    # boundary reaches planner/guard/handoff locks.
-                    self._intent_ingress.revoke()
+                    policy_candidate = self._controlled_policy_stop_eligible_locked(
+                        generation
+                    )
+                    if not policy_candidate:
+                        # Startup/pre-grant and already-static stops establish
+                        # the exact boundary before the transaction becomes
+                        # visible, preserving the original shutdown ordering.
+                        try:
+                            self._stop_navigation_at_boundary(
+                                source="normal_stop_begin",
+                                publish_telemetry=False,
+                            )
+                        except Exception as exc:
+                            raise _NormalStopBoundaryError(str(exc)) from exc
+                        self._static_hold_active = True
                     try:
-                        self._stop_navigation_at_boundary(
-                            source="normal_stop_begin",
-                            publish_telemetry=False,
-                        )
-                    except Exception as exc:
-                        raise _NormalStopBoundaryError(str(exc)) from exc
-                    self._static_hold_active = True
-                    with self._terminal_fault_lock:
-                        if self._fault_latched.is_set():
-                            raise RuntimeError(
-                                "SONIC terminal fault won normal-stop begin"
+                        with self._terminal_fault_lock:
+                            if self._fault_latched.is_set():
+                                raise RuntimeError(
+                                    "SONIC terminal fault won normal-stop begin"
+                                )
+                            if self._stop.is_set():
+                                raise RuntimeError(
+                                    "SONIC shutdown won normal-stop begin"
+                                )
+                            decision = self._intent_ingress.accept(intent)
+                            policy_braking = bool(
+                                policy_candidate
+                                and self._begin_controlled_policy_stop_locked(
+                                    decision
+                                )
                             )
-                        if self._stop.is_set():
-                            raise RuntimeError(
-                                "SONIC shutdown won normal-stop begin"
+                            admitted_action = (
+                                decision.action == "brake"
+                                if policy_braking
+                                else decision.action in {"brake", "stop"}
                             )
-                        decision = self._intent_ingress.accept(intent)
-                        if (
-                            decision.action != "stop"
-                            or decision.state != "STOPPING"
-                            or decision.generation != generation
-                            or decision.sequence != sequence
-                        ):
-                            raise NormalStopWireError(
-                                "normal-stop begin intent was not admitted exactly"
+                            if (
+                                not admitted_action
+                                or decision.state != "STOPPING"
+                                or decision.generation != generation
+                                or decision.sequence != sequence
+                            ):
+                                raise NormalStopWireError(
+                                    "normal-stop begin intent was not admitted exactly"
+                                )
+                            if policy_braking:
+                                self._controlled_stop_source_identity = (
+                                    generation,
+                                    sequence,
+                                )
+                            else:
+                                self._intent_ingress.revoke()
+                            snapshot = state.begin(
+                                control_generation=generation,
+                                gait_source_sequence=sequence,
+                                allow_source_sequence_reset=allow_sequence_reset,
                             )
-                        self._intent_ingress.revoke()
-                        snapshot = state.begin(
-                            control_generation=generation,
-                            gait_source_sequence=sequence,
-                            allow_source_sequence_reset=allow_sequence_reset,
-                        )
-                        self._normal_stop_replays.clear()
-                        self._normal_stop_bridge_boot_id = request.bridge_boot_id
-                        self._normal_stop_seen_bridge_boot_ids.add(
-                            request.bridge_boot_id
-                        )
-                        self._normal_stop_plant_safety_stop_epoch = None
-                        self._normal_stop_begin_intent = intent_signature
+                            self._normal_stop_replays.clear()
+                            self._normal_stop_bridge_boot_id = request.bridge_boot_id
+                            self._normal_stop_seen_bridge_boot_ids.add(
+                                request.bridge_boot_id
+                            )
+                            self._normal_stop_plant_safety_stop_epoch = None
+                            self._normal_stop_begin_intent = intent_signature
+                            self._normal_stop_policy_braking = policy_braking
+                    except ValueError:
+                        if policy_candidate:
+                            # A structurally valid but stale live stop still
+                            # strengthens the actuator boundary before its
+                            # identity is rejected.
+                            try:
+                                self._stop_navigation_at_boundary(
+                                    source="normal_stop_begin",
+                                    publish_telemetry=False,
+                                )
+                            except Exception as exc:
+                                raise _NormalStopBoundaryError(str(exc)) from exc
+                            self._static_hold_active = True
+                        raise
 
                 response = self._normal_stop_response_locked(
                     request_id=request.request_id,
@@ -4565,9 +4923,22 @@ class SonicDriver:
                 raise NormalStopWireError(
                     "stationary intent must follow the first braking sequence"
                 )
-            # Begin already established the physical/local static boundary.
-            # Keep this commit short so terminal Plant halt never waits on
-            # planner, guard, or handoff work.
+            if getattr(self, "_normal_stop_policy_braking", False):
+                # The learned IDLE transition retained actuator authority only
+                # through measured braking. Freeze its exact last successful
+                # DDS target now that GaitAdapter has proved stationarity.
+                try:
+                    self._stop_navigation_at_boundary(
+                        source="normal_stop_stationary",
+                        publish_telemetry=False,
+                    )
+                except Exception as exc:
+                    raise _NormalStopBoundaryError(str(exc)) from exc
+                self._static_hold_active = True
+            # Either begin (already-static path) or the measured stationary
+            # transition above established the physical/local hold boundary.
+            # Keep the remaining commit short so Plant halt never waits on
+            # planner work.
             with self._terminal_fault_lock:
                 if self._fault_latched.is_set():
                     raise RuntimeError(
@@ -5284,8 +5655,29 @@ class SonicDriver:
                 motion_authorized = self._intent_ingress.armed
                 static_hold_active = self._static_hold_active
                 navigation_task_active = self._navigation_task_active
-                nav2_command_zero = self.guard.command_zero
+                # Health reports the latest admitted Nav2 target, not the
+                # previous control tick's filtered value.  On STOPPING the
+                # target becomes zero atomically with driver-owned braking,
+                # while ``command_zero`` becomes true on the next 20 ms tick.
+                # Treating that bounded tail as a non-zero external command
+                # caused a false GRANTED-authority contract fault in live
+                # motion.  Final static-stop proof below/elsewhere still uses
+                # the stronger ``guard.command_zero`` predicate.
+                nav2_command_zero = self.guard.target_zero
                 authority = self._reference_authority.snapshot
+                # STOPPING becomes actuator ownership as soon as the driver
+                # admits the zero-command braking intent.  The correlated
+                # normal-stop service may arrive a few scheduler slices later;
+                # requiring that second transaction here creates an impossible
+                # GRANTED + zero-command health snapshot during the legitimate
+                # policy-braking interval.
+                controlled_policy_stop_active = bool(
+                    getattr(self, "_controlled_stop_active", False)
+                    and self._intent_ingress.braking
+                    and not self._intent_ingress.armed
+                    and not navigation_task_active
+                    and nav2_command_zero
+                )
             terminal_fault = self._fault_latched.is_set()
             motion_ready = (
                 not terminal_fault
@@ -5352,6 +5744,9 @@ class SonicDriver:
                 "navigation_task_active": navigation_task_active,
                 "motion_authorized": motion_authorized,
                 "nav2_command_zero": nav2_command_zero,
+                "controlled_policy_stop_active": (
+                    controlled_policy_stop_active
+                ),
                 "matched_reference_actuator_authority": (
                     visible_actuator_authority
                 ),
@@ -5464,6 +5859,7 @@ class SonicDriver:
             and gait_state == "FAULT"
         )
         stop_boundary_applied = False
+        controlled_brake_applied = False
         stop_boundary_error: Exception | None = None
         try:
             if control_arm:
@@ -5499,7 +5895,20 @@ class SonicDriver:
                         # decision and mutation of generation/sequence.
                         return None
                     decision = self._intent_ingress.accept(payload)
-                    if decision.action == "stop":
+                    if decision.action == "brake":
+                        controlled_brake_applied = (
+                            self._begin_controlled_policy_stop_locked(decision)
+                        )
+                        if not controlled_brake_applied:
+                            try:
+                                self._stop_navigation_at_boundary(
+                                    source="gait_adapter_pregrant_stop",
+                                    publish_telemetry=False,
+                                )
+                            except Exception as exc:
+                                stop_boundary_error = exc
+                            stop_boundary_applied = True
+                    elif decision.action == "stop":
                         try:
                             self._stop_navigation_at_boundary(
                                 source=(
@@ -5527,6 +5936,27 @@ class SonicDriver:
             )
             raise
         if decision.action == "ignore":
+            return None
+        if not control_arm and decision.action == "brake":
+            if stop_boundary_error is not None:
+                self._latch_terminal_fault(
+                    "controlled-stop fallback boundary fault: "
+                    + str(stop_boundary_error),
+                    boundary_already_stopped=True,
+                )
+                return None
+            self.telemetry.update(
+                nav2_state=(
+                    "braking" if controlled_brake_applied else "safety_stop"
+                ),
+                navigation_task_active=False,
+                last_cmd_vx=0.0,
+                last_cmd_vy=0.0,
+                last_cmd_wz=0.0,
+                static_hold_active=not controlled_brake_applied,
+                last_error=decision.reason,
+                **self._planner_telemetry_fields(),
+            )
             return None
         if not control_arm and decision.action == "stop":
             # Ingress acceptance and the in-memory actuator/reference stop are

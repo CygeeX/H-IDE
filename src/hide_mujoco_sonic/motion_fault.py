@@ -21,7 +21,7 @@ from .reference_authority import REFERENCE_AUTHORITY_PHASES
 
 
 MOTION_FAULT_SCHEMA_VERSION = "h-ide.motion-safety-fault/v1"
-SONIC_HEALTH_SCHEMA_VERSION = "h-ide.sonic-health/v3"
+SONIC_HEALTH_SCHEMA_VERSION = "h-ide.sonic-health/v4"
 MOTION_FAULT_MAX_BYTES = 4096
 STALE_HEALTH_CONFIRMATION_PROBES = 2
 SONIC_HEALTH_TRANSPORT_TIMEOUT_CONFIRMATION_PROBES = 2
@@ -92,6 +92,7 @@ _HEALTH_RESPONSE_FIELDS = frozenset(
         "navigation_task_active",
         "motion_authorized",
         "nav2_command_zero",
+        "controlled_policy_stop_active",
         "matched_reference_actuator_authority",
         "reference_authority_state",
         "reference_authority_generation",
@@ -477,6 +478,7 @@ class SonicHealth:
     reference_authority_granted_at_monotonic_s: float | None
     reference_authority_granted_tick_ms: int | None
     reference_authority_dds_target_sequence: int | None
+    controlled_policy_stop_active: bool = False
 
     @property
     def confirmed_safe_hold(self) -> bool:
@@ -495,6 +497,7 @@ class SonicHealth:
             and not self.navigation_task_active
             and not self.motion_authorized
             and self.nav2_command_zero
+            and not self.controlled_policy_stop_active
         )
 
     @classmethod
@@ -529,6 +532,7 @@ class SonicHealth:
             "navigation_task_active",
             "motion_authorized",
             "nav2_command_zero",
+            "controlled_policy_stop_active",
             "matched_reference_actuator_authority",
         )
         if not all(isinstance(value.get(field), bool) for field in boolean_fields):
@@ -590,6 +594,9 @@ class SonicHealth:
         motion_authorized = value["motion_authorized"]
         navigation_task_active = value["navigation_task_active"]
         nav2_command_zero = value["nav2_command_zero"]
+        controlled_policy_stop_active = value[
+            "controlled_policy_stop_active"
+        ]
         actuator_authority = value["matched_reference_actuator_authority"]
         authority_state = value.get("reference_authority_state")
         if (
@@ -679,15 +686,50 @@ class SonicHealth:
             raise ValueError(
                 "SONIC health response active task must carry a non-zero Nav2 command"
             )
-        if actuator_authority and (
-            support_latched
-            or support_pending
-            or not motion_authorized
-            or not navigation_task_active
-            or nav2_command_zero
-        ):
+        controlled_policy_stop_shape = bool(
+            controlled_policy_stop_active
+            and actuator_authority
+            and not support_latched
+            and not support_pending
+            and not value["static_hold_active"]
+            and not motion_authorized
+            and not navigation_task_active
+            and nav2_command_zero
+        )
+        if controlled_policy_stop_active and not controlled_policy_stop_shape:
             raise ValueError(
-                "matched reference actuator authority conflicts with the safety snapshot"
+                "controlled SONIC policy stop conflicts with the safety snapshot"
+            )
+        active_motion_shape = bool(
+            actuator_authority
+            and not support_latched
+            and not support_pending
+            and motion_authorized
+            and navigation_task_active
+            and not nav2_command_zero
+            and not controlled_policy_stop_active
+        )
+        if actuator_authority and not (
+            active_motion_shape or controlled_policy_stop_shape
+        ):
+            # Keep this error self-contained.  A health reply is deliberately
+            # observational and is not persisted by the bridge, so without
+            # the exact safety facts a live scheduler interleaving can only be
+            # diagnosed by reproducing the motion.  Every value below has
+            # already passed strict type/schema validation and is bounded.
+            snapshot_facts = (
+                f"authority_state={authority_state},"
+                f"support_latched={support_latched},"
+                f"support_pending={support_pending},"
+                f"static_hold={value['static_hold_active']},"
+                f"motion_authorized={motion_authorized},"
+                f"navigation_task_active={navigation_task_active},"
+                f"nav2_command_zero={nav2_command_zero},"
+                f"controlled_policy_stop_active={controlled_policy_stop_active}"
+            )
+            raise ValueError(
+                "matched reference actuator authority conflicts with the "
+                f"safety snapshot ({snapshot_facts})"
             )
         return cls(
             request_id=request_id,
@@ -709,6 +751,7 @@ class SonicHealth:
             navigation_task_active=navigation_task_active,
             motion_authorized=motion_authorized,
             nav2_command_zero=nav2_command_zero,
+            controlled_policy_stop_active=controlled_policy_stop_active,
             matched_reference_actuator_authority=actuator_authority,
             reference_authority_state=authority_state,
             reference_authority_generation=authority_generation,

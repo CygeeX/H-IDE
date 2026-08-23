@@ -284,6 +284,51 @@ def test_startup_qualification_latest_only_syncs_without_policy_catchup() -> Non
     assert "control sample overrun" in str(driver.telemetry.values["last_error"])
 
 
+def test_startup_qualification_rebases_forward_gap_then_requires_fresh_window() -> None:
+    driver = _bare_driver(control_clock_armed=False)
+    driver._startup_qualification_required_steps = 2
+    driver._lowstate = SimpleNamespace(tick=1_000)
+    assert driver._next_control_sample(wait_timeout_s=0.0) is None
+
+    # A long model warmup starved the Python DDS callback while Plant remained
+    # held and kept advancing simulation time.  This observation is a new
+    # baseline, never a catch-up policy step or qualification credit.
+    driver._on_lowstate(SimpleNamespace(tick=2_836))
+    assert driver._fault_latched.is_set() is False
+    assert driver._pending_control_sample is None
+    assert driver._startup_qualification_dropped_samples == 1
+    assert driver._startup_qualification_consecutive_steps == 0
+    assert driver._control_clock.last_observed_tick_ms == 2_836
+    assert driver._control_clock.last_control_tick_ms == 2_836
+
+    for tick in (2_840, 2_844, 2_848, 2_852, 2_856):
+        driver._on_lowstate(SimpleNamespace(tick=tick))
+    first = driver._next_control_sample(wait_timeout_s=0.0)
+    assert first is not None
+    assert first[1].tick_ms == 2_856
+    driver._complete_startup_qualification_step(
+        sample_drop_generation=first[2]
+    )
+    assert driver._motion_ready.is_set() is False
+
+    for tick in (2_860, 2_864, 2_868, 2_872, 2_876):
+        driver._on_lowstate(SimpleNamespace(tick=tick))
+    second = driver._next_control_sample(wait_timeout_s=0.0)
+    assert second is not None
+    driver._complete_startup_qualification_step(
+        sample_drop_generation=second[2]
+    )
+    assert driver._motion_ready.is_set() is True
+    assert driver._startup_qualifying is False
+
+    # Once motion may be accepted, the exact same discontinuity is terminal.
+    driver._on_lowstate(SimpleNamespace(tick=4_712))
+    assert driver._fault_latched.is_set() is True
+    assert "control clock source jumped 1836ms" in str(
+        driver.telemetry.values["last_error"]
+    )
+
+
 def test_qualification_step_gets_no_credit_if_processing_was_overrun() -> None:
     driver = _bare_driver(control_clock_armed=False)
     driver._startup_qualification_required_steps = 2
@@ -305,6 +350,39 @@ def test_qualification_step_gets_no_credit_if_processing_was_overrun() -> None:
     assert driver._fault_latched.is_set() is False
     assert driver._startup_qualification_consecutive_steps == 0
     assert driver._motion_ready.is_set() is False
+
+
+def test_qualification_commits_only_with_no_newer_sample_pending() -> None:
+    driver = _bare_driver(control_clock_armed=False)
+    driver._startup_qualification_required_steps = 1
+    driver._lowstate = SimpleNamespace(tick=3_000)
+    assert driver._next_control_sample(wait_timeout_s=0.0) is None
+
+    driver._on_lowstate(SimpleNamespace(tick=3_020))
+    sample = driver._next_control_sample(wait_timeout_s=0.0)
+    assert sample is not None
+
+    # Reproduce the live startup race: the next stationary sample arrives
+    # while the final qualification hold is being published.  It has not been
+    # dropped or overwritten, so the generation alone cannot detect it.
+    driver._on_lowstate(SimpleNamespace(tick=3_040))
+    assert driver._complete_startup_qualification_step(
+        sample_drop_generation=sample[2]
+    ) is False
+    assert driver._fault_latched.is_set() is False
+    assert driver._startup_qualifying is True
+    assert driver._motion_ready.is_set() is False
+    assert driver._startup_qualification_consecutive_steps == 0
+
+    # Consuming that queued stationary sample at a clean boundary may qualify.
+    latest = driver._next_control_sample(wait_timeout_s=0.0)
+    assert latest is not None
+    assert latest[1].tick_ms == 3_040
+    assert driver._complete_startup_qualification_step(
+        sample_drop_generation=latest[2]
+    ) is True
+    assert driver._startup_qualifying is False
+    assert driver._motion_ready.is_set() is True
 
 
 def test_startup_holds_plant_before_warmup_and_leaves_clock_disarmed() -> None:

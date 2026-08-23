@@ -19,10 +19,11 @@ stale or cancelled.
 
 ## What is vendored and what is downloaded
 
-* `vendor/lerobot` is pinned to `cab2c37a172c0101391d95f754123ed054f1b6e6`.
+* `vendor/lerobot` is pinned to `ba4717f071956eea4395151db2e40cb26362b8c6`.
   The source is Apache-2.0.
 * `models/unitree-g1-mujoco` is the public `lerobot/unitree-g1-mujoco`
-  repository.  Its scene/assets are used as the MuJoCo plant.
+  repository. Its simulator bridge and no-hand G1 asset match NVIDIA's current
+  SONIC MuJoCo deployment model, including the full-sole collision boxes.
 * SONIC ONNX weights are downloaded at runtime from `nvidia/GEAR-SONIC` and
   must not be committed or baked into an image.  The weights are covered by
   NVIDIA's Open Model License, which is separate from the LeRobot license.
@@ -112,9 +113,15 @@ non-semantic integrity manifest.
   Robot Agent remains the sole Nav2 action owner and cancels only its correlated
   goal handle; the simulator never uses a global `CancelGoal(all)` operation.
 * The existing loopback-only port 8793 also accepts a strict, read-only
-  `h-ide.sonic-health/v3` probe. In addition to LowState/control-step ages and
+  `h-ide.sonic-health/v4` probe. In addition to LowState/control-step ages and
   the immutable driver boot ID, it carries typed Plant-support latch/pending,
-  static-hold, Nav2-task, motion-authority and zero-command facts. Age-only
+  static-hold, Nav2-task, motion-authority and zero-command facts. A dedicated
+  controlled-policy-stop flag is the only shape allowed to retain an already
+  matched actuator reference after the Nav2 command becomes zero; it must also
+  prove a driver-admitted `STOPPING` owner, no task/ingress authority, no
+  static hold, and no pending or latched Plant stop. The correlated normal-stop
+  transaction upgrades that already-owned braking interval without creating a
+  health-observation gap. Age-only
   faults require two consecutive 25 ms temporal-unhealthy probes with the same
   driver boot ID while motion is authorized or the gait is not settled at
   IDLE; alternating LowState/control-step codes share that one streak.

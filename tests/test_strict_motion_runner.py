@@ -897,13 +897,20 @@ def test_standalone_executor_failure_cancels_stops_and_aborts() -> None:
     backend = FakeExecutorBackend()
 
     class BrokenCollector(FakeExecutorCollector):
+        def __init__(self) -> None:
+            super().__init__([_executor_sample(0.1)])
+            self.calls = 0
+
         def wait_next(self) -> dict:
-            raise runner.StrictMotionRunnerError("evidence lost")
+            self.calls += 1
+            if self.calls > 1:
+                raise runner.StrictMotionRunnerError("evidence lost")
+            return super().wait_next()
 
     evidence = FakeExecutorEvidence()
     executor = runner.StrictMotionCaseExecutor(
         backend,
-        BrokenCollector([]),
+        BrokenCollector(),
         evidence,
         clock=lambda: 1.0,
     )
@@ -913,6 +920,12 @@ def test_standalone_executor_failure_cancels_stops_and_aborts() -> None:
 
     assert backend.calls[-3:] == ["cancel", "zero", "normal_stop"]
     assert evidence.calls == ["begin", "abort"]
+    diagnostics = executor.failure_diagnostics()
+    assert diagnostics["phase"] == "action_active"
+    assert diagnostics["supportReleaseConfirmedEpoch"] == 17
+    assert diagnostics["sampleCount"] == 1
+    assert diagnostics["samples"] == [_executor_sample(0.1)]
+    assert diagnostics["acceptedMotionEvidence"] is False
 
 
 def test_detour_executor_uses_only_fresh_resolved_official_primitives(

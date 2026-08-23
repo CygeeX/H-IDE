@@ -282,15 +282,11 @@ def test_generated_preview_loads_with_mujoco() -> None:
     assert model.ncam == len(scene["render"]["cameras"])
 
 
-def test_runtime_g1_uses_deterministic_full_sole_collision_geometry() -> None:
-    """Lock the Office V2 contact adapter without depending on external files.
+def test_runtime_g1_uses_official_deployment_full_sole_contact_geometry() -> None:
+    """Match NVIDIA's pinned MuJoCo deployment model, not the training MJCF."""
 
-    NVIDIA's pinned MJCF uses four point contacts per foot.  The Office V2
-    dynamics adapter deliberately replaces those points with one thin sole box
-    per foot; this is a simulation contact-stability adaptation, not an
-    upstream SONIC model claim.
-    """
-
+    raw = G1_MODEL.read_text(encoding="utf-8")
+    assert "a0732b642c0333077e127a2f56ab0014c196bca4" in raw
     local_root = ET.parse(G1_MODEL).getroot()
     for body_name in ("left_ankle_roll_link", "right_ankle_roll_link"):
         local_body = local_root.find(f".//body[@name='{body_name}']")
@@ -301,10 +297,10 @@ def test_runtime_g1_uses_deterministic_full_sole_collision_geometry() -> None:
             if geom.get("contype") != "0"
         ]
         assert len(local_contacts) == 1
-        local = local_contacts[0]
-        assert local.get("type") == "box"
-        assert local.get("size") == "0.085 0.03 0.005"
-        assert local.get("pos") == "0.035 0 -0.03"
+        contact = local_contacts[0]
+        assert contact.get("type") == "box"
+        assert contact.get("pos") == "0.035 0 -0.03"
+        assert contact.get("size") == "0.085 0.03 0.005"
 
     assert not any(
         (body.get("name") or "").startswith(("dummy_lf_", "dummy_rf_"))

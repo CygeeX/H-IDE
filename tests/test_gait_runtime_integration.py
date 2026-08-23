@@ -332,9 +332,10 @@ def test_replay_straight_turn_and_zero_stops_before_mapping() -> None:
     payload["velocity_x_mps"] = 999.0
     payload["yaw_rate_rps"] = -999.0
     stopped = ingress.accept(payload)
-    assert stopped.action == "stop"
+    assert stopped.action == "brake"
     assert (stopped.vx, stopped.vy, stopped.wz) == (0.0, 0.0, 0.0)
     assert ingress.armed is False
+    assert ingress.braking is True
 
     clock.value += 0.01
     adapter.ingest_observation(observation(clock), now=clock.value)
@@ -398,9 +399,11 @@ def test_replay_terminal_events_never_reach_model_motion(terminal: str) -> None:
         )
 
     decision = decide(ingress, intent)
-    assert decision.action == "stop"
+    expected_action = "brake" if terminal in {"cancel", "stale"} else "stop"
+    assert decision.action == expected_action
     assert decision.vx == decision.vy == decision.wz == 0.0
     assert ingress.armed is False
+    assert ingress.braking is (expected_action == "brake")
 
 
 def test_bridge_restart_generation_requires_new_stationary_ack() -> None:
@@ -468,6 +471,13 @@ class FakeGuard:
     def stop(self, *, source="watchdog"):
         self.stops.append(source)
         self._command_zero = True
+
+    def stop_at_measured_heading(self, *, source="gait_adapter_controlled_stop"):
+        self.stop(source=source)
+
+    @property
+    def target_zero(self):
+        return self._command_zero
 
     @property
     def command_zero(self):
@@ -801,7 +811,9 @@ def test_driver_obeys_stop_before_model_guard_mapping() -> None:
     payload["velocity_x_mps"] = 10_000.0
     driver.accept_json(payload)
     assert driver.guard.accepted == [(0.20, 0.0, 0.0, "nav2")]
-    assert driver.guard.stops[-1] == "gait_adapter"
+    # This minimal fixture has no installed policy/reference authority, so the
+    # controlled IDLE transition must fail closed at the exact DDS boundary.
+    assert driver.guard.stops[-1] == "gait_adapter_pregrant_stop"
 
 
 def test_legacy_stop_atomically_revokes_ingress_before_racing_motion_accept() -> None:
@@ -1383,10 +1395,17 @@ class _TransactionalEvidence:
         self.accepted_request_generation = 0
         self.ready = False
 
-    def observe_intent(self, intent, *, admitted, simulation_now_s=None) -> None:
+    def observe_intent(
+        self,
+        intent,
+        *,
+        admitted,
+        simulation_now_s=None,
+        allow_static_reference=False,
+    ) -> None:
         if not admitted:
             return
-        if intent.mode == "IDLE":
+        if intent.mode == "IDLE" and not allow_static_reference:
             self.revoke("IDLE")
             return
         self.intent_generation += 1
@@ -2211,6 +2230,53 @@ def test_activation_accumulates_only_admitted_heading_after_decoder_reinit() -> 
     assert driver._reference_request_pending is False
 
 
+def test_pure_rotation_uses_official_idle_planner_without_losing_motion_owner() -> None:
+    from lerobot.robots.unitree_g1.controllers.sonic_pipeline import LM
+
+    clock = Clock()
+    driver = bare_driver(clock)
+    driver._last_published_targets = tuple(0.0 for _ in range(29))
+    driver._reference_source_identity = (42, 7)
+    driver._navigation_task_active = True
+    driver._intent_gate = ReplanIntentGate()
+    driver._decoder_facing_rad = None
+    driver._pending_decoder_heading_delta_rad = 0.0
+    driver._last_intent_signature = None
+    # Keep this test focused on the planner-mode mapping after activation.
+    driver._policy_activation = SimpleNamespace(prepared=True)
+    driver._policy_activation_requested = False
+    evidence = _TransactionalEvidence()
+    driver._planner_evidence = evidence
+    controller = _TransactionalController(
+        evidence,
+        tuple(0.0 for _ in range(29)),
+    )
+    driver._controller = controller
+    rotation = MovementIntent(
+        mode="SLOW_WALK",
+        speed_mps=0.0,
+        movement_angle_rad=0.0,
+        facing_angle_rad=0.20,
+        has_movement=False,
+        stale=False,
+    )
+    driver.guard = SimpleNamespace(
+        intent=lambda **_kwargs: rotation,
+        last_received_at=clock.value,
+    )
+
+    observed = driver._apply_intent(0.02, simulation_now_s=1.0)
+
+    assert observed is rotation
+    assert observed.mode == "SLOW_WALK"
+    assert controller.ms.mode == LM.IDLE
+    assert controller.ms.speed == -1.0
+    assert controller.ms.has_movement is False
+    assert driver._reference_authority.snapshot.phase == "REQUIRED"
+    assert driver._reference_request_pending is True
+    assert evidence.intent_generation == 1
+
+
 def test_activation_rechecks_stop_before_begin_and_stop_wins_before_telemetry() -> None:
     from lerobot.robots.unitree_g1.controllers.sonic_pipeline import DEFAULT_ANGLES
 
@@ -2587,6 +2653,133 @@ def test_reference_execution_is_transactional_across_grant_refresh_and_stop_race
     assert controller.controller.ref_cursor == candidate_cursor
     assert driver._reference_authority.snapshot.phase == "REVOKED"
     assert writes[-1] == pytest.approx(frozen)
+
+
+def test_controlled_stop_watchdog_age_cannot_replan_the_same_source_sequence() -> None:
+    """The driver-owned IDLE brake has one planner/source identity.
+
+    In live motion, CmdVelGuard changed the already-installed controlled-stop
+    zero from fresh to stale after its watchdog interval.  That produced a new
+    planner intent generation but necessarily retained the same correlated
+    STOPPING source sequence, causing a terminal transition fault.  Freshness
+    is irrelevant after the driver owns braking and must not manufacture a
+    second reference transition.
+    """
+
+    from lerobot.robots.unitree_g1.controllers.sonic_pipeline import DEFAULT_ANGLES
+
+    clock = Clock()
+    driver, _writes = _publishing_driver(clock)
+    boundary = tuple(float(value) for value in DEFAULT_ANGLES)
+    lowstate = _lowstate(boundary)
+    target = tuple(value + 0.005 for value in boundary)
+    evidence = _TransactionalEvidence()
+    evidence.intent_generation = 1
+    evidence.intent_signature = "intent-1"
+    evidence.accept_current()
+    controller = _TransactionalController(evidence, target)
+    controller.reference_install_epoch = 2
+    controller.reference_authority = True
+    driver._controller = controller
+    driver._planner_evidence = evidence
+    driver._last_published_targets = boundary
+    driver._intent_gate = ReplanIntentGate()
+    driver._intent_gate.admit(_movement_intent(0.0), now=clock.value - 1.0)
+    driver._controlled_stop_active = True
+    driver._controlled_stop_source_identity = (42, 9)
+    driver._controlled_stop_reference_installed = False
+    driver._reference_source_identity = (42, 7)
+    driver._reference_authority.require(generation=42, source_sequence=7)
+    driver._reference_authority.mark_installed(
+        generation=42,
+        source_sequence=7,
+        planner_intent_generation=1,
+        reference_epoch=2,
+    )
+    driver._reference_authority.prime(
+        generation=42,
+        source_sequence=7,
+        reference_epoch=2,
+    )
+    driver._reference_authority.grant(
+        generation=42,
+        source_sequence=7,
+        reference_epoch=2,
+        granted_at_monotonic_s=clock.value,
+        granted_at_tick_ms=1_000,
+        dds_target_sequence=1,
+    )
+
+    fresh_idle = MovementIntent(
+        mode="IDLE",
+        speed_mps=0.0,
+        movement_angle_rad=0.0,
+        facing_angle_rad=0.0,
+        has_movement=False,
+        stale=False,
+        source="gait_adapter_controlled_stop",
+    )
+    stale_idle = replace(fresh_idle, stale=True, source="watchdog")
+    current_intent = [fresh_idle]
+    driver.guard = SimpleNamespace(
+        intent=lambda **_kwargs: current_intent[0],
+        last_received_at=clock.value,
+    )
+
+    first_idle = driver._apply_intent(0.02, simulation_now_s=clock.value)
+    assert first_idle.stale is False
+    assert first_idle.source == "gait_adapter_controlled_stop"
+    assert evidence.intent_generation == 2
+    assert controller.ms.needs_replan is True
+
+    # Model the vendor request accepting the first IDLE reference, then its
+    # first successful DDS target rebinding authority to STOPPING sequence 9.
+    controller.ms.needs_replan = False
+    controller.refresh_ready = True
+    driver._run_policy_candidate(lowstate)
+    assert driver._controlled_stop_reference_installed is True
+    transitioned = driver._reference_authority.snapshot
+    assert transitioned.phase == "PRIMED"
+    assert transitioned.source_sequence == 9
+    assert transitioned.planner_intent_generation == 2
+    driver._publish(
+        _action(driver, target),
+        lowstate,
+        control_dt_s=0.02,
+        control_tick_ms=1_020,
+        constrain_arms=False,
+    )
+    assert driver._reference_authority.snapshot.phase == "GRANTED"
+
+    # The watchdog changes only freshness/source metadata.  The canonical
+    # controlled-stop IDLE remains the same planner intent and requests no new
+    # reference generation.
+    current_intent[0] = stale_idle
+    clock.value += 0.40
+    second_idle = driver._apply_intent(0.02, simulation_now_s=clock.value)
+    assert second_idle.stale is False
+    assert second_idle.source == "gait_adapter_controlled_stop"
+    assert evidence.intent_generation == 2
+    assert controller.ms.needs_replan is False
+
+    # A true same-intent periodic epoch is still legal and remains bound to the
+    # already-installed STOPPING source sequence.
+    controller.refresh_ready = True
+    driver._run_policy_candidate(lowstate)
+    refreshed = driver._reference_authority.snapshot
+    assert refreshed.phase == "PRIMED"
+    assert refreshed.source_sequence == 9
+    assert refreshed.planner_intent_generation == 2
+    assert refreshed.reference_epoch == 4
+    driver._publish(
+        _action(driver, target),
+        lowstate,
+        control_dt_s=0.02,
+        control_tick_ms=1_040,
+        constrain_arms=False,
+    )
+    assert driver._reference_authority.snapshot.phase == "GRANTED"
+    assert driver._reference_authority.snapshot.reference_epoch == 4
 
 
 def test_health_keeps_last_dds_grant_while_refresh_decode_is_inflight() -> None:
@@ -3311,7 +3504,7 @@ def test_outer_publish_preserves_real_vendor_candidate_epoch_cursor_proof() -> N
             self.record_calls.append(committed)
             return committed
 
-        def advance_cursor(self) -> None:
+        def advance_cursor(self, *, idle_mode: bool = False) -> None:
             self.advance_calls += 1
             self.ref_cursor += 1
 
@@ -3319,6 +3512,7 @@ def test_outer_publish_preserves_real_vendor_candidate_epoch_cursor_proof() -> N
         pipeline = Pipeline(cursor)
         runtime = SonicRuntime.__new__(SonicRuntime)
         runtime.controller = pipeline
+        runtime.ms = SimpleNamespace(mode=0)
         runtime._policy_step_pending = True
         runtime._pending_reference_install_epoch = pending_epoch
         runtime._pending_ref_cursor = pending_cursor

@@ -280,6 +280,18 @@ def _yaw_from_wxyz(quaternion: np.ndarray) -> float:
     )
 
 
+def _roll_pitch_from_wxyz(quaternion: np.ndarray) -> tuple[float, float]:
+    qw, qx, qy, qz = (float(value) for value in quaternion)
+    roll = math.atan2(
+        2.0 * (qw * qx + qy * qz),
+        1.0 - 2.0 * (qx * qx + qy * qy),
+    )
+    pitch = math.asin(
+        max(-1.0, min(1.0, 2.0 * (qw * qy - qz * qx)))
+    )
+    return roll, pitch
+
+
 def _wrap_angle(value: float) -> float:
     return math.atan2(math.sin(value), math.cos(value))
 
@@ -293,16 +305,59 @@ def _wrap_angle(value: float) -> float:
         "has_movement",
         "expected_translation",
         "expected_yaw_sign",
+        "target_magnitude",
+        "motion_timeout_s",
     ),
     (
         # Exact direction-dependent SLOW_WALK speeds from NVIDIA's pinned
         # ROS2 input handler: forward=.30, lateral=.35, backward=.20 m/s.
-        ("forward", 0.30, 0.0, 0.0, True, (1.0, 0.0), 0),
-        ("reverse", 0.20, math.pi, 0.0, True, (-1.0, 0.0), 0),
-        ("left_strafe", 0.35, math.pi / 2.0, 0.0, True, (0.0, 1.0), 0),
-        ("right_strafe", 0.35, -math.pi / 2.0, 0.0, True, (0.0, -1.0), 0),
-        ("left_turn", -1.0, 0.0, math.pi / 2.0, False, (0.0, 0.0), 1),
-        ("right_turn", -1.0, 0.0, -math.pi / 2.0, False, (0.0, 0.0), -1),
+        ("forward_1m", 0.30, 0.0, 0.0, True, (1.0, 0.0), 0, 1.0, 30.0),
+        ("forward_3m", 0.30, 0.0, 0.0, True, (1.0, 0.0), 0, 3.0, 60.0),
+        ("reverse", 0.20, math.pi, 0.0, True, (-1.0, 0.0), 0, 0.5, 30.0),
+        (
+            "left_strafe",
+            0.35,
+            math.pi / 2.0,
+            0.0,
+            True,
+            (0.0, 1.0),
+            0,
+            0.5,
+            30.0,
+        ),
+        (
+            "right_strafe",
+            0.35,
+            -math.pi / 2.0,
+            0.0,
+            True,
+            (0.0, -1.0),
+            0,
+            0.5,
+            30.0,
+        ),
+        (
+            "left_turn",
+            -1.0,
+            0.0,
+            math.pi / 2.0,
+            False,
+            (0.0, 0.0),
+            1,
+            math.pi / 2.0,
+            20.0,
+        ),
+        (
+            "right_turn",
+            -1.0,
+            0.0,
+            -math.pi / 2.0,
+            False,
+            (0.0, 0.0),
+            -1,
+            math.pi / 2.0,
+            20.0,
+        ),
     ),
 )
 def test_official_cold_boot_sequence_moves_in_requested_direction(
@@ -314,12 +369,14 @@ def test_official_cold_boot_sequence_moves_in_requested_direction(
     has_movement: bool,
     expected_translation: tuple[float, float],
     expected_yaw_sign: int,
+    target_magnitude: float,
+    motion_timeout_s: float,
 ) -> None:
     """Prove the official INIT -> WAIT -> CONTROL flow in real MuJoCo.
 
-    The retained support applies no world-X/Y force and no yaw torque during
-    CONTROL.  Translation and heading therefore come from SONIC through the
-    checked-in G1 contact model, rather than from the simulation fall arrest.
+    The elastic band is present only during NVIDIA's 3 s INIT. It is fully
+    released before reference acquisition and CONTROL, matching the official
+    quickstart rather than using vertical or attitude assistance as evidence.
     """
 
     mujoco = pytest.importorskip("mujoco")
@@ -393,11 +450,15 @@ def test_official_cold_boot_sequence_moves_in_requested_direction(
         motion_initial_yaw: float | None = None
         reference_installed_s: float | None = None
         requested_projections: list[float] = []
+        target_reached = False
+        turn_reference_refreshes = 0
         minimum_z = float(data.qpos[2])
         peak_saturation_s = 0.0
         constrained_control_frames = 0
         last_constrained_control_frame = -1
-        physics_steps = round(30.0 / float(model.opt.timestep))
+        physics_steps = round(
+            (3.5 + motion_timeout_s) / float(model.opt.timestep)
+        )
         control_every_float = CONTROL_DT / float(model.opt.timestep)
         assert control_every_float == pytest.approx(round(control_every_float))
         control_every = round(control_every_float)
@@ -428,7 +489,9 @@ def test_official_cold_boot_sequence_moves_in_requested_direction(
                     # NVIDIA WAIT_FOR_CONTROL keeps publishing nominal without
                     # running the policy or mutating its recurrent history.
                     command_sent = True
-                    controller.ms.mode = LM.SLOW_WALK
+                    controller.ms.mode = (
+                        LM.IDLE if expected_yaw_sign else LM.SLOW_WALK
+                    )
                     controller.ms.speed = speed
                     controller.ms.movement_angle = movement_angle
                     controller.ms.facing_angle = facing_angle
@@ -437,11 +500,11 @@ def test_official_cold_boot_sequence_moves_in_requested_direction(
                 if command_sent and not reference_requested:
                     controller.request_reference(lowstate())
                     reference_requested = True
-                if (
-                    reference_requested
-                    and not reference_acquired
-                    and controller.poll_reference()
-                ):
+                    # Planning is a wall-clock worker. Freeze this deterministic
+                    # offline plant at the exact post-release settled LowState
+                    # instead of letting CPU scheduling decide how many seconds
+                    # of unsupported MuJoCo time pass before installation.
+                    _wait_for_matching_reference(controller)
                     controller.acquire_reference(
                         lowstate(),
                         executed_target=tuple(published),
@@ -455,6 +518,26 @@ def test_official_cold_boot_sequence_moves_in_requested_direction(
                         np.asarray(data.qpos[3:7], dtype=np.float64)
                     )
                     reference_installed_s = float(data.time)
+                if (
+                    reference_acquired
+                    and expected_yaw_sign
+                    and reference_installed_s is not None
+                    and turn_reference_refreshes < 2
+                    and float(data.time) - reference_installed_s
+                    >= 8.0 * (turn_reference_refreshes + 1)
+                ):
+                    # A planner clip is a bounded prefix, not a complete Spin
+                    # action. Rebase from the fresh measured LowState exactly
+                    # as the production intent transaction does while Nav2 is
+                    # still commanding the same unresolved yaw goal.
+                    controller.request_reference(lowstate())
+                    _wait_for_matching_reference(controller)
+                    controller.acquire_reference(
+                        lowstate(),
+                        executed_target=tuple(published),
+                        expected_install_epoch=controller.reference_install_epoch,
+                    )
+                    turn_reference_refreshes += 1
                 policy_action = (
                     controller.run_step({}, lowstate())
                     if reference_acquired
@@ -510,11 +593,12 @@ def test_official_cold_boot_sequence_moves_in_requested_direction(
                 10_000.0 * (support_anchor - pose[:3])
                 - 1_000.0 * pose[7:10]
             )
-            data.xfrc_applied[torso_id] = stabilized_support_wrench(
-                raw_wrench,
-                pose,
-                "locomotion" if command_sent else "idle",
-            )
+            if float(data.time) <= 3.0 + 1e-12:
+                data.xfrc_applied[torso_id] = stabilized_support_wrench(
+                    raw_wrench,
+                    pose,
+                    "idle",
+                )
             mujoco.mj_step(model, data)
             assert np.all(np.isfinite(data.qpos))
             if motion_initial_xy is not None and expected_yaw_sign == 0:
@@ -522,10 +606,21 @@ def test_official_cold_boot_sequence_moves_in_requested_direction(
                 requested_projections.append(
                     float(np.dot(displacement, np.asarray(expected_translation)))
                 )
+                target_reached = requested_projections[-1] >= target_magnitude
+            elif motion_initial_yaw is not None:
+                yaw_delta = _wrap_angle(
+                    _yaw_from_wxyz(np.asarray(data.qpos[3:7]))
+                    - motion_initial_yaw
+                )
+                target_reached = (
+                    expected_yaw_sign * yaw_delta >= target_magnitude
+                )
             minimum_z = min(minimum_z, float(data.qpos[2]))
+            if target_reached:
+                break
             if (
                 reference_installed_s is not None
-                and float(data.time) - reference_installed_s >= 10.0
+                and float(data.time) - reference_installed_s >= motion_timeout_s
             ):
                 break
 
@@ -535,6 +630,17 @@ def test_official_cold_boot_sequence_moves_in_requested_direction(
         final_yaw_delta = _wrap_angle(
             _yaw_from_wxyz(np.asarray(data.qpos[3:7])) - motion_initial_yaw
         )
+        minimum_projection_index = (
+            int(np.argmin(requested_projections)) if requested_projections else None
+        )
+        positive_progress_index = next(
+            (
+                index
+                for index, projection in enumerate(requested_projections)
+                if projection >= 0.01
+            ),
+            None,
+        )
         diagnostic = {
             "label": label,
             "displacement_xy_m": tuple(float(value) for value in displacement),
@@ -543,9 +649,30 @@ def test_official_cold_boot_sequence_moves_in_requested_direction(
             "peak_saturation_s": peak_saturation_s,
             "constrained_frames": constrained_control_frames,
             "last_constrained_frame": last_constrained_control_frame,
+            "target_magnitude": target_magnitude,
+            "target_reached": target_reached,
+            "motion_elapsed_s": (
+                None
+                if reference_installed_s is None
+                else float(data.time) - reference_installed_s
+            ),
+            "opposite_transient_m": (
+                None if not requested_projections else -min(requested_projections)
+            ),
+            "opposite_transient_at_s": (
+                None
+                if minimum_projection_index is None
+                else minimum_projection_index * float(model.opt.timestep)
+            ),
+            "positive_progress_at_s": (
+                None
+                if positive_progress_index is None
+                else positive_progress_index * float(model.opt.timestep)
+            ),
         }
+        assert target_reached, diagnostic
         if expected_yaw_sign:
-            assert expected_yaw_sign * final_yaw_delta > math.radians(30.0), diagnostic
+            assert expected_yaw_sign * final_yaw_delta >= target_magnitude, diagnostic
             assert float(np.linalg.norm(displacement)) < 0.30, diagnostic
         else:
             requested = np.asarray(expected_translation, dtype=np.float64)
@@ -553,14 +680,120 @@ def test_official_cold_boot_sequence_moves_in_requested_direction(
             cross = float(
                 abs(requested[0] * displacement[1] - requested[1] * displacement[0])
             )
-            assert forward > 0.12, diagnostic
+            assert forward >= target_magnitude, diagnostic
+            # This fixture exercises the learned gait open-loop, without a
+            # Nav2 lateral/yaw correction loop. Keep the historical 0.30 m
+            # capability envelope here; strict live path tracking is evaluated
+            # separately against the commanded trajectory.
             assert cross < 0.30, diagnostic
-            assert abs(final_yaw_delta) < math.radians(30.0), diagnostic
+            max_open_loop_yaw = 15.0 if label == "forward_3m" else 10.0
+            assert abs(final_yaw_delta) < math.radians(max_open_loop_yaw), diagnostic
+            # The official learned gait may shift its centre of mass before
+            # the first requested step. Bound that startup transient without
+            # weakening the sustained direction or final-target checks.
             assert min(requested_projections) > -0.04, diagnostic
         assert minimum_z >= 0.55, diagnostic
         assert reference_installed_s is not None
         assert peak_saturation_s < 2.0, diagnostic
         assert constrained_control_frames > 0, diagnostic
         assert last_constrained_control_frame >= 0, diagnostic
+
+        # A successful motion action is not complete until the learned
+        # controller has transitioned to NVIDIA's bounded IDLE reference.  A
+        # static snapshot of a live gait pose cannot balance the untethered
+        # model and was the cause of the first live 1 m post-goal fall.
+        stop_started_xy = np.asarray(data.qpos[:2], dtype=np.float64).copy()
+        stop_started_yaw = _yaw_from_wxyz(
+            np.asarray(data.qpos[3:7], dtype=np.float64)
+        )
+        stop_started_epoch = controller.reference_install_epoch
+        controller.ms.mode = LM.IDLE
+        controller.ms.speed = -1.0
+        controller.ms.movement_angle = 0.0
+        controller.ms.facing_angle = stop_started_yaw
+        controller.ms.has_movement = False
+        controller.ms.needs_replan = True
+        # Reference planning is a wall-clock worker while this fixture can run
+        # MuJoCo much faster than real time.  Resolve and install the stop
+        # reference against one frozen LowState so CPU scheduling cannot invent
+        # an unreviewed actuator dwell before IDLE starts.
+        controller.request_reference(lowstate())
+        _wait_for_matching_reference(controller)
+        controller.acquire_reference(
+            lowstate(),
+            executed_target=tuple(published),
+            expected_install_epoch=controller.reference_install_epoch,
+        )
+        controller.ms.needs_replan = False
+        stop_minimum_z = float(data.qpos[2])
+        stop_peak_tilt = 0.0
+        stop_peak_idle_readapt_error = 0.0
+        stop_idle_readapt_states: set[str] = set()
+        stop_started_s = float(data.time)
+        while float(data.time) - stop_started_s < 5.0:
+            physics_tick += 1
+            if physics_tick % control_every == 0:
+                policy_action = controller.run_step({}, lowstate())
+                assert policy_action
+                raw = _targets(policy_action)
+                arm = guard.apply(
+                    raw[15:29],
+                    measured=tuple(float(value) for value in data.qpos[22:36]),
+                    dt=CONTROL_DT,
+                )
+                published = np.asarray(
+                    _project_complete_target(raw, arm.targets),
+                    dtype=np.float64,
+                )
+                controller.record_executed_target(tuple(published))
+                stop_peak_idle_readapt_error = max(
+                    stop_peak_idle_readapt_error,
+                    float(controller.controller.idle_readapt_average_error_rad),
+                )
+                stop_idle_readapt_states.add(
+                    controller.controller.idle_readapt_state.name
+                )
+
+            raw_control = kp * (published - data.qpos[7:]) - kd * data.qvel[6:]
+            data.ctrl[:] = np.clip(
+                raw_control,
+                model.actuator_ctrlrange[:, 0],
+                model.actuator_ctrlrange[:, 1],
+            )
+            data.xfrc_applied[:] = 0.0
+            mujoco.mj_step(model, data)
+            assert np.all(np.isfinite(data.qpos))
+            stop_minimum_z = min(stop_minimum_z, float(data.qpos[2]))
+            roll, pitch = _roll_pitch_from_wxyz(
+                np.asarray(data.qpos[3:7], dtype=np.float64)
+            )
+            stop_peak_tilt = max(stop_peak_tilt, abs(roll), abs(pitch))
+
+        stop_displacement = np.asarray(data.qpos[:2]) - stop_started_xy
+        stop_linear_speed = float(np.linalg.norm(data.qvel[:2]))
+        stop_angular_speed = float(np.linalg.norm(data.qvel[3:6]))
+        stop_diagnostic = {
+            **diagnostic,
+            "stop_displacement_xy_m": tuple(
+                float(value) for value in stop_displacement
+            ),
+            "stop_minimum_z_m": stop_minimum_z,
+            "stop_peak_tilt_rad": stop_peak_tilt,
+            "stop_linear_speed_mps": stop_linear_speed,
+            "stop_angular_speed_rps": stop_angular_speed,
+            "stop_reference_epoch": controller.reference_install_epoch,
+            "stop_idle_readapt_stored": (
+                controller.controller.idle_readapt_stored
+            ),
+            "stop_idle_readapt_states": sorted(stop_idle_readapt_states),
+            "stop_peak_idle_readapt_error_rad": stop_peak_idle_readapt_error,
+        }
+        assert controller.reference_install_epoch > stop_started_epoch, stop_diagnostic
+        assert stop_minimum_z >= 0.55, stop_diagnostic
+        assert stop_peak_tilt < 0.30, stop_diagnostic
+        assert float(np.linalg.norm(stop_displacement)) < 0.60, stop_diagnostic
+        assert stop_linear_speed < 0.08, stop_diagnostic
+        assert stop_angular_speed < 0.20, stop_diagnostic
+        assert controller.controller.idle_readapt_stored is True, stop_diagnostic
     finally:
         controller.shutdown()

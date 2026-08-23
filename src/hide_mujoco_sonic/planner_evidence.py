@@ -31,6 +31,21 @@ _REFERENCE_HZ = 50.0
 # observations so planner noise cannot be mistaken for evidence that a pure
 # Nav2 rotation is turning the requested way.
 _MIN_MEANINGFUL_YAW_RAD = 0.01
+# An official IDLE plan is a braking transition, not a frozen pose.  The
+# pinned planner produces a 45.7 mm root envelope after a 3 m forward gait and
+# the first live controlled stop produced 49.6 mm.  A later exact 0.2 m
+# DriveOnHeading stop produced 51.2 mm and 0.037945 rad of root yaw while its
+# final 200 ms settled to 0.00791 m/s.  Requiring <=30 mm or <=0.03 rad rejected
+# these valid plans and then misreported the local rejection as a planner
+# timeout.  Keep translation inside the already-reviewed 80 mm gait transient
+# boundary and yaw inside the locked planner's 0.05 rad discrete-facing bin;
+# additionally bound every 50 Hz step by the product motion cap and require the
+# final 200 ms to satisfy the measured stationary-speed contract.
+_MAX_STATIC_REFERENCE_TRANSLATION_M = 0.08
+_MAX_STATIC_REFERENCE_YAW_RAD = 0.05
+_MAX_STATIC_REFERENCE_FRAME_SPEED_MPS = 0.40
+_MAX_STATIC_REFERENCE_TAIL_SPEED_MPS = 0.025
+_STATIC_REFERENCE_SETTLE_FRAMES = 10
 
 
 class PlannerReferenceDeadlineExceeded(RuntimeError):
@@ -52,6 +67,7 @@ def _signature(payload: dict[str, object]) -> str:
 class _IntentEvidence:
     generation: int
     signature: str
+    mode: str
     has_movement: bool
     requested_direction: tuple[float, float] | None
     facing_direction: tuple[float, float]
@@ -94,7 +110,9 @@ class PlannerReferenceEvidenceGate:
     both a generation-matched plan and meaningful root-yaw motion whose shortest
     signed delta agrees with the requested facing change.  Translational plans
     retain their root-projection contract; yaw remains diagnostic for them and
-    never replaces that projection gate.
+    never replaces that projection gate. A controlled stop may explicitly ask
+    for the official IDLE reference; that separate path accepts only a bounded
+    static root envelope and is never enabled by an ordinary zero command.
     """
 
     def __init__(self, *, required_timeout_s: float = 0.75) -> None:
@@ -124,6 +142,11 @@ class PlannerReferenceEvidenceGate:
         self._requested_yaw_error_rad: float | None = None
         self._predicted_yaw_delta_rad: float | None = None
         self._yaw_consistent: bool | None = None
+        self._static_root_max_translation_m: float | None = None
+        self._static_root_yaw_delta_rad: float | None = None
+        self._static_root_max_speed_mps: float | None = None
+        self._static_root_tail_max_speed_mps: float | None = None
+        self._static_root_tail_translation_m: float | None = None
         self._required_started_at_s: float | None = None
         self._reason = "no Nav2 motion intent"
 
@@ -175,8 +198,7 @@ class PlannerReferenceEvidenceGate:
         except (AttributeError, TypeError, ValueError):
             return False
         if (
-            mode == 0
-            or has_movement != intent.has_movement
+            has_movement != intent.has_movement
             or len(movement) < 2
             or len(facing) < 2
             or not all(math.isfinite(value) for value in (*movement, *facing, speed))
@@ -186,8 +208,26 @@ class PlannerReferenceEvidenceGate:
         facing_dot = facing[0] * expected_facing[0] + facing[1] * expected_facing[1]
         if facing_dot < 1.0 - 1e-6:
             return False
+        if intent.mode == "IDLE":
+            return bool(
+                mode == 0
+                and not has_movement
+                and speed < 0.0
+                and math.hypot(movement[0], movement[1]) <= 1e-6
+            )
         if intent.requested_direction is None:
-            return math.hypot(movement[0], movement[1]) <= 1e-6
+            # NVIDIA's pinned ROS2 input adapter represents a pure facing
+            # change as an IDLE planner request with a zero movement vector.
+            # The outer MovementIntent remains active SLOW_WALK so command
+            # ownership, watchdogs and stop handling cannot mistake Spin for
+            # an ordinary static hold.
+            return bool(
+                mode == 0
+                and speed < 0.0
+                and math.hypot(movement[0], movement[1]) <= 1e-6
+            )
+        if mode == 0:
+            return False
         expected = intent.requested_direction
         movement_dot = movement[0] * expected[0] + movement[1] * expected[1]
         return speed > 0.0 and movement_dot >= 1.0 - 1e-6
@@ -198,14 +238,19 @@ class PlannerReferenceEvidenceGate:
         *,
         admitted: bool,
         simulation_now_s: float | None = None,
+        allow_static_reference: bool = False,
     ) -> None:
         """Observe one intent admitted (or debounced) by ``ReplanIntentGate``."""
 
         if not admitted:
             return
-        if intent.mode == "IDLE":
+        if not isinstance(allow_static_reference, bool):
+            raise TypeError("allow_static_reference must be a boolean")
+        if intent.mode == "IDLE" and not allow_static_reference:
             self.revoke("Nav2 intent is IDLE")
             return
+        if allow_static_reference and intent.mode != "IDLE":
+            raise ValueError("static reference authority requires an IDLE intent")
         started_at: float | None = None
         if simulation_now_s is not None:
             started_at = float(simulation_now_s)
@@ -230,6 +275,7 @@ class PlannerReferenceEvidenceGate:
             self._intent = _IntentEvidence(
                 generation=self._intent_counter,
                 signature=self._intent_signature(intent),
+                mode=str(intent.mode),
                 has_movement=bool(intent.has_movement),
                 requested_direction=requested_direction,
                 facing_direction=facing_direction,
@@ -248,6 +294,11 @@ class PlannerReferenceEvidenceGate:
             self._requested_yaw_error_rad = None
             self._predicted_yaw_delta_rad = None
             self._yaw_consistent = None
+            self._static_root_max_translation_m = None
+            self._static_root_yaw_delta_rad = None
+            self._static_root_max_speed_mps = None
+            self._static_root_tail_max_speed_mps = None
+            self._static_root_tail_translation_m = None
             self._required_started_at_s = started_at
             self._reason = "awaiting a matching SONIC planner reference"
 
@@ -592,6 +643,62 @@ class PlannerReferenceEvidenceGate:
             consistent = requested_error * predicted_delta > 0.0
         return requested_error, predicted_delta, consistent
 
+    @classmethod
+    def _predicted_static_root_motion(
+        cls,
+        motion: object,
+    ) -> tuple[float, float, float, float, float]:
+        """Measure one bounded, settling IDLE braking trajectory."""
+
+        try:
+            timesteps = int(motion.timesteps)
+            if timesteps < _STATIC_REFERENCE_SETTLE_FRAMES + 1:
+                raise ValueError
+            positions = tuple(
+                (float(motion.body_positions[index][0]), float(motion.body_positions[index][1]))
+                for index in range(timesteps)
+            )
+            quaternions = motion.body_quaternions
+            first_yaw = cls._quaternion_yaw(quaternions[0])
+            last_yaw = cls._quaternion_yaw(quaternions[timesteps - 1])
+        except (AttributeError, IndexError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "static planner motion has no usable root trajectory"
+            ) from exc
+        if not all(
+            math.isfinite(value)
+            for position in positions
+            for value in position
+        ):
+            raise ValueError("static planner root trajectory must be finite")
+        first_x, first_y = positions[0]
+        max_translation = max(
+            math.hypot(x - first_x, y - first_y) for x, y in positions
+        )
+        frame_speeds = tuple(
+            math.hypot(x1 - x0, y1 - y0) * _REFERENCE_HZ
+            for (x0, y0), (x1, y1) in zip(
+                positions,
+                positions[1:],
+                strict=False,
+            )
+        )
+        tail_speeds = frame_speeds[-_STATIC_REFERENCE_SETTLE_FRAMES:]
+        tail_start = positions[-(_STATIC_REFERENCE_SETTLE_FRAMES + 1)]
+        tail_end = positions[-1]
+        tail_translation = math.hypot(
+            tail_end[0] - tail_start[0],
+            tail_end[1] - tail_start[1],
+        )
+        yaw_delta = cls._wrap_angle(last_yaw - first_yaw)
+        return (
+            max_translation,
+            yaw_delta,
+            max(frame_speeds),
+            max(tail_speeds),
+            tail_translation,
+        )
+
     def _store_rejected_yaw_locked(
         self,
         requested_error: float | None,
@@ -628,6 +735,7 @@ class PlannerReferenceEvidenceGate:
                     f"{len(requests)} matching requests"
                 )
             request = requests[0]
+            static_intent = bool(intent is not None and intent.mode == "IDLE")
             current_matches = bool(
                 intent is not None
                 and request.matches_intent
@@ -700,6 +808,40 @@ class PlannerReferenceEvidenceGate:
                 return self._reject_result_locked(
                     "planner root projection opposes or does not realize the Nav2 direction"
                 )
+            if static_intent:
+                try:
+                    (
+                        static_translation,
+                        static_yaw,
+                        static_max_speed,
+                        static_tail_max_speed,
+                        static_tail_translation,
+                    ) = (
+                        self._predicted_static_root_motion(motion)
+                    )
+                except ValueError as exc:
+                    return self._reject_result_locked(str(exc))
+                self._static_root_max_translation_m = static_translation
+                self._static_root_yaw_delta_rad = static_yaw
+                self._static_root_max_speed_mps = static_max_speed
+                self._static_root_tail_max_speed_mps = static_tail_max_speed
+                self._static_root_tail_translation_m = static_tail_translation
+                if static_translation > _MAX_STATIC_REFERENCE_TRANSLATION_M:
+                    return self._reject_result_locked(
+                        "IDLE planner braking translation exceeds the 0.080m envelope"
+                    )
+                if abs(static_yaw) > _MAX_STATIC_REFERENCE_YAW_RAD:
+                    return self._reject_result_locked(
+                        "IDLE planner root yaw exceeds the 0.050rad static envelope"
+                    )
+                if static_max_speed > _MAX_STATIC_REFERENCE_FRAME_SPEED_MPS:
+                    return self._reject_result_locked(
+                        "IDLE planner root speed exceeds the 0.400m/s braking envelope"
+                    )
+                if static_tail_max_speed > _MAX_STATIC_REFERENCE_TAIL_SPEED_MPS:
+                    return self._reject_result_locked(
+                        "IDLE planner tail does not settle below 0.025m/s"
+                    )
             requested_yaw_error: float | None = None
             predicted_yaw_delta: float | None = None
             yaw_consistent: bool | None = None
@@ -713,12 +855,12 @@ class PlannerReferenceEvidenceGate:
                     request.requested_facing_angle_rad,
                 )
             except ValueError as exc:
-                if request.requested_direction is None:
+                if request.requested_direction is None and not static_intent:
                     self._store_rejected_yaw_locked(None, None, False)
                     return self._reject_result_locked(str(exc))
                 # Translation authority remains its positive root projection;
                 # missing yaw is diagnostic only and cannot weaken that gate.
-            if request.requested_direction is None:
+            if request.requested_direction is None and not static_intent:
                 if (
                     requested_yaw_error is None
                     or abs(requested_yaw_error) <= _MIN_MEANINGFUL_YAW_RAD
@@ -862,6 +1004,21 @@ class PlannerReferenceEvidenceGate:
                     self._predicted_yaw_delta_rad
                 ),
                 "sonic_planner_yaw_consistent": self._yaw_consistent,
+                "sonic_planner_static_root_max_translation_m": (
+                    self._static_root_max_translation_m
+                ),
+                "sonic_planner_static_root_yaw_delta_rad": (
+                    self._static_root_yaw_delta_rad
+                ),
+                "sonic_planner_static_root_max_speed_mps": (
+                    self._static_root_max_speed_mps
+                ),
+                "sonic_planner_static_root_tail_max_speed_mps": (
+                    self._static_root_tail_max_speed_mps
+                ),
+                "sonic_planner_static_root_tail_translation_m": (
+                    self._static_root_tail_translation_m
+                ),
                 "sonic_planner_evidence_reason": self._reason,
             }
 

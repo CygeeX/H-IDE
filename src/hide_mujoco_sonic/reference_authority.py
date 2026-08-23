@@ -239,6 +239,58 @@ class ReferenceAuthorityState:
         )
         return self._snapshot
 
+    def transition(
+        self,
+        *,
+        generation: int,
+        source_sequence: int,
+        planner_intent_generation: int,
+        reference_epoch: int,
+    ) -> ReferenceAuthoritySnapshot:
+        """Prime a newer controlled-stop intent without dropping DDS continuity.
+
+        The old GRANTED reference remains executable while the asynchronous
+        planner prepares IDLE.  Only after that IDLE reference is installed do
+        we atomically bind its newer gait sequence and planner generation, then
+        require its first successful DDS write before exposing GRANTED again.
+        """
+
+        generation = _integer(generation, name="generation", minimum=0)
+        source_sequence = _integer(
+            source_sequence, name="source_sequence", minimum=1
+        )
+        planner_intent_generation = _integer(
+            planner_intent_generation,
+            name="planner_intent_generation",
+            minimum=1,
+        )
+        reference_epoch = _integer(
+            reference_epoch, name="reference_epoch", minimum=1
+        )
+        current = self._snapshot
+        if current.phase != "GRANTED" or current.generation != generation:
+            raise ValueError("reference transition requires current granted generation")
+        if current.source_sequence is None or source_sequence <= current.source_sequence:
+            raise ValueError("reference transition source sequence did not advance")
+        if (
+            current.planner_intent_generation is None
+            or planner_intent_generation <= current.planner_intent_generation
+        ):
+            raise ValueError("reference transition planner intent did not advance")
+        if reference_epoch <= current.reference_epoch:
+            raise ValueError("reference transition epoch did not advance")
+        self._snapshot = ReferenceAuthoritySnapshot(
+            phase="PRIMED",
+            generation=generation,
+            source_sequence=source_sequence,
+            planner_intent_generation=planner_intent_generation,
+            reference_epoch=reference_epoch,
+            reason=(
+                "controlled-stop reference decoded; awaiting its first DDS target"
+            ),
+        )
+        return self._snapshot
+
     def revoke(self, reason: str) -> ReferenceAuthoritySnapshot:
         detail = str(reason).strip() or "reference actuator authority revoked"
         previous = self._snapshot

@@ -77,6 +77,11 @@ def test_reference_transaction_and_terminal_fields_are_strict_schema_members():
         sonic_reference_actuator_authority=True,
         sonic_reference_authority_dds_target_sequence=21,
         sonic_execution_feedback_pending=True,
+        sonic_planner_static_root_max_translation_m=0.011,
+        sonic_planner_static_root_yaw_delta_rad=0.006,
+        sonic_planner_static_root_max_speed_mps=0.24,
+        sonic_planner_static_root_tail_max_speed_mps=0.006,
+        sonic_planner_static_root_tail_translation_m=0.0005,
         terminal_boundary_error="vendor revoke failed",
         plant_terminal_halt_confirmed=False,
         plant_terminal_halt_error="timeout",
@@ -88,6 +93,11 @@ def test_reference_transaction_and_terminal_fields_are_strict_schema_members():
     assert updated.sonic_reference_authority_epoch == 3
     assert updated.sonic_reference_actuator_authority is True
     assert updated.sonic_execution_feedback_pending is True
+    assert updated.sonic_planner_static_root_max_translation_m == 0.011
+    assert updated.sonic_planner_static_root_yaw_delta_rad == 0.006
+    assert updated.sonic_planner_static_root_max_speed_mps == 0.24
+    assert updated.sonic_planner_static_root_tail_max_speed_mps == 0.006
+    assert updated.sonic_planner_static_root_tail_translation_m == 0.0005
     assert updated.plant_terminal_halt_confirmed is False
     assert updated.plant_terminal_halt_error == "timeout"
     assert updated.recoverable_motion_fault is True

@@ -737,16 +737,20 @@ def test_command_zero_is_read_only_and_requires_the_filtered_tail_to_stop():
         clock=lambda: now[0],
         smoothing_alpha=0.5,
     )
+    assert guard.target_zero is True
     assert guard.command_zero is True
 
     guard.accept(0.2, 0.0, 0.0)
+    assert guard.target_zero is False
     assert guard.command_zero is False
     guard.intent(now=100.01, dt=0.02)
     guard.stop(source="test_stop")
+    assert guard.target_zero is True
     assert guard.command_zero is False
 
     stopped = guard.intent(now=100.02, dt=0.02)
     assert stopped.mode == "IDLE"
+    assert guard.target_zero is True
     assert guard.command_zero is True
 
 
@@ -1008,6 +1012,29 @@ def test_stop_freezes_and_next_action_reanchors_command_facing():
     restarted = guard.intent(now=100.03, dt=0.02)
     assert restarted.facing_angle_rad == pytest.approx(0.0)
     assert guard.command_facing == pytest.approx(0.0)
+
+
+def test_controlled_stop_reanchors_idle_to_latest_measured_heading():
+    guard = CmdVelGuard(clock=lambda: 100.0, smoothing_alpha=1.0)
+    guard.observe_heading(0.40)
+    guard.accept(0.20, 0.0, 0.10)
+    moving = guard.intent(now=100.01, dt=0.02)
+    assert moving.facing_angle_rad == pytest.approx(0.002)
+
+    # The body makes more yaw progress after the last policy intent.  The
+    # controlled IDLE plan must start from that physical boundary, not from the
+    # older command-facing value.
+    guard.observe_heading(0.46)
+    stopped_target = guard.stop_at_measured_heading(source="controlled_stop")
+    assert stopped_target.source == "controlled_stop"
+    assert guard.target_zero is True
+    assert guard.command_zero is False
+
+    idle = guard.intent(now=100.02, dt=0.02)
+    assert idle.mode == "IDLE"
+    assert idle.facing_angle_rad == pytest.approx(0.06)
+    assert guard.command_facing == pytest.approx(0.06)
+    assert guard.command_zero is True
 
 
 

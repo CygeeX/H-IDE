@@ -62,6 +62,7 @@ def health_response(
     navigation_task_active: bool = False,
     motion_authorized: bool = True,
     nav2_command_zero: bool = True,
+    controlled_policy_stop_active: bool = False,
     matched_reference_actuator_authority: bool = False,
     reference_authority_state: str = "REVOKED",
     reference_authority_generation: int | None = None,
@@ -75,7 +76,7 @@ def health_response(
     return {
         "request_id": str(REQUEST_ID),
         "ok": True,
-        "schema_version": "h-ide.sonic-health/v3",
+        "schema_version": "h-ide.sonic-health/v4",
         "robot_id": "g1-sim",
         "driver_boot_id": str(driver_boot_id),
         "driver_session_id": "31000000-0000-4000-8000-000000000003",
@@ -92,6 +93,7 @@ def health_response(
         "navigation_task_active": navigation_task_active,
         "motion_authorized": motion_authorized,
         "nav2_command_zero": nav2_command_zero,
+        "controlled_policy_stop_active": controlled_policy_stop_active,
         "matched_reference_actuator_authority": matched_reference_actuator_authority,
         "reference_authority_state": reference_authority_state,
         "reference_authority_generation": reference_authority_generation,
@@ -662,6 +664,86 @@ def test_health_exposes_only_first_dds_grant_as_reference_actuator_authority() -
             reference_authority_granted_tick_ms=2500,
             reference_authority_dds_target_sequence=11,
         )
+
+
+def test_health_accepts_only_the_explicit_driver_owned_policy_braking_shape() -> None:
+    braking = parse_health(
+        plant_support_mode="locomotion",
+        static_hold_active=False,
+        navigation_task_active=False,
+        motion_authorized=False,
+        nav2_command_zero=True,
+        controlled_policy_stop_active=True,
+        matched_reference_actuator_authority=True,
+        reference_authority_state="GRANTED",
+        reference_authority_generation=42,
+        reference_authority_source_sequence=7,
+        reference_authority_intent_generation=3,
+        reference_authority_epoch=2,
+        reference_authority_granted_at_monotonic_s=100.25,
+        reference_authority_granted_tick_ms=2500,
+        reference_authority_dds_target_sequence=11,
+    )
+
+    assert braking.controlled_policy_stop_active is True
+    assert braking.matched_reference_actuator_authority is True
+    assert braking.confirmed_safe_hold is False
+
+    with pytest.raises(ValueError, match="matched reference actuator authority"):
+        parse_health(
+            plant_support_mode="locomotion",
+            static_hold_active=False,
+            navigation_task_active=False,
+            motion_authorized=False,
+            nav2_command_zero=True,
+            controlled_policy_stop_active=False,
+            matched_reference_actuator_authority=True,
+            reference_authority_state="GRANTED",
+            reference_authority_generation=42,
+            reference_authority_source_sequence=7,
+            reference_authority_intent_generation=3,
+            reference_authority_epoch=2,
+            reference_authority_granted_at_monotonic_s=100.25,
+            reference_authority_granted_tick_ms=2500,
+            reference_authority_dds_target_sequence=11,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("static_hold_active", True),
+        ("navigation_task_active", True),
+        ("motion_authorized", True),
+        ("nav2_command_zero", False),
+        ("plant_support_stop_pending", True),
+        ("plant_support_safety_latched", True),
+    ],
+)
+def test_controlled_policy_braking_never_hides_an_unsafe_snapshot(
+    field: str,
+    value: bool,
+) -> None:
+    payload = {
+        "plant_support_mode": "locomotion",
+        "static_hold_active": False,
+        "navigation_task_active": False,
+        "motion_authorized": False,
+        "nav2_command_zero": True,
+        "controlled_policy_stop_active": True,
+        "matched_reference_actuator_authority": True,
+        "reference_authority_state": "GRANTED",
+        "reference_authority_generation": 42,
+        "reference_authority_source_sequence": 7,
+        "reference_authority_intent_generation": 3,
+        "reference_authority_epoch": 2,
+        "reference_authority_granted_at_monotonic_s": 100.25,
+        "reference_authority_granted_tick_ms": 2500,
+        "reference_authority_dds_target_sequence": 11,
+        field: value,
+    }
+    with pytest.raises(ValueError):
+        parse_health(**payload)
 
 
 def test_safe_hold_quarantines_age_only_faults_without_latching() -> None:

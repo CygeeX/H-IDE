@@ -33,6 +33,7 @@ class _Clock:
 
 
 class _Guard:
+    target_zero = True
     command_zero = True
 
 

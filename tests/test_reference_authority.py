@@ -104,6 +104,82 @@ def test_periodic_refresh_primes_new_epoch_without_exposing_old_grant() -> None:
     assert refreshed.dds_target_sequence is None
 
 
+def test_controlled_stop_transition_rebinds_new_intent_at_the_installed_epoch() -> None:
+    state = ReferenceAuthorityState()
+    state.require(generation=5, source_sequence=9)
+    state.mark_installed(
+        generation=5,
+        source_sequence=9,
+        planner_intent_generation=2,
+        reference_epoch=4,
+    )
+    state.prime(generation=5, source_sequence=9, reference_epoch=4)
+    state.grant(
+        generation=5,
+        source_sequence=9,
+        reference_epoch=4,
+        granted_at_monotonic_s=2.0,
+        granted_at_tick_ms=200,
+        dds_target_sequence=8,
+    )
+
+    transitioned = state.transition(
+        generation=5,
+        source_sequence=12,
+        planner_intent_generation=3,
+        reference_epoch=5,
+    )
+    assert transitioned.phase == "PRIMED"
+    assert transitioned.actuator_authority is False
+    assert transitioned.source_sequence == 12
+    assert transitioned.planner_intent_generation == 3
+    assert transitioned.reference_epoch == 5
+    assert transitioned.granted_at_monotonic_s is None
+    assert transitioned.dds_target_sequence is None
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"generation": 6},
+        {"source_sequence": 9},
+        {"planner_intent_generation": 2},
+        {"reference_epoch": 4},
+    ],
+)
+def test_controlled_stop_transition_rejects_stale_or_mismatched_identity(
+    overrides: dict[str, int],
+) -> None:
+    state = ReferenceAuthorityState()
+    state.require(generation=5, source_sequence=9)
+    state.mark_installed(
+        generation=5,
+        source_sequence=9,
+        planner_intent_generation=2,
+        reference_epoch=4,
+    )
+    state.prime(generation=5, source_sequence=9, reference_epoch=4)
+    state.grant(
+        generation=5,
+        source_sequence=9,
+        reference_epoch=4,
+        granted_at_monotonic_s=2.0,
+        granted_at_tick_ms=200,
+        dds_target_sequence=8,
+    )
+    values = {
+        "generation": 5,
+        "source_sequence": 12,
+        "planner_intent_generation": 3,
+        "reference_epoch": 5,
+    }
+    values.update(overrides)
+
+    with pytest.raises(ValueError):
+        state.transition(**values)
+    assert state.snapshot.phase == "GRANTED"
+
+
 def test_duplicate_require_cannot_withdraw_primed_or_granted_authority() -> None:
     state = ReferenceAuthorityState()
     state.require(generation=7, source_sequence=12)

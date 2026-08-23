@@ -60,7 +60,15 @@ class TelemetryState:
     sonic_planner_requested_yaw_error_rad: float | None = None
     sonic_planner_predicted_yaw_delta_rad: float | None = None
     sonic_planner_yaw_consistent: bool | None = None
+    sonic_planner_static_root_max_translation_m: float | None = None
+    sonic_planner_static_root_yaw_delta_rad: float | None = None
+    sonic_planner_static_root_max_speed_mps: float | None = None
+    sonic_planner_static_root_tail_max_speed_mps: float | None = None
+    sonic_planner_static_root_tail_translation_m: float | None = None
     sonic_planner_evidence_reason: str = "no Nav2 motion intent"
+    sonic_idle_readapt_state: str = "IDLE"
+    sonic_idle_readapt_stored: bool = False
+    sonic_idle_readapt_average_error_rad: float = 0.0
     sonic_reference_authority_state: str = "REVOKED"
     sonic_reference_authority_generation: int | None = None
     sonic_reference_authority_source_sequence: int | None = None

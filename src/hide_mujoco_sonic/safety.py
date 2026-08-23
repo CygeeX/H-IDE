@@ -121,6 +121,21 @@ class PlantControlClock:
         self.last_observed_tick_ms = None
         self.last_control_tick_ms = None
 
+    def rebase_stationary_qualification(self, tick_ms: int) -> None:
+        """Rebase only a policy-free startup qualification on its latest tick.
+
+        Model/GPU warmup can temporarily prevent the Python DDS callback from
+        observing intermediate LowState samples while MuJoCo continues to
+        publish a stationary held robot.  The caller is responsible for
+        proving that motion is still disabled and invalidating every pending
+        qualification sample.  Runtime policy control must always use
+        :meth:`observe` and remains fail-closed on the same discontinuity.
+        """
+
+        current = self._tick(tick_ms)
+        self.last_observed_tick_ms = current
+        self.last_control_tick_ms = current
+
     def observe(self, tick_ms: int) -> PlantControlStep | None:
         current = self._tick(tick_ms)
         previous_observed = self.last_observed_tick_ms
@@ -1640,6 +1655,21 @@ class CmdVelGuard:
             and all(abs(value) <= 1e-9 for value in (self._vx, self._vy, self._wz))
         )
 
+    @property
+    def target_zero(self) -> bool:
+        """Whether the latest admitted Nav2 target is exactly stopped.
+
+        A controlled policy stop is owned as soon as the zero target crosses
+        the command boundary.  The filtered values intentionally remain from
+        the preceding 50 Hz policy tick until :meth:`intent` consumes that
+        target.  Health must be able to prove the zero target during this
+        bounded transition without misrepresenting the filtered state as
+        already stationary; :attr:`command_zero` remains the stronger final
+        hold predicate.
+        """
+
+        return not self._is_nonzero(self._last)
+
     def observe_heading(self, yaw: float) -> None:
         """Anchor SONIC's global facing frame to measured ``map→base`` yaw.
 
@@ -1719,6 +1749,29 @@ class CmdVelGuard:
     def stop(self, *, source: str = "watchdog") -> CmdVel:
         return self.accept(0.0, 0.0, 0.0, source=source)
 
+    def stop_at_measured_heading(
+        self,
+        *,
+        source: str = "gait_adapter_controlled_stop",
+    ) -> CmdVel:
+        """Stop while holding the latest measured facing in SONIC's frame.
+
+        The learned IDLE reference brakes from the current physical heading.
+        Freezing the preceding command goal instead can ask the planner to
+        correct yaw while it is trying to settle the gait.  Reconstruct the
+        controller-frame measured facing before ``accept(0)`` clears the
+        action's measurement anchor.  Terminal/fault stops deliberately keep
+        using :meth:`stop`; this re-anchor is only for the recoverable learned
+        controlled-stop transaction.
+        """
+
+        measured_facing = self._current_measured_facing()
+        self._facing = measured_facing
+        self._command_facing = measured_facing
+        self._action_facing_origin = measured_facing
+        self._heading_anchor = None
+        return self.accept(0.0, 0.0, 0.0, source=source)
+
     def intent(self, now: float | None = None, dt: float = 0.02) -> MovementIntent:
         current = self._clock() if now is None else float(now)
         if not math.isfinite(current):
@@ -1771,17 +1824,7 @@ class CmdVelGuard:
             self._command_facing = self._wrap_angle(
                 self._command_facing + self._wz * integration_dt
             )
-            measured_facing = self._action_facing_origin
-            if (
-                self._measured_heading is not None
-                and self._heading_anchor is not None
-            ):
-                measured_facing = self._wrap_angle(
-                    self._action_facing_origin
-                    + self._wrap_angle(
-                        self._measured_heading - self._heading_anchor
-                    )
-                )
+            measured_facing = self._current_measured_facing()
             lead_limit = (
                 self.max_translation_facing_offset_rad
                 if moving
@@ -1844,6 +1887,16 @@ class CmdVelGuard:
         self._command_facing = self._facing
         self._heading_anchor = None
         self._action_facing_origin = self._facing
+
+    def _current_measured_facing(self) -> float:
+        """Return measured yaw expressed in the current SONIC action frame."""
+
+        if self._measured_heading is None or self._heading_anchor is None:
+            return self._facing
+        return self._wrap_angle(
+            self._action_facing_origin
+            + self._wrap_angle(self._measured_heading - self._heading_anchor)
+        )
 
     @staticmethod
     def _wrap_angle(value: float) -> float:

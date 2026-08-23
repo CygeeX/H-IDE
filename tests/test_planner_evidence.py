@@ -19,9 +19,11 @@ class FakeMovementState:
         movement_angle: float,
         facing_angle: float = 0.0,
         has_movement: bool = True,
+        mode: int | None = None,
+        speed: float | None = None,
     ) -> None:
-        self.mode = 1
-        self.speed = 0.2
+        self.mode = (1 if has_movement else 0) if mode is None else mode
+        self.speed = (0.2 if has_movement else -1.0) if speed is None else speed
         self.height = -1.0
         self.movement_angle = movement_angle
         self.facing_angle = facing_angle
@@ -76,6 +78,17 @@ def intent(
     )
 
 
+def idle_intent() -> MovementIntent:
+    return MovementIntent(
+        mode="IDLE",
+        speed_mps=0.0,
+        movement_angle_rad=0.0,
+        facing_angle_rad=0.0,
+        has_movement=False,
+        stale=False,
+    )
+
+
 def yaw_quaternion(yaw: float) -> tuple[float, float, float, float]:
     return (math.cos(yaw / 2.0), 0.0, 0.0, math.sin(yaw / 2.0))
 
@@ -98,12 +111,141 @@ def motion(
     )
 
 
+def settled_idle_motion(
+    dx: float,
+    *,
+    last_yaw: float = 0.0,
+    approach_steps: int = 10,
+    tail_speed_mps: float = 0.0,
+):
+    """Build a 50 Hz braking reference with an explicit 200 ms quiet tail."""
+
+    tail_steps = 10
+    tail_delta = float(tail_speed_mps) / 50.0
+    approach_end = float(dx) - tail_steps * tail_delta
+    x_positions = [
+        approach_end * index / approach_steps
+        for index in range(approach_steps + 1)
+    ]
+    x_positions.extend(
+        approach_end + tail_delta * index
+        for index in range(1, tail_steps + 1)
+    )
+    timesteps = len(x_positions)
+    return SimpleNamespace(
+        timesteps=timesteps,
+        body_positions=tuple((x, 0.0, 0.8) for x in x_positions),
+        body_quaternions=tuple(
+            yaw_quaternion(last_yaw * index / (timesteps - 1))
+            for index in range(timesteps)
+        ),
+    )
+
+
 def prefix_motion(*x_positions: float):
     positions = tuple((float(x), 0.0, 0.8) for x in x_positions)
     return SimpleNamespace(
         timesteps=len(positions),
         body_positions=positions,
         body_quaternions=tuple(yaw_quaternion(0.0) for _ in positions),
+    )
+
+
+def test_controlled_stop_accepts_only_a_bounded_official_idle_reference() -> None:
+    planner = FakePlanner()
+    gate = PlannerReferenceEvidenceGate()
+    gate.bind(planner, reference_owner=SimpleNamespace(ref_cursor=0))
+    gate.observe_intent(
+        idle_intent(),
+        admitted=True,
+        simulation_now_s=1.0,
+        allow_static_reference=True,
+    )
+    idle_state = FakeMovementState(
+        movement_angle=0.0,
+        has_movement=False,
+        mode=0,
+        speed=-1.0,
+    )
+    planner.request_replan(5, idle_state)
+    # The locked NVIDIA planner produced a 45.66 mm braking envelope after a
+    # 3 m gait (max frame speed 0.242 m/s, final 200 ms max 0.0058 m/s).
+    # The first live stop produced 49.61 mm. This fixture brackets both while
+    # retaining per-frame and terminal-settle proof.
+    # The exact 0.2 m live DriveOnHeading stop produced 0.037945 rad.  Preserve
+    # that locked-model behavior without widening beyond one 0.05 rad facing
+    # bin, while the independent translation/speed/settle gates remain active.
+    accepted = (settled_idle_motion(0.050, last_yaw=0.038), 15)
+    planner.result = accepted
+
+    assert planner.try_get_new_motion() == accepted
+    assert gate.reference_ready is True
+    evidence = gate.telemetry_fields(ref_cursor=0)
+    assert evidence["sonic_planner_static_root_max_translation_m"] == pytest.approx(
+        0.050
+    )
+    assert evidence["sonic_planner_static_root_yaw_delta_rad"] == pytest.approx(
+        0.038
+    )
+    assert evidence["sonic_planner_static_root_max_speed_mps"] == pytest.approx(
+        0.25
+    )
+    assert evidence[
+        "sonic_planner_static_root_tail_max_speed_mps"
+    ] == pytest.approx(0.0)
+    assert evidence[
+        "sonic_planner_static_root_tail_translation_m"
+    ] == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize(
+    ("candidate", "reason"),
+    [
+        (settled_idle_motion(0.081), "translation"),
+        (settled_idle_motion(0.050, last_yaw=0.051), "yaw"),
+        (settled_idle_motion(0.050, approach_steps=6), "speed"),
+        (settled_idle_motion(0.050, tail_speed_mps=0.026), "settle"),
+        (motion(0.011), "usable root trajectory"),
+    ],
+)
+def test_controlled_stop_rejects_a_non_static_idle_reference(
+    candidate,
+    reason: str,
+) -> None:
+    planner = FakePlanner()
+    gate = PlannerReferenceEvidenceGate()
+    gate.bind(planner, reference_owner=SimpleNamespace(ref_cursor=0))
+    gate.observe_intent(
+        idle_intent(), admitted=True, allow_static_reference=True
+    )
+    planner.request_replan(
+        5,
+        FakeMovementState(
+            movement_angle=0.0,
+            has_movement=False,
+            mode=0,
+            speed=-1.0,
+        ),
+    )
+    planner.result = (candidate, 15)
+
+    assert planner.try_get_new_motion() is None
+    assert gate.reference_ready is False
+    assert reason in gate.telemetry_fields(ref_cursor=0)[
+        "sonic_planner_evidence_reason"
+    ]
+
+
+def test_ordinary_idle_observation_cannot_open_static_planner_authority() -> None:
+    planner = FakePlanner()
+    gate = PlannerReferenceEvidenceGate()
+    gate.bind(planner, reference_owner=SimpleNamespace(ref_cursor=0))
+    gate.observe_intent(idle_intent(), admitted=True)
+
+    assert gate.reference_ready is False
+    assert gate.authority_evidence.intent_generation is None
+    assert gate.telemetry_fields(ref_cursor=0)["sonic_planner_evidence_reason"] == (
+        "Nav2 intent is IDLE"
     )
 
 
@@ -339,6 +481,33 @@ def test_pure_rotation_requires_generation_matched_same_sign_root_yaw(
     assert trace["planner_requested_yaw_error_rad"] == pytest.approx(requested_yaw)
     assert trace["planner_predicted_yaw_delta_rad"] == pytest.approx(predicted_yaw)
     assert trace["planner_yaw_consistent"] is True
+
+
+def test_pure_rotation_rejects_nonofficial_slow_walk_planner_shape() -> None:
+    planner = FakePlanner()
+    gate = PlannerReferenceEvidenceGate()
+    gate.bind(planner, reference_owner=SimpleNamespace(ref_cursor=0))
+    gate.observe_intent(
+        intent(0.0, has_movement=False, facing_angle=0.10),
+        admitted=True,
+    )
+    planner.request_replan(
+        8,
+        FakeMovementState(
+            movement_angle=0.0,
+            facing_angle=0.10,
+            has_movement=False,
+            mode=1,
+            speed=-1.0,
+        ),
+    )
+    planner.result = (motion(0.0, last_yaw=0.090482), 18)
+
+    assert planner.try_get_new_motion() is None
+    assert gate.reference_ready is False
+    assert "mismatched intent" in gate.telemetry_fields(ref_cursor=0)[
+        "sonic_planner_evidence_reason"
+    ]
 
 
 def test_opposite_pure_rotation_yaw_is_rejected_and_handoff_stays_zero() -> None:

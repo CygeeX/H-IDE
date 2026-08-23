@@ -1974,6 +1974,31 @@ class StrictMotionCaseExecutor:
         self.collector = collector
         self.evidence = evidence
         self.clock = clock
+        self._diagnostic_phase = "initialized"
+        self._diagnostic_preflight: dict[str, Any] | None = None
+        self._diagnostic_isolation: dict[str, Any] | None = None
+        self._diagnostic_support_epoch: int | None = None
+        self._diagnostic_samples: list[dict[str, Any]] = []
+
+    def _reset_failure_diagnostics(self, *, phase: str) -> None:
+        self._diagnostic_phase = phase
+        self._diagnostic_preflight = None
+        self._diagnostic_isolation = None
+        self._diagnostic_support_epoch = None
+        self._diagnostic_samples = []
+
+    def failure_diagnostics(self) -> dict[str, Any]:
+        """Return non-authoritative trajectory evidence retained on failure."""
+
+        return {
+            "phase": self._diagnostic_phase,
+            "supportReleaseConfirmedEpoch": self._diagnostic_support_epoch,
+            "preflight": self._diagnostic_preflight,
+            "isolationManifest": self._diagnostic_isolation,
+            "samples": self._diagnostic_samples,
+            "sampleCount": len(self._diagnostic_samples),
+            "acceptedMotionEvidence": False,
+        }
 
     @staticmethod
     def _identities(sample: Mapping[str, Any]) -> tuple[str, str]:
@@ -2013,6 +2038,8 @@ class StrictMotionCaseExecutor:
         support_epoch: int,
     ) -> list[dict[str, Any]]:
         samples: list[dict[str, Any]] = []
+        self._diagnostic_samples = samples
+        self._diagnostic_phase = "action_active"
         deadline = self.clock() + timeout_s
         while True:
             self.backend.raise_if_faulted()
@@ -2134,10 +2161,13 @@ class StrictMotionCaseExecutor:
         timeout_s = action_timeout_s(mode, goal)
         session_active = False
         normal_stopped = False
+        self._reset_failure_diagnostics(phase="standalone_preflight")
         try:
             self.backend.wait_ready()
             preflight = self.collector.collect_once()
             isolation = self.collector.isolation_manifest()
+            self._diagnostic_preflight = preflight
+            self._diagnostic_isolation = isolation
             plant_boot, plant_session = self._identities(preflight)
             # A cold motion-core launch is deliberately stationary at IDLE,
             # but control acquisition is authorized only from the exact,
@@ -2159,6 +2189,7 @@ class StrictMotionCaseExecutor:
                 "support release epoch",
                 minimum=1,
             )
+            self._diagnostic_support_epoch = support_epoch
             action = self._admit_standalone_action(mode, goal, timeout_s)
             samples = self._collect_until_action_terminal(
                 action=action,
@@ -2166,17 +2197,20 @@ class StrictMotionCaseExecutor:
                 support_epoch=support_epoch,
             )
             self.backend.stop_relay()
+            self._diagnostic_phase = "normal_stop"
             self._normal_stop_while_collecting(
                 samples,
                 support_epoch=support_epoch,
             )
             normal_stopped = True
+            self._diagnostic_phase = "terminal_settle"
             self._collect_terminal_settle(
                 samples,
                 support_epoch=support_epoch,
             )
             arm = self.evidence.finalize(case_id=case_id)
             session_active = False
+            self._diagnostic_phase = "evaluation"
             policy_epoch = _integer(
                 arm.get("policyActivationEpoch"),
                 "policy activation epoch",
@@ -2299,10 +2333,13 @@ class StrictMotionCaseExecutor:
         expected_start, goal_pose = self._detour_goal(route_id)
         session_active = False
         normal_stopped = False
+        self._reset_failure_diagnostics(phase="detour_preflight")
         try:
             self.backend.wait_ready()
             preflight = self.collector.collect_once()
             isolation = self.collector.isolation_manifest()
+            self._diagnostic_preflight = preflight
+            self._diagnostic_isolation = isolation
             plant_boot, plant_session = self._identities(preflight)
             current = self.backend.latest_map_pose()
             if (
@@ -2350,13 +2387,16 @@ class StrictMotionCaseExecutor:
                 "support release epoch",
                 minimum=1,
             )
+            self._diagnostic_support_epoch = support_epoch
             samples: list[dict[str, Any]] = []
+            self._diagnostic_samples = samples
             segment_drafts: list[dict[str, Any]] = []
             primitives = plan.get("primitives")
             if not isinstance(primitives, list) or not primitives:
                 raise StrictMotionRunnerError("static primitive plan is empty")
 
             for primitive_index, _primitive in enumerate(primitives):
+                self._diagnostic_phase = f"detour_segment_{primitive_index}"
                 if primitive_index > 0:
                     self.backend.control_arm()
                     normal_stopped = False
@@ -2487,6 +2527,7 @@ class StrictMotionCaseExecutor:
                 samples,
                 support_epoch=support_epoch,
             )
+            self._diagnostic_phase = "evaluation"
             arm = self.evidence.finalize(case_id=case_id)
             session_active = False
             _bind_detour_sample_ticks(samples, arm)
@@ -2669,6 +2710,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     route_id = args.route or "office_waste_bin_s_to_g"
     result_path = args.output.with_name(args.output.name + ".result.json")
     failure_path = args.output.with_name(args.output.name + ".failure.json")
+    executor: StrictMotionCaseExecutor | None = None
     try:
         with RosLiveBackend() as backend:
             collector = RuntimeSnapshotCollector(
@@ -2707,6 +2749,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             "failedAtUnixNs": time.time_ns(),
             "errorType": type(exc).__name__,
             "error": (str(exc).strip() or type(exc).__name__)[:1024],
+            "diagnostics": (
+                executor.failure_diagnostics()
+                if executor is not None
+                else {
+                    "phase": "runner_initialization",
+                    "acceptedMotionEvidence": False,
+                    "sampleCount": 0,
+                    "samples": [],
+                }
+            ),
         }
         try:
             _write_exclusive_json(failure_path, failure)

@@ -6,6 +6,7 @@ from uuid import UUID
 
 import pytest
 
+from hide_mujoco_sonic.motion_fault import SonicHealth, sonic_health_probe
 from hide_mujoco_sonic.normal_stop import NormalStopIdentity, NormalStopState
 from hide_mujoco_sonic.normal_stop_wire import (
     NormalStopWireError,
@@ -15,6 +16,7 @@ from hide_mujoco_sonic.normal_stop_wire import (
     parse_normal_stop_response,
 )
 from hide_mujoco_sonic.reference_authority import ReferenceAuthorityState
+from hide_mujoco_sonic.safety import NominalPolicyActivation
 from hide_mujoco_sonic.sonic_driver import (
     SonicDriver,
     SonicIntentIngress,
@@ -44,7 +46,13 @@ class Clock:
 class Guard:
     def __init__(self) -> None:
         self.stops: list[str] = []
+        self.measured_heading_stops: list[str] = []
+        self._target_zero = True
         self._command_zero = True
+
+    @property
+    def target_zero(self) -> bool:
+        return self._target_zero
 
     @property
     def command_zero(self) -> bool:
@@ -52,7 +60,12 @@ class Guard:
 
     def stop(self, *, source: str) -> None:
         self.stops.append(source)
+        self._target_zero = True
         self._command_zero = True
+
+    def stop_at_measured_heading(self, *, source: str) -> None:
+        self.measured_heading_stops.append(source)
+        self.stop(source=source)
 
     def observe_heading(self, _heading_yaw: float) -> None:
         return None
@@ -95,6 +108,7 @@ def bare_driver(clock: Clock) -> SonicDriver:
     driver.config = SimpleNamespace(robot_id=ROBOT_ID, plant_port=0)
     driver.telemetry = Telemetry()
     driver._driver_boot_id = DRIVER_BOOT_ID
+    driver._driver_session_id = UUID("31000000-0000-4000-8000-000000000003")
     driver._support_lock = threading.RLock()
     driver._terminal_fault_lock = threading.Lock()
     driver._fault_latched = threading.Event()
@@ -433,6 +447,295 @@ def test_begin_atomically_freezes_and_binds_one_braking_transaction() -> None:
     assert driver.guard.stops == ["normal_stop_begin"]
     assert driver.accept_json(payload) == response
     assert driver.guard.stops == ["normal_stop_begin"]
+
+
+def test_granted_motion_uses_policy_idle_until_stationary_then_freezes() -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    activation = NominalPolicyActivation(
+        duration_s=3.0,
+        settle_consecutive_samples=1,
+    )
+    targets = tuple(0.0 for _ in range(29))
+    assert activation.begin(targets, tick_ms=0)
+    final = activation.propose(targets, measured=targets, tick_ms=3_000)
+    assert activation.commit(final, final.targets)
+    activation.observe_settling(
+        nominal=targets,
+        measured=targets,
+        velocities=targets,
+        gyroscope=(0.0, 0.0, 0.0),
+        roll_rad=0.0,
+        pitch_rad=0.0,
+        tick_ms=3_020,
+    )
+    assert activation.record_support_release(activation.epoch)
+    assert activation.confirm_support_release(tick_ms=3_020)
+    assert activation.prepared
+    driver._policy_activation = activation
+    driver._controller = SimpleNamespace(initialized=True)
+    driver._intent_ingress.generation = 10
+    driver._intent_ingress.sequence = 19
+    driver._intent_ingress.armed = True
+    driver._reference_authority.require(generation=10, source_sequence=19)
+    driver._reference_authority.mark_installed(
+        generation=10,
+        source_sequence=19,
+        planner_intent_generation=1,
+        reference_epoch=1,
+    )
+    driver._reference_authority.prime(
+        generation=10,
+        source_sequence=19,
+        reference_epoch=1,
+    )
+    driver._reference_authority.grant(
+        generation=10,
+        source_sequence=19,
+        reference_epoch=1,
+        granted_at_monotonic_s=clock.value,
+        granted_at_tick_ms=10_000,
+        dds_target_sequence=7,
+    )
+
+    response = driver.accept_json(begin_request(clock))
+
+    assert response is not None
+    assert driver._normal_stop.snapshot.phase == "BRAKING"
+    assert driver._normal_stop_policy_braking is True
+    assert driver._controlled_stop_active is True
+    assert driver._controlled_stop_source_identity == (10, 20)
+    assert driver._intent_ingress.braking is True
+    assert driver._safe_hold_targets is None
+    assert driver._static_hold_active is False
+    assert driver._reference_authority.snapshot.phase == "GRANTED"
+    assert driver.guard.stops == ["gait_adapter_controlled_stop"]
+    assert driver.guard.measured_heading_stops == [
+        "gait_adapter_controlled_stop"
+    ]
+
+    configure_control_arm_health(driver, clock)
+    request_id = UUID("40000000-0000-4000-8000-000000000004")
+    health_payload = driver.accept_json(
+        sonic_health_probe(
+            robot_id=ROBOT_ID,
+            producer_boot_id=BRIDGE_BOOT_ID,
+            request_id=request_id,
+        )
+    )
+    assert health_payload is not None
+    health = SonicHealth.from_response(
+        {"request_id": str(request_id), "ok": True, **health_payload},
+        expected_request_id=request_id,
+        expected_robot_id=ROBOT_ID,
+    )
+    assert health.controlled_policy_stop_active is True
+    assert health.matched_reference_actuator_authority is True
+    assert health.motion_authorized is False
+    assert health.navigation_task_active is False
+    assert health.nav2_command_zero is True
+
+    identity = driver._normal_stop.snapshot.identity
+    assert identity is not None
+    clock.value += 0.02
+    stationary = driver.accept_json(stationary_request(clock, identity=identity))
+
+    assert stationary is not None
+    assert driver._normal_stop.snapshot.phase == "STATIONARY_ACK"
+    assert driver._controlled_stop_active is False
+    assert getattr(driver, "_normal_stop_policy_braking", False) is False
+    assert driver._safe_hold_targets == tuple(0.0 for _ in range(29))
+    assert driver._static_hold_active is True
+    assert driver._reference_authority.snapshot.phase == "REVOKED"
+    assert driver.guard.stops == [
+        "gait_adapter_controlled_stop",
+        "normal_stop_stationary",
+    ]
+
+
+def test_generic_stopping_intent_is_health_visible_before_correlated_begin() -> None:
+    """Zero cmd may precede the normal-stop RPC without inventing a fault."""
+
+    clock = Clock()
+    driver = bare_driver(clock)
+    activation = NominalPolicyActivation(
+        duration_s=3.0,
+        settle_consecutive_samples=1,
+    )
+    targets = tuple(0.0 for _ in range(29))
+    assert activation.begin(targets, tick_ms=0)
+    final = activation.propose(targets, measured=targets, tick_ms=3_000)
+    assert activation.commit(final, final.targets)
+    activation.observe_settling(
+        nominal=targets,
+        measured=targets,
+        velocities=targets,
+        gyroscope=(0.0, 0.0, 0.0),
+        roll_rad=0.0,
+        pitch_rad=0.0,
+        tick_ms=3_020,
+    )
+    assert activation.record_support_release(activation.epoch)
+    assert activation.confirm_support_release(tick_ms=3_020)
+    assert activation.prepared
+    driver._policy_activation = activation
+    driver._controller = SimpleNamespace(initialized=True)
+    driver._intent_ingress.generation = 10
+    driver._intent_ingress.sequence = 19
+    driver._intent_ingress.armed = True
+    driver._navigation_task_active = True
+    driver.guard._target_zero = False
+    driver.guard._command_zero = False
+    driver._reference_authority.require(generation=10, source_sequence=19)
+    driver._reference_authority.mark_installed(
+        generation=10,
+        source_sequence=19,
+        planner_intent_generation=1,
+        reference_epoch=1,
+    )
+    driver._reference_authority.prime(
+        generation=10,
+        source_sequence=19,
+        reference_epoch=1,
+    )
+    driver._reference_authority.grant(
+        generation=10,
+        source_sequence=19,
+        reference_epoch=1,
+        granted_at_monotonic_s=clock.value,
+        granted_at_tick_ms=10_000,
+        dds_target_sequence=7,
+    )
+
+    # This is the real scheduling order: the first zero /cmd_vel reaches the
+    # regular gait-intent channel before the correlated normal-stop RPC.
+    assert driver.accept_json(stopping_intent(clock, generation=10, sequence=20)) is None
+    assert driver._normal_stop.snapshot.phase == "NONE"
+    assert driver._controlled_stop_active is True
+    assert getattr(driver, "_normal_stop_policy_braking", False) is False
+
+    # The health probe may run after the zero target is admitted but before
+    # the next 50 Hz control tick consumes the previous filtered command.
+    # This is a legitimate, driver-owned braking transition, not active Nav2
+    # motion and not a final stationary acknowledgement.
+    driver.guard._command_zero = False
+    assert driver.guard.target_zero is True
+    assert driver.guard.command_zero is False
+
+    configure_control_arm_health(driver, clock)
+    request_id = UUID("40000000-0000-4000-8000-000000000005")
+    health_payload = driver.accept_json(
+        sonic_health_probe(
+            robot_id=ROBOT_ID,
+            producer_boot_id=BRIDGE_BOOT_ID,
+            request_id=request_id,
+        )
+    )
+    assert health_payload is not None
+    health = SonicHealth.from_response(
+        {"request_id": str(request_id), "ok": True, **health_payload},
+        expected_request_id=request_id,
+        expected_robot_id=ROBOT_ID,
+    )
+    assert health.controlled_policy_stop_active is True
+    assert health.matched_reference_actuator_authority is True
+    assert health.motion_authorized is False
+    assert health.navigation_task_active is False
+    assert health.nav2_command_zero is True
+    assert driver.guard.command_zero is False
+
+    # The strict transaction joins the already-owned braking generation with
+    # the next GaitAdapter source sequence.  The bridge's mutually-exclusive
+    # state callback prevents another zero-command intent from overtaking it.
+    response = driver.accept_json(begin_request(clock, sequence=21))
+    assert response is not None
+    assert driver._normal_stop.snapshot.phase == "BRAKING"
+    assert driver._normal_stop_policy_braking is True
+
+
+@pytest.mark.parametrize(
+    (
+        "intent_mode",
+        "controlled_stop",
+        "decision_static_hold",
+        "activation_waiting_for_release",
+        "handoff_ratio",
+        "expected",
+    ),
+    [
+        ("SLOW_WALK", False, False, False, 1.0, "locomotion"),
+        ("IDLE", True, False, False, 1.0, "idle"),
+        ("SLOW_WALK", False, True, False, 1.0, "idle"),
+        ("SLOW_WALK", False, False, True, 1.0, "idle"),
+        ("SLOW_WALK", False, False, False, 0.0, "idle"),
+    ],
+)
+def test_policy_support_mode_keeps_controlled_braking_in_plant_idle(
+    intent_mode: str,
+    controlled_stop: bool,
+    decision_static_hold: bool,
+    activation_waiting_for_release: bool,
+    handoff_ratio: float,
+    expected: str,
+) -> None:
+    assert SonicDriver._desired_policy_support_mode(
+        intent_mode=intent_mode,
+        controlled_stop=controlled_stop,
+        decision_static_hold=decision_static_hold,
+        activation_waiting_for_release=activation_waiting_for_release,
+        handoff_ratio=handoff_ratio,
+    ) == expected
+
+
+def test_only_pre_braking_locomotion_tick_is_dropped_after_policy_stop_wins() -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    driver._normal_stop.begin(
+        control_generation=10,
+        gait_source_sequence=20,
+    )
+    driver._normal_stop_policy_braking = True
+
+    with driver._support_lock:
+        assert driver._old_locomotion_tick_lost_to_controlled_stop_locked(
+            controlled_stop_at_tick_start=False,
+        ) is True
+        assert driver._old_locomotion_tick_lost_to_controlled_stop_locked(
+            controlled_stop_at_tick_start=True,
+        ) is False
+
+    driver._normal_stop_policy_braking = False
+    with driver._support_lock:
+        assert driver._old_locomotion_tick_lost_to_controlled_stop_locked(
+            controlled_stop_at_tick_start=False,
+        ) is False
+
+
+def test_braking_ingress_rejects_new_motion_until_stationary_rearm() -> None:
+    clock = Clock()
+    ingress = SonicIntentIngress(clock=clock, max_age_s=0.5)
+    ingress.generation = 10
+    ingress.sequence = 19
+    ingress.armed = True
+
+    stopping = ingress.accept(stopping_intent(clock, generation=10, sequence=20))
+    assert stopping.action == "brake"
+    assert ingress.braking is True
+
+    clock.value += 0.02
+    motion = stopping_intent(clock, generation=10, sequence=21)
+    motion.update(
+        state="STARTING",
+        mode="SLOW_WALK",
+        velocity_x_mps=0.2,
+        linear_speed_mps=0.2,
+        motion_enabled=True,
+        stop_requested=False,
+    )
+    rejected = ingress.accept(motion)
+    assert rejected.action == "stop"
+    assert "stationary IDLE" in str(rejected.reason)
+    assert ingress.armed is False
 
 
 def test_same_request_id_replays_first_response_through_all_later_phases() -> None:
