@@ -119,6 +119,12 @@ class FormalContract:
     expected_lateral_m: float | None = None
     expected_yaw_rad: float | None = None
     final_position_tolerance_m: float = 0.15
+    # Nav2 DriveOnHeading emits the official constant-speed primitive until
+    # odometry reaches its target.  SONIC then needs a bounded gait-braking
+    # interval before the balanced IDLE settles.  Keep final accuracy at 15 cm
+    # while allowing at most 18 cm transient longitudinal travel; collision,
+    # cross-track, pose-jump, direction, and terminal gates remain independent.
+    max_linear_overshoot_m: float = 0.18
     final_yaw_tolerance_rad: float = 0.35
     max_cross_track_m: float = 0.12
     max_heading_error_rad: float = 0.20
@@ -178,6 +184,7 @@ FORMAL_CONTRACTS: dict[str, FormalContract] = {
     "forward_probe": FormalContract(
         expected_longitudinal_m=0.20,
         final_position_tolerance_m=0.05,
+        max_linear_overshoot_m=0.08,
         min_linear_progress_m=0.03,
     ),
     "forward": FormalContract(expected_longitudinal_m=1.0),
@@ -1608,7 +1615,7 @@ class StrictMotionEvaluator:
                     break
             if min(directional) < -self.contract.max_opposite_motion_m - _EPS:
                 self._fail("OPPOSITE_MOTION_EXCEEDED", f"opposite travel reached {-min(directional):.4f}m")
-            if max(directional) > abs(expected) + self.contract.final_position_tolerance_m + _EPS:
+            if max(directional) > abs(expected) + self.contract.max_linear_overshoot_m + _EPS:
                 self._fail("LINEAR_OVERSHOOT", f"directional travel reached {max(directional):.4f}m")
             if max(cross) > self.contract.max_cross_track_m + _EPS:
                 self._fail("CROSS_TRACK_EXCEEDED", f"cross-track travel reached {max(cross):.4f}m")

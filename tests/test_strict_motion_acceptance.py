@@ -1543,6 +1543,40 @@ def test_ros_float32_command_roundoff_is_not_material_overspeed() -> None:
     assert "DRIVE_ON_HEADING_COMMAND_ENVELOPE" in _failure_codes(overspeed)
 
 
+def test_forward_allows_bounded_gait_braking_but_rejects_larger_overshoot() -> None:
+    trace = _trace("forward")
+    positions = {
+        45: 0.90,
+        46: 0.96,
+        47: 1.02,
+        48: 1.08,
+        49: 1.14,
+        50: 1.17,
+        51: 1.16,
+        52: 1.15,
+    }
+    for index, sample in enumerate(trace["samples"]):
+        if index >= 53:
+            positions[index] = 1.14
+        if index not in positions:
+            continue
+        x = positions[index]
+        sample["root"]["x"] = x
+        sample["plantDynamicsEvidence"]["rootState"]["qpos"][0] = x
+        sample["plantDynamicsEvidence"]["robotCenterOfMass"]["positionM"][0] = (
+            x + 0.01
+        )
+
+    assert strict.evaluate_trace(trace)["pass"] is True
+
+    excessive = copy.deepcopy(trace)
+    peak = excessive["samples"][50]
+    peak["root"]["x"] = 1.181
+    peak["plantDynamicsEvidence"]["rootState"]["qpos"][0] = 1.181
+    peak["plantDynamicsEvidence"]["robotCenterOfMass"]["positionM"][0] = 1.191
+    assert "LINEAR_OVERSHOOT" in _failure_codes(excessive)
+
+
 def test_terminal_sampling_allows_5hz_but_not_a_larger_gap() -> None:
     trace = _trace("forward")
     terminal_indices = [
