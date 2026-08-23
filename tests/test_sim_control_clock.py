@@ -98,6 +98,29 @@ def test_driver_consumes_exactly_one_admitted_simulation_step() -> None:
     assert second[1].dt_s == 0.02
 
 
+def test_consuming_control_sample_wakes_reliable_dds_reader() -> None:
+    driver = _bare_driver()
+    driver._on_lowstate(SimpleNamespace(tick=1_000))
+    waiting = threading.Event()
+    released = threading.Event()
+
+    def wait_for_slot() -> None:
+        with driver._control_condition:
+            waiting.set()
+            while driver._pending_control_sample is not None:
+                driver._control_condition.wait(timeout=1.0)
+            released.set()
+
+    waiter = threading.Thread(target=wait_for_slot)
+    waiter.start()
+    assert waiting.wait(timeout=0.2)
+
+    assert driver._next_control_sample(wait_timeout_s=0.0) is not None
+    assert released.wait(timeout=0.2)
+    waiter.join(timeout=0.2)
+    assert not waiter.is_alive()
+
+
 def test_driver_observes_lowstate_and_successful_publish_gaps() -> None:
     driver = _bare_driver()
     lowstates = []

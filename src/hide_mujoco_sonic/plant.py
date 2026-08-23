@@ -40,6 +40,7 @@ from .render_workers import (
 )
 from .runtime_diagnostics import PlantRuntimeDiagnostics
 from .scene_runtime import RuntimeScene
+from .unitree_dds import initialize_unitree_control_channel
 
 
 class PlantPhysicsFault(RuntimeError):
@@ -2138,8 +2139,9 @@ def run_plant(config: SimConfig) -> int:
     if not (simulator_root / "sim" / "simulator_factory.py").is_file():
         raise RuntimeError(f"pinned Unitree simulator is missing: {simulator_root}")
     sys.path.insert(0, str(simulator_root))
-    from sim.simulator_factory import SimulatorFactory, init_channel
+    from sim.simulator_factory import SimulatorFactory
     from sim.unitree_sdk2py_bridge import simulation_time_to_tick_ms
+    from unitree_sdk2py.core.channel import ChannelFactory
 
     model_config = {
         "ROBOT_TYPE": "g1_29dof",
@@ -2185,7 +2187,11 @@ def run_plant(config: SimConfig) -> int:
         + [88, 50, 50]
         + [25, 25, 25, 25, 25, 5, 5] * 2,
     }
-    init_channel(model_config)
+    initialize_unitree_control_channel(
+        ChannelFactory(),
+        domain_id=config.unitree_domain_id,
+        interface=config.interface,
+    )
     simulator = SimulatorFactory.create_simulator(
         config=model_config,
         env_name="default",

@@ -26,6 +26,11 @@ class FakeSubscriber:
 def reader_shell(subscriber: FakeSubscriber) -> SonicDriver:
     driver = SonicDriver.__new__(SonicDriver)
     driver._stop = threading.Event()
+    driver._fault_latched = threading.Event()
+    driver._recoverable_motion_fault = False
+    driver._lowstate_lock = threading.RLock()
+    driver._control_condition = threading.Condition(driver._lowstate_lock)
+    driver._pending_control_sample = None
     driver._lowstate_reader_stop = threading.Event()
     driver._lowstate_reader_close_lock = threading.Lock()
     driver._lowstate_reader_closed = False
@@ -70,6 +75,44 @@ def test_direct_lowstate_reader_latches_unexpected_read_failure() -> None:
     assert reasons == [
         "MuJoCo LowState direct reader failed: RuntimeError: reader broke"
     ]
+
+
+def test_direct_lowstate_reader_waits_for_control_consumer_before_next_read() -> None:
+    first = object()
+    second = object()
+    subscriber = FakeSubscriber((first, second))
+    driver = reader_shell(subscriber)
+    first_delivered = threading.Event()
+    second_delivered = threading.Event()
+    received = []
+
+    def receive(message):
+        received.append(message)
+        if message is first:
+            with driver._control_condition:
+                driver._pending_control_sample = (message, object(), 0)
+            first_delivered.set()
+        else:
+            second_delivered.set()
+            driver._lowstate_reader_stop.set()
+
+    driver._on_lowstate = receive
+    driver._latch_terminal_fault = lambda _reason: None
+    thread = threading.Thread(target=driver._run_lowstate_reader)
+    thread.start()
+
+    assert first_delivered.wait(timeout=0.2)
+    assert received == [first]
+    assert subscriber.read_count == 1
+
+    with driver._control_condition:
+        driver._pending_control_sample = None
+        driver._control_condition.notify_all()
+
+    assert second_delivered.wait(timeout=0.2)
+    thread.join(timeout=0.2)
+    assert not thread.is_alive()
+    assert received == [first, second]
 
 
 def test_direct_lowstate_reader_close_is_bounded_and_idempotent() -> None:

@@ -82,6 +82,7 @@ from .transport import (
     release_plant_fall_arrest,
     set_plant_support,
 )
+from .unitree_dds import initialize_unitree_control_channel
 
 logger = logging.getLogger(__name__)
 
@@ -577,14 +578,18 @@ class SonicDriver:
 
         # These imports are intentionally lazy: `check` and safety tests must
         # work without ROS/Unitree SDK/ONNX installed.
-        from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelPublisher, ChannelSubscriber
+        from unitree_sdk2py.core.channel import ChannelFactory, ChannelPublisher, ChannelSubscriber
         from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_, LowState_
         from unitree_sdk2py.utils.crc import CRC
         from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_
         from lerobot.robots.unitree_g1.controllers.sonic_whole_body import SonicWholeBodyController
 
         self._sdk = (ChannelPublisher, ChannelSubscriber, LowCmd_, LowState_, CRC, unitree_hg_msg_dds__LowCmd_)
-        ChannelFactoryInitialize(config.unitree_domain_id, config.interface)
+        initialize_unitree_control_channel(
+            ChannelFactory(),
+            domain_id=config.unitree_domain_id,
+            interface=config.interface,
+        )
         self._publisher = ChannelPublisher(config.lowcmd_topic, LowCmd_)
         self._publisher.Init()
         self._subscriber = ChannelSubscriber(config.lowstate_topic, LowState_)
@@ -838,6 +843,25 @@ class SonicDriver:
                 return
             if message is not None:
                 self._on_lowstate(message)
+                # The DDS reader owns a reliable queue, while the control loop
+                # owns the single admitted slot below.  Do not drain a burst
+                # into that slot: wait until the exact sample has been taken
+                # before reading the next queued sample.  The existing wall
+                # liveness interlock still faults a genuinely stalled control
+                # loop; this handshake neither drops nor fabricates ticks.
+                with self._control_condition:
+                    while (
+                        self._pending_control_sample is not None
+                        and not self._lowstate_reader_stop.is_set()
+                        and not self._stop.is_set()
+                        and not (
+                            self._fault_latched.is_set()
+                            and not getattr(
+                                self, "_recoverable_motion_fault", False
+                            )
+                        )
+                    ):
+                        self._control_condition.wait(timeout=0.05)
 
     def _close_lowstate_reader(self) -> None:
         """Bound and idempotently release the dedicated DDS reader."""
@@ -1160,6 +1184,7 @@ class SonicDriver:
                 baseline = self._control_clock.observe(int(self._lowstate.tick))
                 assert baseline is not None
                 self._pending_control_sample = None
+                self._control_condition.notify_all()
                 self._control_clock_armed_at_wall_s = self._wall_clock()
                 self._startup_qualifying = True
                 self._startup_qualification_consecutive_steps = 0
@@ -1188,6 +1213,8 @@ class SonicDriver:
                 self._control_condition.wait(timeout=wait_timeout_s)
             sample = self._pending_control_sample
             self._pending_control_sample = None
+            if sample is not None:
+                self._control_condition.notify_all()
             if (
                 sample is None
                 and self._control_clock_armed
