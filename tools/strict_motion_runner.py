@@ -82,6 +82,8 @@ SAMPLE_DEADLINE_S = 0.30
 TERMINAL_SETTLE_S = 3.0
 TERMINAL_SETTLE_MAX_WALL_S = 30.0
 SEGMENT_BALANCED_IDLE_S = 1.5
+EXCEPTION_BALANCED_IDLE_S = 1.0
+EXCEPTION_BALANCED_IDLE_MAX_WALL_S = 8.0
 TERMINAL_LINEAR_SPEED_MPS = 0.01
 # SONIC's learned IDLE policy actively balances an untethered humanoid.  The
 # live one-metre runs held pose while the instantaneous root angular-speed
@@ -2317,6 +2319,45 @@ class StrictMotionCaseExecutor:
         except Exception:
             return False
 
+    def _await_exception_balanced_idle(self, support_epoch: int | None) -> bool:
+        """Give an already-started learned-IDLE stop a bounded completion window.
+
+        Cancelling a Nav2 action and publishing zero starts SONIC's correlated
+        controlled-policy stop asynchronously.  Sampling it immediately almost
+        always observes REQUIRED/PRIMED rather than the first GRANTED IDLE DDS
+        fact.  Issuing the stronger static normal-stop at that instant removes
+        dynamic balance from an untethered humanoid and caused the live timeout
+        cleanup fall.  Wait only while every fresh sample remains support-off,
+        identity-stable and healthy; any fault, evidence loss or timeout still
+        falls back to the terminal normal-stop boundary.
+        """
+
+        if support_epoch is None:
+            return False
+        if self._fresh_balanced_idle_boundary(support_epoch):
+            return True
+        first_settled_t: float | None = None
+        deadline = self.clock() + EXCEPTION_BALANCED_IDLE_MAX_WALL_S
+        while self.clock() < deadline:
+            try:
+                sample = self.collector.wait_next()
+                if not _support_off(sample, support_epoch):
+                    return False
+                if _sample_settled(sample):
+                    t_s = _finite(sample.get("tS"), "exception cleanup tS")
+                    if first_settled_t is None:
+                        first_settled_t = t_s
+                    if (
+                        t_s - first_settled_t
+                        >= EXCEPTION_BALANCED_IDLE_S - 1e-6
+                    ):
+                        return True
+                else:
+                    first_settled_t = None
+            except Exception:
+                return False
+        return False
+
     def _collect_one_idle_sample(
         self,
         samples: list[dict[str, Any]],
@@ -2465,7 +2506,7 @@ class StrictMotionCaseExecutor:
                 self.backend.stop_relay()
             except Exception:
                 pass
-            preserve_balanced_idle = self._fresh_balanced_idle_boundary(
+            preserve_balanced_idle = self._await_exception_balanced_idle(
                 self._diagnostic_support_epoch
             )
             if not normal_stopped and not preserve_balanced_idle:

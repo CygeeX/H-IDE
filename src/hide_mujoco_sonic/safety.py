@@ -1855,7 +1855,20 @@ class CmdVelGuard:
             self._command_facing = self._wrap_angle(
                 self._command_facing + self._wz * integration_dt
             )
-            if moving and abs(self._wz) <= 1e-9:
+            if not moving:
+                # Match NVIDIA's pinned ROS2 adapter: an angular-only Nav2
+                # command advances ``planner_facing_angle_`` directly and the
+                # resulting absolute facing vector is written to
+                # ``MovementState``.  Capping a pure Spin to measured yaw +
+                # 0.05 rad reduced every planner request to a short prefix;
+                # once that prefix ended the robot could not make further
+                # progress even though Nav2 continued to command a turn.
+                # Rotation remains bounded by Nav2's signed Spin goal,
+                # command timeout, direction/progress guards and the action
+                # deadline.  Measured lead limiting is retained below for a
+                # translating curve, where it protects path tracking.
+                self._facing = self._command_facing
+            elif abs(self._wz) <= 1e-9:
                 # DriveOnHeading and a pure lateral step require an absolute
                 # facing target for the complete action.  Following measured
                 # yaw here creates positive feedback: a normal humanoid torso

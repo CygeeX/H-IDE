@@ -862,6 +862,28 @@ def test_dynamic_idle_accepts_observed_balance_correction_but_not_motion() -> No
     assert runner._sample_settled(moving) is False
 
 
+def test_exception_cleanup_waits_for_delayed_balanced_idle_before_static_stop() -> None:
+    """An asynchronous policy stop gets a bounded balance-preserving window."""
+
+    backend = FakeExecutorBackend()
+    collector = FakeExecutorCollector(
+        [
+            _executor_sample(10.0),
+            _executor_sample(10.5),
+            _executor_sample(11.0),
+        ]
+    )
+    executor = runner.StrictMotionCaseExecutor(
+        backend,
+        collector,
+        FakeExecutorEvidence(),
+        clock=lambda: 1.0,
+    )
+
+    assert executor._await_exception_balanced_idle(17) is True
+    assert "normal_stop" not in backend.calls
+
+
 class FakeExecutorBackend:
     def __init__(self) -> None:
         self.calls: list[str] = []

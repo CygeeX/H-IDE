@@ -2258,7 +2258,7 @@ def test_run_never_enters_reference_or_policy_during_nominal_activation() -> Non
     assert activation_calls == [1_000]
 
 
-def test_activation_accumulates_only_admitted_heading_after_decoder_reinit() -> None:
+def test_activation_routes_admitted_heading_only_through_planner_state() -> None:
     clock = Clock()
     driver = bare_driver(clock)
     driver._last_published_targets = tuple(0.0 for _ in range(29))
@@ -2280,7 +2280,7 @@ def test_activation_accumulates_only_admitted_heading_after_decoder_reinit() -> 
     intents = [
         MovementIntent("SLOW_WALK", 0.2, 0.0, 0.10, True, False),
         # This intermediate raw sample is below the gate threshold and must
-        # not influence the decoder or final planner evidence.
+        # not influence the final planner evidence.
         MovementIntent("SLOW_WALK", 0.2, 0.0, 0.12, True, False),
         MovementIntent("SLOW_WALK", 0.2, 0.0, 0.30, True, False),
     ]
@@ -2299,7 +2299,7 @@ def test_activation_accumulates_only_admitted_heading_after_decoder_reinit() -> 
     assert driver._intent_gate.last is latest
     assert controller.controller.reinit_heading is True
     assert controller.controller.delta_heading == 0.0
-    assert driver._pending_decoder_heading_delta_rad == pytest.approx(0.30)
+    assert driver._pending_decoder_heading_delta_rad == pytest.approx(0.0)
     assert controller.ms.facing_angle == pytest.approx(0.30)
     assert evidence.intent_generation == 0
     assert driver._reference_request_pending is False
@@ -2347,6 +2347,9 @@ def test_pure_rotation_uses_official_idle_planner_without_losing_motion_owner() 
     assert controller.ms.mode == LM.IDLE
     assert controller.ms.speed == -1.0
     assert controller.ms.has_movement is False
+    assert controller.controller.reinit_heading is True
+    assert controller.controller.delta_heading == pytest.approx(0.0)
+    assert driver._pending_decoder_heading_delta_rad == pytest.approx(0.0)
     assert driver._reference_authority.snapshot.phase == "REQUIRED"
     assert driver._reference_request_pending is True
     assert evidence.intent_generation == 1

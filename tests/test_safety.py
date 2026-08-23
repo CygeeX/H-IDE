@@ -812,7 +812,7 @@ def test_angular_only_nav2_command_selects_sonic_turning_plan():
     assert intent.facing_angle_rad == pytest.approx(0.006)
 
 
-def test_angular_command_integral_caps_open_loop_lead():
+def test_pure_rotation_follows_official_ros2_command_integral():
     now = [100.0]
     guard = CmdVelGuard(
         max_angular_rps=0.5,
@@ -826,16 +826,34 @@ def test_angular_command_integral_caps_open_loop_lead():
         guard.accept(0.0, 0.0, 0.5)
         saturated = guard.intent(now=now[0], dt=0.02)
     assert guard.command_facing == pytest.approx(0.20)
-    assert saturated.facing_angle_rad == pytest.approx(0.05)
+    assert saturated.facing_angle_rad == pytest.approx(0.20)
 
-    # Measured progress only moves the output lead window; it does not get
-    # added back into the command integral.
+    # Measured progress is observational for a pure Spin.  It neither replaces
+    # nor limits the official command-space planner facing.
     guard.observe_heading(0.7)
     now[0] += 0.02
     guard.accept(0.0, 0.0, 0.5)
     progressed = guard.intent(now=now[0], dt=0.02)
     assert guard.command_facing == pytest.approx(0.21)
-    assert progressed.facing_angle_rad == pytest.approx(0.15)
+    assert progressed.facing_angle_rad == pytest.approx(0.21)
+
+
+def test_translating_curve_retains_measured_facing_lead_limit():
+    now = [100.0]
+    guard = CmdVelGuard(
+        max_angular_rps=0.5,
+        max_facing_lead_rad=0.05,
+        max_translation_facing_offset_rad=0.05,
+        clock=lambda: now[0],
+        smoothing_alpha=1.0,
+    )
+    guard.observe_heading(0.6)
+    for _frame in range(20):
+        now[0] += 0.02
+        guard.accept(0.2, 0.0, 0.5)
+        intent = guard.intent(now=now[0], dt=0.02)
+    assert guard.command_facing == pytest.approx(0.20)
+    assert intent.facing_angle_rad == pytest.approx(0.05)
 
 
 def test_small_reverse_measured_spin_does_not_reverse_command_integral():
@@ -989,8 +1007,8 @@ def test_mixed_curve_facing_integral_accumulates_and_mirrors_past_old_cap():
     assert negative_output == pytest.approx(-positive_output)
 
 
-def test_spin_measured_progress_opens_the_next_planner_facing_segment():
-    """Fresh odometry must advance a long Spin beyond its first small clip."""
+def test_spin_command_integral_opens_successive_planner_facing_segments():
+    """A long official Spin must not depend on measured motion to replan."""
 
     now = [100.0]
     guard = CmdVelGuard(clock=lambda: now[0], smoothing_alpha=1.0)
@@ -1000,31 +1018,21 @@ def test_spin_measured_progress_opens_the_next_planner_facing_segment():
 
     guard.observe_heading(0.0)
     guard.accept(0.0, 0.0, 0.20)
-    first_segment = None
+    admitted_segments = []
     # Reproduce cold INIT: the command integral keeps advancing for 3 s while
-    # measured yaw remains near the starting pose and the emitted target is
-    # capped at the reviewed 0.05-rad lead.
+    # measured yaw remains near the starting pose.  The replan gate emits each
+    # new absolute planner target after its 0.05-rad/0.15-rad thresholds.
     for frame in range(150):
         now[0] += 0.02
         guard.observe_heading(0.0)
         guard.accept(0.0, 0.0, 0.20)
         candidate = guard.intent(now=now[0], dt=0.02)
         if gate.admit(candidate, now=(frame + 1) * 0.02):
-            first_segment = candidate
-    assert first_segment is not None
-    assert first_segment.facing_angle_rad == pytest.approx(0.05)
+            admitted_segments.append(candidate.facing_angle_rad)
+    assert admitted_segments == pytest.approx([0.052, 0.204, 0.356, 0.508])
     assert guard.command_facing == pytest.approx(0.60)
-
-    # The same authoritative odometry sample that proves physical progress is
-    # enough to move the emitted lead and cross the 0.15-rad replan threshold.
-    # A stale separately-cached pose would leave the target at 0.05 forever.
-    now[0] += 0.40
-    guard.observe_heading(0.18)
-    guard.accept(0.0, 0.0, 0.20)
-    next_segment = guard.intent(now=now[0], dt=0.02)
-    assert next_segment.facing_angle_rad == pytest.approx(0.23)
-    assert gate.admit(next_segment, now=3.40)
-    assert gate.last is next_segment
+    assert gate.last is not None
+    assert gate.last.facing_angle_rad == pytest.approx(0.508)
 
 
 @pytest.mark.parametrize("invalid_dt", [float("nan"), 0.0, 0.10])

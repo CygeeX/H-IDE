@@ -3229,27 +3229,18 @@ class SonicDriver:
         elif starting_motion and admitted:
             decoder.reinit_heading = True
             decoder.delta_heading = 0.0
-            # ``step()`` consumes reinit_heading later in this control tick and
-            # resets delta_heading.  The planner keeps one cumulative canonical
-            # facing across actions, while this freshly re-anchored decoder must
-            # receive only the new action's relative increment.
-            previous_facing = (
-                0.0 if self._decoder_facing_rad is None else self._decoder_facing_rad
-            )
-            self._pending_decoder_heading_delta_rad = self._angular_delta(
-                intent.facing_angle_rad,
-                previous_facing,
-            )
+            # The pinned NVIDIA ROS2 input path expresses navigation heading
+            # solely through MovementState.facing_direction.  ``delta_heading``
+            # belongs to the keyboard/ZMQ operator path.  Applying the same
+            # Nav2 angle to both planner facing and decoder heading doubled the
+            # first short Spin request and made later reference transitions
+            # inconsistent with the planner's root-yaw evidence.
+            self._pending_decoder_heading_delta_rad = 0.0
             self._decoder_facing_rad = intent.facing_angle_rad
         elif admitted and self._decoder_facing_rad is not None:
-            delta = self._angular_delta(intent.facing_angle_rad, self._decoder_facing_rad)
-            if bool(getattr(decoder, "reinit_heading", False)):
-                # No policy tick has consumed the re-anchor yet (notably while
-                # nominal activation/reference planning is in progress). Keep
-                # every admitted facing increment on the post-reinit side.
-                self._pending_decoder_heading_delta_rad += delta
-            else:
-                decoder.delta_heading += delta
+            # Planner-facing updates are reference transactions; do not also
+            # inject them through the operator-only decoder offset.
+            self._pending_decoder_heading_delta_rad = 0.0
             self._decoder_facing_rad = intent.facing_angle_rad
         if admitted:
             # Official SONIC ROS2 maps angular-only navigation to an IDLE
