@@ -583,10 +583,15 @@ class SonicRuntime:
             raise RuntimeError("pending SONIC candidate no longer matches its reference epoch/cursor")
         executed = self.controller.record_executed_target(target)
         self._has_committed_policy_target = True
-        self.controller.advance_cursor()
-        self._policy_step_pending = False
-        self._pending_reference_install_epoch = None
-        self._pending_ref_cursor = None
+        try:
+            self.controller.advance_cursor(idle_mode=LM(self.ms.mode) == LM.IDLE)
+        finally:
+            # The DDS target and recurrent action history are already committed
+            # facts.  Even if reference readaptation detects invalid measured
+            # state, do not leave a fictitious unpublished policy candidate.
+            self._policy_step_pending = False
+            self._pending_reference_install_epoch = None
+            self._pending_ref_cursor = None
         return executed
 
     def tick(self, obs: dict, *, debug: bool | None = None, use_joystick: bool = True) -> dict:

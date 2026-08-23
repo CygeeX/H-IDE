@@ -26,7 +26,9 @@ from lerobot.robots.unitree_g1.controllers.sonic_pipeline import (
     DEFAULT_ANGLES,
     DEFAULT_ANGLES_ISAACLAB,
     ENCODER_UPDATE_EVERY,
+    IdleReadaptState,
     ISAACLAB_TO_MUJOCO,
+    LOWER_BODY_IL,
     MUJOCO_TO_ISAACLAB,
     MovementState,
     PlannerController,
@@ -165,6 +167,112 @@ def _initialize_and_acquire(runtime, planner, obs):
         expected_install_epoch=runtime.reference_install_epoch,
     )
     return boundary
+
+
+def _terminal_idle_controller(*, target=None, actual=None):
+    controller = PlannerController(
+        _FakePlanner(),
+        _FakeSession(1762, np.zeros(64, np.float32)),
+        _FakeSession(994, np.zeros(29, np.float32)),
+    )
+    target_il = np.asarray(
+        DEFAULT_ANGLES_ISAACLAB if target is None else target,
+        dtype=np.float64,
+    ).copy()
+    actual_il = np.asarray(target_il if actual is None else actual, dtype=np.float64)
+    controller.motion_timesteps = 2
+    controller.motion_joint_positions[1] = target_il
+    controller.ref_cursor = 0
+    controller.playing = True
+    controller.set_reference_authority(
+        actuator_authority=True,
+        matching_reference_ready=True,
+    )
+    controller.h_q_mj[0] = (
+        actual_il - DEFAULT_ANGLES_ISAACLAB
+    ).astype(np.float32)
+    return controller
+
+
+def test_terminal_idle_reference_readapts_and_recovers_with_official_thresholds():
+    target = DEFAULT_ANGLES_ISAACLAB.astype(np.float64).copy()
+    actual = target.copy()
+    actual[LOWER_BODY_IL] += 0.20
+    controller = _terminal_idle_controller(target=target, actual=actual)
+
+    controller.advance_cursor(idle_mode=True)
+
+    assert controller.idle_readapt_stored is True
+    assert controller.idle_readapt_state is IdleReadaptState.ADAPTING
+    assert controller.idle_readapt_average_error_rad == pytest.approx(0.20)
+    np.testing.assert_allclose(
+        controller.motion_joint_positions[1, LOWER_BODY_IL],
+        target[LOWER_BODY_IL] + 0.004,
+        rtol=0.0,
+        atol=1e-8,
+    )
+    np.testing.assert_allclose(
+        controller.motion_joint_positions[1, np.setdiff1d(np.arange(29), LOWER_BODY_IL)],
+        target[np.setdiff1d(np.arange(29), LOWER_BODY_IL)],
+        rtol=0.0,
+        atol=0.0,
+    )
+
+    # Once measured tracking catches the adapted reference, the official
+    # double-threshold state first exits ADAPTING, then begins recovering the
+    # reference toward the immutable original terminal target.
+    controller.h_q_mj[0] = (
+        controller.motion_joint_positions[1] - DEFAULT_ANGLES_ISAACLAB
+    ).astype(np.float32)
+    controller.advance_cursor(idle_mode=True)
+    assert controller.idle_readapt_state is IdleReadaptState.IDLE
+    before_recovery = controller.motion_joint_positions[1].copy()
+    controller.advance_cursor(idle_mode=True)
+    assert controller.idle_readapt_state is IdleReadaptState.RECOVERING
+    np.testing.assert_allclose(
+        controller.motion_joint_positions[1, LOWER_BODY_IL],
+        0.98 * before_recovery[LOWER_BODY_IL] + 0.02 * target[LOWER_BODY_IL],
+        rtol=0.0,
+        atol=1e-8,
+    )
+
+
+def test_terminal_reference_is_not_readapted_while_locomotion_mode_is_active():
+    target = DEFAULT_ANGLES_ISAACLAB.astype(np.float64).copy()
+    actual = target.copy()
+    actual[LOWER_BODY_IL] += 0.20
+    controller = _terminal_idle_controller(target=target, actual=actual)
+
+    controller.advance_cursor(idle_mode=False)
+
+    assert controller.ref_cursor == 1
+    assert controller.idle_readapt_stored is False
+    assert controller.idle_readapt_state is IdleReadaptState.IDLE
+    np.testing.assert_array_equal(controller.motion_joint_positions[1], target)
+
+
+def test_new_planner_motion_resets_terminal_idle_readaptation_state():
+    target = DEFAULT_ANGLES_ISAACLAB.astype(np.float64).copy()
+    actual = target.copy()
+    actual[LOWER_BODY_IL] += 0.20
+    controller = _terminal_idle_controller(target=target, actual=actual)
+    controller.advance_cursor(idle_mode=True)
+    assert controller.idle_readapt_state is IdleReadaptState.ADAPTING
+
+    replacement = _motion_from_measured(DEFAULT_ANGLES, frames=40)
+    controller.blend_new_motion(replacement, gen_frame=controller.ref_cursor + 2)
+
+    assert controller.idle_readapt_stored is False
+    assert controller.idle_readapt_state is IdleReadaptState.IDLE
+    assert controller.idle_readapt_average_error_rad == 0.0
+
+
+def test_terminal_idle_readaptation_rejects_nonfinite_measured_state():
+    controller = _terminal_idle_controller()
+    controller.h_q_mj[0][LOWER_BODY_IL[0]] = np.nan
+
+    with pytest.raises(RuntimeError, match="finite lower-body state"):
+        controller.advance_cursor(idle_mode=True)
 
 
 def test_action_mapping_is_a_29_axis_bijection():

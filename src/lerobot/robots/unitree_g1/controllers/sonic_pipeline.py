@@ -540,6 +540,14 @@ class MovementSnapshot:
     facing: tuple[float, float, float] = (1.0, 0.0, 0.0)
 
 
+class IdleReadaptState(IntEnum):
+    """Official idle-reference tracking-error readaptation phases."""
+
+    IDLE = 0
+    ADAPTING = 1
+    RECOVERING = 2
+
+
 def snapshot_ms(ms: MovementState) -> MovementSnapshot:
     """Capture the current movement intent as a comparable snapshot."""
     md, fd = ms.movement_direction, ms.facing_direction
@@ -1222,6 +1230,78 @@ class PlannerController(StandingEncoderDecoder):
         self.actuator_authority = False
         self.matching_reference_ready = False
         self.motion_lock = threading.Lock()
+        # Keep parity with NVIDIA's current deploy controller: once an IDLE
+        # plan reaches its terminal frame, large lower-body tracking error
+        # readapts that reference toward the measured robot state.  When the
+        # error is small, the reference recovers gradually toward the original
+        # planner target.  This prevents a terminal IDLE frame generated from
+        # stale planner context from pulling a physically valid gait phase out
+        # from under the robot during a normal stop.
+        self.idle_readapt_original_targets = np.zeros(29, np.float64)
+        self.idle_readapt_stored = False
+        self.idle_readapt_state = IdleReadaptState.IDLE
+        self.idle_readapt_average_error_rad = 0.0
+
+    def _reset_idle_readaptation_locked(self):
+        """Reset readaptation ownership after a new planner motion is installed."""
+
+        self.idle_readapt_stored = False
+        self.idle_readapt_state = IdleReadaptState.IDLE
+        self.idle_readapt_average_error_rad = 0.0
+
+    def _readapt_terminal_idle_reference_locked(self):
+        """Apply NVIDIA's terminal-IDLE error-based reference adaptation.
+
+        The latest measured joint sample is already in ``h_q_mj[0]`` in
+        IsaacLab order.  This method runs only after the corresponding policy
+        target was successfully published and the reference cursor is being
+        advanced, preserving the controller's exact execution-feedback
+        transaction.
+        """
+
+        if self.motion_timesteps <= 0 or self.ref_cursor != self.motion_timesteps - 1:
+            return
+        target = self.motion_joint_positions[self.ref_cursor]
+        actual = self.h_q_mj[0] + DEFAULT_ANGLES_ISAACLAB
+        if not np.all(np.isfinite(target[LOWER_BODY_IL])) or not np.all(
+            np.isfinite(actual[LOWER_BODY_IL])
+        ):
+            raise RuntimeError("SONIC idle readaptation requires finite lower-body state")
+
+        if not self.idle_readapt_stored:
+            self.idle_readapt_original_targets[:] = target
+            self.idle_readapt_stored = True
+            self.idle_readapt_state = IdleReadaptState.IDLE
+
+        average_error = float(
+            np.mean(np.abs(target[LOWER_BODY_IL] - actual[LOWER_BODY_IL]))
+        )
+        self.idle_readapt_average_error_rad = average_error
+
+        # Thresholds and the 0.98/0.02 blend match NVIDIA's current reference
+        # deploy implementation.  Keep them literal here so parity tests can
+        # detect accidental tuning or weakening.
+        if self.idle_readapt_state is IdleReadaptState.IDLE:
+            if average_error > 0.10:
+                self.idle_readapt_state = IdleReadaptState.ADAPTING
+            elif average_error < 0.045:
+                self.idle_readapt_state = IdleReadaptState.RECOVERING
+        elif self.idle_readapt_state is IdleReadaptState.ADAPTING:
+            if average_error < 0.05:
+                self.idle_readapt_state = IdleReadaptState.IDLE
+        elif self.idle_readapt_state is IdleReadaptState.RECOVERING:
+            if average_error > 0.10:
+                self.idle_readapt_state = IdleReadaptState.ADAPTING
+
+        if self.idle_readapt_state is IdleReadaptState.ADAPTING:
+            target[LOWER_BODY_IL] = (
+                0.98 * target[LOWER_BODY_IL] + 0.02 * actual[LOWER_BODY_IL]
+            )
+        elif self.idle_readapt_state is IdleReadaptState.RECOVERING:
+            target[LOWER_BODY_IL] = (
+                0.98 * target[LOWER_BODY_IL]
+                + 0.02 * self.idle_readapt_original_targets[LOWER_BODY_IL]
+            )
 
     @property
     def reference_authority(self):
@@ -1257,6 +1337,7 @@ class PlannerController(StandingEncoderDecoder):
             self.ref_cursor = 0
             self.first_motion = True
             self.playing = False
+            self._reset_idle_readaptation_locked()
 
     def load_initial_motion(self, motion):
         """Copy the planner's first motion into the live buffer and start playback."""
@@ -1272,6 +1353,7 @@ class PlannerController(StandingEncoderDecoder):
             self.first_motion = True
             self.playing = True
             self.delta_heading = 0.0
+            self._reset_idle_readaptation_locked()
 
     def blend_new_motion(self, new_motion, gen_frame):
         """Blend like C++ CurrentFrameAdvancement: 8-frame cross-fade, then copy tail."""
@@ -1290,6 +1372,7 @@ class PlannerController(StandingEncoderDecoder):
                 self.ref_cursor = 0
                 self.init_ref_quat = self.motion_body_quats[0].copy()
                 self.first_motion = False
+                self._reset_idle_readaptation_locked()
                 return
 
             blend_start = max(0, gen_frame - cur)
@@ -1324,6 +1407,7 @@ class PlannerController(StandingEncoderDecoder):
             self.first_motion = False
             self.ref_cursor = 0
             self.init_ref_quat = self.motion_body_quats[0].copy()
+            self._reset_idle_readaptation_locked()
 
     def _heading_apply_delta(self):
         """Heading correction quaternion (init base-vs-ref heading + operator ``delta_heading``)."""
@@ -1429,13 +1513,15 @@ class PlannerController(StandingEncoderDecoder):
                 logger.debug("[Heading] init quat: %s", self.heading_init_base_quat)
         return super().step(robot_obs, update_encoder=update_encoder, debug=debug)
 
-    def advance_cursor(self):
-        """Advance the reference cursor one frame per 50 Hz tick (no wall-clock catch-up)."""
+    def advance_cursor(self, *, idle_mode=False):
+        """Advance one 50 Hz frame and readapt a terminal IDLE reference."""
         if not self.playing or not self.reference_authority:
             return
         with self.motion_lock:
             if self.motion_timesteps > 0:
                 self.ref_cursor = min(self.ref_cursor + 1, self.motion_timesteps - 1)
+                if idle_mode:
+                    self._readapt_terminal_idle_reference_locked()
 
 
 # ── Joystick input ────────────────────────────────────────────────────────────
