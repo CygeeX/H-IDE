@@ -1,6 +1,6 @@
 {
   "schema_version": "h-ide.sonic-model-lock/1",
-  "repository_revision_at_audit": "56834c92d0c25988108536bd55e6cb0e21990932",
+  "repository_revision_at_audit": "c31e349d857416b64a8b0a9a3a88d33ae6ff166f",
   "model_repository": {
     "repo_id": "nvidia/GEAR-SONIC",
     "revision": "9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2",
@@ -9,7 +9,7 @@
   "source_repositories": {
     "lerobot-python": {
       "path": "vendor/lerobot",
-      "revision": "ba4717f071956eea4395151db2e40cb26362b8c6"
+      "revision": "7790eb79b184627e9b8488c2698f115001f2e5a4"
     },
     "nvidia-groot-wbc": {
       "path": "/home/phi/learn-projects/systemed_study/GR00T-WholeBodyControl",
@@ -20,13 +20,13 @@
     "config": {
       "path": "config/ros-headless.yaml",
       "size": 3652,
-      "sha256": "edda120ecd3e04ca0331ed569c3a9ac0a350aa400fd0458bc771d523dbb53919"
+      "sha256": "00b1084263330ef662cb78f7797f28659a4aa2c2cd941412e959d6d1fc16fa9e"
     },
     "declared_model_revision": "9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2",
-    "declared_lerobot_revision": "ba4717f071956eea4395151db2e40cb26362b8c6",
-    "observed_lerobot_revision": "ba4717f071956eea4395151db2e40cb26362b8c6",
+    "declared_lerobot_revision": "7790eb79b184627e9b8488c2698f115001f2e5a4",
+    "observed_lerobot_revision": "7790eb79b184627e9b8488c2698f115001f2e5a4",
     "lock_safe": true,
-    "reason": "The reviewed ros-headless runtime selectors, SONIC model bundle, exact LeRobot cold-start history and control source, official direction-speed mapping, actuator handoff, exact-epoch policy-owned fall-arrest release, controlled stopping, and terminal IDLE reference readaptation are reproducibly anchored by repository commit 56834c92d0c25988108536bd55e6cb0e21990932."
+    "reason": "The reviewed ros-headless runtime selectors, SONIC model bundle, exact LeRobot cold-start history and control source, official direction-speed mapping, actuator handoff, exact-epoch policy-owned fall-arrest release, history-preserving controlled IDLE stopping, and terminal IDLE reference readaptation are reproducibly anchored by repository commit c31e349d857416b64a8b0a9a3a88d33ae6ff166f."
   },
   "profiles": {
     "sonic-official-default": {
@@ -280,8 +280,8 @@
           "role": "controller",
           "path": "vendor/lerobot/src/lerobot/robots/unitree_g1/controllers/sonic_whole_body.py",
           "present": true,
-          "size": 56076,
-          "sha256": "d4c15171704b31eed1faf8dfdc43076f1160e6b3eadc6e15a7972ef67caafffa"
+          "size": 57777,
+          "sha256": "d9436a782f9f2fea0ecbd73f886e357a9d505738269c300d7487e6edeb7c3a01"
         },
         {
           "id": "python-pipeline",
@@ -297,7 +297,7 @@
           "path": "profiles/sonic-python-experimental.yaml",
           "present": true,
           "size": 1280,
-          "sha256": "69120c3f6e498d00781949348d9f43f878217e556c6874bb8f8fc790a302cd76"
+          "sha256": "e255cba402a22108739e5587c718c5531a1c04b765672579e96eef069d58e495"
         }
       ]
     }
