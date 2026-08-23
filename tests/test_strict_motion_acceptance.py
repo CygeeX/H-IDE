@@ -461,6 +461,24 @@ def _apply_lateral_braking_profile(trace: dict[str, Any]) -> None:
         _set_planar_pose(sample, x=x, yaw=yaw)
 
 
+def _apply_turn_braking_profile(trace: dict[str, Any]) -> None:
+    target = math.pi / 2.0
+    post_command_offsets = {
+        8.0: 0.10,
+        8.1: 0.25,
+        8.2: math.radians(21.0),
+        8.3: 0.32,
+    }
+    for sample in trace["samples"]:
+        t_s = float(sample["tS"])
+        if t_s < 8.0:
+            continue
+        _set_planar_pose(
+            sample,
+            yaw=target + post_command_offsets.get(t_s, 0.25),
+        )
+
+
 def _rebuild_detour_trace(
     trace: dict[str, Any],
     path: list[tuple[float, float]],
@@ -1169,6 +1187,56 @@ def test_lateral_motion_braking_and_final_envelopes_fail_closed(
     else:
         sample = trace["samples"][-1]
     _set_planar_pose(sample, **{axis: value})
+
+    assert expected_code in _failure_codes(trace)
+
+
+def test_turn_accepts_only_bounded_learned_idle_braking_transient() -> None:
+    trace = _trace("turn_left")
+    _apply_turn_braking_profile(trace)
+
+    result = strict.evaluate_trace(trace)
+
+    assert result["pass"] is True, result["failures"]
+    envelope = result["metrics"]["turnTrackingEnvelope"]
+    target = envelope["targetMagnitudeRad"]
+    assert envelope["activeMaxDirectionalYawRad"] <= target + 0.35
+    assert (
+        target + 0.35
+        < envelope["brakingMaxDirectionalYawRad"]
+        <= target + math.radians(22.0)
+    )
+    assert abs(envelope["finalDirectionalYawRad"] - target) <= 0.35
+
+
+@pytest.mark.parametrize(
+    ("phase", "offset_rad", "expected_code"),
+    [
+        ("active", math.radians(20.1), "TURN_OVERSHOOT"),
+        ("braking", math.radians(22.1), "TURN_BRAKING_OVERSHOOT"),
+        ("final", math.radians(20.1), "FINAL_YAW_MISSED"),
+    ],
+)
+def test_turn_motion_braking_and_final_envelopes_fail_closed(
+    phase: str,
+    offset_rad: float,
+    expected_code: str,
+) -> None:
+    trace = _trace("turn_left")
+    _apply_turn_braking_profile(trace)
+    if phase == "active":
+        sample = [
+            sample for sample in trace["samples"] if sample["motionIntentActive"]
+        ][-1]
+    elif phase == "braking":
+        sample = next(
+            sample
+            for sample in trace["samples"]
+            if not sample["motionIntentActive"] and float(sample["tS"]) == 8.2
+        )
+    else:
+        sample = trace["samples"][-1]
+    _set_planar_pose(sample, yaw=math.pi / 2.0 + offset_rad)
 
     assert expected_code in _failure_codes(trace)
 

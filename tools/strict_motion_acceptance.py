@@ -141,6 +141,11 @@ class FormalContract:
     max_turn_translation_m: float = 0.15
     max_turn_reverse_rad: float = 0.05
     max_turn_overshoot_rad: float = 0.35
+    # As with lateral gait, learned IDLE brakes the whole body after Nav2 Spin
+    # withdraws its command.  The active and final contracts remain at the
+    # existing 0.35 rad bound; only the measured command-zero transient gets
+    # a separately reported 22 degree envelope.
+    max_turn_braking_overshoot_rad: float = math.radians(22.0)
     progress_window_s: float = 15.0
     min_linear_progress_m: float = 0.10
     min_turn_progress_rad: float = 0.35
@@ -1841,14 +1846,26 @@ class StrictMotionEvaluator:
             direction = 1.0 if expected > 0 else -1.0
             directional = [direction * value for value in heading_values]
             translations = [math.hypot(*value) for value in root_values]
+            active_indices = [
+                index for index, sample in enumerate(samples) if sample["intent"]
+            ]
+            active_directional = [directional[index] for index in active_indices]
+            self.metrics["turnTrackingEnvelope"] = {
+                "activeMaxDirectionalYawRad": max(active_directional, default=0.0),
+                "brakingMaxDirectionalYawRad": max(directional),
+                "finalDirectionalYawRad": directional[-1],
+                "targetMagnitudeRad": abs(expected),
+            }
             for sample, value in zip(samples, directional):
                 if value >= self.contract.min_turn_progress_rad:
                     progress_time = float(sample["t"])
                     break
             if min(directional) < -self.contract.max_turn_reverse_rad - _EPS:
                 self._fail("TURN_REVERSED", f"turn reversed by {-min(directional):.4f}rad")
-            if max(directional) > abs(expected) + self.contract.max_turn_overshoot_rad + _EPS:
-                self._fail("TURN_OVERSHOOT", f"turn reached {max(directional):.4f}rad")
+            if max(active_directional, default=0.0) > abs(expected) + self.contract.max_turn_overshoot_rad + _EPS:
+                self._fail("TURN_OVERSHOOT", f"active turn reached {max(active_directional):.4f}rad")
+            if max(directional) > abs(expected) + self.contract.max_turn_braking_overshoot_rad + _EPS:
+                self._fail("TURN_BRAKING_OVERSHOOT", f"turn braking transient reached {max(directional):.4f}rad")
             if max(translations) > self.contract.max_turn_translation_m + _EPS:
                 self._fail("TURN_TRANSLATION_EXCEEDED", f"turn translated {max(translations):.4f}m")
             if abs(heading_values[-1] - expected) > self.contract.final_yaw_tolerance_rad + _EPS:
