@@ -15,6 +15,7 @@ from hide_mujoco_sonic.gait_adapter import (
     Nav2Twist,
 )
 from hide_mujoco_sonic.ros_bridge import (
+    _gait_observation_timeout_s,
     _intent_payload,
     _observe_health_reference_authority,
     _ros_stamp_in_monotonic_domain,
@@ -64,6 +65,39 @@ class Clock:
 
     def __call__(self) -> float:
         return self.value
+
+
+def test_gait_observation_timeout_matches_atomic_capture_validity() -> None:
+    assert _gait_observation_timeout_s(10) == pytest.approx(0.50)
+    assert _gait_observation_timeout_s(30) == pytest.approx(0.50)
+    assert _gait_observation_timeout_s(2) == pytest.approx(1.50)
+    for value in (True, 0, -1, float("nan"), float("inf"), None):
+        with pytest.raises(ValueError, match="finite and positive"):
+            _gait_observation_timeout_s(value)
+
+
+def test_motion_observation_survives_one_bounded_capture_miss_but_not_500ms() -> None:
+    clock = Clock(10.0)
+    adapter = GaitAdapter(
+        GaitAdapterConfig(
+            command_timeout_s=2.0,
+            observation_timeout_s=_gait_observation_timeout_s(10),
+        ),
+        clock=clock,
+    )
+    adapter.advance_generation(1, now=clock.value)
+    adapter.ingest_observation(observation(clock), now=clock.value)
+    assert adapter.arm(1, now=clock.value).state == "IDLE"
+    clock.value = 10.02
+    starting = adapter.ingest_twist(twist(clock, vx=0.2), now=clock.value)
+    assert starting.state == "STARTING"
+
+    clock.value = 10.49
+    assert adapter.tick(now=clock.value).state == "STARTING"
+    clock.value = 10.501
+    fault = adapter.tick(now=clock.value)
+    assert fault.state == "FAULT"
+    assert fault.reason == "base observation became stale during motion"
 
 
 def observation(

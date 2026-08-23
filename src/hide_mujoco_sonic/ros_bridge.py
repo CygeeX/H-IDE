@@ -39,6 +39,7 @@ from .motion_fault import (
     sonic_health_probe,
 )
 from .normal_stop_coordinator import BridgeNormalStopCoordinator
+from .render_workers import MAX_CAPTURE_AGE_NS
 from .safety import (
     BodyStabilityGuard,
     GoalProgressGuard,
@@ -63,6 +64,28 @@ class RosBridgeUnavailable(RuntimeError):
 
 BRIDGE_HEALTH_SCHEMA_VERSION = "h-ide.ros-bridge-health/v1"
 BRIDGE_HEALTH_MAX_PROGRESS_AGE_S = 0.10
+
+
+def _gait_observation_timeout_s(observation_hz: object) -> float:
+    """Match gait freshness to the authoritative capture validity window.
+
+    Odometry is derived from the same atomic MuJoCo capture as RGB-D.  A
+    single bounded HTTP miss must not terminally remove the learned balance
+    controller while that source generation is still valid.  Conversely, no
+    pose older than the capture contract's 500 ms ceiling may authorize
+    continued motion.
+    """
+
+    if isinstance(observation_hz, bool):
+        raise ValueError("observation_hz must be finite and positive")
+    try:
+        hz = float(observation_hz)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("observation_hz must be finite and positive") from exc
+    if not math.isfinite(hz) or hz <= 0.0:
+        raise ValueError("observation_hz must be finite and positive")
+    capture_validity_s = MAX_CAPTURE_AGE_NS / 1_000_000_000.0
+    return max(capture_validity_s, 3.0 / hz)
 
 
 class BridgeRuntimeHealth:
@@ -566,7 +589,9 @@ def run_ros_bridge(config: SimConfig) -> None:
     gait = GaitAdapter(
         GaitAdapterConfig(
             command_timeout_s=config.command_timeout_s,
-            observation_timeout_s=max(0.30, 3.0 / config.observation_hz),
+            observation_timeout_s=_gait_observation_timeout_s(
+                config.observation_hz
+            ),
             max_linear_mps=config.max_linear_mps,
             max_angular_rps=config.max_angular_rps,
             linear_deadband_mps=config.min_walk_command_mps,
