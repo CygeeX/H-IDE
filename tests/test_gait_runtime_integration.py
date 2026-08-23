@@ -48,6 +48,7 @@ from hide_mujoco_sonic.safety import (
     StaticJointHandoff,
 )
 from hide_mujoco_sonic.sonic_driver import (
+    IngressDecision,
     SonicDriver,
     SonicIntentIngress,
     _bind_command_server,
@@ -2774,6 +2775,71 @@ def test_controlled_stop_watchdog_age_cannot_replan_the_same_source_sequence() -
     )
     assert driver._reference_authority.snapshot.phase == "GRANTED"
     assert driver._reference_authority.snapshot.reference_epoch == 4
+
+
+def test_correlated_stop_takes_over_inflight_idle_request_without_requeue() -> None:
+    """The strict stop identity must not duplicate an already queued plan.
+
+    A regular STOPPING envelope reaches the 50 Hz loop before the correlated
+    normal-stop request in the live bridge.  Both share the same frozen
+    reference cursor.  Re-enqueuing at correlation time therefore gives the
+    evidence gate two requests with one upstream ``gen_frame`` and makes every
+    otherwise valid result ambiguous.
+    """
+
+    from lerobot.robots.unitree_g1.controllers.sonic_pipeline import DEFAULT_ANGLES
+
+    clock = Clock()
+    driver, _writes = _publishing_driver(clock)
+    boundary = tuple(float(value) for value in DEFAULT_ANGLES)
+    lowstate = _lowstate(boundary)
+    evidence = _TransactionalEvidence()
+    evidence.intent_generation = 1
+    evidence.intent_signature = "idle-intent-1"
+    controller = _TransactionalController(evidence, boundary)
+    driver._controller = controller
+    driver._planner_evidence = evidence
+    driver._policy_activation = SimpleNamespace(prepared=True)
+    driver._intent_ingress.armed = True
+    driver._last_published_targets = boundary
+    driver._joint_handoff.freeze(boundary)
+    driver._controlled_stop_active = True
+    driver._controlled_stop_source_identity = (42, 9)
+    driver._controlled_stop_reference_installed = False
+    driver._reference_source_identity = (42, 9)
+    driver._reference_authority.require(generation=42, source_sequence=9)
+    driver._reference_request_pending = True
+
+    # The uncorrelated STOPPING path has already put one measured IDLE request
+    # in flight.  It has not returned yet.
+    assert driver._progress_reference_transaction(lowstate) is False
+    assert controller.request_calls == 1
+    assert driver._reference_request_pending is False
+
+    correlated = IngressDecision(
+        action="brake",
+        generation=42,
+        sequence=10,
+        state="STOPPING",
+    )
+    with driver._support_lock:
+        assert driver._begin_controlled_policy_stop_locked(
+            correlated,
+            correlated=True,
+        ) is True
+
+    assert driver._controlled_stop_source_identity == (42, 10)
+    assert driver._reference_authority.snapshot.source_sequence == 10
+    assert driver._reference_request_pending is False
+
+    # Poll and install the first request.  Correlation changes only the source
+    # ownership; it never issues a duplicate planner request.
+    controller.install_ready = True
+    assert driver._progress_reference_transaction(lowstate) is True
+    assert controller.request_calls == 1
+    assert controller.acquire_calls == [pytest.approx(boundary)]
+    assert driver._reference_authority.snapshot.phase == "PRIMED"
+    assert driver._reference_authority.snapshot.source_sequence == 10
 
 
 def test_health_keeps_last_dds_grant_while_refresh_decode_is_inflight() -> None:

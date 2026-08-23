@@ -1631,6 +1631,15 @@ class SonicDriver:
             self._reference_source_identity = identity
             self._reference_request_pending = True
         elif correlated:
+            # A regular STOPPING envelope may already have enqueued the
+            # measured IDLE planner request.  The later correlated
+            # normal-stop envelope takes ownership of the source identity,
+            # but it must not turn an in-flight request back into a pending
+            # enqueue.  Doing so creates two requests with the same upstream
+            # ``gen_frame`` while the reference cursor is frozen; strict
+            # planner evidence then (correctly) rejects both as ambiguous and
+            # the otherwise healthy stop eventually times out.
+            request_still_needs_enqueue = self._reference_request_pending
             authority = self._reference_authority.snapshot
             if authority.phase in {"MATCHED_INSTALLED", "PRIMED", "GRANTED"}:
                 self._controlled_stop_reference_installed = True
@@ -1642,9 +1651,7 @@ class SonicDriver:
                 self._controlled_stop_reference_installed = False
             self._controlled_stop_source_identity = identity
             self._reference_source_identity = identity
-            self._reference_request_pending = (
-                self._reference_authority.snapshot.phase == "REQUIRED"
-            )
+            self._reference_request_pending = request_still_needs_enqueue
         self._navigation_task_active = False
         return True
 
