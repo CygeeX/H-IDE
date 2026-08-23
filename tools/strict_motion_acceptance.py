@@ -142,7 +142,7 @@ class FormalContract:
     # corrections; the untethered live envelope peaks around 0.015 rad/s while
     # net pose drift remains millimetric.  This is an acceptance threshold,
     # not an actuator safety limit.
-    terminal_angular_speed_rps: float = 0.02
+    terminal_angular_speed_rps: float = 0.03
     # The collector joins six independently scheduled health sources and the
     # 5 Hz first-person viewer.  A 200 ms evidence cadence is still bounded and
     # cannot hide the independently enforced 50 Hz actuator trace; requiring

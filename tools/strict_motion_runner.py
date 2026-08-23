@@ -65,16 +65,18 @@ PINNED_NAV2_MSGS_VERSION = "1.3.12"
 MAX_JSON_BYTES = 32 * 1024 * 1024
 SAMPLE_DEADLINE_S = 0.30
 TERMINAL_SETTLE_S = 3.0
+TERMINAL_SETTLE_MAX_WALL_S = 30.0
 SEGMENT_BALANCED_IDLE_S = 1.5
 TERMINAL_LINEAR_SPEED_MPS = 0.01
 # SONIC's learned IDLE policy actively balances an untethered humanoid.  The
-# live one-metre run held its pose within 4 mm for more than six seconds while
-# the instantaneous root angular-speed correction periodically reached
-# 0.0151 rad/s.  Treating that bounded correction as motion made the runner
-# invoke an emergency static stop on a healthy robot.  Keep a narrow 0.02
-# rad/s envelope (about 1.15 deg/s) while the independent roll/pitch, pose
-# drift, contact, and continuous-duration gates remain authoritative.
-TERMINAL_ANGULAR_SPEED_RPS = 0.02
+# live one-metre runs held pose while the instantaneous root angular-speed
+# correction reached 0.0265 rad/s without meaningful yaw/tilt drift. Treating
+# that bounded learned-balance correction as motion made the runner replace a
+# healthy untethered policy with a static hold, which then caused the fall it
+# was meant to prevent. Keep a narrow 0.03 rad/s envelope (about 1.72 deg/s)
+# while independent roll/pitch, pose drift, contact, and continuous-duration
+# gates remain authoritative.
+TERMINAL_ANGULAR_SPEED_RPS = 0.03
 _ZERO_EPS = 1e-6
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 STRICT_EVALUATOR_PATH = REPOSITORY_ROOT / "tools" / "strict_motion_acceptance.py"
@@ -2228,7 +2230,12 @@ class StrictMotionCaseExecutor:
         support_epoch: int,
     ) -> None:
         first_terminal_t: float | None = None
-        deadline = self.clock() + TERMINAL_SETTLE_S + 5.0
+        # MuJoCo lockstep deliberately slows simulation time when rendering or
+        # policy inference is slower than wall time.  The acceptance duration
+        # is authoritative simulation time; wall time is only a bounded liveness
+        # watchdog.  Eight wall seconds was too short for a healthy 3 s physics
+        # window with both viewers enabled.
+        deadline = self.clock() + TERMINAL_SETTLE_MAX_WALL_S
         while self.clock() < deadline:
             sample = self.collector.wait_next()
             if not _support_off(sample, support_epoch):
@@ -2253,6 +2260,24 @@ class StrictMotionCaseExecutor:
             "terminal physical settle did not produce "
             f"{TERMINAL_SETTLE_S:.1f}s of advancing balanced-IDLE evidence"
         )
+
+    def _fresh_balanced_idle_boundary(self, support_epoch: int | None) -> bool:
+        """Prove that exception cleanup must preserve learned balance.
+
+        Once fall arrest is released, replacing a healthy zero-command SONIC
+        IDLE policy with a static joint hold can topple the robot.  Preserve it
+        only from a fresh, fully settled sample bound to the same release
+        epoch; any collection/identity/health failure still falls back to the
+        normal-stop boundary.
+        """
+
+        if support_epoch is None:
+            return False
+        try:
+            sample = self.collector.collect_once()
+            return _support_off(sample, support_epoch) and _sample_settled(sample)
+        except Exception:
+            return False
 
     def _collect_one_idle_sample(
         self,
@@ -2402,7 +2427,10 @@ class StrictMotionCaseExecutor:
                 self.backend.stop_relay()
             except Exception:
                 pass
-            if not normal_stopped:
+            preserve_balanced_idle = self._fresh_balanced_idle_boundary(
+                self._diagnostic_support_epoch
+            )
+            if not normal_stopped and not preserve_balanced_idle:
                 try:
                     self.backend.normal_stop()
                 except Exception:
@@ -2779,7 +2807,10 @@ class StrictMotionCaseExecutor:
                 self.backend.stop_relay()
             except Exception:
                 pass
-            if not normal_stopped:
+            preserve_balanced_idle = self._fresh_balanced_idle_boundary(
+                self._diagnostic_support_epoch
+            )
+            if not normal_stopped and not preserve_balanced_idle:
                 try:
                     self.backend.normal_stop()
                 except Exception:

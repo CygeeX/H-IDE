@@ -1098,8 +1098,8 @@ def test_detour_requires_nonoverlap_and_observed_physical_stop_between_segments(
     stop_sample = next(
         sample for sample in moving["samples"] if sample["sonicControlTick"] == first_end_tick
     )
-    stop_sample["root"]["angularSpeedRps"] = 0.0201
-    stop_sample["plantDynamicsEvidence"]["rootState"]["qvel"][5] = 0.0201
+    stop_sample["root"]["angularSpeedRps"] = 0.0301
+    stop_sample["plantDynamicsEvidence"]["rootState"]["qvel"][5] = 0.0301
     assert "DETOUR_STOP_NOT_SETTLED" in _failure_codes(moving)
 
 

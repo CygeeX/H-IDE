@@ -800,11 +800,11 @@ def _executor_sample(t_s: float) -> dict:
 
 def test_dynamic_idle_accepts_observed_balance_correction_but_not_motion() -> None:
     observed = _executor_sample(1.0)
-    observed["root"]["angularSpeedRps"] = 0.0151
+    observed["root"]["angularSpeedRps"] = 0.0265
     assert runner._sample_settled(observed) is True
 
     moving = _executor_sample(1.1)
-    moving["root"]["angularSpeedRps"] = 0.020001
+    moving["root"]["angularSpeedRps"] = 0.030001
     assert runner._sample_settled(moving) is False
 
 
@@ -1096,6 +1096,46 @@ def test_standalone_executor_failure_cancels_stops_and_aborts() -> None:
     assert diagnostics["sampleCount"] == 1
     assert diagnostics["samples"] == [_executor_sample(0.1)]
     assert diagnostics["acceptedMotionEvidence"] is False
+
+
+def test_evidence_failure_preserves_fresh_support_off_balanced_idle() -> None:
+    backend = FakeExecutorBackend()
+
+    class BalancedAfterFailureCollector(FakeExecutorCollector):
+        def __init__(self) -> None:
+            super().__init__([_executor_sample(0.1)])
+            self.wait_calls = 0
+            self.collect_calls = 0
+
+        def collect_once(self) -> dict:
+            self.collect_calls += 1
+            if self.collect_calls == 1:
+                return super().collect_once()
+            return _executor_sample(9.0)
+
+        def wait_next(self) -> dict:
+            self.wait_calls += 1
+            if self.wait_calls > 1:
+                raise runner.StrictMotionRunnerError("evidence lost after balance")
+            return super().wait_next()
+
+    evidence = FakeExecutorEvidence()
+    executor = runner.StrictMotionCaseExecutor(
+        backend,
+        BalancedAfterFailureCollector(),
+        evidence,
+        clock=lambda: 1.0,
+    )
+
+    with pytest.raises(
+        runner.StrictMotionRunnerError,
+        match="evidence lost after balance",
+    ):
+        executor.run_standalone(mode="forward", case_id="balanced-failure")
+
+    assert backend.calls[-2:] == ["cancel", "zero"]
+    assert "normal_stop" not in backend.calls[-2:]
+    assert evidence.calls == ["begin", "abort"]
 
 
 def test_detour_executor_uses_only_fresh_resolved_official_primitives(
