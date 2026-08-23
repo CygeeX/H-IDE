@@ -24,6 +24,7 @@ class SimConfig:
     robot_profile: str
     localization_epoch_id: str
     ros_domain_id: int
+    unitree_domain_id: int
     interface: str
     cmd_vel_topic: str
     odom_topic: str
@@ -87,6 +88,7 @@ class SimConfig:
             raise ValueError("simulation config must be a YAML object")
         required = {
             "schema_version", "robot_id", "robot_profile", "localization_epoch_id", "ros_domain_id",
+            "unitree_domain_id",
             "interface", "cmd_vel_topic", "odom_topic", "localization_topic", "nav_path_topic",
             "motion_fault_topic",
             "lowstate_topic", "lowcmd_topic", "telemetry_host", "telemetry_port",
@@ -115,8 +117,22 @@ class SimConfig:
         policy_release_fall_arrest = raw["policy_release_fall_arrest"]
         if not isinstance(policy_release_fall_arrest, bool):
             raise ValueError("policy_release_fall_arrest must be a boolean")
-        if raw["ros_domain_id"] == 231:
+        ros_domain_id = raw["ros_domain_id"]
+        unitree_domain_id = raw["unitree_domain_id"]
+        for name, value in (
+            ("ros_domain_id", ros_domain_id),
+            ("unitree_domain_id", unitree_domain_id),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{name} must be an integer")
+            if not 0 <= value <= 232:
+                raise ValueError(f"{name} must be in [0, 232]")
+        if ros_domain_id == 231 or unitree_domain_id == 231:
             raise ValueError("simulation ROS domain 232 must stay isolated from live domain 231")
+        if ros_domain_id == unitree_domain_id:
+            raise ValueError(
+                "Unitree LowState/LowCmd must use a DDS domain isolated from ROS/Nav2"
+            )
         motion_fault_topic = str(raw["motion_fault_topic"])
         if not re.fullmatch(
             r"/(?:[A-Za-z_][A-Za-z0-9_]*/)*[A-Za-z_][A-Za-z0-9_]*",
@@ -271,7 +287,8 @@ class SimConfig:
             robot_id=str(raw["robot_id"]),
             robot_profile=str(raw["robot_profile"]),
             localization_epoch_id=str(raw["localization_epoch_id"]),
-            ros_domain_id=int(raw["ros_domain_id"]),
+            ros_domain_id=ros_domain_id,
+            unitree_domain_id=unitree_domain_id,
             interface=str(raw["interface"]),
             cmd_vel_topic=str(raw["cmd_vel_topic"]),
             odom_topic=str(raw["odom_topic"]),

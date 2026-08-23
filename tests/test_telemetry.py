@@ -55,6 +55,21 @@ def test_hot_path_update_does_not_clone_full_telemetry(monkeypatch):
     assert store.update_hot(plant_tick=17, sonic_speed_mps=0.1) is None
 
 
+def test_hot_path_peak_reset_does_not_clone_full_telemetry(monkeypatch):
+    store = TelemetryStore(TelemetryState(robot_id="g1-sim"))
+    store.update(
+        navigation_task_active=True,
+        navigation_arm_constrained_joints=3,
+    )
+
+    def fail_if_copied(_self):
+        raise AssertionError("hot peak reset cloned the complete telemetry state")
+
+    monkeypatch.setattr(TelemetryState, "json", fail_if_copied)
+    assert store.reset_navigation_task_peaks_hot() is None
+    assert store._value.navigation_task_peak_arm_constrained_joints == 0
+
+
 def test_regular_update_keeps_its_isolated_snapshot_return_value():
     store = TelemetryStore(TelemetryState(robot_id="g1-sim"))
 

@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -147,6 +148,24 @@ def test_nav2_output_fails_closed_when_source_stalls() -> None:
     relay.observe_nav2(command(vx=0.3), observed_at_s=2.0)
     with pytest.raises(runner.StrictMotionRunnerError, match="stale"):
         relay.nav2_output(now_s=2.151)
+
+
+def test_inactive_strict_backend_is_silent_until_a_primitive_owns_cmd_vel() -> None:
+    backend = runner.RosLiveBackend.__new__(runner.RosLiveBackend)
+    backend._lock = threading.RLock()
+    backend._fatal = None
+    backend._relay = runner.StrictCommandRelay(clock=lambda: 1.0)
+    backend._latest_odom = None
+    published: list[runner.TwistCommand] = []
+    backend._publish = published.append
+
+    backend._publish_control_tick()
+    assert published == []
+
+    backend._relay.begin("turn_left")
+    backend._publish_control_tick()
+    assert published == [runner.ZERO_COMMAND]
+    assert runner.STRICT_RELAY_PERIOD_S == pytest.approx(0.05)
 
 
 def test_nav2_action_contracts_are_version_and_field_pinned() -> None:

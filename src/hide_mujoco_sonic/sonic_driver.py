@@ -11,6 +11,7 @@ import argparse
 from collections import deque
 import copy
 from dataclasses import dataclass, replace
+import faulthandler
 import hashlib
 import json
 import logging
@@ -580,7 +581,7 @@ class SonicDriver:
         from lerobot.robots.unitree_g1.controllers.sonic_whole_body import SonicWholeBodyController
 
         self._sdk = (ChannelPublisher, ChannelSubscriber, LowCmd_, LowState_, CRC, unitree_hg_msg_dds__LowCmd_)
-        ChannelFactoryInitialize(config.ros_domain_id, config.interface)
+        ChannelFactoryInitialize(config.unitree_domain_id, config.interface)
         self._publisher = ChannelPublisher(config.lowcmd_topic, LowCmd_)
         self._publisher.Init()
         self._subscriber = ChannelSubscriber(config.lowstate_topic, LowState_)
@@ -792,6 +793,11 @@ class SonicDriver:
         if clock_fault is not None:
             # Any clock discontinuity invalidates policy history and actuator
             # continuity.  Never rebuild history or replay missed policy ticks.
+            if clock_fault.startswith("MuJoCo control sample overrun:"):
+                logger.error(
+                    "capturing all SONIC thread stacks at control-sample overrun"
+                )
+                faulthandler.dump_traceback(all_threads=True)
             self._latch_terminal_fault(clock_fault)
 
     def _wait_for_initial_lowstate(self, *, timeout_s: float = 5.0):
@@ -1195,7 +1201,7 @@ class SonicDriver:
             consecutive = self._startup_qualification_consecutive_steps
             dropped = self._startup_qualification_dropped_samples
 
-        self.telemetry.update(
+        self._update_telemetry_hot(
             status="running" if complete else "qualifying",
             control_clock_status=(
                 "simulation_time_50hz_motion_ready"
@@ -2642,7 +2648,7 @@ class SonicDriver:
     def _set_plant_support_mode(self, mode: str) -> bool:
         """Switch only MuJoCo's confirmed fall-arrest profile over loopback."""
 
-        self.telemetry.update(plant_support_requested_mode=mode)
+        self._update_telemetry_hot(plant_support_requested_mode=mode)
         with self._support_lock:
             if (
                 mode == "locomotion"
@@ -2791,6 +2797,32 @@ class SonicDriver:
         except (TypeError, ValueError):
             return None
         return cursor if cursor >= 0 else None
+
+    def _update_telemetry_hot(self, **changes: Any) -> None:
+        """Publish control-rate telemetry without cloning its full state.
+
+        Production always supplies :class:`TelemetryStore`.  The fallback
+        preserves the deliberately tiny telemetry doubles used by boundary
+        tests without putting their compatibility branch on the production
+        hot path.
+        """
+
+        update_hot = getattr(self.telemetry, "update_hot", None)
+        if callable(update_hot):
+            update_hot(**changes)
+            return
+        self.telemetry.update(**changes)
+
+    def _reset_navigation_task_peaks_hot(self) -> None:
+        reset_hot = getattr(
+            self.telemetry,
+            "reset_navigation_task_peaks_hot",
+            None,
+        )
+        if callable(reset_hot):
+            reset_hot()
+            return
+        self.telemetry.reset_navigation_task_peaks()
 
     def _planner_telemetry_fields(self) -> dict[str, Any]:
         evidence = getattr(self, "_planner_evidence", None)
@@ -2951,11 +2983,20 @@ class SonicDriver:
         # Command admission, stop, and reference ownership share one lock.
         # A stop that wins this boundary resets the intent gate before a
         # control tick can resurrect its already-sampled motion as REQUIRED.
+        started_at = self._wall_clock()
         with self._support_lock:
-            return self._apply_intent_locked(
+            intent = self._apply_intent_locked(
                 dt,
                 simulation_now_s=simulation_now_s,
             )
+        elapsed_s = max(0.0, self._wall_clock() - started_at)
+        if elapsed_s > 0.05:
+            logger.warning(
+                "slow SONIC control stage stage=intent_apply elapsed_s=%.6f mode=%s",
+                elapsed_s,
+                getattr(intent, "mode", "unknown"),
+            )
+        return intent
 
     def _apply_intent_locked(self, dt: float, *, simulation_now_s: float):
         intent = self.guard.intent(dt=dt)
@@ -3129,7 +3170,7 @@ class SonicDriver:
         elif not controlled_stop:
             controller.ms.needs_replan = False
         received_at = self.guard.last_received_at
-        self.telemetry.update(
+        self._update_telemetry_hot(
             sonic_mode=intent.mode,
             sonic_speed_mps=intent.speed_mps,
             sonic_movement_angle_rad=intent.movement_angle_rad,
@@ -3567,6 +3608,7 @@ class SonicDriver:
             DEFAULT_ANGLES,
         )
 
+        started_at = self._wall_clock()
         nominal_targets = tuple(float(value) for value in DEFAULT_ANGLES)
         activation = self._policy_activation
         with self._support_lock:
@@ -3617,7 +3659,9 @@ class SonicDriver:
                 if phase_at_tick == "SETTLING_TETHERED":
                     settle_phase_to_observe = phase_at_tick
 
+        proposed_at = self._wall_clock()
         support_ready = self._set_plant_support_mode("idle")
+        support_ready_at = self._wall_clock()
         with self._support_lock:
             effective_static_hold = self._commit_static_hold_decision_locked(
                 not released or not support_ready
@@ -3643,6 +3687,7 @@ class SonicDriver:
             control_tick_ms=control_step.tick_ms,
             constrain_arms=not effective_static_hold,
         )
+        published_at = self._wall_clock()
         with self._support_lock:
             # This flag proves the actuator/support boundary for this tick; it
             # does not mean the multi-tick activation has completed. A stable
@@ -3714,6 +3759,7 @@ class SonicDriver:
             published_targets=published_targets,
             handoff_ratio=(activation.ratio if decision is None else decision.ratio),
         )
+        traced_at = self._wall_clock()
         with self._support_lock:
             phase = activation.phase
             current_static_hold = self._static_hold_active
@@ -3727,7 +3773,7 @@ class SonicDriver:
                 "WAITING_FOR_SUPPORT_RELEASE": "waiting_for_matched_reference_before_support_release",
                 "PREPARED": "simulation_time_50hz_nominal_prepared",
             }.get(phase, "simulation_time_50hz_motion_ready")
-            self.telemetry.update(
+            self._update_telemetry_hot(
                 sonic_policy_speed_mps=0.0,
                 control_tick_ms=control_step.tick_ms,
                 control_dt_s=control_step.dt_s,
@@ -3743,6 +3789,21 @@ class SonicDriver:
                 ),
                 **self._policy_activation_telemetry_fields_locked(),
                 **self._planner_telemetry_fields(),
+            )
+        completed_at = self._wall_clock()
+        elapsed_s = max(0.0, completed_at - started_at)
+        if elapsed_s > 0.05:
+            logger.warning(
+                "slow SONIC activation tick total_s=%.6f propose_s=%.6f "
+                "support_s=%.6f publish_s=%.6f trace_s=%.6f telemetry_s=%.6f "
+                "phase=%s",
+                elapsed_s,
+                max(0.0, proposed_at - started_at),
+                max(0.0, support_ready_at - proposed_at),
+                max(0.0, published_at - support_ready_at),
+                max(0.0, traced_at - published_at),
+                max(0.0, completed_at - traced_at),
+                phase,
             )
 
     def _progress_reference_transaction(self, lowstate) -> bool:
@@ -4047,6 +4108,7 @@ class SonicDriver:
         control_tick_ms: int | None = None,
         constrain_arms: bool = True,
     ) -> tuple[float, ...]:
+        publish_started_at = self._wall_clock()
         # Populate the official Unitree lowcmd message.  The simulator consumes
         # this exact DDS message, just as a G1 hardware bridge would.
         self._msg.mode_machine = getattr(lowstate, "mode_machine", 0)
@@ -4092,6 +4154,7 @@ class SonicDriver:
             )
             for index in range(29)
         )
+        publish_prepared_at = self._wall_clock()
         guarded_arm = None
         with self._support_lock:
             terminal_boundary = self._enforce_terminal_boundary_locked()
@@ -4257,6 +4320,7 @@ class SonicDriver:
             if guarded_arm is None:
                 self._arm_guard.anchor(published_targets[15:29])
         self._mark_control_step_published()
+        publish_committed_at = self._wall_clock()
         nonzero = any(abs(float(self._msg.motor_cmd[i].q)) > 1e-4 for i in range(29))
         # Legs and waist are the locomotion plant.  Tracking their commanded
         # joint references separately from the arms tells an operator whether
@@ -4282,7 +4346,7 @@ class SonicDriver:
             abs(float(lowstate.motor_state[index].tau_est))
             for index in range(15)
         ]
-        self.telemetry.update(
+        self._update_telemetry_hot(
             joint_target_nonzero=nonzero,
             navigation_arm_constrained_joints=(0 if guarded_arm is None else guarded_arm.constrained_joints),
             navigation_arm_max_step_rad=(0.0 if guarded_arm is None else guarded_arm.max_step_rad),
@@ -4309,6 +4373,17 @@ class SonicDriver:
             lower_body_max_estimated_torque_nm=max(lower_body_torques),
             **self._planner_telemetry_fields(),
         )
+        publish_completed_at = self._wall_clock()
+        publish_elapsed_s = max(0.0, publish_completed_at - publish_started_at)
+        if publish_elapsed_s > 0.05:
+            logger.warning(
+                "slow SONIC publish total_s=%.6f prepare_s=%.6f "
+                "boundary_dds_s=%.6f metrics_s=%.6f",
+                publish_elapsed_s,
+                max(0.0, publish_prepared_at - publish_started_at),
+                max(0.0, publish_committed_at - publish_prepared_at),
+                max(0.0, publish_completed_at - publish_committed_at),
+            )
         return published_targets
 
     @staticmethod
@@ -4554,6 +4629,7 @@ class SonicDriver:
                 motion_ready=False,
             )
         while not self._stop.is_set():
+            loop_started_at = self._wall_clock()
             sample = self._next_control_sample()
             if self._fault_latched.is_set():
                 if getattr(self, "_recoverable_motion_fault", False):
@@ -4629,7 +4705,7 @@ class SonicDriver:
                         activation_fields = (
                             self._policy_activation_telemetry_fields_locked()
                         )
-                    self.telemetry.update(
+                    self._update_telemetry_hot(
                         sonic_policy_speed_mps=0.0,
                         control_tick_ms=control_step.tick_ms,
                         control_dt_s=control_step.dt_s,
@@ -4691,7 +4767,7 @@ class SonicDriver:
                         published_targets=self._last_published_targets,
                         handoff_ratio=0.0,
                     )
-                    self.telemetry.update(
+                    self._update_telemetry_hot(
                         sonic_policy_speed_mps=0.0,
                         control_tick_ms=control_step.tick_ms,
                         control_dt_s=control_step.dt_s,
@@ -4724,7 +4800,7 @@ class SonicDriver:
                 # Decode creates a pending candidate. Its action history and
                 # reference cursor commit only after the complete DDS write.
                 policy_action = self._run_policy_candidate(lowstate)
-                self.telemetry.update(
+                self._update_telemetry_hot(
                     sonic_policy_speed_mps=(
                         max(0.0, float(self._controller.ms.speed))
                     ),
@@ -4880,7 +4956,7 @@ class SonicDriver:
                         not self._policy_activation.prepared
                         and self._policy_activation.waiting_for_support_release
                     )
-                self.telemetry.update(
+                self._update_telemetry_hot(
                     control_tick_ms=control_step.tick_ms,
                     control_dt_s=control_step.dt_s,
                     control_clock_status=(
@@ -4910,6 +4986,13 @@ class SonicDriver:
                     self._stop.set()
                 break
             finally:
+                loop_elapsed_s = max(0.0, self._wall_clock() - loop_started_at)
+                if loop_elapsed_s > 0.035:
+                    logger.warning(
+                        "slow SONIC control loop elapsed_s=%.6f tick_ms=%s",
+                        loop_elapsed_s,
+                        getattr(control_step, "tick_ms", "unavailable"),
+                    )
                 self._control_evidence_context.control_step = None
         try:
             self._controller.shutdown()
@@ -6784,12 +6867,12 @@ class SonicDriver:
             # envelopes therefore cannot overwrite the first admitted identity.
             self.guard.accept(decision.vx, decision.vy, decision.wz, source="nav2")
         if new_navigation_task:
-            self.telemetry.reset_navigation_task_peaks()
-            self.telemetry.update(
+            self._reset_navigation_task_peaks_hot()
+            self._update_telemetry_hot(
                 navigation_task_active=True,
                 balanced_policy_idle_active=False,
             )
-        self.telemetry.update(
+        self._update_telemetry_hot(
             nav2_state="commanding",
             last_cmd_vx=decision.vx,
             last_cmd_vy=decision.vy,
@@ -6844,7 +6927,21 @@ def _handle_command_connection(driver: SonicDriver, conn) -> None:
 
 
 def run_driver(config: SimConfig) -> None:
-    telemetry = TelemetryStore(TelemetryState(robot_id=config.robot_id, ros_domain_id=config.ros_domain_id))
+    # The package CLI calls ``run_driver`` directly rather than this module's
+    # standalone ``main`` function.  Configure the process logger here so
+    # safety faults and bounded-latency diagnostics are never silently lost
+    # when SONIC is launched through ``python -m hide_mujoco_sonic sonic``.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+    telemetry = TelemetryStore(
+        TelemetryState(
+            robot_id=config.robot_id,
+            ros_domain_id=config.ros_domain_id,
+            unitree_domain_id=config.unitree_domain_id,
+        )
+    )
     serve_telemetry(
         telemetry,
         config.telemetry_bind_host,
@@ -6892,10 +6989,21 @@ def run_driver(config: SimConfig) -> None:
                     return
                 raise
             with conn:
+                request_started_at = time.monotonic()
                 try:
                     _handle_command_connection(driver, conn)
                 except Exception as exc:
                     logger.warning("invalid bridge command: %s", exc)
+                finally:
+                    request_elapsed_s = max(
+                        0.0,
+                        time.monotonic() - request_started_at,
+                    )
+                    if request_elapsed_s > 0.020:
+                        logger.warning(
+                            "slow SONIC command connection elapsed_s=%.6f",
+                            request_elapsed_s,
+                        )
 
     threading.Thread(target=accept_loop, daemon=True, name="sonic-command-server").start()
     try:

@@ -3,6 +3,7 @@ robot_id: g1-sim
 robot_profile: unitree_g1_29dof
 localization_epoch_id: g1-sim-map-epoch-1
 ros_domain_id: 232
+unitree_domain_id: 230
 interface: lo
 cmd_vel_topic: /cmd_vel
 odom_topic: /odom

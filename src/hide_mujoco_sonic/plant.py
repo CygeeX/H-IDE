@@ -2092,7 +2092,10 @@ def run_plant(config: SimConfig) -> int:
         # ``Path / absolute`` in the pinned simulator preserves the verified
         # absolute path loaded from runtime_manifest.json.
         "ROBOT_SCENE": str(config.model_scene),
-        "DOMAIN_ID": config.ros_domain_id,
+        # Keep Unitree actuator/state DDS off the ROS 2 Nav2 graph.  Joining a
+        # full Nav2 action graph to the old shared domain repeatedly delayed
+        # the otherwise healthy LowState/LowCmd pair past its liveness bound.
+        "DOMAIN_ID": config.unitree_domain_id,
         "INTERFACE": config.interface,
         "SIMULATOR": "mujoco",
         # The scene already has a floating root; its actuator vector contains

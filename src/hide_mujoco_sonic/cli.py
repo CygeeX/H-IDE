@@ -25,7 +25,11 @@ def check(config: SimConfig) -> int:
         return 2
     print("config: ok")
     print(f"robot: {config.robot_id} ({config.robot_profile})")
-    print(f"ros domain: {config.ros_domain_id} (isolated)")
+    print(f"ros domain: {config.ros_domain_id} (isolated from live)")
+    print(
+        "unitree control domain: "
+        f"{config.unitree_domain_id} (isolated from ROS/Nav2)"
+    )
     print(f"scene: {config.model_scene}")
     print(f"cmd_vel guard: <= {config.max_linear_mps} m/s, <= {config.max_angular_rps} rad/s, timeout {config.command_timeout_s}s")
     for module in ("numpy", "yaml"):

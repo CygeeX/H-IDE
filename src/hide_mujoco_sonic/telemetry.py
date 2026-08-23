@@ -21,6 +21,7 @@ class TelemetryState:
     status: str = "starting"
     source_mode: str = "synthetic"
     ros_domain_id: int = 232
+    unitree_domain_id: int = 230
     nav2_state: str = "idle"
     sonic_mode: str = "IDLE"
     sonic_speed_mps: float = 0.0
@@ -216,12 +217,13 @@ class TelemetryStore:
             return TelemetryState(**self._value.json())
 
     def update_hot(self, **changes: Any) -> None:
-        """Update without cloning the full state for a callback-rate writer.
+        """Update without cloning the full state for a control-rate writer.
 
-        The LowState DDS callback is the only production caller.  Readers still
-        receive isolated snapshots through :meth:`get` or
+        Readers still receive isolated snapshots through :meth:`get` or
         :meth:`snapshot_json`, while ordinary ``update`` keeps its historical
-        return value for compatibility.
+        return value for compatibility.  Writers that do not consume the
+        returned snapshot must use this method so a 50 Hz actuator loop never
+        pays for a recursive ``dataclasses.asdict`` clone.
         """
 
         with self._lock:
@@ -260,16 +262,25 @@ class TelemetryStore:
         """Start a fresh per-goal diagnostic window without changing control."""
 
         with self._lock:
-            self._value.navigation_task_peak_arm_constrained_joints = 0
-            self._value.navigation_task_peak_arm_raw_deviation_rad = 0.0
-            self._value.navigation_task_peak_arm_tracking_error_rad = 0.0
-            self._value.navigation_task_peak_arm_measured_deviation_rad = 0.0
-            self._value.navigation_task_peak_arm_velocity_rps = 0.0
-            self._value.navigation_task_peak_arm_estimated_torque_nm = 0.0
-            self._value.navigation_task_peak_lower_body_target_max_error_rad = 0.0
-            self._value.navigation_task_peak_lower_body_target_rms_error_rad = 0.0
-            self._value.updated_at = time.time()
+            self._reset_navigation_task_peaks_locked()
             return TelemetryState(**self._value.json())
+
+    def reset_navigation_task_peaks_hot(self) -> None:
+        """Reset per-goal peaks without cloning the complete telemetry state."""
+
+        with self._lock:
+            self._reset_navigation_task_peaks_locked()
+
+    def _reset_navigation_task_peaks_locked(self) -> None:
+        self._value.navigation_task_peak_arm_constrained_joints = 0
+        self._value.navigation_task_peak_arm_raw_deviation_rad = 0.0
+        self._value.navigation_task_peak_arm_tracking_error_rad = 0.0
+        self._value.navigation_task_peak_arm_measured_deviation_rad = 0.0
+        self._value.navigation_task_peak_arm_velocity_rps = 0.0
+        self._value.navigation_task_peak_arm_estimated_torque_nm = 0.0
+        self._value.navigation_task_peak_lower_body_target_max_error_rad = 0.0
+        self._value.navigation_task_peak_lower_body_target_rms_error_rad = 0.0
+        self._value.updated_at = time.time()
 
     def get(self) -> TelemetryState:
         with self._lock:

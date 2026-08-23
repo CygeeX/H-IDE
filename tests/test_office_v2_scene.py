@@ -505,6 +505,9 @@ def test_supported_configs_all_select_the_same_verified_office_v2_bundle() -> No
         assert config.runtime_scene.spawn_y == pytest.approx(0.0)
         assert config.reset_policy == "explicit_process_restart"
         assert config.motion_fault_topic == "/h_ide/g1_sim/motion_safety_fault"
+        assert config.ros_domain_id == 232
+        assert config.unitree_domain_id == 230
+        assert config.unitree_domain_id != config.ros_domain_id
         assert config.sonic_health_probe_period_s == pytest.approx(0.025)
         assert config.sonic_health_probe_timeout_s == pytest.approx(0.040)
         assert config.sonic_health_probe_timeout_s > config.sonic_health_probe_period_s
@@ -557,6 +560,33 @@ def test_health_probe_timeout_may_span_two_ticks_but_not_exhaust_handoff(
     candidate = tmp_path / "unsafe-health-budget.yaml"
     candidate.write_text(yaml.safe_dump(payload), encoding="utf-8")
     with pytest.raises(ValueError, match="confirmation must remain below"):
+        SimConfig.from_file(candidate)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("unitree_domain_id", 232, "isolated from ROS/Nav2"),
+        ("unitree_domain_id", 231, "isolated from live domain 231"),
+        ("unitree_domain_id", True, "must be an integer"),
+        ("unitree_domain_id", 233, "must be in"),
+        ("ros_domain_id", 230, "isolated from ROS/Nav2"),
+    ],
+)
+def test_unitree_control_dds_domain_is_distinct_and_bounded(
+    tmp_path: Path,
+    field: str,
+    value,
+    message: str,
+) -> None:
+    payload = yaml.safe_load(
+        (ROOT / "config" / "ros-headless.yaml").read_text(encoding="utf-8")
+    )
+    payload[field] = value
+    candidate = tmp_path / "invalid-dds-domain.yaml"
+    candidate.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
         SimConfig.from_file(candidate)
 
 

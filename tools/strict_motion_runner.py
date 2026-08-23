@@ -48,6 +48,12 @@ OFFICIAL_SPIN_MAX_RPS = 0.20
 OBSERVED_TRANSLATION_PROGRESS_FLOOR_MPS = 0.04
 TRANSLATION_STARTUP_STOP_MARGIN_S = 10.0
 NAV2_COMMAND_STALE_S = 0.15
+# Nav2's reviewed controller loop is 20 Hz.  Relaying an unconditional 50 Hz
+# zero command doubled the bridge-to-SONIC control-plane traffic before an
+# action even existed (50 intent connections plus 40 health probes per second)
+# and repeatedly starved the independent 50 Hz actuator consumer.  Stay silent
+# while no primitive owns /cmd_vel, then relay the official command at 20 Hz.
+STRICT_RELAY_PERIOD_S = 0.05
 LATERAL_DISTANCE_M = 0.50
 LATERAL_STOP_TOLERANCE_M = 0.03
 LATERAL_MAX_LONGITUDINAL_DRIFT_M = 0.12
@@ -589,7 +595,10 @@ class RosLiveBackend:
             ComputePathToPose,
             "compute_path_to_pose",
         )
-        self._timer = self.node.create_timer(0.02, self._publish_control_tick)
+        self._timer = self.node.create_timer(
+            STRICT_RELAY_PERIOD_S,
+            self._publish_control_tick,
+        )
         self._executor = MultiThreadedExecutor(num_threads=4)
         self._executor.add_node(self.node)
         self._spin_thread = threading.Thread(
@@ -642,6 +651,12 @@ class RosLiveBackend:
                 fatal = self._fatal
                 primitive = self._relay.primitive
                 odom = self._latest_odom
+            if fatal is None and primitive is None:
+                # Merely constructing the strict runner is observational.  A
+                # single explicit stop is published by stop_relay()/close();
+                # an idle 20 Hz stream has no control meaning and must not
+                # contend with SONIC health/control ownership.
+                return
             if fatal is not None:
                 command = ZERO_COMMAND
             elif primitive == "LateralStep":
