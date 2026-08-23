@@ -1044,16 +1044,20 @@ class SonicDriver:
         if runtime_diagnostics is not None:
             runtime_diagnostics.freeze_warm_runtime()
             gc_state = runtime_diagnostics.snapshot()
-            if gc_state["python_gc_freeze_applied"]:
+            if (
+                gc_state["python_gc_freeze_applied"]
+                and gc_state["python_gc_automatic_disabled"]
+                and not gc_state["python_gc_enabled"]
+            ):
                 logger.info(
                     "SONIC warm runtime frozen after collecting %d objects; "
-                    "automatic GC remains enabled",
+                    "automatic cyclic GC is disabled for deterministic control",
                     gc_state["python_gc_warmup_collected_objects"],
                 )
             else:
-                logger.warning(
-                    "SONIC warm-runtime GC optimization was not applied: %s",
-                    gc_state["python_gc_freeze_error"],
+                raise RuntimeError(
+                    "SONIC deterministic cyclic-GC setup failed: "
+                    + str(gc_state["python_gc_freeze_error"] or "incomplete state")
                 )
         if self._fault_latched.is_set():
             raise RuntimeError(self._terminal_fault_reason or "startup fault latched")

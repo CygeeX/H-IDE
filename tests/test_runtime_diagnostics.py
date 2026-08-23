@@ -35,6 +35,9 @@ class FakeGc:
     def enable(self) -> None:
         self.enabled = True
 
+    def disable(self) -> None:
+        self.enabled = False
+
     def collect(self) -> int:
         return self.collected
 
@@ -189,7 +192,7 @@ def test_mixed_stall_persists_gc_and_non_gc_evidence_after_healthy_sample():
     diagnostics.close()
 
 
-def test_freeze_warm_runtime_keeps_automatic_gc_enabled_and_is_observable():
+def test_freeze_warm_runtime_disables_automatic_gc_and_is_observable():
     monotonic = FakeClock()
     fake_gc = FakeGc()
     fake_gc.enabled = False
@@ -202,9 +205,10 @@ def test_freeze_warm_runtime_keeps_automatic_gc_enabled_and_is_observable():
     diagnostics.freeze_warm_runtime()
 
     state = diagnostics.snapshot()
-    assert fake_gc.enabled is True
+    assert fake_gc.enabled is False
     assert fake_gc.frozen is True
-    assert state["python_gc_enabled"] is True
+    assert state["python_gc_enabled"] is False
+    assert state["python_gc_automatic_disabled"] is True
     assert state["python_gc_warmup_collected_objects"] == 17
     assert state["python_gc_freeze_applied"] is True
     assert state["python_gc_frozen_objects"] == 123

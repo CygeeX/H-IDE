@@ -469,6 +469,8 @@ def test_startup_holds_plant_before_warmup_and_leaves_clock_disarmed() -> None:
         freeze_warm_runtime=lambda: events.append(("gc_freeze", None)),
         snapshot=lambda: {
             "python_gc_freeze_applied": True,
+            "python_gc_automatic_disabled": True,
+            "python_gc_enabled": False,
             "python_gc_warmup_collected_objects": 11,
             "python_gc_freeze_error": None,
         },

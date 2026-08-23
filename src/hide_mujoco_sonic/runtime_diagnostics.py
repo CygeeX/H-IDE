@@ -123,6 +123,7 @@ class SonicRuntimeDiagnostics:
         self._gc_last_completed_at_unix_s: float | None = None
         self._gc_warmup_collected_objects = 0
         self._gc_freeze_applied = False
+        self._gc_automatic_disabled = False
         self._gc_freeze_error: str | None = None
         self._gc_callback = self._observe_gc
         self._registered = False
@@ -179,11 +180,15 @@ class SonicRuntimeDiagnostics:
         )
 
     def freeze_warm_runtime(self) -> None:
-        """Collect then freeze the warmed object graph without disabling GC.
+        """Collect/freeze the warm graph, then disable automatic cyclic GC.
 
-        Refcounting and automatic cyclic GC remain active for all objects
-        created after warm-up, including HTTP request threads.  Freezing only
-        removes the existing long-lived process graph from later full scans.
+        CPython refcounting remains active.  Cyclic collection is deliberately
+        manual-only after warm-up because it is process-global and therefore
+        can stop the 50 Hz actuator owner even when a request/telemetry thread
+        triggers it.  A live incident measured an 80.5 ms generation-1 pause
+        inside a 154.6 ms control-publish gap.  The process is bounded-lived;
+        deterministic control takes precedence over opportunistic cycle
+        reclamation while it owns an actuator session.
         """
 
         try:
@@ -191,10 +196,15 @@ class SonicRuntimeDiagnostics:
                 self._gc.enable()
             self._gc_warmup_collected_objects = int(self._gc.collect())
             self._gc.freeze()
+            self._gc.disable()
+            if self._gc.isenabled():
+                raise RuntimeError("automatic cyclic GC remained enabled")
             self._gc_freeze_applied = True
+            self._gc_automatic_disabled = True
             self._gc_freeze_error = None
-        except Exception as exc:  # diagnostics must not block safe stationary start
+        except Exception as exc:
             self._gc_freeze_applied = False
+            self._gc_automatic_disabled = False
             self._gc_freeze_error = f"{type(exc).__name__}: {exc}"[:256]
 
     def snapshot(self) -> dict[str, Any]:
@@ -222,6 +232,7 @@ class SonicRuntimeDiagnostics:
                 self._gc_warmup_collected_objects
             ),
             "python_gc_freeze_applied": self._gc_freeze_applied,
+            "python_gc_automatic_disabled": self._gc_automatic_disabled,
             "python_gc_frozen_objects": frozen_objects,
             "python_gc_freeze_error": self._gc_freeze_error,
         }

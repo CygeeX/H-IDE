@@ -504,8 +504,10 @@ class RuntimeCounterTracker:
             abs_tol=1e-9,
         ):
             raise ValueError("runtime stall threshold is not the reviewed 0.1s")
-        if sonic_timing.get("python_gc_enabled") is not True:
-            raise ValueError("SONIC cyclic GC is not enabled")
+        if sonic_timing.get("python_gc_enabled") is not False:
+            raise ValueError("SONIC automatic cyclic GC is not disabled")
+        if sonic_timing.get("python_gc_automatic_disabled") is not True:
+            raise ValueError("SONIC deterministic GC mode is not confirmed")
         if sonic_timing.get("python_gc_freeze_applied") is not True:
             raise ValueError("SONIC warm runtime freeze was not applied")
         if sonic_timing.get("python_gc_freeze_error") is not None:

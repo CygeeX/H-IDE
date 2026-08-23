@@ -198,7 +198,8 @@ def _runtime_diagnostics(
 ) -> dict:
     value = {
         "runtime_stall_threshold_s": 0.1,
-        "python_gc_enabled": True,
+        "python_gc_enabled": False,
+        "python_gc_automatic_disabled": True,
         "python_gc_pause_active": False,
         "python_gc_collection_count": 10,
         "python_gc_last_generation": 1,
