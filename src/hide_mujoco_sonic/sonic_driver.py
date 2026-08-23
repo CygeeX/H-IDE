@@ -588,7 +588,18 @@ class SonicDriver:
         self._publisher = ChannelPublisher(config.lowcmd_topic, LowCmd_)
         self._publisher.Init()
         self._subscriber = ChannelSubscriber(config.lowstate_topic, LowState_)
-        self._subscriber.Init(self._on_lowstate, 10)
+        # Do not use Unitree SDK's Listener -> BQueue callback adapter here.
+        # Its listener takes exactly one DDS sample per data-available edge.  If
+        # the 250 Hz Plant gets ahead of that callback, unread samples can keep
+        # the edge asserted without another callback, leaving the Python queue
+        # empty even though a direct DataReader still sees a healthy stream.
+        # A dedicated blocking reader drains the authoritative DDS reader
+        # directly and then enters the existing serialized LowState callback.
+        self._subscriber.Init()
+        self._lowstate_reader_stop = threading.Event()
+        self._lowstate_reader_close_lock = threading.Lock()
+        self._lowstate_reader_closed = False
+        self._lowstate_reader_thread: threading.Thread | None = None
         self._crc = CRC()
         self._msg = unitree_hg_msg_dds__LowCmd_()
         self._controller_type = SonicWholeBodyController
@@ -628,6 +639,12 @@ class SonicDriver:
             max_samples=max(1, config.control_hz * 5),
         )
         self._fault_trace_path = self._default_fault_trace_path()
+        self._lowstate_reader_thread = threading.Thread(
+            target=self._run_lowstate_reader,
+            daemon=True,
+            name="sonic-lowstate-reader",
+        )
+        self._lowstate_reader_thread.start()
 
     @staticmethod
     def _default_fault_trace_path() -> Path:
@@ -802,6 +819,47 @@ class SonicDriver:
                 )
                 faulthandler.dump_traceback(all_threads=True)
             self._latch_terminal_fault(clock_fault)
+
+    def _run_lowstate_reader(self) -> None:
+        """Drain LowState with a blocking DataReader instead of SDK callbacks."""
+
+        while (
+            not self._lowstate_reader_stop.is_set()
+            and not self._stop.is_set()
+        ):
+            try:
+                message = self._subscriber.Read(timeout=0.05)
+            except Exception as exc:
+                if not self._lowstate_reader_stop.is_set() and not self._stop.is_set():
+                    self._latch_terminal_fault(
+                        "MuJoCo LowState direct reader failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                return
+            if message is not None:
+                self._on_lowstate(message)
+
+    def _close_lowstate_reader(self) -> None:
+        """Bound and idempotently release the dedicated DDS reader."""
+
+        stop_event = getattr(self, "_lowstate_reader_stop", None)
+        if stop_event is None:
+            return
+        stop_event.set()
+        thread = getattr(self, "_lowstate_reader_thread", None)
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=0.25)
+            if thread.is_alive():
+                logger.warning("SONIC LowState reader did not stop within 250ms")
+                return
+        close_lock = getattr(self, "_lowstate_reader_close_lock", None)
+        if close_lock is None:
+            return
+        with close_lock:
+            if self._lowstate_reader_closed:
+                return
+            self._subscriber.Close()
+            self._lowstate_reader_closed = True
 
     def _wait_for_initial_lowstate(self, *, timeout_s: float = 5.0):
         """Wait for plant state while the strict control clock remains disarmed."""
@@ -5045,6 +5103,7 @@ class SonicDriver:
         if condition is not None:
             with condition:
                 condition.notify_all()
+        self._close_lowstate_reader()
 
     def _ensure_normal_stop_runtime_locked(self) -> NormalStopState:
         """Initialize normal-stop fields for lightweight/offline driver shells."""
