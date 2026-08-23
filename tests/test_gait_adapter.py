@@ -365,7 +365,10 @@ def test_normal_stop_balance_window_rejects_continued_motion(
     motion: str,
     reason_fragment: str,
 ) -> None:
-    config = GaitAdapterConfig(stop_timeout_s=0.80)
+    config = GaitAdapterConfig(
+        stop_timeout_s=0.80,
+        balanced_idle_stop_timeout_s=0.80,
+    )
     adapter = armed_adapter(config=config)
     if motion == "translation":
         starting = adapter.ingest_twist(twist(10.02, vx=0.2), now=10.02)
@@ -398,6 +401,59 @@ def test_normal_stop_balance_window_rejects_continued_motion(
     fault = adapter.tick(now=10.85)
     assert fault.state == "FAULT"
     assert reason_fragment in (fault.reason or "")
+
+
+def test_normal_stop_uses_longer_balanced_idle_timeout_after_late_correction() -> None:
+    config = GaitAdapterConfig(
+        stop_timeout_s=0.80,
+        balanced_idle_stop_timeout_s=1.60,
+    )
+    adapter = armed_adapter(config=config)
+    starting = adapter.ingest_twist(twist(10.02, wz=0.2), now=10.02)
+    grant_reference(adapter, starting)
+    adapter.ingest_observation(observation(10.03, wz=0.12), now=10.03)
+    adapter.ingest_twist(twist(10.04), now=10.04)
+
+    # One late learned-policy correction occurs after the emergency stop
+    # deadline.  It invalidates the balance window without turning a normal
+    # transition into a safety fault.
+    late = adapter.ingest_observation(
+        observation(10.90, wz=0.21),
+        now=10.90,
+    )
+    assert late.state == "STOPPING"
+
+    result = None
+    for index, timestamp in enumerate((10.91, 11.01, 11.11, 11.21, 11.31, 11.41)):
+        result = adapter.ingest_observation(
+            observation(
+                timestamp,
+                yaw=0.002 * (index % 3),
+                vx=0.03,
+                wz=0.08 if index % 2 == 0 else -0.08,
+            ),
+            now=timestamp,
+        )
+
+    assert result is not None
+    assert result.state == "IDLE"
+
+
+def test_safe_stop_retains_short_emergency_timeout() -> None:
+    adapter = armed_adapter(
+        config=GaitAdapterConfig(
+            stop_timeout_s=0.80,
+            balanced_idle_stop_timeout_s=1.60,
+        )
+    )
+    starting = adapter.ingest_twist(twist(10.02, wz=0.2), now=10.02)
+    grant_reference(adapter, starting)
+    adapter.ingest_observation(observation(10.03, wz=0.12), now=10.03)
+    assert adapter.request_safe_stop(1, now=10.04).state == "STOPPING"
+
+    fault = adapter.tick(now=10.85)
+    assert fault.state == "FAULT"
+    assert "stop before timeout" in (fault.reason or "")
 
 
 def test_normal_stop_balance_window_restarts_after_gap_or_large_correction() -> None:
@@ -470,6 +526,8 @@ def test_safe_stop_does_not_use_normal_balanced_idle_window() -> None:
     "kwargs",
     [
         {"balanced_idle_stop_samples": True},
+        {"stop_timeout_s": 2.0, "balanced_idle_stop_timeout_s": 1.99},
+        {"balanced_idle_stop_timeout_s": 0.45},
         {"balanced_idle_stop_window_s": 2.0},
         {"balanced_idle_stop_max_sample_gap_s": 0.45},
         {"balanced_idle_stop_max_linear_mps": 0.025},

@@ -601,6 +601,10 @@ def run_ros_bridge(config: SimConfig) -> None:
             # before that fact and must not weaken measured-gait fail-fast.
             start_timeout_s=1.5,
             stop_timeout_s=2.5,
+            # learned-IDLE is an active balancing policy.  Give its bounded
+            # pose window time to recover from one late whole-body correction
+            # without weakening cancel/safe-stop acknowledgement.
+            balanced_idle_stop_timeout_s=4.0,
             max_facing_delta_rad=config.max_facing_lead_rad,
         )
     )

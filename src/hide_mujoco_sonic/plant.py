@@ -104,6 +104,7 @@ class _SupportBandState:
     enabled: bool
     release_epoch_confirmed: int | None
     release_epoch_rejected: int | None
+    reengaged_safety_stop_epoch: int | None
     updated_at: float
 
 
@@ -195,9 +196,11 @@ class PlantSupportController:
             # Positive epochs are reserved for an explicit SONIC activation.
             release_epoch_confirmed=None if fall_arrest_enabled else 0,
             release_epoch_rejected=None,
+            reengaged_safety_stop_epoch=None,
             updated_at=now,
         )
-        # Serializes the rare one-way band release with every stop/fault
+        self._fall_arrest_available = fall_arrest_enabled
+        # Serializes each authority-bound band release with every stop/fault
         # transition. It is deliberately separate from the HTTP writer lock:
         # an urgent physics fault must never wait behind a slow request.
         self._release_transition_lock = threading.Lock()
@@ -216,6 +219,21 @@ class PlantSupportController:
     @property
     def physics_fault(self) -> str | None:
         return self._physics_state.fault
+
+    @property
+    def fall_arrest_enabled(self) -> bool:
+        """Return the immutable simulation-thread fall-arrest decision."""
+
+        return self._band_state.enabled
+
+    def synchronize_physical_fall_arrest(self, support_band: object) -> bool:
+        """Apply the current decision before the upstream physics-step gate."""
+
+        if not self._fall_arrest_available:
+            raise RuntimeError("Plant has no physical fall-arrest band")
+        enabled = self.fall_arrest_enabled
+        setattr(support_band, "enable", enabled)
+        return enabled
 
     def set_mode(self, mode: str) -> str:
         value = str(mode)
@@ -296,7 +314,14 @@ class PlantSupportController:
             return self.mode
 
     def latch_motion_fault(self, reason: str) -> bool:
-        """Hold a recoverable navigation fault without stopping MuJoCo."""
+        """Hold a recoverable navigation fault without stopping MuJoCo.
+
+        A released humanoid cannot balance under a frozen joint target.  The
+        recoverable fault boundary therefore re-engages the simulation-only
+        vertical/roll/pitch fall arrest.  It never applies horizontal force or
+        yaw torque, remains visible in evidence, and requires a newer policy
+        activation epoch before it can be released again.
+        """
 
         detail = str(reason).strip()
         if not detail or len(detail) > 512:
@@ -311,13 +336,34 @@ class PlantSupportController:
                 if command.motion_fault != detail:
                     raise ValueError("plant already carries another motion fault")
                 return False
+            next_safety_stop_epoch = command.safety_stop_epoch + 1
+            band = self._band_state
+            pending_release = command.fall_arrest_release_epoch_requested
+            release_was_pending = (
+                pending_release is not None
+                and band.enabled
+                and band.release_epoch_confirmed != pending_release
+            )
             self._command_state = replace(
                 command,
                 mode="safety_stop",
                 updated_at=time.time(),
-                safety_stop_epoch=command.safety_stop_epoch + 1,
+                safety_stop_epoch=next_safety_stop_epoch,
                 motion_fault=detail,
+                fall_arrest_release_epoch_requested=None,
             )
+            if self._fall_arrest_available:
+                self._band_state = replace(
+                    band,
+                    enabled=True,
+                    release_epoch_rejected=(
+                        pending_release
+                        if release_was_pending
+                        else band.release_epoch_rejected
+                    ),
+                    reengaged_safety_stop_epoch=next_safety_stop_epoch,
+                    updated_at=time.time(),
+                )
             return True
 
     def clear_motion_fault(self, reason: str) -> bool:
@@ -349,7 +395,7 @@ class PlantSupportController:
             return True
 
     def request_fall_arrest_release(self, activation_epoch: int) -> bool:
-        """Request a one-way elastic-band release at a safe boundary."""
+        """Request an authority-bound elastic-band release at a safe boundary."""
 
         if (
             isinstance(activation_epoch, bool)
@@ -382,15 +428,24 @@ class PlantSupportController:
                     raise ValueError(
                         "fall-arrest release was rejected at the physics boundary"
                     )
-                raise ValueError(
-                    "fall-arrest release already belongs to another activation"
-                )
             if not band.enabled:
                 if band.release_epoch_confirmed not in {0, activation_epoch}:
                     raise ValueError(
                         "fall-arrest release already belongs to another activation"
                     )
                 return False
+            prior_epochs = tuple(
+                epoch
+                for epoch in (
+                    band.release_epoch_confirmed,
+                    band.release_epoch_rejected,
+                )
+                if isinstance(epoch, int) and epoch > 0
+            )
+            if prior_epochs and activation_epoch <= max(prior_epochs):
+                raise ValueError(
+                    "fall-arrest release activation epoch must be strictly newer"
+                )
             existing = command.fall_arrest_release_epoch_requested
             if existing is not None:
                 if existing != activation_epoch:
@@ -437,6 +492,11 @@ class PlantSupportController:
                     release_epoch_rejected=epoch,
                     updated_at=time.time(),
                 )
+                self._command_state = replace(
+                    command,
+                    updated_at=time.time(),
+                    fall_arrest_release_epoch_requested=None,
+                )
                 return None
             try:
                 release_band()
@@ -445,6 +505,11 @@ class PlantSupportController:
                     band,
                     release_epoch_rejected=epoch,
                     updated_at=time.time(),
+                )
+                self._command_state = replace(
+                    command,
+                    updated_at=time.time(),
+                    fall_arrest_release_epoch_requested=None,
                 )
                 raise
             self._band_state = replace(
@@ -555,12 +620,16 @@ class PlantSupportController:
                 physics.safety_stop_epoch_floor,
             ),
             "lastRearmGeneration": None if generation < 0 else generation,
+            "fallArrestAvailable": self._fall_arrest_available,
             "fallArrestEnabled": band.enabled,
             "fallArrestReleaseRequestedEpoch": (
                 command.fall_arrest_release_epoch_requested
             ),
             "fallArrestReleaseConfirmedEpoch": band.release_epoch_confirmed,
             "fallArrestReleaseRejectedEpoch": band.release_epoch_rejected,
+            "fallArrestReengagedSafetyStopEpoch": (
+                band.reengaged_safety_stop_epoch
+            ),
         }
 
 
@@ -2441,6 +2510,15 @@ def run_plant(config: SimConfig) -> int:
             # The support callback repeats this physics-health check at the
             # last safe point before mj_step.
             support_controller.require_healthy()
+            if support_band is not None:
+                # Upstream checks ``elastic_band.enable`` before calling the
+                # wrapped Advance method. Synchronize the controller's
+                # immutable decision at every authoritative physics boundary
+                # so a recoverable motion fault can re-engage fall arrest
+                # after an earlier successful policy release.
+                support_controller.synchronize_physical_fall_arrest(
+                    support_band
+                )
             result = original_sim_step()
             # Capture the exact post-step evidence before the terminal monitor
             # can raise and close the process.  HTTP reads only the resulting

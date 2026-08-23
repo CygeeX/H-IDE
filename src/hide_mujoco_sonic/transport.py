@@ -242,6 +242,11 @@ def _plant_motion_fault_request(
         or payload.get("safetyStopLatched") is not True
         or payload.get("fault") is not None
         or payload.get("motionFault") != expected_fault
+        or not isinstance(payload.get("fallArrestAvailable"), bool)
+        or (
+            payload.get("fallArrestAvailable") is True
+            and payload.get("fallArrestEnabled") is not True
+        )
     ):
         raise RuntimeError("plant did not confirm the recoverable motion fault state")
     return payload
@@ -298,7 +303,7 @@ def release_plant_fall_arrest(
     clock=time.monotonic,
     sleeper=time.sleep,
 ) -> dict[str, Any]:
-    """Request and prove the one-way simulation fall-arrest release."""
+    """Request and prove one authority-bound simulation fall-arrest release."""
 
     if (
         isinstance(activation_epoch, bool)

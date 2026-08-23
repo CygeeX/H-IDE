@@ -635,6 +635,8 @@ def test_recoverable_motion_fault_keeps_observation_service_alive_until_reset() 
         )
         assert latched["fault"] is None
         assert latched["motionFault"] == reason
+        assert latched["fallArrestAvailable"] is True
+        assert latched["fallArrestEnabled"] is True
         assert support.physics_fault is None
 
         # A reset only removes the named fault; it cannot create motion or

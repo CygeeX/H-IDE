@@ -3,6 +3,7 @@ import math
 import sys
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 import numpy as np
@@ -135,6 +136,9 @@ def test_motion_fault_keeps_physics_healthy_and_requires_explicit_reset() -> Non
     assert state["mode"] == "safety_stop"
     assert state["fault"] is None
     assert state["motionFault"] == reason
+    assert state["fallArrestAvailable"] is True
+    assert state["fallArrestEnabled"] is True
+    assert state["fallArrestReengagedSafetyStopEpoch"] == 1
     support.require_healthy()
 
     with pytest.raises(ValueError, match="explicitly reset"):
@@ -227,9 +231,52 @@ def test_plant_without_fall_arrest_reports_support_already_off() -> None:
     support.finish_startup()
 
     state = support.state()
+    assert state["fallArrestAvailable"] is False
     assert state["fallArrestEnabled"] is False
     assert state["fallArrestReleaseConfirmedEpoch"] == 0
     assert support.request_fall_arrest_release(9) is False
+
+
+def test_motion_fault_reengages_released_fall_arrest_until_newer_activation() -> None:
+    support = _released_support(epoch=17)
+    assert support.state()["fallArrestEnabled"] is False
+
+    reason = "gait_adapter/GAIT_ADAPTER_FAULT: stop acknowledgement timeout"
+    assert support.latch_motion_fault(reason) is True
+    latched = support.state()
+    assert latched["fallArrestAvailable"] is True
+    assert latched["fallArrestEnabled"] is True
+    assert latched["fallArrestReleaseConfirmedEpoch"] == 17
+    assert latched["fallArrestReleaseRequestedEpoch"] is None
+    assert latched["fallArrestReengagedSafetyStopEpoch"] == 1
+    physical_band = SimpleNamespace(enable=False)
+    assert support.synchronize_physical_fall_arrest(physical_band) is True
+    assert physical_band.enable is True
+
+    assert support.clear_motion_fault(reason) is True
+    assert support.rearm(1) == "idle"
+    with pytest.raises(ValueError, match="strictly newer"):
+        support.request_fall_arrest_release(17)
+    assert support.request_fall_arrest_release(18) is True
+    assert support.consume_fall_arrest_release(
+        lambda: setattr(physical_band, "enable", False)
+    ) == 18
+    assert physical_band.enable is False
+    assert support.state()["fallArrestEnabled"] is False
+    assert support.state()["fallArrestReleaseConfirmedEpoch"] == 18
+
+
+def test_motion_fault_cannot_invent_fall_arrest_when_plant_has_no_band() -> None:
+    support = PlantSupportController(fall_arrest_enabled=False)
+    support.finish_startup()
+
+    assert support.latch_motion_fault("injected recoverable fault") is True
+    state = support.state()
+    assert state["fallArrestAvailable"] is False
+    assert state["fallArrestEnabled"] is False
+    assert state["fallArrestReengagedSafetyStopEpoch"] is None
+    with pytest.raises(RuntimeError, match="no physical fall-arrest"):
+        support.synchronize_physical_fall_arrest(SimpleNamespace(enable=True))
 
 
 def _released_support(epoch: int = 17) -> PlantSupportController:

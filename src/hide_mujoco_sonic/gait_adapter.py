@@ -137,6 +137,7 @@ class GaitAdapterConfig:
     # exceed the rigid-body thresholds above, but only while a continuous pose
     # window proves bounded oscillation and strict near-zero net motion. This
     # path is never used for cancel, safe-stop, or fault acknowledgement.
+    balanced_idle_stop_timeout_s: float = 4.0
     balanced_idle_stop_window_s: float = 0.45
     balanced_idle_stop_max_sample_gap_s: float = 0.20
     balanced_idle_stop_linear_excursion_m: float = 0.015
@@ -174,6 +175,7 @@ class GaitAdapterConfig:
             self.stop_angular_ack_rps,
             self.stop_ack_s,
             self.stop_timeout_s,
+            self.balanced_idle_stop_timeout_s,
             self.balanced_idle_stop_window_s,
             self.balanced_idle_stop_max_sample_gap_s,
             self.balanced_idle_stop_linear_excursion_m,
@@ -235,8 +237,14 @@ class GaitAdapterConfig:
             raise ValueError(
                 "balanced IDLE angular speed must be between the strict stop and command limits"
             )
-        if self.balanced_idle_stop_window_s >= self.stop_timeout_s:
-            raise ValueError("balanced IDLE stop window must be shorter than stop timeout")
+        if self.balanced_idle_stop_timeout_s < self.stop_timeout_s:
+            raise ValueError(
+                "balanced IDLE stop timeout must not be shorter than emergency stop timeout"
+            )
+        if self.balanced_idle_stop_window_s >= self.balanced_idle_stop_timeout_s:
+            raise ValueError(
+                "balanced IDLE stop window must be shorter than its stop timeout"
+            )
         if (
             self.balanced_idle_stop_max_sample_gap_s
             >= self.balanced_idle_stop_window_s
@@ -616,7 +624,15 @@ class GaitAdapter:
             if self._stop_acknowledged:
                 self._complete_stop()
                 return
-            if self._stop_started_at is not None and now - self._stop_started_at > self.config.stop_timeout_s:
+            stop_timeout_s = (
+                self.config.balanced_idle_stop_timeout_s
+                if self._stop_terminal is GaitState.IDLE
+                else self.config.stop_timeout_s
+            )
+            if (
+                self._stop_started_at is not None
+                and now - self._stop_started_at > stop_timeout_s
+            ):
                 self._trip_fault("measured base did not acknowledge stop before timeout", now)
             return
 
