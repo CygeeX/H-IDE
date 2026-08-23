@@ -8,6 +8,7 @@ import pytest
 import numpy as np
 
 from hide_mujoco_sonic.plant import (
+    PlantControlSynchronizer,
     PlantPhysicsFault,
     PlantSupportController,
     stabilized_support_wrench,
@@ -195,6 +196,115 @@ def test_plant_without_fall_arrest_reports_support_already_off() -> None:
     assert state["fallArrestEnabled"] is False
     assert state["fallArrestReleaseConfirmedEpoch"] == 0
     assert support.request_fall_arrest_release(9) is False
+
+
+def _released_support(epoch: int = 17) -> PlantSupportController:
+    support = PlantSupportController(fall_arrest_enabled=True)
+    support.finish_startup()
+    assert support.request_fall_arrest_release(epoch) is True
+    assert support.consume_fall_arrest_release(lambda: None) == epoch
+    return support
+
+
+def test_control_synchronizer_pauses_only_after_policy_support_release() -> None:
+    support = PlantSupportController(fall_arrest_enabled=True)
+    support.finish_startup()
+    sequence = [4]
+    waits: list[tuple[int, float]] = []
+
+    def wait_for_tick(previous: int, tick_ms: int, timeout_s: float) -> bool:
+        assert tick_ms == 40
+        waits.append((previous, timeout_s))
+        sequence[0] += 1
+        return True
+
+    sync = PlantControlSynchronizer(
+        support,
+        control_hz=50,
+        command_sequence=lambda: sequence[0],
+        wait_for_command_for_tick=wait_for_tick,
+    )
+
+    assert sync.wait_after_lowstate(
+        tick_ms=20,
+        command_sequence_before_publish=4,
+    ) is False
+    assert waits == []
+
+    assert support.request_fall_arrest_release(17) is True
+    assert support.consume_fall_arrest_release(lambda: None) == 17
+    assert sync.wait_after_lowstate(
+        tick_ms=24,
+        command_sequence_before_publish=4,
+    ) is False
+    assert sync.wait_after_lowstate(
+        tick_ms=40,
+        command_sequence_before_publish=4,
+    ) is True
+    assert waits and waits[0][0] == 4
+    status = sync.snapshot()
+    assert status["active"] is True
+    assert status["waitCount"] == 1
+    assert status["lastControlTickMs"] == 40
+    assert status["lastCommandSequence"] == 5
+
+
+def test_control_synchronizer_turns_host_jitter_into_wall_wait_not_sim_skip() -> None:
+    support = _released_support()
+    sequence = [10]
+    wall = [100.0]
+
+    def delayed_command(previous: int, tick_ms: int, _timeout_s: float) -> bool:
+        assert previous == 10
+        assert tick_ms == 1_000
+        wall[0] += 0.037
+        sequence[0] += 1
+        return True
+
+    sync = PlantControlSynchronizer(
+        support,
+        control_hz=50,
+        command_sequence=lambda: sequence[0],
+        wait_for_command_for_tick=delayed_command,
+        wall_clock=lambda: wall[0],
+    )
+
+    assert sync.wait_after_lowstate(
+        tick_ms=1_000,
+        command_sequence_before_publish=10,
+    ) is True
+    status = sync.snapshot()
+    assert status["lastWaitMs"] == pytest.approx(37.0)
+    assert status["maxWaitMs"] == pytest.approx(37.0)
+    # Only one simulation control tick was admitted.  The 37 ms host delay did
+    # not create a second/catch-up policy step.
+    assert status["lastControlTickMs"] == 1_000
+
+
+def test_control_synchronizer_missing_controller_latches_physics_fault() -> None:
+    support = _released_support()
+    wall = [5.0]
+
+    def never_arrives(_previous: int, tick_ms: int, timeout_s: float) -> bool:
+        assert tick_ms == 2_000
+        wall[0] += timeout_s
+        return False
+
+    sync = PlantControlSynchronizer(
+        support,
+        control_hz=50,
+        command_sequence=lambda: 3,
+        wait_for_command_for_tick=never_arrives,
+        max_wall_wait_s=0.10,
+        wall_clock=lambda: wall[0],
+    )
+
+    with pytest.raises(PlantPhysicsFault, match="timed out"):
+        sync.wait_after_lowstate(
+            tick_ms=2_000,
+            command_sequence_before_publish=3,
+        )
+    assert "timed out" in str(support.state()["fault"])
 
 
 def test_physics_hot_path_never_waits_for_http_command_writer() -> None:

@@ -563,6 +563,147 @@ class PlantSupportController:
         }
 
 
+class PlantControlSynchronizer:
+    """Pause MuJoCo time until one fresh 50 Hz actuator command arrives.
+
+    Hardware time cannot pause, so a real controller must treat a missed
+    deadline as a fault.  MuJoCo *can* pause safely.  Once the policy-owned
+    fall-arrest release proves that SONIC controls the untethered plant, this
+    barrier turns the asynchronous DDS transport into the same observation ->
+    controller -> actuator ordering used by the official synchronous
+    simulator examples.  Host scheduling jitter slows wall time instead of
+    dropping a learned-policy observation or terminating a healthy scene.
+
+    The barrier is deliberately inactive during cold start and for
+    support-always-on standalone demos.  It never catches up, repeats a policy
+    step, or advances simulation without a newly received LowCmd.  A missing
+    controller eventually latches the existing Plant physics fault.
+    """
+
+    def __init__(
+        self,
+        support: PlantSupportController,
+        *,
+        control_hz: int,
+        command_sequence: Callable[[], int],
+        wait_for_command_for_tick: Callable[[int, int, float], bool],
+        max_wall_wait_s: float = 2.0,
+        wall_clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if isinstance(control_hz, bool) or int(control_hz) <= 0:
+            raise ValueError("control synchronizer frequency must be positive")
+        if 1_000 % int(control_hz) != 0:
+            raise ValueError("control synchronizer frequency must divide 1000")
+        if isinstance(max_wall_wait_s, bool):
+            raise ValueError("control synchronizer timeout must be finite and positive")
+        timeout = float(max_wall_wait_s)
+        if not math.isfinite(timeout) or timeout <= 0.0:
+            raise ValueError("control synchronizer timeout must be finite and positive")
+        if not callable(command_sequence) or not callable(wait_for_command_for_tick):
+            raise TypeError("control synchronizer requires command sequence callbacks")
+        self._support = support
+        self._period_ms = 1_000 // int(control_hz)
+        self._command_sequence = command_sequence
+        self._wait_for_command_for_tick = wait_for_command_for_tick
+        self._max_wall_wait_s = timeout
+        self._wall_clock = wall_clock
+        self._lock = threading.Lock()
+        self._last_control_tick_ms: int | None = None
+        self._wait_count = 0
+        self._max_wait_s = 0.0
+        self._last_wait_s = 0.0
+        self._last_command_sequence: int | None = None
+
+    @staticmethod
+    def _sequence(value: object) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError("LowCmd sequence must be a non-negative integer")
+        return value
+
+    def command_sequence_before_publish(self) -> int:
+        return self._sequence(self._command_sequence())
+
+    def _release_epoch(self) -> int | None:
+        state = self._support.state()
+        epoch = state.get("fallArrestReleaseConfirmedEpoch")
+        if (
+            state.get("fallArrestEnabled") is False
+            and isinstance(epoch, int)
+            and not isinstance(epoch, bool)
+            and epoch > 0
+        ):
+            return epoch
+        return None
+
+    def wait_after_lowstate(
+        self,
+        *,
+        tick_ms: int,
+        command_sequence_before_publish: int,
+    ) -> bool:
+        if isinstance(tick_ms, bool) or not isinstance(tick_ms, int) or tick_ms < 0:
+            raise ValueError("control synchronization tick must be non-negative")
+        sequence = self._sequence(command_sequence_before_publish)
+        if self._release_epoch() is None or tick_ms % self._period_ms != 0:
+            return False
+        with self._lock:
+            previous_tick = self._last_control_tick_ms
+            if previous_tick is not None and tick_ms <= previous_tick:
+                reason = (
+                    "MuJoCo synchronized control tick did not advance: "
+                    f"{tick_ms}ms after {previous_tick}ms"
+                )
+                self._support.latch_fault(reason)
+                raise PlantPhysicsFault(reason)
+            self._last_control_tick_ms = tick_ms
+
+        started = self._wall_clock()
+        deadline = started + self._max_wall_wait_s
+        while True:
+            self._support.require_healthy()
+            remaining = deadline - self._wall_clock()
+            if remaining <= 0.0:
+                reason = (
+                    "MuJoCo synchronized control timed out waiting for a fresh "
+                    f"LowCmd after tick {tick_ms}ms"
+                )
+                self._support.latch_fault(reason)
+                raise PlantPhysicsFault(reason)
+            if self._wait_for_command_for_tick(
+                sequence,
+                tick_ms,
+                min(0.05, remaining),
+            ):
+                break
+
+        observed_sequence = self._sequence(self._command_sequence())
+        if observed_sequence <= sequence:
+            reason = "MuJoCo control synchronization reported a stale LowCmd"
+            self._support.latch_fault(reason)
+            raise PlantPhysicsFault(reason)
+        waited_s = max(0.0, self._wall_clock() - started)
+        with self._lock:
+            self._wait_count += 1
+            self._last_wait_s = waited_s
+            self._max_wait_s = max(self._max_wait_s, waited_s)
+            self._last_command_sequence = observed_sequence
+        return True
+
+    def snapshot(self) -> dict[str, object]:
+        with self._lock:
+            return {
+                "schemaVersion": "h-ide.mujoco-control-synchronization/1",
+                "active": self._release_epoch() is not None,
+                "periodMs": self._period_ms,
+                "maxWallWaitS": self._max_wall_wait_s,
+                "lastControlTickMs": self._last_control_tick_ms,
+                "waitCount": self._wait_count,
+                "lastWaitMs": self._last_wait_s * 1_000.0,
+                "maxWaitMs": self._max_wait_s * 1_000.0,
+                "lastCommandSequence": self._last_command_sequence,
+            }
+
+
 def stabilized_support_wrench(
     raw_wrench,
     pose,
@@ -1306,6 +1447,7 @@ class PlantFrameStore:
         worker_status_provider=None,
         viewer_status_provider=None,
         dynamics_evidence_provider=None,
+        control_synchronization_provider=None,
     ):
         self.config = config
         self.support = support
@@ -1324,6 +1466,7 @@ class PlantFrameStore:
         self._worker_status_provider = worker_status_provider
         self._viewer_status_provider = viewer_status_provider
         self._dynamics_evidence_provider = dynamics_evidence_provider
+        self._control_synchronization_provider = control_synchronization_provider
         self._servers: list[ThreadingHTTPServer] = []
 
     def set_worker_status_provider(self, provider) -> None:
@@ -1334,6 +1477,9 @@ class PlantFrameStore:
 
     def set_dynamics_evidence_provider(self, provider) -> None:
         self._dynamics_evidence_provider = provider
+
+    def set_control_synchronization_provider(self, provider) -> None:
+        self._control_synchronization_provider = provider
 
     def commit(self, frame: RenderedFrame) -> None:
         """Atomically install one complete RGB-D/state generation."""
@@ -1459,6 +1605,27 @@ class PlantFrameStore:
                 )[:512],
             }
 
+    def _control_synchronization(self) -> dict[str, object]:
+        provider = self._control_synchronization_provider
+        if provider is None:
+            return {
+                "schemaVersion": "h-ide.mujoco-control-synchronization/1",
+                "active": False,
+                "status": "unconfigured",
+            }
+        try:
+            return dict(provider())
+        except Exception as exc:
+            return {
+                "schemaVersion": "h-ide.mujoco-control-synchronization/1",
+                "active": False,
+                "status": "failed",
+                "lastError": (
+                    "control synchronization evidence unavailable: "
+                    f"{type(exc).__name__}: {exc}"
+                )[:512],
+            }
+
     def _observation_status(
         self,
         frame: RenderedFrame | None,
@@ -1559,6 +1726,7 @@ class PlantFrameStore:
             ),
             "support": support_state,
             "dynamicsEvidence": self._dynamics_evidence(),
+            "controlSynchronization": self._control_synchronization(),
             "runtimeTiming": (
                 self.runtime_diagnostics.snapshot()
                 if self.runtime_diagnostics is not None
@@ -1952,6 +2120,30 @@ def run_plant(config: SimConfig) -> int:
     else:
         support_controller.finish_startup()
 
+    unitree_bridge = sim_env.unitree_bridge
+    control_synchronizer = PlantControlSynchronizer(
+        support_controller,
+        control_hz=config.control_hz,
+        command_sequence=unitree_bridge.LowCmdSequence,
+        wait_for_command_for_tick=unitree_bridge.WaitForLowCmdForTick,
+    )
+    original_publish_lowstate = unitree_bridge.PublishLowState
+
+    def publish_synchronized_lowstate(observation):
+        # Snapshot before publish so a fast DDS response cannot race past the
+        # waiter.  Once support is released there is exactly one controller
+        # write per admitted 50 Hz LowState; an asynchronous stop write after
+        # this boundary is also a valid fresh actuator decision.
+        command_sequence = control_synchronizer.command_sequence_before_publish()
+        result = original_publish_lowstate(observation)
+        control_synchronizer.wait_after_lowstate(
+            tick_ms=int(unitree_bridge.low_state.tick),
+            command_sequence_before_publish=command_sequence,
+        )
+        return result
+
+    unitree_bridge.PublishLowState = publish_synchronized_lowstate
+
     apply_process_start_spawn(
         sim_env.mj_data,
         sim_env.mj_model,
@@ -2130,6 +2322,7 @@ def run_plant(config: SimConfig) -> int:
                 support_controller,
                 runtime_diagnostics,
                 dynamics_evidence_provider=dynamics_evidence.capture_state,
+                control_synchronization_provider=control_synchronizer.snapshot,
             )
             rgbd_mailbox = LatestStateMailbox(
                 state_shape,

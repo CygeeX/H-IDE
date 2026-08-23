@@ -84,6 +84,13 @@ from .transport import (
 
 logger = logging.getLogger(__name__)
 
+# Correlate each simulator-only LowCmd with the LowState control tick that
+# produced it.  The matching Plant bridge reads these application-reserved
+# fields before advancing untethered MuJoCo physics.  An out-of-band stop/fault
+# write uses the second marker and is valid at any waiting tick.
+_SIM_CONTROL_TICK_MAGIC = 0x48494445
+_SIM_ASYNC_BOUNDARY_MAGIC = 0x48494446
+
 
 _NORMAL_STOP_INTENT_FIELDS = frozenset(
     {
@@ -1201,6 +1208,30 @@ class SonicDriver:
             )
         return complete
 
+    def _stamp_sim_control_identity(
+        self,
+        control_tick_ms: int | None = None,
+    ) -> None:
+        """Stamp one LowCmd with its exact Plant tick or async stop identity."""
+
+        tick = control_tick_ms
+        if tick is None:
+            context = getattr(self, "_control_evidence_context", None)
+            step = getattr(context, "control_step", None)
+            if isinstance(step, PlantControlStep):
+                tick = step.tick_ms
+        reserve = getattr(self._msg, "reserve", None)
+        if not isinstance(reserve, list) or len(reserve) < 2:
+            raise RuntimeError("Unitree LowCmd lacks the simulator correlation reserve")
+        if tick is None:
+            reserve[0] = _SIM_ASYNC_BOUNDARY_MAGIC
+            reserve[1] = 0
+            return
+        if isinstance(tick, bool) or not isinstance(tick, int) or tick < 0:
+            raise ValueError("Plant control correlation tick must be non-negative")
+        reserve[0] = _SIM_CONTROL_TICK_MAGIC
+        reserve[1] = tick
+
     def _publish_position_hold(
         self,
         targets: tuple[float, ...],
@@ -1233,6 +1264,7 @@ class SonicDriver:
                 motor.q = float(selected[index])
                 motor.dq = 0.0
                 motor.tau = 0.0
+            self._stamp_sim_control_identity()
             self._msg.crc = self._crc.Crc(self._msg)
             # Final pre-Write linearization.  A fault may be claimed while the
             # 29-axis command and CRC are being prepared after the earlier
@@ -3957,6 +3989,7 @@ class SonicDriver:
                 motor.q = published_targets[index]
                 motor.dq = 0.0
                 motor.tau = 0.0
+            self._stamp_sim_control_identity(control_tick_ms)
             self._msg.crc = self._crc.Crc(self._msg)
             with self._terminal_fault_lock:
                 terminal_before_write = self._fault_latched.is_set()

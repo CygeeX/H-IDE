@@ -1351,6 +1351,7 @@ def _publishing_driver(clock: Clock):
     driver._msg = SimpleNamespace(
         mode_machine=0,
         crc=0,
+        reserve=[0, 0, 0, 0],
         motor_cmd=[
             SimpleNamespace(mode=0, kp=0.0, kd=0.0, q=0.0, dq=0.0, tau=0.0)
             for _ in range(29)
@@ -1367,6 +1368,16 @@ def _publishing_driver(clock: Clock):
     )
     driver._arm_guard = driver._new_arm_guard()
     return driver, writes
+
+
+def test_lowcmd_simulator_identity_distinguishes_owner_tick_and_async_stop() -> None:
+    driver, _writes = _publishing_driver(Clock())
+
+    driver._stamp_sim_control_identity(2_040)
+    assert driver._msg.reserve[:2] == [0x48494445, 2_040]
+
+    driver._stamp_sim_control_identity()
+    assert driver._msg.reserve[:2] == [0x48494446, 0]
 
 
 def _lowstate(targets: tuple[float, ...], *, arm_lag_rad: float = 0.0):
@@ -1690,6 +1701,7 @@ def test_arm_slew_projection_is_the_exact_dds_feedback_and_grant_boundary() -> N
     assert raw[23] - boundary[23] > 0.12
     assert published == pytest.approx(expected)
     assert writes == [pytest.approx(expected)]
+    assert driver._msg.reserve[:2] == [0x48494445, 1_020]
     assert controller.commits == [pytest.approx(expected)]
     assert controller.execution_feedback_pending is False
     assert controller.controller.ref_cursor == 1
