@@ -418,6 +418,27 @@ def sonic_nav2_zero_idle_state() -> dict:
     }
 
 
+def sonic_controlled_braking_state(*, authority_phase: str) -> dict:
+    granted = authority_phase == "GRANTED"
+    return {
+        **sonic_safe_hold_state(),
+        "nav2_state": "braking",
+        "sonic_mode": "IDLE",
+        "static_hold_active": not granted,
+        "navigation_task_active": False,
+        "sonic_planner_required_pending": authority_phase == "REQUIRED",
+        "sonic_reference_authority_state": authority_phase,
+        "sonic_reference_actuator_authority": granted,
+        "sonic_reference_authority_dds_target_sequence": 17 if granted else None,
+        "sonic_execution_feedback_pending": False,
+        "plant_support_mode": "idle",
+        "plant_support_requested_mode": "idle",
+        "plant_support_confirmed_mode": "idle",
+        "plant_support_safety_latched": False,
+        "plant_support_stop_generation": None,
+    }
+
+
 def first_person_status(path: Path) -> None:
     path.write_text(
         json.dumps(
@@ -505,6 +526,50 @@ def test_snapshot_collector_accepts_nav2_terminal_zero_at_exact_idle_boundary(
     )
 
     assert collector.collect_once()["runtimeHealth"]["sonic"]["healthy"] is True
+
+
+@pytest.mark.parametrize(
+    "authority_phase",
+    ["REVOKED", "REQUIRED", "MATCHED_INSTALLED", "PRIMED", "GRANTED"],
+)
+def test_snapshot_collector_accepts_fresh_idle_rebase_during_controlled_braking(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    authority_phase: str,
+) -> None:
+    status = tmp_path / "first-person.json"
+    first_person_status(status)
+    monkeypatch.setattr(runner, "_inactive_user_unit", lambda _unit: "inactive")
+    monkeypatch.setattr(runner, "_require_port_closed", lambda _port: None)
+    collector = runner.RuntimeSnapshotCollector(
+        FakeRos(),
+        reader=FakeReader(
+            plant_state(),
+            sonic_controlled_braking_state(authority_phase=authority_phase),
+        ),
+        first_person_status=status,
+    )
+
+    assert collector.collect_once()["runtimeHealth"]["sonic"]["healthy"] is True
+
+
+def test_snapshot_collector_rejects_nonzero_command_disguised_as_braking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    status = tmp_path / "first-person.json"
+    first_person_status(status)
+    monkeypatch.setattr(runner, "_inactive_user_unit", lambda _unit: "inactive")
+    monkeypatch.setattr(runner, "_require_port_closed", lambda _port: None)
+    sonic = sonic_controlled_braking_state(authority_phase="REQUIRED")
+    sonic["last_cmd_vx"] = 0.2
+    collector = runner.RuntimeSnapshotCollector(
+        FakeRos(),
+        reader=FakeReader(plant_state(), sonic),
+        first_person_status=status,
+    )
+
+    with pytest.raises(runner.StrictMotionRunnerError, match="health failed: sonic"):
+        collector.collect_once()
 
 
 def test_snapshot_collector_rejects_unrecognized_reason_at_idle_boundary(

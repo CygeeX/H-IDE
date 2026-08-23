@@ -689,6 +689,47 @@ def test_health_accepts_only_the_explicit_driver_owned_policy_braking_shape() ->
     assert braking.matched_reference_actuator_authority is True
     assert braking.confirmed_safe_hold is False
 
+    # A correlated controlled stop first withdraws the moving clip, then
+    # requests/acquires a fresh measured IDLE reference.  Those planning-only
+    # phases deliberately carry no actuator authority but remain an explicit
+    # driver-owned braking transaction rather than a component failure.
+    for phase in ("REVOKED", "REQUIRED", "MATCHED_INSTALLED", "PRIMED"):
+        rebasing = parse_health(
+            plant_support_mode="idle",
+            static_hold_active=True,
+            navigation_task_active=False,
+            motion_authorized=False,
+            nav2_command_zero=True,
+            controlled_policy_stop_active=True,
+            matched_reference_actuator_authority=False,
+            reference_authority_state=phase,
+            reference_authority_generation=42,
+            reference_authority_source_sequence=7,
+            reference_authority_intent_generation=(
+                3 if phase in {"MATCHED_INSTALLED", "PRIMED"} else None
+            ),
+            reference_authority_epoch=2,
+        )
+        assert rebasing.controlled_policy_stop_active is True
+        assert rebasing.matched_reference_actuator_authority is False
+        assert rebasing.confirmed_safe_hold is False
+
+    with pytest.raises(ValueError, match="controlled SONIC policy stop"):
+        parse_health(
+            plant_support_mode="idle",
+            static_hold_active=False,
+            navigation_task_active=False,
+            motion_authorized=False,
+            nav2_command_zero=True,
+            controlled_policy_stop_active=True,
+            matched_reference_actuator_authority=False,
+            reference_authority_state="REQUIRED",
+            reference_authority_generation=42,
+            reference_authority_source_sequence=7,
+            reference_authority_intent_generation=None,
+            reference_authority_epoch=2,
+        )
+
     with pytest.raises(ValueError, match="matched reference actuator authority"):
         parse_health(
             plant_support_mode="locomotion",

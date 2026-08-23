@@ -1146,13 +1146,14 @@ def _sonic_runtime_healthy(sonic: Mapping[str, Any]) -> bool:
 
     Normal-stop intentionally leaves its reason in ``last_error`` for
     operator diagnostics.  Treating every non-empty reason as a component
-    failure makes both action completion and the following explicit normal
-    stop impossible.  Nav2's terminal zero command first produces a clean
-    actuator IDLE boundary while Plant support is still ``idle``; the runner
-    then promotes that boundary to the correlated ``safety_stop`` transaction.
-    Both exceptions are deliberately narrow: all command, task, reference,
-    handoff, fault-trace, and terminal-error facts must prove no executable
-    motion remains.
+    failure makes action completion impossible.  During the correlated brake,
+    the moving reference is withdrawn and a fresh measured IDLE reference is
+    acquired before policy braking resumes.  Nav2's terminal zero command then
+    produces a clean actuator IDLE boundary while Plant support is still
+    ``idle``; the runner promotes that boundary to the correlated
+    ``safety_stop`` transaction.  Every exception is deliberately narrow:
+    command, task, reference, support, fault-trace, and terminal-error facts
+    must match the exact transaction phase.
     """
 
     if sonic.get("status") != "running" or sonic.get("motion_ready") is not True:
@@ -1162,6 +1163,51 @@ def _sonic_runtime_healthy(sonic: Mapping[str, Any]) -> bool:
         return True
     if not isinstance(last_error, str) or not last_error.strip():
         return False
+    if (
+        last_error == "Nav2 requested zero velocity"
+        and sonic.get("nav2_state") == "braking"
+    ):
+        authority_phase = sonic.get("sonic_reference_authority_state")
+        actuator_authority = sonic.get("sonic_reference_actuator_authority")
+        dds_sequence = sonic.get(
+            "sonic_reference_authority_dds_target_sequence"
+        )
+        try:
+            command_zero = all(
+                abs(_finite(sonic.get(name), f"SONIC {name}")) <= _ZERO_EPS
+                for name in ("last_cmd_vx", "last_cmd_vy", "last_cmd_wz")
+            )
+        except StrictMotionRunnerError:
+            return False
+        reference_shape = bool(
+            (
+                authority_phase == "GRANTED"
+                and actuator_authority is True
+                and isinstance(dds_sequence, int)
+                and not isinstance(dds_sequence, bool)
+                and dds_sequence >= 1
+                and sonic.get("static_hold_active") is False
+            )
+            or (
+                authority_phase
+                in {"REVOKED", "REQUIRED", "MATCHED_INSTALLED", "PRIMED"}
+                and actuator_authority is False
+                and dds_sequence is None
+                and sonic.get("static_hold_active") is True
+            )
+        )
+        return bool(
+            reference_shape
+            and sonic.get("navigation_task_active") is False
+            and command_zero
+            and sonic.get("plant_support_stop_pending") is False
+            and sonic.get("plant_support_safety_latched") is False
+            and sonic.get("fault_trace_path") in {None, ""}
+            and sonic.get("fault_trace_sample_count") in {None, 0}
+            and sonic.get("terminal_boundary_error") in {None, ""}
+            and sonic.get("plant_terminal_halt_error") in {None, ""}
+            and sonic.get("recoverable_motion_fault") is not True
+        )
     zero_fields = (
         "sonic_speed_mps",
         "sonic_policy_speed_mps",

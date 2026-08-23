@@ -1562,18 +1562,28 @@ class SonicDriver:
     def _begin_controlled_policy_stop_locked(
         self,
         decision: IngressDecision,
+        *,
+        correlated: bool = False,
     ) -> bool:
-        """Retain learned-control continuity while rejecting new locomotion.
+        """Rebase IDLE at the executed boundary while rejecting new motion.
 
         STOPPING is recoverable deceleration, not a terminal safety event.  It
-        may keep the already-GRANTED SONIC reference running while the official
-        IDLE reference is planned.  Fault, process-stop, support-latch, startup,
-        and pre-grant paths deliberately fall back to the exact static boundary.
-        The caller owns ``_support_lock``.
+        must not, however, blend a moving gait clip directly into IDLE.  That
+        path completed a live one-metre walk and then destabilized the model
+        during braking.  Freeze the exact last successful DDS target, withdraw
+        the moving reference, and let the correlated normal-stop transaction
+        request a fresh measured IDLE reference.  A generic STOPPING envelope
+        establishes the hold immediately but deliberately defers planner I/O
+        until the strict begin request supplies its durable source identity.
+
+        Fault, process-stop, support-latch, startup, and pre-grant paths still
+        fall back to the stronger static boundary.  The caller owns
+        ``_support_lock``.
         """
 
         if (
-            decision.action != "brake"
+            not isinstance(correlated, bool)
+            or decision.action != "brake"
             or decision.state != "STOPPING"
             or decision.generation is None
             or decision.sequence is None
@@ -1581,27 +1591,61 @@ class SonicDriver:
             return False
         if not self._controlled_policy_stop_eligible_locked(decision.generation):
             return False
-        self.guard.stop_at_measured_heading(
-            source="gait_adapter_controlled_stop"
-        )
-        self._controlled_stop_active = True
-        self._controlled_stop_source_identity = (
-            decision.generation,
-            decision.sequence,
-        )
-        self._controlled_stop_reference_installed = False
+        identity = (decision.generation, decision.sequence)
+        already_active = bool(getattr(self, "_controlled_stop_active", False))
+        authority = self._reference_authority.snapshot
+        if (
+            already_active
+            and correlated
+            and authority.phase in {"MATCHED_INSTALLED", "PRIMED", "GRANTED"}
+            and (
+                authority.generation != identity[0]
+                or authority.source_sequence != identity[1]
+            )
+        ):
+            # Do not partially rewrite the active stop identity after an IDLE
+            # reference has already been installed.  Such a second correlated
+            # transaction must take the stronger static-stop fallback.
+            return False
+        if not already_active:
+            self.guard.stop_at_measured_heading(
+                source="gait_adapter_controlled_stop"
+            )
+            if not self._freeze_planner_handoff_boundary():
+                return False
+            self._revoke_planner_reference_locked(
+                "controlled stop requires a fresh measured IDLE reference"
+            )
+            self._static_hold_active = True
+            self._controlled_stop_active = True
+            self._controlled_stop_source_identity = identity
+            self._controlled_stop_reference_installed = False
+        if correlated:
+            authority = self._reference_authority.snapshot
+            if authority.phase in {"MATCHED_INSTALLED", "PRIMED", "GRANTED"}:
+                self._controlled_stop_reference_installed = True
+            else:
+                self._reference_authority.require(
+                    generation=identity[0],
+                    source_sequence=identity[1],
+                )
+                self._controlled_stop_reference_installed = False
+            self._controlled_stop_source_identity = identity
+            self._reference_source_identity = identity
+            self._reference_request_pending = (
+                self._reference_authority.snapshot.phase == "REQUIRED"
+            )
         self._navigation_task_active = False
         return True
 
     def _controlled_policy_stop_eligible_locked(self, generation: int) -> bool:
-        """Check whether STOPPING may retain the current learned controller."""
+        """Check whether STOPPING may rebase the current learned controller."""
 
         authority = self._reference_authority.snapshot
         activation = getattr(self, "_policy_activation", None)
         controller = getattr(self, "_controller", None)
-        return not (
-            authority.phase != "GRANTED"
-            or authority.generation != generation
+        common_blocked = (
+            authority.generation != generation
             or self._last_published_targets is None
             or activation is None
             or not bool(getattr(activation, "prepared", False))
@@ -1615,6 +1659,22 @@ class SonicDriver:
             or self._plant_support_stop_pending
             or self._plant_support_safety_latched
         )
+        if common_blocked:
+            return False
+        if getattr(self, "_controlled_stop_active", False):
+            identity = getattr(self, "_controlled_stop_source_identity", None)
+            return bool(
+                identity is not None
+                and identity[0] == generation
+                and authority.phase in {
+                    "REVOKED",
+                    "REQUIRED",
+                    "MATCHED_INSTALLED",
+                    "PRIMED",
+                    "GRANTED",
+                }
+            )
+        return authority.phase == "GRANTED"
 
     def _freeze_planner_handoff_boundary(self) -> bool:
         """Start a new planner generation from the last actuator target.
@@ -2760,9 +2820,18 @@ class SonicDriver:
                 self._reference_request_pending = not defer_planner_for_activation
         elif admitted and intent.mode == "IDLE":
             if controlled_stop:
-                if not self._reference_authority.executable:
+                authority = self._reference_authority.snapshot
+                controlled_identity = self._controlled_stop_source_identity
+                if controlled_identity is None:
                     raise RuntimeError(
-                        "controlled stop lost its granted SONIC reference"
+                        "controlled stop has no correlated SONIC identity"
+                    )
+                if authority.phase != "REVOKED" and (
+                    authority.generation != controlled_identity[0]
+                    or authority.source_sequence != controlled_identity[1]
+                ):
+                    raise RuntimeError(
+                        "controlled-stop IDLE reference identity diverged"
                     )
             else:
                 self._revoke_planner_reference("Nav2 intent is IDLE")
@@ -2827,9 +2896,11 @@ class SonicDriver:
             controller.ms.movement_angle = intent.movement_angle_rad
             controller.ms.facing_angle = intent.facing_angle_rad
             controller.ms.has_movement = intent.has_movement
-            # Manual authority requests the reference explicitly on the
-            # planning-only path; the policy tick must not issue a duplicate.
-            controller.ms.needs_replan = bool(controlled_stop)
+            # Manual authority requests every fresh reference explicitly on
+            # the planning-only path.  In particular, controlled stop now
+            # rebases from current LowState instead of letting ``run_step``
+            # blend a moving clip into IDLE.
+            controller.ms.needs_replan = False
             self._last_intent_signature = (
                 intent.has_movement,
                 round(intent.movement_angle_rad, 3),
@@ -3512,6 +3583,22 @@ class SonicDriver:
                 source_sequence=authority.source_sequence,
                 reference_epoch=epoch,
             )
+            if getattr(self, "_controlled_stop_active", False):
+                controlled_identity = getattr(
+                    self, "_controlled_stop_source_identity", None
+                )
+                if (
+                    controlled_identity is None
+                    or controlled_identity[0] != authority.generation
+                    or controlled_identity[1] != authority.source_sequence
+                    or int(getattr(controller.ms, "mode", -1)) != 0
+                    or bool(getattr(controller.ms, "has_movement", True))
+                ):
+                    raise RuntimeError(
+                        "fresh controlled-stop reference lacks exact IDLE identity"
+                    )
+                self._reference_source_identity = controlled_identity
+                self._controlled_stop_reference_installed = True
             # An earlier stop hold may be released only after the measured
             # history and exact executed boundary have been atomically rebased.
             self._safe_hold_targets = None
@@ -4871,7 +4958,8 @@ class SonicDriver:
                             policy_braking = bool(
                                 policy_candidate
                                 and self._begin_controlled_policy_stop_locked(
-                                    decision
+                                    decision,
+                                    correlated=True,
                                 )
                             )
                             admitted_action = (
@@ -5001,9 +5089,23 @@ class SonicDriver:
                     "stationary intent must follow the first braking sequence"
                 )
             if getattr(self, "_normal_stop_policy_braking", False):
-                # The learned IDLE transition retained actuator authority only
-                # through measured braking. Freeze its exact last successful
-                # DDS target now that GaitAdapter has proved stationarity.
+                authority = self._reference_authority.snapshot
+                if (
+                    not getattr(
+                        self, "_controlled_stop_reference_installed", False
+                    )
+                    or authority.phase != "GRANTED"
+                    or authority.generation != identity.control_generation
+                    or authority.source_sequence != identity.gait_source_sequence
+                ):
+                    raise NormalStopWireError(
+                        "stationary acknowledgement requires the fresh IDLE "
+                        "reference to cross DDS"
+                    )
+                # The freshly rebased IDLE reference owns actuator authority
+                # only through measured braking. Freeze its exact last
+                # successful DDS target now that GaitAdapter has proved
+                # stationarity.
                 try:
                     self._stop_navigation_at_boundary(
                         source="normal_stop_stationary",
@@ -6030,7 +6132,7 @@ class SonicDriver:
                 last_cmd_vx=0.0,
                 last_cmd_vy=0.0,
                 last_cmd_wz=0.0,
-                static_hold_active=not controlled_brake_applied,
+                static_hold_active=self._static_hold_active,
                 last_error=decision.reason,
                 **self._planner_telemetry_fields(),
             )

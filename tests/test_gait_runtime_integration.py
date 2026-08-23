@@ -2660,14 +2660,12 @@ def test_reference_execution_is_transactional_across_grant_refresh_and_stop_race
 
 
 def test_controlled_stop_watchdog_age_cannot_replan_the_same_source_sequence() -> None:
-    """The driver-owned IDLE brake has one planner/source identity.
+    """The fresh measured IDLE rebase has one planner/source identity.
 
-    In live motion, CmdVelGuard changed the already-installed controlled-stop
-    zero from fresh to stale after its watchdog interval.  That produced a new
-    planner intent generation but necessarily retained the same correlated
-    STOPPING source sequence, causing a terminal transition fault.  Freshness
-    is irrelevant after the driver owns braking and must not manufacture a
-    second reference transition.
+    A controlled stop withdraws the moving clip and plans from current
+    LowState while publishing the exact previous DDS boundary.  CmdVelGuard
+    later changing the same zero from fresh to stale must neither repeat that
+    measured rebase nor manufacture a second reference identity.
     """
 
     from lerobot.robots.unitree_g1.controllers.sonic_pipeline import DEFAULT_ANGLES
@@ -2683,36 +2681,18 @@ def test_controlled_stop_watchdog_age_cannot_replan_the_same_source_sequence() -
     evidence.accept_current()
     controller = _TransactionalController(evidence, target)
     controller.reference_install_epoch = 2
-    controller.reference_authority = True
     driver._controller = controller
     driver._planner_evidence = evidence
     driver._last_published_targets = boundary
+    driver._joint_handoff.freeze(boundary)
     driver._intent_gate = ReplanIntentGate()
     driver._intent_gate.admit(_movement_intent(0.0), now=clock.value - 1.0)
     driver._controlled_stop_active = True
     driver._controlled_stop_source_identity = (42, 9)
     driver._controlled_stop_reference_installed = False
-    driver._reference_source_identity = (42, 7)
-    driver._reference_authority.require(generation=42, source_sequence=7)
-    driver._reference_authority.mark_installed(
-        generation=42,
-        source_sequence=7,
-        planner_intent_generation=1,
-        reference_epoch=2,
-    )
-    driver._reference_authority.prime(
-        generation=42,
-        source_sequence=7,
-        reference_epoch=2,
-    )
-    driver._reference_authority.grant(
-        generation=42,
-        source_sequence=7,
-        reference_epoch=2,
-        granted_at_monotonic_s=clock.value,
-        granted_at_tick_ms=1_000,
-        dds_target_sequence=1,
-    )
+    driver._reference_source_identity = (42, 9)
+    driver._reference_authority.require(generation=42, source_sequence=9)
+    driver._reference_request_pending = True
 
     fresh_idle = MovementIntent(
         mode="IDLE",
@@ -2734,20 +2714,28 @@ def test_controlled_stop_watchdog_age_cannot_replan_the_same_source_sequence() -
     assert first_idle.stale is False
     assert first_idle.source == "gait_adapter_controlled_stop"
     assert evidence.intent_generation == 2
-    assert controller.ms.needs_replan is True
+    assert controller.ms.needs_replan is False
 
-    # Model the vendor request accepting the first IDLE reference, then its
-    # first successful DDS target rebinding authority to STOPPING sequence 9.
-    controller.ms.needs_replan = False
-    controller.refresh_ready = True
-    driver._run_policy_candidate(lowstate)
+    # Planning-only request/poll never runs the moving clip.  It acquires the
+    # accepted IDLE clip from fresh LowState and the exact actuator boundary.
+    assert driver._progress_reference_transaction(lowstate) is False
+    assert controller.request_calls == 1
+    assert controller.acquire_calls == []
+    assert driver._reference_authority.snapshot.phase == "REQUIRED"
+    controller.install_ready = True
+    assert driver._progress_reference_transaction(lowstate) is True
+    assert controller.acquire_calls == [pytest.approx(boundary)]
     assert driver._controlled_stop_reference_installed is True
     transitioned = driver._reference_authority.snapshot
     assert transitioned.phase == "PRIMED"
     assert transitioned.source_sequence == 9
     assert transitioned.planner_intent_generation == 2
+    assert controller.controller.ref_cursor == 0
+
+    policy_action = driver._run_policy_candidate(lowstate)
+    assert policy_action
     driver._publish(
-        _action(driver, target),
+        policy_action,
         lowstate,
         control_dt_s=0.02,
         control_tick_ms=1_020,
@@ -2765,6 +2753,8 @@ def test_controlled_stop_watchdog_age_cannot_replan_the_same_source_sequence() -
     assert second_idle.source == "gait_adapter_controlled_stop"
     assert evidence.intent_generation == 2
     assert controller.ms.needs_replan is False
+    assert controller.request_calls == 1
+    assert controller.acquire_calls == [pytest.approx(boundary)]
 
     # A true same-intent periodic epoch is still legal and remains bound to the
     # already-installed STOPPING source sequence.

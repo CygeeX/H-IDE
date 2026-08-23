@@ -449,7 +449,7 @@ def test_begin_atomically_freezes_and_binds_one_braking_transaction() -> None:
     assert driver.guard.stops == ["normal_stop_begin"]
 
 
-def test_granted_motion_uses_policy_idle_until_stationary_then_freezes() -> None:
+def test_granted_motion_rebases_idle_from_exact_boundary_before_braking() -> None:
     clock = Clock()
     driver = bare_driver(clock)
     activation = NominalPolicyActivation(
@@ -505,10 +505,18 @@ def test_granted_motion_uses_policy_idle_until_stationary_then_freezes() -> None
     assert driver._normal_stop_policy_braking is True
     assert driver._controlled_stop_active is True
     assert driver._controlled_stop_source_identity == (10, 20)
+    assert driver._reference_source_identity == (10, 20)
     assert driver._intent_ingress.braking is True
     assert driver._safe_hold_targets is None
-    assert driver._static_hold_active is False
-    assert driver._reference_authority.snapshot.phase == "GRANTED"
+    assert driver._static_hold_active is True
+    # A live gait clip must not blend directly into IDLE.  The production
+    # failure on 2026-08-23 walked the requested metre, then fell while that
+    # continuous blend was braking.  Correlated STOPPING now withdraws the
+    # old clip and requires a fresh measured IDLE reference at the exact last
+    # successful DDS boundary before another policy target may be published.
+    assert driver._reference_authority.snapshot.phase == "REQUIRED"
+    assert driver._reference_authority.snapshot.source_sequence == 20
+    assert driver._reference_request_pending is True
     assert driver.guard.stops == ["gait_adapter_controlled_stop"]
     assert driver.guard.measured_heading_stops == [
         "gait_adapter_controlled_stop"
@@ -530,7 +538,7 @@ def test_granted_motion_uses_policy_idle_until_stationary_then_freezes() -> None
         expected_robot_id=ROBOT_ID,
     )
     assert health.controlled_policy_stop_active is True
-    assert health.matched_reference_actuator_authority is True
+    assert health.matched_reference_actuator_authority is False
     assert health.motion_authorized is False
     assert health.navigation_task_active is False
     assert health.nav2_command_zero is True
@@ -538,7 +546,35 @@ def test_granted_motion_uses_policy_idle_until_stationary_then_freezes() -> None
     identity = driver._normal_stop.snapshot.identity
     assert identity is not None
     clock.value += 0.02
-    stationary = driver.accept_json(stationary_request(clock, identity=identity))
+    stationary_payload = stationary_request(clock, identity=identity)
+    with pytest.raises(
+        NormalStopWireError,
+        match="fresh IDLE reference to cross DDS",
+    ):
+        driver.accept_json(stationary_payload)
+    assert driver._normal_stop.snapshot.phase == "BRAKING"
+
+    driver._reference_authority.mark_installed(
+        generation=10,
+        source_sequence=20,
+        planner_intent_generation=2,
+        reference_epoch=2,
+    )
+    driver._reference_authority.prime(
+        generation=10,
+        source_sequence=20,
+        reference_epoch=2,
+    )
+    driver._reference_authority.grant(
+        generation=10,
+        source_sequence=20,
+        reference_epoch=2,
+        granted_at_monotonic_s=clock.value,
+        granted_at_tick_ms=10_020,
+        dds_target_sequence=8,
+    )
+    driver._controlled_stop_reference_installed = True
+    stationary = driver.accept_json(stationary_payload)
 
     assert stationary is not None
     assert driver._normal_stop.snapshot.phase == "STATIONARY_ACK"
@@ -613,6 +649,8 @@ def test_generic_stopping_intent_is_health_visible_before_correlated_begin() -> 
     assert driver._normal_stop.snapshot.phase == "NONE"
     assert driver._controlled_stop_active is True
     assert getattr(driver, "_normal_stop_policy_braking", False) is False
+    assert driver._reference_authority.snapshot.phase == "REVOKED"
+    assert driver._reference_request_pending is False
 
     # The health probe may run after the zero target is admitted but before
     # the next 50 Hz control tick consumes the previous filtered command.
@@ -638,7 +676,7 @@ def test_generic_stopping_intent_is_health_visible_before_correlated_begin() -> 
         expected_robot_id=ROBOT_ID,
     )
     assert health.controlled_policy_stop_active is True
-    assert health.matched_reference_actuator_authority is True
+    assert health.matched_reference_actuator_authority is False
     assert health.motion_authorized is False
     assert health.navigation_task_active is False
     assert health.nav2_command_zero is True
@@ -651,6 +689,11 @@ def test_generic_stopping_intent_is_health_visible_before_correlated_begin() -> 
     assert response is not None
     assert driver._normal_stop.snapshot.phase == "BRAKING"
     assert driver._normal_stop_policy_braking is True
+    assert driver._controlled_stop_source_identity == (10, 21)
+    assert driver._reference_source_identity == (10, 21)
+    assert driver._reference_authority.snapshot.phase == "REQUIRED"
+    assert driver._reference_authority.snapshot.source_sequence == 21
+    assert driver._reference_request_pending is True
 
 
 @pytest.mark.parametrize(

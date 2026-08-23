@@ -688,13 +688,23 @@ class SonicHealth:
             )
         controlled_policy_stop_shape = bool(
             controlled_policy_stop_active
-            and actuator_authority
             and not support_latched
             and not support_pending
-            and not value["static_hold_active"]
             and not motion_authorized
             and not navigation_task_active
             and nav2_command_zero
+            and (
+                (
+                    actuator_authority
+                    and not value["static_hold_active"]
+                )
+                or (
+                    not actuator_authority
+                    and value["static_hold_active"]
+                    and authority_state
+                    in {"REVOKED", "REQUIRED", "MATCHED_INSTALLED", "PRIMED"}
+                )
+            )
         )
         if controlled_policy_stop_active and not controlled_policy_stop_shape:
             raise ValueError(
