@@ -722,10 +722,12 @@ def test_official_cold_boot_sequence_moves_in_requested_direction(
         controller.ms.mode = LM.IDLE
         controller.ms.speed = -1.0
         controller.ms.movement_angle = 0.0
-        # The controlled-stop planner context is heading-neutral.  Reusing a
-        # world/controller yaw here applies it a second time and reproduced the
-        # 0.1919 rad rejected-IDLE incident.
-        controller.ms.facing_angle = 0.0
+        # H-IDE may install several measured-frame references during one Nav2
+        # action. Continuous-IDLE must therefore hold the exact yaw at the live
+        # planner cursor: zero undoes a turn, while a stale global goal can add
+        # it twice.
+        stop_reference_facing = controller.current_reference_facing_angle()
+        controller.ms.facing_angle = stop_reference_facing
         controller.ms.has_movement = False
         controller.ms.needs_replan = False
         # Reference planning is a wall-clock worker while this fixture can run
@@ -795,6 +797,7 @@ def test_official_cold_boot_sequence_moves_in_requested_direction(
                 float(value) for value in stop_displacement
             ),
             "stop_yaw_delta_rad": stop_yaw_delta,
+            "stop_reference_facing_rad": stop_reference_facing,
             "stop_minimum_z_m": stop_minimum_z,
             "stop_peak_tilt_rad": stop_peak_tilt,
             "stop_linear_speed_mps": stop_linear_speed,

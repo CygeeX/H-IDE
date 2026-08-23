@@ -1781,26 +1781,26 @@ class CmdVelGuard:
         self,
         *,
         source: str = "gait_adapter_controlled_stop",
+        facing_angle_rad: float | None = None,
     ) -> CmdVel:
-        """Rebase the latest measured heading as controlled IDLE's local zero.
+        """Stop motion at the exact live planner-reference facing.
 
-        ``request_reference(lowstate)`` starts a fresh planner context whose
-        measured body orientation is the identity.  Carrying the preceding
-        controller-frame angle into that new context applies the physical yaw
-        twice: once in ``lowstate`` and once as a non-zero IDLE facing request.
-        The 2026-08-23 repeated-task incident did exactly that (0.2203 rad in,
-        0.1919 rad predicted) and the otherwise valid static result was
-        rejected by the IDLE yaw envelope.  Holding the current physical
-        heading in the fresh local frame is therefore exactly zero.
-
-        Terminal/fault stops deliberately keep using :meth:`stop`; this frame
-        reset belongs only to the recoverable measured-reference transaction.
+        The name is retained for the internal controlled-stop API, but the
+        transaction now uses NVIDIA's continuous-history IDLE reference.  The
+        driver supplies the yaw at the current reference cursor because H-IDE
+        may have rebased that frame during a Nav2 action. Resetting to zero
+        undoes the completed turn; reusing a stale global command angle can add
+        the turn twice. ``accept`` then freezes that exact planner boundary.
         """
 
-        self._facing = 0.0
-        self._command_facing = 0.0
-        self._action_facing_origin = 0.0
-        self._heading_anchor = None
+        if facing_angle_rad is not None:
+            value = float(facing_angle_rad)
+            if not math.isfinite(value):
+                raise ValueError("controlled-stop reference facing must be finite")
+            self._facing = self._wrap_angle(value)
+            self._command_facing = self._facing
+            self._action_facing_origin = self._facing
+            self._heading_anchor = None
         return self.accept(0.0, 0.0, 0.0, source=source)
 
     def intent(self, now: float | None = None, dt: float = 0.02) -> MovementIntent:

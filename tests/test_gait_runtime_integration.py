@@ -507,7 +507,12 @@ class FakeGuard:
         self.stops.append(source)
         self._command_zero = True
 
-    def stop_at_measured_heading(self, *, source="gait_adapter_controlled_stop"):
+    def stop_at_measured_heading(
+        self,
+        *,
+        source="gait_adapter_controlled_stop",
+        facing_angle_rad=None,
+    ):
         self.stop(source=source)
 
     @property
@@ -1551,6 +1556,10 @@ class _TransactionalController:
             has_movement=False,
             needs_replan=False,
         )
+        self.reference_facing_angle = 0.0
+
+    def current_reference_facing_angle(self) -> float:
+        return float(self.reference_facing_angle)
 
     def request_reference(self, _lowstate) -> None:
         assert self.execution_feedback_pending is False
@@ -2826,8 +2835,9 @@ def test_controlled_stop_watchdog_age_cannot_replan_the_same_source_sequence() -
     driver._reference_authority.require(generation=42, source_sequence=9)
     driver._reference_request_pending = True
     driver._reference_request_continuous = True
-    # Reproduce a completed turn before the stop. The continuous IDLE plan is
-    # heading-neutral and must retire both pieces of old driver bookkeeping.
+    # Reproduce a completed turn before the stop. The continuous IDLE planner
+    # request retains this goal exactly like NVIDIA's ROS2 adapter; only the
+    # decoder bookkeeping is reset after the new reference is installed.
     driver._decoder_facing_rad = 0.22029595072884373
     driver._pending_decoder_heading_delta_rad = 0.03
 
@@ -2835,7 +2845,7 @@ def test_controlled_stop_watchdog_age_cannot_replan_the_same_source_sequence() -
         mode="IDLE",
         speed_mps=0.0,
         movement_angle_rad=0.0,
-        facing_angle_rad=0.0,
+        facing_angle_rad=0.22029595072884373,
         has_movement=False,
         stale=False,
         source="gait_adapter_controlled_stop",
@@ -2852,6 +2862,7 @@ def test_controlled_stop_watchdog_age_cannot_replan_the_same_source_sequence() -
     assert first_idle.source == "gait_adapter_controlled_stop"
     assert evidence.intent_generation == 2
     assert controller.ms.needs_replan is False
+    assert controller.ms.facing_angle == pytest.approx(0.22029595072884373)
 
     # Planning-only request/poll never runs the moving clip. It acquires the
     # accepted IDLE clip against the exact actuator boundary without reseeding

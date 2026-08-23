@@ -38,16 +38,14 @@ _MIN_MEANINGFUL_YAW_RAD = 0.01
 # 62.13 mm / 0.060183 rad (1 m task) while their final 200 ms settled below the
 # stationary-speed contract.  Requiring <=30 mm rejected valid official IDLE
 # braking references and then misreported the local rejection as a planner
-# timeout.  The continuous-history reference after a verified 90-degree Spin
-# additionally reported -0.714 rad between its internal first/last root
-# quaternions, while the cached NVIDIA controller plus MuJoCo retained the
-# completed heading within 0.20 rad for five unsupported seconds.  That
-# quaternion delta is therefore not an actuator-space stop-heading invariant
-# for the vendor's continuous-IDLE/readaptation path.  Keep it as evidence, but
-# gate the reference on bounded translation, per-frame speed and a quiet tail;
-# measured heading/action completion and runtime tilt/collision gates remain
-# authoritative for physical pose.
+# timeout.  Keep translation inside the already-reviewed 80 mm gait transient
+# boundary and yaw inside the product's audited 0.15 rad stop-heading envelope.
+# A live 90-degree Spin proved why the yaw gate remains necessary: resetting
+# continuous IDLE facing to zero yielded a -0.714 rad reference and physically
+# undid about 0.69 rad of the completed turn. Independent 50 Hz speed,
+# quiet-tail, measured-pose, collision, and actuator gates remain unchanged.
 _MAX_STATIC_REFERENCE_TRANSLATION_M = 0.08
+_MAX_STATIC_REFERENCE_YAW_RAD = 0.15
 _MAX_STATIC_REFERENCE_FRAME_SPEED_MPS = 0.40
 _MAX_STATIC_REFERENCE_TAIL_SPEED_MPS = 0.025
 _STATIC_REFERENCE_SETTLE_FRAMES = 10
@@ -834,6 +832,10 @@ class PlannerReferenceEvidenceGate:
                 if static_translation > _MAX_STATIC_REFERENCE_TRANSLATION_M:
                     return self._reject_result_locked(
                         "IDLE planner braking translation exceeds the 0.080m envelope"
+                    )
+                if abs(static_yaw) > _MAX_STATIC_REFERENCE_YAW_RAD:
+                    return self._reject_result_locked(
+                        "IDLE planner root yaw exceeds the 0.150rad stop-heading envelope"
                     )
                 if static_max_speed > _MAX_STATIC_REFERENCE_FRAME_SPEED_MPS:
                     return self._reject_result_locked(

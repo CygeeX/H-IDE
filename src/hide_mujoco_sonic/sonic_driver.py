@@ -1720,9 +1720,9 @@ class SonicDriver:
 
         STOPPING is recoverable deceleration, not a terminal safety event.
         Freeze the exact last successful DDS target, withdraw only the outer
-        actuator authority, and request a heading-neutral IDLE reference while
-        preserving SONIC's acknowledged recurrent history and reference
-        cursor.  Rebuilding history from one measured sample worked for a
+        actuator authority, and request an IDLE reference at the exact live
+        planner-cursor facing while preserving SONIC's acknowledged recurrent
+        history. Rebuilding history from one measured sample worked for a
         forward stop but destabilized the live reverse stop.  The regular gait
         channel owns this exact source identity; a later explicit normal-stop
         transaction may join it, but action completion does not depend on a
@@ -1779,8 +1779,18 @@ class SonicDriver:
             self._navigation_task_active = False
             return True
         if not already_active:
+            reference_facing = getattr(
+                self._controller,
+                "current_reference_facing_angle",
+                None,
+            )
+            if not callable(reference_facing):
+                raise RuntimeError(
+                    "controlled stop lacks live reference-facing evidence"
+                )
             self.guard.stop_at_measured_heading(
-                source="gait_adapter_controlled_stop"
+                source="gait_adapter_controlled_stop",
+                facing_angle_rad=float(reference_facing()),
             )
             if not self._freeze_planner_handoff_boundary():
                 return False

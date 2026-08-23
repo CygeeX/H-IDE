@@ -1064,26 +1064,29 @@ def test_stop_freezes_and_next_action_reanchors_command_facing():
     assert guard.command_facing == pytest.approx(0.0)
 
 
-def test_controlled_stop_rebases_latest_measured_heading_as_local_zero():
+def test_controlled_stop_preserves_official_ros2_planner_facing():
     guard = CmdVelGuard(clock=lambda: 100.0, smoothing_alpha=1.0)
     guard.observe_heading(0.40)
     guard.accept(0.20, 0.0, 0.10)
     moving = guard.intent(now=100.01, dt=0.02)
     assert moving.facing_angle_rad == pytest.approx(0.002)
 
-    # The body makes more yaw progress after the last policy intent.  The fresh
-    # measured planner reference already contains that physical orientation,
-    # so its local IDLE facing must be zero rather than the old relative angle.
+    # The body makes more yaw progress after the last policy intent.  NVIDIA's
+    # ROS2 adapter nevertheless retains its admitted planner-facing goal when
+    # angular velocity becomes zero; measured yaw must not rewrite that goal.
     guard.observe_heading(0.46)
-    stopped_target = guard.stop_at_measured_heading(source="controlled_stop")
+    stopped_target = guard.stop_at_measured_heading(
+        source="controlled_stop",
+        facing_angle_rad=0.37,
+    )
     assert stopped_target.source == "controlled_stop"
     assert guard.target_zero is True
     assert guard.command_zero is False
 
     idle = guard.intent(now=100.02, dt=0.02)
     assert idle.mode == "IDLE"
-    assert idle.facing_angle_rad == pytest.approx(0.0)
-    assert guard.command_facing == pytest.approx(0.0)
+    assert idle.facing_angle_rad == pytest.approx(0.37)
+    assert guard.command_facing == pytest.approx(0.37)
     assert guard.command_zero is True
 
 
