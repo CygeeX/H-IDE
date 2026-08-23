@@ -210,24 +210,26 @@ def test_control_synchronizer_pauses_only_after_policy_support_release() -> None
     support = PlantSupportController(fall_arrest_enabled=True)
     support.finish_startup()
     sequence = [4]
+    command_tick = [20]
     waits: list[tuple[int, float]] = []
 
     def wait_for_tick(previous: int, tick_ms: int, timeout_s: float) -> bool:
         assert tick_ms == 40
         waits.append((previous, timeout_s))
         sequence[0] += 1
+        command_tick[0] = tick_ms
         return True
 
     sync = PlantControlSynchronizer(
         support,
         control_hz=50,
-        command_sequence=lambda: sequence[0],
+        command_identity=lambda: (sequence[0], command_tick[0], False),
         wait_for_command_for_tick=wait_for_tick,
     )
 
     assert sync.wait_after_lowstate(
         tick_ms=20,
-        command_sequence_before_publish=4,
+        command_identity_before_publish=(4, 20, False),
     ) is False
     assert waits == []
 
@@ -235,11 +237,11 @@ def test_control_synchronizer_pauses_only_after_policy_support_release() -> None
     assert support.consume_fall_arrest_release(lambda: None) == 17
     assert sync.wait_after_lowstate(
         tick_ms=24,
-        command_sequence_before_publish=4,
+        command_identity_before_publish=(4, 20, False),
     ) is False
     assert sync.wait_after_lowstate(
         tick_ms=40,
-        command_sequence_before_publish=4,
+        command_identity_before_publish=(4, 20, False),
     ) is True
     assert waits and waits[0][0] == 4
     status = sync.snapshot()
@@ -252,6 +254,7 @@ def test_control_synchronizer_pauses_only_after_policy_support_release() -> None
 def test_control_synchronizer_turns_host_jitter_into_wall_wait_not_sim_skip() -> None:
     support = _released_support()
     sequence = [10]
+    command_tick = [980]
     wall = [100.0]
 
     def delayed_command(previous: int, tick_ms: int, _timeout_s: float) -> bool:
@@ -259,19 +262,20 @@ def test_control_synchronizer_turns_host_jitter_into_wall_wait_not_sim_skip() ->
         assert tick_ms == 1_000
         wall[0] += 0.037
         sequence[0] += 1
+        command_tick[0] = tick_ms
         return True
 
     sync = PlantControlSynchronizer(
         support,
         control_hz=50,
-        command_sequence=lambda: sequence[0],
+        command_identity=lambda: (sequence[0], command_tick[0], False),
         wait_for_command_for_tick=delayed_command,
         wall_clock=lambda: wall[0],
     )
 
     assert sync.wait_after_lowstate(
         tick_ms=1_000,
-        command_sequence_before_publish=10,
+        command_identity_before_publish=(10, 980, False),
     ) is True
     status = sync.snapshot()
     assert status["lastWaitMs"] == pytest.approx(37.0)
@@ -293,7 +297,7 @@ def test_control_synchronizer_missing_controller_latches_physics_fault() -> None
     sync = PlantControlSynchronizer(
         support,
         control_hz=50,
-        command_sequence=lambda: 3,
+        command_identity=lambda: (3, 1_980, False),
         wait_for_command_for_tick=never_arrives,
         max_wall_wait_s=0.10,
         wall_clock=lambda: wall[0],
@@ -302,9 +306,63 @@ def test_control_synchronizer_missing_controller_latches_physics_fault() -> None
     with pytest.raises(PlantPhysicsFault, match="timed out"):
         sync.wait_after_lowstate(
             tick_ms=2_000,
-            command_sequence_before_publish=3,
+            command_identity_before_publish=(3, 1_980, False),
         )
     assert "timed out" in str(support.state()["fault"])
+
+
+def test_control_synchronizer_uses_sonic_command_phase_not_global_modulo() -> None:
+    support = _released_support()
+    sequence = [7]
+    identity = [(7, 1_004, False)]
+    waits: list[tuple[int, int]] = []
+
+    def wait_for_tick(previous: int, tick_ms: int, _timeout_s: float) -> bool:
+        waits.append((previous, tick_ms))
+        sequence[0] += 1
+        identity[0] = (sequence[0], tick_ms, False)
+        return True
+
+    sync = PlantControlSynchronizer(
+        support,
+        control_hz=50,
+        command_identity=lambda: identity[0],
+        wait_for_command_for_tick=wait_for_tick,
+    )
+
+    # The live SONIC clock is based on the first LowState it consumes and may
+    # have any 4 ms MuJoCo phase.  The old global-modulo barrier waited at 1020
+    # while SONIC was waiting for 1024, deadlocking both processes.
+    assert sync.wait_after_lowstate(
+        tick_ms=1_008,
+        command_identity_before_publish=(7, 1_004, False),
+    ) is False
+    assert sync.wait_after_lowstate(
+        tick_ms=1_020,
+        command_identity_before_publish=(7, 1_004, False),
+    ) is False
+    assert sync.wait_after_lowstate(
+        tick_ms=1_024,
+        command_identity_before_publish=(7, 1_004, False),
+    ) is True
+    assert waits == [(7, 1_024)]
+    assert sync.snapshot()["phaseMs"] == 4
+
+
+def test_control_synchronizer_rejects_missing_phase_provenance_after_release() -> None:
+    support = _released_support()
+    sync = PlantControlSynchronizer(
+        support,
+        control_hz=50,
+        command_identity=lambda: (2, None, False),
+        wait_for_command_for_tick=lambda *_args: False,
+    )
+
+    with pytest.raises(PlantPhysicsFault, match="phase provenance"):
+        sync.wait_after_lowstate(
+            tick_ms=1_008,
+            command_identity_before_publish=(2, None, False),
+        )
 
 
 def test_physics_hot_path_never_waits_for_http_command_writer() -> None:

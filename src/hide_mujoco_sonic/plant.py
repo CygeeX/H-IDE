@@ -585,7 +585,7 @@ class PlantControlSynchronizer:
         support: PlantSupportController,
         *,
         control_hz: int,
-        command_sequence: Callable[[], int],
+        command_identity: Callable[[], tuple[int, int | None, bool]],
         wait_for_command_for_tick: Callable[[int, int, float], bool],
         max_wall_wait_s: float = 2.0,
         wall_clock: Callable[[], float] = time.monotonic,
@@ -599,11 +599,11 @@ class PlantControlSynchronizer:
         timeout = float(max_wall_wait_s)
         if not math.isfinite(timeout) or timeout <= 0.0:
             raise ValueError("control synchronizer timeout must be finite and positive")
-        if not callable(command_sequence) or not callable(wait_for_command_for_tick):
-            raise TypeError("control synchronizer requires command sequence callbacks")
+        if not callable(command_identity) or not callable(wait_for_command_for_tick):
+            raise TypeError("control synchronizer requires command identity callbacks")
         self._support = support
         self._period_ms = 1_000 // int(control_hz)
-        self._command_sequence = command_sequence
+        self._command_identity = command_identity
         self._wait_for_command_for_tick = wait_for_command_for_tick
         self._max_wall_wait_s = timeout
         self._wall_clock = wall_clock
@@ -613,6 +613,9 @@ class PlantControlSynchronizer:
         self._max_wait_s = 0.0
         self._last_wait_s = 0.0
         self._last_command_sequence: int | None = None
+        self._active_release_epoch: int | None = None
+        self._phase_ms: int | None = None
+        self._phase_source_tick_ms: int | None = None
 
     @staticmethod
     def _sequence(value: object) -> int:
@@ -620,8 +623,28 @@ class PlantControlSynchronizer:
             raise ValueError("LowCmd sequence must be a non-negative integer")
         return value
 
-    def command_sequence_before_publish(self) -> int:
-        return self._sequence(self._command_sequence())
+    @classmethod
+    def _identity(
+        cls,
+        value: object,
+    ) -> tuple[int, int | None, bool]:
+        if not isinstance(value, tuple) or len(value) != 3:
+            raise ValueError("LowCmd identity must be a (sequence, tick, async) tuple")
+        sequence = cls._sequence(value[0])
+        tick = value[1]
+        asynchronous = value[2]
+        if tick is not None and (
+            isinstance(tick, bool) or not isinstance(tick, int) or tick < 0
+        ):
+            raise ValueError("LowCmd control tick must be a non-negative integer")
+        if not isinstance(asynchronous, bool):
+            raise ValueError("LowCmd async-boundary marker must be boolean")
+        if asynchronous and tick is not None:
+            raise ValueError("async LowCmd must not claim a policy control tick")
+        return sequence, tick, asynchronous
+
+    def command_identity_before_publish(self) -> tuple[int, int | None, bool]:
+        return self._identity(self._command_identity())
 
     def _release_epoch(self) -> int | None:
         state = self._support.state()
@@ -639,14 +662,45 @@ class PlantControlSynchronizer:
         self,
         *,
         tick_ms: int,
-        command_sequence_before_publish: int,
+        command_identity_before_publish: tuple[int, int | None, bool],
     ) -> bool:
         if isinstance(tick_ms, bool) or not isinstance(tick_ms, int) or tick_ms < 0:
             raise ValueError("control synchronization tick must be non-negative")
-        sequence = self._sequence(command_sequence_before_publish)
-        if self._release_epoch() is None or tick_ms % self._period_ms != 0:
-            return False
+        identity = self._identity(command_identity_before_publish)
+        sequence, command_tick_ms, asynchronous = identity
+        release_epoch = self._release_epoch()
         with self._lock:
+            if release_epoch is None:
+                self._active_release_epoch = None
+                self._phase_ms = None
+                self._phase_source_tick_ms = None
+                return False
+            if self._active_release_epoch != release_epoch:
+                self._active_release_epoch = release_epoch
+                self._phase_ms = None
+                self._phase_source_tick_ms = None
+                self._last_control_tick_ms = None
+            if self._phase_ms is None:
+                if asynchronous or command_tick_ms is None:
+                    reason = (
+                        "MuJoCo control synchronization has no SONIC phase provenance "
+                        f"after support release epoch {release_epoch}"
+                    )
+                    self._support.latch_fault(reason)
+                    raise PlantPhysicsFault(reason)
+                command_age_ms = tick_ms - command_tick_ms
+                if not 0 <= command_age_ms <= self._period_ms:
+                    reason = (
+                        "MuJoCo control synchronization received stale or future "
+                        "SONIC phase provenance: "
+                        f"command={command_tick_ms}ms plant={tick_ms}ms"
+                    )
+                    self._support.latch_fault(reason)
+                    raise PlantPhysicsFault(reason)
+                self._phase_ms = command_tick_ms % self._period_ms
+                self._phase_source_tick_ms = command_tick_ms
+            if tick_ms % self._period_ms != self._phase_ms:
+                return False
             previous_tick = self._last_control_tick_ms
             if previous_tick is not None and tick_ms <= previous_tick:
                 reason = (
@@ -676,7 +730,9 @@ class PlantControlSynchronizer:
             ):
                 break
 
-        observed_sequence = self._sequence(self._command_sequence())
+        observed_sequence, observed_tick_ms, observed_async = self._identity(
+            self._command_identity()
+        )
         if observed_sequence <= sequence:
             reason = "MuJoCo control synchronization reported a stale LowCmd"
             self._support.latch_fault(reason)
@@ -687,6 +743,13 @@ class PlantControlSynchronizer:
             self._last_wait_s = waited_s
             self._max_wait_s = max(self._max_wait_s, waited_s)
             self._last_command_sequence = observed_sequence
+            if not observed_async and observed_tick_ms != tick_ms:
+                reason = (
+                    "MuJoCo control synchronization observed a mismatched LowCmd: "
+                    f"expected={tick_ms}ms observed={observed_tick_ms}ms"
+                )
+                self._support.latch_fault(reason)
+                raise PlantPhysicsFault(reason)
         return True
 
     def snapshot(self) -> dict[str, object]:
@@ -695,6 +758,9 @@ class PlantControlSynchronizer:
                 "schemaVersion": "h-ide.mujoco-control-synchronization/1",
                 "active": self._release_epoch() is not None,
                 "periodMs": self._period_ms,
+                "phaseMs": self._phase_ms,
+                "phaseSourceTickMs": self._phase_source_tick_ms,
+                "releaseEpoch": self._active_release_epoch,
                 "maxWallWaitS": self._max_wall_wait_s,
                 "lastControlTickMs": self._last_control_tick_ms,
                 "waitCount": self._wait_count,
@@ -2124,7 +2190,7 @@ def run_plant(config: SimConfig) -> int:
     control_synchronizer = PlantControlSynchronizer(
         support_controller,
         control_hz=config.control_hz,
-        command_sequence=unitree_bridge.LowCmdSequence,
+        command_identity=unitree_bridge.LowCmdIdentity,
         wait_for_command_for_tick=unitree_bridge.WaitForLowCmdForTick,
     )
     original_publish_lowstate = unitree_bridge.PublishLowState
@@ -2134,11 +2200,11 @@ def run_plant(config: SimConfig) -> int:
         # waiter.  Once support is released there is exactly one controller
         # write per admitted 50 Hz LowState; an asynchronous stop write after
         # this boundary is also a valid fresh actuator decision.
-        command_sequence = control_synchronizer.command_sequence_before_publish()
+        command_identity = control_synchronizer.command_identity_before_publish()
         result = original_publish_lowstate(observation)
         control_synchronizer.wait_after_lowstate(
             tick_ms=int(unitree_bridge.low_state.tick),
-            command_sequence_before_publish=command_sequence,
+            command_identity_before_publish=command_identity,
         )
         return result
 

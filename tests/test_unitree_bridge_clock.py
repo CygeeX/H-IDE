@@ -112,6 +112,7 @@ def test_lowcmd_tick_correlation_rejects_delayed_prior_command() -> None:
     )
     bridge.LowCmdHandler(current)
     assert bridge.WaitForLowCmdForTick(1, 1_020, 0.001) is True
+    assert bridge.LowCmdIdentity() == (2, 1_020, False)
 
 
 def test_lowcmd_async_stop_satisfies_any_waiting_control_tick() -> None:
@@ -122,3 +123,4 @@ def test_lowcmd_async_stop_satisfies_any_waiting_control_tick() -> None:
     )
 
     assert bridge.WaitForLowCmdForTick(0, 9_999, 0.001) is True
+    assert bridge.LowCmdIdentity() == (1, None, True)
