@@ -61,10 +61,21 @@ LATERAL_ODOMETRY_STALE_S = 0.15
 STRICT_RELAY_PERIOD_S = 0.05
 LATERAL_DISTANCE_M = 0.50
 LATERAL_STOP_TOLERANCE_M = 0.03
-LATERAL_MIN_STOP_PROGRESS_M = 0.40
-LATERAL_RIGHT_MIN_STOP_PROGRESS_M = 0.35
-LATERAL_PREDICTIVE_STOP_HORIZON_S = 0.20
-LATERAL_RIGHT_PREDICTIVE_STOP_HORIZON_S = 0.55
+# Permit a high measured lateral speed to trigger predictive braking one relay
+# interval before 0.40 m.  Slow motion at this boundary continues normally.
+LATERAL_MIN_STOP_PROGRESS_M = 0.35
+LATERAL_RIGHT_MIN_STOP_PROGRESS_M = 0.30
+# Live r107 reached 0.449 m before the zero command became observable while
+# still translating at 0.568 m/s, then learned-IDLE coasted another 0.151 m.
+# Predict one extra 20 Hz relay interval ahead so left strafe stops inside the
+# unchanged 0.50 +/- 0.10 m physical envelope.  The NVIDIA 0.40 m/s command is
+# unchanged; this only advances the measured-odometry handoff to zero.
+LATERAL_PREDICTIVE_STOP_HORIZON_S = 0.40
+# r108 reached the correct right-strafe endpoint but accumulated a 12.1 degree
+# transient yaw during the learned-IDLE handoff.  Start braking one bounded
+# relay interval earlier to reduce whole-body lateral/yaw momentum while
+# retaining the same official speed and endpoint/yaw contracts.
+LATERAL_RIGHT_PREDICTIVE_STOP_HORIZON_S = 0.60
 LATERAL_MAX_LONGITUDINAL_DRIFT_M = 0.12
 LATERAL_MAX_OPPOSITE_M = 0.04
 LATERAL_MAX_YAW_DRIFT_RAD = math.radians(10.0)
@@ -462,10 +473,10 @@ class StrictCommandRelay:
         # add as much as 0.13 m while the body decelerates.  Start the handoff
         # only when authoritative base_link twist predicts entry into the
         # 0.47 m stop band. The pinned policy is physically asymmetric at the
-        # stop boundary: r66 right-strafe IDLE added 0.17 m after zero while
-        # r64 left-strafe added about 0.07 m. The right trigger must therefore
-        # begin at the measured 0.35 m coast boundary; both directions retain
-        # the exact same final 0.50 +/- 0.10 m acceptance contract.
+        # stop boundary: r66 right-strafe IDLE added 0.17 m after zero, while
+        # r107 left-strafe reached 0.568 m/s and added 0.15 m. The velocity
+        # horizon advances zero without reducing the official command speed;
+        # both directions retain the exact same 0.50 +/- 0.10 m contract.
         if remaining <= LATERAL_STOP_TOLERANCE_M or (
             directional >= minimum_stop_progress_m
             and predictive_progress

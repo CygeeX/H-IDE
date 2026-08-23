@@ -427,6 +427,32 @@ def test_lateral_step_predicts_dynamic_idle_stop_from_authoritative_twist(
     ) == command(vy=sign * runner.OFFICIAL_LATERAL_SPEED_MPS)
 
 
+def test_left_lateral_stops_before_the_captured_r107_coast_boundary() -> None:
+    relay = runner.StrictCommandRelay()
+    relay.begin("lateral_left", start_pose=runner.PlanarPose(0.0, 0.0, 0.0))
+
+    # r107 was still moving at 0.333 m/s near 0.377 m.  A 0.20 s horizon
+    # continued for another relay interval and the later 0.568 m/s handoff
+    # coasted 0.5 mm outside the unchanged 0.60 m physical envelope.
+    captured = runner.PlanarPose(0.0, 0.377, 0.0)
+    assert relay.lateral_output(captured, body_vy_mps=0.333).is_zero
+    assert relay.lateral_complete is True
+
+    high_speed = runner.StrictCommandRelay()
+    high_speed.begin("lateral_left", start_pose=runner.PlanarPose(0.0, 0.0, 0.0))
+    assert high_speed.lateral_output(
+        runner.PlanarPose(0.0, 0.35, 0.0),
+        body_vy_mps=0.34,
+    ).is_zero
+
+    not_yet = runner.StrictCommandRelay()
+    not_yet.begin("lateral_left", start_pose=runner.PlanarPose(0.0, 0.0, 0.0))
+    assert not_yet.lateral_output(
+        runner.PlanarPose(0.0, 0.35, 0.0),
+        body_vy_mps=0.20,
+    ) == command(vy=runner.OFFICIAL_LATERAL_SPEED_MPS)
+
+
 def test_lateral_predictive_stop_rotates_base_link_twist_into_start_frame() -> None:
     relay = runner.StrictCommandRelay()
     relay.begin(
@@ -441,7 +467,7 @@ def test_lateral_predictive_stop_rotates_base_link_twist_into_start_frame() -> N
     ).is_zero
 
 
-def test_right_lateral_uses_measured_asymmetric_idle_coast_horizon() -> None:
+def test_lateral_uses_direction_specific_measured_idle_coast_horizons() -> None:
     pose = runner.PlanarPose(0.0, -0.351, 0.0)
     right = runner.StrictCommandRelay()
     right.begin("lateral_right", start_pose=runner.PlanarPose(0.0, 0.0, 0.0))
@@ -452,7 +478,28 @@ def test_right_lateral_uses_measured_asymmetric_idle_coast_horizon() -> None:
     assert left.lateral_output(
         runner.PlanarPose(0.0, 0.351, 0.0),
         body_vy_mps=0.348,
-    ) == command(vy=runner.OFFICIAL_LATERAL_SPEED_MPS)
+    ).is_zero
+
+
+def test_right_lateral_stops_before_the_captured_r108_yaw_transient() -> None:
+    relay = runner.StrictCommandRelay()
+    relay.begin("lateral_right", start_pose=runner.PlanarPose(0.0, 0.0, 0.0))
+
+    # At the preceding r108 sample the robot was already moving right at
+    # 0.271 m/s. Waiting for 0.35 m allowed one more high-momentum gait frame
+    # and a 12.1 degree stop transient. The unchanged 0.60 m endpoint envelope
+    # has ample room for the measured coast from this earlier boundary.
+    assert relay.lateral_output(
+        runner.PlanarPose(0.0, -0.317, 0.0),
+        body_vy_mps=-0.271,
+    ).is_zero
+
+    slow = runner.StrictCommandRelay()
+    slow.begin("lateral_right", start_pose=runner.PlanarPose(0.0, 0.0, 0.0))
+    assert slow.lateral_output(
+        runner.PlanarPose(0.0, -0.29, 0.0),
+        body_vy_mps=-0.27,
+    ) == command(vy=-runner.OFFICIAL_LATERAL_SPEED_MPS)
 
 
 def test_lateral_step_rejects_opposite_drift_yaw_and_overshoot() -> None:

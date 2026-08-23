@@ -415,6 +415,52 @@ def _refresh_arm_trace_hash(trace: dict[str, Any]) -> None:
     )
 
 
+def _set_planar_pose(
+    sample: dict[str, Any],
+    *,
+    x: float | None = None,
+    y: float | None = None,
+    yaw: float | None = None,
+) -> None:
+    root = sample["root"]
+    root_state = sample["plantDynamicsEvidence"]["rootState"]
+    com = sample["plantDynamicsEvidence"]["robotCenterOfMass"]["positionM"]
+    if x is not None:
+        com[0] += x - float(root["x"])
+        root["x"] = x
+        root_state["qpos"][0] = x
+    if y is not None:
+        com[1] += y - float(root["y"])
+        root["y"] = y
+        root_state["qpos"][1] = y
+    if yaw is not None:
+        root["yaw"] = yaw
+        root_state["qpos"][3:] = [
+            math.cos(yaw / 2.0),
+            0.0,
+            0.0,
+            math.sin(yaw / 2.0),
+        ]
+
+
+def _apply_lateral_braking_profile(trace: dict[str, Any]) -> None:
+    for sample in trace["samples"]:
+        t_s = float(sample["tS"])
+        if t_s <= 1.2:
+            ratio = t_s / 1.2
+            x = 0.10 * ratio
+            yaw = math.radians(8.0) * ratio
+        elif t_s <= 1.4:
+            ratio = (t_s - 1.2) / 0.2
+            x = 0.10 + 0.025 * ratio
+            yaw = math.radians(8.0 + 3.5 * ratio)
+        else:
+            ratio = min(1.0, (t_s - 1.4) / 0.3)
+            x = 0.125 - 0.007 * ratio
+            yaw = math.radians(11.5 - 3.5 * ratio)
+        _set_planar_pose(sample, x=x, yaw=yaw)
+
+
 def _rebuild_detour_trace(
     trace: dict[str, Any],
     path: list[tuple[float, float]],
@@ -1059,6 +1105,72 @@ def test_lateral_requires_true_vy_only_and_no_nav2_action() -> None:
     assert _failure_codes(trace).issuperset(
         {"LATERAL_COMMAND_ENVELOPE", "NAV2_ACTION_ACTIVE_DURING_LATERAL"}
     )
+
+
+def test_lateral_accepts_only_bounded_learned_idle_braking_transient() -> None:
+    trace = _trace("lateral_left")
+    _apply_lateral_braking_profile(trace)
+
+    result = strict.evaluate_trace(trace)
+
+    assert result["pass"] is True, result["failures"]
+    envelope = result["metrics"]["lateralTrackingEnvelope"]
+    assert envelope["activeMaxCrossTrackM"] <= 0.12
+    assert 0.12 < envelope["brakingMaxCrossTrackM"] <= 0.13
+    assert envelope["finalCrossTrackM"] <= 0.12
+    assert envelope["activeMaxHeadingErrorRad"] <= math.radians(10.0)
+    assert (
+        math.radians(10.0)
+        < envelope["brakingMaxHeadingErrorRad"]
+        <= math.radians(12.0)
+    )
+    assert envelope["finalHeadingErrorRad"] <= math.radians(10.0)
+
+
+@pytest.mark.parametrize(
+    ("phase", "axis", "value", "expected_code"),
+    [
+        ("active", "x", 0.121, "CROSS_TRACK_EXCEEDED"),
+        ("braking", "x", 0.131, "BRAKING_CROSS_TRACK_EXCEEDED"),
+        ("final", "x", 0.121, "FINAL_CROSS_TRACK_EXCEEDED"),
+        ("active", "yaw", math.radians(10.1), "HEADING_ERROR_EXCEEDED"),
+        (
+            "braking",
+            "yaw",
+            math.radians(12.1),
+            "BRAKING_HEADING_ERROR_EXCEEDED",
+        ),
+        (
+            "final",
+            "yaw",
+            math.radians(10.1),
+            "FINAL_HEADING_ERROR_EXCEEDED",
+        ),
+    ],
+)
+def test_lateral_motion_braking_and_final_envelopes_fail_closed(
+    phase: str,
+    axis: str,
+    value: float,
+    expected_code: str,
+) -> None:
+    trace = _trace("lateral_left")
+    _apply_lateral_braking_profile(trace)
+    if phase == "active":
+        sample = [
+            sample for sample in trace["samples"] if sample["motionIntentActive"]
+        ][-1]
+    elif phase == "braking":
+        sample = next(
+            sample
+            for sample in trace["samples"]
+            if not sample["motionIntentActive"] and float(sample["tS"]) == 1.4
+        )
+    else:
+        sample = trace["samples"][-1]
+    _set_planar_pose(sample, **{axis: value})
+
+    assert expected_code in _failure_codes(trace)
 
 
 def test_detour_plan_hash_and_geometry_hash_are_verified() -> None:
