@@ -203,7 +203,7 @@ mkdir -p var/acceptance
 ```
 
 The accepted standalone modes are `forward` (1 m), `forward_3m`, `reverse`
-(0.5 m), `lateral_left`, `lateral_right` (0.5 m), `turn_left`, and
+(1 m), `lateral_left`, `lateral_right` (0.5 m), `turn_left`, and
 `turn_right` (90 degrees). `detour` additionally requires one of the two
 locked Office V2 waste-bin routes. DriveOnHeading uses NVIDIA/Nav2's reviewed
 0.20 m/s, true lateral uses NVIDIA's 0.40 m/s, and Spin stays within
