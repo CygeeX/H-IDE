@@ -42,6 +42,8 @@ def _bare_driver(
     driver._control_condition = threading.Condition(driver._lowstate_lock)
     driver._control_clock = PlantControlClock(control_hz=50)
     driver._control_clock_armed = control_clock_armed
+    driver._lowstate_sequence = 0
+    driver._runtime_clock_committed = control_clock_armed
     driver._control_consumer_ready = threading.Event()
     driver._motion_ready = threading.Event()
     driver._startup_qualifying = False
@@ -321,12 +323,72 @@ def test_startup_qualification_rebases_forward_gap_then_requires_fresh_window() 
     assert driver._motion_ready.is_set() is True
     assert driver._startup_qualifying is False
 
-    # Once motion may be accepted, the exact same discontinuity is terminal.
+    # Once the first control-arm transaction commits, the exact same
+    # discontinuity is terminal for the lifetime of the process.
+    driver._runtime_clock_committed = True
     driver._on_lowstate(SimpleNamespace(tick=4_712))
     assert driver._fault_latched.is_set() is True
     assert "control clock source jumped 1836ms" in str(
         driver.telemetry.values["last_error"]
     )
+
+
+def test_pre_authority_idle_gap_revokes_readiness_and_requalifies() -> None:
+    driver = _bare_driver(control_clock_armed=False)
+    driver._startup_qualification_required_steps = 1
+    driver._lowstate = SimpleNamespace(tick=1_000)
+    assert driver._next_control_sample(wait_timeout_s=0.0) is None
+
+    driver._on_lowstate(SimpleNamespace(tick=1_020))
+    sample = driver._next_control_sample(wait_timeout_s=0.0)
+    assert sample is not None
+    assert driver._complete_startup_qualification_step(
+        sample_drop_generation=sample[2]
+    ) is True
+    assert driver._motion_ready.is_set() is True
+
+    driver._on_lowstate(SimpleNamespace(tick=2_780))
+
+    assert driver._fault_latched.is_set() is False
+    assert driver._runtime_clock_committed is False
+    assert driver._motion_ready.is_set() is False
+    assert driver._startup_qualifying is True
+    assert driver.telemetry.values["motion_ready"] is False
+    assert driver.telemetry.values["control_clock_status"] == "startup_requalification"
+    assert driver._control_clock.last_observed_tick_ms == 2_780
+    assert driver._pending_control_sample is None
+
+
+def test_post_warm_drain_requires_a_fresh_bounded_lowstate_window() -> None:
+    driver = _bare_driver(control_clock_armed=False)
+    driver._lowstate = SimpleNamespace(tick=1_000)
+    result = []
+
+    waiter = threading.Thread(
+        target=lambda: result.append(
+            driver._wait_for_post_warm_lowstate_stream(timeout_s=1.0)
+        )
+    )
+    waiter.start()
+    for _ in range(100):
+        if (
+            driver.telemetry.values.get("control_clock_status")
+            == "waiting_for_fresh_post_warm_lowstate"
+        ):
+            break
+        threading.Event().wait(0.001)
+
+    # The first callback is a stale-backlog jump and earns no continuity.
+    # Six subsequent 4 ms samples prove five fresh bounded intervals.
+    for tick in (2_760, 2_764, 2_768, 2_772, 2_776, 2_780, 2_784):
+        driver._on_lowstate(SimpleNamespace(tick=tick))
+        threading.Event().wait(0.005)
+
+    waiter.join(timeout=0.5)
+    assert waiter.is_alive() is False
+    assert result and result[0].tick == 2_780
+    assert driver._control_clock_armed is False
+    assert driver._motion_ready.is_set() is False
 
 
 def test_qualification_step_gets_no_credit_if_processing_was_overrun() -> None:
@@ -411,6 +473,9 @@ def test_startup_holds_plant_before_warmup_and_leaves_clock_disarmed() -> None:
             "python_gc_freeze_error": None,
         },
     )
+    driver._wait_for_post_warm_lowstate_stream = lambda: events.append(
+        ("fresh", None)
+    )
 
     driver._prepare_idle_startup()
 
@@ -420,6 +485,7 @@ def test_startup_holds_plant_before_warmup_and_leaves_clock_disarmed() -> None:
         ("initialize", lowstate),
         ("warm", lowstate),
         ("gc_freeze", None),
+        ("fresh", None),
     ]
     assert driver._control_clock_armed is False
     assert driver._control_consumer_ready.is_set() is False

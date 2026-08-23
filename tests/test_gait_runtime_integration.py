@@ -526,6 +526,10 @@ def bare_driver(clock: Clock) -> SonicDriver:
     driver._control_condition = threading.Condition(driver._lowstate_lock)
     driver._control_clock = PlantControlClock(control_hz=50)
     driver._control_clock_armed = False
+    driver._lowstate_sequence = 0
+    # This fixture represents an already-qualified runtime unless a test
+    # explicitly replaces the clock/qualification state.
+    driver._runtime_clock_committed = True
     driver._control_consumer_ready = threading.Event()
     driver._control_consumer_ready.set()
     driver._motion_ready = threading.Event()
@@ -4432,6 +4436,7 @@ def test_driver_support_notification_stays_latched_until_control_arm(
     clock = Clock()
     adapter, _ = runtime(clock)
     driver = bare_driver(clock)
+    driver._runtime_clock_committed = False
     monkeypatch.setattr(
         "hide_mujoco_sonic.sonic_driver.set_plant_support",
         lambda _host, _port, mode, **_kwargs: {"mode": mode},
@@ -4500,6 +4505,7 @@ def test_driver_support_notification_stays_latched_until_control_arm(
         "generation": 2,
     }
     assert calls == [2]
+    assert driver._runtime_clock_committed is True
     assert driver.telemetry.values["plant_support_mode"] == "idle"
     assert driver.telemetry.values["plant_support_safety_latched"] is False
     assert driver.guard.accepted == []

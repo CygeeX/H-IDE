@@ -453,6 +453,15 @@ class SonicDriver:
         self._control_condition = threading.Condition(self._lowstate_lock)
         self._control_clock = PlantControlClock(control_hz=config.control_hz)
         self._control_clock_armed = False
+        # Controller construction and the isolated first inference can starve
+        # the Python DDS callback while MuJoCo continues publishing a held
+        # robot.  Track callback progress independently from the strict clock
+        # so startup can drain that cold-path backlog before choosing its
+        # baseline.  Once the first control-arm transaction commits,
+        # ``_runtime_clock_committed`` never becomes false again: identical
+        # gaps during or after motion remain terminal.
+        self._lowstate_sequence = 0
+        self._runtime_clock_committed = False
         # ``_control_consumer_ready`` is only the callback/consumer handshake.
         # Motion remains blocked until ``_motion_ready`` is set after startup
         # qualification has observed a sustained real 50 Hz simulation stream.
@@ -675,12 +684,14 @@ class SonicDriver:
             self._latch_terminal_fault(f"invalid lowstate tick: {exc}")
             return
         clock_fault: str | None = None
+        startup_requalified = False
         received_at_wall_s = self._wall_clock()
         runtime_diagnostics = getattr(self, "_runtime_diagnostics", None)
         if runtime_diagnostics is not None:
             runtime_diagnostics.observe_lowstate(received_at_wall_s)
         with self._control_condition:
             self._lowstate = message
+            self._lowstate_sequence += 1
             self._last_lowstate_wall_s = received_at_wall_s
             if not self._control_clock_armed:
                 self._control_condition.notify_all()
@@ -690,24 +701,28 @@ class SonicDriver:
                 )
             elif self._control_clock_armed:
                 previous_tick = self._control_clock.last_observed_tick_ms
-                startup_forward_gap = bool(
-                    self._startup_qualifying
+                pre_authority_forward_gap = bool(
+                    not self._runtime_clock_committed
                     and previous_tick is not None
                     and tick - previous_tick
                     > self._control_clock.max_source_gap_ms
                 )
-                if startup_forward_gap:
+                if pre_authority_forward_gap:
                     # ONNX/GPU warmup may hold the Python DDS callback while
                     # Plant continues to publish a stationary measured hold.
-                    # No controller state, policy cursor, or actuator motion
-                    # exists during qualification, so invalidate all pending
-                    # credit and require a fresh consecutive 50 Hz window.
-                    # The identical gap after motion_ready remains terminal.
+                    # Before the first successful control-arm transaction no
+                    # controller state, policy cursor, or actuator motion is
+                    # authorized, so invalidate all pending credit and require
+                    # a fresh consecutive 50 Hz window.  The identical gap
+                    # after that authority boundary remains terminal.
                     self._control_clock.rebase_stationary_qualification(tick)
                     self._pending_control_sample = None
                     self._startup_qualification_dropped_samples += 1
                     self._startup_qualification_drop_generation += 1
                     self._startup_qualification_consecutive_steps = 0
+                    self._startup_qualifying = True
+                    self._motion_ready.clear()
+                    startup_requalified = True
                     self._control_condition.notify_all()
                     control_step = None
                 else:
@@ -750,6 +765,12 @@ class SonicDriver:
                                 self._startup_qualification_drop_generation,
                             )
                             self._control_condition.notify_all()
+        if startup_requalified:
+            self.telemetry.update(
+                status="qualifying",
+                control_clock_status="startup_requalification",
+                motion_ready=False,
+            )
         self.telemetry.update_hot(
             plant_tick=tick,
             startup_qualification_dropped_samples=(
@@ -781,6 +802,59 @@ class SonicDriver:
             if self._lowstate is None:
                 raise RuntimeError("timed out waiting for initial MuJoCo LowState")
             return self._lowstate
+
+    def _wait_for_post_warm_lowstate_stream(self, *, timeout_s: float = 5.0):
+        """Choose a startup baseline only after cold inference backlog drains.
+
+        The subscriber is created before the three ONNX sessions so Plant can
+        remain held while those sessions load.  A long GIL/ORT scheduling
+        pause can nevertheless leave ``_lowstate`` older than the first
+        callback delivered after warm-up.  Arming against that stale sample
+        manufactures a multi-second source jump even though no motion was
+        possible.  Require a fresh, bounded-gap callback window while the
+        strict clock is still disarmed; no sample earns policy or startup
+        qualification credit here.
+        """
+
+        if not math.isfinite(float(timeout_s)) or float(timeout_s) <= 0.0:
+            raise ValueError("post-warm LowState timeout must be positive and finite")
+        deadline = self._wall_clock() + float(timeout_s)
+        required_samples = self._STARTUP_QUALIFICATION_STEPS + 1
+        previous_tick: int | None = None
+        consecutive = 0
+        with self._control_condition:
+            if self._control_clock_armed:
+                raise RuntimeError("post-warm LowState drain requires a disarmed clock")
+            observed_sequence = self._lowstate_sequence
+            self.telemetry.update(
+                control_clock_status="waiting_for_fresh_post_warm_lowstate",
+                motion_ready=False,
+            )
+            while not self._fault_latched.is_set() and not self._stop.is_set():
+                if self._lowstate_sequence != observed_sequence:
+                    observed_sequence = self._lowstate_sequence
+                    if self._lowstate is None:
+                        raise RuntimeError("post-warm LowState callback lost its sample")
+                    tick = int(self._lowstate.tick)
+                    gap = None if previous_tick is None else tick - previous_tick
+                    if gap is not None and 0 < gap <= self._control_clock.max_source_gap_ms:
+                        consecutive += 1
+                    else:
+                        consecutive = 1
+                    previous_tick = tick
+                    if consecutive >= required_samples:
+                        return self._lowstate
+                remaining = deadline - self._wall_clock()
+                if remaining <= 0.0:
+                    break
+                self._control_condition.wait(timeout=min(0.10, remaining))
+        if self._fault_latched.is_set():
+            raise RuntimeError(self._terminal_fault_reason or "startup fault latched")
+        if self._stop.is_set():
+            raise RuntimeError("SONIC stopped while draining post-warm LowState")
+        raise RuntimeError(
+            "timed out waiting for a fresh post-warm MuJoCo LowState window"
+        )
 
     @staticmethod
     def _clone_state_owner(owner, *, excluded: frozenset[str]):
@@ -972,6 +1046,9 @@ class SonicDriver:
                     "SONIC warm-runtime GC optimization was not applied: %s",
                     gc_state["python_gc_freeze_error"],
                 )
+        if self._fault_latched.is_set():
+            raise RuntimeError(self._terminal_fault_reason or "startup fault latched")
+        self._wait_for_post_warm_lowstate_stream()
         if self._fault_latched.is_set():
             raise RuntimeError(self._terminal_fault_reason or "startup fault latched")
 
@@ -6023,6 +6100,11 @@ class SonicDriver:
                             self._commit_staged_plant_support_rearm_locked(
                                 decision.generation
                             )
+                            # This is the first boundary at which a strict
+                            # runtime clock discontinuity can invalidate
+                            # authorized policy/history state.  It is
+                            # monotonic for the lifetime of this process.
+                            self._runtime_clock_committed = True
             except Exception as exc:
                 with self._support_lock:
                     self._intent_ingress.revoke()
