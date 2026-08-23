@@ -1405,14 +1405,21 @@ class ReplanIntentGate:
         min_update_interval_s: float = 0.35,
         min_speed_delta_mps: float = 0.05,
         min_angle_delta_rad: float = 0.15,
+        min_rotation_start_angle_rad: float = 0.05,
         clock=time.monotonic,
     ) -> None:
-        limits = (min_update_interval_s, min_speed_delta_mps, min_angle_delta_rad)
+        limits = (
+            min_update_interval_s,
+            min_speed_delta_mps,
+            min_angle_delta_rad,
+            min_rotation_start_angle_rad,
+        )
         if not all(math.isfinite(float(value)) and value > 0 for value in limits):
             raise ValueError("replan gate limits must be finite and positive")
         self.min_update_interval_s = float(min_update_interval_s)
         self.min_speed_delta_mps = float(min_speed_delta_mps)
         self.min_angle_delta_rad = float(min_angle_delta_rad)
+        self.min_rotation_start_angle_rad = float(min_rotation_start_angle_rad)
         self._clock = clock
         self._last: MovementIntent | None = None
         self._last_at = 0.0
@@ -1431,6 +1438,16 @@ class ReplanIntentGate:
         current = self._clock() if now is None else float(now)
         if not math.isfinite(current):
             raise ValueError("replan gate time must be finite")
+        # Nav2's Spin behavior ramps angular velocity from zero.  Admitting the
+        # first non-zero sample used to ask the asynchronous SONIC planner for a
+        # 1--4 mrad pure-rotation clip.  The locked planner's measured noise
+        # floor is 0.004016 rad and its smallest verified directional request is
+        # +/-0.05 rad, so such a clip cannot provide meaningful same-sign yaw
+        # evidence.  Keep executing the already-proven learned IDLE balance
+        # policy until the command-only facing integral reaches that verified
+        # request size; only then start the required-reference deadline.
+        if self._defer_small_rotation_start(intent):
+            return False
         if self._last is None:
             return self._remember(intent, current)
 
@@ -1452,6 +1469,17 @@ class ReplanIntentGate:
             >= self.min_angle_delta_rad
         )
         return self._remember(intent, current) if changed else False
+
+    def _defer_small_rotation_start(self, intent: MovementIntent) -> bool:
+        if intent.mode == "IDLE" or intent.has_movement:
+            return False
+        if self._last is not None and self._last.mode != "IDLE":
+            return False
+        origin = 0.0 if self._last is None else self._last.facing_angle_rad
+        return (
+            self._angular_distance(intent.facing_angle_rad, origin) + 1e-12
+            < self.min_rotation_start_angle_rad
+        )
 
     def _remember(self, intent: MovementIntent, current: float) -> bool:
         self._last = intent

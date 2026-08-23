@@ -2351,6 +2351,60 @@ def test_pure_rotation_uses_official_idle_planner_without_losing_motion_owner() 
     assert evidence.intent_generation == 1
 
 
+def test_tiny_spin_ramp_keeps_proven_idle_until_yaw_request_is_meaningful() -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    driver._intent_gate = ReplanIntentGate()
+    idle = MovementIntent(
+        mode="IDLE",
+        speed_mps=0.0,
+        movement_angle_rad=0.0,
+        facing_angle_rad=0.0,
+        has_movement=False,
+        stale=False,
+    )
+    assert driver._intent_gate.admit(idle, now=0.0)
+    driver._decoder_facing_rad = 0.0
+    driver._pending_decoder_heading_delta_rad = 0.0
+    driver._last_intent_signature = None
+    driver._policy_activation = SimpleNamespace(prepared=True)
+    driver._policy_activation_requested = False
+    evidence = _TransactionalEvidence()
+    driver._planner_evidence = evidence
+    controller = _TransactionalController(
+        evidence,
+        tuple(0.0 for _ in range(29)),
+    )
+    driver._controller = controller
+    tiny_rotation = MovementIntent(
+        mode="SLOW_WALK",
+        speed_mps=0.0,
+        movement_angle_rad=0.0014,
+        facing_angle_rad=0.0014,
+        has_movement=False,
+        stale=False,
+    )
+    driver.guard = SimpleNamespace(
+        intent=lambda **_kwargs: tiny_rotation,
+        last_received_at=clock.value,
+    )
+    driver._joint_handoff = SimpleNamespace(
+        freeze=lambda _targets: pytest.fail(
+            "sub-noise Spin ramp replaced the proven learned-IDLE boundary"
+        )
+    )
+
+    observed = driver._apply_intent(0.02, simulation_now_s=0.02)
+
+    assert observed is tiny_rotation
+    assert driver._intent_gate.last is idle
+    assert driver._reference_request_pending is False
+    assert driver._reference_authority.snapshot.phase == "REVOKED"
+    assert evidence.intent_generation == 0
+    assert controller.ms.mode == 0
+    assert controller.ms.facing_angle == pytest.approx(0.0)
+
+
 def test_activation_rechecks_stop_before_begin_and_stop_wins_before_telemetry() -> None:
     from lerobot.robots.unitree_g1.controllers.sonic_pipeline import DEFAULT_ANGLES
 

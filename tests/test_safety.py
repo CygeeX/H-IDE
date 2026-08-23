@@ -1070,6 +1070,40 @@ def test_replan_gate_rate_limits_significant_in_motion_change():
     assert gate.admit(MovementIntent("SLOW_WALK", 0.25, 0.0, 0.20, True, False))
 
 
+@pytest.mark.parametrize("sign", [-1.0, 1.0])
+def test_replan_gate_waits_for_verified_pure_rotation_request_size(sign):
+    now = [30.0]
+    gate = ReplanIntentGate(clock=lambda: now[0])
+    idle = MovementIntent("IDLE", 0.0, 0.40, 0.40, False, False)
+    assert gate.admit(idle)
+
+    # Reproduce the live Spin incident: Nav2's acceleration ramp first exposed
+    # a 0.0014 rad facing request.  That is below the locked planner's measured
+    # 0.004016 rad noise floor and must not replace the proven IDLE policy or
+    # start the required-reference clock.
+    tiny = MovementIntent(
+        "SLOW_WALK",
+        0.0,
+        0.40 + sign * 0.0014,
+        0.40 + sign * 0.0014,
+        False,
+        False,
+    )
+    assert gate.admit(tiny, now=30.02) is False
+    assert gate.last is idle
+
+    verified = MovementIntent(
+        "SLOW_WALK",
+        0.0,
+        0.40 + sign * 0.05,
+        0.40 + sign * 0.05,
+        False,
+        False,
+    )
+    assert gate.admit(verified, now=30.50) is True
+    assert gate.last is verified
+
+
 def test_non_finite_command_is_rejected():
     guard = CmdVelGuard()
     with pytest.raises(ValueError):
