@@ -471,6 +471,144 @@ def _normalise_pose(current_pose: Mapping[str, object]) -> dict[str, float]:
     return pose
 
 
+def resolve_start_clearance_recovery(
+    current_pose: Mapping[str, object],
+    *,
+    map_yaml_path: Path,
+    map_image_path: Path,
+    runtime_manifest_path: Path,
+    motion_profile_manifest_path: Path,
+    robot_radius_m: float,
+    footprint_padding_m: float,
+    extra_clearance_m: float = 0.05,
+    min_segment_m: float = 0.16,
+    max_recovery_m: float = 0.50,
+    heading_tolerance_rad: float = 0.09,
+    **_unused: object,
+) -> dict[str, object]:
+    """Resolve a forward-only egress when NavFn's start is inscribed.
+
+    Learned in-place turns beside furniture can leave the robot centre inside
+    Nav2's conservative inflation band even after physical contact has ended.
+    NavFn then rejects the start before returning a path.  This recovery never
+    plans toward the requested goal.  It may only drive forward, along the
+    robot's already-held heading, through centre cells whose distance from the
+    nearest static obstacle is monotonically non-decreasing, until the full
+    reviewed planning clearance is restored.
+    """
+
+    pose = _normalise_pose(current_pose)
+    values = {
+        "robot radius": _finite_number(robot_radius_m, "robot radius"),
+        "footprint padding": _finite_number(
+            footprint_padding_m, "footprint padding"
+        ),
+        "extra clearance": _finite_number(extra_clearance_m, "extra clearance"),
+        "minimum segment": _finite_number(min_segment_m, "minimum segment"),
+        "maximum recovery": _finite_number(max_recovery_m, "maximum recovery"),
+        "heading tolerance": _finite_number(
+            heading_tolerance_rad, "heading tolerance"
+        ),
+    }
+    _require(values["robot radius"] > 0.0, "robot radius must be positive")
+    _require(values["footprint padding"] >= 0.0, "footprint padding cannot be negative")
+    _require(values["extra clearance"] >= 0.05, "extra clearance must be at least 0.05 m")
+    _require(0.0 < values["minimum segment"] <= values["maximum recovery"], "recovery distance bounds are invalid")
+    _require(0.0 < values["heading tolerance"] <= 0.09, "heading tolerance must be in (0, 0.09]")
+
+    static_map = StaticMap.load(map_yaml_path, map_image_path)
+    _validate_runtime_bindings(
+        static_map,
+        runtime_manifest_path,
+        motion_profile_manifest_path,
+    )
+    clearance_radius = (
+        values["robot radius"]
+        + values["footprint padding"]
+        + values["extra clearance"]
+    )
+    full_blocked = static_map.inflated_blocked_cells(clearance_radius)
+    start_xy = (pose["x"], pose["y"])
+    start_cell = static_map.world_to_cell(*start_xy)
+    if start_cell not in full_blocked:
+        return {"disposition": "not_required", "action_goal": None}
+    _require(
+        start_cell not in static_map.base_blocked,
+        "NavFn start centre is inside static geometry",
+    )
+
+    clearance_cache: dict[tuple[int, int], float] = {}
+
+    def obstacle_clearance(cell: tuple[int, int]) -> float:
+        cached = clearance_cache.get(cell)
+        if cached is not None:
+            return cached
+        value = min(
+            math.hypot(cell[0] - blocked[0], cell[1] - blocked[1])
+            * static_map.resolution
+            for blocked in static_map.base_blocked
+        )
+        clearance_cache[cell] = value
+        return value
+
+    radius_cells = math.ceil(values["maximum recovery"] / static_map.resolution)
+    candidates: list[tuple[float, float, float, tuple[float, float]]] = []
+    for row in range(
+        max(0, start_cell[0] - radius_cells),
+        min(static_map.height, start_cell[0] + radius_cells + 1),
+    ):
+        for column in range(
+            max(0, start_cell[1] - radius_cells),
+            min(static_map.width, start_cell[1] + radius_cells + 1),
+        ):
+            cell = (row, column)
+            if cell in full_blocked:
+                continue
+            endpoint = static_map.cell_center(cell)
+            distance = math.dist(start_xy, endpoint)
+            if not (
+                values["minimum segment"] - 1e-12
+                <= distance
+                <= values["maximum recovery"] + 1e-12
+            ):
+                continue
+            heading = math.atan2(
+                endpoint[1] - start_xy[1], endpoint[0] - start_xy[0]
+            )
+            heading_error = abs(_wrap_angle(heading - pose["yaw"]))
+            if heading_error > values["heading tolerance"] + 1e-12:
+                continue
+            cells = static_map.segment_cells(start_xy, endpoint)
+            if any(item in static_map.base_blocked for item in cells):
+                continue
+            clearances = [obstacle_clearance(item) for item in cells]
+            if any(
+                after + 1e-12 < before
+                for before, after in zip(clearances, clearances[1:])
+            ):
+                continue
+            candidates.append((heading_error, distance, -clearances[-1], endpoint))
+
+    _require(
+        candidates,
+        "NavFn start has no forward-aligned monotonic clearance recovery",
+    )
+    heading_error, distance, neg_clearance, endpoint = min(candidates)
+    return {
+        "disposition": "send_action",
+        "action_type": DRIVE_ACTION,
+        "action_goal": {
+            "target": {"x": distance, "y": 0.0, "z": 0.0},
+            "speed_mps": OFFICIAL_FORWARD_SPEED_MPS,
+        },
+        "recovery_end_map": {"x": endpoint[0], "y": endpoint[1]},
+        "start_clearance_m": obstacle_clearance(start_cell),
+        "end_clearance_m": -neg_clearance,
+        "heading_error_rad": heading_error,
+        "clearance_radius_m": clearance_radius,
+    }
+
+
 def _segment_indices(
     static_map: StaticMap,
     poses: tuple[dict[str, float], ...],

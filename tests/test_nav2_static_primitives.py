@@ -412,6 +412,37 @@ def test_navfn_goal_inside_physical_footprint_clearance_is_rejected() -> None:
         _build(module, navfn_path)
 
 
+def test_start_clearance_recovery_moves_forward_monotonically_outward() -> None:
+    module = _planner()
+    current = {"x": 0.584, "y": 4.368, "yaw": 1.014}
+
+    resolved = module.resolve_start_clearance_recovery(
+        current,
+        **_plan_kwargs(),
+    )
+
+    assert resolved["disposition"] == "send_action"
+    assert resolved["action_type"] == "nav2_msgs/action/DriveOnHeading"
+    assert 0.16 <= resolved["action_goal"]["target"]["x"] <= 0.50
+    assert resolved["heading_error_rad"] <= 0.09
+    assert resolved["end_clearance_m"] >= CLEARANCE_RADIUS
+    assert resolved["end_clearance_m"] > resolved["start_clearance_m"]
+    assert resolved["recovery_end_map"] == {
+        "x": pytest.approx(0.825),
+        "y": pytest.approx(4.725),
+    }
+
+
+def test_start_clearance_recovery_refuses_a_turn_inside_the_margin() -> None:
+    module = _planner()
+
+    with pytest.raises(ValueError, match="no forward-aligned"):
+        module.resolve_start_clearance_recovery(
+            {"x": 0.584, "y": 4.368, "yaw": -math.pi / 2.0},
+            **_plan_kwargs(),
+        )
+
+
 def test_navfn_start_inside_relaxed_physical_clearance_is_rejected() -> None:
     module = _planner()
     navfn_path = _astar_fixture_navfn_path(module, START, GOAL)

@@ -103,6 +103,9 @@ class FakePlanner:
             ],
         }
 
+    def resolve_start_clearance_recovery(self, _pose, **_kwargs):
+        return {"disposition": "not_required", "action_goal": None}
+
     def verify_primitive_plan(self, plan, navfn_path, **_kwargs):
         return plan
 
@@ -325,6 +328,33 @@ def test_navigate_already_inside_physical_endpoint_sends_no_micro_motion() -> No
     assert result.final_pose == backend.pose
     assert backend.compute_calls == 1
     assert backend.sent == []
+
+
+def test_navigate_executes_forward_only_start_clearance_recovery_first() -> None:
+    backend = FakeBackend()
+
+    class RecoveringPlanner(FakePlanner):
+        def resolve_start_clearance_recovery(self, _pose, **_kwargs):
+            return {
+                "disposition": "send_action",
+                "action_type": "nav2_msgs/action/DriveOnHeading",
+                "action_goal": {
+                    "target": {"x": 0.30, "y": 0.0, "z": 0.0},
+                    "speed_mps": runner.OFFICIAL_DRIVE_SPEED_MPS,
+                },
+            }
+
+    result = executor(backend, RecoveringPlanner()).navigate(
+        runner.PlanarPose(1.0, 0.0, 0.0)
+    )
+
+    assert result.completed_primitives == 4
+    assert backend.sent == [
+        ("DriveOnHeading", pytest.approx(0.30)),
+        ("Spin", pytest.approx(0.20)),
+        ("DriveOnHeading", pytest.approx(0.50)),
+        ("DriveOnHeading", pytest.approx(0.20)),
+    ]
 
 
 def test_replan_partition_failure_outside_physical_endpoint_still_aborts() -> None:

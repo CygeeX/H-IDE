@@ -299,6 +299,22 @@ class StrictNavigationExecutor:
         final_plan_hash = ""
         try:
             self.backend.wait_ready(timeout_s=10.0)
+            recovery_pose = self.backend.wait_fresh_map_pose()
+            recovery = self.static_planner.resolve_start_clearance_recovery(
+                {
+                    "x": recovery_pose.pose.x,
+                    "y": recovery_pose.pose.y,
+                    "yaw": recovery_pose.pose.yaw,
+                },
+                **self._plan_kwargs(),
+            )
+            if recovery.get("disposition") == "send_action":
+                self._execute_resolved(recovery, cancelled=cancelled)
+                completed += 1
+            elif recovery.get("disposition") != "not_required":
+                raise runner.StrictMotionRunnerError(
+                    "static start-clearance recovery returned an invalid disposition"
+                )
             for plan_attempt in range(1, MAX_PRODUCT_REPLANS + 2):
                 self._cancelled(cancelled)
                 if self.clock() - started >= self.command_timeout_s:
