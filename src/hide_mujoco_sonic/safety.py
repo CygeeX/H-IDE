@@ -1527,7 +1527,7 @@ class ReplanIntentGate:
         *,
         min_update_interval_s: float = 0.35,
         min_speed_delta_mps: float = 0.05,
-        min_angle_delta_rad: float = 0.15,
+        min_angle_delta_rad: float = 0.30,
         min_rotation_start_angle_rad: float = 0.05,
         clock=time.monotonic,
     ) -> None:

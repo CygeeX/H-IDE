@@ -176,7 +176,7 @@ def _assert_primitive_plan(module, navfn_path, plan) -> None:
         "heading_tolerance_rad": 0.06,
         "drive_speed_mps": 0.30,
         "spin_min_angular_rps": 0.10,
-        "spin_max_angular_rps": 0.10,
+        "spin_max_angular_rps": 0.20,
         "spin_angular_accel_rps2": 0.30,
         "zero_spin_policy": "skip_within_heading_tolerance",
         "final_heading_policy": (
@@ -624,7 +624,7 @@ def test_schema_and_motion_manifest_forbid_unaccepted_follow_path_motion() -> No
     assert manifest["primitive_action_contract"] == {
         "drive_on_heading_speed_mps": 0.3,
         "spin_min_angular_rps": 0.1,
-        "spin_max_angular_rps": 0.1,
+        "spin_max_angular_rps": 0.2,
         "spin_angular_accel_rps2": 0.3,
     }
     assert {

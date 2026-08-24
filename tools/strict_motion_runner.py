@@ -40,12 +40,10 @@ OFFICIAL_REVERSE_SPEED_MPS = 0.20
 # measured odometry below, not by inventing a smaller pseudo-speed.
 OFFICIAL_LATERAL_SPEED_MPS = 0.40
 OFFICIAL_SPIN_MIN_RPS = 0.10
-# Keep successive SONIC pure-rotation reference requests outside the pinned
-# planner clip horizon.  ReplanIntentGate advances at 0.15 rad and the planner
-# emits about 44 frames at 30 Hz: 0.15 / 0.10 = 1.50 s >= 44 / 30 s.  The old
-# 0.20 rad/s cap opened a new reference every 0.75 s and the r128 live sequence
-# installed a fresh turn clip at the endpoint, producing a 1.9 rad/s impulse.
-OFFICIAL_SPIN_MAX_RPS = 0.10
+# Preserve the previously live-proven Nav2 Spin envelope.  Runtime SONIC now
+# opens successive pure-rotation references at 0.30 rad, so 0.30 / 0.20 =
+# 1.50 s remains outside the pinned 44-frame / 30 Hz planner clip horizon.
+OFFICIAL_SPIN_MAX_RPS = 0.20
 DETOUR_HEADING_TOLERANCE_RAD = 0.06
 # The command values above are NVIDIA/Nav2 setpoints and remain unchanged. Live
 # r18 evidence measured 0.2913 m over 6.964 s of commanded reverse motion
@@ -56,6 +54,12 @@ DETOUR_HEADING_TOLERANCE_RAD = 0.06
 # official value and the independent progress/fall/contact gates remain active.
 OBSERVED_TRANSLATION_PROGRESS_FLOOR_MPS = 0.04
 TRANSLATION_STARTUP_STOP_MARGIN_S = 10.0
+# Live r131 at the temporary 0.10 rad/s cap achieved 0.913 rad over the
+# complete 25.8 wall-second action window (0.0354 rad/s including activation
+# and reference latency).  Size only the wall-time allowance from that direct
+# evidence; the relayed Nav2 command remains the reviewed 0.10..0.20 ramp.
+OBSERVED_SPIN_PROGRESS_FLOOR_RPS = 0.035
+SPIN_STARTUP_STOP_MARGIN_S = 10.0
 NAV2_COMMAND_STALE_S = 0.15
 LATERAL_ODOMETRY_STALE_S = 0.15
 # Nav2's reviewed controller loop is 20 Hz.  Relaying an unconditional 50 Hz
@@ -410,7 +414,7 @@ class StrictCommandRelay:
             ):
                 raise StrictMotionRunnerError(
                     "Spin command has the wrong sign or exceeds the reviewed "
-                    "0.10 rad/s cap"
+                    "0.20 rad/s cap"
                 )
         else:
             raise StrictMotionRunnerError(
@@ -2064,7 +2068,11 @@ def action_timeout_s(mode: str, goal: Mapping[str, Any]) -> float:
             abs(_finite(goal.get("distanceM"), "distanceM"))
         )
     if mode in StrictCommandRelay._SPIN_MODES:
-        return abs(_finite(goal.get("targetYawRad"), "targetYawRad")) / OFFICIAL_SPIN_MIN_RPS + 10.0
+        return (
+            abs(_finite(goal.get("targetYawRad"), "targetYawRad"))
+            / OBSERVED_SPIN_PROGRESS_FLOOR_RPS
+            + SPIN_STARTUP_STOP_MARGIN_S
+        )
     if mode in StrictCommandRelay._LATERAL_MODES:
         return translation_action_timeout_s(LATERAL_DISTANCE_M)
     raise ValueError("detour timeouts are resolved per primitive")
@@ -2978,7 +2986,10 @@ class StrictMotionCaseExecutor:
                         }
                         primitive_type = "Spin"
                         direction = 1 if target_yaw > 0.0 else -1
-                        timeout_s = abs(target_yaw) / OFFICIAL_SPIN_MIN_RPS + 10.0
+                        timeout_s = (
+                            abs(target_yaw) / OBSERVED_SPIN_PROGRESS_FLOOR_RPS
+                            + SPIN_STARTUP_STOP_MARGIN_S
+                        )
                     else:
                         raise StrictMotionRunnerError(
                             "static resolver emitted a forbidden action type"

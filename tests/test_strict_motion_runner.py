@@ -143,6 +143,13 @@ def test_translation_deadline_uses_observed_progress_without_changing_command() 
     assert runner.action_timeout_s(
         "forward_3m", runner.motion_goal("forward_3m")
     ) == pytest.approx(85.0)
+    assert runner.action_timeout_s(
+        "turn_left", runner.motion_goal("turn_left")
+    ) == pytest.approx(
+        (math.pi / 2.0) / runner.OBSERVED_SPIN_PROGRESS_FLOOR_RPS
+        + runner.SPIN_STARTUP_STOP_MARGIN_S
+    )
+    assert runner.OFFICIAL_SPIN_MAX_RPS == pytest.approx(0.20)
 
 
 def test_drive_on_heading_goal_speed_has_the_same_sign_as_distance() -> None:
@@ -178,9 +185,14 @@ def test_drive_on_heading_rejects_wrong_sign_and_mixed_axes() -> None:
 
 @pytest.mark.parametrize(
     ("mode", "wz"),
-    (("turn_left", 0.1), ("turn_right", -0.1)),
+    (
+        ("turn_left", 0.1),
+        ("turn_left", 0.2),
+        ("turn_right", -0.1),
+        ("turn_right", -0.2),
+    ),
 )
-def test_spin_relays_the_reviewed_clip_safe_command(mode: str, wz: float) -> None:
+def test_spin_relays_the_reviewed_acceleration_envelope(mode: str, wz: float) -> None:
     relay = runner.StrictCommandRelay()
     relay.begin(mode)
     relay.observe_nav2(command(wz=wz), observed_at_s=1.0)
@@ -190,12 +202,12 @@ def test_spin_relays_the_reviewed_clip_safe_command(mode: str, wz: float) -> Non
 def test_spin_accepts_nav2_acceleration_ramp_but_rejects_unsafe_commands() -> None:
     relay = runner.StrictCommandRelay()
     relay.begin("turn_left")
-    for ramped in (0.001, 0.03, 0.075, 0.1):
+    for ramped in (0.001, 0.03, 0.075, 0.1, 0.15, 0.2):
         relay.observe_nav2(command(wz=ramped), observed_at_s=1.0)
     for invalid in (
-        command(wz=-0.1),
-        command(wz=0.101),
-        command(vx=0.01, wz=0.1),
+        command(wz=-0.2),
+        command(wz=0.201),
+        command(vx=0.01, wz=0.2),
     ):
         with pytest.raises(runner.StrictMotionRunnerError):
             relay.observe_nav2(invalid, observed_at_s=1.0)

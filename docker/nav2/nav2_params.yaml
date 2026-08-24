@@ -207,14 +207,13 @@ behavior_server:
     simulate_ahead_time: 2.0
     # Humanoid turning is a sequence of learned planner clips, not an
     # instantaneous differential-drive yaw.  The pinned SONIC planner emits
-    # about 44 frames at 30 Hz (1.47 s), while the reference gate opens a new
-    # facing segment every 0.15 rad.  At 0.20 rad/s a new request arrived every
-    # 0.75 s and could replace a still-running clip near the Spin endpoint,
-    # producing the r128 1.9 rad/s stop impulse.  Use Nav2's reviewed minimum
-    # 0.10 rad/s for both bounds: 0.15 / 0.10 = 1.50 s, so a new reference
-    # cannot overtake the preceding learned clip.  The downstream guard still
-    # verifies the command unchanged.
-    max_rotational_vel: 0.1
+    # about 44 frames at 30 Hz (1.47 s).  Keep the previously live-proven
+    # 0.20 rad/s upper bound, but admit a new SONIC reference only after a
+    # 0.30 rad command-facing change: 0.30 / 0.20 = 1.50 s.  This preserves the
+    # responsive Nav2 Spin while preventing a new clip from replacing the
+    # preceding endpoint braking clip.  The downstream guard verifies the
+    # signed acceleration ramp without changing it.
+    max_rotational_vel: 0.2
     min_rotational_vel: 0.1
     rotational_acc_lim: 0.3
 

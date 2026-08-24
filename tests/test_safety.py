@@ -1228,8 +1228,8 @@ def test_mixed_curve_facing_integral_accumulates_and_mirrors_past_old_cap():
     assert negative_output == pytest.approx(-positive_output)
 
 
-def test_spin_command_integral_opens_successive_planner_facing_segments():
-    """A long official Spin must not depend on measured motion to replan."""
+def test_spin_command_integral_spaces_planner_segments_beyond_clip_horizon():
+    """A long official Spin must not replace a still-running planner clip."""
 
     now = [100.0]
     guard = CmdVelGuard(clock=lambda: now[0], smoothing_alpha=1.0)
@@ -1242,7 +1242,7 @@ def test_spin_command_integral_opens_successive_planner_facing_segments():
     admitted_segments = []
     # Reproduce cold INIT: the command integral keeps advancing for 3 s while
     # measured yaw remains near the starting pose.  The replan gate emits each
-    # new absolute planner target after its 0.05-rad/0.15-rad thresholds.
+    # new absolute planner target after its 0.05-rad/0.30-rad thresholds.
     for frame in range(150):
         now[0] += 0.02
         guard.observe_heading(0.0)
@@ -1250,10 +1250,11 @@ def test_spin_command_integral_opens_successive_planner_facing_segments():
         candidate = guard.intent(now=now[0], dt=0.02)
         if gate.admit(candidate, now=(frame + 1) * 0.02):
             admitted_segments.append(candidate.facing_angle_rad)
-    assert admitted_segments == pytest.approx([0.052, 0.204, 0.356, 0.508])
+    assert admitted_segments == pytest.approx([0.052, 0.352])
     assert guard.command_facing == pytest.approx(0.60)
     assert gate.last is not None
-    assert gate.last.facing_angle_rad == pytest.approx(0.508)
+    assert gate.last.facing_angle_rad == pytest.approx(0.352)
+    assert 0.30 / 0.20 >= 44.0 / 30.0
 
 
 @pytest.mark.parametrize("invalid_dt", [float("nan"), 0.0, 0.10])
@@ -1322,7 +1323,7 @@ def test_replan_gate_debounces_small_nav2_corrections_but_stops_immediately():
     tiny_correction = MovementIntent("SLOW_WALK", 0.21, 0.01, 0.02, True, False)
     assert gate.admit(tiny_correction) is False
 
-    significant = MovementIntent("SLOW_WALK", 0.25, 0.0, 0.20, True, False)
+    significant = MovementIntent("SLOW_WALK", 0.25, 0.0, 0.31, True, False)
     assert gate.admit(significant) is True
 
     now[0] = 10.41
@@ -1335,9 +1336,9 @@ def test_replan_gate_rate_limits_significant_in_motion_change():
     gate = ReplanIntentGate(clock=lambda: now[0])
     assert gate.admit(MovementIntent("SLOW_WALK", 0.20, 0.0, 0.0, True, False))
     now[0] = 20.10
-    assert not gate.admit(MovementIntent("SLOW_WALK", 0.25, 0.0, 0.20, True, False))
+    assert not gate.admit(MovementIntent("SLOW_WALK", 0.25, 0.0, 0.31, True, False))
     now[0] = 20.36
-    assert gate.admit(MovementIntent("SLOW_WALK", 0.25, 0.0, 0.20, True, False))
+    assert gate.admit(MovementIntent("SLOW_WALK", 0.25, 0.0, 0.31, True, False))
 
 
 @pytest.mark.parametrize("sign", [-1.0, 1.0])

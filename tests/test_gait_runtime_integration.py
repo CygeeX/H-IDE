@@ -2645,7 +2645,7 @@ def test_activation_routes_admitted_heading_only_through_planner_state() -> None
         # This intermediate raw sample is below the gate threshold and must
         # not influence the final planner evidence.
         MovementIntent("SLOW_WALK", 0.2, 0.0, 0.12, True, False),
-        MovementIntent("SLOW_WALK", 0.2, 0.0, 0.30, True, False),
+        MovementIntent("SLOW_WALK", 0.2, 0.0, 0.41, True, False),
     ]
     driver.guard = SimpleNamespace(
         intent=lambda **_kwargs: intents.pop(0),
@@ -2658,12 +2658,12 @@ def test_activation_routes_admitted_heading_only_through_planner_state() -> None
 
     assert first.facing_angle_rad == pytest.approx(0.10)
     assert rejected.facing_angle_rad == pytest.approx(0.12)
-    assert latest.facing_angle_rad == pytest.approx(0.30)
+    assert latest.facing_angle_rad == pytest.approx(0.41)
     assert driver._intent_gate.last is latest
     assert controller.controller.reinit_heading is True
     assert controller.controller.delta_heading == 0.0
     assert driver._pending_decoder_heading_delta_rad == pytest.approx(0.0)
-    assert controller.ms.facing_angle == pytest.approx(0.30)
+    assert controller.ms.facing_angle == pytest.approx(0.41)
     assert evidence.intent_generation == 0
     assert driver._reference_request_pending is False
 
@@ -2722,7 +2722,7 @@ def test_same_spin_replan_preserves_vendor_cursor_instead_of_rebasing_measured_h
     """A cumulative Spin goal must stay in one planner reference frame.
 
     The live r128 failure requested a fresh measured reference for every
-    0.15-rad facing segment.  The measured rebase resets planner heading to
+    0.30-rad facing segment.  The measured rebase resets planner heading to
     zero, so the next cumulative target repeats the yaw already executed.  The
     first segment remains a fresh transaction; every later segment of the same
     action must use the vendor's frozen-cursor continuous transaction.
@@ -2748,7 +2748,7 @@ def test_same_spin_replan_preserves_vendor_cursor_instead_of_rebasing_measured_h
     driver._controller = controller
     intents = [
         MovementIntent("SLOW_WALK", 0.0, 0.052, 0.052, False, False),
-        MovementIntent("SLOW_WALK", 0.0, 0.204, 0.204, False, False),
+        MovementIntent("SLOW_WALK", 0.0, 0.356, 0.356, False, False),
     ]
     driver.guard = SimpleNamespace(
         intent=lambda **_kwargs: intents.pop(0),
@@ -2774,7 +2774,7 @@ def test_same_spin_replan_preserves_vendor_cursor_instead_of_rebasing_measured_h
     )
 
     second = driver._apply_intent(0.02, simulation_now_s=1.40)
-    assert second.facing_angle_rad == pytest.approx(0.204)
+    assert second.facing_angle_rad == pytest.approx(0.356)
     assert driver._reference_request_continuous_motion is True
     assert driver._vendor_revoke_pending is False
     assert driver._reference_authority.snapshot.phase == "REQUIRED"

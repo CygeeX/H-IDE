@@ -215,10 +215,10 @@ def _command(mode: str, active: bool) -> dict[str, float]:
     if mode == "lateral_right":
         return {"vx": 0.0, "vy": -0.40, "wz": 0.0}
     if mode == "turn_left":
-        return {"vx": 0.0, "vy": 0.0, "wz": 0.1}
+        return {"vx": 0.0, "vy": 0.0, "wz": 0.2}
     if mode == "turn_right":
-        return {"vx": 0.0, "vy": 0.0, "wz": -0.1}
-    return {"vx": 0.3, "vy": 0.0, "wz": 0.1}
+        return {"vx": 0.0, "vy": 0.0, "wz": -0.2}
+    return {"vx": 0.3, "vy": 0.0, "wz": 0.2}
 
 
 def _feet(progress: float) -> tuple[dict[str, int], dict[str, int]]:
@@ -271,7 +271,7 @@ def _sample(mode: str, t_s: float, progress: float, active: bool, sequence: int)
             else 0.0
         )
     )
-    angular_speed = 0.1 if active and mode in {"turn_left", "turn_right", "detour"} else 0.0
+    angular_speed = 0.2 if active and mode in {"turn_left", "turn_right", "detour"} else 0.0
     isolation_manifest = _isolation_manifest(mode)
     dynamics_sequence = 10_000 + sequence
     return {
@@ -561,7 +561,7 @@ def _rebuild_detour_trace(
             append_segment(
                 spin_sequence,
                 "Spin",
-                {"targetYawRad": spin_delta, "maxWzRps": 0.1},
+                {"targetYawRad": spin_delta, "maxWzRps": 0.2},
                 (before[0], before[1], current_yaw),
                 (before[0], before[1], settled_spin_yaw),
                 abs(spin_delta),
@@ -581,7 +581,7 @@ def _rebuild_detour_trace(
                 append_segment(
                     spin_sequence,
                     "Spin",
-                    {"targetYawRad": correction, "maxWzRps": 0.1},
+                    {"targetYawRad": correction, "maxWzRps": 0.2},
                     (before[0], before[1], current_yaw),
                     (before[0], before[1], corrected_yaw),
                     abs(correction),
@@ -603,7 +603,7 @@ def _rebuild_detour_trace(
         append_segment(
             2 * (len(path) - 1),
             "Spin",
-            {"targetYawRad": final_spin, "maxWzRps": 0.1},
+            {"targetYawRad": final_spin, "maxWzRps": 0.2},
             (endpoint[0], endpoint[1], current_yaw),
             (endpoint[0], endpoint[1], final_yaw),
             abs(final_spin),
@@ -665,8 +665,8 @@ def _rebuild_detour_trace(
             segment_index = active_segment["sequenceIndex"]
         else:
             spin_sign = math.copysign(1.0, active_segment["goal"]["targetYawRad"])
-            command = {"vx": 0.0, "vy": 0.0, "wz": spin_sign * 0.1}
-            linear_speed, angular_speed = 0.0, 0.1
+            command = {"vx": 0.0, "vy": 0.0, "wz": spin_sign * 0.2}
+            linear_speed, angular_speed = 0.0, 0.2
             nav2_actions = {
                 "driveOnHeadingActive": False,
                 "navigateToPoseActive": False,
@@ -1978,9 +1978,9 @@ def test_normal_fast_motion_is_not_misclassified_as_a_pose_jump() -> None:
         ("forward", {"vx": 0.301}, "DRIVE_ON_HEADING_COMMAND_ENVELOPE"),
         ("reverse", {"vy": 0.001}, "DRIVE_ON_HEADING_COMMAND_ENVELOPE"),
         ("turn_left", {"vx": 0.001}, "SPIN_COMMAND_ENVELOPE"),
-        ("turn_right", {"wz": -0.101}, "SPIN_COMMAND_ENVELOPE"),
+        ("turn_right", {"wz": -0.201}, "SPIN_COMMAND_ENVELOPE"),
         ("detour", {"vy": 0.001}, "SPIN_COMMAND_ENVELOPE"),
-        ("detour", {"wz": 0.101}, "SPIN_COMMAND_ENVELOPE"),
+        ("detour", {"wz": 0.201}, "SPIN_COMMAND_ENVELOPE"),
     ],
 )
 def test_official_command_envelopes_reject_overspeed_and_mixed_axes(
