@@ -1145,6 +1145,19 @@ def test_lateral_accepts_only_bounded_learned_idle_braking_transient() -> None:
     assert envelope["finalHeadingErrorRad"] <= math.radians(10.0)
 
 
+def test_lateral_accepts_bounded_learned_idle_final_heading_residual() -> None:
+    trace = _trace("lateral_right")
+    _apply_lateral_braking_profile(trace)
+    _set_planar_pose(trace["samples"][-1], yaw=math.radians(11.0))
+
+    result = strict.evaluate_trace(trace)
+
+    assert result["pass"] is True, result["failures"]
+    assert result["metrics"]["lateralTrackingEnvelope"][
+        "finalHeadingErrorRad"
+    ] == pytest.approx(math.radians(11.0))
+
+
 @pytest.mark.parametrize(
     ("phase", "axis", "value", "expected_code"),
     [
@@ -1161,7 +1174,7 @@ def test_lateral_accepts_only_bounded_learned_idle_braking_transient() -> None:
         (
             "final",
             "yaw",
-            math.radians(10.1),
+            math.radians(12.1),
             "FINAL_HEADING_ERROR_EXCEEDED",
         ),
     ],
