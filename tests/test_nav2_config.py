@@ -62,6 +62,17 @@ def test_planner_never_silently_substitutes_an_approved_goal() -> None:
     assert planner["tolerance"] == 0.0
 
 
+def test_costmaps_share_the_bounded_recovery_footprint() -> None:
+    params = _params()
+
+    assert params["global_costmap"]["global_costmap"]["ros__parameters"][
+        "robot_radius"
+    ] == 0.25
+    assert params["local_costmap"]["local_costmap"]["ros__parameters"][
+        "robot_radius"
+    ] == 0.25
+
+
 def test_controller_uses_forward_only_rotation_shim_and_graceful_profile() -> None:
     params = _params()
     follow_path = params["controller_server"]["ros__parameters"]["FollowPath"]

@@ -476,6 +476,8 @@ def _segment_indices(
     poses: tuple[dict[str, float], ...],
     blocked: frozenset[tuple[int, int]],
     *,
+    relaxed_start_blocked: frozenset[tuple[int, int]],
+    reentry_blocked: frozenset[tuple[int, int]],
     min_segment_m: float,
     max_segment_m: float,
 ) -> tuple[int, ...]:
@@ -484,12 +486,49 @@ def _segment_indices(
         "segment distance bounds are invalid",
     )
     points = tuple((pose["x"], pose["y"]) for pose in poses)
-    for index, point in enumerate(points):
+    recovery_index = 0
+    if static_map.world_to_cell(*points[0]) in blocked:
+        _require(
+            static_map.world_to_cell(*points[0]) not in relaxed_start_blocked,
+            "NavFn path start violates relaxed physical clearance",
+        )
+        recovery_index = -1
+        for index in range(1, len(points)):
+            point = points[index]
+            _require(
+                static_map.world_to_cell(*point) not in relaxed_start_blocked,
+                f"NavFn recovery path pose {index} violates relaxed physical clearance",
+            )
+            _require(
+                static_map.segment_is_clear(
+                    points[index - 1], point, relaxed_start_blocked
+                ),
+                f"NavFn recovery path edge {index - 1}->{index} violates relaxed physical clearance",
+            )
+            distance = math.dist(points[0], point)
+            if distance > max_segment_m + 1e-12:
+                break
+            if (
+                distance >= min_segment_m - 1e-12
+                and static_map.world_to_cell(*point) not in reentry_blocked
+                and static_map.segment_is_clear(
+                    points[0], point, relaxed_start_blocked
+                )
+            ):
+                recovery_index = index
+                break
+        _require(
+            recovery_index > 0,
+            "NavFn path cannot restore full clearance from its relaxed start",
+        )
+
+    for index, point in enumerate(points[recovery_index:], start=recovery_index):
         _require(
             static_map.world_to_cell(*point) not in blocked,
             f"NavFn path pose {index} violates inflated clearance",
         )
-    for index, (start, end) in enumerate(zip(points, points[1:])):
+    for index in range(recovery_index, len(points) - 1):
+        start, end = points[index], points[index + 1]
         _require(
             static_map.segment_is_clear(start, end, blocked),
             f"NavFn path edge {index}->{index + 1} violates inflated clearance",
@@ -504,7 +543,7 @@ def _segment_indices(
     next_index: list[int | None] = [None] * len(points)
     reachable = [False] * len(points)
     reachable[-1] = True
-    for start_index in range(len(points) - 2, -1, -1):
+    for start_index in range(len(points) - 2, recovery_index - 1, -1):
         for end_index in range(len(points) - 1, start_index, -1):
             if not reachable[end_index]:
                 continue
@@ -522,12 +561,14 @@ def _segment_indices(
             break
 
     result: tuple[int, ...] | None = None
-    if reachable[0]:
-        selected = [0]
+    if reachable[recovery_index]:
+        selected = [recovery_index]
         while selected[-1] != len(points) - 1:
             endpoint = next_index[selected[-1]]
             _require(endpoint is not None, "reachable segment chain is incomplete")
             selected.append(endpoint)
+        if recovery_index:
+            selected.insert(0, 0)
         result = tuple(selected)
     _require(
         result is not None,
@@ -601,6 +642,12 @@ def build_primitive_plan(
         static_map,
         poses,
         blocked,
+        relaxed_start_blocked=static_map.inflated_blocked_cells(
+            RELAXED_LIVE_EXECUTION_CLEARANCE_RADIUS_M
+        ),
+        reentry_blocked=static_map.inflated_blocked_cells(
+            clearance_radius + endpoint_tolerance_m
+        ),
         min_segment_m=min_segment_m,
         max_segment_m=max_segment_m,
     )

@@ -286,6 +286,53 @@ def test_locked_short_route_segments_bidirectionally_without_oracle_data() -> No
     assert "scenes/office_v2/scene.yaml" not in source
 
 
+def test_navfn_relaxed_start_must_reenter_full_clearance_before_normal_segments(
+) -> None:
+    module = _planner()
+    start = (-4.476, -2.389)
+    reentry = (-4.475, -2.125)
+    suffix = _astar_fixture_navfn_path(module, reentry, GOAL)
+    navfn_path = {
+        "frame_id": "map",
+        "poses": [
+            {"x": start[0], "y": start[1], "yaw": 0.0},
+            {"x": -4.475, "y": -2.325, "yaw": 0.0},
+            {"x": -4.475, "y": -2.275, "yaw": 0.0},
+            {"x": -4.475, "y": -2.225, "yaw": 0.0},
+            {"x": reentry[0], "y": reentry[1], "yaw": 0.0},
+            *suffix["poses"][1:],
+        ],
+    }
+
+    plan = _build(module, navfn_path)
+    static_map = module.StaticMap.load(MAP_YAML, MAP_IMAGE)
+    full = static_map.inflated_blocked_cells(CLEARANCE_RADIUS)
+    relaxed = static_map.inflated_blocked_cells(
+        module.RELAXED_LIVE_EXECUTION_CLEARANCE_RADIUS_M
+    )
+
+    assert static_map.world_to_cell(*start) in full
+    assert static_map.world_to_cell(*start) not in relaxed
+    assert plan["segment_endpoint_indices"][:2] == [0, 4]
+    first = plan["segments"][0]
+    assert first["end_map"] == {"x": reentry[0], "y": reentry[1]}
+    assert static_map.segment_is_clear(start, reentry, relaxed)
+    assert all(
+        static_map.world_to_cell(pose["x"], pose["y"]) not in full
+        for pose in navfn_path["poses"][4:]
+    )
+    module.verify_primitive_plan(plan, navfn_path, **_plan_kwargs())
+
+
+def test_navfn_start_inside_relaxed_physical_clearance_is_rejected() -> None:
+    module = _planner()
+    navfn_path = _astar_fixture_navfn_path(module, START, GOAL)
+    navfn_path["poses"][0] = {"x": -5.621, "y": -1.291, "yaw": 0.0}
+
+    with pytest.raises(ValueError, match="relaxed physical clearance"):
+        _build(module, navfn_path)
+
+
 def test_live_resolver_uses_fresh_pose_and_never_emits_zero_or_subfloor_goals() -> None:
     module = _planner()
     navfn_path = _astar_fixture_navfn_path(module, START, GOAL)

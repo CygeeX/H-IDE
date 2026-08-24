@@ -255,20 +255,22 @@ def test_rotation_direction_guard_rejects_reverse_spin_and_clears_after_idle():
 
 
 def test_rotation_direction_guard_demo_profile_tolerates_support_foot_counter_sway():
-    guard = RotationDirectionGuard(max_reverse_rad=0.20)
+    guard = RotationDirectionGuard(max_reverse_rad=0.35)
     guard.observe_pose(0.0, 0.0, 0.0)
     assert guard.accept_command(0.0, 0.0, 0.2) is True
 
-    # The first full-chain office scan produced -0.051 rad before turning in
-    # the commanded direction.  That is ordinary learned-gait counter-sway,
-    # not a reason to terminate the simulator.
+    # Full-chain office scans have produced a support-foot counter-turn of
+    # 0.221 rad before turning in the commanded direction.  The gait adapter
+    # already budgets 0.35 rad for this learned startup transient, so this
+    # redundant bridge guard must not terminate earlier.
     assert guard.observe_pose(0.0, 0.0, -0.051) is False
-    assert guard.observe_pose(0.0, 0.0, -0.199) is False
+    assert guard.observe_pose(0.0, 0.0, -0.221) is False
+    assert guard.observe_pose(0.0, 0.0, -0.349) is False
     assert guard.latched is False
 
     # A genuinely wrong-way response still fails closed at the reviewed
     # configuration boundary.
-    assert guard.observe_pose(0.0, 0.0, -0.201) is True
+    assert guard.observe_pose(0.0, 0.0, -0.351) is True
     assert "opposes Nav2 Spin" in (guard.reason or "")
 
 

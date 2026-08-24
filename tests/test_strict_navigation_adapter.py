@@ -117,7 +117,8 @@ class FakePlanner:
                 "action_type": "nav2_msgs/action/Spin",
                 "action_goal": {"target_yaw_rad": 0.2},
             }
-        if self.resolve_calls[key] > 1:
+        remaining = max(0.0, 1.0 - float(pose["x"]))
+        if remaining <= runner.DETOUR_ENDPOINT_TOLERANCE_M:
             return {"disposition": "skip_within_endpoint_tolerance"}
         return {
             "disposition": "send_action",
@@ -127,10 +128,78 @@ class FakePlanner:
                 else "nav2_msgs/action/DriveOnHeading"
             ),
             "action_goal": {
-                "target": {"x": 1.0, "y": 0.0, "z": 0.0},
+                "target": {"x": remaining, "y": 0.0, "z": 0.0},
                 "speed_mps": runner.OFFICIAL_DRIVE_SPEED_MPS,
             },
-            "fresh_distance_to_endpoint_m": 1.0,
+            "fresh_distance_to_endpoint_m": remaining,
+        }
+
+
+class ResidualEndpointBackend(FakeBackend):
+    """First learned drive stops 0.26 m short, as observed in MuJoCo."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.drive_finishes = 0
+
+    def finish_action(self, execution):
+        if execution.kind != "DriveOnHeading":
+            return super().finish_action(execution)
+        self.drive_finishes += 1
+        progress = (
+            max(0.0, execution.distance - 0.26)
+            if self.drive_finishes == 1
+            else execution.distance
+        )
+        self.pose = runner.PlanarPose(
+            self.pose.x + progress,
+            self.pose.y,
+            self.pose.yaw,
+        )
+
+
+class FinalHeadingPlanner(FakePlanner):
+    def build_primitive_plan(self, navfn_path, **_kwargs):
+        self.plan_number += 1
+        return {
+            "plan_sha256": f"plan-{self.plan_number}",
+            "primitives": [
+                {"kind": "spin"},
+                {"kind": "drive_on_heading"},
+                {"kind": "spin"},
+            ],
+        }
+
+    def resolve_live_primitive(self, plan, index, navfn_path, pose, **_kwargs):
+        del plan, navfn_path, _kwargs
+        if index == 0:
+            return {
+                "disposition": "send_action",
+                "action_type": "nav2_msgs/action/Spin",
+                "action_goal": {"target_yaw_rad": 0.2},
+            }
+        distance = max(0.0, 1.0 - float(pose["x"]))
+        if index == 1:
+            if distance <= runner.DETOUR_ENDPOINT_TOLERANCE_M:
+                return {
+                    "disposition": "skip_within_endpoint_tolerance",
+                    "fresh_distance_to_endpoint_m": distance,
+                }
+            return {
+                "disposition": "send_action",
+                "action_type": "nav2_msgs/action/DriveOnHeading",
+                "action_goal": {
+                    "target": {"x": distance, "y": 0.0, "z": 0.0},
+                    "speed_mps": runner.OFFICIAL_DRIVE_SPEED_MPS,
+                },
+                "fresh_distance_to_endpoint_m": distance,
+            }
+        if distance > runner.DETOUR_ENDPOINT_TOLERANCE_M:
+            raise ValueError("final heading checkpoint reached before endpoint")
+        return {
+            "disposition": "send_action",
+            "action_type": "nav2_msgs/action/Spin",
+            "action_goal": {"target_yaw_rad": 0.3},
         }
 
 
@@ -153,15 +222,52 @@ def test_navigate_uses_only_spin_and_drive_then_returns_idle() -> None:
     )
 
     assert result.plan_sha256 == "plan-1"
-    assert result.completed_primitives == 2
+    assert result.completed_primitives == 3
     assert backend.compute_calls == 1
-    assert backend.sent == [("Spin", 0.2), ("DriveOnHeading", 1.0)]
+    assert backend.sent == [
+        ("Spin", 0.2),
+        ("DriveOnHeading", 0.5),
+        ("DriveOnHeading", 0.5),
+    ]
     assert backend.started == [
         ("detour", "Spin", 1),
         ("detour", "DriveOnHeading", 1),
+        ("detour", "DriveOnHeading", 1),
     ]
-    assert backend.stop_calls == 2
+    assert backend.stop_calls == 3
     assert len(progress) >= 2
+
+
+def test_navigate_closes_observed_residual_before_final_heading() -> None:
+    backend = ResidualEndpointBackend()
+
+    result = executor(backend, FinalHeadingPlanner()).navigate(
+        runner.PlanarPose(1.0, 0.0, 0.5)
+    )
+
+    assert result.final_pose.x == pytest.approx(1.0)
+    assert backend.sent == [
+        ("Spin", 0.2),
+        ("DriveOnHeading", 0.5),
+        ("DriveOnHeading", 0.5),
+        ("DriveOnHeading", pytest.approx(0.26)),
+        ("Spin", 0.3),
+    ]
+
+
+def test_navigate_realigns_long_drive_at_half_metre_boundaries() -> None:
+    backend = FakeBackend()
+
+    result = executor(backend, FakePlanner()).navigate(
+        runner.PlanarPose(1.0, 0.0, 0.2)
+    )
+
+    assert result.final_pose.x == pytest.approx(1.0)
+    assert backend.sent == [
+        ("Spin", 0.2),
+        ("DriveOnHeading", 0.5),
+        ("DriveOnHeading", 0.5),
+    ]
 
 
 def test_fresh_geometry_failure_replans_at_most_twice() -> None:

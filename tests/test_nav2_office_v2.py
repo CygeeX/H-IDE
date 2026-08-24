@@ -123,7 +123,12 @@ def test_both_nav2_costmaps_use_the_office_v2_static_geometry() -> None:
             "subscribe_to_updates": False,
         }
         assert costmap["resolution"] == scene["map"]["resolution"]
-        assert costmap["robot_radius"] == navigation["robot_radius_m"]
+        # Nav2 uses the collision-observed physical footprint to escape a
+        # scan-drifted but collision-free start.  The independent static
+        # primitive planner retains scene.navigation's stricter 0.35 m radius
+        # plus padding and clearance for every normal path segment.
+        assert costmap["robot_radius"] == 0.25
+        assert navigation["robot_radius_m"] == 0.35
         assert costmap["footprint_padding"] == navigation["footprint_padding_m"]
 
 

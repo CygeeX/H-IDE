@@ -33,6 +33,12 @@ DEFAULT_COMMAND_TIMEOUT_S = 300.0
 IDLE_SETTLE_TIMEOUT_S = 20.0
 POLL_PERIOD_S = 0.02
 MAX_PRODUCT_REPLANS = 2
+# DriveOnHeading is distance-controlled, not an endpoint-tracking controller.
+# Re-sample map odometry and heading at least every half metre so small learned
+# gait yaw errors cannot accumulate across a two-metre static-plan segment and
+# put the next NavFn start inside an inflated doorway cell.
+MAX_RUNTIME_DRIVE_CHUNK_M = 0.50
+MAX_RUNTIME_DRIVE_ACTIONS_PER_SEGMENT = 8
 
 
 class StrictNavigationCancelled(RuntimeError):
@@ -176,7 +182,10 @@ class StrictNavigationExecutor:
         goal = self._mapping(resolved.get("action_goal"), "resolved action goal")
         if action_type == "nav2_msgs/action/DriveOnHeading":
             target = self._mapping(goal.get("target"), "DriveOnHeading target")
-            distance = self._finite(target.get("x"), "DriveOnHeading distance")
+            resolved_distance = self._finite(
+                target.get("x"), "DriveOnHeading distance"
+            )
+            distance = min(resolved_distance, MAX_RUNTIME_DRIVE_CHUNK_M)
             timeout_s = runner.translation_action_timeout_s(distance)
             self.backend.begin_relay(
                 "detour", primitive="DriveOnHeading", direction=1
@@ -346,7 +355,14 @@ class StrictNavigationExecutor:
                                 "fresh endpoint distance",
                             )
                             if previous_distance is not None:
-                                if distance <= runner.DETOUR_COMPLETED_ENDPOINT_TOLERANCE_M:
+                                # The following final-heading checkpoint is
+                                # validated by the static planner against the
+                                # reviewed endpoint tolerance (0.15 m).  Do
+                                # not terminate progress at the looser 0.35 m
+                                # motion-acceptance radius, or the very next
+                                # checkpoint deterministically rejects the
+                                # same pose as "before endpoint".
+                                if distance <= runner.DETOUR_ENDPOINT_TOLERANCE_M:
                                     break
                                 if (
                                     distance
@@ -356,7 +372,10 @@ class StrictNavigationExecutor:
                                     raise runner.StrictMotionRunnerError(
                                         "DriveOnHeading made no bounded endpoint progress"
                                     )
-                            if drive_actions >= runner.MAX_DRIVE_PROGRESS_ACTIONS:
+                            if (
+                                drive_actions
+                                >= MAX_RUNTIME_DRIVE_ACTIONS_PER_SEGMENT
+                            ):
                                 raise runner.StrictMotionRunnerError(
                                     "DriveOnHeading exceeded bounded progress actions"
                                 )
@@ -566,6 +585,10 @@ class StrictNavigationActionServer:
             result.error_code = 0
             result.error_msg = "cancelled"
         except Exception as exc:
+            self.backend.node.get_logger().error(
+                "strict NavigateToPose aborted: %s"
+                % (str(exc).strip() or type(exc).__name__)
+            )
             goal_handle.abort()
             result.error_code = 100
             result.error_msg = (str(exc).strip() or type(exc).__name__)[:512]
@@ -591,6 +614,10 @@ class StrictNavigationActionServer:
             result.error_code = 0
             result.error_msg = "cancelled"
         except Exception as exc:
+            self.backend.node.get_logger().error(
+                "strict Spin aborted: %s"
+                % (str(exc).strip() or type(exc).__name__)
+            )
             goal_handle.abort()
             result.error_code = 100
             result.error_msg = (str(exc).strip() or type(exc).__name__)[:512]

@@ -235,8 +235,8 @@ class SimConfig:
             raise ValueError("max_translation_heading_error_rad must be in (0, 0.5]")
         if not 0 < float(raw["translation_heading_violation_s"]) <= 2.0:
             raise ValueError("translation_heading_violation_s must be in (0, 2]")
-        if not 0 < float(raw["max_spin_reverse_rad"]) <= 0.2:
-            raise ValueError("max_spin_reverse_rad must be in (0, 0.2]")
+        if not 0 < float(raw["max_spin_reverse_rad"]) <= 0.35:
+            raise ValueError("max_spin_reverse_rad must be in (0, 0.35]")
         if not 0 < float(raw["max_spin_translation_m"]) <= 0.35:
             raise ValueError("max_spin_translation_m must be in (0, 0.35]")
         if not 0 < float(raw["spin_translation_violation_s"]) <= 2.0:
