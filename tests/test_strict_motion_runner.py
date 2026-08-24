@@ -1915,6 +1915,76 @@ def test_detour_executor_repeats_bounded_drive_until_endpoint_confirmation(
     assert planner.drive_resolutions == 3
 
 
+def test_detour_executor_accepts_successful_drive_inside_relaxed_physical_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SuccessfulEndpointPlanner(FakeStaticPlanner):
+        def resolve_live_primitive(self, plan, index, path, pose, **kwargs):
+            if index == 0:
+                return {
+                    "primitive_sequence": 0,
+                    "plan_sha256": "a" * 64,
+                    "fresh_odometry_used": True,
+                    "disposition": "skip_within_heading_tolerance",
+                    "action_goal": None,
+                    "fresh_distance_to_endpoint_m": 0.8,
+                }
+            self.drive_resolutions += 1
+            remaining = 0.8 if self.drive_resolutions == 1 else 0.30
+            return {
+                "primitive_sequence": 1,
+                "plan_sha256": "a" * 64,
+                "fresh_odometry_used": True,
+                "disposition": "send_action",
+                "action_type": "nav2_msgs/action/DriveOnHeading",
+                "action_goal": {
+                    "target": {"x": 0.5, "y": 0.0, "z": 0.0},
+                    "speed_mps": 0.3,
+                },
+                "fresh_distance_to_endpoint_m": remaining,
+                "command_distance_m": 0.5,
+                "endpoint_confirmation_required": True,
+            }
+
+    backend = FakeDetourBackend()
+    samples = [_executor_sample(index / 10.0) for index in range(90)]
+    samples[2]["motionIntentActive"] = True
+    samples[2]["nav2Actions"]["driveOnHeadingActive"] = True
+    samples[2]["command"]["vx"] = 0.3
+    evidence = FakeDetourEvidence()
+    planner = SuccessfulEndpointPlanner()
+
+    def load(name: str, _path: Path):
+        if "planner" in name:
+            return planner
+        return SimpleNamespace(
+            evaluate_trace=lambda trace: {
+                "pass": [item["type"] for item in trace["action"]["segments"]]
+                == ["DriveOnHeading"]
+            }
+        )
+
+    monkeypatch.setattr(runner, "_load_file_module", load)
+    executor = runner.StrictMotionCaseExecutor(
+        backend,
+        FakeExecutorCollector(samples),
+        evidence,
+        clock=lambda: 1.0,
+    )
+
+    trace, result = executor.run_detour(
+        case_id="detour-successful-physical-endpoint",
+        route_id="office_waste_bin_s_to_g",
+    )
+
+    assert result == {"pass": True}
+    assert [item["type"] for item in trace["action"]["segments"]] == [
+        "DriveOnHeading"
+    ]
+    assert backend.calls.count("send_drive") == 1
+    assert planner.drive_resolutions == 2
+
+
 def test_detour_executor_rejects_nonprogressing_drive_chunk(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -136,11 +136,16 @@ MAX_DRIVE_REALIGNMENT_SPINS = 4
 MAX_DRIVE_REALIGNMENT_RETAINED_ERROR_RATIO = 0.90
 # A successful learned DriveOnHeading action is not an exact endpoint
 # controller.  Re-resolve the same static endpoint from fresh map odometry and
-# allow a bounded number of collision-checked chunks.  Each completed chunk
-# must make observable progress unless it enters the 0.15 m endpoint envelope.
+# allow a bounded number of collision-checked chunks.  A first action is still
+# resolved against the production 0.15 m endpoint envelope.  Once Nav2 has
+# reported a DriveOnHeading action successful, however, accept a fresh physical
+# endpoint within 0.35 m instead of commanding a short backtracking correction
+# beside an obstacle.  Fresh map odometry and the next segment's inflated-map
+# line-of-sight check remain authoritative.
 MAX_DRIVE_PROGRESS_ACTIONS = 4
 MIN_DRIVE_ENDPOINT_PROGRESS_M = 0.02
 DETOUR_ENDPOINT_TOLERANCE_M = 0.15
+DETOUR_COMPLETED_ENDPOINT_TOLERANCE_M = 0.35
 EXCEPTION_BALANCED_IDLE_S = 1.0
 EXCEPTION_BALANCED_IDLE_MAX_WALL_S = 8.0
 TERMINAL_LINEAR_SPEED_MPS = 0.01
@@ -2988,6 +2993,12 @@ class StrictMotionCaseExecutor:
                             "fresh distance to DriveOnHeading endpoint",
                         )
                         if pending_drive_start_distance_m is not None:
+                            if (
+                                drive_remaining_m
+                                <= DETOUR_COMPLETED_ENDPOINT_TOLERANCE_M
+                            ):
+                                pending_drive_start_distance_m = None
+                                break
                             if (
                                 drive_remaining_m
                                 > DETOUR_ENDPOINT_TOLERANCE_M
