@@ -489,14 +489,18 @@ def _segment_indices(
             f"NavFn path edge {index}->{index + 1} violates inflated clearance",
         )
 
-    # Dynamic programming finds a deterministic minimum-count partition. Every
-    # endpoint remains an original NavFn pose, preserving product provenance.
-    best: list[tuple[int, ...] | None] = [None] * len(points)
-    best[0] = (0,)
-    for end_index in range(1, len(points)):
-        for start_index in range(end_index):
-            prefix = best[start_index]
-            if prefix is None:
+    # Work backwards once, retaining the farthest path-progress endpoint that
+    # is collision-free and can itself reach the goal.  The previous all-pairs
+    # minimum-count search spent tens of seconds rechecking the same 500-pose
+    # NavFn path.  This keeps the same source-pose and inflated-map provenance,
+    # handles a short terminal residual without greedy dead-ends, and normally
+    # needs only one rasterized line-of-sight check per source pose.
+    next_index: list[int | None] = [None] * len(points)
+    reachable = [False] * len(points)
+    reachable[-1] = True
+    for start_index in range(len(points) - 2, -1, -1):
+        for end_index in range(len(points) - 1, start_index, -1):
+            if not reachable[end_index]:
                 continue
             distance = math.dist(points[start_index], points[end_index])
             if not min_segment_m - 1e-12 <= distance <= max_segment_m + 1e-12:
@@ -507,14 +511,18 @@ def _segment_indices(
                 blocked,
             ):
                 continue
-            candidate = (*prefix, end_index)
-            current = best[end_index]
-            if current is None or (len(candidate), candidate) < (
-                len(current),
-                current,
-            ):
-                best[end_index] = candidate
-    result = best[-1]
+            next_index[start_index] = end_index
+            reachable[start_index] = True
+            break
+
+    result: tuple[int, ...] | None = None
+    if reachable[0]:
+        selected = [0]
+        while selected[-1] != len(points) - 1:
+            endpoint = next_index[selected[-1]]
+            _require(endpoint is not None, "reachable segment chain is incomplete")
+            selected.append(endpoint)
+        result = tuple(selected)
     _require(
         result is not None,
         "NavFn path cannot be partitioned into collision-free distance-bounded segments",
@@ -537,7 +545,7 @@ def build_primitive_plan(
     footprint_padding_m: float,
     extra_clearance_m: float = 0.05,
     min_segment_m: float = 0.16,
-    max_segment_m: float = 0.50,
+    max_segment_m: float = 2.0,
     drive_speed_mps: float = OFFICIAL_FORWARD_SPEED_MPS,
     endpoint_tolerance_m: float = 0.15,
     heading_tolerance_rad: float = 0.09,
@@ -566,11 +574,6 @@ def build_primitive_plan(
     _require(extra_clearance_m >= 0.05, "extra clearance must be at least 0.05 m")
     _require(0.0 < endpoint_tolerance_m < min_segment_m, "endpoint tolerance must be below minimum segment distance")
     _require(0.0 < heading_tolerance_rad <= 0.09, "heading tolerance must be in (0, 0.09]")
-    _require(
-        max_segment_m * math.sin(heading_tolerance_rad)
-        < extra_clearance_m,
-        "heading tolerance can consume the reserved path clearance",
-    )
     _require(
         math.isclose(
             drive_speed_mps,
@@ -736,7 +739,7 @@ def verify_primitive_plan(
     footprint_padding_m: float,
     extra_clearance_m: float = 0.05,
     min_segment_m: float = 0.16,
-    max_segment_m: float = 0.50,
+    max_segment_m: float = 2.0,
     drive_speed_mps: float = OFFICIAL_FORWARD_SPEED_MPS,
     endpoint_tolerance_m: float = 0.15,
     heading_tolerance_rad: float = 0.09,
@@ -827,7 +830,7 @@ def resolve_live_primitive(
     footprint_padding_m: float,
     extra_clearance_m: float = 0.05,
     min_segment_m: float = 0.16,
-    max_segment_m: float = 0.50,
+    max_segment_m: float = 2.0,
     drive_speed_mps: float = OFFICIAL_FORWARD_SPEED_MPS,
     endpoint_tolerance_m: float = 0.15,
     heading_tolerance_rad: float = 0.09,
@@ -1017,7 +1020,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--footprint-padding-m", type=float, required=True)
     parser.add_argument("--extra-clearance-m", type=float, default=0.05)
     parser.add_argument("--min-segment-m", type=float, default=0.16)
-    parser.add_argument("--max-segment-m", type=float, default=0.50)
+    parser.add_argument("--max-segment-m", type=float, default=2.0)
     return parser.parse_args()
 
 

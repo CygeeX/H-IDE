@@ -517,6 +517,7 @@ class SonicDriver:
         )
         self._navigation_task_active = False
         self._controlled_stop_active = False
+        self._controlled_stop_waiting_for_motion_refresh = False
         self._balanced_policy_idle_active = False
         self._controlled_stop_source_identity: tuple[int, int] | None = None
         self._controlled_stop_reference_installed = False
@@ -1686,6 +1687,7 @@ class SonicDriver:
         with self._support_lock:
             self._clear_lateral_heading_hold_locked()
             self._controlled_stop_active = False
+            self._controlled_stop_waiting_for_motion_refresh = False
             self._balanced_policy_idle_active = False
             self._controlled_stop_source_identity = None
             self._controlled_stop_reference_installed = False
@@ -1772,6 +1774,41 @@ class SonicDriver:
         identity = (decision.generation, decision.sequence)
         already_active = bool(getattr(self, "_controlled_stop_active", False))
         authority = self._reference_authority.snapshot
+        deferred_motion_refresh = bool(
+            not already_active
+            and authority.phase == "REQUIRED"
+            and getattr(self, "_reference_request_continuous_motion", False)
+            and not getattr(self, "_reference_request_pending", False)
+        )
+        if deferred_motion_refresh:
+            # A same-action periodic refresh may have withdrawn vendor
+            # authority only a few milliseconds before Nav2 sends zero.  The
+            # old implementation treated that healthy async seam as a
+            # pre-grant emergency and dropped to Plant safety_stop.  Preserve
+            # the frozen actuator boundary, let the already-issued refresh
+            # finish, then replace it with the continuous learned-IDLE plan
+            # before any moving policy frame can be published.
+            reference_facing = getattr(
+                self._controller,
+                "current_reference_facing_angle",
+                None,
+            )
+            if not callable(reference_facing):
+                return False
+            self.guard.stop_at_measured_heading(
+                source="gait_adapter_controlled_stop",
+                facing_angle_rad=float(reference_facing()),
+            )
+            if not self._freeze_planner_handoff_boundary():
+                return False
+            self._static_hold_active = True
+            self._controlled_stop_active = True
+            self._controlled_stop_waiting_for_motion_refresh = True
+            self._balanced_policy_idle_active = False
+            self._controlled_stop_source_identity = identity
+            self._controlled_stop_reference_installed = False
+            self._navigation_task_active = False
+            return True
         if (
             already_active
             and correlated
@@ -1827,6 +1864,7 @@ class SonicDriver:
                 raise failures[0]
             self._static_hold_active = True
             self._controlled_stop_active = True
+            self._controlled_stop_waiting_for_motion_refresh = False
             self._balanced_policy_idle_active = False
             self._controlled_stop_source_identity = identity
             self._controlled_stop_reference_installed = False
@@ -1860,6 +1898,75 @@ class SonicDriver:
             self._controlled_stop_source_identity = identity
             self._reference_source_identity = identity
             self._reference_request_pending = request_still_needs_enqueue
+        self._navigation_task_active = False
+        return True
+
+    def _stage_controlled_stop_after_motion_refresh_locked(self) -> bool:
+        """Replace one completed moving refresh with learned IDLE.
+
+        The moving refresh is allowed to install only so the vendor planner's
+        cursor/history transaction remains well formed.  This method runs in
+        the same 50 Hz owner tick immediately after acquisition and before a
+        policy candidate is decoded, so no post-stop moving target can reach
+        DDS.
+        """
+
+        if not getattr(
+            self,
+            "_controlled_stop_waiting_for_motion_refresh",
+            False,
+        ):
+            return False
+        identity = getattr(self, "_controlled_stop_source_identity", None)
+        controller = self._controller
+        authority = self._reference_authority.snapshot
+        if (
+            identity is None
+            or len(identity) != 2
+            or authority.phase != "PRIMED"
+            or not bool(getattr(controller, "reference_authority", False))
+            or not bool(getattr(controller, "matching_reference_installed", False))
+            or bool(getattr(controller, "execution_feedback_pending", False))
+        ):
+            raise RuntimeError(
+                "completed motion refresh cannot transfer to controlled IDLE"
+            )
+        reference_facing = getattr(
+            controller,
+            "current_reference_facing_angle",
+            None,
+        )
+        if not callable(reference_facing):
+            raise RuntimeError(
+                "controlled stop lacks live reference-facing evidence"
+            )
+        live_facing = float(reference_facing())
+        if not math.isfinite(live_facing):
+            raise RuntimeError("controlled stop live reference facing is not finite")
+        self.guard.stop_at_measured_heading(
+            source="gait_adapter_controlled_stop",
+            facing_angle_rad=live_facing,
+        )
+        if not self._freeze_planner_handoff_boundary():
+            raise RuntimeError(
+                "controlled stop has no executed actuator boundary"
+            )
+        failures = self._withdraw_external_planner_authority_locked(
+            "completed motion refresh transfers directly to controlled IDLE"
+        )
+        if failures:
+            raise failures[0]
+        self._reference_authority.require(
+            generation=identity[0],
+            source_sequence=identity[1],
+        )
+        self._reference_source_identity = identity
+        self._reference_request_pending = True
+        self._reference_request_continuous = True
+        self._reference_request_continuous_motion = False
+        self._controlled_stop_waiting_for_motion_refresh = False
+        self._controlled_stop_reference_installed = False
+        self._static_hold_active = True
         self._navigation_task_active = False
         return True
 
@@ -2025,7 +2132,24 @@ class SonicDriver:
                     "GRANTED",
                 }
             )
-        return authority.phase == "GRANTED"
+        if authority.phase == "GRANTED":
+            return True
+        if (
+            authority.phase == "REQUIRED"
+            and getattr(self, "_reference_request_continuous_motion", False)
+        ):
+            # A request not yet handed to the vendor still has executable
+            # vendor authority and can be replaced immediately.  Once handed
+            # off, the exact same-action refresh is allowed to finish under a
+            # frozen DDS boundary and is converted to IDLE before decode.
+            pending = bool(getattr(self, "_reference_request_pending", False))
+            vendor_ready = bool(
+                getattr(controller, "reference_authority", False)
+                and getattr(controller, "matching_reference_installed", False)
+                and not getattr(controller, "execution_feedback_pending", False)
+            )
+            return (pending and vendor_ready) or (not pending and not vendor_ready)
+        return False
 
     def _freeze_planner_handoff_boundary(self) -> bool:
         """Start a new planner generation from the last actuator target.
@@ -3292,6 +3416,14 @@ class SonicDriver:
             getattr(self, "_controlled_stop_active", False)
             and intent.mode == "IDLE"
         )
+        deferred_controlled_stop = bool(
+            controlled_stop
+            and getattr(
+                self,
+                "_controlled_stop_waiting_for_motion_refresh",
+                False,
+            )
+        )
         if controlled_stop:
             # Once the correlated STOPPING transaction owns deceleration, the
             # zero command is driver-owned rather than a live Nav2 command.
@@ -3351,7 +3483,7 @@ class SonicDriver:
         )
         admitted = (
             False
-            if same_motion_transaction_inflight
+            if same_motion_transaction_inflight or deferred_controlled_stop
             else self._intent_gate.admit(intent, now=simulation_now_s)
         )
         # Every newly required motion generation, and every transition back to
@@ -4250,6 +4382,13 @@ class SonicDriver:
             continuous_motion = bool(
                 getattr(self, "_reference_request_continuous_motion", False)
             )
+            deferred_controlled_stop = bool(
+                getattr(
+                    self,
+                    "_controlled_stop_waiting_for_motion_refresh",
+                    False,
+                )
+            )
             if continuous_stop and continuous_motion:
                 raise RuntimeError(
                     "SONIC reference cannot be both controlled-stop and active-motion continuous"
@@ -4265,11 +4404,20 @@ class SonicDriver:
             controlled_stop = bool(
                 getattr(self, "_controlled_stop_active", False)
             )
-            if controlled_stop != continuous_stop:
+            if controlled_stop != continuous_stop and not (
+                deferred_controlled_stop
+                and controlled_stop
+                and continuous_motion
+                and not continuous_stop
+            ):
                 raise RuntimeError(
                     "controlled-stop reference lost its continuous-history identity"
                 )
-            if continuous_motion and controlled_stop:
+            if (
+                continuous_motion
+                and controlled_stop
+                and not deferred_controlled_stop
+            ):
                 raise RuntimeError(
                     "active-motion continuous reference cannot own a controlled stop"
                 )
@@ -4364,7 +4512,10 @@ class SonicDriver:
                 source_sequence=authority.source_sequence,
                 reference_epoch=epoch,
             )
-            if getattr(self, "_controlled_stop_active", False):
+            if (
+                getattr(self, "_controlled_stop_active", False)
+                and not deferred_controlled_stop
+            ):
                 controlled_identity = getattr(
                     self, "_controlled_stop_source_identity", None
                 )
@@ -4392,6 +4543,9 @@ class SonicDriver:
                 self._reference_request_continuous = False
             if continuous_motion:
                 self._reference_request_continuous_motion = False
+                if deferred_controlled_stop:
+                    self._stage_controlled_stop_after_motion_refresh_locked()
+                    return False
             # An earlier stop hold may be released only after the preserved
             # history and exact executed boundary have been atomically bound to
             # the newly accepted reference.

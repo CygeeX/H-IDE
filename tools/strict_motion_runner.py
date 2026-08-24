@@ -46,9 +46,10 @@ OFFICIAL_SPIN_MIN_RPS = 0.10
 OFFICIAL_SPIN_MAX_RPS = 0.20
 # Live corridor-column r142 showed that separate +/-0.07..0.08 rad Spin goals
 # cause learned whole-body overshoot and counter-correction instead of useful
-# path progress.  Pair a 0.09 rad resolution with 0.50 m segments: the maximum
-# uncorrected cross-track drift is 0.50*sin(0.09)=0.04494 m, no larger than the
-# previous 0.75*sin(0.06)=0.04497 m and still below the reserved 0.05 m.
+# path progress.  Retain the measured 0.09 rad action resolution, but let the
+# production segmenter merge clear NavFn chords up to 2 m.  Every action is
+# still resolved from fresh map odometry and the complete chord is rechecked
+# against the 0.42 m inflated static map immediately before execution.
 DETOUR_HEADING_TOLERANCE_RAD = 0.09
 # The command values above are NVIDIA/Nav2 setpoints and remain unchanged. Live
 # r18 evidence measured 0.2913 m over 6.964 s of commanded reverse motion

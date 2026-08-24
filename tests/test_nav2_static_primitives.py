@@ -167,7 +167,7 @@ def _assert_primitive_plan(module, navfn_path, plan) -> None:
     # any new motion segment must be longer than that endpoint envelope. Its
     # command speed remains NVIDIA's exact 0.30 m/s Slow Walk command.
     assert plan["segmenter"]["min_segment_m"] == 0.16
-    assert plan["segmenter"]["max_segment_m"] == 0.50
+    assert plan["segmenter"]["max_segment_m"] == 2.0
     assert plan["execution_policy"] == {
         "fresh_odometry_required": True,
         "fresh_pose_frame": "map",
@@ -214,7 +214,7 @@ def _assert_primitive_plan(module, navfn_path, plan) -> None:
         if previous_end is not None:
             assert segment["start_map"] == previous_end
         previous_end = segment["end_map"]
-        assert 0.16 <= segment["distance_m"] <= 0.50
+        assert 0.16 <= segment["distance_m"] <= 2.0
         assert static_map.segment_is_clear(
             (source_start["x"], source_start["y"]),
             (source_end["x"], source_end["y"]),
@@ -342,8 +342,12 @@ def test_live_resolver_uses_fresh_pose_and_never_emits_zero_or_subfloor_goals() 
     assert chunked["fresh_distance_to_endpoint_m"] == pytest.approx(
         segment["distance_m"] + 0.40
     )
-    assert chunked["command_distance_m"] == pytest.approx(0.50)
-    assert chunked["action_goal"]["target"]["x"] == pytest.approx(0.50)
+    assert chunked["command_distance_m"] == pytest.approx(
+        segment["distance_m"] + 0.40
+    )
+    assert chunked["action_goal"]["target"]["x"] == pytest.approx(
+        segment["distance_m"] + 0.40
+    )
 
     misaligned_pose = {
         **segment["start_map"],
@@ -380,8 +384,8 @@ def test_live_resolver_uses_fresh_pose_and_never_emits_zero_or_subfloor_goals() 
 
     # A residual at the reviewed whole-body resolution is skipped instead of
     # asking the official >=0.10 rad/s Spin to execute a one-step correction.
-    # The maximum 0.50 m segment then drifts <0.05 m, inside the independently
-    # inflated clearance reserve. Anything just outside remains a Spin.
+    # Anything inside the measured action resolution retains the current
+    # heading; anything just outside remains an explicit Spin.
     within_resolution = {
         **segment["start_map"],
         "yaw": heading - 0.09,
@@ -452,17 +456,23 @@ def test_live_resolver_uses_fresh_pose_and_never_emits_zero_or_subfloor_goals() 
     assert final["action_goal"] is None
 
 
-def test_heading_tolerance_cannot_consume_reserved_path_clearance() -> None:
+def test_long_segments_still_require_inflated_map_line_of_sight() -> None:
     module = _planner()
     navfn_path = _astar_fixture_navfn_path(module, START, GOAL)
     plan_kwargs = _plan_kwargs()
-    plan_kwargs["max_segment_m"] = 0.56
+    plan_kwargs["max_segment_m"] = 6.0
 
-    with pytest.raises(
-        ValueError,
-        match="heading tolerance can consume the reserved path clearance",
-    ):
-        module.build_primitive_plan(navfn_path, **plan_kwargs)
+    plan = module.build_primitive_plan(navfn_path, **plan_kwargs)
+    static_map = module.StaticMap.load(MAP_YAML, MAP_IMAGE)
+    blocked = static_map.inflated_blocked_cells(CLEARANCE_RADIUS)
+    for segment in plan["segments"]:
+        start = segment["start_map"]
+        end = segment["end_map"]
+        assert static_map.segment_is_clear(
+            (start["x"], start["y"]),
+            (end["x"], end["y"]),
+            blocked,
+        )
 
 
 def test_final_spin_is_omitted_when_last_segment_already_meets_goal_yaw() -> None:

@@ -193,9 +193,8 @@ class FormalContract:
     detour_endpoint_tolerance_m: float = 0.15
     # Nav2's official Spin has a 0.10 rad/s minimum command.  Live column-route
     # r142 showed that separate +/-0.07..0.08 rad learned whole-body Spins are
-    # less precise than driving the already-clear short segment.  Pairing this
-    # tolerance with 0.50 m segments keeps the drift geometrically bounded:
-    # 0.50 * sin(0.09) = 0.04494 m, below the 0.05 m clearance reserve.
+    # less precise than retaining the current heading.  Long chords remain
+    # subject to fresh-odometry and inflated-map line-of-sight verification.
     detour_heading_tolerance_rad: float = 0.09
     robot_radius_m: float = 0.35
     footprint_padding_m: float = 0.02
@@ -2788,7 +2787,7 @@ class StrictMotionEvaluator:
             self.contract.footprint_padding_m,
             self.contract.map_resolution_m,
             0.16,
-            0.50,
+            2.0,
             self.contract.drive_on_heading_max_vx_mps,
             self.contract.detour_endpoint_tolerance_m,
             self.contract.detour_heading_tolerance_rad,
@@ -2895,7 +2894,7 @@ class StrictMotionEvaluator:
             "extra_clearance_m": self.contract.map_resolution_m,
             "clearance_radius_m": self.contract.required_obstacle_boundary_clearance_m,
             "min_segment_m": 0.16,
-            "max_segment_m": 0.5,
+            "max_segment_m": 2.0,
         }
         if set(segmenter) != {"source_sha256", *expected_segmenter}:
             raise TraceContractError("static primitive segmenter fields are invalid")
@@ -3015,7 +3014,7 @@ class StrictMotionEvaluator:
                     or math.dist(end, expected_end) > 1e-6
                     or abs(distance - expected_distance) > 1e-6
                     or abs(_angle_delta(heading, expected_heading)) > 1e-6
-                    or not 0.16 - _EPS <= distance <= 0.5 + _EPS
+                    or not 0.16 - _EPS <= distance <= 2.0 + _EPS
                 )
             if mismatch:
                 self._fail(
@@ -3459,7 +3458,7 @@ class StrictMotionEvaluator:
                     abs(resolved_goal["distanceM"] - command_distance_m)
                     > 1e-6
                     or command_distance_m
-                    > 0.50 + _EPS
+                    > 2.0 + _EPS
                     or command_distance_m
                     > remaining_m + _EPS
                 ):

@@ -491,6 +491,7 @@ def _rebuild_detour_trace(
 ) -> None:
     if final_yaw is None:
         final_yaw = float(trace["action"]["goal"]["yaw"])
+    navfn_source_path = list(path)
     # Execute the production segmenter's endpoints, not the sparse NavFn
     # fixture poses.  The production planner may shorten its maximum segment
     # while retaining the exact NavFn path provenance.
@@ -752,7 +753,7 @@ def _rebuild_detour_trace(
     for segment in public_segments:
         fresh = segment["freshOdometry"]
         segment["resolverResult"] = copy.deepcopy(_cached_resolver_result(
-            tuple(path),
+            tuple(navfn_source_path),
             final_yaw,
             segment["primitiveSequence"],
             fresh["x"],

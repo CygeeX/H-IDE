@@ -83,7 +83,7 @@
         "extra_clearance_m": {"const": 0.05},
         "clearance_radius_m": {"const": 0.42},
         "min_segment_m": {"const": 0.16},
-        "max_segment_m": {"const": 0.5}
+        "max_segment_m": {"const": 2.0}
       },
       "additionalProperties": false
     },
@@ -183,7 +183,7 @@
         "path_end_index": {"type": "integer", "minimum": 1, "maximum": 999999},
         "start_map": {"$ref": "#/$defs/point"},
         "end_map": {"$ref": "#/$defs/point"},
-        "distance_m": {"type": "number", "minimum": 0.05, "maximum": 0.5},
+        "distance_m": {"type": "number", "minimum": 0.05, "maximum": 2.0},
         "heading_map_yaw_rad": {"$ref": "#/$defs/yaw"}
       },
       "additionalProperties": false

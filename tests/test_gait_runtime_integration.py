@@ -2790,6 +2790,131 @@ def test_same_spin_replan_preserves_vendor_cursor_instead_of_rebasing_measured_h
     assert driver._reference_authority.snapshot.phase == "PRIMED"
 
 
+def test_zero_command_waits_for_inflight_motion_refresh_then_enters_learned_idle() -> None:
+    """The live r151 40 ms refresh/zero race must remain a normal stop.
+
+    A periodic same-action request has already withdrawn vendor authority when
+    STOPPING arrives.  Finish that request only to preserve cursor/history,
+    replace it with IDLE before decode, and never fall back to Plant
+    safety_stop merely because the two asynchronous messages overlapped.
+    """
+
+    clock = Clock()
+    driver = bare_driver(clock)
+    boundary = tuple(0.0 for _ in range(29))
+    lowstate = _lowstate(boundary)
+    driver._last_published_targets = boundary
+    driver._joint_handoff = StaticJointHandoff(warmup_s=0.0, blend_s=0.01)
+    driver._joint_handoff.freeze(boundary)
+    driver._reference_source_identity = (42, 7)
+    driver._navigation_task_active = True
+    driver._intent_gate = ReplanIntentGate()
+    driver._decoder_facing_rad = None
+    driver._pending_decoder_heading_delta_rad = 0.0
+    driver._last_intent_signature = None
+    driver._policy_activation = SimpleNamespace(prepared=True)
+    driver._policy_activation_requested = False
+    evidence = _TransactionalEvidence()
+    driver._planner_evidence = evidence
+    controller = _TransactionalController(evidence, boundary)
+    driver._controller = controller
+
+    first = MovementIntent("SLOW_WALK", 0.0, 0.052, 0.052, False, False)
+    second = MovementIntent("SLOW_WALK", 0.0, 0.356, 0.356, False, False)
+    intents = [first, second]
+    driver.guard = SimpleNamespace(
+        intent=lambda **_kwargs: intents.pop(0),
+        last_received_at=clock.value,
+    )
+    assert driver._apply_intent(0.02, simulation_now_s=1.0) is first
+    assert driver._progress_reference_transaction(lowstate) is False
+    controller.install_ready = True
+    assert driver._progress_reference_transaction(lowstate) is True
+    first_epoch = driver._reference_authority.snapshot.reference_epoch
+    driver._reference_authority.grant(
+        generation=42,
+        source_sequence=7,
+        reference_epoch=first_epoch,
+        granted_at_monotonic_s=clock.value,
+        granted_at_tick_ms=1_020,
+        dds_target_sequence=1,
+    )
+
+    assert driver._apply_intent(0.02, simulation_now_s=1.40) is second
+    assert driver._reference_request_continuous_motion is True
+    assert driver._progress_reference_transaction(lowstate) is False
+    assert controller.continuous_motion_request_calls == 1
+    assert controller.reference_authority is False
+    assert driver._reference_authority.snapshot.phase == "REQUIRED"
+
+    live_idle = MovementIntent(
+        mode="IDLE",
+        speed_mps=0.0,
+        movement_angle_rad=0.0,
+        facing_angle_rad=0.0,
+        has_movement=False,
+        stale=False,
+        source="gait_adapter_controlled_stop",
+    )
+
+    class StopGuard:
+        last_received_at = clock.value
+        target_zero = True
+        command_zero = True
+
+        @staticmethod
+        def intent(**_kwargs):
+            return live_idle
+
+        @staticmethod
+        def stop_at_measured_heading(**_kwargs):
+            return None
+
+    driver.guard = StopGuard()
+    driver._intent_ingress.armed = True
+    driver._intent_ingress.braking = True
+    stop = IngressDecision(
+        action="brake",
+        generation=42,
+        sequence=8,
+        state="STOPPING",
+    )
+    with driver._support_lock:
+        assert driver._begin_controlled_policy_stop_locked(stop) is True
+    assert driver._controlled_stop_waiting_for_motion_refresh is True
+    assert driver._controlled_stop_active is True
+    assert driver._safe_hold_targets is None
+
+    # The stop does not replace planner/evidence state until the already-sent
+    # moving refresh has returned.
+    observed = driver._apply_intent(0.02, simulation_now_s=1.42)
+    assert observed == live_idle
+    assert driver._intent_gate.last is second
+    assert evidence.intent_generation == 2
+    controller.install_ready = True
+    assert driver._progress_reference_transaction(lowstate) is False
+
+    # No moving candidate was decoded.  The exact acquired cursor is now the
+    # base of one continuous IDLE request owned by the STOPPING sequence.
+    assert controller.run_calls == 0
+    assert driver._controlled_stop_waiting_for_motion_refresh is False
+    assert driver._reference_request_continuous_motion is False
+    assert driver._reference_request_continuous is True
+    assert driver._reference_request_pending is True
+    required = driver._reference_authority.snapshot
+    assert required.phase == "REQUIRED"
+    assert required.source_sequence == 8
+
+    driver._apply_intent(0.02, simulation_now_s=1.44)
+    assert evidence.intent_generation == 3
+    assert driver._progress_reference_transaction(lowstate) is False
+    assert controller.continuous_request_calls == 1
+    controller.install_ready = True
+    assert driver._progress_reference_transaction(lowstate) is True
+    assert driver._reference_authority.snapshot.phase == "PRIMED"
+    assert driver._controlled_stop_reference_installed is True
+
+
 def test_same_motion_target_is_not_mutated_while_continuous_reference_is_pending() -> None:
     clock = Clock()
     driver = bare_driver(clock)
