@@ -104,6 +104,80 @@ def test_periodic_refresh_primes_new_epoch_without_exposing_old_grant() -> None:
     assert refreshed.dds_target_sequence is None
 
 
+def test_newer_same_intent_epoch_may_supersede_only_an_ungranted_candidate() -> None:
+    state = ReferenceAuthorityState()
+    state.require(generation=5, source_sequence=9)
+    state.mark_installed(
+        generation=5,
+        source_sequence=9,
+        planner_intent_generation=2,
+        reference_epoch=4,
+    )
+    state.prime(generation=5, source_sequence=9, reference_epoch=4)
+
+    with pytest.raises(ValueError, match="intent generation"):
+        state.supersede_primed(
+            generation=5,
+            source_sequence=9,
+            planner_intent_generation=3,
+            reference_epoch=5,
+        )
+    superseded = state.supersede_primed(
+        generation=5,
+        source_sequence=9,
+        planner_intent_generation=2,
+        reference_epoch=5,
+    )
+    assert superseded.phase == "PRIMED"
+    assert superseded.actuator_authority is False
+    assert superseded.reference_epoch == 5
+    assert superseded.granted_at_monotonic_s is None
+    assert superseded.dds_target_sequence is None
+
+    with pytest.raises(ValueError, match="did not advance"):
+        state.supersede_primed(
+            generation=5,
+            source_sequence=9,
+            planner_intent_generation=2,
+            reference_epoch=5,
+        )
+
+
+def test_many_same_intent_primed_refreshes_never_grant_before_dds() -> None:
+    state = ReferenceAuthorityState()
+    state.require(generation=7, source_sequence=11)
+    state.mark_installed(
+        generation=7,
+        source_sequence=11,
+        planner_intent_generation=3,
+        reference_epoch=2,
+    )
+    state.prime(generation=7, source_sequence=11, reference_epoch=2)
+
+    for reference_epoch in range(3, 203):
+        superseded = state.supersede_primed(
+            generation=7,
+            source_sequence=11,
+            planner_intent_generation=3,
+            reference_epoch=reference_epoch,
+        )
+        assert superseded.phase == "PRIMED"
+        assert superseded.actuator_authority is False
+        assert superseded.dds_target_sequence is None
+
+    granted = state.grant(
+        generation=7,
+        source_sequence=11,
+        reference_epoch=202,
+        granted_at_monotonic_s=4.0,
+        granted_at_tick_ms=4_000,
+        dds_target_sequence=19,
+    )
+    assert granted.phase == "GRANTED"
+    assert granted.actuator_authority is True
+    assert granted.reference_epoch == 202
+
+
 def test_controlled_stop_transition_rebinds_new_intent_at_the_installed_epoch() -> None:
     state = ReferenceAuthorityState()
     state.require(generation=5, source_sequence=9)

@@ -4415,9 +4415,12 @@ class SonicDriver:
                 # that exact pending epoch/cursor internally, but never grants
                 # it outer actuator authority.
                 return
-            if authority.phase != "GRANTED":
+            if authority.phase not in {"PRIMED", "GRANTED"}:
                 raise RuntimeError(
-                    "SONIC candidate changed reference epoch without granted authority"
+                    "SONIC candidate changed reference epoch outside a matching "
+                    f"candidate transaction (phase={authority.phase}, "
+                    f"authority_epoch={authority.reference_epoch}, "
+                    f"candidate_epoch={epoch})"
                 )
             if not controller.execution_feedback_pending:
                 raise RuntimeError(
@@ -4460,15 +4463,23 @@ class SonicDriver:
                         raise RuntimeError(
                             "installed controlled-stop reference changed identity"
                         )
-                    self._reference_authority.refresh(
+                    transition = (
+                        self._reference_authority.refresh
+                        if authority.phase == "GRANTED"
+                        else self._reference_authority.supersede_primed
+                    )
+                    transition(
                         generation=authority.generation,
                         source_sequence=authority.source_sequence,
-                        planner_intent_generation=(
-                            authority.planner_intent_generation
-                        ),
+                        planner_intent_generation=authority.planner_intent_generation,
                         reference_epoch=epoch,
                     )
                     return
+                if authority.phase != "GRANTED":
+                    raise RuntimeError(
+                        "uninstalled controlled-stop reference cannot supersede "
+                        "an ungranted candidate"
+                    )
                 if (
                     proof.accepted_intent_generation is None
                     or proof.accepted_intent_generation
@@ -4493,7 +4504,12 @@ class SonicDriver:
                 raise RuntimeError(
                     "periodic SONIC refresh changed planner intent generation"
                 )
-            self._reference_authority.refresh(
+            transition = (
+                self._reference_authority.refresh
+                if authority.phase == "GRANTED"
+                else self._reference_authority.supersede_primed
+            )
+            transition(
                 generation=authority.generation,
                 source_sequence=authority.source_sequence,
                 planner_intent_generation=authority.planner_intent_generation,

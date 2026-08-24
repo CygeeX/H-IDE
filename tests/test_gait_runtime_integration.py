@@ -3261,7 +3261,16 @@ def test_reference_execution_is_transactional_across_grant_refresh_and_stop_race
     assert primed.reference_epoch == 2
     assert primed.actuator_authority is False
     assert controller.acquire_calls == [boundary]
+    # The async planner may already have another matching same-intent result
+    # queued when the first candidate is decoded.  It supersedes epoch 2 while
+    # authority is still PRIMED; neither epoch has actuator authority until
+    # this exact candidate crosses DDS.
+    controller.refresh_ready = True
     driver._run_policy_candidate(lowstate)
+    superseded = driver._reference_authority.snapshot
+    assert superseded.phase == "PRIMED"
+    assert superseded.reference_epoch == 3
+    assert superseded.actuator_authority is False
     first = driver._joint_handoff.decide(
         motion_active=True,
         reference_ready=driver._reference_authority.executable,
@@ -3281,17 +3290,17 @@ def test_reference_execution_is_transactional_across_grant_refresh_and_stop_race
     assert controller.commits[-1] == pytest.approx(target)
     assert controller.controller.ref_cursor == 1
     assert granted.phase == "GRANTED"
-    assert granted.reference_epoch == 2
+    assert granted.reference_epoch == 3
     assert granted.dds_target_sequence == 2
 
     # A periodic result is installed before decode. The old epoch loses health
     # authority atomically, and only the new epoch's successful DDS write grants.
     controller.refresh_ready = True
     driver._run_policy_candidate(lowstate)
-    assert controller.reference_install_epoch == 3
+    assert controller.reference_install_epoch == 4
     refreshed = driver._reference_authority.snapshot
     assert refreshed.phase == "PRIMED"
-    assert refreshed.reference_epoch == 3
+    assert refreshed.reference_epoch == 4
     assert refreshed.actuator_authority is False
     driver._publish(
         _action(driver, target),
@@ -3301,7 +3310,7 @@ def test_reference_execution_is_transactional_across_grant_refresh_and_stop_race
         constrain_arms=False,
     )
     assert driver._reference_authority.snapshot.phase == "GRANTED"
-    assert driver._reference_authority.snapshot.reference_epoch == 3
+    assert driver._reference_authority.snapshot.reference_epoch == 4
     assert controller.controller.ref_cursor == 2
 
     # Stop wins after decode. The frozen target, not the discarded candidate,

@@ -239,6 +239,49 @@ class ReferenceAuthorityState:
         )
         return self._snapshot
 
+    def supersede_primed(
+        self,
+        *,
+        generation: int,
+        source_sequence: int,
+        planner_intent_generation: int,
+        reference_epoch: int,
+    ) -> ReferenceAuthoritySnapshot:
+        """Replace an ungranted candidate with a newer same-intent epoch.
+
+        The asynchronous planner may finish another matching refresh after a
+        reference has been installed/primed but before that reference's first
+        candidate crosses DDS.  No actuator authority exists in this phase, so
+        binding the pending candidate to the newer epoch preserves the same
+        transaction: only that candidate's successful DDS write may grant it.
+        """
+
+        self._require_identity(generation, source_sequence, phase="PRIMED")
+        planner_intent_generation = _integer(
+            planner_intent_generation,
+            name="planner_intent_generation",
+            minimum=1,
+        )
+        reference_epoch = _integer(
+            reference_epoch,
+            name="reference_epoch",
+            minimum=1,
+        )
+        current = self._snapshot
+        if planner_intent_generation != current.planner_intent_generation:
+            raise ValueError("superseding planner intent generation mismatch")
+        if reference_epoch <= current.reference_epoch:
+            raise ValueError("superseding reference epoch did not advance")
+        self._snapshot = replace(
+            current,
+            reference_epoch=reference_epoch,
+            reason=(
+                "newer matching reference superseded the ungranted candidate; "
+                "awaiting its first DDS target"
+            ),
+        )
+        return self._snapshot
+
     def transition(
         self,
         *,
