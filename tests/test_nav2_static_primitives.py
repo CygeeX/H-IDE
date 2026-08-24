@@ -364,6 +364,8 @@ def test_live_resolver_uses_fresh_pose_and_never_emits_zero_or_subfloor_goals() 
         "primitive_sequence": 2 * short_segment_index + 1,
         "plan_sha256": plan["plan_sha256"],
         "fresh_odometry_used": True,
+        "planning_clearance_radius_m": pytest.approx(0.42),
+        "live_execution_clearance_radius_m": pytest.approx(0.42),
         "disposition": "realign_spin_required",
         "action_goal": None,
         "fresh_distance_to_endpoint_m": pytest.approx(segment["distance_m"]),
@@ -473,6 +475,53 @@ def test_long_segments_still_require_inflated_map_line_of_sight() -> None:
             (end["x"], end["y"]),
             blocked,
         )
+
+
+def test_live_revalidation_uses_physical_envelope_after_a_successful_action(
+) -> None:
+    module = _planner()
+    navfn_path = _astar_fixture_navfn_path(module, (-6.45, 0.0), (6.1, 0.0))
+    plan = _build(module, navfn_path)
+    segment_index = 3
+    segment = plan["segments"][segment_index]
+    endpoint = segment["end_map"]
+    current = {"x": -0.3772, "y": 0.5273}
+    current["yaw"] = math.atan2(
+        endpoint["y"] - current["y"],
+        endpoint["x"] - current["x"],
+    )
+    static_map = module.StaticMap.load(MAP_YAML, MAP_IMAGE)
+    start = (current["x"], current["y"])
+    end = (endpoint["x"], endpoint["y"])
+
+    assert not static_map.segment_is_clear(
+        start,
+        end,
+        static_map.inflated_blocked_cells(CLEARANCE_RADIUS),
+    )
+    assert static_map.segment_is_clear(
+        start,
+        end,
+        static_map.inflated_blocked_cells(
+            module.RELAXED_LIVE_EXECUTION_CLEARANCE_RADIUS_M
+        ),
+    )
+
+    resolved = module.resolve_live_primitive(
+        plan,
+        2 * segment_index + 1,
+        navfn_path,
+        current,
+        live_execution_clearance_radius_m=(
+            module.RELAXED_LIVE_EXECUTION_CLEARANCE_RADIUS_M
+        ),
+        **_plan_kwargs(),
+    )
+
+    assert resolved["disposition"] == "send_action"
+    assert resolved["action_type"] == "nav2_msgs/action/DriveOnHeading"
+    assert resolved["planning_clearance_radius_m"] == pytest.approx(0.42)
+    assert resolved["live_execution_clearance_radius_m"] == pytest.approx(0.25)
 
 
 def test_final_spin_is_omitted_when_last_segment_already_meets_goal_yaw() -> None:

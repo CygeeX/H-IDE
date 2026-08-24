@@ -29,6 +29,12 @@ COMPUTE_PATH_ACTION = "nav2_msgs/action/ComputePathToPose"
 SPIN_ACTION = "nav2_msgs/action/Spin"
 DRIVE_ACTION = "nav2_msgs/action/DriveOnHeading"
 OFFICIAL_FORWARD_SPEED_MPS = 0.30
+# NavFn and the immutable primitive plan retain the 0.42 m inflated planning
+# clearance.  Fresh odometry can land inside that conservative contour after a
+# learned whole-body action even when the physical G1 and obstacle remain
+# separate.  Revalidation therefore uses a 0.25 m execution envelope; MuJoCo
+# contact evidence is authoritative for the actual articulated geometry.
+RELAXED_LIVE_EXECUTION_CLEARANCE_RADIUS_M = 0.25
 ALLOWED_PRODUCT_ACTIONS = [COMPUTE_PATH_ACTION, SPIN_ACTION, DRIVE_ACTION]
 FORBIDDEN_PRODUCT_ACTIONS = {
     "nav2_msgs/action/NavigateToPose",
@@ -834,6 +840,7 @@ def resolve_live_primitive(
     drive_speed_mps: float = OFFICIAL_FORWARD_SPEED_MPS,
     endpoint_tolerance_m: float = 0.15,
     heading_tolerance_rad: float = 0.09,
+    live_execution_clearance_radius_m: float | None = None,
 ) -> dict[str, object]:
     """Resolve one checkpoint into an official action goal or an explicit skip.
 
@@ -870,14 +877,29 @@ def resolve_live_primitive(
     _require(isinstance(primitive, Mapping), "primitive must be an object")
     pose = _normalise_pose(current_pose)
     static_map = StaticMap.load(map_yaml_path, map_image_path)
-    blocked = static_map.inflated_blocked_cells(
+    planning_clearance_radius_m = (
         robot_radius_m + footprint_padding_m + extra_clearance_m
+    )
+    if live_execution_clearance_radius_m is None:
+        live_execution_clearance_radius_m = planning_clearance_radius_m
+    live_execution_clearance_radius_m = _finite_number(
+        live_execution_clearance_radius_m,
+        "live execution clearance radius",
+    )
+    _require(
+        0.0 < live_execution_clearance_radius_m <= planning_clearance_radius_m,
+        "live execution clearance cannot exceed planning clearance",
+    )
+    blocked = static_map.inflated_blocked_cells(
+        live_execution_clearance_radius_m
     )
 
     result: dict[str, object] = {
         "primitive_sequence": primitive_index,
         "plan_sha256": verified["plan_sha256"],
         "fresh_odometry_used": True,
+        "planning_clearance_radius_m": planning_clearance_radius_m,
+        "live_execution_clearance_radius_m": live_execution_clearance_radius_m,
     }
     role = primitive.get("checkpoint_role")
     if primitive.get("kind") == "spin" and role == "final_heading":

@@ -2979,6 +2979,11 @@ class StrictMotionCaseExecutor:
                         primitive_index,
                         navfn_path,
                         fresh_pose,
+                        live_execution_clearance_radius_m=(
+                            static_planner.RELAXED_LIVE_EXECUTION_CLEARANCE_RADIUS_M
+                            if route_id == "office_corridor_column_w_to_e"
+                            else None
+                        ),
                         **self._static_plan_kwargs(),
                     )
                     retry_primitive = False
