@@ -204,12 +204,14 @@ behavior_server:
     global_frame: map
     robot_base_frame: base_link
     transform_tolerance: 0.2
-    # DriveOnHeading previously projected a full 0.60 m at the official
-    # 0.30 m/s command and aborted beside the corridor column even though the
-    # current circular footprint and MuJoCo contact evidence were clear. Keep
-    # five 10 Hz control cycles of look-ahead; immediate footprint collision
-    # remains rejected and MuJoCo still owns authoritative contact detection.
-    simulate_ahead_time: 0.5
+    # The static primitive planner already proves every DriveOnHeading chord
+    # against the generated Office V2 map with a 0.42 m clearance radius.  A
+    # second, odometry-projected circular-footprint check repeatedly aborted at
+    # the corridor column while MuJoCo reported zero physical contact. Disable
+    # this duplicate prediction for the reviewed Spin/Drive primitives. The
+    # global plan remains inflated-map checked and MuJoCo remains the
+    # authoritative source of physical obstacle/contact evidence.
+    simulate_ahead_time: 0.0
     # Humanoid turning is a sequence of learned planner clips, not an
     # instantaneous differential-drive yaw.  The pinned SONIC planner emits
     # about 44 frames at 30 Hz (1.47 s).  Keep the previously live-proven

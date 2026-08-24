@@ -250,6 +250,11 @@ def test_official_primitive_actions_share_the_reviewed_sonic_envelope() -> None:
     assert behavior["min_rotational_vel"] == 0.1
     assert behavior["max_rotational_vel"] == 0.2
     assert behavior["rotational_acc_lim"] == 0.3
+    # Static primitives are already line-of-sight checked against a 0.42 m
+    # inflated Office V2 map. Do not let Nav2's duplicate odometry projection
+    # reject a physically clear chord beside the column; MuJoCo contact
+    # evidence remains authoritative at execution time.
+    assert behavior["simulate_ahead_time"] == 0.0
 
     # The pinned planner emits about 44 frames at 30 Hz. SONIC admits a new
     # pure-rotation reference after each 0.30 rad command-facing change. Keep
