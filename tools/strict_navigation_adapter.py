@@ -228,6 +228,57 @@ class StrictNavigationExecutor:
         except Exception:
             pass
 
+    def _finish_relaxed_terminal_pose(
+        self,
+        goal: runner.PlanarPose,
+        *,
+        plan_sha256: str,
+        plan_attempt: int,
+        completed_primitives: int,
+        cancelled: Callable[[], bool],
+    ) -> NavigationResult | None:
+        """Finish a previously reviewed route from its physical endpoint.
+
+        Learned ``DriveOnHeading`` is intentionally accepted inside the
+        reviewed 0.35 m physical endpoint after it has made real progress.  A
+        subsequent NavFn recovery can produce a residual that is too short to
+        partition even though the robot is already inside that same endpoint
+        envelope.  In that case, do not backtrack or abort: keep the last
+        verified plan provenance and execute only the collision-checked Nav2
+        ``Spin`` needed to satisfy the requested final heading.
+
+        This path is unavailable before at least one static plan has been
+        verified, so an arbitrary near-goal request cannot bypass planning.
+        """
+
+        if not plan_sha256:
+            return None
+        fresh = self.backend.wait_fresh_map_pose()
+        distance = math.hypot(goal.x - fresh.pose.x, goal.y - fresh.pose.y)
+        if distance > runner.DETOUR_COMPLETED_ENDPOINT_TOLERANCE_M:
+            return None
+        delta = math.atan2(
+            math.sin(goal.yaw - fresh.pose.yaw),
+            math.cos(goal.yaw - fresh.pose.yaw),
+        )
+        completed = completed_primitives
+        if abs(delta) > runner.DETOUR_HEADING_TOLERANCE_RAD:
+            self._execute_resolved(
+                {
+                    "action_type": "nav2_msgs/action/Spin",
+                    "action_goal": {"target_yaw_rad": delta},
+                },
+                cancelled=cancelled,
+            )
+            completed += 1
+        final = self.backend.wait_fresh_map_pose().pose
+        return NavigationResult(
+            final_pose=final,
+            plan_sha256=plan_sha256,
+            completed_primitives=completed,
+            plan_attempts=plan_attempt,
+        )
+
     def navigate(
         self,
         goal: runner.PlanarPose,
@@ -249,9 +300,21 @@ class StrictNavigationExecutor:
                         "strict navigation exceeded its command timeout"
                     )
                 navfn_path = self.backend.compute_path(goal, timeout_s=10.0)
-                plan = self.static_planner.build_primitive_plan(
-                    navfn_path, **self._plan_kwargs()
-                )
+                try:
+                    plan = self.static_planner.build_primitive_plan(
+                        navfn_path, **self._plan_kwargs()
+                    )
+                except Exception:
+                    terminal = self._finish_relaxed_terminal_pose(
+                        goal,
+                        plan_sha256=final_plan_hash,
+                        plan_attempt=plan_attempt,
+                        completed_primitives=completed,
+                        cancelled=cancelled,
+                    )
+                    if terminal is not None:
+                        return terminal
+                    raise
                 verified = self.static_planner.verify_primitive_plan(
                     plan, navfn_path, **self._plan_kwargs()
                 )

@@ -283,6 +283,57 @@ def test_fresh_geometry_failure_replans_at_most_twice() -> None:
     assert result.plan_sha256 == "plan-2"
 
 
+def test_replan_partition_failure_finishes_inside_reviewed_physical_endpoint() -> None:
+    backend = FakeBackend()
+
+    class NearGoalReplanPlanner(FakePlanner):
+        def build_primitive_plan(self, navfn_path, **kwargs):
+            if self.plan_number == 1:
+                raise ValueError(
+                    "NavFn path cannot be partitioned into collision-free "
+                    "distance-bounded segments"
+                )
+            return super().build_primitive_plan(navfn_path, **kwargs)
+
+        def resolve_live_primitive(self, plan, index, navfn_path, pose, **kwargs):
+            backend.pose = runner.PlanarPose(0.82, 0.0, 0.0)
+            raise RuntimeError("fresh chord requires a bounded replan")
+
+    result = executor(backend, NearGoalReplanPlanner()).navigate(
+        runner.PlanarPose(1.0, 0.0, 0.5)
+    )
+
+    assert result.plan_sha256 == "plan-1"
+    assert result.plan_attempts == 2
+    assert result.completed_primitives == 1
+    assert result.final_pose == runner.PlanarPose(0.82, 0.0, 0.5)
+    assert backend.compute_calls == 2
+    assert backend.sent == [("Spin", pytest.approx(0.5))]
+
+
+def test_replan_partition_failure_outside_physical_endpoint_still_aborts() -> None:
+    backend = FakeBackend()
+
+    class FarReplanPlanner(FakePlanner):
+        def build_primitive_plan(self, navfn_path, **kwargs):
+            if self.plan_number == 1:
+                raise ValueError("route remains unpartitionable")
+            return super().build_primitive_plan(navfn_path, **kwargs)
+
+        def resolve_live_primitive(self, plan, index, navfn_path, pose, **kwargs):
+            backend.pose = runner.PlanarPose(0.40, 0.0, 0.0)
+            raise RuntimeError("fresh chord requires a bounded replan")
+
+    with pytest.raises(ValueError, match="route remains unpartitionable"):
+        executor(backend, FarReplanPlanner()).navigate(
+            runner.PlanarPose(1.0, 0.0, 0.5)
+        )
+
+    assert backend.compute_calls == 2
+    assert backend.sent == []
+    assert backend.cancel_calls == 1
+
+
 def test_forbidden_follow_path_fails_closed_and_publishes_zero() -> None:
     backend = FakeBackend()
     planner = FakePlanner(forbidden=True)
