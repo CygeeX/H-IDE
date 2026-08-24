@@ -1,6 +1,6 @@
 {
   "schema_version": "h-ide.sonic-model-lock/1",
-  "repository_revision_at_audit": "a5e782c7ba29af7424a469a4299f610e1d59d83e",
+  "repository_revision_at_audit": "d9ad0edfd6f7247992549db511889aa7c5db5b3a",
   "model_repository": {
     "repo_id": "nvidia/GEAR-SONIC",
     "revision": "9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2",
@@ -19,14 +19,14 @@
   "audited_runtime": {
     "config": {
       "path": "config/ros-headless.yaml",
-      "size": 3834,
-      "sha256": "46ce88942515ecb9467fa72b9b116e60fc68298e07046a6f81bd87a0bb3a0511"
+      "size": 4059,
+      "sha256": "696fe91a5552e80f05e0a84a0199e7113428b2cff8d5e4dded72667d6c724b0b"
     },
     "declared_model_revision": "9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2",
     "declared_lerobot_revision": "56b4087c40d7ee8e78e3485f78fe21e88679355b",
     "observed_lerobot_revision": "56b4087c40d7ee8e78e3485f78fe21e88679355b",
     "lock_safe": true,
-    "reason": "The reviewed ros-headless runtime selectors, ROS/Nav2 domain 232, isolated Unitree LowState/LowCmd domain 230, SONIC model bundle, exact LeRobot cold-start history and control source, official direction-speed mapping, actuator handoff, exact-epoch policy-owned fall-arrest release, bounded planner-reference waits, cursor-preserving same-action motion and pure-rotation replanning, history-preserving controlled IDLE stopping at the live planner-reference cursor facing, and terminal IDLE reference readaptation are reproducibly anchored by repository commit a5e782c7ba29af7424a469a4299f610e1d59d83e."
+    "reason": "The reviewed ros-headless runtime selectors, ROS/Nav2 domain 232, isolated Unitree LowState/LowCmd domain 230, SONIC model bundle, exact LeRobot cold-start history and control source, official direction-speed mapping, actuator handoff, one-time measured nominal activation with retained non-propulsive vertical/roll/pitch fall arrest, bounded planner-reference waits, cursor-preserving same-action motion and pure-rotation replanning, history-preserving controlled IDLE stopping at the live planner-reference cursor facing, terminal IDLE reference readaptation, and the strict NavFn-to-Spin/DriveOnHeading adapter are reproducibly anchored by repository commit d9ad0edfd6f7247992549db511889aa7c5db5b3a."
   },
   "profiles": {
     "sonic-official-default": {
