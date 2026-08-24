@@ -2516,6 +2516,110 @@ class SonicDriver:
             )
         return stopped_generation
 
+    def _record_confirmed_support_reengagement_locked(
+        self,
+        safety_stop_epoch: int,
+    ) -> None:
+        """Invalidate a prior support-off policy proof after Plant re-engages.
+
+        ``PlantSupportController`` binds fall-arrest re-engagement to the same
+        monotonically increasing safety-stop epoch returned by ``/support``.
+        Once that physical fact exists, a later control acquisition must run a
+        fresh measured INIT/settle transaction; treating the older support-off
+        activation as still PREPARED would skip the release handshake.
+
+        The caller owns ``_support_lock``.
+        """
+
+        activation = getattr(self, "_policy_activation", None)
+        if activation is None or not bool(
+            getattr(activation, "release_fall_arrest", False)
+        ):
+            return
+        if not bool(getattr(activation, "support_release_confirmed", False)):
+            return
+        activation.record_support_reengagement(safety_stop_epoch)
+        self._policy_activation_release_confirmed_epoch = None
+        self._reset_policy_activation_release_locked()
+
+    def _validate_and_record_support_reengagement_locked(
+        self,
+        state: Mapping[str, object],
+        safety_stop_epoch: int,
+    ) -> None:
+        """Consume Plant fall-arrest evidence before freezing learned balance.
+
+        The caller owns ``_support_lock``.  A completed support-off activation
+        requires an exact, same-epoch proof that the band is physically enabled
+        again; a mere ``mode`` string is not sufficient authority to replace
+        the learned balance controller with a static joint target.
+        """
+
+        activation = getattr(self, "_policy_activation", None)
+        if activation is None or not bool(
+            getattr(activation, "release_fall_arrest", False)
+        ):
+            return
+        if not bool(getattr(activation, "support_release_confirmed", False)):
+            return
+        if (
+            state.get("fallArrestAvailable") is not True
+            or state.get("fallArrestEnabled") is not True
+            or state.get("fallArrestReengagedSafetyStopEpoch")
+            != safety_stop_epoch
+        ):
+            raise RuntimeError(
+                "Plant safety stop did not prove same-epoch fall-arrest "
+                "re-engagement"
+            )
+        self._record_confirmed_support_reengagement_locked(safety_stop_epoch)
+
+    def _engage_plant_support_before_static_hold(self, *, reason: str) -> bool:
+        """Re-engage physical fall arrest before withdrawing learned balance.
+
+        This is the emergency boundary for an exiting ROS bridge or an
+        uncorrelated command-source loss.  Keep the last learned controller
+        output active while Plant atomically restores its non-propulsive
+        vertical/roll/pitch support, then freeze/revoke the exact DDS target.
+        If the first acknowledgement is lost, fall back to the stronger
+        idempotent stop helper, which fences software authority before retrying
+        Plant.
+        """
+
+        detail = str(reason).strip()[:512] or "uncontrolled IDLE requires support"
+        try:
+            state = set_plant_support(
+                "127.0.0.1",
+                self.config.plant_port,
+                "safety_stop",
+                timeout=0.30,
+            )
+            epoch = state.get("safetyStopEpoch")
+            if (
+                state.get("mode") != "safety_stop"
+                or state.get("safetyStopLatched") is not True
+                or state.get("fault") is not None
+                or isinstance(epoch, bool)
+                or not isinstance(epoch, int)
+                or epoch <= 0
+            ):
+                raise RuntimeError(
+                    "Plant did not confirm a non-fault safety-stop latch"
+                )
+            with self._support_lock:
+                self._validate_and_record_support_reengagement_locked(
+                    state,
+                    epoch,
+                )
+        except Exception:
+            # A timeout can mean Plant consumed the stronger request but its
+            # acknowledgement was lost.  Retry through the existing
+            # idempotent, software-first containment transaction.
+            return self._ensure_plant_support_stopped(reason=detail)
+
+        self._latch_plant_support_stop(reason=detail)
+        return True
+
     def _ensure_plant_support_stopped(self, *, reason: str) -> bool:
         """Strengthen Plant support after an uncertain/racing transition.
 
@@ -2583,6 +2687,20 @@ class SonicDriver:
             )
             return False
         self._latch_plant_support_stop(reason=reason)
+        epoch = state.get("safetyStopEpoch")
+        if isinstance(epoch, int) and not isinstance(epoch, bool) and epoch > 0:
+            try:
+                with self._support_lock:
+                    self._validate_and_record_support_reengagement_locked(
+                        state,
+                        epoch,
+                    )
+            except Exception as exc:
+                self._latch_terminal_fault(
+                    "Plant support re-engagement evidence failed: " + str(exc),
+                    boundary_already_stopped=True,
+                )
+                return False
         return True
 
     def _require_fresh_control_arm_health_locked(self, *, phase: str) -> None:
@@ -5071,6 +5189,36 @@ class SonicDriver:
                     and intent.mode == "IDLE"
                 )
                 if intent.mode == "IDLE" and not controlled_stop:
+                    with self._support_lock:
+                        activation = getattr(self, "_policy_activation", None)
+                        unsupported_static_hold = bool(
+                            activation is not None
+                            and bool(
+                                getattr(
+                                    activation,
+                                    "release_fall_arrest",
+                                    False,
+                                )
+                            )
+                            and bool(
+                                getattr(
+                                    activation,
+                                    "support_release_confirmed",
+                                    False,
+                                )
+                            )
+                            and not self._plant_support_safety_latched
+                        )
+                    if unsupported_static_hold:
+                        self._control_loop_stage = (
+                            "idle_fall_arrest_reengagement"
+                        )
+                        self._engage_plant_support_before_static_hold(
+                            reason=(
+                                "uncontrolled command source became IDLE after "
+                                "fall-arrest release"
+                            )
+                        )
                     self._control_loop_stage = "idle_position_hold"
                     with self._support_lock:
                         decision = self._joint_handoff.decide(
@@ -6203,6 +6351,11 @@ class SonicDriver:
                     )
 
                 assert plant_epoch is not None
+                # The bridge validates the raw Plant response, including the
+                # same-epoch physical fall-arrest proof, before constructing
+                # this identity-bound request. Invalidate the old support-off
+                # activation before withdrawing the learned IDLE controller.
+                self._record_confirmed_support_reengagement_locked(plant_epoch)
                 if getattr(self, "_normal_stop_policy_braking", False):
                     # Plant is already physically latched at this point. It is
                     # now safe to replace the learned IDLE balance controller
@@ -6996,6 +7149,15 @@ class SonicDriver:
             return None
         if payload.get("type") == "stop":
             reason = payload.get("reason")
+            if payload.get("source") == "bridge_shutdown":
+                self._engage_plant_support_before_static_hold(
+                    reason=(
+                        str(reason).strip()
+                        if reason
+                        else "ROS bridge process is shutting down"
+                    )
+                )
+                return None
             boundary_error: Exception | None = None
             with self._support_lock:
                 try:

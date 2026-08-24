@@ -265,6 +265,36 @@ class PlantSupportController:
                 updated_at=time.time(),
                 safety_stop_epoch=epoch,
             )
+            if value == "safety_stop" and self._fall_arrest_available:
+                # A static joint target cannot balance an unsupported floating
+                # humanoid.  Every ordinary safety-stop therefore restores the
+                # same non-propulsive vertical/roll/pitch fall arrest used by
+                # the recoverable motion-fault path before SONIC is allowed to
+                # freeze its exact DDS boundary.  Horizontal force and yaw
+                # torque remain disabled, so this cannot manufacture travel or
+                # heading.  Repeating an already-latched stop is idempotent and
+                # retains the original re-engagement epoch.
+                band = self._band_state
+                pending_release = command.fall_arrest_release_epoch_requested
+                release_was_pending = (
+                    pending_release is not None
+                    and band.enabled
+                    and band.release_epoch_confirmed != pending_release
+                )
+                reengaged_epoch = band.reengaged_safety_stop_epoch
+                if effective_mode != "safety_stop" or not band.enabled:
+                    reengaged_epoch = epoch
+                self._band_state = replace(
+                    band,
+                    enabled=True,
+                    release_epoch_rejected=(
+                        pending_release
+                        if release_was_pending
+                        else band.release_epoch_rejected
+                    ),
+                    reengaged_safety_stop_epoch=reengaged_epoch,
+                    updated_at=time.time(),
+                )
             return self.mode
 
     def rearm(self, generation: int) -> str:

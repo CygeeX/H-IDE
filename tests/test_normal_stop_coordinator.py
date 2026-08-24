@@ -5,6 +5,8 @@ import time
 from typing import Callable, Mapping
 from uuid import UUID
 
+import pytest
+
 from hide_mujoco_sonic.motion_fault import SonicHealth
 from hide_mujoco_sonic.normal_stop import NormalStopState
 from hide_mujoco_sonic.normal_stop_coordinator import (
@@ -198,6 +200,9 @@ def coordinator_fixture(
             "safetyStopEpoch": 9,
             "lastRearmGeneration": generation(),
             "fault": None,
+            "fallArrestAvailable": True,
+            "fallArrestEnabled": True,
+            "fallArrestReengagedSafetyStopEpoch": 9,
         }
 
     def probe_health(_request_id: UUID, timeout: float) -> SonicHealth:
@@ -221,6 +226,33 @@ def coordinator_fixture(
     )
     holder["value"] = coordinator
     return coordinator, events, driver
+
+
+def test_normal_stop_rejects_safety_stop_without_physical_fall_arrest_proof() -> None:
+    state = {
+        "mode": "safety_stop",
+        "safetyStopLatched": True,
+        "safetyStopEpoch": 9,
+        "lastRearmGeneration": 10,
+        "fault": None,
+        "fallArrestAvailable": True,
+        "fallArrestEnabled": False,
+        "fallArrestReengagedSafetyStopEpoch": None,
+    }
+
+    with pytest.raises(
+        RuntimeError,
+        match="correlated non-fault safety-stop latch",
+    ):
+        BridgeNormalStopCoordinator._successful_plant_evidence(state)
+
+    state["fallArrestEnabled"] = True
+    state["fallArrestReengagedSafetyStopEpoch"] = 8
+    with pytest.raises(
+        RuntimeError,
+        match="correlated non-fault safety-stop latch",
+    ):
+        BridgeNormalStopCoordinator._successful_plant_evidence(state)
 
 
 def run_and_observe(

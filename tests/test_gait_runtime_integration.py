@@ -627,6 +627,242 @@ def bare_driver(clock: Clock) -> SonicDriver:
     return driver
 
 
+def released_policy_activation(
+    targets: tuple[float, ...],
+) -> NominalPolicyActivation:
+    activation = NominalPolicyActivation(
+        joint_count=len(targets),
+        duration_s=3.0,
+        settle_consecutive_samples=1,
+    )
+    assert activation.begin(targets, tick_ms=0)
+    final = activation.propose(
+        targets,
+        measured=targets,
+        tick_ms=3_000,
+    )
+    assert activation.commit(final, final.targets)
+    assert activation.observe_settling(
+        nominal=targets,
+        measured=targets,
+        velocities=tuple(0.0 for _ in targets),
+        gyroscope=(0.0, 0.0, 0.0),
+        roll_rad=0.0,
+        pitch_rad=0.0,
+        tick_ms=3_020,
+    ).stage_complete
+    assert activation.record_support_release(activation.epoch)
+    assert activation.confirm_support_release(tick_ms=3_040)
+    assert activation.support_release_confirmed
+    return activation
+
+
+def test_bridge_shutdown_reengages_support_before_static_boundary(
+    monkeypatch,
+) -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    targets = tuple(0.01 * index for index in range(29))
+    activation = released_policy_activation(targets)
+    driver._policy_activation = activation
+    driver._policy_activation_release_epoch = activation.epoch
+    driver._policy_activation_release_confirmed_epoch = activation.epoch
+    driver._policy_activation_release_result = None
+    driver._policy_activation_release_error = None
+    driver._policy_activation_release_thread = None
+    driver._last_published_targets = targets
+    events: list[str] = []
+
+    def set_support(_host, _port, mode, **_kwargs):
+        events.append(f"plant:{mode}")
+        return {
+            "mode": "safety_stop",
+            "safetyStopLatched": True,
+            "safetyStopEpoch": 7,
+            "fault": None,
+            "fallArrestAvailable": True,
+            "fallArrestEnabled": True,
+            "fallArrestReengagedSafetyStopEpoch": 7,
+        }
+
+    def stop_boundary(*, source: str, publish_telemetry: bool) -> None:
+        events.append(f"boundary:{source}")
+        assert publish_telemetry is False
+        driver.guard.stop(source=source)
+        driver._intent_ingress.revoke()
+        driver._navigation_task_active = False
+        driver._static_hold_active = True
+
+    monkeypatch.setattr(
+        "hide_mujoco_sonic.sonic_driver.set_plant_support",
+        set_support,
+    )
+    driver._stop_navigation_at_boundary = stop_boundary
+
+    assert driver.accept_json(
+        {
+            "type": "stop",
+            "source": "bridge_shutdown",
+            "reason": "ROS bridge process is shutting down",
+        }
+    ) is None
+
+    assert events == ["plant:safety_stop", "boundary:plant_safety_stop"]
+    assert activation.support_release_confirmed is False
+    assert activation.phase == "UNPREPARED"
+    assert driver._plant_support_mode == "safety_stop"
+    assert driver._plant_support_safety_latched is True
+    assert driver._static_hold_active is True
+
+
+def test_bridge_shutdown_retries_lost_ack_before_static_hold(monkeypatch) -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    targets = tuple(0.01 * index for index in range(29))
+    activation = released_policy_activation(targets)
+    driver._policy_activation = activation
+    driver._policy_activation_release_epoch = activation.epoch
+    driver._policy_activation_release_confirmed_epoch = activation.epoch
+    driver._policy_activation_release_result = None
+    driver._policy_activation_release_error = None
+    driver._policy_activation_release_thread = None
+    driver._last_published_targets = targets
+    events: list[str] = []
+
+    def set_support(_host, _port, mode, **_kwargs):
+        events.append(f"plant:{mode}")
+        if events.count("plant:safety_stop") == 1:
+            raise TimeoutError("lost first Plant acknowledgement")
+        return {
+            "mode": "safety_stop",
+            "safetyStopLatched": True,
+            "safetyStopEpoch": 8,
+            "fault": None,
+            "fallArrestAvailable": True,
+            "fallArrestEnabled": True,
+            "fallArrestReengagedSafetyStopEpoch": 8,
+        }
+
+    def stop_boundary(*, source: str, publish_telemetry: bool) -> None:
+        events.append(f"boundary:{source}")
+        assert publish_telemetry is False
+        driver.guard.stop(source=source)
+        driver._intent_ingress.revoke()
+        driver._navigation_task_active = False
+        driver._static_hold_active = True
+
+    monkeypatch.setattr(
+        "hide_mujoco_sonic.sonic_driver.set_plant_support",
+        set_support,
+    )
+    driver._stop_navigation_at_boundary = stop_boundary
+
+    assert driver._engage_plant_support_before_static_hold(
+        reason="bridge acknowledgement loss"
+    ) is True
+
+    assert events == [
+        "plant:safety_stop",
+        "boundary:plant_safety_stop",
+        "plant:safety_stop",
+        "boundary:plant_safety_stop",
+    ]
+    assert activation.support_release_confirmed is False
+    assert driver._plant_support_safety_latched is True
+
+
+def test_uncontrolled_idle_reengages_support_before_position_hold() -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    targets = tuple(0.01 * index for index in range(29))
+    activation = released_policy_activation(targets)
+    driver._policy_activation = activation
+    driver._policy_activation_requested = False
+    driver._controlled_stop_active = False
+    driver._prepare_idle_startup = lambda: None
+    driver._startup_qualifying = False
+    driver._planner_telemetry_fields = lambda: {}
+    idle = MovementIntent(
+        mode="IDLE",
+        speed_mps=0.0,
+        movement_angle_rad=0.0,
+        facing_angle_rad=0.0,
+        has_movement=False,
+        stale=True,
+    )
+    driver._apply_intent = lambda *_args, **_kwargs: idle
+    driver._controller = SimpleNamespace(shutdown=lambda: None)
+    driver._joint_handoff = SimpleNamespace(
+        decide=lambda **_kwargs: SimpleNamespace(targets=targets),
+    )
+    events: list[str] = []
+
+    def engage(*, reason: str) -> bool:
+        events.append("plant:safety_stop")
+        assert "uncontrolled command source" in reason
+        activation.record_support_reengagement(9)
+        driver._plant_support_mode = "safety_stop"
+        driver._plant_support_safety_latched = True
+        return True
+
+    def set_support(mode: str) -> bool:
+        events.append(f"support:{mode}")
+        assert driver._plant_support_safety_latched is True
+        return True
+
+    def publish_position_hold(published: tuple[float, ...]) -> None:
+        events.append("dds:static_hold")
+        assert driver._plant_support_safety_latched is True
+        assert activation.support_release_confirmed is False
+        driver._last_published_targets = tuple(published)
+        driver._stop.set()
+
+    driver._engage_plant_support_before_static_hold = engage
+    driver._set_plant_support_mode = set_support
+    driver._publish_position_hold = publish_position_hold
+    driver._record_control_trace = lambda **_kwargs: None
+    samples = [
+        (
+            _lowstate(targets),
+            PlantControlStep(tick_ms=3_060, dt_s=0.02),
+            0,
+        )
+    ]
+    driver._next_control_sample = lambda: samples.pop(0)
+
+    driver.run()
+
+    assert events == [
+        "plant:safety_stop",
+        "support:idle",
+        "dds:static_hold",
+    ]
+
+
+def test_correlated_normal_stop_invalidates_released_support_activation() -> None:
+    clock = Clock()
+    adapter, _ = runtime(clock)
+    driver = bare_driver(clock)
+    targets = tuple(0.01 * index for index in range(29))
+    activation = released_policy_activation(targets)
+    driver._policy_activation = activation
+    driver._policy_activation_release_epoch = activation.epoch
+    driver._policy_activation_release_confirmed_epoch = activation.epoch
+    driver._policy_activation_release_result = None
+    driver._policy_activation_release_error = None
+    driver._policy_activation_release_thread = None
+    driver._last_published_targets = targets
+    driver.accept_json(
+        _intent_payload(adapter.tick(now=clock.value), measured_heading_yaw=0.0)
+    )
+
+    confirm_correlated_driver_stop(adapter, driver, clock)
+
+    assert activation.support_release_confirmed is False
+    assert activation.phase == "UNPREPARED"
+    assert driver._plant_support_safety_latched is True
+
+
 def confirm_correlated_driver_stop(
     adapter: GaitAdapter,
     driver: SonicDriver,

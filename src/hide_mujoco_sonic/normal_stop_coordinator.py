@@ -968,6 +968,14 @@ class BridgeNormalStopCoordinator:
             state.get("mode") != "safety_stop"
             or state.get("safetyStopLatched") is not True
             or state.get("fault") is not None
+            or not isinstance(state.get("fallArrestAvailable"), bool)
+            or (
+                state.get("fallArrestAvailable") is True
+                and (
+                    state.get("fallArrestEnabled") is not True
+                    or state.get("fallArrestReengagedSafetyStopEpoch") != epoch
+                )
+            )
             or isinstance(epoch, bool)
             or not isinstance(epoch, int)
             or epoch < 1

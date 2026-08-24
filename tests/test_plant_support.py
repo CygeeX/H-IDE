@@ -117,6 +117,31 @@ def test_safety_stop_is_sticky_until_strictly_newer_explicit_rearm() -> None:
     assert support.rearm(102) == "idle"
 
 
+def test_safety_stop_reengages_released_fall_arrest_before_static_hold() -> None:
+    support = _released_support(17)
+    released = support.state()
+    assert released["fallArrestEnabled"] is False
+    assert released["fallArrestReleaseConfirmedEpoch"] == 17
+
+    assert support.set_mode("safety_stop") == "safety_stop"
+    stopped = support.state()
+    assert stopped["safetyStopLatched"] is True
+    assert stopped["safetyStopEpoch"] == 1
+    assert stopped["fallArrestEnabled"] is True
+    assert stopped["fallArrestReleaseConfirmedEpoch"] == 17
+    assert stopped["fallArrestReengagedSafetyStopEpoch"] == 1
+    physical_band = SimpleNamespace(enable=False)
+    assert support.synchronize_physical_fall_arrest(physical_band) is True
+    assert physical_band.enable is True
+
+    # An idempotent retry must not manufacture another stop/re-engagement
+    # identity.
+    assert support.set_mode("safety_stop") == "safety_stop"
+    retried = support.state()
+    assert retried["safetyStopEpoch"] == 1
+    assert retried["fallArrestReengagedSafetyStopEpoch"] == 1
+
+
 def test_physics_fault_cannot_be_rearmed_online() -> None:
     support = PlantSupportController()
     support.latch_fault("physics invalid")

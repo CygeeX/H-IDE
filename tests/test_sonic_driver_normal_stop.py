@@ -665,6 +665,8 @@ def test_granted_motion_rebases_idle_from_exact_boundary_before_braking() -> Non
     assert driver._static_hold_active is True
     assert driver._reference_authority.snapshot.phase == "REVOKED"
     assert driver._plant_support_safety_latched is True
+    assert activation.support_release_confirmed is False
+    assert activation.phase == "UNPREPARED"
     assert driver.guard.stops == [
         "gait_adapter_controlled_stop",
         "normal_stop_plant_confirmed",
