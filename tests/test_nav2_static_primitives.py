@@ -324,6 +324,48 @@ def test_navfn_relaxed_start_must_reenter_full_clearance_before_normal_segments(
     module.verify_primitive_plan(plan, navfn_path, **_plan_kwargs())
 
 
+def test_relaxed_start_recovery_may_finish_inside_endpoint_tolerance() -> None:
+    """Regression for a live post-Spin pose beside the west waste bin."""
+
+    module = _planner()
+    start = (-6.75, -0.25)
+    reentry = (-6.35, -0.15)
+    goal = (-6.243011889573126, -0.1146368064599927)
+    navfn_path = {
+        "frame_id": "map",
+        "poses": [
+            {"x": start[0], "y": start[1], "yaw": 0.0},
+            {"x": reentry[0], "y": reentry[1], "yaw": 0.0},
+            {"x": goal[0], "y": goal[1], "yaw": 0.24566406970129795},
+        ],
+    }
+
+    plan = _build(module, navfn_path)
+    static_map = module.StaticMap.load(MAP_YAML, MAP_IMAGE)
+    full = static_map.inflated_blocked_cells(CLEARANCE_RADIUS)
+
+    assert static_map.world_to_cell(*start) in full
+    assert static_map.world_to_cell(*reentry) not in full
+    assert math.dist(reentry, goal) < plan["execution_policy"][
+        "endpoint_tolerance_m"
+    ]
+    assert plan["segment_endpoint_indices"] == [0, 1]
+    assert plan["segments"] == [
+        {
+            "id": "segment-000",
+            "path_start_index": 0,
+            "path_end_index": 1,
+            "start_map": {"x": start[0], "y": start[1]},
+            "end_map": {"x": reentry[0], "y": reentry[1]},
+            "distance_m": pytest.approx(math.dist(start, reentry)),
+            "heading_map_yaw_rad": pytest.approx(
+                math.atan2(reentry[1] - start[1], reentry[0] - start[0])
+            ),
+        }
+    ]
+    module.verify_primitive_plan(plan, navfn_path, **_plan_kwargs())
+
+
 def test_navfn_start_inside_relaxed_physical_clearance_is_rejected() -> None:
     module = _planner()
     navfn_path = _astar_fixture_navfn_path(module, START, GOAL)

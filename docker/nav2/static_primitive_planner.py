@@ -480,10 +480,15 @@ def _segment_indices(
     reentry_blocked: frozenset[tuple[int, int]],
     min_segment_m: float,
     max_segment_m: float,
+    endpoint_tolerance_m: float,
 ) -> tuple[int, ...]:
     _require(
         0.0 < min_segment_m <= max_segment_m,
         "segment distance bounds are invalid",
+    )
+    _require(
+        0.0 < endpoint_tolerance_m < min_segment_m,
+        "endpoint tolerance must be below minimum segment distance",
     )
     points = tuple((pose["x"], pose["y"]) for pose in poses)
     recovery_index = 0
@@ -542,8 +547,29 @@ def _segment_indices(
     # needs only one rasterized line-of-sight check per source pose.
     next_index: list[int | None] = [None] * len(points)
     reachable = [False] * len(points)
-    reachable[-1] = True
+    # A clearance-recovery checkpoint can legitimately land inside the
+    # reviewed endpoint tolerance.  Requiring another >= min_segment_m action
+    # in that case makes a short, already-satisfied residual impossible to
+    # partition (the live resolver would skip that same residual).  Treat any
+    # later path checkpoint with clear line of sight to the exact NavFn goal
+    # as a terminal checkpoint, while deliberately excluding index 0 so an
+    # entirely sub-tolerance request cannot manufacture an empty plan.
+    terminal_indices = {len(points) - 1}
+    if recovery_index > 0:
+        for index in range(recovery_index, len(points) - 1):
+            if (
+                math.dist(points[index], points[-1])
+                <= endpoint_tolerance_m + 1e-12
+                and static_map.segment_is_clear(
+                    points[index], points[-1], blocked
+                )
+            ):
+                terminal_indices.add(index)
+    for index in terminal_indices:
+        reachable[index] = True
     for start_index in range(len(points) - 2, recovery_index - 1, -1):
+        if start_index in terminal_indices:
+            continue
         for end_index in range(len(points) - 1, start_index, -1):
             if not reachable[end_index]:
                 continue
@@ -563,7 +589,7 @@ def _segment_indices(
     result: tuple[int, ...] | None = None
     if reachable[recovery_index]:
         selected = [recovery_index]
-        while selected[-1] != len(points) - 1:
+        while selected[-1] not in terminal_indices:
             endpoint = next_index[selected[-1]]
             _require(endpoint is not None, "reachable segment chain is incomplete")
             selected.append(endpoint)
@@ -650,6 +676,7 @@ def build_primitive_plan(
         ),
         min_segment_m=min_segment_m,
         max_segment_m=max_segment_m,
+        endpoint_tolerance_m=endpoint_tolerance_m,
     )
 
     segments: list[dict[str, object]] = []
