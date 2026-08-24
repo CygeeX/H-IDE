@@ -29,6 +29,7 @@ COMPUTE_PATH_ACTION = "nav2_msgs/action/ComputePathToPose"
 SPIN_ACTION = "nav2_msgs/action/Spin"
 DRIVE_ACTION = "nav2_msgs/action/DriveOnHeading"
 OFFICIAL_FORWARD_SPEED_MPS = 0.30
+OFFICIAL_REVERSE_SPEED_MPS = 0.20
 # NavFn and the immutable primitive plan retain the 0.42 m inflated planning
 # clearance.  Fresh odometry can land inside that conservative contour after a
 # learned whole-body action even when the physical G1 and obstacle remain
@@ -486,13 +487,13 @@ def resolve_start_clearance_recovery(
     heading_tolerance_rad: float = 0.09,
     **_unused: object,
 ) -> dict[str, object]:
-    """Resolve a forward-only egress when NavFn's start is inscribed.
+    """Resolve a heading-aligned egress when NavFn's start is inscribed.
 
     Learned in-place turns beside furniture can leave the robot centre inside
     Nav2's conservative inflation band even after physical contact has ended.
     NavFn then rejects the start before returning a path.  This recovery never
-    plans toward the requested goal.  It may only drive forward, along the
-    robot's already-held heading, through centre cells whose distance from the
+    plans toward the requested goal.  It may only drive forward or reverse,
+    without turning the robot, through centre cells whose distance from the
     nearest static obstacle is monotonically non-decreasing, until the full
     reviewed planning clearance is restored.
     """
@@ -552,7 +553,9 @@ def resolve_start_clearance_recovery(
         return value
 
     radius_cells = math.ceil(values["maximum recovery"] / static_map.resolution)
-    candidates: list[tuple[float, float, float, tuple[float, float]]] = []
+    candidates: list[
+        tuple[float, float, float, tuple[float, float], str]
+    ] = []
     for row in range(
         max(0, start_cell[0] - radius_cells),
         min(static_map.height, start_cell[0] + radius_cells + 1),
@@ -575,7 +578,10 @@ def resolve_start_clearance_recovery(
             heading = math.atan2(
                 endpoint[1] - start_xy[1], endpoint[0] - start_xy[0]
             )
-            heading_error = abs(_wrap_angle(heading - pose["yaw"]))
+            forward_error = abs(_wrap_angle(heading - pose["yaw"]))
+            reverse_error = abs(_wrap_angle(heading - pose["yaw"] - math.pi))
+            reverse = reverse_error < forward_error
+            heading_error = reverse_error if reverse else forward_error
             if heading_error > values["heading tolerance"] + 1e-12:
                 continue
             cells = static_map.segment_cells(start_xy, endpoint)
@@ -587,20 +593,36 @@ def resolve_start_clearance_recovery(
                 for before, after in zip(clearances, clearances[1:])
             ):
                 continue
-            candidates.append((heading_error, distance, -clearances[-1], endpoint))
+            candidates.append(
+                (
+                    heading_error,
+                    -distance if reverse else distance,
+                    -clearances[-1],
+                    endpoint,
+                    "reverse" if reverse else "forward",
+                )
+            )
 
     _require(
         candidates,
-        "NavFn start has no forward-aligned monotonic clearance recovery",
+        "NavFn start has no heading-aligned monotonic clearance recovery",
     )
-    heading_error, distance, neg_clearance, endpoint = min(candidates)
+    heading_error, signed_distance, neg_clearance, endpoint, direction = min(
+        candidates,
+        key=lambda item: (item[0], abs(item[1]), item[2]),
+    )
     return {
         "disposition": "send_action",
         "action_type": DRIVE_ACTION,
         "action_goal": {
-            "target": {"x": distance, "y": 0.0, "z": 0.0},
-            "speed_mps": OFFICIAL_FORWARD_SPEED_MPS,
+            "target": {"x": signed_distance, "y": 0.0, "z": 0.0},
+            "speed_mps": (
+                OFFICIAL_REVERSE_SPEED_MPS
+                if signed_distance < 0.0
+                else OFFICIAL_FORWARD_SPEED_MPS
+            ),
         },
+        "recovery_direction": direction,
         "recovery_end_map": {"x": endpoint[0], "y": endpoint[1]},
         "start_clearance_m": obstacle_clearance(start_cell),
         "end_clearance_m": -neg_clearance,

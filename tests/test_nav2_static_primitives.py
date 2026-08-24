@@ -433,14 +433,21 @@ def test_start_clearance_recovery_moves_forward_monotonically_outward() -> None:
     }
 
 
-def test_start_clearance_recovery_refuses_a_turn_inside_the_margin() -> None:
+def test_start_clearance_recovery_reverses_without_turning_inside_the_margin() -> None:
     module = _planner()
 
-    with pytest.raises(ValueError, match="no forward-aligned"):
-        module.resolve_start_clearance_recovery(
-            {"x": 0.584, "y": 4.368, "yaw": -math.pi / 2.0},
-            **_plan_kwargs(),
-        )
+    resolved = module.resolve_start_clearance_recovery(
+        {"x": 3.482, "y": 3.297, "yaw": 2.907},
+        **_plan_kwargs(),
+    )
+
+    assert resolved["disposition"] == "send_action"
+    assert resolved["recovery_direction"] == "reverse"
+    assert -0.50 <= resolved["action_goal"]["target"]["x"] <= -0.16
+    assert resolved["action_goal"]["speed_mps"] == pytest.approx(0.20)
+    assert resolved["heading_error_rad"] <= 0.09
+    assert resolved["end_clearance_m"] >= CLEARANCE_RADIUS
+    assert resolved["end_clearance_m"] > resolved["start_clearance_m"]
 
 
 def test_navfn_start_inside_relaxed_physical_clearance_is_rejected() -> None:

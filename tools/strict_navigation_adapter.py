@@ -186,10 +186,15 @@ class StrictNavigationExecutor:
             resolved_distance = self._finite(
                 target.get("x"), "DriveOnHeading distance"
             )
-            distance = min(resolved_distance, MAX_RUNTIME_DRIVE_CHUNK_M)
-            timeout_s = runner.translation_action_timeout_s(distance)
+            distance = math.copysign(
+                min(abs(resolved_distance), MAX_RUNTIME_DRIVE_CHUNK_M),
+                resolved_distance,
+            )
+            timeout_s = runner.translation_action_timeout_s(abs(distance))
             self.backend.begin_relay(
-                "detour", primitive="DriveOnHeading", direction=1
+                "detour",
+                primitive="DriveOnHeading",
+                direction=1 if distance > 0.0 else -1,
             )
             execution = self.backend.send_drive(distance, timeout_s=timeout_s)
             kind = "DriveOnHeading"

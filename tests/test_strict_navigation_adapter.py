@@ -357,6 +357,26 @@ def test_navigate_executes_forward_only_start_clearance_recovery_first() -> None
     ]
 
 
+def test_execute_resolved_preserves_bounded_reverse_drive_direction() -> None:
+    backend = FakeBackend()
+    subject = executor(backend, FakePlanner())
+
+    kind = subject._execute_resolved(
+        {
+            "action_type": "nav2_msgs/action/DriveOnHeading",
+            "action_goal": {
+                "target": {"x": -0.70, "y": 0.0, "z": 0.0},
+                "speed_mps": runner.OFFICIAL_REVERSE_SPEED_MPS,
+            },
+        },
+        cancelled=lambda: False,
+    )
+
+    assert kind == "DriveOnHeading"
+    assert backend.sent == [("DriveOnHeading", pytest.approx(-0.50))]
+    assert backend.started == [("detour", "DriveOnHeading", -1)]
+
+
 def test_replan_partition_failure_outside_physical_endpoint_still_aborts() -> None:
     backend = FakeBackend()
 
