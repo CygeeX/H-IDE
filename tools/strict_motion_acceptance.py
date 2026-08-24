@@ -53,6 +53,8 @@ ARM_LIMITER_SCHEMA_VERSION = "h-ide.sonic-arm-limiter-success-trace/1"
 STATIC_PRIMITIVE_PLAN_SCHEMA_VERSION = "h-ide.nav2-static-primitives/1"
 MAX_DRIVE_REALIGNMENT_SPINS = 4
 MAX_DRIVE_REALIGNMENT_RETAINED_ERROR_RATIO = 0.90
+MAX_DRIVE_PROGRESS_ACTIONS = 4
+MIN_DRIVE_ENDPOINT_PROGRESS_M = 0.02
 ARM_JOINT_INDICES = tuple(range(15, 29))
 MODES = (
     "forward_probe",
@@ -3309,14 +3311,28 @@ class StrictMotionEvaluator:
                     (primitive_sequence - 1, "Spin")
                 )
                 actual_cursor += 1
-            expanded_expected_actions.append((primitive_sequence, expected_type))
-            if actual_cursor < len(self.detour_segments):
+            drive_action_count = 0
+            while actual_cursor < len(self.detour_segments):
                 candidate = self.detour_segments[actual_cursor]
-                if (
+                if not (
                     candidate.get("type") == expected_type
                     and candidate.get("primitiveSequence") == primitive_sequence
                 ):
-                    actual_cursor += 1
+                    break
+                drive_action_count += 1
+                if drive_action_count > MAX_DRIVE_PROGRESS_ACTIONS:
+                    self._fail(
+                        "DETOUR_DRIVE_PROGRESS_BUDGET_EXCEEDED",
+                        "DriveOnHeading used more than four endpoint-progress actions",
+                    )
+                expanded_expected_actions.append(
+                    (primitive_sequence, expected_type)
+                )
+                actual_cursor += 1
+            if drive_action_count == 0:
+                expanded_expected_actions.append(
+                    (primitive_sequence, expected_type)
+                )
 
         if actual_cursor != len(self.detour_segments):
             self._fail(
@@ -3331,6 +3347,8 @@ class StrictMotionEvaluator:
                 "executed action count does not match static-plan checkpoints",
             )
         resolved_results: list[dict[str, Any]] = list(skipped_resolver_results)
+        previous_drive_remaining_m: dict[int, float] = {}
+        drive_action_counts: dict[int, int] = {}
         for index, (expected, actual) in enumerate(zip(expected_actions, self.detour_segments)):
             primitive_sequence, expected_type = expected
             fresh = _mapping(actual.get("freshOdometry"), "detourSegment.freshOdometry")
@@ -3378,6 +3396,43 @@ class StrictMotionEvaluator:
                     "maxWzRps": self.contract.spin_max_wz_rps,
                 }
             elif resolved_action_type == "DriveOnHeading":
+                remaining_m = _finite(
+                    resolved.get("fresh_distance_to_endpoint_m"),
+                    f"resolved primitive {primitive_sequence} endpoint distance",
+                )
+                command_distance_m = _finite(
+                    resolved.get("command_distance_m"),
+                    f"resolved primitive {primitive_sequence} command distance",
+                )
+                if resolved.get("endpoint_confirmation_required") is not True:
+                    self._fail(
+                        "DETOUR_ENDPOINT_CONFIRMATION_MISSING",
+                        "DriveOnHeading resolver did not require fresh endpoint confirmation",
+                    )
+                prior_remaining = previous_drive_remaining_m.get(
+                    primitive_sequence
+                )
+                if (
+                    prior_remaining is not None
+                    and remaining_m
+                    > prior_remaining - MIN_DRIVE_ENDPOINT_PROGRESS_M
+                ):
+                    self._fail(
+                        "DETOUR_DRIVE_PROGRESS_NOT_CONVERGING",
+                        "repeated DriveOnHeading action did not reduce endpoint distance by 0.02 m",
+                    )
+                previous_drive_remaining_m[primitive_sequence] = remaining_m
+                drive_action_counts[primitive_sequence] = (
+                    drive_action_counts.get(primitive_sequence, 0) + 1
+                )
+                if (
+                    drive_action_counts[primitive_sequence]
+                    > MAX_DRIVE_PROGRESS_ACTIONS
+                ):
+                    self._fail(
+                        "DETOUR_DRIVE_PROGRESS_BUDGET_EXCEEDED",
+                        "DriveOnHeading exceeded its bounded endpoint-progress action count",
+                    )
                 target = _mapping(
                     resolved_action_goal.get("target"),
                     "resolved DriveOnHeading target",
@@ -3400,6 +3455,18 @@ class StrictMotionEvaluator:
                         "resolved DriveOnHeading speed_mps",
                     ),
                 }
+                if (
+                    abs(resolved_goal["distanceM"] - command_distance_m)
+                    > 1e-6
+                    or command_distance_m
+                    > 0.50 + _EPS
+                    or command_distance_m
+                    > remaining_m + _EPS
+                ):
+                    self._fail(
+                        "DETOUR_DRIVE_CHUNK_INVALID",
+                        "DriveOnHeading command is not the bounded prefix of its fresh endpoint residual",
+                    )
             else:
                 self._fail(
                     "DETOUR_FORBIDDEN_ACTION",

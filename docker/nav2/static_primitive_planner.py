@@ -792,7 +792,6 @@ def _fresh_segment_geometry(
     *,
     endpoint_tolerance_m: float,
     min_segment_m: float,
-    max_segment_m: float,
 ) -> tuple[float, float]:
     endpoint = _mapping(segment.get("end_map"), "segment endpoint")
     end = (
@@ -810,10 +809,6 @@ def _fresh_segment_geometry(
     _require(
         distance >= min_segment_m - 1e-12,
         "fresh residual is outside endpoint tolerance but below minimum segment; replan required",
-    )
-    _require(
-        distance <= max_segment_m + 1e-12,
-        "fresh residual exceeds maximum segment distance; replan required",
     )
     return distance, math.atan2(end[1] - start[1], end[0] - start[0])
 
@@ -928,7 +923,6 @@ def resolve_live_primitive(
         pose,
         endpoint_tolerance_m=endpoint_tolerance_m,
         min_segment_m=min_segment_m,
-        max_segment_m=max_segment_m,
     )
     if distance <= endpoint_tolerance_m + 1e-12:
         return {
@@ -998,10 +992,16 @@ def resolve_live_primitive(
         "disposition": "send_action",
         "action_type": DRIVE_ACTION,
         "action_goal": {
-            "target": {"x": distance, "y": 0.0, "z": 0.0},
+            "target": {
+                "x": min(distance, max_segment_m),
+                "y": 0.0,
+                "z": 0.0,
+            },
             "speed_mps": OFFICIAL_FORWARD_SPEED_MPS,
         },
         "fresh_distance_to_endpoint_m": distance,
+        "command_distance_m": min(distance, max_segment_m),
+        "endpoint_confirmation_required": True,
         "resolved_target_map_yaw_rad": target_heading,
     }
 

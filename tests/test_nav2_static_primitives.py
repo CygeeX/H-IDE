@@ -321,6 +321,29 @@ def test_live_resolver_uses_fresh_pose_and_never_emits_zero_or_subfloor_goals() 
     assert drive["action_goal"]["target"]["x"] == pytest.approx(
         segment["distance_m"]
     )
+    assert drive["command_distance_m"] == pytest.approx(
+        segment["distance_m"]
+    )
+    assert drive["endpoint_confirmation_required"] is True
+
+    behind_pose = {
+        "x": segment["start_map"]["x"] - 0.40 * math.cos(heading),
+        "y": segment["start_map"]["y"] - 0.40 * math.sin(heading),
+        "yaw": heading,
+    }
+    chunked = module.resolve_live_primitive(
+        plan,
+        2 * short_segment_index + 1,
+        navfn_path,
+        behind_pose,
+        **_plan_kwargs(),
+    )
+    assert chunked["disposition"] == "send_action"
+    assert chunked["fresh_distance_to_endpoint_m"] == pytest.approx(
+        segment["distance_m"] + 0.40
+    )
+    assert chunked["command_distance_m"] == pytest.approx(0.50)
+    assert chunked["action_goal"]["target"]["x"] == pytest.approx(0.50)
 
     misaligned_pose = {
         **segment["start_map"],

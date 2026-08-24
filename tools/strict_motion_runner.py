@@ -133,6 +133,13 @@ SEGMENT_BALANCED_IDLE_MAX_WALL_S = 10.0
 # than evidence of divergence.
 MAX_DRIVE_REALIGNMENT_SPINS = 4
 MAX_DRIVE_REALIGNMENT_RETAINED_ERROR_RATIO = 0.90
+# A successful learned DriveOnHeading action is not an exact endpoint
+# controller.  Re-resolve the same static endpoint from fresh map odometry and
+# allow a bounded number of collision-checked chunks.  Each completed chunk
+# must make observable progress unless it enters the 0.15 m endpoint envelope.
+MAX_DRIVE_PROGRESS_ACTIONS = 4
+MIN_DRIVE_ENDPOINT_PROGRESS_M = 0.02
+DETOUR_ENDPOINT_TOLERANCE_M = 0.15
 EXCEPTION_BALANCED_IDLE_S = 1.0
 EXCEPTION_BALANCED_IDLE_MAX_WALL_S = 8.0
 TERMINAL_LINEAR_SPEED_MPS = 0.01
@@ -2890,6 +2897,8 @@ class StrictMotionCaseExecutor:
             for primitive_index, _primitive in enumerate(primitives):
                 realignment_count = 0
                 previous_realignment_error_abs: float | None = None
+                drive_progress_count = 0
+                pending_drive_start_distance_m: float | None = None
                 while True:
                     self._diagnostic_phase = f"detour_segment_{primitive_index}"
                     fresh_runtime = self.collector.wait_next()
@@ -2913,6 +2922,32 @@ class StrictMotionCaseExecutor:
                     )
                     retry_primitive = False
                     execution_primitive_index = primitive_index
+                    drive_remaining_m: float | None = None
+                    if (
+                        isinstance(_primitive, Mapping)
+                        and _primitive.get("kind") == "drive_on_heading"
+                    ):
+                        drive_remaining_m = _finite(
+                            resolved.get("fresh_distance_to_endpoint_m"),
+                            "fresh distance to DriveOnHeading endpoint",
+                        )
+                        if pending_drive_start_distance_m is not None:
+                            if (
+                                drive_remaining_m
+                                > DETOUR_ENDPOINT_TOLERANCE_M
+                                and drive_remaining_m
+                                > pending_drive_start_distance_m
+                                - MIN_DRIVE_ENDPOINT_PROGRESS_M
+                            ):
+                                raise StrictMotionRunnerError(
+                                    "DriveOnHeading endpoint distance did not make bounded progress"
+                                )
+                            pending_drive_start_distance_m = None
+                        if (
+                            resolved.get("disposition")
+                            == "skip_within_endpoint_tolerance"
+                        ):
+                            break
                     if resolved.get("disposition") == "realign_spin_required":
                         realignment_error_abs = abs(
                             _finite(
@@ -2994,6 +3029,14 @@ class StrictMotionCaseExecutor:
                         "resolved detour action goal",
                     )
                     if action_type == "nav2_msgs/action/DriveOnHeading":
+                        if drive_remaining_m is None:
+                            raise StrictMotionRunnerError(
+                                "DriveOnHeading resolver omitted endpoint distance"
+                            )
+                        if drive_progress_count >= MAX_DRIVE_PROGRESS_ACTIONS:
+                            raise StrictMotionRunnerError(
+                                "DriveOnHeading endpoint remained outside tolerance after bounded progress actions"
+                            )
                         target = _mapping(
                             resolved_goal.get("target"),
                             "resolved DriveOnHeading target",
@@ -3009,6 +3052,9 @@ class StrictMotionCaseExecutor:
                         primitive_type = "DriveOnHeading"
                         direction = 1
                         timeout_s = translation_action_timeout_s(distance)
+                        drive_progress_count += 1
+                        pending_drive_start_distance_m = drive_remaining_m
+                        retry_primitive = True
                     elif action_type == "nav2_msgs/action/Spin":
                         target_yaw = _finite(
                             resolved_goal.get("target_yaw_rad"),

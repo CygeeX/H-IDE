@@ -1511,6 +1511,7 @@ class FakeStaticPlanner:
                 "fresh_odometry_used": True,
                 "disposition": "skip_within_heading_tolerance",
                 "action_goal": None,
+                "fresh_distance_to_endpoint_m": 0.5,
             }
         if index == 0:
             self.spin_resolutions += 1
@@ -1536,6 +1537,16 @@ class FakeStaticPlanner:
                 "action_goal": None,
                 "realignment_primitive_sequence": 0,
                 "heading_error_rad": 0.20,
+                "fresh_distance_to_endpoint_m": 0.5,
+            }
+        if self.drive_resolutions >= (3 if self.realign_once else 2):
+            return {
+                "primitive_sequence": 1,
+                "plan_sha256": "a" * 64,
+                "fresh_odometry_used": True,
+                "disposition": "skip_within_endpoint_tolerance",
+                "action_goal": None,
+                "fresh_distance_to_endpoint_m": 0.1,
             }
         return {
             "primitive_sequence": 1,
@@ -1547,6 +1558,9 @@ class FakeStaticPlanner:
                 "target": {"x": 0.5, "y": 0.0, "z": 0.0},
                 "speed_mps": 0.3,
             },
+            "fresh_distance_to_endpoint_m": 0.5,
+            "command_distance_m": 0.5,
+            "endpoint_confirmation_required": True,
         }
 
 
@@ -1777,6 +1791,156 @@ def test_detour_executor_skips_subresolution_alignment_before_drive(
     assert evidence.calls == ["begin", "finalize"]
 
 
+def test_detour_executor_repeats_bounded_drive_until_endpoint_confirmation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ChunkedDrivePlanner(FakeStaticPlanner):
+        def resolve_live_primitive(self, plan, index, path, pose, **kwargs):
+            if index == 0:
+                return {
+                    "primitive_sequence": 0,
+                    "plan_sha256": "a" * 64,
+                    "fresh_odometry_used": True,
+                    "disposition": "skip_within_heading_tolerance",
+                    "action_goal": None,
+                    "fresh_distance_to_endpoint_m": 0.8,
+                }
+            self.drive_resolutions += 1
+            remaining = (0.8, 0.6, 0.1)[
+                min(self.drive_resolutions - 1, 2)
+            ]
+            if remaining <= 0.15:
+                return {
+                    "primitive_sequence": 1,
+                    "plan_sha256": "a" * 64,
+                    "fresh_odometry_used": True,
+                    "disposition": "skip_within_endpoint_tolerance",
+                    "action_goal": None,
+                    "fresh_distance_to_endpoint_m": remaining,
+                }
+            return {
+                "primitive_sequence": 1,
+                "plan_sha256": "a" * 64,
+                "fresh_odometry_used": True,
+                "disposition": "send_action",
+                "action_type": "nav2_msgs/action/DriveOnHeading",
+                "action_goal": {
+                    "target": {"x": 0.5, "y": 0.0, "z": 0.0},
+                    "speed_mps": 0.3,
+                },
+                "fresh_distance_to_endpoint_m": remaining,
+                "command_distance_m": 0.5,
+                "endpoint_confirmation_required": True,
+            }
+
+    backend = FakeDetourBackend()
+    samples = [_executor_sample(index / 10.0) for index in range(90)]
+    for index in (2, 20):
+        samples[index]["motionIntentActive"] = True
+        samples[index]["nav2Actions"]["driveOnHeadingActive"] = True
+        samples[index]["command"]["vx"] = 0.3
+    collector = FakeExecutorCollector(samples)
+    evidence = FakeDetourEvidence()
+    planner = ChunkedDrivePlanner()
+
+    def load(name: str, _path: Path):
+        if "planner" in name:
+            return planner
+        return SimpleNamespace(
+            evaluate_trace=lambda trace: {
+                "pass": [
+                    (item["primitiveSequence"], item["type"])
+                    for item in trace["action"]["segments"]
+                ]
+                == [(1, "DriveOnHeading"), (1, "DriveOnHeading")]
+            }
+        )
+
+    monkeypatch.setattr(runner, "_load_file_module", load)
+    executor = runner.StrictMotionCaseExecutor(
+        backend,
+        collector,
+        evidence,
+        clock=lambda: 1.0,
+    )
+
+    trace, result = executor.run_detour(
+        case_id="detour-chunked-drive",
+        route_id="office_waste_bin_s_to_g",
+    )
+
+    assert result == {"pass": True}
+    assert [
+        (item["primitiveSequence"], item["type"])
+        for item in trace["action"]["segments"]
+    ] == [(1, "DriveOnHeading"), (1, "DriveOnHeading")]
+    assert backend.calls.count("send_drive") == 2
+    assert planner.drive_resolutions == 3
+
+
+def test_detour_executor_rejects_nonprogressing_drive_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StalledDrivePlanner(FakeStaticPlanner):
+        def resolve_live_primitive(self, plan, index, path, pose, **kwargs):
+            if index == 0:
+                return {
+                    "primitive_sequence": 0,
+                    "plan_sha256": "a" * 64,
+                    "fresh_odometry_used": True,
+                    "disposition": "skip_within_heading_tolerance",
+                    "action_goal": None,
+                    "fresh_distance_to_endpoint_m": 0.5,
+                }
+            result = super().resolve_live_primitive(
+                plan, index, path, pose, **kwargs
+            )
+            if result["disposition"] == "skip_within_endpoint_tolerance":
+                result = {
+                    **result,
+                    "disposition": "send_action",
+                    "action_type": "nav2_msgs/action/DriveOnHeading",
+                    "action_goal": {
+                        "target": {"x": 0.5, "y": 0.0, "z": 0.0},
+                        "speed_mps": 0.3,
+                    },
+                    "fresh_distance_to_endpoint_m": 0.5,
+                    "command_distance_m": 0.5,
+                    "endpoint_confirmation_required": True,
+                }
+            return result
+
+    backend = FakeDetourBackend()
+    samples = [_executor_sample(index / 10.0) for index in range(40)]
+    samples[2]["motionIntentActive"] = True
+    samples[2]["nav2Actions"]["driveOnHeadingActive"] = True
+    samples[2]["command"]["vx"] = 0.3
+    evidence = FakeDetourEvidence()
+    monkeypatch.setattr(
+        runner,
+        "_load_file_module",
+        lambda *_args: StalledDrivePlanner(),
+    )
+    executor = runner.StrictMotionCaseExecutor(
+        backend,
+        FakeExecutorCollector(samples),
+        evidence,
+        clock=lambda: 1.0,
+    )
+
+    with pytest.raises(
+        runner.StrictMotionRunnerError,
+        match="endpoint distance did not make bounded progress",
+    ):
+        executor.run_detour(
+            case_id="detour-stalled-drive",
+            route_id="office_waste_bin_s_to_g",
+        )
+
+    assert backend.calls.count("send_drive") == 1
+    assert evidence.calls == ["begin", "abort"]
+
+
 def test_detour_executor_realigns_drive_from_fresh_pose_with_bounded_spin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1826,7 +1990,7 @@ def test_detour_executor_realigns_drive_from_fresh_pose_with_bounded_spin(
         for item in trace["action"]["segments"]
     ] == [(0, "Spin"), (0, "Spin"), (1, "DriveOnHeading")]
     assert planner.spin_resolutions == 2
-    assert planner.drive_resolutions == 2
+    assert planner.drive_resolutions == 3
     assert backend.calls.count("send_spin") == 2
     assert backend.calls.count("send_drive") == 1
 
@@ -1856,6 +2020,7 @@ def test_detour_executor_fails_closed_after_four_drive_realignment_spins(
                     "heading_error_rad": errors[
                         min(self.drive_resolutions - 1, len(errors) - 1)
                     ],
+                    "fresh_distance_to_endpoint_m": 0.5,
                 }
             return super().resolve_live_primitive(
                 plan,
@@ -1911,6 +2076,7 @@ def test_detour_executor_fails_closed_when_realignment_error_does_not_contract(
                     "action_goal": None,
                     "realignment_primitive_sequence": 0,
                     "heading_error_rad": 0.20,
+                    "fresh_distance_to_endpoint_m": 0.5,
                 }
             return super().resolve_live_primitive(plan, index, path, pose, **kwargs)
 
