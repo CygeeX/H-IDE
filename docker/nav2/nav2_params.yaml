@@ -205,11 +205,16 @@ behavior_server:
     robot_base_frame: base_link
     transform_tolerance: 0.2
     simulate_ahead_time: 2.0
-    # Humanoid turning is a stepping gait, not an instantaneous differential-
-    # drive yaw.  Keep Nav2's own Spin profile inside SONIC's auditable limit so
-    # the downstream guard never silently changes the velocity Nav2 believes it
-    # commanded.
-    max_rotational_vel: 0.2
+    # Humanoid turning is a sequence of learned planner clips, not an
+    # instantaneous differential-drive yaw.  The pinned SONIC planner emits
+    # about 44 frames at 30 Hz (1.47 s), while the reference gate opens a new
+    # facing segment every 0.15 rad.  At 0.20 rad/s a new request arrived every
+    # 0.75 s and could replace a still-running clip near the Spin endpoint,
+    # producing the r128 1.9 rad/s stop impulse.  Use Nav2's reviewed minimum
+    # 0.10 rad/s for both bounds: 0.15 / 0.10 = 1.50 s, so a new reference
+    # cannot overtake the preceding learned clip.  The downstream guard still
+    # verifies the command unchanged.
+    max_rotational_vel: 0.1
     min_rotational_vel: 0.1
     rotational_acc_lim: 0.3
 

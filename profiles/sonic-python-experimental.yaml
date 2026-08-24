@@ -9,7 +9,7 @@ motion_accepted: false
 
 source:
   repository: vendor/lerobot
-  revision: f5fdcb61cda272b866ca81f72ce6f1f76b87fad9
+  revision: 56b4087c40d7ee8e78e3485f78fe21e88679355b
 model:
   repository: nvidia/GEAR-SONIC
   revision: 9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2

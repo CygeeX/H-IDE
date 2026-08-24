@@ -40,7 +40,12 @@ OFFICIAL_REVERSE_SPEED_MPS = 0.20
 # measured odometry below, not by inventing a smaller pseudo-speed.
 OFFICIAL_LATERAL_SPEED_MPS = 0.40
 OFFICIAL_SPIN_MIN_RPS = 0.10
-OFFICIAL_SPIN_MAX_RPS = 0.20
+# Keep successive SONIC pure-rotation reference requests outside the pinned
+# planner clip horizon.  ReplanIntentGate advances at 0.15 rad and the planner
+# emits about 44 frames at 30 Hz: 0.15 / 0.10 = 1.50 s >= 44 / 30 s.  The old
+# 0.20 rad/s cap opened a new reference every 0.75 s and the r128 live sequence
+# installed a fresh turn clip at the endpoint, producing a 1.9 rad/s impulse.
+OFFICIAL_SPIN_MAX_RPS = 0.10
 DETOUR_HEADING_TOLERANCE_RAD = 0.06
 # The command values above are NVIDIA/Nav2 setpoints and remain unchanged. Live
 # r18 evidence measured 0.2913 m over 6.964 s of commanded reverse motion
@@ -405,7 +410,7 @@ class StrictCommandRelay:
                 or abs(command.wz) > OFFICIAL_SPIN_MAX_RPS + _ZERO_EPS
             ):
                 raise StrictMotionRunnerError(
-                    "Spin command is outside the signed official 0.10-0.20 rad/s"
+                    "Spin command is not the signed reviewed 0.10 rad/s"
                 )
         else:
             raise StrictMotionRunnerError(

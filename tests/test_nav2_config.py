@@ -244,9 +244,17 @@ def test_official_primitive_actions_share_the_reviewed_sonic_envelope() -> None:
     assert manifest["primitive_action_contract"] == {
         "drive_on_heading_speed_mps": 0.3,
         "spin_min_angular_rps": 0.1,
-        "spin_max_angular_rps": 0.2,
+        "spin_max_angular_rps": 0.1,
         "spin_angular_accel_rps2": 0.3,
     }
     assert behavior["min_rotational_vel"] == 0.1
-    assert behavior["max_rotational_vel"] == 0.2
+    assert behavior["max_rotational_vel"] == 0.1
     assert behavior["rotational_acc_lim"] == 0.3
+
+    # The pinned planner emits about 44 frames at 30 Hz. SONIC admits a new
+    # pure-rotation reference after each 0.15 rad command-facing change. Keep
+    # that cadence no faster than one complete learned clip; otherwise a new
+    # clip can replace endpoint braking, as happened in live case r128.
+    planner_clip_horizon_s = 44.0 / 30.0
+    pure_rotation_replan_interval_s = 0.15 / behavior["max_rotational_vel"]
+    assert pure_rotation_replan_interval_s >= planner_clip_horizon_s

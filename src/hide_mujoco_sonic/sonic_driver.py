@@ -572,6 +572,7 @@ class SonicDriver:
         self._reference_source_identity: tuple[int, int] | None = None
         self._reference_request_pending = False
         self._reference_request_continuous = False
+        self._reference_request_continuous_motion = False
         self._vendor_revoke_pending = False
         self._dds_target_sequence = 0
         self._control_evidence_context = threading.local()
@@ -1823,6 +1824,7 @@ class SonicDriver:
             self._reference_source_identity = identity
             self._reference_request_pending = True
             self._reference_request_continuous = True
+            self._reference_request_continuous_motion = False
         elif correlated:
             # A regular STOPPING envelope may already have enqueued the
             # continuous IDLE planner request. The later correlated
@@ -3188,6 +3190,7 @@ class SonicDriver:
             self._vendor_revoke_pending = True
         self._reference_request_pending = False
         self._reference_request_continuous = False
+        self._reference_request_continuous_motion = False
         if failures:
             raise failures[0]
 
@@ -3303,11 +3306,41 @@ class SonicDriver:
         starting_motion = intent.mode != "IDLE" and (
             previous is None or previous.mode == "IDLE"
         )
+        activation = getattr(self, "_policy_activation", None)
+        activation_prepared = bool(
+            activation is None or getattr(activation, "prepared", False)
+        )
+        authority_before_admission = self._reference_authority.snapshot
+        vendor_reference_executable = bool(
+            getattr(controller, "reference_authority", False)
+            and getattr(controller, "matching_reference_installed", False)
+            and not getattr(controller, "execution_feedback_pending", False)
+        )
         # Replanning is part of the learned controller's state evolution.  Its
         # debounce window must therefore use the same authoritative MuJoCo
         # clock as the policy cursor, handoff blend, and arm slew guard.  Wall
         # time remains valid only for ingress freshness/watchdog decisions.
-        admitted = self._intent_gate.admit(intent, now=simulation_now_s)
+        # Do not mutate the admitted planner target while an earlier
+        # same-action generation is still being planned/installed.  The guard's
+        # command integral keeps advancing, so the latest target is retried on
+        # the first GRANTED tick.  Mutating the evidence mid-transaction makes
+        # the old result stale while vendor authority is already withdrawn,
+        # leaving no continuous cursor from which to request the replacement.
+        same_motion_transaction_inflight = bool(
+            activation_prepared
+            and intent.mode != "IDLE"
+            and previous is not None
+            and previous.mode != "IDLE"
+            and (
+                authority_before_admission.phase != "GRANTED"
+                or not vendor_reference_executable
+            )
+        )
+        admitted = (
+            False
+            if same_motion_transaction_inflight
+            else self._intent_gate.admit(intent, now=simulation_now_s)
+        )
         # Every newly required motion generation, and every transition back to
         # IDLE, starts at the exact 29-DoF actuator target that crossed DDS.
         # The IDLE branch matters when the local cmd_vel watchdog fires before
@@ -3322,9 +3355,14 @@ class SonicDriver:
                 raise RuntimeError(
                     "intent transition has no published actuator boundary"
                 )
-        activation = getattr(self, "_policy_activation", None)
-        activation_prepared = bool(
-            activation is None or getattr(activation, "prepared", False)
+        continuing_motion = bool(
+            admitted
+            and intent.mode != "IDLE"
+            and previous is not None
+            and previous.mode != "IDLE"
+            and activation_prepared
+            and authority_before_admission.phase == "GRANTED"
+            and vendor_reference_executable
         )
         # A pure-rotation ramp is deliberately held below the planner's
         # verified 0.05-rad request floor.  That raw, not-yet-admitted intent
@@ -3347,9 +3385,17 @@ class SonicDriver:
                     raise RuntimeError(
                         "admitted SONIC motion has no first source identity"
                     )
-                self._revoke_planner_reference_locked(
-                    "new Nav2 intent requires a matching planner reference"
-                )
+                if continuing_motion:
+                    failures = self._withdraw_external_planner_authority_locked(
+                        "same Nav2 action requires a continuous matching reference"
+                    )
+                    if failures:
+                        raise failures[0]
+                    self._reference_request_continuous_motion = True
+                else:
+                    self._revoke_planner_reference_locked(
+                        "new Nav2 intent requires a matching planner reference"
+                    )
                 self._reference_authority.require(
                     generation=identity[0],
                     source_sequence=identity[1],
@@ -3778,6 +3824,7 @@ class SonicDriver:
             simulation_now_s=simulation_now_s,
         )
         self._reference_request_continuous = False
+        self._reference_request_continuous_motion = False
         self._reference_request_pending = True
         self._policy_activation_requested = False
         return True
@@ -4187,9 +4234,16 @@ class SonicDriver:
             continuous_stop = bool(
                 getattr(self, "_reference_request_continuous", False)
             )
-            if continuous_stop and self._vendor_revoke_pending:
+            continuous_motion = bool(
+                getattr(self, "_reference_request_continuous_motion", False)
+            )
+            if continuous_stop and continuous_motion:
                 raise RuntimeError(
-                    "continuous IDLE reference cannot consume a vendor revoke"
+                    "SONIC reference cannot be both controlled-stop and active-motion continuous"
+                )
+            if (continuous_stop or continuous_motion) and self._vendor_revoke_pending:
+                raise RuntimeError(
+                    "continuous SONIC reference cannot consume a vendor revoke"
                 )
             self._consume_vendor_revoke_locked()
             authority = self._reference_authority.snapshot
@@ -4201,6 +4255,10 @@ class SonicDriver:
             if controlled_stop != continuous_stop:
                 raise RuntimeError(
                     "controlled-stop reference lost its continuous-history identity"
+                )
+            if continuous_motion and controlled_stop:
+                raise RuntimeError(
+                    "active-motion continuous reference cannot own a controlled stop"
                 )
             controller = self._controller
             if not controller.initialized:
@@ -4222,6 +4280,17 @@ class SonicDriver:
                             "SONIC controller lacks continuous IDLE reference support"
                         )
                     request_continuous_idle()
+                elif continuous_motion:
+                    request_continuous = getattr(
+                        controller,
+                        "request_continuous_reference",
+                        None,
+                    )
+                    if not callable(request_continuous):
+                        raise RuntimeError(
+                            "SONIC controller lacks continuous motion reference support"
+                        )
+                    request_continuous()
                 else:
                     controller.request_reference(lowstate)
                 self._reference_request_pending = False
@@ -4257,7 +4326,7 @@ class SonicDriver:
                 raise RuntimeError(
                     "matching SONIC reference has no executed actuator boundary"
                 )
-            if continuous_stop:
+            if continuous_stop or continuous_motion:
                 acquire_continuous = getattr(
                     controller,
                     "acquire_continuous_reference",
@@ -4308,6 +4377,8 @@ class SonicDriver:
                 self._reference_source_identity = controlled_identity
                 self._controlled_stop_reference_installed = True
                 self._reference_request_continuous = False
+            if continuous_motion:
+                self._reference_request_continuous_motion = False
             # An earlier stop hold may be released only after the preserved
             # history and exact executed boundary have been atomically bound to
             # the newly accepted reference.

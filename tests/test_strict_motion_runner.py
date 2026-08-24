@@ -178,9 +178,9 @@ def test_drive_on_heading_rejects_wrong_sign_and_mixed_axes() -> None:
 
 @pytest.mark.parametrize(
     ("mode", "wz"),
-    (("turn_left", 0.1), ("turn_left", 0.2), ("turn_right", -0.1), ("turn_right", -0.2)),
+    (("turn_left", 0.1), ("turn_right", -0.1)),
 )
-def test_spin_relays_the_official_acceleration_envelope(mode: str, wz: float) -> None:
+def test_spin_relays_the_reviewed_clip_safe_command(mode: str, wz: float) -> None:
     relay = runner.StrictCommandRelay()
     relay.begin(mode)
     relay.observe_nav2(command(wz=wz), observed_at_s=1.0)
@@ -190,7 +190,12 @@ def test_spin_relays_the_official_acceleration_envelope(mode: str, wz: float) ->
 def test_spin_rejects_wrong_sign_subfloor_and_translation() -> None:
     relay = runner.StrictCommandRelay()
     relay.begin("turn_left")
-    for invalid in (command(wz=-0.2), command(wz=0.099), command(vx=0.01, wz=0.2)):
+    for invalid in (
+        command(wz=-0.1),
+        command(wz=0.099),
+        command(wz=0.101),
+        command(vx=0.01, wz=0.1),
+    ):
         with pytest.raises(runner.StrictMotionRunnerError):
             relay.observe_nav2(invalid, observed_at_s=1.0)
 

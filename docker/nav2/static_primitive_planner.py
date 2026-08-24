@@ -392,7 +392,7 @@ def _validate_runtime_bindings(
     expected_primitive_contract = {
         "drive_on_heading_speed_mps": OFFICIAL_FORWARD_SPEED_MPS,
         "spin_min_angular_rps": 0.10,
-        "spin_max_angular_rps": 0.20,
+        "spin_max_angular_rps": 0.10,
         "spin_angular_accel_rps2": 0.30,
     }
     _require(
@@ -708,7 +708,7 @@ def build_primitive_plan(
             "heading_tolerance_rad": heading_tolerance_rad,
             "drive_speed_mps": drive_speed_mps,
             "spin_min_angular_rps": 0.10,
-            "spin_max_angular_rps": 0.20,
+            "spin_max_angular_rps": 0.10,
             "spin_angular_accel_rps2": 0.30,
             "zero_spin_policy": "skip_within_heading_tolerance",
             "final_heading_policy": (

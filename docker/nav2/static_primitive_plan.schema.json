@@ -111,7 +111,7 @@
         "heading_tolerance_rad": {"const": 0.06},
         "drive_speed_mps": {"const": 0.3},
         "spin_min_angular_rps": {"const": 0.1},
-        "spin_max_angular_rps": {"const": 0.2},
+        "spin_max_angular_rps": {"const": 0.1},
         "spin_angular_accel_rps2": {"const": 0.3},
         "zero_spin_policy": {"const": "skip_within_heading_tolerance"},
         "final_heading_policy": {"const": "omit_checkpoint_if_within_heading_tolerance"},

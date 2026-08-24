@@ -181,7 +181,7 @@ class FormalContract:
     steady_target_tolerance: float = 0.01
     drive_on_heading_max_vx_mps: float = 0.30
     lateral_step_max_vy_mps: float = 0.40
-    spin_max_wz_rps: float = 0.20
+    spin_max_wz_rps: float = 0.10
     max_fresh_odometry_age_s: float = 0.10
     max_first_person_capture_age_ms: float = 2000.0
     # The official constant-speed primitive hands off to learned IDLE before
@@ -1884,7 +1884,7 @@ class StrictMotionEvaluator:
                 ):
                     self._fail(
                         "SPIN_COMMAND_ENVELOPE",
-                        "Spin requires |vx|,|vy|<=1e-6 and |wz|<=0.20rad/s",
+                        "Spin requires |vx|,|vy|<=1e-6 and |wz|<=0.10rad/s",
                         float(sample["t"]),
                     )
             if max(signed_commands) < self.contract.spin_max_wz_rps - self.contract.steady_target_tolerance - _EPS:
@@ -2417,7 +2417,7 @@ class StrictMotionEvaluator:
                 ) > _EPS:
                     self._fail(
                         "DETOUR_SEGMENT_GOAL_INVALID",
-                        "Spin detour goals require non-zero target yaw and locked 0.20rad/s speed",
+                        "Spin detour goals require non-zero target yaw and locked 0.10rad/s speed",
                     )
                 normalized_goal = {
                     "targetYawRad": target_yaw,
@@ -2627,7 +2627,7 @@ class StrictMotionEvaluator:
                 ):
                     self._fail(
                         "SPIN_COMMAND_ENVELOPE",
-                        "detour Spin requires target-signed 0<|wz|<=0.20rad/s and zero vx/vy",
+                        "detour Spin requires target-signed 0<|wz|<=0.10rad/s and zero vx/vy",
                         float(sample["t"]),
                     )
 

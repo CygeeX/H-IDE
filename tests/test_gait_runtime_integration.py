@@ -1789,6 +1789,7 @@ class _TransactionalController:
         self.refresh_ready = False
         self.request_calls = 0
         self.continuous_request_calls = 0
+        self.continuous_motion_request_calls = 0
         self.poll_calls = 0
         self.acquire_calls = []
         self.continuous_acquire_calls = []
@@ -1838,6 +1839,13 @@ class _TransactionalController:
         assert self.execution_feedback_pending is False
         assert self.reference_authority is True
         self.continuous_request_calls += 1
+        self.matching_reference_installed = False
+        self.reference_authority = False
+
+    def request_continuous_reference(self) -> None:
+        assert self.execution_feedback_pending is False
+        assert self.reference_authority is True
+        self.continuous_motion_request_calls += 1
         self.matching_reference_installed = False
         self.reference_authority = False
 
@@ -2685,7 +2693,7 @@ def test_pure_rotation_uses_official_idle_planner_without_losing_motion_owner() 
     rotation = MovementIntent(
         mode="SLOW_WALK",
         speed_mps=0.0,
-        movement_angle_rad=0.0,
+        movement_angle_rad=0.20,
         facing_angle_rad=0.20,
         has_movement=False,
         stale=False,
@@ -2708,6 +2716,110 @@ def test_pure_rotation_uses_official_idle_planner_without_losing_motion_owner() 
     assert driver._reference_authority.snapshot.phase == "REQUIRED"
     assert driver._reference_request_pending is True
     assert evidence.intent_generation == 1
+
+
+def test_same_spin_replan_preserves_vendor_cursor_instead_of_rebasing_measured_heading() -> None:
+    """A cumulative Spin goal must stay in one planner reference frame.
+
+    The live r128 failure requested a fresh measured reference for every
+    0.15-rad facing segment.  The measured rebase resets planner heading to
+    zero, so the next cumulative target repeats the yaw already executed.  The
+    first segment remains a fresh transaction; every later segment of the same
+    action must use the vendor's frozen-cursor continuous transaction.
+    """
+
+    clock = Clock()
+    driver = bare_driver(clock)
+    boundary = tuple(0.0 for _ in range(29))
+    lowstate = _lowstate(boundary)
+    driver._last_published_targets = boundary
+    driver._joint_handoff.freeze(boundary)
+    driver._reference_source_identity = (42, 7)
+    driver._navigation_task_active = True
+    driver._intent_gate = ReplanIntentGate()
+    driver._decoder_facing_rad = None
+    driver._pending_decoder_heading_delta_rad = 0.0
+    driver._last_intent_signature = None
+    driver._policy_activation = SimpleNamespace(prepared=True)
+    driver._policy_activation_requested = False
+    evidence = _TransactionalEvidence()
+    driver._planner_evidence = evidence
+    controller = _TransactionalController(evidence, boundary)
+    driver._controller = controller
+    intents = [
+        MovementIntent("SLOW_WALK", 0.0, 0.052, 0.052, False, False),
+        MovementIntent("SLOW_WALK", 0.0, 0.204, 0.204, False, False),
+    ]
+    driver.guard = SimpleNamespace(
+        intent=lambda **_kwargs: intents.pop(0),
+        last_received_at=clock.value,
+    )
+
+    first = driver._apply_intent(0.02, simulation_now_s=1.0)
+    assert first.facing_angle_rad == pytest.approx(0.052)
+    assert driver._reference_request_continuous_motion is False
+    assert driver._progress_reference_transaction(lowstate) is False
+    assert controller.request_calls == 1
+    assert controller.continuous_motion_request_calls == 0
+    controller.install_ready = True
+    assert driver._progress_reference_transaction(lowstate) is True
+    first_epoch = driver._reference_authority.snapshot.reference_epoch
+    driver._reference_authority.grant(
+        generation=42,
+        source_sequence=7,
+        reference_epoch=first_epoch,
+        granted_at_monotonic_s=clock.value,
+        granted_at_tick_ms=1_020,
+        dds_target_sequence=1,
+    )
+
+    second = driver._apply_intent(0.02, simulation_now_s=1.40)
+    assert second.facing_angle_rad == pytest.approx(0.204)
+    assert driver._reference_request_continuous_motion is True
+    assert driver._vendor_revoke_pending is False
+    assert driver._reference_authority.snapshot.phase == "REQUIRED"
+    assert driver._progress_reference_transaction(lowstate) is False
+    assert controller.request_calls == 1
+    assert controller.continuous_motion_request_calls == 1
+    controller.install_ready = True
+    assert driver._progress_reference_transaction(lowstate) is True
+    assert controller.request_calls == 1
+    assert controller.continuous_motion_request_calls == 1
+    assert len(controller.continuous_acquire_calls) == 1
+    assert driver._reference_request_continuous_motion is False
+    assert driver._reference_authority.snapshot.phase == "PRIMED"
+
+
+def test_same_motion_target_is_not_mutated_while_continuous_reference_is_pending() -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    boundary = tuple(0.0 for _ in range(29))
+    driver._last_published_targets = boundary
+    driver._joint_handoff.freeze(boundary)
+    driver._reference_source_identity = (42, 7)
+    driver._intent_gate = ReplanIntentGate()
+    previous = MovementIntent("SLOW_WALK", 0.0, 0.052, 0.052, False, False)
+    assert driver._intent_gate.admit(previous, now=1.0)
+    driver._policy_activation = SimpleNamespace(prepared=True)
+    driver._policy_activation_requested = False
+    evidence = _TransactionalEvidence()
+    driver._planner_evidence = evidence
+    controller = _TransactionalController(evidence, boundary)
+    driver._controller = controller
+    driver._reference_authority.require(generation=42, source_sequence=7)
+    candidate = MovementIntent("SLOW_WALK", 0.0, 0.30, 0.30, False, False)
+    driver.guard = SimpleNamespace(
+        intent=lambda **_kwargs: candidate,
+        last_received_at=clock.value,
+    )
+
+    observed = driver._apply_intent(0.02, simulation_now_s=1.40)
+
+    assert observed is candidate
+    assert driver._intent_gate.last is previous
+    assert controller.ms.facing_angle == pytest.approx(0.0)
+    assert evidence.intent_generation == 0
+    assert driver._reference_request_pending is False
 
 
 def test_tiny_spin_ramp_keeps_proven_idle_until_yaw_request_is_meaningful() -> None:
