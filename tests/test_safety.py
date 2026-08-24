@@ -52,6 +52,26 @@ def test_body_stability_guard_requires_stable_pose_and_nav2_zero_before_recovery
     assert guard.latched is False
 
 
+def test_default_body_stability_guard_matches_gait_adapter_tilt_envelope() -> None:
+    now = [10.0]
+    guard = BodyStabilityGuard(clock=lambda: now[0])
+
+    # The live Office V2 gait reached 0.301 rad while upright.  This is a
+    # normal supported walking transient, not a fall.
+    assert guard.observe(0.301, 0.0) is False
+    now[0] += 0.06
+    assert guard.observe(0.31, 0.0) is False
+    assert guard.latched is False
+
+    # Crossing the GaitAdapter's authoritative 0.55-rad envelope for the
+    # configured dwell still latches and blocks non-zero Nav2 commands.
+    assert guard.observe(0.551, 0.0) is False
+    now[0] += 0.06
+    assert guard.observe(0.56, 0.0) is True
+    assert guard.latched is True
+    assert guard.admit_command(0.2, 0.0, 0.0) is False
+
+
 def test_plant_tick_guard_distinguishes_delayed_sample_from_restart():
     guard = PlantTickGuard(rollback_threshold_ms=1_000)
     assert guard.observe(50_000) is False

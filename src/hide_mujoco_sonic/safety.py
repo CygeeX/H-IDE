@@ -1650,7 +1650,12 @@ class BodyStabilityGuard:
     def __init__(
         self,
         *,
-        max_tilt_rad: float = 0.30,
+        # Match the authoritative GaitAdapter envelope.  The ROS bridge is a
+        # redundant stale-command gate, not a second tighter posture policy;
+        # a learned G1 step can transiently exceed 0.30 rad while remaining
+        # upright and supported.  GaitAdapter still hard-fails at 0.55 rad,
+        # and this guard retains its sustained-violation latch at that bound.
+        max_tilt_rad: float = 0.55,
         violation_s: float = 0.05,
         recovery_s: float = 0.75,
         clock=time.monotonic,
