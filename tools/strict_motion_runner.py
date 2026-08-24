@@ -205,7 +205,21 @@ DETOUR_ROUTES = {
         "start": (-6.45, 0.0, 0.0),
         "goal": (6.10, 0.0, 0.0),
     },
+    # Continue from the east-corridor target into the private focus office and
+    # stop at the generated desk approach pose.  The endpoints come directly
+    # from Office V2's generated scene contract; NavFn remains responsible for
+    # routing through the corridor/doorway around the intervening walls.
+    "office_corridor_east_to_focus_office": {
+        "start": (6.10, 0.0, 0.0),
+        "goal": (1.75, -4.60, 3.14159),
+    },
 }
+RELAXED_LIVE_CLEARANCE_ROUTES = frozenset(
+    {
+        "office_corridor_column_w_to_e",
+        "office_corridor_east_to_focus_office",
+    }
+)
 OFFICE_DETOUR_OBSTACLES = [
     {
         "source": "pgm_occupied_component",
@@ -2981,7 +2995,7 @@ class StrictMotionCaseExecutor:
                         fresh_pose,
                         live_execution_clearance_radius_m=(
                             static_planner.RELAXED_LIVE_EXECUTION_CLEARANCE_RADIUS_M
-                            if route_id == "office_corridor_column_w_to_e"
+                            if route_id in RELAXED_LIVE_CLEARANCE_ROUTES
                             else None
                         ),
                         **self._static_plan_kwargs(),

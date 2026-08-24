@@ -2800,7 +2800,10 @@ class StrictMotionEvaluator:
         live_execution_clearance_radius_m = (
             _production_static_planner().RELAXED_LIVE_EXECUTION_CLEARANCE_RADIUS_M
             if self.document.get("routeId")
-            == "office_corridor_column_w_to_e"
+            in {
+                "office_corridor_column_w_to_e",
+                "office_corridor_east_to_focus_office",
+            }
             else None
         )
         plan_json = _canonical_json(plan)

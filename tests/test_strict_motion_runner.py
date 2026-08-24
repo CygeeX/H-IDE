@@ -165,6 +165,18 @@ def test_corridor_column_route_matches_the_generated_scene_evaluation() -> None:
     assert route["start"][0] < column["center"][0] < route["goal"][0]
 
 
+def test_east_corridor_to_focus_office_route_uses_generated_scene_targets() -> None:
+    route = runner.DETOUR_ROUTES["office_corridor_east_to_focus_office"]
+
+    assert route == {
+        "start": (6.10, 0.0, 0.0),
+        "goal": (1.75, -4.60, 3.14159),
+    }
+    assert "office_corridor_east_to_focus_office" in (
+        runner.RELAXED_LIVE_CLEARANCE_ROUTES
+    )
+
+
 
 def test_translation_deadline_uses_observed_progress_without_changing_command() -> None:
     assert runner.motion_goal("reverse") == {
