@@ -2097,7 +2097,7 @@
     }
   ],
   "scene_id": "office_v2",
-  "scene_source_sha256": "21eb09e9ccdfe5e8e9c82b011eefc28da4ee049801092e2b9bbfd058c11bc3ef",
+  "scene_source_sha256": "76ee5cd945aab28f034075eab65e5e104085c904048bf2d7085495796b46c379",
   "schema_version": "h-ide.office-v2-evaluation/1",
   "semantic_tests": [
     {

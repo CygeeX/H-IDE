@@ -16,6 +16,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import argparse
+import hashlib
 import json
 import math
 import threading
@@ -235,7 +236,6 @@ class StrictNavigationExecutor:
         plan_sha256: str,
         plan_attempt: int,
         completed_primitives: int,
-        cancelled: Callable[[], bool],
     ) -> NavigationResult | None:
         """Finish a previously reviewed route from its physical endpoint.
 
@@ -244,8 +244,10 @@ class StrictNavigationExecutor:
         subsequent NavFn recovery can produce a residual that is too short to
         partition even though the robot is already inside that same endpoint
         envelope.  In that case, do not backtrack or abort: keep the last
-        verified plan provenance and execute only the collision-checked Nav2
-        ``Spin`` needed to satisfy the requested final heading.
+        verified plan provenance and accept the physical endpoint without
+        another learned turn.  Office inspection owns its scan headings as
+        separate ``Spin`` actions; a hidden terminal turn beside furniture
+        only adds drift and cannot improve positional arrival.
 
         This path is unavailable before at least one static plan has been
         verified, so an arbitrary near-goal request cannot bypass planning.
@@ -257,27 +259,31 @@ class StrictNavigationExecutor:
         distance = math.hypot(goal.x - fresh.pose.x, goal.y - fresh.pose.y)
         if distance > runner.DETOUR_COMPLETED_ENDPOINT_TOLERANCE_M:
             return None
-        delta = math.atan2(
-            math.sin(goal.yaw - fresh.pose.yaw),
-            math.cos(goal.yaw - fresh.pose.yaw),
-        )
-        completed = completed_primitives
-        if abs(delta) > runner.DETOUR_HEADING_TOLERANCE_RAD:
-            self._execute_resolved(
-                {
-                    "action_type": "nav2_msgs/action/Spin",
-                    "action_goal": {"target_yaw_rad": delta},
-                },
-                cancelled=cancelled,
-            )
-            completed += 1
-        final = self.backend.wait_fresh_map_pose().pose
         return NavigationResult(
-            final_pose=final,
+            final_pose=fresh.pose,
             plan_sha256=plan_sha256,
-            completed_primitives=completed,
+            completed_primitives=completed_primitives,
             plan_attempts=plan_attempt,
         )
+
+    @staticmethod
+    def _terminal_path_sha256(
+        navfn_path: Mapping[str, Any], goal: runner.PlanarPose
+    ) -> str:
+        payload = {
+            "schemaVersion": "h-ide.strict-terminal-path/1",
+            "goal": {"x": goal.x, "y": goal.y, "yaw": goal.yaw},
+            "navfnPath": dict(navfn_path),
+        }
+        return hashlib.sha256(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
 
     def navigate(
         self,
@@ -300,6 +306,20 @@ class StrictNavigationExecutor:
                         "strict navigation exceeded its command timeout"
                     )
                 navfn_path = self.backend.compute_path(goal, timeout_s=10.0)
+                fresh_before_plan = self.backend.wait_fresh_map_pose()
+                if (
+                    math.hypot(
+                        goal.x - fresh_before_plan.pose.x,
+                        goal.y - fresh_before_plan.pose.y,
+                    )
+                    <= runner.DETOUR_COMPLETED_ENDPOINT_TOLERANCE_M
+                ):
+                    return NavigationResult(
+                        final_pose=fresh_before_plan.pose,
+                        plan_sha256=self._terminal_path_sha256(navfn_path, goal),
+                        completed_primitives=completed,
+                        plan_attempts=plan_attempt,
+                    )
                 try:
                     plan = self.static_planner.build_primitive_plan(
                         navfn_path, **self._plan_kwargs()
@@ -310,7 +330,6 @@ class StrictNavigationExecutor:
                         plan_sha256=final_plan_hash,
                         plan_attempt=plan_attempt,
                         completed_primitives=completed,
-                        cancelled=cancelled,
                     )
                     if terminal is not None:
                         return terminal

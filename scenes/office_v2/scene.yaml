@@ -126,7 +126,7 @@ inspection_catalog:
       polygon_xy: [[-1.14, 1.41], [3.04, 1.41], [3.04, 5.82], [-1.14, 5.82]]
       entry_pose: [-0.60, 1.95, 1.5707963267948966]
       stations:
-        - {station_id: meeting_entry, purpose: entrance, pose: [-0.60, 1.95, 1.5707963267948966], scan_headings_rad: [1.5707963267948966, -1.5707963267948966]}
+        - {station_id: meeting_entry, purpose: entrance, pose: [-0.60, 1.95, 1.5707963267948966], scan_headings_rad: [1.5707963267948966]}
         - {station_id: meeting_south, purpose: interior, pose: [0.70, 2.18, 1.5707963267948966], scan_headings_rad: [0.0, 1.5707963267948966, 3.141592653589793, -1.5707963267948966]}
         - {station_id: meeting_north, purpose: interior, pose: [0.70, 4.70, 1.5707963267948966], scan_headings_rad: [0.0, 1.5707963267948966, 3.141592653589793, -1.5707963267948966]}
     - region_id: focus_office

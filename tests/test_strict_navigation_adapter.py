@@ -283,7 +283,7 @@ def test_fresh_geometry_failure_replans_at_most_twice() -> None:
     assert result.plan_sha256 == "plan-2"
 
 
-def test_replan_partition_failure_finishes_inside_reviewed_physical_endpoint() -> None:
+def test_replan_finishes_inside_endpoint_before_unpartitionable_micro_route() -> None:
     backend = FakeBackend()
 
     class NearGoalReplanPlanner(FakePlanner):
@@ -303,12 +303,28 @@ def test_replan_partition_failure_finishes_inside_reviewed_physical_endpoint() -
         runner.PlanarPose(1.0, 0.0, 0.5)
     )
 
-    assert result.plan_sha256 == "plan-1"
+    assert len(result.plan_sha256) == 64
     assert result.plan_attempts == 2
-    assert result.completed_primitives == 1
-    assert result.final_pose == runner.PlanarPose(0.82, 0.0, 0.5)
+    assert result.completed_primitives == 0
+    assert result.final_pose == runner.PlanarPose(0.82, 0.0, 0.0)
     assert backend.compute_calls == 2
-    assert backend.sent == [("Spin", pytest.approx(0.5))]
+    assert backend.sent == []
+
+
+def test_navigate_already_inside_physical_endpoint_sends_no_micro_motion() -> None:
+    backend = FakeBackend()
+    backend.pose = runner.PlanarPose(0.82, 0.0, -1.0)
+
+    result = executor(backend, FakePlanner()).navigate(
+        runner.PlanarPose(1.0, 0.0, 1.5)
+    )
+
+    assert len(result.plan_sha256) == 64
+    assert result.plan_attempts == 1
+    assert result.completed_primitives == 0
+    assert result.final_pose == backend.pose
+    assert backend.compute_calls == 1
+    assert backend.sent == []
 
 
 def test_replan_partition_failure_outside_physical_endpoint_still_aborts() -> None:

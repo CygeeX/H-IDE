@@ -18,7 +18,7 @@
     ],
     "resolution": 0.05,
     "widthCells": 320,
-    "yamlSha256": "1246c331b61f19107fc27d17ba5bec86fc07d09f9c34a6f264a69abcdbd7214a"
+    "yamlSha256": "e017333aeb057bd15b809a8321a81af60ac07031e2f5377a78d4b915f00064e2"
   },
   "regions": [
     {
@@ -303,8 +303,7 @@
           },
           "purpose": "entrance",
           "scanHeadingsRad": [
-            1.5707963267948966,
-            -1.5707963267948966
+            1.5707963267948966
           ],
           "stationId": "meeting_entry"
         },
@@ -621,6 +620,6 @@
     "corridor_east"
   ],
   "sceneId": "office_v2",
-  "sceneSourceSha256": "21eb09e9ccdfe5e8e9c82b011eefc28da4ee049801092e2b9bbfd058c11bc3ef",
+  "sceneSourceSha256": "76ee5cd945aab28f034075eab65e5e104085c904048bf2d7085495796b46c379",
   "schemaVersion": "h-ide.office-inspection/1"
 }

@@ -23,7 +23,7 @@
   "inspection_catalog": {
     "contains_object_answers": false,
     "path": "inspection_catalog.json",
-    "sha256": "10c422b6f41b0f5df74d687fa055899c9b8d9b13c4290c89feec44b879e65680"
+    "sha256": "6688432062548a8bb27d21067eb4128524aae845a3388eaf21c0100e7243552e"
   },
   "map": {
     "frame_id": "map",
@@ -45,13 +45,13 @@
     "width_cells": 320,
     "yaml": {
       "path": "nav2/office_v2.yaml",
-      "sha256": "1246c331b61f19107fc27d17ba5bec86fc07d09f9c34a6f264a69abcdbd7214a"
+      "sha256": "e017333aeb057bd15b809a8321a81af60ac07031e2f5377a78d4b915f00064e2"
     }
   },
   "model": {
     "office_include": {
       "path": "mujoco/office_v2.include.xml",
-      "sha256": "39c78ad37b6263a5818356288a8a8342c6e33482d826e825809cff9420270fdb"
+      "sha256": "b709087d8c896102a600fd061c91fc09dc6838e3a0c99a44a59507b7cd8b5ed4"
     },
     "render_assets": [
       {
@@ -102,6 +102,6 @@
   },
   "reset_policy": "explicit_process_restart",
   "scene_id": "office_v2",
-  "scene_source_sha256": "21eb09e9ccdfe5e8e9c82b011eefc28da4ee049801092e2b9bbfd058c11bc3ef",
+  "scene_source_sha256": "76ee5cd945aab28f034075eab65e5e104085c904048bf2d7085495796b46c379",
   "schema_version": "h-ide.office-v2-runtime/1"
 }
