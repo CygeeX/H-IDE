@@ -131,6 +131,45 @@ def test_paired_static_detour_routes_share_exact_terminal_poses() -> None:
     assert forward["goal"] == reverse["start"]
     assert reverse["goal"] == forward["start"]
 
+    turn_safe_forward = runner.DETOUR_ROUTES[
+        "office_waste_bin_turn_safe_s_to_g"
+    ]
+    turn_safe_reverse = runner.DETOUR_ROUTES[
+        "office_waste_bin_turn_safe_g_to_s"
+    ]
+    assert turn_safe_forward["goal"] == turn_safe_reverse["start"]
+    assert turn_safe_reverse["goal"] == turn_safe_forward["start"]
+
+
+def test_turn_safe_detour_keeps_a_spin_reserve_while_still_requiring_a_detour() -> None:
+    start = runner.DETOUR_ROUTES["office_waste_bin_turn_safe_s_to_g"]["start"]
+    goal = runner.DETOUR_ROUTES["office_waste_bin_turn_safe_s_to_g"]["goal"]
+    bin_x, bin_y, bin_radius = -6.85, -0.78, 0.22
+
+    # The turn-around pose has 0.537 m of obstacle-boundary clearance and
+    # 0.48 m to the west wall, both beyond the 0.42 m planning requirement.
+    assert math.hypot(goal[0] - bin_x, goal[1] - bin_y) - bin_radius > 0.53
+    assert goal[0] - (-7.88) > 0.47
+
+    # Yet the direct S->G segment crosses the inflated bin, so this route still
+    # proves static detouring instead of moving the goal into a clear straight
+    # line.  Project the bin center onto the finite start-goal segment.
+    dx, dy = goal[0] - start[0], goal[1] - start[1]
+    projection = max(
+        0.0,
+        min(
+            1.0,
+            ((bin_x - start[0]) * dx + (bin_y - start[1]) * dy)
+            / (dx * dx + dy * dy),
+        ),
+    )
+    closest_x = start[0] + projection * dx
+    closest_y = start[1] + projection * dy
+    direct_boundary_clearance = (
+        math.hypot(closest_x - bin_x, closest_y - bin_y) - bin_radius
+    )
+    assert direct_boundary_clearance < 0.42
+
 
 def test_translation_deadline_uses_observed_progress_without_changing_command() -> None:
     assert runner.motion_goal("reverse") == {

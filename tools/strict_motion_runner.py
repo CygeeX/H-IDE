@@ -178,6 +178,22 @@ DETOUR_ROUTES = {
         "start": (-7.30, -0.30, -2.50),
         "goal": (-6.45, 0.0, 0.0),
     },
+    # The compact route above intentionally proves the minimum-clearance
+    # NavFn detour.  Its terminal pose leaves too little reserve for the
+    # whole-body displacement of a subsequent ~pi Spin: live r140 correctly
+    # tripped Nav2's collision-ahead check while attempting the return leg.
+    # This paired route keeps the same direct-line obstruction but moves the
+    # turn-around pose into the open area south-west of the bin.  It is the
+    # product route for a stop/turn/return sequence; the compact pair remains
+    # a one-way clearance regression.
+    "office_waste_bin_turn_safe_s_to_g": {
+        "start": (-6.45, 0.0, 0.0),
+        "goal": (-7.40, -1.30, -2.20),
+    },
+    "office_waste_bin_turn_safe_g_to_s": {
+        "start": (-7.40, -1.30, -2.20),
+        "goal": (-6.45, 0.0, 0.0),
+    },
 }
 OFFICE_DETOUR_OBSTACLES = [
     {
