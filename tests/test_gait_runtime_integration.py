@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import math
+import socket
 import threading
 from types import SimpleNamespace
 from uuid import UUID
@@ -1074,6 +1075,59 @@ def test_adjacent_intent_and_health_probe_fit_the_20ms_loopback_budget() -> None
     )
     assert parsed.status == "ready"
     assert driver._intent_ingress.armed is True
+
+
+def test_silent_client_cannot_starve_the_next_health_probe() -> None:
+    clock = Clock()
+    driver = bare_driver(clock)
+    driver._last_lowstate_wall_s = clock.value - 0.01
+    driver._last_control_step_wall_s = clock.value - 0.01
+    server = _bind_command_server("127.0.0.1", 0)
+    port = int(server.getsockname()[1])
+    failures: list[Exception] = []
+
+    def serve_two_connections() -> None:
+        try:
+            for _ in range(2):
+                conn, _address = server.accept()
+                with conn:
+                    try:
+                        _handle_command_connection(driver, conn)
+                    except TimeoutError:
+                        pass
+        except Exception as exc:
+            failures.append(exc)
+
+    worker = threading.Thread(target=serve_two_connections, daemon=True)
+    worker.start()
+    poison = socket.create_connection(("127.0.0.1", port), timeout=0.1)
+    request_id = UUID("50000000-0000-4000-8000-000000000006")
+    try:
+        response = request_json(
+            "127.0.0.1",
+            port,
+            sonic_health_probe(
+                robot_id="g1-sim",
+                producer_boot_id=UUID(
+                    "20000000-0000-4000-8000-000000000002"
+                ),
+                request_id=request_id,
+            ),
+            timeout=0.040,
+        )
+    finally:
+        poison.close()
+        worker.join(timeout=1.0)
+        server.close()
+
+    assert worker.is_alive() is False
+    assert failures == []
+    parsed = SonicHealth.from_response(
+        response,
+        expected_request_id=request_id,
+        expected_robot_id="g1-sim",
+    )
+    assert parsed.status == "ready"
 
 
 def test_driver_obeys_stop_before_model_guard_mapping() -> None:

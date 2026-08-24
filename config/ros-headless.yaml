@@ -64,11 +64,14 @@ force_cpu: false
 # remains enabled for H-IDE Vision and mission evidence.
 onscreen: false
 offscreen: true
-# Disable the legacy time-based release. SONIC owns the only product release:
-# after INIT, tethered settle, and the first successful learned-policy DDS it
-# requests one exact activation epoch from Plant, then proves support is off.
+# Disable the legacy time-based release.  The workstation integration profile
+# deliberately retains only MuJoCo's non-propulsive vertical/roll/pitch fall
+# arrest after the one-time INIT and tethered settle.  It contributes no
+# world-X/Y force or yaw torque, so translation and turning still have to come
+# from SONIC, while normal room-to-room stops no longer re-run INIT.  The
+# support-off profiles remain available for the stricter balance acceptance.
 startup_support_s: 0.0
-policy_release_fall_arrest: true
+policy_release_fall_arrest: false
 # Model/controller resynchronization is slower than a normal cold start. Keep
 # the root over its initial footprint until the new static hold is established;
 # horizontal support is removed before any navigation acceptance begins.

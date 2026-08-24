@@ -106,6 +106,7 @@ HIDE_DEMO_COUPLED_UNIT_SUFFIXES=(
   ros-cmd-vel-bridge
   ros-observation-bridge
   ros-safe-stop
+  strict-navigation-adapter
   sim-robot-agent-gateway
   observation-gateway
   robot-agent-g1-sim
@@ -762,6 +763,42 @@ raise SystemExit(0 if ready else 1)
   return 1
 }
 
+wait_for_strict_navigation_adapter() {
+  local timeout_seconds="${1:-30}"
+  local deadline=$((SECONDS + timeout_seconds))
+  local action_list=""
+  local health=""
+  while (( SECONDS < deadline )); do
+    if ! systemctl --user is-active --quiet \
+      "${HIDE_DEMO_SYSTEMD_PREFIX}-strict-navigation-adapter.service"; then
+      sleep 0.2
+      continue
+    fi
+    action_list="$(demo_ros_command ros2 action list -t 2>/dev/null || true)"
+    if [[ "${action_list}" != *'/h_ide/strict/navigate_to_pose [nav2_msgs/action/NavigateToPose]'* ]] \
+      || [[ "${action_list}" != *'/h_ide/strict/spin [nav2_msgs/action/Spin]'* ]]; then
+      sleep 0.2
+      continue
+    fi
+    health="$(
+      demo_ros_command ros2 service call \
+        /h_ide/strict_navigation/health \
+        std_srvs/srv/Trigger '{}' 2>/dev/null || true
+    )"
+    if [[ "${health}" == *'success=True'* ]] \
+      || [[ "${health}" == *'success=true'* ]] \
+      || [[ "${health}" == *'success: true'* ]]; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  printf '%s\n' \
+    'Strict navigation adapter did not expose both reviewed action contracts.' \
+    "Action list: ${action_list:-unavailable}" \
+    "Health: ${health:-unavailable}" >&2
+  return 1
+}
+
 wait_for_simulation_tf() {
   local timeout_seconds="${1:-45}"
   local deadline=$((SECONDS + timeout_seconds))
@@ -844,6 +881,40 @@ nav2_image="h-ide-nav2-sim:jazzy"
 # committed runtime artifact exactly matches a clean deterministic build.
 "${HIDE_DEMO_SIM_ROOT}/.venv/bin/python" \
   "${HIDE_DEMO_SIM_ROOT}/tools/build_scene.py" --check
+
+if [[ "${HIDE_DEMO_MOTION_CORE}" != "true" ]]; then
+  # The product-safe Scene API package is committed in H-IDE so Control API
+  # and the simulator do not share evaluator-only scene.yaml access.  Refuse a
+  # launch when that immutable copy is stale relative to the generated Office
+  # V2 PGM/catalog used by MuJoCo and Nav2.
+  office_v2_product_source="${HIDE_DEMO_SIM_ROOT}/scenes/office_v2/generated"
+  office_v2_product_copy="${HIDE_DEMO_H_IDE_ROOT}/services/scene_api/builtin/office_v2"
+  for product_file in inspection_catalog.json nav2/office_v2.pgm nav2/office_v2.yaml; do
+    copied_name="$(basename -- "${product_file}")"
+    if ! cmp -s \
+      "${office_v2_product_source}/${product_file}" \
+      "${office_v2_product_copy}/${copied_name}"; then
+      printf 'Office V2 product Scene API bundle is stale: %s\n' \
+        "${copied_name}" >&2
+      exit 1
+    fi
+  done
+  wait_for_http 'Scene API' 'http://127.0.0.1:8090/readyz' 60
+  scene_public_token="$(
+    sed -n 's/^CONTROL_API_TOKEN=//p' "${HIDE_DEMO_H_IDE_ROOT}/.env" | tail -n 1
+  )"
+  scene_internal_token="$(
+    sed -n 's/^SCENE_API_INTERNAL_TOKEN=//p' "${HIDE_DEMO_H_IDE_ROOT}/.env" | tail -n 1
+  )"
+  SCENE_API_TOKEN="${scene_public_token:-dev-token}" \
+  SCENE_API_INTERNAL_TOKEN="${scene_internal_token:-dev-scene-internal-token}" \
+  SIMULATION_ROBOT_AGENT_ID=g1-sim \
+    "${HIDE_DEMO_H_IDE_ROOT}/.venv/bin/python" \
+      -m services.scene_api.office_v2_bootstrap \
+      --base-url http://127.0.0.1:8090 \
+      --timeout-seconds 900
+  printf '%-28s ready\n' 'Office V2 Scene binding'
+fi
 office_v2_runtime_manifest="${HIDE_DEMO_SIM_ROOT}/scenes/office_v2/generated/runtime_manifest.json"
 office_v2_source_sha256="$(
   "${HIDE_DEMO_SIM_ROOT}/.venv/bin/python" -c \
@@ -1002,6 +1073,20 @@ if [[ "${HIDE_DEMO_MOTION_CORE}" == "true" ]]; then
     'Motion-core is stationary and isolated: RobotAgent and simulation gateway are not running.' \
     'No motion command has been sent. Run one explicit tools/strict_motion_runner.py --execute case at a time.'
   exit 0
+fi
+
+# Full-chain RobotAgent navigation must terminate at the same primitive-only
+# motion owner that passed motion-core acceptance.  Start this adapter after
+# Nav2 lifecycle activation and before any component capable of acquiring a
+# RobotAgent lease.  NavigateToPose / FollowPath output remains quarantined.
+start_process \
+  strict-navigation-adapter \
+  'tools/strict_navigation_adapter.py' \
+  "${HIDE_DEMO_SIM_ROOT}" \
+  'source /opt/ros/jazzy/setup.bash; source "$HIDE_DEMO_ROBOT_ROOT/tools/activate-local-nav2-jazzy.bash"; export ROS_DOMAIN_ID=232 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp CYCLONEDDS_URI="$HIDE_DEMO_CYCLONE"; export PYTHONPATH="$HIDE_DEMO_SIM_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"; exec /usr/bin/python3 -u "$HIDE_DEMO_SIM_ROOT/tools/strict_navigation_adapter.py" --command-timeout-seconds 300'
+
+if ! wait_for_strict_navigation_adapter 30; then
+  exit 1
 fi
 
 start_process \

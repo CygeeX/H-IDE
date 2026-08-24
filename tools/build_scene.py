@@ -9,8 +9,10 @@ intentionally emits three different trust domains from that inventory:
 * ``evaluation/manifest.json`` contains privileged semantic ground truth and
   must never be mounted into a product service.
 
-No downloaded mesh or texture is required.  The small PNG textures are
-generated deterministically with the Python standard library.
+No downloaded mesh or texture is required.  The small PNG textures and the
+lightweight architectural dressing are generated deterministically with the
+Python standard library.  Detailed visual dressing deliberately keeps simple
+collision proxies so perception fidelity cannot perturb navigation physics.
 """
 
 from __future__ import annotations
@@ -33,8 +35,8 @@ from typing import Any, Iterable, Mapping, Sequence
 import yaml
 
 
-BUILD_VERSION = "office-v2-generator/2"
-SCHEMA_VERSION = "h-ide.office-scene/2"
+BUILD_VERSION = "office-v2-generator/3"
+SCHEMA_VERSION = "h-ide.office-scene/3"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SCENE = REPO_ROOT / "scenes" / "office_v2" / "scene.yaml"
 SUPPORTED_TEMPLATES = {
@@ -147,6 +149,76 @@ def _validate_scene(scene: Mapping[str, Any]) -> None:
     if not math.isfinite(footprint_padding) or footprint_padding < 0:
         raise SceneBuildError("navigation.footprint_padding_m must be non-negative")
 
+    inspection = scene.get("inspection_catalog")
+    if not isinstance(inspection, Mapping):
+        raise SceneBuildError("inspection_catalog must be an object")
+    if inspection.get("schema_version") != "h-ide.office-inspection/1":
+        raise SceneBuildError(
+            "inspection_catalog.schema_version must be h-ide.office-inspection/1"
+        )
+    capture_policy = inspection.get("capture_policy")
+    if not isinstance(capture_policy, Mapping):
+        raise SceneBuildError("inspection_catalog.capture_policy must be an object")
+    if int(capture_policy.get("frames_per_heading", 0)) != 3:
+        raise SceneBuildError("inspection capture must use exactly three frames per heading")
+    for field in ("burst_duration_s", "stop_before_capture_s", "maximum_settle_s"):
+        value = float(capture_policy.get(field, 0))
+        if not math.isfinite(value) or value <= 0:
+            raise SceneBuildError(f"inspection_catalog.capture_policy.{field} must be positive")
+    regions = inspection.get("regions")
+    if not isinstance(regions, list) or not regions:
+        raise SceneBuildError("inspection_catalog.regions must be a non-empty list")
+    region_ids: set[str] = set()
+    station_ids: set[str] = set()
+    for region in regions:
+        if not isinstance(region, Mapping):
+            raise SceneBuildError("inspection catalog regions must be objects")
+        region_id = region.get("region_id")
+        if not isinstance(region_id, str) or not ID_PATTERN.fullmatch(region_id):
+            raise SceneBuildError(f"invalid inspection region ID: {region_id!r}")
+        if region_id in region_ids:
+            raise SceneBuildError(f"duplicate inspection region ID: {region_id}")
+        region_ids.add(region_id)
+        if region.get("kind") not in {"room", "corridor"}:
+            raise SceneBuildError(f"invalid inspection region kind: {region.get('kind')!r}")
+        if not isinstance(region.get("name"), str) or not region["name"].strip():
+            raise SceneBuildError(f"inspection region {region_id} must have a name")
+        polygon = region.get("polygon_xy")
+        if not isinstance(polygon, list) or len(polygon) < 3:
+            raise SceneBuildError(f"inspection region {region_id} polygon must have at least 3 points")
+        for index, point in enumerate(polygon):
+            x, y = _numbers(point, 2, f"inspection_catalog.{region_id}.polygon_xy[{index}]")
+            if not (bounds_min[0] <= x <= bounds_max[0] and bounds_min[1] <= y <= bounds_max[1]):
+                raise SceneBuildError(f"inspection region {region_id} polygon is outside scene bounds")
+        _numbers(region.get("entry_pose"), 3, f"inspection_catalog.{region_id}.entry_pose")
+        stations = region.get("stations")
+        if not isinstance(stations, list) or not stations:
+            raise SceneBuildError(f"inspection region {region_id} must define stations")
+        for station in stations:
+            if not isinstance(station, Mapping):
+                raise SceneBuildError(f"inspection region {region_id} stations must be objects")
+            station_id = station.get("station_id")
+            if not isinstance(station_id, str) or not ID_PATTERN.fullmatch(station_id):
+                raise SceneBuildError(f"invalid inspection station ID: {station_id!r}")
+            if station_id in station_ids:
+                raise SceneBuildError(f"duplicate inspection station ID: {station_id}")
+            station_ids.add(station_id)
+            if station.get("purpose") not in {"entrance", "interior", "corridor"}:
+                raise SceneBuildError(f"invalid purpose for inspection station {station_id}")
+            _numbers(station.get("pose"), 3, f"inspection_catalog.{station_id}.pose")
+            headings = station.get("scan_headings_rad")
+            if not isinstance(headings, list) or not 1 <= len(headings) <= 8:
+                raise SceneBuildError(f"inspection station {station_id} must define 1-8 headings")
+            for heading in headings:
+                value = float(heading)
+                if not math.isfinite(value) or not -math.pi <= value <= math.pi:
+                    raise SceneBuildError(f"inspection station {station_id} heading is invalid")
+    route = inspection.get("route")
+    if not isinstance(route, list) or len(route) != len(station_ids):
+        raise SceneBuildError("inspection_catalog.route must visit every station exactly once")
+    if len(set(route)) != len(route) or set(route) != station_ids:
+        raise SceneBuildError("inspection_catalog.route must be a permutation of station IDs")
+
     material_ids = set(scene["materials"])
     texture_ids = {item["id"] for item in scene["textures"]}
     if len(texture_ids) != len(scene["textures"]):
@@ -161,7 +233,14 @@ def _validate_scene(scene: Mapping[str, Any]) -> None:
             raise SceneBuildError(f"materials.{material_id}.rgba must be normalized")
 
     all_ids: set[str] = set()
-    for group in ("structures", "objects", "spawns", "targets", "semantic_tests"):
+    for group in (
+        "structures",
+        "visual_decor",
+        "objects",
+        "spawns",
+        "targets",
+        "semantic_tests",
+    ):
         for entry in scene[group]:
             entry_id = entry.get("id")
             if not isinstance(entry_id, str) or not ID_PATTERN.fullmatch(entry_id):
@@ -179,6 +258,33 @@ def _validate_scene(scene: Mapping[str, Any]) -> None:
             raise SceneBuildError(f"structure {structure['id']} dimensions must be positive")
         if structure["material"] not in material_ids:
             raise SceneBuildError(f"structure {structure['id']} references an unknown material")
+
+    for item in scene["visual_decor"]:
+        kind = item.get("kind")
+        if kind not in {"floor_zone", "doorway_frame", "ceiling_panel"}:
+            raise SceneBuildError(f"unsupported visual_decor kind: {kind}")
+        _numbers(item["pose"], 4, f"visual_decor.{item['id']}.pose")
+        dimensions = _numbers(
+            item["dimensions"], 3, f"visual_decor.{item['id']}.dimensions"
+        )
+        if any(axis <= 0 for axis in dimensions):
+            raise SceneBuildError(
+                f"visual_decor {item['id']} dimensions must be positive"
+            )
+        if item["material"] not in material_ids:
+            raise SceneBuildError(
+                f"visual_decor {item['id']} references an unknown material"
+            )
+        if kind == "doorway_frame":
+            frame_width = float(item.get("frame_width", 0))
+            if not math.isfinite(frame_width) or frame_width <= 0:
+                raise SceneBuildError(
+                    f"visual_decor {item['id']} frame_width must be positive"
+                )
+            if dimensions[0] <= frame_width * 2:
+                raise SceneBuildError(
+                    f"visual_decor {item['id']} opening is too narrow for its frame"
+                )
 
     object_ids = {entry["id"] for entry in scene["objects"]}
     for item in scene["objects"]:
@@ -266,7 +372,9 @@ FONT_5X7 = {
     "O": ("01110", "10001", "10001", "10001", "10001", "10001", "01110"),
     "P": ("11110", "10001", "10001", "11110", "10000", "10000", "10000"),
     "R": ("11110", "10001", "10001", "11110", "10100", "10010", "10001"),
+    "S": ("01111", "10000", "10000", "01110", "00001", "00001", "11110"),
     "T": ("11111", "00100", "00100", "00100", "00100", "00100", "00100"),
+    "U": ("10001", "10001", "10001", "10001", "10001", "10001", "01110"),
     "Y": ("10001", "10001", "01010", "00100", "00100", "00100", "00100"),
 }
 
@@ -391,6 +499,7 @@ class MjcfBuilder:
         self.source_sha = source_sha
         self.lines: list[str] = []
         self.object_mappings: list[dict[str, Any]] = []
+        self.decor_visual_names: list[str] = []
 
     def add(self, indent: int, text: str) -> None:
         self.lines.append("  " * indent + text)
@@ -449,13 +558,21 @@ class MjcfBuilder:
                 for y in (-depth * 0.34, depth * 0.34):
                     box([x, y, (height - top) / 2], [0.10, 0.10, height - top], "brushed_metal")
             box([0, 0, height - top - 0.08], [width * 0.65, 0.08, 0.10], "brushed_metal")
+            # A recessed cable/power module gives the conference table a
+            # recognizable visual focal point without adding collision.
+            box([0, 0, height + 0.006], [width * 0.16, depth * 0.13, 0.018], "charcoal")
         elif template == "chair":
             seat_z = height * 0.50
             box([0, 0, seat_z], [width * 0.88, depth * 0.82, 0.10])
-            box([0, -depth * 0.39, height * 0.72], [width * 0.88, 0.09, height * 0.48])
+            box([0, 0, seat_z + 0.055], [width * 0.78, depth * 0.70, 0.055], "navy_fabric")
+            box([0, -depth * 0.39, height * 0.72], [width * 0.88, 0.09, height * 0.48], euler=[-0.10, 0, 0])
+            box([0, -depth * 0.34, height * 0.73], [width * 0.72, 0.055, height * 0.34], "navy_fabric", euler=[-0.10, 0, 0])
             cylinder([0, 0, seat_z * 0.48], width * 0.07, seat_z * 0.78, "charcoal")
             for yaw in (0.0, 1.5708):
                 box([0, 0, 0.07], [width * 0.92, 0.055, 0.055], "charcoal", [0, 0, yaw])
+            for x in (-width * 0.46, width * 0.46):
+                box([x, 0, seat_z + height * 0.11], [0.045, depth * 0.64, 0.045], "charcoal")
+                box([x, -depth * 0.08, seat_z + height * 0.16], [0.075, depth * 0.42, 0.055], "navy_fabric")
         elif template == "display":
             box([0, 0.01, height / 2], [width, depth, height], "charcoal")
             box([0, -depth * 0.53, height / 2], [width * 0.91, depth * 0.10, height * 0.84], material)
@@ -494,6 +611,10 @@ class MjcfBuilder:
             box([0, depth * 0.06, height + 0.29], [width * 0.38, 0.06, 0.42], "charcoal")
             box([0, depth * 0.025, height + 0.29], [width * 0.34, 0.018, 0.35], "screen_glow")
             box([0, -depth * 0.27, height + 0.018], [width * 0.34, depth * 0.20, 0.035], "charcoal")
+            box([-width * 0.34, depth * 0.18, height * 0.36], [width * 0.22, depth * 0.42, height * 0.67], "white_plastic")
+            for z in (height * 0.18, height * 0.36, height * 0.54):
+                box([-width * 0.34, -depth * 0.04, z], [width * 0.17, 0.018, 0.028], "charcoal")
+            cylinder([0, depth * 0.03, height + 0.075], 0.025, 0.15, "charcoal")
         elif template == "cabinet":
             box([0, 0, height / 2], [width, depth, height], material)
             box([0, -depth * 0.505, height / 2], [width * 0.92, 0.025, height * 0.96], "warm_wall")
@@ -512,16 +633,29 @@ class MjcfBuilder:
             box([0, 0, height * 0.48], [width, depth * 0.78, height * 0.88], material)
             box([0, 0, height - 0.04], [width * 1.03, depth, 0.08], "white_plastic")
             box([0, -depth * 0.43, height * 0.52], [width * 0.52, 0.035, height * 0.28], "brushed_metal")
+            box([0, depth * 0.08, height + 0.26], [width * 0.30, 0.055, 0.38], "charcoal")
+            box([0, depth * 0.045, height + 0.26], [width * 0.26, 0.018, 0.31], "screen_glow")
+            box([0, depth * 0.08, height + 0.055], [0.055, 0.055, 0.18], "charcoal")
         elif template == "sofa":
             box([0, 0, height * 0.25], [width, depth, height * 0.32], material)
             box([0, depth * 0.38, height * 0.61], [width, depth * 0.18, height * 0.70], material)
             for x in (-width * 0.46, width * 0.46):
                 box([x, 0, height * 0.42], [width * 0.09, depth, height * 0.45], material)
-            box([0, -depth * 0.05, height * 0.43], [width * 0.78, depth * 0.68, height * 0.11], "navy_fabric")
+            for x in (-width * 0.20, width * 0.20):
+                box([x, -depth * 0.05, height * 0.43], [width * 0.36, depth * 0.68, height * 0.12], "navy_fabric")
+                box([x, depth * 0.28, height * 0.68], [width * 0.35, depth * 0.12, height * 0.42], "navy_fabric", euler=[0.12, 0, 0])
+            for x in (-width * 0.42, width * 0.42):
+                box([x, 0, 0.055], [0.07, depth * 0.62, 0.11], "charcoal")
         elif template == "whiteboard":
             box([0, 0, height / 2], [width, depth, height], "brushed_metal")
             box([0, -depth * 0.52, height / 2], [width * 0.94, depth * 0.12, height * 0.88], material)
             box([0, -depth * 0.62, 0.02], [width * 0.48, depth * 0.22, 0.04], "charcoal")
+            for x, z, length, mat in (
+                (-width * 0.20, height * 0.66, width * 0.22, "accent_focus"),
+                (width * 0.13, height * 0.48, width * 0.30, "accent_pantry"),
+                (-width * 0.05, height * 0.30, width * 0.38, "accent_meeting"),
+            ):
+                box([x, -depth * 0.60, z], [length, 0.009, 0.018], mat, euler=[0, 0, 0.08])
         elif template == "waste_bin":
             cylinder([0, 0, height / 2], width / 2, height, material)
             cylinder([0, 0, height * 0.98], width * 0.42, 0.025, "charcoal")
@@ -563,6 +697,59 @@ class MjcfBuilder:
         self.lines[-1] = self.lines[-1].replace('contype="0" conaffinity="0" group="2"', 'contype="1" conaffinity="1" group="2" friction="0.9 0.02 0.001" condim="3"')
         for index, light in enumerate(render["lights"], start=1):
             self.add(2, f'<light name="office_v2_light_{index:03d}" pos="{_vec(light["position"])}" diffuse="{_vec(light["diffuse"])}" specular="0.08 0.08 0.08" castshadow="true"/>')
+
+        # Visual dressing is intentionally bodyless and collision-free.  The
+        # canonical collision proxies below remain the only source for MuJoCo
+        # contacts and the Nav2 occupancy map.
+        for index, item in enumerate(self.scene["visual_decor"], start=1):
+            prefix = f"office_decor_{index:03d}"
+            x, y, z, yaw = [float(axis) for axis in item["pose"]]
+            width, depth, height = [float(axis) for axis in item["dimensions"]]
+            material = str(item["material"])
+            kind = str(item["kind"])
+
+            def decor_box(
+                suffix: str,
+                local_pos: Sequence[float],
+                dimensions: Sequence[float],
+            ) -> None:
+                local_x, local_y, local_z = [float(axis) for axis in local_pos]
+                world_x = x + math.cos(yaw) * local_x - math.sin(yaw) * local_y
+                world_y = y + math.sin(yaw) * local_x + math.cos(yaw) * local_y
+                name = f"{prefix}_{suffix}"
+                self.geom(
+                    2,
+                    name,
+                    geom_type="box",
+                    pos=[world_x, world_y, z + local_z],
+                    size=[float(axis) / 2 for axis in dimensions],
+                    material=material,
+                    euler=[0, 0, yaw],
+                )
+                self.decor_visual_names.append(name)
+
+            if kind in {"floor_zone", "ceiling_panel"}:
+                decor_box("visual_01", [0, 0, height / 2], [width, depth, height])
+            else:
+                frame_width = float(item["frame_width"])
+                opening_width = width
+                opening_height = height
+                post_x = opening_width / 2 + frame_width / 2
+                decor_box(
+                    "visual_01",
+                    [-post_x, 0, opening_height / 2],
+                    [frame_width, depth, opening_height],
+                )
+                decor_box(
+                    "visual_02",
+                    [post_x, 0, opening_height / 2],
+                    [frame_width, depth, opening_height],
+                )
+                decor_box(
+                    "visual_03",
+                    [0, 0, opening_height + frame_width / 2],
+                    [opening_width + frame_width * 2, depth, frame_width],
+                )
 
         for index, structure in enumerate(self.scene["structures"], start=1):
             prefix = f"office_structure_{index:03d}"
@@ -710,6 +897,24 @@ def _ensure_navigation_points_are_free(scene: Mapping[str, Any], pgm: bytes, wid
                     f"{group[:-1]} {item['id']} has only {nearest:.3f} m collision "
                     f"clearance; {required:.3f} m is required"
                 )
+    for region in scene["inspection_catalog"]["regions"]:
+        points = [
+            (f"region {region['region_id']} entry", region["entry_pose"]),
+            *[
+                (f"station {station['station_id']}", station["pose"])
+                for station in region["stations"]
+            ],
+        ]
+        for label, pose in points:
+            x, y, _yaw = [float(axis) for axis in pose]
+            if _cell_value(pgm, width, height, scene, x, y) == occupied:
+                raise SceneBuildError(f"inspection {label} lies in an occupied map cell")
+            nearest = min(_distance_to_geometry(x, y, obstacle) for obstacle in geometry)
+            if nearest + 1e-9 < body_clearance:
+                raise SceneBuildError(
+                    f"inspection {label} has only {nearest:.3f} m collision clearance; "
+                    f"{body_clearance:.3f} m is required"
+                )
 
 
 def _asset_label(texture_id: str) -> str:
@@ -725,6 +930,7 @@ def _output_inventory(paths: BuildPaths, texture_ids: Sequence[str]) -> list[tup
         ("scenes/office_v2/generated/nav2/office_v2.yaml", paths.generated / "nav2" / "office_v2.yaml"),
         ("scenes/office_v2/generated/runtime_manifest.json", paths.generated / "runtime_manifest.json"),
         ("scenes/office_v2/generated/visual_manifest.json", paths.generated / "visual_manifest.json"),
+        ("scenes/office_v2/generated/inspection_catalog.json", paths.generated / "inspection_catalog.json"),
         ("scenes/office_v2/evaluation/manifest.json", paths.evaluation / "manifest.json"),
         ("assets/office_v2/ASSET_LICENSES.json", paths.assets.parent / "ASSET_LICENSES.json"),
     ]
@@ -745,7 +951,8 @@ def build_scene(paths: BuildPaths | None = None) -> dict[str, str]:
         _atomic_write(paths.assets / f"{texture_id}.png", png)
         _atomic_write(paths.generated / "mujoco" / "textures" / f"{texture_id}.png", png)
 
-    mjcf, mappings = MjcfBuilder(scene, source_sha).build()
+    mjcf_builder = MjcfBuilder(scene, source_sha)
+    mjcf, mappings = mjcf_builder.build()
     include_path = paths.generated / "mujoco" / "office_v2.include.xml"
     _write_text(include_path, mjcf)
     preview = (
@@ -788,6 +995,72 @@ def build_scene(paths: BuildPaths | None = None) -> dict[str, str]:
         f"mode: {map_spec['mode']}\n"
     )
     _write_text(yaml_path, nav_yaml)
+
+    source_inspection = scene["inspection_catalog"]
+    inspection_catalog = {
+        "schemaVersion": source_inspection["schema_version"],
+        "sceneId": scene["scene_id"],
+        "sceneSourceSha256": source_sha,
+        "containsObjectAnswers": False,
+        "locale": source_inspection["locale"],
+        "map": {
+            "frameId": map_spec["frame_id"],
+            "resolution": float(map_spec["resolution"]),
+            "origin": [float(value) for value in map_spec["origin"]],
+            "widthCells": map_width,
+            "heightCells": map_height,
+            "yamlSha256": _sha256_path(yaml_path),
+            "imageSha256": _sha256_path(pgm_path),
+        },
+        "capturePolicy": {
+            "framesPerHeading": int(source_inspection["capture_policy"]["frames_per_heading"]),
+            "burstDurationS": float(source_inspection["capture_policy"]["burst_duration_s"]),
+            "stopBeforeCaptureS": float(
+                source_inspection["capture_policy"]["stop_before_capture_s"]
+            ),
+            "maximumSettleS": float(source_inspection["capture_policy"]["maximum_settle_s"]),
+        },
+        "regions": [
+            {
+                "regionId": region["region_id"],
+                "name": region["name"],
+                "aliases": list(region.get("aliases", [])),
+                "kind": region["kind"],
+                "polygonXY": [
+                    {"x": float(point[0]), "y": float(point[1])}
+                    for point in region["polygon_xy"]
+                ],
+                "entryPose": {
+                    "frameId": "map",
+                    "x": float(region["entry_pose"][0]),
+                    "y": float(region["entry_pose"][1]),
+                    "z": 0.0,
+                    "yaw": float(region["entry_pose"][2]),
+                },
+                "stations": [
+                    {
+                        "stationId": station["station_id"],
+                        "purpose": station["purpose"],
+                        "pose": {
+                            "frameId": "map",
+                            "x": float(station["pose"][0]),
+                            "y": float(station["pose"][1]),
+                            "z": 0.0,
+                            "yaw": float(station["pose"][2]),
+                        },
+                        "scanHeadingsRad": [
+                            float(value) for value in station["scan_headings_rad"]
+                        ],
+                    }
+                    for station in region["stations"]
+                ],
+            }
+            for region in source_inspection["regions"]
+        ],
+        "route": list(source_inspection["route"]),
+    }
+    inspection_path = paths.generated / "inspection_catalog.json"
+    _write_text(inspection_path, _canonical_json(inspection_catalog))
 
     mapping_by_id = {entry["source_id"]: entry for entry in mappings}
     evaluation_objects = []
@@ -899,6 +1172,11 @@ def build_scene(paths: BuildPaths | None = None) -> dict[str, str]:
             "clearance_radius_m": float(default_spawn["clearance_radius"]),
         },
         "collision_contract_sha256": collision_contract_sha256,
+        "inspection_catalog": {
+            "path": "inspection_catalog.json",
+            "sha256": _sha256_path(inspection_path),
+            "contains_object_answers": False,
+        },
     }
     runtime_manifest_path = paths.generated / "runtime_manifest.json"
     _write_text(runtime_manifest_path, _canonical_json(runtime_manifest))
@@ -920,6 +1198,7 @@ def build_scene(paths: BuildPaths | None = None) -> dict[str, str]:
             "nav2_pgm": {"path": "generated/nav2/office_v2.pgm", "sha256": _sha256_path(pgm_path)},
             "nav2_yaml": {"path": "generated/nav2/office_v2.yaml", "sha256": _sha256_path(yaml_path)},
             "runtime_manifest": {"path": "generated/runtime_manifest.json", "sha256": _sha256_path(runtime_manifest_path)},
+            "inspection_catalog": {"path": "generated/inspection_catalog.json", "sha256": _sha256_path(inspection_path)},
         },
         "render_assets": [
             {"path": f"generated/mujoco/textures/{texture['id']}.png", "sha256": texture_hashes[texture["id"]]}
@@ -927,8 +1206,10 @@ def build_scene(paths: BuildPaths | None = None) -> dict[str, str]:
         ],
         "counts": {
             "structures": len(scene["structures"]),
+            "visual_decor": len(scene["visual_decor"]),
             "fixtures": len(scene["objects"]),
-            "visual_geoms": sum(len(entry["visual_geoms"]) for entry in mappings),
+            "visual_geoms": sum(len(entry["visual_geoms"]) for entry in mappings)
+            + len(mjcf_builder.decor_visual_names),
             "collision_geoms": sum(len(entry["collision_geoms"]) for entry in mappings),
         },
     }

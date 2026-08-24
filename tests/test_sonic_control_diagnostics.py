@@ -68,8 +68,14 @@ class _Connection:
     def __init__(self, payload: bytes) -> None:
         self._chunks = [payload, b""]
         self.sent = b""
+        self.timeout: float | None = None
+        self.recv_count = 0
+
+    def settimeout(self, value: float) -> None:
+        self.timeout = value
 
     def recv(self, _size: int) -> bytes:
+        self.recv_count += 1
         return self._chunks.pop(0)
 
     def sendall(self, data: bytes) -> None:
@@ -92,7 +98,8 @@ def test_slow_command_log_names_operation_and_stage(caplog) -> None:
         sonic_driver._handle_command_connection(_Driver(), connection)
 
     assert b'"ok":true' in connection.sent
+    assert connection.timeout == 0.010
+    assert connection.recv_count == 1
     assert "types=diagnostic_test" in caplog.text
     assert "accept_s=" in caplog.text
     assert "recv_s=" in caplog.text
-

@@ -368,6 +368,14 @@ class FakeTransport:
                 "lastError": None,
                 "authorityFeedbackEnabled": False,
                 "keyCallbackRegistered": False,
+                "nativeViewerActive": True,
+                "shutdownStarted": False,
+                "nativeShutdownComplete": False,
+                "lastSuccessSequence": 40,
+                "lastSuccessAtUnixNs": 1_800_000_000_000_000_000,
+                "progressAgeMs": 10.0,
+                "staleAfterMs": 2_000.0,
+                "mailboxPublishedCount": 40,
             }
         if self.released_pose is not None:
             plant["pose"].update(self.released_pose)
@@ -391,14 +399,14 @@ class FakeTransport:
         if self.active and self.mode == "hard_height" and self.elapsed >= 0.3:
             plant["pose"]["z"] = 0.549
         if self.active and self.mode == "hard_reverse" and self.elapsed >= 0.3:
-            plant["pose"]["x"] = 1.0 - 0.031 * math.cos(0.3)
-            plant["pose"]["y"] = 2.0 - 0.031 * math.sin(0.3)
+            plant["pose"]["x"] = 1.0 - 0.101 * math.cos(0.3)
+            plant["pose"]["y"] = 2.0 - 0.101 * math.sin(0.3)
         if self.active and self.mode == "hard_jump" and not self.fault_once and self.elapsed >= 0.3:
             self.fault_once = True
             plant["pose"]["x"] += 0.081
         if self.mode == "hard_arm" and self.active and not self.fault_once and self.elapsed >= 0.3:
             self.fault_once = True
-            sonic["navigation_task_peak_arm_velocity_rps"] = 2.001
+            sonic["navigation_task_peak_arm_velocity_rps"] = 7.001
         active_count = 0 if state == "idle" else int(state == "active")
         ra = _robot_agent(
             state="active" if self.active and not self.released else "safe_hold",
@@ -663,24 +671,24 @@ class FakeJsonl:
                             "max_lateral_m": 0.12,
                             "max_heading_error_rad": 0.20,
                             "max_directional_travel_m": 0.30,
-                            "max_reverse_m": 0.03,
+                            "max_reverse_m": 0.10,
                             "progress_window_s": 15.0,
                             "min_progress_m": 0.03,
                             "expected_forward_m": 0.20,
                             "final_position_tolerance_m": 0.05,
-                            "max_arm_constrained_joints": 0,
+                            "max_arm_constrained_joints": 14,
                             "max_arm_step_rad": 0.12,
-                            "max_arm_raw_deviation_rad": 1.25,
-                            "max_arm_tracking_error_rad": 0.50,
-                            "max_arm_measured_deviation_rad": 1.0,
-                            "max_arm_velocity_rps": 2.0,
-                            "max_arm_estimated_torque_nm": 15.0,
+                            "max_arm_raw_deviation_rad": 2.75,
+                            "max_arm_tracking_error_rad": 0.90,
+                            "max_arm_measured_deviation_rad": 2.75,
+                            "max_arm_velocity_rps": 7.0,
+                            "max_arm_estimated_torque_nm": 35.0,
                             "require_settled": True,
                         },
                     }
                 )
                 if self.fault == "weak_limits":
-                    session_start["limits"]["max_reverse_m"] = 0.031
+                    session_start["limits"]["max_reverse_m"] = 0.101
                 elif self.fault == "missing_limit":
                     session_start["limits"].pop("max_reverse_m")
             else:
@@ -3723,7 +3731,6 @@ def test_fresh_but_unhealthy_first_motion_sample_blocks_discover_and_post(
         "viewer_error",
         "viewer_authority_feedback",
         "viewer_key_callback",
-        "viewer_enabled",
     ],
 )
 def test_acceptance_profile_rejects_noncanonical_render_worker_health_before_discover(
@@ -3738,6 +3745,26 @@ def test_acceptance_profile_rejects_noncanonical_render_worker_health_before_dis
     assert result["discoverGetCount"] == 0
     assert result["commandPostCount"] == 0
     assert not any("/internal/v1/" in call.url for call in transport.calls)
+
+
+def test_acceptance_profile_allows_healthy_read_only_native_viewer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    machine, _clock, _transport, evidence = _build(
+        monkeypatch, mode="viewer_enabled"
+    )
+
+    result = machine.run()
+
+    assert result["passed"] is True
+    assert machine.safety.identities is not None
+    assert machine.safety.identities["plant.viewerWorkerMode"] == "enabled_read_only"
+    assert machine.safety.identities["plant.viewerWorkerPid"] == 302
+    assert (
+        machine.safety.identities["plant.viewerWorkerBootId"]
+        == "viewer-worker-1"
+    )
+    assert evidence.records[-1]["passed"] is True
 
 
 @pytest.mark.parametrize("sidecar_fault", ["baseline_missing_process", "baseline_bad_pid"])

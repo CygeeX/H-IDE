@@ -1,4 +1,4 @@
-schema_version: h-ide.office-scene/2
+schema_version: h-ide.office-scene/3
 scene_id: office_v2
 title: H-IDE Office V2
 description: >-
@@ -6,7 +6,7 @@ description: >-
   navigation. This file is the only content manifest: MuJoCo visuals and
   collision proxies, the Nav2 map, and isolated evaluation truth are all
   generated from it.
-generator_version: office-v2-generator/2
+generator_version: office-v2-generator/3
 
 runtime_boundary:
   product_may_read:
@@ -17,6 +17,7 @@ runtime_boundary:
     - generated/nav2/office_v2.pgm
     - generated/runtime_manifest.json
     - generated/visual_manifest.json
+    - generated/inspection_catalog.json
   evaluation_only:
     - evaluation/manifest.json
   forbidden_product_inputs:
@@ -29,8 +30,8 @@ provenance:
     author: H-IDE contributors
     license: CC0-1.0
     source_url: generated://tools/build_scene.py
-    source_revision: office-v2-generator/2
-    attribution: H-IDE Office V2 procedural textures and signs
+    source_revision: office-v2-generator/3
+    attribution: H-IDE Office V2 procedural textures, architectural dressing, and signs
   third_party_assets: []
   design_references:
     - project: MuJoCo
@@ -47,6 +48,11 @@ provenance:
       url: https://github.com/robocasa/robocasa
       revision: 921c9a5736a8d0ea5589657898aadcfa55a6a195
       license: MIT code; CC-BY-4.0 assets and datasets
+      files_copied: []
+    - project: Poly Haven
+      url: https://polyhaven.com/
+      revision: catalog-reviewed-2026-08-24
+      license: CC0-1.0 assets
       files_copied: []
 
 bounds:
@@ -71,6 +77,110 @@ navigation:
   robot_radius_m: 0.35
   footprint_padding_m: 0.02
 
+# Product-safe semantic navigation and observation stations.  This catalog is
+# deliberately separate from evaluator-only object labels and target answers:
+# it tells the Mission runtime where named regions and collision-checked scan
+# stations are, but never tells the VLM which objects it should report there.
+inspection_catalog:
+  schema_version: h-ide.office-inspection/1
+  locale: zh-CN
+  capture_policy:
+    frames_per_heading: 3
+    burst_duration_s: 0.6
+    stop_before_capture_s: 1.0
+    maximum_settle_s: 5.0
+  regions:
+    - region_id: corridor
+      name: 走廊
+      aliases: [corridor]
+      kind: corridor
+      polygon_xy: [[-7.82, -1.23], [7.82, -1.23], [7.82, 1.23], [-7.82, 1.23]]
+      entry_pose: [-6.15, 0.35, 0.0]
+      stations:
+        - {station_id: corridor_west, purpose: corridor, pose: [-6.15, 0.35, 0.0], scan_headings_rad: [0.0, 1.5707963267948966, 3.141592653589793, -1.5707963267948966]}
+        - {station_id: corridor_center, purpose: corridor, pose: [-1.15, 0.0, 0.0], scan_headings_rad: [0.0, 1.5707963267948966, 3.141592653589793, -1.5707963267948966]}
+        - {station_id: corridor_east, purpose: corridor, pose: [6.10, 0.0, 0.0], scan_headings_rad: [0.0, 1.5707963267948966, 3.141592653589793, -1.5707963267948966]}
+    - region_id: reception
+      name: 前台接待区
+      aliases: [reception]
+      kind: room
+      polygon_xy: [[-7.82, -5.82], [-2.46, -5.82], [-2.46, -1.41], [-7.82, -1.41]]
+      entry_pose: [-5.10, -1.95, -1.5707963267948966]
+      stations:
+        - {station_id: reception_entry, purpose: entrance, pose: [-5.10, -1.95, -1.5707963267948966], scan_headings_rad: [-1.5707963267948966, 1.5707963267948966]}
+        - {station_id: reception_main, purpose: interior, pose: [-4.55, -2.15, -1.5707963267948966], scan_headings_rad: [0.0, 1.5707963267948966, 3.141592653589793, -1.5707963267948966]}
+    - region_id: open_office
+      name: 开放办公区
+      aliases: [open office, open_office]
+      kind: room
+      polygon_xy: [[-7.82, 1.41], [-1.26, 1.41], [-1.26, 5.82], [-7.82, 5.82]]
+      entry_pose: [-4.30, 1.95, 1.5707963267948966]
+      stations:
+        - {station_id: open_office_entry, purpose: entrance, pose: [-4.30, 1.95, 1.5707963267948966], scan_headings_rad: [1.5707963267948966, -1.5707963267948966]}
+        - {station_id: open_office_west, purpose: interior, pose: [-4.55, 2.45, 1.5707963267948966], scan_headings_rad: [0.0, 1.5707963267948966, 3.141592653589793, -1.5707963267948966]}
+        - {station_id: open_office_east, purpose: interior, pose: [-2.35, 2.45, 1.5707963267948966], scan_headings_rad: [0.0, 1.5707963267948966, 3.141592653589793, -1.5707963267948966]}
+    - region_id: meeting_room
+      name: 会议室
+      aliases: [meeting room, meeting_room]
+      kind: room
+      polygon_xy: [[-1.14, 1.41], [3.04, 1.41], [3.04, 5.82], [-1.14, 5.82]]
+      entry_pose: [-0.60, 1.95, 1.5707963267948966]
+      stations:
+        - {station_id: meeting_entry, purpose: entrance, pose: [-0.60, 1.95, 1.5707963267948966], scan_headings_rad: [1.5707963267948966, -1.5707963267948966]}
+        - {station_id: meeting_south, purpose: interior, pose: [0.70, 2.18, 1.5707963267948966], scan_headings_rad: [0.0, 1.5707963267948966, 3.141592653589793, -1.5707963267948966]}
+        - {station_id: meeting_north, purpose: interior, pose: [0.70, 4.70, 1.5707963267948966], scan_headings_rad: [0.0, 1.5707963267948966, 3.141592653589793, -1.5707963267948966]}
+    - region_id: focus_office
+      name: 独立办公室
+      aliases: [focus office, focus_office]
+      kind: room
+      polygon_xy: [[-2.34, -5.82], [3.34, -5.82], [3.34, -1.41], [-2.34, -1.41]]
+      entry_pose: [1.20, -1.95, -1.5707963267948966]
+      stations:
+        - {station_id: focus_entry, purpose: entrance, pose: [1.20, -1.95, -1.5707963267948966], scan_headings_rad: [-1.5707963267948966, 1.5707963267948966]}
+        - {station_id: focus_main, purpose: interior, pose: [1.75, -4.60, 3.141592653589793], scan_headings_rad: [0.0, 1.5707963267948966, 3.141592653589793, -1.5707963267948966]}
+        - {station_id: focus_east_wall, purpose: interior, pose: [1.75, -3.20, 0.0], scan_headings_rad: [0.0, 1.5707963267948966, 3.141592653589793, -1.5707963267948966]}
+    - region_id: pantry
+      name: 茶水间
+      aliases: [pantry]
+      kind: room
+      polygon_xy: [[3.16, 1.41], [7.82, 1.41], [7.82, 5.82], [3.16, 5.82]]
+      entry_pose: [4.40, 1.95, 1.5707963267948966]
+      stations:
+        - {station_id: pantry_entry, purpose: entrance, pose: [4.40, 1.95, 1.5707963267948966], scan_headings_rad: [1.5707963267948966, -1.5707963267948966]}
+        - {station_id: pantry_west, purpose: interior, pose: [3.62, 3.48, 1.5707963267948966], scan_headings_rad: [0.0, 1.5707963267948966, 3.141592653589793, -1.5707963267948966]}
+        - {station_id: pantry_center, purpose: interior, pose: [5.05, 4.15, 1.5707963267948966], scan_headings_rad: [0.0, 1.5707963267948966, 3.141592653589793, -1.5707963267948966]}
+    - region_id: storage
+      name: 储物间
+      aliases: [storage]
+      kind: room
+      polygon_xy: [[3.46, -5.82], [7.82, -5.82], [7.82, -1.41], [3.46, -1.41]]
+      entry_pose: [5.20, -1.95, -1.5707963267948966]
+      stations:
+        - {station_id: storage_entry, purpose: entrance, pose: [5.20, -1.95, -1.5707963267948966], scan_headings_rad: [-1.5707963267948966, 1.5707963267948966]}
+        - {station_id: storage_main, purpose: interior, pose: [5.20, -3.10, -1.5707963267948966], scan_headings_rad: [0.0, 1.5707963267948966, 3.141592653589793, -1.5707963267948966]}
+        - {station_id: storage_deep, purpose: interior, pose: [5.20, -4.50, 0.0], scan_headings_rad: [0.0, 1.5707963267948966, 3.141592653589793, -1.5707963267948966]}
+  route:
+    - corridor_west
+    - reception_entry
+    - reception_main
+    - open_office_entry
+    - open_office_west
+    - open_office_east
+    - meeting_entry
+    - meeting_south
+    - meeting_north
+    - corridor_center
+    - focus_entry
+    - focus_main
+    - focus_east_wall
+    - pantry_entry
+    - pantry_west
+    - pantry_center
+    - storage_entry
+    - storage_main
+    - storage_deep
+    - corridor_east
+
 render:
   floor_material: commercial_carpet
   wall_height: 2.7
@@ -88,6 +198,9 @@ render:
     - {id: meeting_entry, position: [0.70, 1.72, 1.48], look_at: [0.70, 3.85, 0.85]}
     - {id: pantry_entry, position: [4.35, 1.75, 1.48], look_at: [5.25, 4.90, 0.95]}
     - {id: open_office_entry, position: [-4.30, 1.75, 1.48], look_at: [-4.45, 4.35, 0.90]}
+    - {id: reception_entry, position: [-5.10, -1.75, 1.48], look_at: [-5.00, -4.20, 0.90]}
+    - {id: focus_entry, position: [1.20, -1.75, 1.48], look_at: [0.55, -4.25, 0.90]}
+    - {id: storage_entry, position: [5.20, -1.75, 1.48], look_at: [6.35, -4.55, 1.05]}
 
 textures:
   - {id: tex_01, kind: carpet, size: [256, 256], colors: [[112, 112, 108], [91, 93, 92], [134, 131, 122]]}
@@ -98,6 +211,8 @@ textures:
   - {id: tex_06, kind: sign, size: [512, 128], text: OPEN OFFICE, colors: [[239, 235, 221], [44, 48, 55], [109, 114, 145]]}
   - {id: tex_07, kind: sign, size: [512, 128], text: RECEPTION, colors: [[239, 235, 221], [44, 48, 55], [133, 105, 146]]}
   - {id: tex_08, kind: screen, size: [320, 180], colors: [[20, 27, 37], [67, 137, 158], [225, 193, 113]]}
+  - {id: tex_09, kind: sign, size: [512, 128], text: FOCUS OFFICE, colors: [[239, 235, 221], [44, 48, 55], [104, 123, 151]]}
+  - {id: tex_10, kind: sign, size: [512, 128], text: STORAGE, colors: [[239, 235, 221], [44, 48, 55], [145, 113, 77]]}
 
 materials:
   commercial_carpet: {rgba: [0.62, 0.62, 0.59, 1.0], texture: tex_01, repeat: [16, 12], reflectance: 0.03}
@@ -117,6 +232,22 @@ materials:
   sign_02: {rgba: [1.0, 1.0, 1.0, 1.0], texture: tex_05, repeat: [1, 1], texuniform: false, emission: 0.03}
   sign_03: {rgba: [1.0, 1.0, 1.0, 1.0], texture: tex_06, repeat: [1, 1], texuniform: false, emission: 0.03}
   sign_04: {rgba: [1.0, 1.0, 1.0, 1.0], texture: tex_07, repeat: [1, 1], texuniform: false, emission: 0.03}
+  sign_05: {rgba: [1.0, 1.0, 1.0, 1.0], texture: tex_09, repeat: [1, 1], texuniform: false, emission: 0.06}
+  sign_06: {rgba: [1.0, 1.0, 1.0, 1.0], texture: tex_10, repeat: [1, 1], texuniform: false, emission: 0.06}
+  corridor_carpet: {rgba: [0.27, 0.29, 0.30, 1.0], texture: tex_01, repeat: [18, 4], reflectance: 0.02}
+  open_office_carpet: {rgba: [0.45, 0.47, 0.57, 1.0], texture: tex_01, repeat: [8, 6], reflectance: 0.02}
+  meeting_carpet: {rgba: [0.57, 0.48, 0.34, 1.0], texture: tex_01, repeat: [6, 6], reflectance: 0.02}
+  pantry_floor: {rgba: [0.39, 0.52, 0.48, 1.0], texture: tex_01, repeat: [6, 6], reflectance: 0.03}
+  reception_carpet: {rgba: [0.50, 0.42, 0.55, 1.0], texture: tex_01, repeat: [7, 6], reflectance: 0.02}
+  focus_carpet: {rgba: [0.40, 0.47, 0.58, 1.0], texture: tex_01, repeat: [7, 6], reflectance: 0.02}
+  storage_floor: {rgba: [0.47, 0.41, 0.34, 1.0], texture: tex_01, repeat: [6, 6], reflectance: 0.02}
+  accent_open: {rgba: [0.43, 0.45, 0.62, 1.0], reflectance: 0.08}
+  accent_meeting: {rgba: [0.63, 0.52, 0.34, 1.0], reflectance: 0.08}
+  accent_pantry: {rgba: [0.35, 0.56, 0.50, 1.0], reflectance: 0.08}
+  accent_reception: {rgba: [0.54, 0.42, 0.61, 1.0], reflectance: 0.08}
+  accent_focus: {rgba: [0.38, 0.49, 0.65, 1.0], reflectance: 0.08}
+  accent_storage: {rgba: [0.60, 0.46, 0.30, 1.0], reflectance: 0.08}
+  ceiling_light: {rgba: [0.96, 0.94, 0.84, 1.0], emission: 0.35, reflectance: 0.04}
 
 # Dimensions are full extents in metres. Poses are [x, y, z, yaw] in map.
 structures:
@@ -136,6 +267,32 @@ structures:
   - {id: south_corridor_04, kind: wall, pose: [6.92, -1.35, 0.0, 0.0], dimensions: [2.04, 0.12, 2.7], material: warm_wall}
   - {id: south_room_divider_west, kind: wall, pose: [-2.40, -3.645, 0.0, 0.0], dimensions: [0.12, 4.59, 2.7], material: warm_wall}
   - {id: south_room_divider_east, kind: wall, pose: [3.40, -3.645, 0.0, 0.0], dimensions: [0.12, 4.59, 2.7], material: warm_wall}
+
+# Collision-free architectural dressing improves RGB-D/VLM readability while
+# preserving the original MuJoCo/Nav2 collision contract bit-for-bit.
+visual_decor:
+  - {id: floor_corridor, kind: floor_zone, pose: [0.0, 0.0, 0.001, 0.0], dimensions: [15.72, 2.56, 0.002], material: corridor_carpet}
+  - {id: floor_open_office, kind: floor_zone, pose: [-4.58, 3.64, 0.002, 0.0], dimensions: [6.60, 4.44, 0.002], material: open_office_carpet}
+  - {id: floor_meeting, kind: floor_zone, pose: [0.95, 3.64, 0.002, 0.0], dimensions: [4.18, 4.44, 0.002], material: meeting_carpet}
+  - {id: floor_pantry, kind: floor_zone, pose: [5.50, 3.64, 0.002, 0.0], dimensions: [4.66, 4.44, 0.002], material: pantry_floor}
+  - {id: floor_reception, kind: floor_zone, pose: [-5.15, -3.64, 0.002, 0.0], dimensions: [5.38, 4.44, 0.002], material: reception_carpet}
+  - {id: floor_focus, kind: floor_zone, pose: [0.50, -3.64, 0.002, 0.0], dimensions: [5.68, 4.44, 0.002], material: focus_carpet}
+  - {id: floor_storage, kind: floor_zone, pose: [5.67, -3.64, 0.002, 0.0], dimensions: [4.42, 4.44, 0.002], material: storage_floor}
+  - {id: portal_open_office, kind: doorway_frame, pose: [-4.30, 1.35, 0.0, 0.0], dimensions: [1.40, 0.20, 2.24], frame_width: 0.10, material: accent_open}
+  - {id: portal_meeting, kind: doorway_frame, pose: [-0.80, 1.35, 0.0, 0.0], dimensions: [1.40, 0.20, 2.24], frame_width: 0.10, material: accent_meeting}
+  - {id: portal_pantry, kind: doorway_frame, pose: [4.40, 1.35, 0.0, 0.0], dimensions: [1.40, 0.20, 2.24], frame_width: 0.10, material: accent_pantry}
+  - {id: portal_reception, kind: doorway_frame, pose: [-5.10, -1.35, 0.0, 0.0], dimensions: [1.40, 0.20, 2.24], frame_width: 0.10, material: accent_reception}
+  - {id: portal_focus, kind: doorway_frame, pose: [1.20, -1.35, 0.0, 0.0], dimensions: [1.40, 0.20, 2.24], frame_width: 0.10, material: accent_focus}
+  - {id: portal_storage, kind: doorway_frame, pose: [5.20, -1.35, 0.0, 0.0], dimensions: [1.40, 0.20, 2.24], frame_width: 0.10, material: accent_storage}
+  - {id: ceiling_west, kind: ceiling_panel, pose: [-4.7, 0.0, 2.55, 0.0], dimensions: [1.20, 0.32, 0.035], material: ceiling_light}
+  - {id: ceiling_center, kind: ceiling_panel, pose: [0.0, 0.0, 2.55, 0.0], dimensions: [1.20, 0.32, 0.035], material: ceiling_light}
+  - {id: ceiling_east, kind: ceiling_panel, pose: [4.7, 0.0, 2.55, 0.0], dimensions: [1.20, 0.32, 0.035], material: ceiling_light}
+  - {id: ceiling_open_office, kind: ceiling_panel, pose: [-4.6, 3.8, 2.55, 0.0], dimensions: [1.40, 0.55, 0.035], material: ceiling_light}
+  - {id: ceiling_meeting, kind: ceiling_panel, pose: [0.7, 3.8, 2.55, 0.0], dimensions: [1.40, 0.55, 0.035], material: ceiling_light}
+  - {id: ceiling_pantry, kind: ceiling_panel, pose: [5.3, 3.8, 2.55, 0.0], dimensions: [1.40, 0.55, 0.035], material: ceiling_light}
+  - {id: ceiling_reception, kind: ceiling_panel, pose: [-5.1, -3.8, 2.55, 0.0], dimensions: [1.40, 0.55, 0.035], material: ceiling_light}
+  - {id: ceiling_focus, kind: ceiling_panel, pose: [0.5, -3.8, 2.55, 0.0], dimensions: [1.40, 0.55, 0.035], material: ceiling_light}
+  - {id: ceiling_storage, kind: ceiling_panel, pose: [5.6, -3.8, 2.55, 0.0], dimensions: [1.40, 0.55, 0.035], material: ceiling_light}
 
 objects:
   - id: corridor_column
@@ -189,8 +346,8 @@ objects:
     semantic: {class: display_screen, labels: [会议室显示屏, meeting-room display], aliases: [屏幕, display, monitor]}
   - id: meeting_sign
     room: corridor
-    pose: [-0.78, 1.27, 1.75, 0.0]
-    dimensions: [0.78, 0.06, 0.24]
+    pose: [-0.80, 1.24, 1.78, 0.0]
+    dimensions: [1.08, 0.07, 0.32]
     visual: {template: sign, material: sign_01}
     collision: {shape: none, nav_obstacle: false}
     semantic: {class: room_sign, labels: [会议室标牌, meeting sign], aliases: [MEETING]}
@@ -238,8 +395,8 @@ objects:
     semantic: {class: refrigerator, labels: [冰箱, refrigerator], aliases: [冷藏柜, fridge]}
   - id: pantry_sign
     room: corridor
-    pose: [4.40, 1.27, 1.75, 0.0]
-    dimensions: [0.78, 0.06, 0.24]
+    pose: [4.40, 1.24, 1.78, 0.0]
+    dimensions: [1.08, 0.07, 0.32]
     visual: {template: sign, material: sign_02}
     collision: {shape: none, nav_obstacle: false}
     semantic: {class: room_sign, labels: [茶水间标牌, pantry sign], aliases: [PANTRY]}
@@ -287,8 +444,8 @@ objects:
     semantic: {class: potted_plant, labels: [绿植, potted plant], aliases: [植物, plant]}
   - id: open_office_sign
     room: corridor
-    pose: [-4.30, 1.27, 1.75, 0.0]
-    dimensions: [0.98, 0.06, 0.24]
+    pose: [-4.30, 1.24, 1.78, 0.0]
+    dimensions: [1.28, 0.07, 0.32]
     visual: {template: sign, material: sign_03}
     collision: {shape: none, nav_obstacle: false}
     semantic: {class: room_sign, labels: [开放办公区标牌, open-office sign], aliases: [OPEN OFFICE]}
@@ -308,8 +465,8 @@ objects:
     semantic: {class: sofa, labels: [接待沙发, reception sofa], aliases: [沙发, couch]}
   - id: reception_sign
     room: corridor
-    pose: [-5.10, -1.27, 1.75, 3.14159]
-    dimensions: [0.98, 0.06, 0.24]
+    pose: [-5.10, -1.24, 1.78, 3.14159]
+    dimensions: [1.20, 0.07, 0.32]
     visual: {template: sign, material: sign_04}
     collision: {shape: none, nav_obstacle: false}
     semantic: {class: room_sign, labels: [前台标牌, reception sign], aliases: [RECEPTION]}
@@ -334,6 +491,13 @@ objects:
     visual: {template: whiteboard, material: white_plastic}
     collision: {shape: none, nav_obstacle: false}
     semantic: {class: whiteboard, labels: [白板, whiteboard], aliases: [写字板, board]}
+  - id: focus_office_sign
+    room: corridor
+    pose: [1.20, -1.24, 1.78, 3.14159]
+    dimensions: [1.28, 0.07, 0.32]
+    visual: {template: sign, material: sign_05}
+    collision: {shape: none, nav_obstacle: false}
+    semantic: {class: room_sign, labels: [独立办公室标牌, focus-office sign], aliases: [FOCUS OFFICE]}
   - id: storage_cabinet_01
     room: storage
     pose: [7.35, -4.70, 0.0, 0.0]
@@ -348,6 +512,13 @@ objects:
     visual: {template: cabinet, material: brushed_metal}
     collision: {shape: box, size: [0.72, 1.50], height: 1.82, nav_obstacle: true}
     semantic: {class: storage_cabinet, labels: [工具柜, utility cabinet], aliases: [柜子, cabinet]}
+  - id: storage_sign
+    room: corridor
+    pose: [5.20, -1.24, 1.78, 3.14159]
+    dimensions: [1.08, 0.07, 0.32]
+    visual: {template: sign, material: sign_06}
+    collision: {shape: none, nav_obstacle: false}
+    semantic: {class: room_sign, labels: [储物间标牌, storage sign], aliases: [STORAGE]}
   - id: corridor_plant
     room: corridor
     pose: [6.90, 0.65, 0.0, 0.0]

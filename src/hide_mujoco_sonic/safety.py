@@ -272,6 +272,16 @@ class MotionDirectionGuard:
             return True
 
         self._zero_since = None
+        if is_zero:
+            # Zero velocity ends the current translational authority.  The
+            # learned gait may need several balanced-policy frames to settle
+            # after Nav2 cancels or completes a primitive; projecting that
+            # deliberate braking motion onto the previous command direction
+            # creates a false reverse-motion fault after authority has ended.
+            # A later non-zero translation establishes a fresh anchor.
+            self._anchor = None
+            self._expected = None
+            return True
         if self._pose is None:
             self._anchor = None
             self._expected = None
@@ -430,7 +440,14 @@ class GoalProgressGuard:
                 return True
             self._zero_since = None
             linear = math.hypot(values[0], values[1])
-            if linear < 1e-6 and abs(values[2]) >= 1e-6:
+            if linear < 1e-6 and abs(values[2]) < 1e-6:
+                # A completed/cancelled primitive no longer owns monotonic
+                # progress toward its endpoint.  Stop-settle pelvis motion is
+                # governed by the posture and finite-state guards, not by a
+                # stale goal-distance transaction.
+                self._translation_active = False
+                self._reset_progress()
+            elif linear < 1e-6 and abs(values[2]) >= 1e-6:
                 # Pure Spin has no monotonic Euclidean-distance contract to a
                 # global path endpoint.  Humanoid pelvis sway can temporarily
                 # move away from that endpoint while yaw progresses correctly.

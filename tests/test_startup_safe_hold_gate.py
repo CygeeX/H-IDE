@@ -544,6 +544,7 @@ def test_launcher_rejects_partial_motion_topology_before_startup_work() -> None:
         "ros-cmd-vel-bridge",
         "ros-observation-bridge",
         "ros-safe-stop",
+        "strict-navigation-adapter",
         "sim-robot-agent-gateway",
         "observation-gateway",
         "robot-agent-g1-sim",
@@ -580,6 +581,26 @@ def test_launcher_has_a_cold_isolated_motion_core_mode() -> None:
     assert completed.returncode == 2
     assert "--motion-core requires --viewer" in completed.stderr
 
+
+def test_full_chain_starts_strict_navigation_before_any_remote_motion_owner() -> None:
+    launcher = (ROOT / "scripts" / "start-workstation-demo.sh").read_text(
+        encoding="utf-8"
+    )
+
+    nav2_ready = launcher.index("if ! wait_for_nav2_active 60")
+    motion_core_exit = launcher.index("Motion-core is stationary and isolated")
+    adapter_start = launcher.index(
+        "start_process \\\n  strict-navigation-adapter"
+    )
+    adapter_gate = launcher.index("if ! wait_for_strict_navigation_adapter 30")
+    gateway_start = launcher.index("start_process \\\n  sim-robot-agent-gateway")
+    robot_agent_start = launcher.index("start_process \\\n  robot-agent-g1-sim")
+
+    assert nav2_ready < motion_core_exit < adapter_start < adapter_gate
+    assert adapter_gate < gateway_start < robot_agent_start
+    assert "/h_ide/strict/navigate_to_pose" in launcher
+    assert "/h_ide/strict/spin" in launcher
+    assert "tools/strict_navigation_adapter.py" in launcher
 
 def test_launcher_secures_runtime_evidence_directory_before_model_lock() -> None:
     launcher = (ROOT / "scripts" / "start-workstation-demo.sh").read_text(

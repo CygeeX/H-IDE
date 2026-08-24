@@ -1,0 +1,626 @@
+{
+  "capturePolicy": {
+    "burstDurationS": 0.6,
+    "framesPerHeading": 3,
+    "maximumSettleS": 5.0,
+    "stopBeforeCaptureS": 1.0
+  },
+  "containsObjectAnswers": false,
+  "locale": "zh-CN",
+  "map": {
+    "frameId": "map",
+    "heightCells": 240,
+    "imageSha256": "47b2ddd54d9f0aa2a220d5b79afcee367cbaa7a57068e4809189f24ab207360d",
+    "origin": [
+      -8.0,
+      -6.0,
+      0.0
+    ],
+    "resolution": 0.05,
+    "widthCells": 320,
+    "yamlSha256": "1246c331b61f19107fc27d17ba5bec86fc07d09f9c34a6f264a69abcdbd7214a"
+  },
+  "regions": [
+    {
+      "aliases": [
+        "corridor"
+      ],
+      "entryPose": {
+        "frameId": "map",
+        "x": -6.15,
+        "y": 0.35,
+        "yaw": 0.0,
+        "z": 0.0
+      },
+      "kind": "corridor",
+      "name": "走廊",
+      "polygonXY": [
+        {
+          "x": -7.82,
+          "y": -1.23
+        },
+        {
+          "x": 7.82,
+          "y": -1.23
+        },
+        {
+          "x": 7.82,
+          "y": 1.23
+        },
+        {
+          "x": -7.82,
+          "y": 1.23
+        }
+      ],
+      "regionId": "corridor",
+      "stations": [
+        {
+          "pose": {
+            "frameId": "map",
+            "x": -6.15,
+            "y": 0.35,
+            "yaw": 0.0,
+            "z": 0.0
+          },
+          "purpose": "corridor",
+          "scanHeadingsRad": [
+            0.0,
+            1.5707963267948966,
+            3.141592653589793,
+            -1.5707963267948966
+          ],
+          "stationId": "corridor_west"
+        },
+        {
+          "pose": {
+            "frameId": "map",
+            "x": -1.15,
+            "y": 0.0,
+            "yaw": 0.0,
+            "z": 0.0
+          },
+          "purpose": "corridor",
+          "scanHeadingsRad": [
+            0.0,
+            1.5707963267948966,
+            3.141592653589793,
+            -1.5707963267948966
+          ],
+          "stationId": "corridor_center"
+        },
+        {
+          "pose": {
+            "frameId": "map",
+            "x": 6.1,
+            "y": 0.0,
+            "yaw": 0.0,
+            "z": 0.0
+          },
+          "purpose": "corridor",
+          "scanHeadingsRad": [
+            0.0,
+            1.5707963267948966,
+            3.141592653589793,
+            -1.5707963267948966
+          ],
+          "stationId": "corridor_east"
+        }
+      ]
+    },
+    {
+      "aliases": [
+        "reception"
+      ],
+      "entryPose": {
+        "frameId": "map",
+        "x": -5.1,
+        "y": -1.95,
+        "yaw": -1.5707963267948966,
+        "z": 0.0
+      },
+      "kind": "room",
+      "name": "前台接待区",
+      "polygonXY": [
+        {
+          "x": -7.82,
+          "y": -5.82
+        },
+        {
+          "x": -2.46,
+          "y": -5.82
+        },
+        {
+          "x": -2.46,
+          "y": -1.41
+        },
+        {
+          "x": -7.82,
+          "y": -1.41
+        }
+      ],
+      "regionId": "reception",
+      "stations": [
+        {
+          "pose": {
+            "frameId": "map",
+            "x": -5.1,
+            "y": -1.95,
+            "yaw": -1.5707963267948966,
+            "z": 0.0
+          },
+          "purpose": "entrance",
+          "scanHeadingsRad": [
+            -1.5707963267948966,
+            1.5707963267948966
+          ],
+          "stationId": "reception_entry"
+        },
+        {
+          "pose": {
+            "frameId": "map",
+            "x": -4.55,
+            "y": -2.15,
+            "yaw": -1.5707963267948966,
+            "z": 0.0
+          },
+          "purpose": "interior",
+          "scanHeadingsRad": [
+            0.0,
+            1.5707963267948966,
+            3.141592653589793,
+            -1.5707963267948966
+          ],
+          "stationId": "reception_main"
+        }
+      ]
+    },
+    {
+      "aliases": [
+        "open office",
+        "open_office"
+      ],
+      "entryPose": {
+        "frameId": "map",
+        "x": -4.3,
+        "y": 1.95,
+        "yaw": 1.5707963267948966,
+        "z": 0.0
+      },
+      "kind": "room",
+      "name": "开放办公区",
+      "polygonXY": [
+        {
+          "x": -7.82,
+          "y": 1.41
+        },
+        {
+          "x": -1.26,
+          "y": 1.41
+        },
+        {
+          "x": -1.26,
+          "y": 5.82
+        },
+        {
+          "x": -7.82,
+          "y": 5.82
+        }
+      ],
+      "regionId": "open_office",
+      "stations": [
+        {
+          "pose": {
+            "frameId": "map",
+            "x": -4.3,
+            "y": 1.95,
+            "yaw": 1.5707963267948966,
+            "z": 0.0
+          },
+          "purpose": "entrance",
+          "scanHeadingsRad": [
+            1.5707963267948966,
+            -1.5707963267948966
+          ],
+          "stationId": "open_office_entry"
+        },
+        {
+          "pose": {
+            "frameId": "map",
+            "x": -4.55,
+            "y": 2.45,
+            "yaw": 1.5707963267948966,
+            "z": 0.0
+          },
+          "purpose": "interior",
+          "scanHeadingsRad": [
+            0.0,
+            1.5707963267948966,
+            3.141592653589793,
+            -1.5707963267948966
+          ],
+          "stationId": "open_office_west"
+        },
+        {
+          "pose": {
+            "frameId": "map",
+            "x": -2.35,
+            "y": 2.45,
+            "yaw": 1.5707963267948966,
+            "z": 0.0
+          },
+          "purpose": "interior",
+          "scanHeadingsRad": [
+            0.0,
+            1.5707963267948966,
+            3.141592653589793,
+            -1.5707963267948966
+          ],
+          "stationId": "open_office_east"
+        }
+      ]
+    },
+    {
+      "aliases": [
+        "meeting room",
+        "meeting_room"
+      ],
+      "entryPose": {
+        "frameId": "map",
+        "x": -0.6,
+        "y": 1.95,
+        "yaw": 1.5707963267948966,
+        "z": 0.0
+      },
+      "kind": "room",
+      "name": "会议室",
+      "polygonXY": [
+        {
+          "x": -1.14,
+          "y": 1.41
+        },
+        {
+          "x": 3.04,
+          "y": 1.41
+        },
+        {
+          "x": 3.04,
+          "y": 5.82
+        },
+        {
+          "x": -1.14,
+          "y": 5.82
+        }
+      ],
+      "regionId": "meeting_room",
+      "stations": [
+        {
+          "pose": {
+            "frameId": "map",
+            "x": -0.6,
+            "y": 1.95,
+            "yaw": 1.5707963267948966,
+            "z": 0.0
+          },
+          "purpose": "entrance",
+          "scanHeadingsRad": [
+            1.5707963267948966,
+            -1.5707963267948966
+          ],
+          "stationId": "meeting_entry"
+        },
+        {
+          "pose": {
+            "frameId": "map",
+            "x": 0.7,
+            "y": 2.18,
+            "yaw": 1.5707963267948966,
+            "z": 0.0
+          },
+          "purpose": "interior",
+          "scanHeadingsRad": [
+            0.0,
+            1.5707963267948966,
+            3.141592653589793,
+            -1.5707963267948966
+          ],
+          "stationId": "meeting_south"
+        },
+        {
+          "pose": {
+            "frameId": "map",
+            "x": 0.7,
+            "y": 4.7,
+            "yaw": 1.5707963267948966,
+            "z": 0.0
+          },
+          "purpose": "interior",
+          "scanHeadingsRad": [
+            0.0,
+            1.5707963267948966,
+            3.141592653589793,
+            -1.5707963267948966
+          ],
+          "stationId": "meeting_north"
+        }
+      ]
+    },
+    {
+      "aliases": [
+        "focus office",
+        "focus_office"
+      ],
+      "entryPose": {
+        "frameId": "map",
+        "x": 1.2,
+        "y": -1.95,
+        "yaw": -1.5707963267948966,
+        "z": 0.0
+      },
+      "kind": "room",
+      "name": "独立办公室",
+      "polygonXY": [
+        {
+          "x": -2.34,
+          "y": -5.82
+        },
+        {
+          "x": 3.34,
+          "y": -5.82
+        },
+        {
+          "x": 3.34,
+          "y": -1.41
+        },
+        {
+          "x": -2.34,
+          "y": -1.41
+        }
+      ],
+      "regionId": "focus_office",
+      "stations": [
+        {
+          "pose": {
+            "frameId": "map",
+            "x": 1.2,
+            "y": -1.95,
+            "yaw": -1.5707963267948966,
+            "z": 0.0
+          },
+          "purpose": "entrance",
+          "scanHeadingsRad": [
+            -1.5707963267948966,
+            1.5707963267948966
+          ],
+          "stationId": "focus_entry"
+        },
+        {
+          "pose": {
+            "frameId": "map",
+            "x": 1.75,
+            "y": -4.6,
+            "yaw": 3.141592653589793,
+            "z": 0.0
+          },
+          "purpose": "interior",
+          "scanHeadingsRad": [
+            0.0,
+            1.5707963267948966,
+            3.141592653589793,
+            -1.5707963267948966
+          ],
+          "stationId": "focus_main"
+        },
+        {
+          "pose": {
+            "frameId": "map",
+            "x": 1.75,
+            "y": -3.2,
+            "yaw": 0.0,
+            "z": 0.0
+          },
+          "purpose": "interior",
+          "scanHeadingsRad": [
+            0.0,
+            1.5707963267948966,
+            3.141592653589793,
+            -1.5707963267948966
+          ],
+          "stationId": "focus_east_wall"
+        }
+      ]
+    },
+    {
+      "aliases": [
+        "pantry"
+      ],
+      "entryPose": {
+        "frameId": "map",
+        "x": 4.4,
+        "y": 1.95,
+        "yaw": 1.5707963267948966,
+        "z": 0.0
+      },
+      "kind": "room",
+      "name": "茶水间",
+      "polygonXY": [
+        {
+          "x": 3.16,
+          "y": 1.41
+        },
+        {
+          "x": 7.82,
+          "y": 1.41
+        },
+        {
+          "x": 7.82,
+          "y": 5.82
+        },
+        {
+          "x": 3.16,
+          "y": 5.82
+        }
+      ],
+      "regionId": "pantry",
+      "stations": [
+        {
+          "pose": {
+            "frameId": "map",
+            "x": 4.4,
+            "y": 1.95,
+            "yaw": 1.5707963267948966,
+            "z": 0.0
+          },
+          "purpose": "entrance",
+          "scanHeadingsRad": [
+            1.5707963267948966,
+            -1.5707963267948966
+          ],
+          "stationId": "pantry_entry"
+        },
+        {
+          "pose": {
+            "frameId": "map",
+            "x": 3.62,
+            "y": 3.48,
+            "yaw": 1.5707963267948966,
+            "z": 0.0
+          },
+          "purpose": "interior",
+          "scanHeadingsRad": [
+            0.0,
+            1.5707963267948966,
+            3.141592653589793,
+            -1.5707963267948966
+          ],
+          "stationId": "pantry_west"
+        },
+        {
+          "pose": {
+            "frameId": "map",
+            "x": 5.05,
+            "y": 4.15,
+            "yaw": 1.5707963267948966,
+            "z": 0.0
+          },
+          "purpose": "interior",
+          "scanHeadingsRad": [
+            0.0,
+            1.5707963267948966,
+            3.141592653589793,
+            -1.5707963267948966
+          ],
+          "stationId": "pantry_center"
+        }
+      ]
+    },
+    {
+      "aliases": [
+        "storage"
+      ],
+      "entryPose": {
+        "frameId": "map",
+        "x": 5.2,
+        "y": -1.95,
+        "yaw": -1.5707963267948966,
+        "z": 0.0
+      },
+      "kind": "room",
+      "name": "储物间",
+      "polygonXY": [
+        {
+          "x": 3.46,
+          "y": -5.82
+        },
+        {
+          "x": 7.82,
+          "y": -5.82
+        },
+        {
+          "x": 7.82,
+          "y": -1.41
+        },
+        {
+          "x": 3.46,
+          "y": -1.41
+        }
+      ],
+      "regionId": "storage",
+      "stations": [
+        {
+          "pose": {
+            "frameId": "map",
+            "x": 5.2,
+            "y": -1.95,
+            "yaw": -1.5707963267948966,
+            "z": 0.0
+          },
+          "purpose": "entrance",
+          "scanHeadingsRad": [
+            -1.5707963267948966,
+            1.5707963267948966
+          ],
+          "stationId": "storage_entry"
+        },
+        {
+          "pose": {
+            "frameId": "map",
+            "x": 5.2,
+            "y": -3.1,
+            "yaw": -1.5707963267948966,
+            "z": 0.0
+          },
+          "purpose": "interior",
+          "scanHeadingsRad": [
+            0.0,
+            1.5707963267948966,
+            3.141592653589793,
+            -1.5707963267948966
+          ],
+          "stationId": "storage_main"
+        },
+        {
+          "pose": {
+            "frameId": "map",
+            "x": 5.2,
+            "y": -4.5,
+            "yaw": 0.0,
+            "z": 0.0
+          },
+          "purpose": "interior",
+          "scanHeadingsRad": [
+            0.0,
+            1.5707963267948966,
+            3.141592653589793,
+            -1.5707963267948966
+          ],
+          "stationId": "storage_deep"
+        }
+      ]
+    }
+  ],
+  "route": [
+    "corridor_west",
+    "reception_entry",
+    "reception_main",
+    "open_office_entry",
+    "open_office_west",
+    "open_office_east",
+    "meeting_entry",
+    "meeting_south",
+    "meeting_north",
+    "corridor_center",
+    "focus_entry",
+    "focus_main",
+    "focus_east_wall",
+    "pantry_entry",
+    "pantry_west",
+    "pantry_center",
+    "storage_entry",
+    "storage_main",
+    "storage_deep",
+    "corridor_east"
+  ],
+  "sceneId": "office_v2",
+  "sceneSourceSha256": "21eb09e9ccdfe5e8e9c82b011eefc28da4ee049801092e2b9bbfd058c11bc3ef",
+  "schemaVersion": "h-ide.office-inspection/1"
+}

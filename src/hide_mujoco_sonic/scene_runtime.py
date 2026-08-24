@@ -42,6 +42,7 @@ class RuntimeScene:
     map_size: tuple[float, float]
     map_width_cells: int
     map_height_cells: int
+    inspection_catalog: Path
     bounds_min: tuple[float, float, float]
     bounds_max: tuple[float, float, float]
     spawn_x: float
@@ -242,6 +243,16 @@ def load_runtime_scene(
     collision_hash = value.get("collision_contract_sha256")
     if not isinstance(collision_hash, str) or not SHA256_PATTERN.fullmatch(collision_hash):
         raise ValueError("runtime scene collision contract hash is invalid")
+    inspection_value = value.get("inspection_catalog")
+    if not isinstance(inspection_value, Mapping):
+        raise ValueError("runtime scene inspection_catalog must be an object")
+    if inspection_value.get("contains_object_answers") is not False:
+        raise ValueError("runtime scene inspection catalog must not contain object answers")
+    inspection_catalog = _bundle_file(
+        root,
+        inspection_value,
+        "inspection_catalog",
+    )
 
     return RuntimeScene(
         manifest_path=manifest,
@@ -258,6 +269,7 @@ def load_runtime_scene(
         map_size=size,  # type: ignore[arg-type]
         map_width_cells=width,
         map_height_cells=height,
+        inspection_catalog=inspection_catalog,
         bounds_min=bounds_min,  # type: ignore[arg-type]
         bounds_max=bounds_max,  # type: ignore[arg-type]
         spawn_x=spawn_x,

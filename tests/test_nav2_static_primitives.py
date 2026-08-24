@@ -145,7 +145,7 @@ def _assert_primitive_plan(module, navfn_path, plan) -> None:
         navfn_path["poses"]
     )
     assert plan["map_provenance"]["scene_source_sha256"] == (
-        "2d29641a9db85cbd1eb10d3159d901627a2c2728f033318c3be8f3493b0a50c9"
+        "21eb09e9ccdfe5e8e9c82b011eefc28da4ee049801092e2b9bbfd058c11bc3ef"
     )
     assert all(
         len(plan["map_provenance"][name]) == 64

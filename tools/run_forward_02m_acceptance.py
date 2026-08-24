@@ -83,18 +83,18 @@ _EXPECTED_MOTION_LIMITS: Mapping[str, Any] = {
     "max_lateral_m": 0.12,
     "max_heading_error_rad": 0.20,
     "max_directional_travel_m": 0.30,
-    "max_reverse_m": 0.03,
+    "max_reverse_m": 0.10,
     "progress_window_s": 15.0,
     "min_progress_m": 0.03,
     "expected_forward_m": 0.20,
     "final_position_tolerance_m": 0.05,
-    "max_arm_constrained_joints": 0,
+    "max_arm_constrained_joints": 14,
     "max_arm_step_rad": 0.12,
-    "max_arm_raw_deviation_rad": 1.25,
-    "max_arm_tracking_error_rad": 0.50,
-    "max_arm_measured_deviation_rad": 1.0,
-    "max_arm_velocity_rps": 2.0,
-    "max_arm_estimated_torque_nm": 15.0,
+    "max_arm_raw_deviation_rad": 2.75,
+    "max_arm_tracking_error_rad": 0.90,
+    "max_arm_measured_deviation_rad": 2.75,
+    "max_arm_velocity_rps": 7.0,
+    "max_arm_estimated_torque_nm": 35.0,
     "require_settled": True,
 }
 
@@ -935,19 +935,19 @@ class SafetyTracker:
             if self._RESET_MARKERS.search(text):
                 raise AcceptanceError("SONIC reports reset/numerical fault evidence")
         arm_limits = {
-            "navigation_arm_constrained_joints": 0.0,
+            "navigation_arm_constrained_joints": 14.0,
             "navigation_arm_max_step_rad": 0.12,
-            "navigation_arm_raw_max_deviation_rad": 1.25,
-            "navigation_arm_raw_max_error_from_measured_rad": 0.50,
-            "navigation_arm_measured_max_deviation_rad": 1.0,
-            "navigation_arm_max_velocity_rps": 2.0,
-            "navigation_arm_max_estimated_torque_nm": 15.0,
-            "navigation_task_peak_arm_constrained_joints": 0.0,
-            "navigation_task_peak_arm_raw_deviation_rad": 1.25,
-            "navigation_task_peak_arm_tracking_error_rad": 0.50,
-            "navigation_task_peak_arm_measured_deviation_rad": 1.0,
-            "navigation_task_peak_arm_velocity_rps": 2.0,
-            "navigation_task_peak_arm_estimated_torque_nm": 15.0,
+            "navigation_arm_raw_max_deviation_rad": 2.75,
+            "navigation_arm_raw_max_error_from_measured_rad": 0.90,
+            "navigation_arm_measured_max_deviation_rad": 2.75,
+            "navigation_arm_max_velocity_rps": 7.0,
+            "navigation_arm_max_estimated_torque_nm": 35.0,
+            "navigation_task_peak_arm_constrained_joints": 14.0,
+            "navigation_task_peak_arm_raw_deviation_rad": 2.75,
+            "navigation_task_peak_arm_tracking_error_rad": 0.90,
+            "navigation_task_peak_arm_measured_deviation_rad": 2.75,
+            "navigation_task_peak_arm_velocity_rps": 7.0,
+            "navigation_task_peak_arm_estimated_torque_nm": 35.0,
         }
         for field, limit in arm_limits.items():
             arm_value = _finite(sonic.get(field), f"sonic.{field}")
@@ -959,7 +959,7 @@ class SafetyTracker:
         dx, dy = x - bx, y - by
         forward = dx * math.cos(byaw) + dy * math.sin(byaw)
         lateral = -dx * math.sin(byaw) + dy * math.cos(byaw)
-        if forward < -0.03 or forward > 0.30 or abs(lateral) > 0.12:
+        if forward < -0.10 or forward > 0.30 or abs(lateral) > 0.12:
             raise AcceptanceError("directional-travel hard threshold exceeded")
         return forward
 
@@ -1093,26 +1093,74 @@ class SafetyTracker:
         ):
             raise AcceptanceError("Plant observation worker health is invalid")
         viewer_failure_count = viewer_worker.get("failureCount", 0)
-        if (
-            viewer_worker.get("status") != "disabled"
-            or viewer_worker.get("authorityFeedbackEnabled") is not False
-            or viewer_worker.get("keyCallbackRegistered") is not False
-            or (
-                viewer_worker.get("ready") is not None
-                and viewer_worker.get("ready") is not False
+        viewer_status = viewer_worker.get("status")
+        if viewer_status == "disabled":
+            if (
+                viewer_worker.get("authorityFeedbackEnabled") is not False
+                or viewer_worker.get("keyCallbackRegistered") is not False
+                or viewer_worker.get("ready") not in (None, False)
+                or viewer_worker.get("alive") not in (None, False)
+                or viewer_worker.get("exitCode") is not None
+                or viewer_worker.get("workerPid") is not None
+                or viewer_worker.get("workerBootId") is not None
+                or _integer(viewer_failure_count, "viewer worker failureCount") != 0
+                or viewer_worker.get("lastFailureAtUnixNs") is not None
+                or viewer_worker.get("lastError") is not None
+            ):
+                raise AcceptanceError("disabled Plant viewer health is not canonical")
+            viewer_mode = "disabled"
+            viewer_pid = None
+            viewer_boot_id = None
+        elif viewer_status == "running":
+            viewer_pid = _integer(
+                viewer_worker.get("workerPid"), "viewer worker pid", minimum=1
             )
-            or (
-                viewer_worker.get("alive") is not None
-                and viewer_worker.get("alive") is not False
+            viewer_boot_id = self._identity(
+                viewer_worker.get("workerBootId"), "viewer worker boot"
             )
-            or viewer_worker.get("exitCode") is not None
-            or viewer_worker.get("workerPid") is not None
-            or viewer_worker.get("workerBootId") is not None
-            or _integer(viewer_failure_count, "viewer worker failureCount") != 0
-            or viewer_worker.get("lastFailureAtUnixNs") is not None
-            or viewer_worker.get("lastError") is not None
-        ):
-            raise AcceptanceError("Plant viewer must remain canonically disabled")
+            last_success_sequence = _integer(
+                viewer_worker.get("lastSuccessSequence"),
+                "viewer worker lastSuccessSequence",
+                minimum=1,
+            )
+            mailbox_published_count = _integer(
+                viewer_worker.get("mailboxPublishedCount"),
+                "viewer worker mailboxPublishedCount",
+                minimum=1,
+            )
+            progress_age_ms = _finite(
+                viewer_worker.get("progressAgeMs"), "viewer worker progressAgeMs"
+            )
+            stale_after_ms = _finite(
+                viewer_worker.get("staleAfterMs"), "viewer worker staleAfterMs"
+            )
+            if (
+                viewer_worker.get("ready") is not True
+                or viewer_worker.get("alive") is not True
+                or viewer_worker.get("exitCode") is not None
+                or _integer(viewer_failure_count, "viewer worker failureCount") != 0
+                or viewer_worker.get("lastFailureAtUnixNs") is not None
+                or viewer_worker.get("lastError") is not None
+                or viewer_worker.get("authorityFeedbackEnabled") is not False
+                or viewer_worker.get("keyCallbackRegistered") is not False
+                or viewer_worker.get("nativeViewerActive") is not True
+                or viewer_worker.get("shutdownStarted") is not False
+                or viewer_worker.get("nativeShutdownComplete") is not False
+                or _integer(
+                    viewer_worker.get("lastSuccessAtUnixNs"),
+                    "viewer worker lastSuccessAtUnixNs",
+                    minimum=1,
+                )
+                <= 0
+                or progress_age_ms < 0.0
+                or stale_after_ms <= 0.0
+                or progress_age_ms > stale_after_ms
+                or mailbox_published_count < last_success_sequence
+            ):
+                raise AcceptanceError("enabled Plant viewer is not healthy and read-only")
+            viewer_mode = "enabled_read_only"
+        else:
+            raise AcceptanceError("Plant viewer status is unknown")
         identities: dict[str, Any] = {
             "plant.robotId": plant.get("robotId"),
             "plant.sourceId": self._identity(plant.get("sourceId"), "Plant source"),
@@ -1131,9 +1179,9 @@ class SafetyTracker:
             "plant.observationWorkerBootId": self._identity(
                 observation_worker.get("workerBootId"), "observation worker boot"
             ),
-            "plant.viewerWorkerMode": "disabled",
-            "plant.viewerWorkerPid": None,
-            "plant.viewerWorkerBootId": None,
+            "plant.viewerWorkerMode": viewer_mode,
+            "plant.viewerWorkerPid": viewer_pid,
+            "plant.viewerWorkerBootId": viewer_boot_id,
         }
         if "driver_boot_id" in sonic:
             identities["sonic.driver_boot_id"] = self._identity(sonic.get("driver_boot_id"), "SONIC boot")

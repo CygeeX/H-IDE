@@ -7859,6 +7859,16 @@ def _run_control_stall_diagnostic_watchdog(
 def _handle_command_connection(driver: SonicDriver, conn) -> None:
     """Serve one bounded-lifetime 8793 client without changing its semantics."""
 
+    # Port 8793 is a newline-delimited command socket, not HTTP.  A client
+    # that keeps the write side open must never monopolize the single
+    # serialized accept loop and starve the ROS bridge health probe.  The
+    # legitimate loopback clients send one complete JSON line with sendall;
+    # stop reading at that frame boundary and retain a short deadline only
+    # for a genuinely fragmented first frame.
+    set_timeout = getattr(conn, "settimeout", None)
+    if callable(set_timeout):
+        set_timeout(0.010)
+    maximum_frame_bytes = 64 * 1024
     connection_started_at = time.monotonic()
     receive_completed_at = connection_started_at
     parse_completed_at = connection_started_at
@@ -7872,6 +7882,10 @@ def _handle_command_connection(driver: SonicDriver, conn) -> None:
             if not chunk:
                 break
             data += chunk
+            if len(data) > maximum_frame_bytes:
+                raise ValueError("SONIC command frame exceeds 64 KiB")
+            if b"\n" in data:
+                break
         receive_completed_at = time.monotonic()
         messages, _ = parse_lines(
             data + (b"" if data.endswith(b"\n") else b"\n")

@@ -147,6 +147,7 @@ def test_build_is_idempotent_and_matches_committed_outputs(tmp_path: Path) -> No
     assert paths.generated.joinpath("mujoco/office_v2.runtime.xml").read_bytes() == GENERATED.joinpath("mujoco/office_v2.runtime.xml").read_bytes()
     assert paths.generated.joinpath("nav2/office_v2.pgm").read_bytes() == GENERATED.joinpath("nav2/office_v2.pgm").read_bytes()
     assert paths.generated.joinpath("runtime_manifest.json").read_bytes() == GENERATED.joinpath("runtime_manifest.json").read_bytes()
+    assert paths.generated.joinpath("inspection_catalog.json").read_bytes() == GENERATED.joinpath("inspection_catalog.json").read_bytes()
     assert paths.evaluation.joinpath("manifest.json").read_bytes() == EVALUATION.read_bytes()
 
 
@@ -206,6 +207,98 @@ def test_every_static_entry_generates_visual_and_matching_collision_contract() -
             assert item["mjcf"]["collision_geoms"] == []
         else:
             assert set(item["mjcf"]["collision_geoms"]).issubset(geom_names)
+
+
+def test_visual_dressing_is_collision_free_and_all_room_signs_are_present() -> None:
+    scene = yaml.safe_load(SCENE_SOURCE.read_text(encoding="utf-8"))
+    xml = ET.parse(GENERATED / "mujoco" / "office_v2.include.xml")
+    geoms = {geom.attrib["name"]: geom for geom in xml.findall(".//geom")}
+
+    decor_geoms = {
+        name: geom for name, geom in geoms.items() if name.startswith("office_decor_")
+    }
+    assert decor_geoms
+    assert all(geom.attrib["contype"] == "0" for geom in decor_geoms.values())
+    assert all(geom.attrib["conaffinity"] == "0" for geom in decor_geoms.values())
+
+    expected_signs = {
+        "meeting_sign",
+        "pantry_sign",
+        "open_office_sign",
+        "reception_sign",
+        "focus_office_sign",
+        "storage_sign",
+    }
+    signs = {
+        item["id"]: item
+        for item in scene["objects"]
+        if item["semantic"]["class"] == "room_sign"
+    }
+    assert set(signs) == expected_signs
+    assert all(float(item["dimensions"][2]) >= 0.32 for item in signs.values())
+    assert {item["visual"]["material"] for item in signs.values()} == {
+        f"sign_{index:02d}" for index in range(1, 7)
+    }
+
+
+def test_product_inspection_catalog_is_complete_safe_and_map_bound() -> None:
+    scene = yaml.safe_load(SCENE_SOURCE.read_text(encoding="utf-8"))
+    catalog_path = GENERATED / "inspection_catalog.json"
+    catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+    runtime = json.loads((GENERATED / "runtime_manifest.json").read_text(encoding="utf-8"))
+    visual = json.loads((GENERATED / "visual_manifest.json").read_text(encoding="utf-8"))
+
+    assert catalog["schemaVersion"] == "h-ide.office-inspection/1"
+    assert catalog["sceneId"] == "office_v2"
+    assert catalog["containsObjectAnswers"] is False
+    assert catalog["sceneSourceSha256"] == runtime["scene_source_sha256"]
+    assert catalog["map"]["imageSha256"] == _sha(GENERATED / "nav2/office_v2.pgm")
+    assert catalog["map"]["yamlSha256"] == _sha(GENERATED / "nav2/office_v2.yaml")
+    assert runtime["inspection_catalog"] == {
+        "path": "inspection_catalog.json",
+        "sha256": _sha(catalog_path),
+        "contains_object_answers": False,
+    }
+    assert visual["bundles"]["inspection_catalog"]["sha256"] == _sha(catalog_path)
+
+    regions = catalog["regions"]
+    assert {region["regionId"] for region in regions} == {
+        "corridor",
+        "reception",
+        "open_office",
+        "meeting_room",
+        "focus_office",
+        "pantry",
+        "storage",
+    }
+    assert sum(region["kind"] == "room" for region in regions) == 6
+    stations = [station for region in regions for station in region["stations"]]
+    assert len(catalog["route"]) == len(stations) == 20
+    assert set(catalog["route"]) == {station["stationId"] for station in stations}
+    assert catalog["capturePolicy"] == {
+        "framesPerHeading": 3,
+        "burstDurationS": 0.6,
+        "stopBeforeCaptureS": 1.0,
+        "maximumSettleS": 5.0,
+    }
+
+    # Named regions and observation poses are the only semantic facts in this
+    # product bundle.  Object inventories, evaluator targets and expected
+    # recognition answers remain exclusively in evaluation/manifest.json.
+    serialized = json.dumps(catalog, ensure_ascii=False, sort_keys=True)
+    for forbidden_key in (
+        '"objects"',
+        '"objectId"',
+        '"object_id"',
+        '"expectedObjectIds"',
+        '"targets"',
+        '"semanticTests"',
+        '"evaluation"',
+        '"oracle"',
+    ):
+        assert forbidden_key not in serialized
+    for item in scene["objects"]:
+        assert item["id"] not in serialized
 
 
 def test_product_manifest_contains_no_privileged_semantic_answers() -> None:
@@ -475,7 +568,8 @@ def test_runtime_loader_hashes_every_included_office_asset_and_fails_closed(
     shutil.copytree(GENERATED, copied)
     runtime = load_runtime_scene(copied / "runtime_manifest.json")
     assert runtime.model_office_include.name == "office_v2.include.xml"
-    assert len(runtime.model_render_assets) == 8
+    assert len(runtime.model_render_assets) == 10
+    assert runtime.inspection_catalog.name == "inspection_catalog.json"
 
     runtime.model_office_include.write_text(
         runtime.model_office_include.read_text(encoding="utf-8") + "\n",
@@ -515,7 +609,7 @@ def test_supported_configs_all_select_the_same_verified_office_v2_bundle() -> No
         assert config.sonic_control_step_stale_s == pytest.approx(0.10)
         assert config.planner_reference_timeout_s == pytest.approx(1.0)
         assert config.policy_activation_s == pytest.approx(3.0)
-        assert config.policy_release_fall_arrest is True
+        assert config.policy_release_fall_arrest is (name != "ros-headless.yaml")
         assert config.max_linear_mps == pytest.approx(0.40)
         assert config.min_walk_command_mps == pytest.approx(0.20)
         assert (

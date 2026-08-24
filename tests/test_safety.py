@@ -215,6 +215,22 @@ def test_motion_direction_guard_pure_spin_ends_previous_translation_anchor():
     assert guard.latched is False
 
 
+def test_motion_direction_guard_zero_ends_translation_before_stop_settle():
+    guard = MotionDirectionGuard()
+    guard.observe_pose(0.0, 0.0, 0.0)
+    assert guard.accept_command(0.2, 0.0, 0.0) is True
+    assert guard.observe_pose(-0.03, 0.0, 0.0) is False
+
+    assert guard.accept_command(0.0, 0.0, 0.0) is True
+    assert guard.observe_pose(-0.20, 0.0, 0.0) is False
+    assert guard.latched is False
+
+    # A later translation still establishes a new independent direction
+    # transaction and detects genuine wrong-way motion.
+    assert guard.accept_command(0.2, 0.0, 0.0) is True
+    assert guard.observe_pose(-0.27, 0.0, 0.0) is True
+
+
 def test_motion_direction_guard_keeps_anchor_through_nav2_turn_transient():
     guard = MotionDirectionGuard()
     guard.observe_pose(0.0, 0.0, 0.0)
@@ -304,6 +320,21 @@ def test_goal_progress_guard_ignores_small_detour_and_equivalent_replan():
     assert guard.observe_goal(1.04, 0.02) is False
     assert guard.observe_pose(0.08, 0.0) is False
     assert guard.latched is False
+
+
+def test_goal_progress_guard_zero_ends_progress_before_stop_settle():
+    guard = GoalProgressGuard(max_regression_m=0.15)
+    guard.observe_pose(0.0, 0.0)
+    guard.observe_goal(1.0, 0.0)
+    assert guard.accept_command(0.2, 0.0, 0.0) is True
+    assert guard.observe_pose(0.10, 0.0) is False
+
+    assert guard.accept_command(0.0, 0.0, 0.0) is True
+    assert guard.observe_pose(-0.20, 0.0) is False
+    assert guard.latched is False
+
+    assert guard.accept_command(0.2, 0.0, 0.0) is True
+    assert guard.observe_pose(-0.36, 0.0) is True
 
 
 def test_goal_progress_guard_suspends_and_reanchors_across_pure_spin() -> None:
