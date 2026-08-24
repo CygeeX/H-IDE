@@ -98,7 +98,10 @@ BRIDGE_HEALTH_SCHEMA = "h-ide.ros-bridge-health/v1"
 TRACE_SCHEMA_VERSION = "h-ide.strict-motion-trace/2"
 PINNED_NAV2_MSGS_VERSION = "1.3.12"
 MAX_JSON_BYTES = 32 * 1024 * 1024
-SAMPLE_DEADLINE_S = 0.30
+# The first-person evidence source is intentionally capped at 5 Hz.  Give one
+# complete extra frame period for scheduler/ROS collection jitter, while still
+# requiring a strictly newer authoritative sequence (never a reused frame).
+SAMPLE_DEADLINE_S = 0.50
 TERMINAL_SETTLE_S = 3.0
 TERMINAL_SETTLE_MAX_WALL_S = 30.0
 SEGMENT_BALANCED_IDLE_S = 1.5

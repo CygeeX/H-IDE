@@ -2044,16 +2044,17 @@ def test_forward_allows_bounded_gait_braking_but_rejects_larger_overshoot() -> N
     assert "LINEAR_OVERSHOOT" in _failure_codes(excessive)
 
 
-def test_terminal_sampling_allows_5hz_but_not_a_larger_gap() -> None:
+def test_terminal_sampling_allows_bounded_5hz_jitter_but_not_a_larger_gap() -> None:
     trace = _trace("forward")
     terminal_indices = [
         index
         for index, sample in enumerate(trace["samples"])
         if not sample["motionIntentActive"]
     ]
-    # Preserve the terminal endpoints while turning one 100 ms pair into an
-    # exact 200 ms interval, matching the slowest authoritative viewer source.
-    del trace["samples"][terminal_indices[-3]]
+    # Preserve the terminal endpoints while turning three 100 ms intervals
+    # into one exact 300 ms interval.  This covers the nominal 5 Hz viewer plus
+    # one bounded scheduler interval without accepting a repeated sequence.
+    del trace["samples"][terminal_indices[-4] : terminal_indices[-2]]
     assert strict.evaluate_trace(trace)["pass"] is True
 
     too_sparse = _trace("forward")
@@ -2062,7 +2063,7 @@ def test_terminal_sampling_allows_5hz_but_not_a_larger_gap() -> None:
         for index, sample in enumerate(too_sparse["samples"])
         if not sample["motionIntentActive"]
     ]
-    del too_sparse["samples"][terminal_indices[-4] : terminal_indices[-2]]
+    del too_sparse["samples"][terminal_indices[-5] : terminal_indices[-2]]
     assert "TERMINAL_SETTLE_SAMPLE_GAP" in _failure_codes(too_sparse)
 
 

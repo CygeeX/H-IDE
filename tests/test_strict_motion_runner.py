@@ -1054,6 +1054,95 @@ def test_snapshot_collector_brackets_first_person_with_later_plant_snapshot(
     assert sample["runtimeHealth"]["firstPersonViewer"]["plantSequence"] == 101
 
 
+def test_snapshot_collector_waits_for_a_strictly_new_5hz_viewer_frame(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    status = tmp_path / "first-person.json"
+    first_person_status(status)
+    reads = 0
+    now = 0.0
+
+    def read_status(path: Path) -> dict:
+        nonlocal reads
+        reads += 1
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if reads >= 4:
+            payload["sequence"] = 41
+            payload["lastSuccessAtUnixNs"] += 1
+        return payload
+
+    def clock() -> float:
+        return now
+
+    def sleep(seconds: float) -> None:
+        nonlocal now
+        now += seconds
+
+    monkeypatch.setattr(runner, "read_secure_status", read_status)
+    monkeypatch.setattr(runner.time, "sleep", sleep)
+    monkeypatch.setattr(runner, "_inactive_user_unit", lambda _unit: "inactive")
+    monkeypatch.setattr(runner, "_require_port_closed", lambda _port: None)
+    collector = runner.RuntimeSnapshotCollector(
+        FakeRos(),
+        reader=FakeReader(plant_state(), sonic_state()),
+        first_person_status=status,
+        clock=clock,
+    )
+    collector._last_sequences = {
+        "plant": 99,
+        "sonic": 12_499,
+        "nav2": 79,
+        "rosBridge": 49,
+        "nativeViewer": 89,
+        "firstPersonViewer": 40,
+    }
+
+    sample = collector.wait_next()
+
+    assert reads == 4
+    assert now == pytest.approx(0.03)
+    assert sample["runtimeHealth"]["firstPersonViewer"]["sequence"] == 41
+
+
+def test_snapshot_collector_still_rejects_a_viewer_that_never_advances(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    status = tmp_path / "first-person.json"
+    first_person_status(status)
+    now = 0.0
+
+    def clock() -> float:
+        return now
+
+    def sleep(seconds: float) -> None:
+        nonlocal now
+        now += seconds
+
+    monkeypatch.setattr(runner.time, "sleep", sleep)
+    monkeypatch.setattr(runner, "_inactive_user_unit", lambda _unit: "inactive")
+    monkeypatch.setattr(runner, "_require_port_closed", lambda _port: None)
+    collector = runner.RuntimeSnapshotCollector(
+        FakeRos(),
+        reader=FakeReader(plant_state(), sonic_state()),
+        first_person_status=status,
+        clock=clock,
+    )
+    collector._last_sequences = {
+        "plant": 99,
+        "sonic": 12_499,
+        "nav2": 79,
+        "rosBridge": 49,
+        "nativeViewer": 89,
+        "firstPersonViewer": 40,
+    }
+
+    with pytest.raises(
+        runner.StrictMotionRunnerError,
+        match="runtime evidence did not advance: firstPersonViewer",
+    ):
+        collector.wait_next(deadline_s=0.02)
+
+
 def test_snapshot_collector_rejects_bridge_sonic_identity_mismatch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

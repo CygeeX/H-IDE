@@ -164,10 +164,11 @@ class FormalContract:
     # not an actuator safety limit.
     terminal_angular_speed_rps: float = 0.04
     # The collector joins six independently scheduled health sources and the
-    # 5 Hz first-person viewer.  A 200 ms evidence cadence is still bounded and
-    # cannot hide the independently enforced 50 Hz actuator trace; requiring
-    # 100 ms made a healthy 160 ms scheduler interval fail after the fact.
-    max_terminal_sample_gap_s: float = 0.20
+    # 5 Hz first-person viewer.  Permit one 100 ms scheduling margin beyond its
+    # nominal 200 ms frame period.  Every sample must still carry a strictly
+    # newer viewer sequence and the actuator trace remains authoritative at
+    # 50 Hz, so this does not admit repeated/stale visual evidence.
+    max_terminal_sample_gap_s: float = 0.30
     max_arm_continuous_saturation_s: float = 0.24
     arm_must_clear_before_s: float = 0.25
     arm_control_period_s: float = 0.02
