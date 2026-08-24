@@ -1,6 +1,6 @@
 {
   "schema_version": "h-ide.sonic-model-lock/1",
-  "repository_revision_at_audit": "d9ad0edfd6f7247992549db511889aa7c5db5b3a",
+  "repository_revision_at_audit": "398bc629df613de3049c51ebb4eb1e19a85882a4",
   "model_repository": {
     "repo_id": "nvidia/GEAR-SONIC",
     "revision": "9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2",
@@ -19,14 +19,14 @@
   "audited_runtime": {
     "config": {
       "path": "config/ros-headless.yaml",
-      "size": 4059,
-      "sha256": "696fe91a5552e80f05e0a84a0199e7113428b2cff8d5e4dded72667d6c724b0b"
+      "size": 4265,
+      "sha256": "13ee61be7e45c82f3e730d11c07682624ed6518d89f17e142f641e31ef422d09"
     },
     "declared_model_revision": "9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2",
     "declared_lerobot_revision": "56b4087c40d7ee8e78e3485f78fe21e88679355b",
     "observed_lerobot_revision": "56b4087c40d7ee8e78e3485f78fe21e88679355b",
     "lock_safe": true,
-    "reason": "The reviewed ros-headless runtime selectors, ROS/Nav2 domain 232, isolated Unitree LowState/LowCmd domain 230, SONIC model bundle, exact LeRobot cold-start history and control source, official direction-speed mapping, actuator handoff, one-time measured nominal activation with retained non-propulsive vertical/roll/pitch fall arrest, bounded planner-reference waits, cursor-preserving same-action motion and pure-rotation replanning, history-preserving controlled IDLE stopping at the live planner-reference cursor facing, terminal IDLE reference readaptation, and the strict NavFn-to-Spin/DriveOnHeading adapter are reproducibly anchored by repository commit d9ad0edfd6f7247992549db511889aa7c5db5b3a."
+    "reason": "The reviewed ros-headless runtime selectors, ROS/Nav2 domain 232, isolated Unitree LowState/LowCmd domain 230, SONIC model bundle, exact LeRobot cold-start history and control source, official direction-speed mapping, actuator handoff, one-time measured nominal activation with retained non-propulsive vertical/roll/pitch fall arrest, bounded planner-reference waits, cursor-preserving same-action motion and pure-rotation replanning, history-preserving controlled IDLE stopping at the live planner-reference cursor facing, terminal IDLE reference readaptation, a bounded 0.20 rad support-foot counter-sway allowance for workstation Spins, and the strict NavFn-to-Spin/DriveOnHeading adapter are reproducibly anchored by repository commit 398bc629df613de3049c51ebb4eb1e19a85882a4."
   },
   "profiles": {
     "sonic-official-default": {
