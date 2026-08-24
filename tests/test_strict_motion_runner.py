@@ -1828,6 +1828,62 @@ def test_detour_executor_skips_subresolution_alignment_before_drive(
     assert evidence.calls == ["begin", "finalize"]
 
 
+def test_detour_executor_skips_alignment_when_prior_action_reached_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class EndpointReachedPlanner(FakeStaticPlanner):
+        def resolve_live_primitive(self, plan, index, path, pose, **kwargs):
+            if index == 0:
+                return {
+                    "primitive_sequence": 0,
+                    "plan_sha256": "a" * 64,
+                    "fresh_odometry_used": True,
+                    "disposition": "skip_within_endpoint_tolerance",
+                    "action_goal": None,
+                    "fresh_distance_to_endpoint_m": 0.1,
+                }
+            return super().resolve_live_primitive(
+                plan, index, path, pose, **kwargs
+            )
+
+    backend = FakeDetourBackend()
+    samples = [_executor_sample(index / 10.0) for index in range(60)]
+    samples[2]["motionIntentActive"] = True
+    samples[2]["nav2Actions"]["driveOnHeadingActive"] = True
+    samples[2]["command"]["vx"] = 0.3
+    evidence = FakeDetourEvidence()
+    planner = EndpointReachedPlanner()
+
+    def load(name: str, _path: Path):
+        if "planner" in name:
+            return planner
+        return SimpleNamespace(
+            evaluate_trace=lambda trace: {
+                "pass": [item["type"] for item in trace["action"]["segments"]]
+                == ["DriveOnHeading"]
+            }
+        )
+
+    monkeypatch.setattr(runner, "_load_file_module", load)
+    executor = runner.StrictMotionCaseExecutor(
+        backend,
+        FakeExecutorCollector(samples),
+        evidence,
+        clock=lambda: 1.0,
+    )
+
+    trace, result = executor.run_detour(
+        case_id="detour-prior-action-reached-endpoint",
+        route_id="office_waste_bin_s_to_g",
+    )
+
+    assert result == {"pass": True}
+    assert [item["type"] for item in trace["action"]["segments"]] == [
+        "DriveOnHeading"
+    ]
+    assert "send_spin" not in backend.calls
+
+
 def test_detour_executor_repeats_bounded_drive_until_endpoint_confirmation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

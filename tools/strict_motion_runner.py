@@ -3081,15 +3081,19 @@ class StrictMotionCaseExecutor:
                         isinstance(_primitive, Mapping)
                         and _primitive.get("kind") == "spin"
                         and resolved.get("disposition")
-                        == "skip_within_heading_tolerance"
+                        in {
+                            "skip_within_heading_tolerance",
+                            "skip_within_endpoint_tolerance",
+                        }
                     ):
                         # Alignment checkpoints are deliberately present before
                         # every DriveOnHeading so fresh odometry can request a
                         # correction after drift.  When the measured heading is
-                        # already within the reviewed resolution there is no
-                        # physical action to execute; the following Drive
-                        # checkpoint samples again and will request the same
-                        # Spin if the pose moved in the meantime.
+                        # already within the reviewed resolution, or the prior
+                        # learned action has physically reached this segment's
+                        # endpoint, there is no Spin to execute. The following
+                        # Drive checkpoint samples again and remains free to
+                        # request a correction if the pose moved meanwhile.
                         break
                     elif resolved.get("disposition") != "send_action":
                         raise StrictMotionRunnerError(

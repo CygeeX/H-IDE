@@ -3188,6 +3188,35 @@ class StrictMotionEvaluator:
         skipped_resolver_results: list[dict[str, Any]] = []
         actual_cursor = 0
         realignment_spin_count = 0
+        terminal_sample = self._parsed_samples[-1]
+        terminal_root = terminal_sample["root"]
+        terminal_fresh_pose = {
+            "x": float(terminal_root[0]),
+            "y": float(terminal_root[1]),
+            "yaw": float(terminal_sample["yaw"]),
+        }
+
+        def resolve_omitted_from_terminal(
+            primitive_sequence: int,
+        ) -> dict[str, Any] | None:
+            try:
+                return dict(
+                    _resolve_production_static_primitive_cached(
+                        plan_json,
+                        navfn_path_json,
+                        primitive_sequence,
+                        _canonical_json(terminal_fresh_pose),
+                        production_parameters,
+                        live_execution_clearance_radius_m,
+                    )
+                )
+            except (OSError, TypeError, ValueError) as exc:
+                self._fail(
+                    "DETOUR_PRODUCTION_RESOLUTION_FAILED",
+                    f"production resolver rejected omitted primitive {primitive_sequence}: {exc}",
+                )
+                return None
+
         for primitive_sequence, expected_type in expected_actions:
             if expected_type == "Spin":
                 candidate = (
@@ -3246,7 +3275,10 @@ class StrictMotionEvaluator:
                     else:
                         if (
                             skipped.get("disposition")
-                            == "skip_within_heading_tolerance"
+                            in {
+                                "skip_within_heading_tolerance",
+                                "skip_within_endpoint_tolerance",
+                            }
                             and skipped.get("action_goal") is None
                         ):
                             skipped_resolver_results.append(skipped)
@@ -3255,6 +3287,20 @@ class StrictMotionEvaluator:
                             "DETOUR_CHECKPOINT_NOT_EXECUTABLE",
                             f"omitted Spin primitive {primitive_sequence} was not within heading tolerance",
                         )
+
+                if candidate is None:
+                    skipped = resolve_omitted_from_terminal(primitive_sequence)
+                    if (
+                        skipped is not None
+                        and skipped.get("disposition")
+                        in {
+                            "skip_within_heading_tolerance",
+                            "skip_within_endpoint_tolerance",
+                        }
+                        and skipped.get("action_goal") is None
+                    ):
+                        skipped_resolver_results.append(skipped)
+                        continue
 
                 # Keep the unmatched checkpoint in the expected sequence so
                 # the ordinary count/order gates fail closed below.
@@ -3341,6 +3387,16 @@ class StrictMotionEvaluator:
                 )
                 actual_cursor += 1
             if drive_action_count == 0:
+                if actual_cursor >= len(self.detour_segments):
+                    skipped = resolve_omitted_from_terminal(primitive_sequence)
+                    if (
+                        skipped is not None
+                        and skipped.get("disposition")
+                        == "skip_within_endpoint_tolerance"
+                        and skipped.get("action_goal") is None
+                    ):
+                        skipped_resolver_results.append(skipped)
+                        continue
                 expanded_expected_actions.append(
                     (primitive_sequence, expected_type)
                 )
