@@ -220,6 +220,12 @@ RELAXED_LIVE_CLEARANCE_ROUTES = frozenset(
         "office_corridor_east_to_focus_office",
     }
 )
+DETOUR_START_POSITION_TOLERANCE_M = {
+    # target_corridor_east is generated with a 0.35 m arrival tolerance.  A
+    # subsequent scene acceptance must be allowed to continue from any pose
+    # that the preceding canonical route legitimately accepted.
+    "office_corridor_east_to_focus_office": 0.35,
+}
 OFFICE_DETOUR_OBSTACLES = [
     {
         "source": "pgm_occupied_component",
@@ -2921,7 +2927,7 @@ class StrictMotionCaseExecutor:
                     (current.pose.x, current.pose.y),
                     (expected_start.x, expected_start.y),
                 )
-                > 0.15
+                > DETOUR_START_POSITION_TOLERANCE_M.get(route_id, 0.15)
                 or abs(_angle_delta(current.pose.yaw, expected_start.yaw)) > 0.35
             ):
                 raise StrictMotionRunnerError(

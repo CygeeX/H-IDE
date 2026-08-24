@@ -175,6 +175,9 @@ def test_east_corridor_to_focus_office_route_uses_generated_scene_targets() -> N
     assert "office_corridor_east_to_focus_office" in (
         runner.RELAXED_LIVE_CLEARANCE_ROUTES
     )
+    assert runner.DETOUR_START_POSITION_TOLERANCE_M[
+        "office_corridor_east_to_focus_office"
+    ] == pytest.approx(0.35)
 
 
 
