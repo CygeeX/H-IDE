@@ -621,16 +621,25 @@ def run_ros_bridge(config: SimConfig) -> None:
             max_angular_rps=config.max_angular_rps,
             linear_deadband_mps=config.min_walk_command_mps,
             angular_deadband_rps=0.05,
-            # This budget begins only after SONIC reports the first exact DDS
-            # authority grant. Nominal activation and reference planning occur
-            # before that fact and must not weaken measured-gait fail-fast.
-            start_timeout_s=1.5,
+            # A learned whole-body step can initially counter-shift its pelvis
+            # and may need several seconds to produce an odometry-scale base
+            # velocity after a fresh Spin/Drive reference. Let the bounded
+            # Nav2 action own an ordinary no-progress case instead of latching
+            # the whole simulator after 1.5 seconds of benign foot placement.
+            start_linear_ack_mps=0.005,
+            start_angular_ack_rps=0.005,
+            start_timeout_s=12.0,
+            reverse_translation_m=0.30,
+            reverse_min_travel_m=0.30,
+            startup_reverse_grace_s=6.0,
+            startup_progress_deadline_s=10.0,
+            reverse_rotation_rad=0.35,
             stop_timeout_s=2.5,
             # learned-IDLE is an active balancing policy. Ordinary action
             # completion may need several seconds to absorb a whole-body
             # turn/translation correction; emergency cancel/safe-stop keeps
             # the independent 2.5 s limit above.
-            balanced_idle_stop_timeout_s=10.0,
+            balanced_idle_stop_timeout_s=15.0,
             balanced_idle_stop_linear_excursion_m=0.08,
             balanced_idle_stop_yaw_excursion_rad=0.25,
             balanced_idle_stop_max_linear_mps=0.20,
