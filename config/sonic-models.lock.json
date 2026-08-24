@@ -1,6 +1,6 @@
 {
   "schema_version": "h-ide.sonic-model-lock/1",
-  "repository_revision_at_audit": "72237820f70e9b2826fb7423aced0e4a5af10ade",
+  "repository_revision_at_audit": "a5e782c7ba29af7424a469a4299f610e1d59d83e",
   "model_repository": {
     "repo_id": "nvidia/GEAR-SONIC",
     "revision": "9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2",
@@ -9,7 +9,7 @@
   "source_repositories": {
     "lerobot-python": {
       "path": "vendor/lerobot",
-      "revision": "f5fdcb61cda272b866ca81f72ce6f1f76b87fad9"
+      "revision": "56b4087c40d7ee8e78e3485f78fe21e88679355b"
     },
     "nvidia-groot-wbc": {
       "path": "/home/phi/learn-projects/systemed_study/GR00T-WholeBodyControl",
@@ -20,13 +20,13 @@
     "config": {
       "path": "config/ros-headless.yaml",
       "size": 3834,
-      "sha256": "cc98b6228627413e208da3041303848e26b0d4d9c3d327419bcb43d5eb722e9d"
+      "sha256": "46ce88942515ecb9467fa72b9b116e60fc68298e07046a6f81bd87a0bb3a0511"
     },
     "declared_model_revision": "9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2",
-    "declared_lerobot_revision": "f5fdcb61cda272b866ca81f72ce6f1f76b87fad9",
-    "observed_lerobot_revision": "f5fdcb61cda272b866ca81f72ce6f1f76b87fad9",
+    "declared_lerobot_revision": "56b4087c40d7ee8e78e3485f78fe21e88679355b",
+    "observed_lerobot_revision": "56b4087c40d7ee8e78e3485f78fe21e88679355b",
     "lock_safe": true,
-    "reason": "The reviewed ros-headless runtime selectors, ROS/Nav2 domain 232, isolated Unitree LowState/LowCmd domain 230, SONIC model bundle, exact LeRobot cold-start history and control source, official direction-speed mapping, actuator handoff, exact-epoch policy-owned fall-arrest release, the bounded one-second stationary planner-reference wait, history-preserving controlled IDLE stopping at the live planner-reference cursor facing, and terminal IDLE reference readaptation are reproducibly anchored by repository commit 72237820f70e9b2826fb7423aced0e4a5af10ade."
+    "reason": "The reviewed ros-headless runtime selectors, ROS/Nav2 domain 232, isolated Unitree LowState/LowCmd domain 230, SONIC model bundle, exact LeRobot cold-start history and control source, official direction-speed mapping, actuator handoff, exact-epoch policy-owned fall-arrest release, bounded planner-reference waits, cursor-preserving same-action motion and pure-rotation replanning, history-preserving controlled IDLE stopping at the live planner-reference cursor facing, and terminal IDLE reference readaptation are reproducibly anchored by repository commit a5e782c7ba29af7424a469a4299f610e1d59d83e."
   },
   "profiles": {
     "sonic-official-default": {
@@ -280,8 +280,8 @@
           "role": "controller",
           "path": "vendor/lerobot/src/lerobot/robots/unitree_g1/controllers/sonic_whole_body.py",
           "present": true,
-          "size": 58562,
-          "sha256": "bfeec2a712c3550646adc97d72b2cf51913d39ec7481d48945edd095f4cf95f4"
+          "size": 60365,
+          "sha256": "319009f540ac5d72cf423e59b2623460f93c7cf93754e10e5538f8ff4f379626"
         },
         {
           "id": "python-pipeline",
@@ -297,7 +297,7 @@
           "path": "profiles/sonic-python-experimental.yaml",
           "present": true,
           "size": 1280,
-          "sha256": "d218645b910651f8d91427617b7c1743a0fbb61ac6571d2a2c96bd3c57208b55"
+          "sha256": "2933faabed293710a18bbf262f6755ef292e342e904771aad735aa3607395279"
         }
       ]
     }
