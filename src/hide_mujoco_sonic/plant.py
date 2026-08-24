@@ -548,6 +548,18 @@ class PlantSupportController:
                 release_epoch_confirmed=epoch,
                 updated_at=time.time(),
             )
+            # A successful physics-thread consume is terminal for this
+            # request.  Leaving it in command state makes a later safety-stop
+            # re-engagement look like the old epoch is pending again; the next
+            # physics tick then permanently rejects an already-confirmed
+            # release.  Keep the historical confirmation in band state, but
+            # clear the one-shot command exactly at the same serialized
+            # boundary that disables the band.
+            self._command_state = replace(
+                command,
+                updated_at=time.time(),
+                fall_arrest_release_epoch_requested=None,
+            )
             return epoch
 
     def finish_startup(self) -> str:

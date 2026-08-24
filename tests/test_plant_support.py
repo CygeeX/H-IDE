@@ -197,12 +197,32 @@ def test_fall_arrest_release_is_one_way_and_bound_to_activation_epoch() -> None:
     assert released == [True]
     released = support.state()
     assert released["fallArrestEnabled"] is False
+    assert released["fallArrestReleaseRequestedEpoch"] is None
     assert released["fallArrestReleaseConfirmedEpoch"] == 17
     assert support.request_fall_arrest_release(17) is False
     assert support.consume_fall_arrest_release(lambda: None) is None
 
     with pytest.raises(ValueError, match="another activation"):
         support.request_fall_arrest_release(18)
+
+
+def test_consumed_release_cannot_be_rejected_by_a_later_safety_stop() -> None:
+    support = PlantSupportController(fall_arrest_enabled=True)
+    support.finish_startup()
+
+    assert support.request_fall_arrest_release(17) is True
+    assert support.consume_fall_arrest_release(lambda: None) == 17
+
+    # The confirmed request is no longer pending.  Re-engaging fall arrest at
+    # a later action boundary must preserve the historical confirmation
+    # without manufacturing a rejection for that already-consumed epoch.
+    assert support.set_mode("safety_stop") == "safety_stop"
+    assert support.consume_fall_arrest_release(lambda: None) is None
+    stopped = support.state()
+    assert stopped["fallArrestEnabled"] is True
+    assert stopped["fallArrestReleaseRequestedEpoch"] is None
+    assert stopped["fallArrestReleaseConfirmedEpoch"] == 17
+    assert stopped["fallArrestReleaseRejectedEpoch"] is None
 
 
 def test_fall_arrest_release_fails_closed_at_unsafe_boundaries() -> None:

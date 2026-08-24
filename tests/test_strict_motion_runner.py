@@ -187,12 +187,13 @@ def test_spin_relays_the_reviewed_clip_safe_command(mode: str, wz: float) -> Non
     assert relay.nav2_output(now_s=1.1) == command(wz=wz)
 
 
-def test_spin_rejects_wrong_sign_subfloor_and_translation() -> None:
+def test_spin_accepts_nav2_acceleration_ramp_but_rejects_unsafe_commands() -> None:
     relay = runner.StrictCommandRelay()
     relay.begin("turn_left")
+    for ramped in (0.001, 0.03, 0.075, 0.1):
+        relay.observe_nav2(command(wz=ramped), observed_at_s=1.0)
     for invalid in (
         command(wz=-0.1),
-        command(wz=0.099),
         command(wz=0.101),
         command(vx=0.01, wz=0.1),
     ):

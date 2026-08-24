@@ -1890,7 +1890,7 @@ class StrictMotionEvaluator:
             if max(signed_commands) < self.contract.spin_max_wz_rps - self.contract.steady_target_tolerance - _EPS:
                 self._fail(
                     "SPIN_STEADY_TARGET_MISSING",
-                    "no signed 0.20rad/s Spin steady command was observed",
+                    "no signed 0.10rad/s Spin steady command was observed",
                 )
         else:
             cumulative_translation = [0.0]

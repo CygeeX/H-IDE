@@ -406,11 +406,11 @@ class StrictCommandRelay:
             signed = self._direction * command.wz
             if not command.is_zero and (
                 signed <= 0.0
-                or abs(command.wz) < OFFICIAL_SPIN_MIN_RPS - _ZERO_EPS
                 or abs(command.wz) > OFFICIAL_SPIN_MAX_RPS + _ZERO_EPS
             ):
                 raise StrictMotionRunnerError(
-                    "Spin command is not the signed reviewed 0.10 rad/s"
+                    "Spin command has the wrong sign or exceeds the reviewed "
+                    "0.10 rad/s cap"
                 )
         else:
             raise StrictMotionRunnerError(
