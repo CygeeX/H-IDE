@@ -478,6 +478,7 @@ def _segment_indices(
     *,
     relaxed_start_blocked: frozenset[tuple[int, int]],
     reentry_blocked: frozenset[tuple[int, int]],
+    physical_endpoint_blocked: frozenset[tuple[int, int]],
     min_segment_m: float,
     max_segment_m: float,
     endpoint_tolerance_m: float,
@@ -527,12 +528,57 @@ def _segment_indices(
             "NavFn path cannot restore full clearance from its relaxed start",
         )
 
-    for index, point in enumerate(points[recovery_index:], start=recovery_index):
+    # NavFn may legally place the exact goal in its inflation-cost band.  The
+    # extra 5 cm planning margin is not part of the robot footprint and must
+    # not turn an otherwise reachable inspection pose into a hard failure.
+    # Stop at the closest full-clearance path sample within the reviewed
+    # endpoint tolerance, but only when the omitted NavFn tail remains clear
+    # for the physical footprint plus footprint padding.  No command is sent
+    # into that tail; the live resolver reports the endpoint satisfied.
+    terminal_index = len(points) - 1
+    if static_map.world_to_cell(*points[-1]) in blocked:
+        _require(
+            static_map.world_to_cell(*points[-1]) not in physical_endpoint_blocked,
+            "NavFn goal violates physical footprint clearance",
+        )
+        candidate = None
+        for index in range(len(points) - 2, max(recovery_index, 1) - 1, -1):
+            if (
+                math.dist(points[index], points[-1])
+                <= endpoint_tolerance_m + 1e-12
+                and static_map.world_to_cell(*points[index]) not in blocked
+                and static_map.segment_is_clear(
+                    points[index], points[-1], physical_endpoint_blocked
+                )
+            ):
+                candidate = index
+                break
+        _require(
+            candidate is not None,
+            "NavFn goal cannot be satisfied from a full-clearance endpoint",
+        )
+        terminal_index = candidate
+        for index in range(terminal_index + 1, len(points)):
+            _require(
+                static_map.world_to_cell(*points[index])
+                not in physical_endpoint_blocked,
+                f"NavFn terminal path pose {index} violates physical footprint clearance",
+            )
+            _require(
+                static_map.segment_is_clear(
+                    points[index - 1], points[index], physical_endpoint_blocked
+                ),
+                f"NavFn terminal path edge {index - 1}->{index} violates physical footprint clearance",
+            )
+
+    for index, point in enumerate(
+        points[recovery_index : terminal_index + 1], start=recovery_index
+    ):
         _require(
             static_map.world_to_cell(*point) not in blocked,
             f"NavFn path pose {index} violates inflated clearance",
         )
-    for index in range(recovery_index, len(points) - 1):
+    for index in range(recovery_index, terminal_index):
         start, end = points[index], points[index + 1]
         _require(
             static_map.segment_is_clear(start, end, blocked),
@@ -554,9 +600,9 @@ def _segment_indices(
     # later path checkpoint with clear line of sight to the exact NavFn goal
     # as a terminal checkpoint, while deliberately excluding index 0 so an
     # entirely sub-tolerance request cannot manufacture an empty plan.
-    terminal_indices = {len(points) - 1}
+    terminal_indices = {terminal_index}
     if recovery_index > 0:
-        for index in range(recovery_index, len(points) - 1):
+        for index in range(recovery_index, terminal_index):
             if (
                 math.dist(points[index], points[-1])
                 <= endpoint_tolerance_m + 1e-12
@@ -567,10 +613,10 @@ def _segment_indices(
                 terminal_indices.add(index)
     for index in terminal_indices:
         reachable[index] = True
-    for start_index in range(len(points) - 2, recovery_index - 1, -1):
+    for start_index in range(terminal_index - 1, recovery_index - 1, -1):
         if start_index in terminal_indices:
             continue
-        for end_index in range(len(points) - 1, start_index, -1):
+        for end_index in range(terminal_index, start_index, -1):
             if not reachable[end_index]:
                 continue
             distance = math.dist(points[start_index], points[end_index])
@@ -673,6 +719,9 @@ def build_primitive_plan(
         ),
         reentry_blocked=static_map.inflated_blocked_cells(
             clearance_radius + endpoint_tolerance_m
+        ),
+        physical_endpoint_blocked=static_map.inflated_blocked_cells(
+            robot_radius_m + footprint_padding_m
         ),
         min_segment_m=min_segment_m,
         max_segment_m=max_segment_m,

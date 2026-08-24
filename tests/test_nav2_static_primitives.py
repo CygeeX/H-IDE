@@ -366,6 +366,52 @@ def test_relaxed_start_recovery_may_finish_inside_endpoint_tolerance() -> None:
     module.verify_primitive_plan(plan, navfn_path, **_plan_kwargs())
 
 
+def test_navfn_goal_in_extra_margin_stops_at_physical_clear_endpoint() -> None:
+    module = _planner()
+    start = (1.0, 5.1)
+    endpoint = (0.75, 4.75)
+    goal = (0.70, 4.70)
+    navfn_path = {
+        "frame_id": "map",
+        "poses": [
+            {"x": start[0], "y": start[1], "yaw": 0.0},
+            {"x": endpoint[0], "y": endpoint[1], "yaw": 0.0},
+            {"x": goal[0], "y": goal[1], "yaw": math.pi / 2.0},
+        ],
+    }
+
+    plan = _build(module, navfn_path)
+    static_map = module.StaticMap.load(MAP_YAML, MAP_IMAGE)
+    full = static_map.inflated_blocked_cells(CLEARANCE_RADIUS)
+    physical = static_map.inflated_blocked_cells(0.35 + 0.02)
+
+    assert static_map.world_to_cell(*endpoint) not in full
+    assert static_map.world_to_cell(*goal) in full
+    assert static_map.world_to_cell(*goal) not in physical
+    assert math.dist(endpoint, goal) < 0.15
+    assert plan["segment_endpoint_indices"] == [0, 1]
+    assert plan["segments"][-1]["end_map"] == {
+        "x": endpoint[0],
+        "y": endpoint[1],
+    }
+    module.verify_primitive_plan(plan, navfn_path, **_plan_kwargs())
+
+
+def test_navfn_goal_inside_physical_footprint_clearance_is_rejected() -> None:
+    module = _planner()
+    navfn_path = {
+        "frame_id": "map",
+        "poses": [
+            {"x": 1.0, "y": 5.1, "yaw": 0.0},
+            {"x": 0.75, "y": 4.75, "yaw": 0.0},
+            {"x": 0.75, "y": 4.55, "yaw": math.pi / 2.0},
+        ],
+    }
+
+    with pytest.raises(ValueError, match="physical footprint clearance"):
+        _build(module, navfn_path)
+
+
 def test_navfn_start_inside_relaxed_physical_clearance_is_rejected() -> None:
     module = _planner()
     navfn_path = _astar_fixture_navfn_path(module, START, GOAL)
