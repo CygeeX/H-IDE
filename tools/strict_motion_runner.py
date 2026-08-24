@@ -2303,18 +2303,24 @@ def _support_off(sample: Mapping[str, Any], expected_epoch: int) -> bool:
     support = _mapping(sample.get("plantSupport"), "plantSupport")
     dynamics = _mapping(sample.get("plantDynamicsEvidence"), "plantDynamicsEvidence")
     rejected = support.get("fallArrestReleaseRejectedEpoch")
-    if rejected is not None:
+    if rejected == expected_epoch:
         raise StrictMotionRunnerError(
             f"Plant rejected fall-arrest release epoch {rejected!r}"
         )
     confirmed = support.get("fallArrestReleaseConfirmedEpoch")
-    if confirmed is not None and confirmed != expected_epoch:
+    # Plant retains the preceding release epoch after a safety-stop has
+    # re-engaged fall arrest.  That historical provenance is not a conflict:
+    # a new activation must wait for its own exact epoch while support remains
+    # enabled.  A mismatched epoch is invalid only if Plant claims support is
+    # already off for it.
+    if support.get("fallArrestEnabled") is not False:
+        return False
+    if confirmed != expected_epoch:
         raise StrictMotionRunnerError(
             "Plant fall-arrest release belongs to another activation epoch"
         )
     return (
-        support.get("fallArrestEnabled") is False
-        and dynamics.get("supportBandEnabled") is False
+        dynamics.get("supportBandEnabled") is False
         and confirmed == expected_epoch
     )
 

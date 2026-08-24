@@ -180,6 +180,47 @@ def test_east_corridor_to_focus_office_route_uses_generated_scene_targets() -> N
     ] == pytest.approx(0.35)
 
 
+def test_support_off_waits_through_a_reengaged_historical_release_epoch() -> None:
+    sample = {
+        "plantSupport": {
+            "fallArrestEnabled": True,
+            "fallArrestReleaseConfirmedEpoch": 1,
+            "fallArrestReleaseRejectedEpoch": None,
+        },
+        "plantDynamicsEvidence": {"supportBandEnabled": True},
+    }
+
+    assert runner._support_off(sample, 2) is False
+
+
+def test_support_off_rejects_wrong_epoch_only_after_support_is_off() -> None:
+    sample = {
+        "plantSupport": {
+            "fallArrestEnabled": False,
+            "fallArrestReleaseConfirmedEpoch": 1,
+            "fallArrestReleaseRejectedEpoch": None,
+        },
+        "plantDynamicsEvidence": {"supportBandEnabled": False},
+    }
+
+    with pytest.raises(runner.StrictMotionRunnerError, match="another activation"):
+        runner._support_off(sample, 2)
+
+
+def test_support_off_rejects_the_current_release_epoch() -> None:
+    sample = {
+        "plantSupport": {
+            "fallArrestEnabled": True,
+            "fallArrestReleaseConfirmedEpoch": 1,
+            "fallArrestReleaseRejectedEpoch": 2,
+        },
+        "plantDynamicsEvidence": {"supportBandEnabled": True},
+    }
+
+    with pytest.raises(runner.StrictMotionRunnerError, match="rejected"):
+        runner._support_off(sample, 2)
+
+
 
 def test_translation_deadline_uses_observed_progress_without_changing_command() -> None:
     assert runner.motion_goal("reverse") == {
