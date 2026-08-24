@@ -10,6 +10,7 @@ import pytest
 from hide_mujoco_sonic.arm_limiter_evidence import (
     ARM_JOINT_INDICES,
     ARTIFACT_SCHEMA_VERSION,
+    DEFAULT_MAX_RECORDS,
     ArmLimiterEvidenceError,
     ArmLimiterEvidenceRecorder,
     canonical_sha256,
@@ -23,7 +24,7 @@ SOURCE_HASH = "a" * 64
 
 def _recorder(
     *,
-    max_records: int = 20_000,
+    max_records: int = DEFAULT_MAX_RECORDS,
     artifact_directory: Path | None = None,
 ) -> ArmLimiterEvidenceRecorder:
     return ArmLimiterEvidenceRecorder(
@@ -290,6 +291,18 @@ def test_record_capacity_is_bounded_and_overflow_is_not_truncated() -> None:
     _record(recorder, 101)
     with pytest.raises(ArmLimiterEvidenceError, match="bounded record capacity"):
         _record(recorder, 102)
+
+
+def test_default_capacity_covers_more_than_the_previous_400_second_limit() -> None:
+    recorder = _recorder()
+    _begin(recorder)
+
+    for tick in range(100, 20_101):
+        _record(recorder, tick)
+
+    assert recorder.max_records == 120_000
+    assert recorder.active is True
+    assert recorder.failed_reason is None
 
 
 def test_finalize_rejects_constrained_tail_and_case_collision() -> None:

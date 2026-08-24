@@ -497,9 +497,61 @@ def test_unfenced_successful_write_permanently_invalidates_active_evidence(
         )
     )
     driver._control_evidence_context.control_step = PlantControlStep(1000, 0.02)
-    with pytest.raises(Exception, match="not fenced"):
-        driver._record_successful_dds_target(tuple(0.0 for _ in range(29)))
+    result = driver._record_successful_dds_target(tuple(0.0 for _ in range(29)))
+    assert result == tuple(0.0 for _ in range(29))
     assert "not fenced" in str(driver._arm_evidence.failed_reason)
+
+
+def test_evidence_capacity_failure_never_becomes_an_actuator_fault(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    driver = _driver(tmp_path)
+    driver._arm_evidence.max_records = 2
+    monkeypatch.setattr(
+        "hide_mujoco_sonic.sonic_driver.read_plant_identity",
+        lambda *_args, **_kwargs: dict(PLANT_IDENTITY),
+    )
+    driver.accept_json(
+        _request(
+            "arm_limiter_evidence_begin",
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab",
+            plant_boot_id=PLANT_IDENTITY["producerBootId"],
+            plant_session_id=PLANT_IDENTITY["sessionId"],
+        )
+    )
+
+    for tick in (1000, 1020, 1040, 1060):
+        driver._control_evidence_context.control_step = PlantControlStep(tick, 0.02)
+        token = driver._begin_arm_evidence_write()
+        result = driver._record_successful_dds_target(
+            tuple(tick / 1_000_000.0 for _ in range(29)),
+            evidence_write_token=token,
+        )
+        assert result[0] == tick / 1_000_000.0
+
+    assert driver._dds_target_sequence == 4
+    assert driver._last_published_targets[0] == 0.00106
+    assert driver._arm_evidence.active is True
+    assert "bounded record capacity" in str(driver._arm_evidence.failed_reason)
+    assert driver._fault_latched.is_set() is False
+    assert driver._stop.is_set() is False
+    assert driver._arm_evidence_writes_inflight == set()
+
+    driver._intent_ingress.armed = False
+    driver._plant_support_mode = "safety_stop"
+    driver._plant_support_safety_latched = True
+    driver._policy_activation = _prepared_activation()
+    driver._normal_stop = SimpleNamespace(
+        snapshot=SimpleNamespace(phase="DRIVER_CONFIRMED")
+    )
+    with pytest.raises(RuntimeError, match="bounded record capacity"):
+        driver.accept_json(
+            _request(
+                "arm_limiter_evidence_finalize",
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaac",
+            )
+        )
 
 
 def test_recoverable_motion_fault_closes_evidence_before_context_free_hold(

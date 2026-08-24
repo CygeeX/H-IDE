@@ -31,6 +31,12 @@ ARM_JOINT_INDICES = tuple(range(15, 29))
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _CONTROL_DT_S = 0.02
 _MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
+# A whole-scene primitive route can legitimately take considerably longer than
+# the old 400 s / 20,000-tick bound when the learned gait advances at roughly
+# 0.04 m/s. Keep the recorder bounded, but size the default for forty minutes
+# of authoritative 50 Hz control. The artifact retains its separate 64 MiB
+# hard limit.
+DEFAULT_MAX_RECORDS = 120_000
 _ARTIFACT_DESCRIPTOR_FIELDS = {
     "schemaVersion",
     "caseId",
@@ -456,8 +462,10 @@ class ArmLimiterEvidenceRecorder:
     ``begin`` and ``finalize`` are control-plane requests.  ``record`` must be
     called exactly once for every admitted 50 Hz SONIC control step while the
     session is active.  A gap, duplicate, overflow, malformed duration, or
-    lifecycle conflict permanently fails that active session; callers must
-    stop motion rather than fill or interpolate missing evidence.
+    lifecycle conflict permanently fails that active acceptance session. It
+    must never be repaired by filling or interpolation; the actuator owner is
+    nevertheless responsible for keeping this diagnostic failure separate
+    from the independent motion-safety boundary.
     """
 
     def __init__(
@@ -466,7 +474,7 @@ class ArmLimiterEvidenceRecorder:
         sonic_driver_boot_id: str,
         sonic_driver_session_id: str,
         sonic_driver_source_sha256: str,
-        max_records: int = 20_000,
+        max_records: int = DEFAULT_MAX_RECORDS,
         artifact_directory: str | Path | None = None,
     ) -> None:
         self.sonic_driver_boot_id = _identifier(

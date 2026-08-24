@@ -1533,50 +1533,61 @@ class SonicDriver:
         self._last_published_targets = final_targets
         self._dds_target_sequence += 1
         try:
-            if self._arm_evidence.active:
-                if evidence_write_token is None:
-                    self._arm_evidence.fail_active(
-                        "successful DDS write was not fenced for arm evidence"
-                    )
-                control_step = getattr(
-                    self._control_evidence_context,
-                    "control_step",
-                    None,
-                )
-                if not isinstance(control_step, PlantControlStep):
-                    self._arm_evidence.fail_active(
-                        "successful DDS write has no authoritative Plant control step"
-                    )
-                if arm_guard_result is None:
-                    constrained_global: tuple[int, ...] = ()
-                    saturation_by_joint = {
-                        joint: 0.0 for joint in ARM_JOINT_INDICES
-                    }
-                else:
-                    if len(arm_guard_result.continuous_saturation_s) != len(
-                        ARM_JOINT_INDICES
-                    ):
+            if self._arm_evidence.active and self._arm_evidence.failed_reason is None:
+                try:
+                    if evidence_write_token is None:
                         self._arm_evidence.fail_active(
-                            "arm limiter result has an invalid joint dimension"
+                            "successful DDS write was not fenced for arm evidence"
                         )
-                    constrained_global = tuple(
-                        ARM_JOINT_INDICES[index]
-                        for index in arm_guard_result.constrained_joint_indices
+                    control_step = getattr(
+                        self._control_evidence_context,
+                        "control_step",
+                        None,
                     )
-                    saturation_by_joint = dict(
-                        zip(
-                            ARM_JOINT_INDICES,
-                            arm_guard_result.continuous_saturation_s,
-                            strict=True,
+                    if not isinstance(control_step, PlantControlStep):
+                        self._arm_evidence.fail_active(
+                            "successful DDS write has no authoritative Plant control step"
                         )
+                    if arm_guard_result is None:
+                        constrained_global: tuple[int, ...] = ()
+                        saturation_by_joint = {
+                            joint: 0.0 for joint in ARM_JOINT_INDICES
+                        }
+                    else:
+                        if len(arm_guard_result.continuous_saturation_s) != len(
+                            ARM_JOINT_INDICES
+                        ):
+                            self._arm_evidence.fail_active(
+                                "arm limiter result has an invalid joint dimension"
+                            )
+                        constrained_global = tuple(
+                            ARM_JOINT_INDICES[index]
+                            for index in arm_guard_result.constrained_joint_indices
+                        )
+                        saturation_by_joint = dict(
+                            zip(
+                                ARM_JOINT_INDICES,
+                                arm_guard_result.continuous_saturation_s,
+                                strict=True,
+                            )
+                        )
+                    self._arm_evidence.record(
+                        control_tick=self._dds_target_sequence,
+                        t_s=control_step.tick_ms / 1_000.0,
+                        dt_s=control_step.dt_s,
+                        constrained_joint_indices=constrained_global,
+                        continuous_saturation_by_joint_s=saturation_by_joint,
                     )
-                self._arm_evidence.record(
-                    control_tick=self._dds_target_sequence,
-                    t_s=control_step.tick_ms / 1_000.0,
-                    dt_s=control_step.dt_s,
-                    constrained_joint_indices=constrained_global,
-                    continuous_saturation_by_joint_s=saturation_by_joint,
-                )
+                except ArmLimiterEvidenceError as exc:
+                    # Acceptance evidence is diagnostic, not an actuator
+                    # interlock. Preserve the exact failure for fail-closed
+                    # finalization while the independent arm, gait, contact,
+                    # and Plant guards continue to protect motion.
+                    logger.error(
+                        "arm limiter acceptance evidence invalidated; "
+                        "motion safety remains active: %s",
+                        exc,
+                    )
             return final_targets
         finally:
             if evidence_write_token is not None:
