@@ -27,6 +27,7 @@ from .arm_limiter_evidence import (
     ARM_JOINT_INDICES,
     ArmLimiterEvidenceError,
     ArmLimiterEvidenceRecorder,
+    default_arm_limiter_evidence_directory,
     source_bundle_sha256,
 )
 from .config import SimConfig
@@ -642,6 +643,7 @@ class SonicDriver:
                     Path(__file__).with_name("arm_limiter_evidence.py").resolve(),
                 )
             ),
+            artifact_directory=default_arm_limiter_evidence_directory(),
         )
         self._arm_evidence_request_replays: dict[
             UUID, tuple[bytes, dict[str, object] | None]
@@ -6713,11 +6715,11 @@ class SonicDriver:
         self,
         case_id: object,
     ) -> dict[str, object]:
-        completed = self._arm_evidence._completed_transport_payload(
+        completed = self._arm_evidence._completed_transport_descriptor(
             case_id=str(case_id),
         )
         if completed is not None:
-            return {"status": "complete", "evidence": completed}
+            return {"status": "complete", "artifact": completed}
         with self._arm_evidence_materialization_lock:
             active_case = self._arm_evidence_materialization_case_id
             error = self._arm_evidence_materialization_error
@@ -6734,12 +6736,12 @@ class SonicDriver:
             raise ArmLimiterEvidenceError(
                 "arm evidence materialization ended without an artifact"
             )
-        return {"status": "materializing", "evidence": None}
+        return {"status": "materializing", "artifact": None}
 
     def _start_arm_evidence_materialization(self, case_id: object) -> None:
         requested_case = str(case_id)
         if (
-            self._arm_evidence._completed_transport_payload(
+            self._arm_evidence._completed_transport_descriptor(
                 case_id=requested_case,
             )
             is not None
@@ -6916,21 +6918,21 @@ class SonicDriver:
                 raise RuntimeError("arm evidence finalization was not admitted")
             self._start_arm_evidence_materialization(case_id)
             # Always keep the admission response small. The client polls the
-            # idempotent get operation; once complete, only one bounded JSON
-            # transport remains on the single command connection.
-            response = {"status": "materializing", "evidence": None}
+            # idempotent get operation; once complete, only a bounded local-file
+            # descriptor crosses the single probe-serving command connection.
+            response = {"status": "materializing", "artifact": None}
         elif operation == "arm_limiter_evidence_abort":
             with self._arm_evidence_boundary_lock:
                 aborted = self._arm_evidence.abort(case_id=case_id)
             response = {"status": "aborted", "aborted": aborted}
         else:
-            completed = self._arm_evidence._completed_transport_payload(
+            completed = self._arm_evidence._completed_transport_descriptor(
                 case_id=case_id,
             )
             if completed is not None:
-                response = {"status": "complete", "evidence": completed}
+                response = {"status": "complete", "artifact": completed}
             elif self._arm_evidence.active_case_id == case_id:
-                response = {"status": "recording", "evidence": None}
+                response = {"status": "recording", "artifact": None}
             elif self._arm_evidence.sealed_case_id == case_id:
                 response = self._arm_evidence_materialization_status(case_id)
             else:
@@ -6939,9 +6941,8 @@ class SonicDriver:
                 )
 
         if operation == "arm_limiter_evidence_get" and response.get("status") == "complete":
-            # ``None`` is an internal replay marker: regenerate the transport
-            # view from the immutable completed artifact without a 50+ ms deep
-            # copy on the probe-serving command thread.
+            # ``None`` is an internal replay marker: regenerate the small
+            # descriptor from the immutable completed artifact.
             replays[request_id] = (canonical, None)
         else:
             replays[request_id] = (canonical, copy.deepcopy(response))

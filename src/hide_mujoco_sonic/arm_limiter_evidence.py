@@ -3,8 +3,10 @@
 The existing fault trace is intentionally a short pre-fault ring.  It cannot
 prove that a successful multi-second motion remained inside the per-joint
 saturation budget.  This module provides a separate, explicitly armed recorder
-whose only input is the 50 Hz actuator-owner loop.  It performs no network or
-file I/O and is disabled unless a strict acceptance runner starts a session.
+whose only input is the 50 Hz actuator-owner loop.  It performs no I/O on that
+loop.  After the exact end boundary is sealed, a background worker may persist
+the complete artifact so the probe-serving command socket only returns a small
+descriptor instead of serializing tens of thousands of records.
 """
 
 from __future__ import annotations
@@ -17,15 +19,28 @@ import math
 import os
 from pathlib import Path
 import re
+import stat
 import threading
 import time
 from typing import Any
 
 
 SCHEMA_VERSION = "h-ide.sonic-arm-limiter-success-trace/1"
+ARTIFACT_SCHEMA_VERSION = "h-ide.sonic-arm-limiter-artifact/1"
 ARM_JOINT_INDICES = tuple(range(15, 29))
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _CONTROL_DT_S = 0.02
+_MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
+_ARTIFACT_DESCRIPTOR_FIELDS = {
+    "schemaVersion",
+    "caseId",
+    "path",
+    "sizeBytes",
+    "fileSha256",
+    "traceSha256",
+    "sonicDriverBootId",
+    "sonicDriverSessionId",
+}
 
 
 class ArmLimiterEvidenceError(RuntimeError):
@@ -45,15 +60,277 @@ def canonical_sha256(value: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def default_arm_limiter_evidence_directory() -> Path:
+    """Return the shared same-user runtime directory for large artifacts."""
+
+    runtime_root = Path(
+        os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    )
+    if not runtime_root.is_dir():
+        runtime_root = Path("/tmp")
+    return (
+        runtime_root
+        / f"h-ide-mujoco-demo-{os.getuid()}"
+        / "arm-limiter-evidence"
+    )
+
+
+def _normalized_absolute_path(value: str | Path, label: str) -> Path:
+    path = Path(value)
+    normalized = Path(os.path.normpath(str(path)))
+    if not path.is_absolute() or normalized != path:
+        raise ArmLimiterEvidenceError(f"{label} must be a normalized absolute path")
+    return path
+
+
+def _require_private_directory(path: Path, *, create: bool) -> Path:
+    directory = _normalized_absolute_path(path, "arm evidence directory")
+    if create:
+        try:
+            directory.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+    try:
+        metadata = directory.lstat()
+        resolved = directory.resolve(strict=True)
+    except OSError as exc:
+        raise ArmLimiterEvidenceError(
+            "arm evidence directory is unavailable"
+        ) from exc
+    if (
+        resolved != directory
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise ArmLimiterEvidenceError(
+            "arm evidence directory must be a private owned non-symlink directory"
+        )
+    return directory
+
+
+def _artifact_filename(
+    *,
+    case_id: str,
+    sonic_driver_session_id: str,
+    trace_sha256: str,
+) -> str:
+    binding = canonical_sha256(
+        {
+            "caseId": case_id,
+            "sonicDriverSessionId": sonic_driver_session_id,
+        }
+    )
+    return f"arm-limiter-{binding[:24]}-{trace_sha256}.json"
+
+
+def _persist_artifact(
+    payload: Mapping[str, Any],
+    *,
+    directory: Path,
+) -> dict[str, Any]:
+    root = _require_private_directory(directory, create=True)
+    case_id = _identifier(payload.get("caseId"), "case_id")
+    driver_boot_id = _identifier(
+        payload.get("sonicDriverBootId"), "sonic_driver_boot_id"
+    )
+    driver_session_id = _identifier(
+        payload.get("sonicDriverSessionId"), "sonic_driver_session_id"
+    )
+    trace_sha256 = payload.get("traceSha256")
+    if not isinstance(trace_sha256, str) or _SHA256.fullmatch(trace_sha256) is None:
+        raise ArmLimiterEvidenceError("arm evidence trace hash is invalid")
+    filename = _artifact_filename(
+        case_id=case_id,
+        sonic_driver_session_id=driver_session_id,
+        trace_sha256=trace_sha256,
+    )
+    final_path = root / filename
+    temporary = root / (
+        f".{filename}.tmp-{os.getpid()}-{threading.get_ident()}-{time.time_ns()}"
+    )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(temporary, flags, 0o600)
+    file_digest = hashlib.sha256()
+    size_bytes = 0
+    encoder = json.JSONEncoder(
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    try:
+        with os.fdopen(descriptor, "wb", closefd=True) as stream:
+            for index, chunk in enumerate(encoder.iterencode(payload), start=1):
+                encoded = chunk.encode("utf-8")
+                size_bytes += len(encoded)
+                if size_bytes > _MAX_ARTIFACT_BYTES:
+                    raise ArmLimiterEvidenceError(
+                        "arm evidence artifact exceeds the bounded file size"
+                    )
+                stream.write(encoded)
+                file_digest.update(encoded)
+                if index % 4096 == 0:
+                    time.sleep(0)
+            stream.flush()
+            os.fchmod(stream.fileno(), 0o600)
+            os.fsync(stream.fileno())
+        os.replace(temporary, final_path)
+        directory_descriptor = os.open(
+            root,
+            os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    except Exception:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    return {
+        "schemaVersion": ARTIFACT_SCHEMA_VERSION,
+        "caseId": case_id,
+        "path": str(final_path),
+        "sizeBytes": size_bytes,
+        "fileSha256": file_digest.hexdigest(),
+        "traceSha256": trace_sha256,
+        "sonicDriverBootId": driver_boot_id,
+        "sonicDriverSessionId": driver_session_id,
+    }
+
+
+def load_arm_limiter_evidence_artifact(
+    descriptor: Mapping[str, Any],
+    *,
+    case_id: str,
+    directory: str | Path | None = None,
+) -> dict[str, Any]:
+    """Load a local artifact through a fail-closed same-user file boundary."""
+
+    if not isinstance(descriptor, Mapping) or set(descriptor) != _ARTIFACT_DESCRIPTOR_FIELDS:
+        raise ArmLimiterEvidenceError(
+            "arm evidence artifact descriptor fields do not match v1"
+        )
+    requested_case = _identifier(case_id, "case_id")
+    if descriptor.get("schemaVersion") != ARTIFACT_SCHEMA_VERSION:
+        raise ArmLimiterEvidenceError("arm evidence artifact schema is unsupported")
+    if descriptor.get("caseId") != requested_case:
+        raise ArmLimiterEvidenceError("arm evidence artifact case identity does not match")
+    driver_boot_id = _identifier(
+        descriptor.get("sonicDriverBootId"), "sonic_driver_boot_id"
+    )
+    driver_session_id = _identifier(
+        descriptor.get("sonicDriverSessionId"), "sonic_driver_session_id"
+    )
+    file_sha256 = descriptor.get("fileSha256")
+    trace_sha256 = descriptor.get("traceSha256")
+    if (
+        not isinstance(file_sha256, str)
+        or _SHA256.fullmatch(file_sha256) is None
+        or not isinstance(trace_sha256, str)
+        or _SHA256.fullmatch(trace_sha256) is None
+    ):
+        raise ArmLimiterEvidenceError("arm evidence artifact hashes are invalid")
+    size_bytes = descriptor.get("sizeBytes")
+    if (
+        isinstance(size_bytes, bool)
+        or not isinstance(size_bytes, int)
+        or size_bytes <= 0
+        or size_bytes > _MAX_ARTIFACT_BYTES
+    ):
+        raise ArmLimiterEvidenceError("arm evidence artifact size is invalid")
+    root = _require_private_directory(
+        Path(directory) if directory is not None else default_arm_limiter_evidence_directory(),
+        create=False,
+    )
+    path_value = descriptor.get("path")
+    if not isinstance(path_value, str):
+        raise ArmLimiterEvidenceError("arm evidence artifact path is invalid")
+    path = _normalized_absolute_path(path_value, "arm evidence artifact path")
+    expected_name = _artifact_filename(
+        case_id=requested_case,
+        sonic_driver_session_id=driver_session_id,
+        trace_sha256=trace_sha256,
+    )
+    if path.parent != root or path.name != expected_name:
+        raise ArmLimiterEvidenceError(
+            "arm evidence artifact path escapes its trusted runtime directory"
+        )
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        file_descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise ArmLimiterEvidenceError("arm evidence artifact cannot be opened") from exc
+    try:
+        before = os.fstat(file_descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.getuid()
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or before.st_nlink != 1
+            or before.st_size != size_bytes
+        ):
+            raise ArmLimiterEvidenceError("arm evidence artifact file is unsafe")
+        chunks: list[bytes] = []
+        digest = hashlib.sha256()
+        remaining = size_bytes
+        while remaining:
+            chunk = os.read(file_descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise ArmLimiterEvidenceError("arm evidence artifact read was incomplete")
+            chunks.append(chunk)
+            digest.update(chunk)
+            remaining -= len(chunk)
+        if os.read(file_descriptor, 1):
+            raise ArmLimiterEvidenceError("arm evidence artifact grew while read")
+        after = os.fstat(file_descriptor)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            raise ArmLimiterEvidenceError("arm evidence artifact changed while read")
+    finally:
+        os.close(file_descriptor)
+    if digest.hexdigest() != file_sha256:
+        raise ArmLimiterEvidenceError("arm evidence artifact file hash does not match")
+    try:
+        payload = json.loads(b"".join(chunks))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ArmLimiterEvidenceError("arm evidence artifact is invalid JSON") from exc
+    if not isinstance(payload, dict):
+        raise ArmLimiterEvidenceError("arm evidence artifact payload is not an object")
+    if (
+        payload.get("caseId") != requested_case
+        or payload.get("traceSha256") != trace_sha256
+        or payload.get("sonicDriverBootId") != driver_boot_id
+        or payload.get("sonicDriverSessionId") != driver_session_id
+    ):
+        raise ArmLimiterEvidenceError(
+            "arm evidence artifact payload does not match its descriptor"
+        )
+    return payload
+
+
 def _cooperative_canonical_sha256(value: object) -> str:
     """Hash a large canonical document without monopolising the Python GIL.
 
-    Successful motion traces contain several thousand 50 Hz records.  A single
-    ``json.dumps`` of that document previously occupied the SONIC command
-    thread long enough for two health probes to time out and falsely latch a
-    terminal motion fault.  ``iterencode`` preserves the exact canonical byte
-    representation while yielding periodically so the small health/probe path
-    and the learned-IDLE balance loop keep making progress.
+    Successful motion traces contain several thousand 50 Hz records.  Building,
+    hashing, or transmitting that document on SONIC's command thread can make
+    health probes time out and falsely latch a terminal motion fault.
+    ``iterencode`` preserves the exact canonical byte representation while the
+    background materializer yields periodically; the command thread later sees
+    only the small artifact descriptor.
     """
 
     encoder = json.JSONEncoder(
@@ -190,6 +467,7 @@ class ArmLimiterEvidenceRecorder:
         sonic_driver_session_id: str,
         sonic_driver_source_sha256: str,
         max_records: int = 20_000,
+        artifact_directory: str | Path | None = None,
     ) -> None:
         self.sonic_driver_boot_id = _identifier(
             sonic_driver_boot_id, "sonic_driver_boot_id"
@@ -206,12 +484,21 @@ class ArmLimiterEvidenceRecorder:
             raise ValueError("max_records must be an integer of at least two")
         self.sonic_driver_source_sha256 = sonic_driver_source_sha256
         self.max_records = max_records
+        self.artifact_directory = (
+            None
+            if artifact_directory is None
+            else _normalized_absolute_path(
+                artifact_directory,
+                "arm evidence directory",
+            )
+        )
         self._lock = threading.RLock()
         self._identity: _SessionIdentity | None = None
         self._records: list[_Record] = []
         self._sealed: _SealedSession | None = None
         self._failed_reason: str | None = None
         self._completed: dict[str, Any] | None = None
+        self._completed_artifact: dict[str, Any] | None = None
 
     @property
     def active(self) -> bool:
@@ -290,6 +577,7 @@ class ArmLimiterEvidenceRecorder:
             self._records = []
             self._failed_reason = None
             self._completed = None
+            self._completed_artifact = None
 
     def record(
         self,
@@ -450,6 +738,11 @@ class ArmLimiterEvidenceRecorder:
             "records": records,
         }
         payload["traceSha256"] = _cooperative_canonical_sha256(payload)
+        artifact = (
+            None
+            if self.artifact_directory is None
+            else _persist_artifact(payload, directory=self.artifact_directory)
+        )
 
         with self._lock:
             if (
@@ -458,10 +751,16 @@ class ArmLimiterEvidenceRecorder:
             ):
                 return
             if self._sealed is not sealed:
+                if artifact is not None:
+                    try:
+                        Path(str(artifact["path"])).unlink()
+                    except FileNotFoundError:
+                        pass
                 raise ArmLimiterEvidenceError(
                     "sealed arm evidence changed during finalization"
                 )
             self._completed = payload
+            self._completed_artifact = artifact
             self._sealed = None
             self._failed_reason = None
 
@@ -474,23 +773,22 @@ class ArmLimiterEvidenceRecorder:
             )
         return completed
 
-    def _completed_transport_payload(
+    def _completed_transport_descriptor(
         self,
         *,
         case_id: str,
     ) -> dict[str, Any] | None:
-        """Return the immutable-by-convention command-transport payload.
-
-        This deliberately avoids a 50+ ms deep copy on SONIC's probe-serving
-        command thread.  The only caller serializes the mapping immediately and
-        never mutates it; ordinary callers retain the copying ``completed`` API.
-        """
+        """Return only the bounded descriptor used by the command transport."""
 
         requested_case = _identifier(case_id, "case_id")
         with self._lock:
             if self._completed is None or self._completed["caseId"] != requested_case:
                 return None
-            return self._completed
+            if self._completed_artifact is None:
+                raise ArmLimiterEvidenceError(
+                    "arm evidence artifact transport is not configured"
+                )
+            return dict(self._completed_artifact)
 
     def abort(self, *, case_id: str) -> bool:
         requested_case = _identifier(case_id, "case_id")

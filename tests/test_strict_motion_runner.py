@@ -69,21 +69,30 @@ def test_sonic_evidence_client_polls_async_materialization_to_completion(
                 "sonic_driver_session_id": "14000000-0000-4000-8000-000000000001",
             }
         if operation == "arm_limiter_evidence_finalize":
-            return {"status": "materializing", "evidence": None}
+            return {"status": "materializing", "artifact": None}
         get_count += 1
         if get_count == 1:
-            return {"status": "materializing", "evidence": None}
-        return {"status": "complete", "evidence": {"caseId": "case-async"}}
+            return {"status": "materializing", "artifact": None}
+        return {"status": "complete", "artifact": {"token": "local-file"}}
 
     monkeypatch.setattr(runner.time, "sleep", lambda _seconds: None)
-    client = runner.SonicEvidenceClient(request=request)
+    client = runner.SonicEvidenceClient(
+        request=request,
+        artifact_loader=lambda artifact, **_kwargs: {
+            "caseId": "case-async",
+            "artifactToken": artifact["token"],
+        },
+    )
     client.begin(
         case_id="case-async",
         plant_boot_id="11000000-0000-4000-8000-000000000001",
         plant_session_id="12000000-0000-4000-8000-000000000001",
     )
 
-    assert client.finalize(case_id="case-async") == {"caseId": "case-async"}
+    assert client.finalize(case_id="case-async") == {
+        "caseId": "case-async",
+        "artifactToken": "local-file",
+    }
     assert operations == [
         "arm_limiter_evidence_begin",
         "arm_limiter_evidence_finalize",
@@ -1247,6 +1256,12 @@ def _executor_sample(t_s: float) -> dict:
             "fallArrestReleaseRejectedEpoch": None,
         },
         "plantDynamicsEvidence": {"supportBandEnabled": False},
+        "runtimeHealth": {
+            "plant": {
+                "bootId": "11000000-0000-4000-8000-000000000001",
+                "sessionId": "12000000-0000-4000-8000-000000000001",
+            }
+        },
     }
 
 
@@ -1258,6 +1273,28 @@ def test_dynamic_idle_accepts_observed_balance_correction_but_not_motion() -> No
     moving = _executor_sample(1.1)
     moving["root"]["angularSpeedRps"] = 0.040001
     assert runner._sample_settled(moving) is False
+
+
+def test_post_evidence_health_gate_rejects_a_delayed_runtime_stop() -> None:
+    healthy = _executor_sample(10.0)
+    stopped = _executor_sample(10.2)
+    stopped["sonicPolicyIdle"]["active"] = False
+    stopped["sonicPolicyIdle"]["referenceAuthorityState"] = "REVOKED"
+    stopped["sonicPolicyIdle"]["actuatorAuthority"] = False
+    stopped["sonicPolicyIdle"]["staticHoldActive"] = True
+    stopped["sonicPolicyIdle"]["plantSupportMode"] = "safety_stop"
+    stopped["sonicPolicyIdle"]["plantSupportSafetyLatched"] = True
+    executor = runner.StrictMotionCaseExecutor(
+        FakeExecutorBackend(),
+        FakeExecutorCollector([healthy, stopped]),
+        FakeExecutorEvidence(),
+    )
+
+    with pytest.raises(runner.StrictMotionRunnerError, match="evidence retrieval"):
+        executor._confirm_post_evidence_health(
+            plant_boot_id="11000000-0000-4000-8000-000000000001",
+            plant_session_id="12000000-0000-4000-8000-000000000001",
+        )
 
 
 def test_exception_cleanup_waits_for_delayed_balanced_idle_before_static_stop() -> None:

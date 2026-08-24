@@ -2128,12 +2128,24 @@ def _load_file_module(name: str, path: Path) -> Any:
 class SonicEvidenceClient:
     """Idempotent control-plane access to SONIC's authoritative recorder."""
 
-    def __init__(self, request: Callable[..., dict[str, Any]] | None = None) -> None:
+    def __init__(
+        self,
+        request: Callable[..., dict[str, Any]] | None = None,
+        *,
+        artifact_loader: Callable[..., dict[str, Any]] | None = None,
+    ) -> None:
         if request is None:
             from hide_mujoco_sonic.transport import request_json
 
             request = request_json
+        if artifact_loader is None:
+            from hide_mujoco_sonic.arm_limiter_evidence import (
+                load_arm_limiter_evidence_artifact,
+            )
+
+            artifact_loader = load_arm_limiter_evidence_artifact
         self._request = request
+        self._artifact_loader = artifact_loader
         self._active_case: str | None = None
 
     def _call(
@@ -2228,13 +2240,23 @@ class SonicEvidenceClient:
             response = self._call(
                 "arm_limiter_evidence_get",
                 case_id=case_id,
-                max_response_bytes=MAX_JSON_BYTES,
             )
-        evidence = response.get("evidence")
-        if response.get("status") != "complete" or not isinstance(evidence, dict):
+        artifact = response.get("artifact")
+        if response.get("status") != "complete" or not isinstance(artifact, dict):
             raise StrictMotionRunnerError(
                 "SONIC evidence did not finalize completely"
             )
+        try:
+            evidence = self._artifact_loader(artifact, case_id=case_id)
+        except Exception as exc:
+            detail = " ".join(
+                (str(exc).strip() or type(exc).__name__).replace("\x00", "").split()
+            )[:512]
+            raise StrictMotionRunnerError(
+                f"SONIC evidence artifact failed verification: {detail}"
+            ) from exc
+        if not isinstance(evidence, dict):
+            raise StrictMotionRunnerError("SONIC evidence artifact is not an object")
         self._active_case = None
         return evidence
 
@@ -2411,6 +2433,35 @@ class StrictMotionCaseExecutor:
             "sampleCount": len(self._diagnostic_samples),
             "acceptedMotionEvidence": False,
         }
+
+    def _confirm_post_evidence_health(
+        self,
+        *,
+        plant_boot_id: str,
+        plant_session_id: str,
+    ) -> None:
+        """Prove that evidence retrieval did not disturb the stopped runtime.
+
+        The artifact is intentionally finalized after the authoritative arm
+        trace closes.  These samples therefore are not motion samples and must
+        not be appended to that trace.  They are a live commit gate: two fully
+        advancing observations, including both viewers and the bridge health
+        probe, must remain on the same Plant identity and balanced-policy IDLE.
+        """
+
+        self._diagnostic_phase = "post_evidence_health"
+        for _sample_index in range(2):
+            self.backend.raise_if_faulted()
+            sample = self.collector.wait_next()
+            if not _sample_balanced_policy_idle(sample):
+                raise StrictMotionRunnerError(
+                    "runtime left balanced-policy IDLE during evidence retrieval"
+                )
+            if self._identities(sample) != (plant_boot_id, plant_session_id):
+                raise StrictMotionRunnerError(
+                    "Plant identity changed during evidence retrieval"
+                )
+        self.backend.raise_if_faulted()
 
     @staticmethod
     def _identities(sample: Mapping[str, Any]) -> tuple[str, str]:
@@ -2704,6 +2755,10 @@ class StrictMotionCaseExecutor:
             )
             arm = self.evidence.finalize(case_id=case_id)
             session_active = False
+            self._confirm_post_evidence_health(
+                plant_boot_id=plant_boot,
+                plant_session_id=plant_session,
+            )
             self._diagnostic_phase = "evaluation"
             policy_epoch = _integer(
                 arm.get("policyActivationEpoch"),
@@ -3140,9 +3195,13 @@ class StrictMotionCaseExecutor:
                 samples,
                 support_epoch=support_epoch,
             )
-            self._diagnostic_phase = "evaluation"
             arm = self.evidence.finalize(case_id=case_id)
             session_active = False
+            self._confirm_post_evidence_health(
+                plant_boot_id=plant_boot,
+                plant_session_id=plant_session,
+            )
+            self._diagnostic_phase = "evaluation"
             _bind_detour_sample_ticks(samples, arm)
             segments: list[dict[str, Any]] = []
             for draft in segment_drafts:

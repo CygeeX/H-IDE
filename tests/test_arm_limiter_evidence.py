@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import copy
+import json
+import os
 from pathlib import Path
 
 import pytest
 
 from hide_mujoco_sonic.arm_limiter_evidence import (
     ARM_JOINT_INDICES,
+    ARTIFACT_SCHEMA_VERSION,
     ArmLimiterEvidenceError,
     ArmLimiterEvidenceRecorder,
     canonical_sha256,
+    load_arm_limiter_evidence_artifact,
     source_bundle_sha256,
 )
 
@@ -17,12 +21,17 @@ from hide_mujoco_sonic.arm_limiter_evidence import (
 SOURCE_HASH = "a" * 64
 
 
-def _recorder(*, max_records: int = 20_000) -> ArmLimiterEvidenceRecorder:
+def _recorder(
+    *,
+    max_records: int = 20_000,
+    artifact_directory: Path | None = None,
+) -> ArmLimiterEvidenceRecorder:
     return ArmLimiterEvidenceRecorder(
         sonic_driver_boot_id="sonic-boot-1",
         sonic_driver_session_id="sonic-session-1",
         sonic_driver_source_sha256=SOURCE_HASH,
         max_records=max_records,
+        artifact_directory=artifact_directory,
     )
 
 
@@ -118,6 +127,93 @@ def test_success_trace_is_exact_bound_hashed_and_idempotently_readable() -> None
     assert replay == result
     replay["records"].clear()
     assert recorder.completed(case_id="case-1") == result
+
+
+def test_large_artifact_is_private_atomic_and_transport_descriptor_is_bounded(
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / "arm-limiter-evidence"
+    recorder = _recorder(artifact_directory=directory)
+    _begin(recorder)
+    for tick in range(100, 600):
+        _record(recorder, tick)
+
+    expected = recorder.finalize(case_id="case-1")
+    descriptor = recorder._completed_transport_descriptor(case_id="case-1")
+
+    assert descriptor is not None
+    assert descriptor["schemaVersion"] == ARTIFACT_SCHEMA_VERSION
+    assert descriptor["caseId"] == "case-1"
+    assert descriptor["traceSha256"] == expected["traceSha256"]
+    assert len(json.dumps({"status": "complete", "artifact": descriptor})) < 4096
+    artifact = Path(descriptor["path"])
+    assert artifact.parent == directory
+    assert artifact.stat().st_mode & 0o777 == 0o600
+    assert directory.stat().st_mode & 0o777 == 0o700
+    assert not list(directory.glob("*.tmp-*"))
+    assert load_arm_limiter_evidence_artifact(
+        descriptor,
+        case_id="case-1",
+        directory=directory,
+    ) == expected
+
+
+def test_artifact_loader_rejects_tampering_unsafe_mode_and_path_escape(
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / "arm-limiter-evidence"
+    recorder = _recorder(artifact_directory=directory)
+    _begin(recorder)
+    _record(recorder, 100)
+    _record(recorder, 101)
+    recorder.finalize(case_id="case-1")
+    descriptor = recorder._completed_transport_descriptor(case_id="case-1")
+    assert descriptor is not None
+    artifact = Path(descriptor["path"])
+
+    escaped = dict(descriptor)
+    escaped["path"] = str(tmp_path / artifact.name)
+    with pytest.raises(ArmLimiterEvidenceError, match="escapes"):
+        load_arm_limiter_evidence_artifact(
+            escaped,
+            case_id="case-1",
+            directory=directory,
+        )
+
+    original = artifact.read_bytes()
+    symlink_target = tmp_path / "untrusted-copy.json"
+    symlink_target.write_bytes(original)
+    artifact.unlink()
+    artifact.symlink_to(symlink_target)
+    with pytest.raises(ArmLimiterEvidenceError, match="cannot be opened"):
+        load_arm_limiter_evidence_artifact(
+            descriptor,
+            case_id="case-1",
+            directory=directory,
+        )
+    artifact.unlink()
+    artifact.write_bytes(original)
+    os.chmod(artifact, 0o600)
+
+    os.chmod(artifact, 0o644)
+    with pytest.raises(ArmLimiterEvidenceError, match="unsafe"):
+        load_arm_limiter_evidence_artifact(
+            descriptor,
+            case_id="case-1",
+            directory=directory,
+        )
+    os.chmod(artifact, 0o600)
+
+    raw = bytearray(artifact.read_bytes())
+    raw[-2] = ord("0") if raw[-2] != ord("0") else ord("1")
+    artifact.write_bytes(raw)
+    os.chmod(artifact, 0o600)
+    with pytest.raises(ArmLimiterEvidenceError, match="hash"):
+        load_arm_limiter_evidence_artifact(
+            descriptor,
+            case_id="case-1",
+            directory=directory,
+        )
 
 
 def test_seal_detaches_the_live_boundary_before_json_materialization() -> None:

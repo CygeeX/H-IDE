@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from types import SimpleNamespace
 import threading
 from uuid import UUID
 
 import pytest
 
-from hide_mujoco_sonic.arm_limiter_evidence import ArmLimiterEvidenceRecorder
+from hide_mujoco_sonic.arm_limiter_evidence import (
+    ArmLimiterEvidenceRecorder,
+    load_arm_limiter_evidence_artifact,
+)
 from hide_mujoco_sonic.normal_stop import NormalStopState
 from hide_mujoco_sonic.reference_authority import ReferenceAuthorityState
 from hide_mujoco_sonic.safety import (
@@ -37,7 +42,7 @@ class _Guard:
     command_zero = True
 
 
-def _driver() -> SonicDriver:
+def _driver(tmp_path: Path) -> SonicDriver:
     clock = _Clock()
     driver = SonicDriver.__new__(SonicDriver)
     driver.config = SimpleNamespace(
@@ -78,6 +83,7 @@ def _driver() -> SonicDriver:
         sonic_driver_boot_id=str(DRIVER_BOOT),
         sonic_driver_session_id=str(DRIVER_SESSION),
         sonic_driver_source_sha256="a" * 64,
+        artifact_directory=tmp_path / "arm-limiter-evidence",
     )
     driver._arm_evidence_request_replays = {}
     driver._arm_evidence_materialization_lock = threading.Lock()
@@ -163,8 +169,9 @@ def _configure_balanced_policy_idle(driver: SonicDriver, *, epoch: int = 1) -> N
 
 def test_driver_records_global_arm_indices_at_each_successful_dds_fact(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    driver = _driver()
+    driver = _driver(tmp_path)
     monkeypatch.setattr(
         "hide_mujoco_sonic.sonic_driver.read_plant_identity",
         lambda *_args, **_kwargs: dict(PLANT_IDENTITY),
@@ -229,12 +236,20 @@ def test_driver_records_global_arm_indices_at_each_successful_dds_fact(
             "66666666-6666-4666-8666-666666666666",
         )
     )
-    assert admitted == {"status": "materializing", "evidence": None}
+    assert admitted == {"status": "materializing", "artifact": None}
     completed = _wait_completed_evidence(
         driver,
         request_id="66666666-6666-4666-8666-666666666667",
     )
-    evidence = completed["evidence"]
+    assert len(json.dumps(completed)) < 4096
+    assert "evidence" not in completed
+    artifact = completed["artifact"]
+    assert isinstance(artifact, dict)
+    evidence = load_arm_limiter_evidence_artifact(
+        artifact,
+        case_id="forward-1m-run-1",
+        directory=tmp_path / "arm-limiter-evidence",
+    )
     assert evidence["records"][0]["constrainedJointIndices"] == [15]
     assert evidence["records"][0]["continuousSaturationByJointS"]["15"] == 0.02
     assert evidence["records"][1]["constrainedJoints"] == 0
@@ -242,8 +257,9 @@ def test_driver_records_global_arm_indices_at_each_successful_dds_fact(
 
 def test_evidence_can_begin_and_finalize_at_exact_balanced_policy_idle(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    driver = _driver()
+    driver = _driver(tmp_path)
     _configure_balanced_policy_idle(driver)
     monkeypatch.setattr(
         "hide_mujoco_sonic.sonic_driver.read_plant_identity",
@@ -276,18 +292,26 @@ def test_evidence_can_begin_and_finalize_at_exact_balanced_policy_idle(
             "99999999-9999-4999-8999-999999999992",
         )
     )
-    assert admitted == {"status": "materializing", "evidence": None}
+    assert admitted == {"status": "materializing", "artifact": None}
     completed = _wait_completed_evidence(
         driver,
         request_id="99999999-9999-4999-8999-999999999998",
     )
-    assert completed["evidence"]["taskEndControlTick"] == 2
+    artifact = completed["artifact"]
+    assert isinstance(artifact, dict)
+    evidence = load_arm_limiter_evidence_artifact(
+        artifact,
+        case_id="forward-1m-run-1",
+        directory=tmp_path / "arm-limiter-evidence",
+    )
+    assert evidence["taskEndControlTick"] == 2
 
 
 def test_large_evidence_materialization_holds_no_live_control_lock(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    driver = _driver()
+    driver = _driver(tmp_path)
     _configure_balanced_policy_idle(driver)
     monkeypatch.setattr(
         "hide_mujoco_sonic.sonic_driver.read_plant_identity",
@@ -329,7 +353,7 @@ def test_large_evidence_materialization_holds_no_live_control_lock(
             "99999999-9999-4999-8999-999999999997",
         )
     )
-    assert response == {"status": "materializing", "evidence": None}
+    assert response == {"status": "materializing", "artifact": None}
     assert materialization_entered.wait(timeout=1.0)
     assert driver._arm_evidence.active is False
     assert driver._arm_evidence.sealed_case_id == "forward-1m-run-1"
@@ -354,8 +378,9 @@ def test_large_evidence_materialization_holds_no_live_control_lock(
 
 def test_evidence_rejects_balanced_idle_flag_without_exact_controller_ownership(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    driver = _driver()
+    driver = _driver(tmp_path)
     _configure_balanced_policy_idle(driver)
     driver._controller.ms.has_movement = True
     monkeypatch.setattr(
@@ -376,8 +401,9 @@ def test_evidence_rejects_balanced_idle_flag_without_exact_controller_ownership(
 
 def test_evidence_finalize_rejects_lost_balanced_policy_ownership(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    driver = _driver()
+    driver = _driver(tmp_path)
     monkeypatch.setattr(
         "hide_mujoco_sonic.sonic_driver.read_plant_identity",
         lambda *_args, **_kwargs: dict(PLANT_IDENTITY),
@@ -411,8 +437,9 @@ def test_evidence_finalize_rejects_lost_balanced_policy_ownership(
 
 def test_evidence_begin_and_finalize_fail_closed_on_identity_or_state_drift(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    driver = _driver()
+    driver = _driver(tmp_path)
     monkeypatch.setattr(
         "hide_mujoco_sonic.sonic_driver.read_plant_identity",
         lambda *_args, **_kwargs: dict(PLANT_IDENTITY),
@@ -454,8 +481,9 @@ def test_evidence_begin_and_finalize_fail_closed_on_identity_or_state_drift(
 
 def test_unfenced_successful_write_permanently_invalidates_active_evidence(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    driver = _driver()
+    driver = _driver(tmp_path)
     monkeypatch.setattr(
         "hide_mujoco_sonic.sonic_driver.read_plant_identity",
         lambda *_args, **_kwargs: dict(PLANT_IDENTITY),
@@ -476,8 +504,9 @@ def test_unfenced_successful_write_permanently_invalidates_active_evidence(
 
 def test_recoverable_motion_fault_closes_evidence_before_context_free_hold(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    driver = _driver()
+    driver = _driver(tmp_path)
     reason = "navigation_guard/NAVIGATION_GUARD_FAULT: unsafe tilt"
     driver._recoverable_motion_fault = False
     driver._terminal_fault_reason = None
