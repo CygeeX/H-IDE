@@ -414,9 +414,39 @@ class SonicRuntime:
                     "continuous SONIC IDLE stop requires the exact live-reference facing"
                 )
         elif is_idle or not has_movement:
-            raise RuntimeError(
-                "continuous SONIC replanning requires a non-IDLE movement intent"
+            # NVIDIA represents an in-place facing change as an IDLE planner
+            # request with no translational speed.  It is still an active
+            # navigation operation: movement_angle and facing_angle carry the
+            # same new command-space heading, while the existing cursor and
+            # recurrent histories define the frame in which that heading is
+            # interpreted.  Requiring every such update to use
+            # ``request_reference(obs)`` rebases that frame to zero and applies
+            # the already-completed part of a long Spin again.
+            movement_angle = float(self.ms.movement_angle)
+            facing_angle = float(self.ms.facing_angle)
+            reference_facing = self.current_reference_facing_angle()
+            facing_error = math.atan2(
+                math.sin(facing_angle - reference_facing),
+                math.cos(facing_angle - reference_facing),
             )
+            movement_facing_error = math.atan2(
+                math.sin(movement_angle - facing_angle),
+                math.cos(movement_angle - facing_angle),
+            )
+            if (
+                not is_idle
+                or has_movement
+                or float(self.ms.speed) != -1.0
+                or float(self.ms.height) != -1.0
+                or not math.isfinite(movement_angle)
+                or not math.isfinite(facing_angle)
+                or abs(movement_facing_error) > 1e-9
+                or abs(facing_error) <= 1e-9
+            ):
+                raise RuntimeError(
+                    "continuous SONIC replanning requires active translation or "
+                    "a new pure-rotation facing"
+                )
         cursor = int(self.controller.ref_cursor)
         self.revoke_reference_authority(
             discard_reference=True,
@@ -429,7 +459,12 @@ class SonicRuntime:
         self.last_ms = snapshot_ms(self.ms)
 
     def request_continuous_reference(self) -> None:
-        """Freeze policy history and request the next moving reference."""
+        """Freeze policy history and request the next active-motion reference.
+
+        Active motion includes NVIDIA's IDLE-mode, zero-translation encoding of
+        an in-place facing change.  A stationary IDLE stop remains available
+        only through :meth:`request_continuous_idle_reference`.
+        """
 
         self._request_continuous_reference(controlled_idle_stop=False)
 

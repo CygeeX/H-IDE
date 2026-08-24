@@ -543,6 +543,58 @@ def test_continuous_replan_freezes_cursor_and_preserves_executed_history():
         )
 
 
+def test_continuous_pure_rotation_preserves_cursor_without_accepting_plain_idle():
+    runtime, planner, controller, _encoder, _decoder, _raw_action = _runtime()
+    obs = _complete_obs(offset=0.02)
+    runtime.initialize_from_observation(obs)
+    boundary = np.array(
+        [obs[f"{motor.name}.q"] for motor in G1_29_JointIndex],
+        np.float32,
+    )
+    runtime.acquire_initial_reference(
+        obs,
+        executed_target=boundary,
+        expected_install_epoch=runtime.reference_install_epoch,
+    )
+    idle = runtime.tick(obs, debug=False, use_joystick=False)
+    published = _target_vector(idle)
+    runtime.record_executed_target(published)
+    cursor_before = controller.ref_cursor
+    step_before = runtime.step
+
+    reference_facing = runtime.current_reference_facing_angle()
+    next_facing = reference_facing + 0.20
+    runtime.ms.mode = 0
+    runtime.ms.speed = -1.0
+    runtime.ms.height = -1.0
+    runtime.ms.movement_angle = next_facing
+    runtime.ms.facing_angle = next_facing
+    runtime.ms.has_movement = False
+    runtime.request_continuous_reference()
+
+    assert planner.requests[-1][0] == cursor_before
+    assert planner.requests[-1][1].facing_angle == pytest.approx(next_facing)
+    assert controller.ref_cursor == cursor_before
+    assert runtime.step == step_before
+    planner.results.append((_motion_from_measured(boundary), planner.gen_frame))
+    assert runtime.poll_reference()
+    runtime.acquire_continuous_reference(
+        executed_target=published,
+        expected_install_epoch=runtime.reference_install_epoch,
+    )
+    assert runtime.reference_authority
+    assert runtime.step == step_before
+
+    runtime.ms.movement_angle = runtime.current_reference_facing_angle()
+    runtime.ms.facing_angle = runtime.current_reference_facing_angle()
+    with pytest.raises(RuntimeError, match="new pure-rotation facing"):
+        runtime.request_continuous_reference()
+
+    runtime.ms.movement_angle = runtime.ms.facing_angle + 0.01
+    with pytest.raises(RuntimeError, match="new pure-rotation facing"):
+        runtime.request_continuous_reference()
+
+
 def test_continuous_idle_stop_preserves_cursor_and_executed_history():
     runtime, planner, controller, _encoder, _decoder, _raw_action = _runtime()
     obs = _complete_obs(offset=0.02)
