@@ -123,6 +123,25 @@ def test_drive_on_heading_relays_only_the_exact_official_speed(mode: str, vx: fl
         relay.observe_nav2(command(vx=math.copysign(wrong, vx)), observed_at_s=10.11)
 
 
+def test_detour_reverse_relays_the_exact_official_reverse_speed() -> None:
+    relay = runner.StrictCommandRelay()
+    relay.begin_detour_primitive("DriveOnHeading", direction=-1)
+
+    relay.observe_nav2(
+        command(vx=-runner.OFFICIAL_REVERSE_SPEED_MPS),
+        observed_at_s=10.0,
+    )
+
+    assert relay.nav2_output(now_s=10.1) == command(
+        vx=-runner.OFFICIAL_REVERSE_SPEED_MPS
+    )
+    with pytest.raises(runner.StrictMotionRunnerError, match="NVIDIA direction speed"):
+        relay.observe_nav2(
+            command(vx=-runner.OFFICIAL_DRIVE_SPEED_MPS),
+            observed_at_s=10.11,
+        )
+
+
 def test_forward_probe_is_a_fixed_short_official_drive() -> None:
     assert runner.motion_goal("forward_probe") == {
         "distanceM": 0.20,

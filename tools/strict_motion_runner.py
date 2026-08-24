@@ -448,6 +448,7 @@ class StrictCommandRelay:
             expected_speed = (
                 OFFICIAL_REVERSE_SPEED_MPS
                 if self._mode == "reverse"
+                or (self._mode == "detour" and self._direction < 0)
                 else OFFICIAL_DRIVE_SPEED_MPS
             )
             if not command.is_zero and (
