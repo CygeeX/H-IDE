@@ -1285,6 +1285,35 @@ def test_detour_plan_hash_and_geometry_hash_are_verified() -> None:
     )
 
 
+def test_generated_pgm_proves_detour_when_semantic_obstacle_subset_does_not() -> None:
+    trace = _trace("detour")
+    # The semantic list is explanatory evidence, not the collision oracle.
+    # Keep a finite but irrelevant obstacle while the generated PGM still
+    # proves the direct route blocked and the NavFn path collision-free.
+    trace["nav2Plan"]["obstacles"] = [
+        {
+            "source": "diagnostic_subset",
+            "shape": "circle",
+            "center": [100.0, 100.0],
+            "radius": 0.1,
+        }
+    ]
+    trace["nav2Plan"]["obstacleSetHashSha256"] = strict.canonical_sha256(
+        trace["nav2Plan"]["obstacles"]
+    )
+
+    result = strict.evaluate_trace(trace)
+
+    assert result["pass"] is True, result["failures"]
+    assert result["metrics"]["nav2Plan"]["directPgmLineOfSightClear"] is False
+
+
+def test_focus_office_scene_transfer_inherits_generated_start_tolerance() -> None:
+    assert strict._ROUTE_START_POSITION_TOLERANCE_M == {
+        "office_corridor_east_to_focus_office": 0.35,
+    }
+
+
 def test_detour_uses_only_ordered_official_primitives_bound_to_plan() -> None:
     trace = _trace("detour")
 

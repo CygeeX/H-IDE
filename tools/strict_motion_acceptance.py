@@ -96,6 +96,12 @@ _STATIC_PLANNER_MODULE: Any | None = None
 _FIRST_PERSON_VIEWER_HEALTH_SCHEMA_VERSION = (
     "h-ide.first-person-viewer-health/1"
 )
+_ROUTE_START_POSITION_TOLERANCE_M = {
+    # This scene transfer starts from target_corridor_east, whose generated
+    # arrival contract is 0.35 m.  Preserve that accepted boundary when the
+    # next acceptance case begins.
+    "office_corridor_east_to_focus_office": 0.35,
+}
 
 
 def _production_static_planner() -> Any:
@@ -2698,6 +2704,14 @@ class StrictMotionEvaluator:
             active_samples = [self._parsed_samples[item] for item in observed]
             fresh = _mapping(segment.get("freshOdometry"), "detourSegment.freshOdometry")
             first_active = active_samples[0]
+            fresh_position_tolerance_m = self.contract.detour_endpoint_tolerance_m
+            if index == 0:
+                fresh_position_tolerance_m = max(
+                    fresh_position_tolerance_m,
+                    _ROUTE_START_POSITION_TOLERANCE_M.get(
+                        str(self.document.get("routeId")), 0.0
+                    ),
+                )
             if (
                 math.dist(
                     (
@@ -2706,7 +2720,7 @@ class StrictMotionEvaluator:
                     ),
                     tuple(first_active["root"][:2]),
                 )
-                > self.contract.detour_endpoint_tolerance_m + _EPS
+                > fresh_position_tolerance_m + _EPS
                 or abs(
                     _angle_delta(
                         _finite(fresh.get("yaw"), "detourSegment.freshOdometry.yaw"),
@@ -3199,8 +3213,9 @@ class StrictMotionEvaluator:
             "yaw": float(terminal_sample["yaw"]),
         }
 
-        def resolve_omitted_from_terminal(
+        def resolve_omitted_from_pose(
             primitive_sequence: int,
+            fresh_pose: Mapping[str, float],
         ) -> dict[str, Any] | None:
             try:
                 return dict(
@@ -3208,7 +3223,7 @@ class StrictMotionEvaluator:
                         plan_json,
                         navfn_path_json,
                         primitive_sequence,
-                        _canonical_json(terminal_fresh_pose),
+                        _canonical_json(fresh_pose),
                         production_parameters,
                         live_execution_clearance_radius_m,
                     )
@@ -3219,6 +3234,31 @@ class StrictMotionEvaluator:
                     f"production resolver rejected omitted primitive {primitive_sequence}: {exc}",
                 )
                 return None
+
+        def omitted_checkpoint_pose(
+            candidate: Mapping[str, Any] | None,
+            primitive_sequence: int,
+        ) -> dict[str, float] | None:
+            if candidate is None:
+                return terminal_fresh_pose
+            candidate_sequence = candidate.get("primitiveSequence")
+            if (
+                isinstance(candidate_sequence, bool)
+                or not isinstance(candidate_sequence, int)
+                or candidate_sequence <= primitive_sequence
+            ):
+                return None
+            fresh = _mapping(
+                candidate.get("freshOdometry"),
+                "detour later-checkpoint freshOdometry",
+            )
+            return {
+                "x": _finite(fresh.get("x"), "detour omitted checkpoint fresh x"),
+                "y": _finite(fresh.get("y"), "detour omitted checkpoint fresh y"),
+                "yaw": _finite(
+                    fresh.get("yaw"), "detour omitted checkpoint fresh yaw"
+                ),
+            }
 
         for primitive_sequence, expected_type in expected_actions:
             if expected_type == "Spin":
@@ -3238,61 +3278,19 @@ class StrictMotionEvaluator:
                     actual_cursor += 1
                     continue
 
-                # A planned alignment checkpoint is evidence-bearing even when
-                # it emits no ROS action.  Re-evaluate it from the immediately
-                # following DriveOnHeading's fresh pose; that same pose must
-                # prove the Spin was within tolerance and the Drive executable.
-                if (
-                    candidate is not None
-                    and candidate.get("type") == "DriveOnHeading"
-                    and candidate.get("primitiveSequence")
-                    == primitive_sequence + 1
-                ):
-                    fresh = _mapping(
-                        candidate.get("freshOdometry"),
-                        "detour skipped Spin freshOdometry",
+                # One action may finish inside multiple subsequent endpoint
+                # checkpoints (for example a final 5 cm segment). Re-resolve
+                # every omitted checkpoint from the next executed action's
+                # fresh pose, or from the terminal authoritative pose when no
+                # action follows. It is omitted only when production returns
+                # an explicit no-action disposition.
+                omitted_pose = omitted_checkpoint_pose(
+                    candidate, primitive_sequence
+                )
+                if omitted_pose is not None:
+                    skipped = resolve_omitted_from_pose(
+                        primitive_sequence, omitted_pose
                     )
-                    fresh_pose = {
-                        "x": _finite(fresh.get("x"), "detour skipped Spin fresh x"),
-                        "y": _finite(fresh.get("y"), "detour skipped Spin fresh y"),
-                        "yaw": _finite(
-                            fresh.get("yaw"), "detour skipped Spin fresh yaw"
-                        ),
-                    }
-                    try:
-                        skipped = dict(
-                            _resolve_production_static_primitive_cached(
-                                plan_json,
-                                navfn_path_json,
-                                primitive_sequence,
-                                _canonical_json(fresh_pose),
-                                production_parameters,
-                                live_execution_clearance_radius_m,
-                            )
-                        )
-                    except (OSError, TypeError, ValueError) as exc:
-                        self._fail(
-                            "DETOUR_PRODUCTION_RESOLUTION_FAILED",
-                            f"production resolver rejected skipped primitive {primitive_sequence}: {exc}",
-                        )
-                    else:
-                        if (
-                            skipped.get("disposition")
-                            in {
-                                "skip_within_heading_tolerance",
-                                "skip_within_endpoint_tolerance",
-                            }
-                            and skipped.get("action_goal") is None
-                        ):
-                            skipped_resolver_results.append(skipped)
-                            continue
-                        self._fail(
-                            "DETOUR_CHECKPOINT_NOT_EXECUTABLE",
-                            f"omitted Spin primitive {primitive_sequence} was not within heading tolerance",
-                        )
-
-                if candidate is None:
-                    skipped = resolve_omitted_from_terminal(primitive_sequence)
                     if (
                         skipped is not None
                         and skipped.get("disposition")
@@ -3390,8 +3388,18 @@ class StrictMotionEvaluator:
                 )
                 actual_cursor += 1
             if drive_action_count == 0:
-                if actual_cursor >= len(self.detour_segments):
-                    skipped = resolve_omitted_from_terminal(primitive_sequence)
+                candidate = (
+                    self.detour_segments[actual_cursor]
+                    if actual_cursor < len(self.detour_segments)
+                    else None
+                )
+                omitted_pose = omitted_checkpoint_pose(
+                    candidate, primitive_sequence
+                )
+                if omitted_pose is not None:
+                    skipped = resolve_omitted_from_pose(
+                        primitive_sequence, omitted_pose
+                    )
                     if (
                         skipped is not None
                         and skipped.get("disposition")
@@ -3667,6 +3675,15 @@ class StrictMotionEvaluator:
         realized_clearance = _path_clearance(realized_path, obstacles)
         start, goal = realized_path[0], realized_path[-1]
         direct_clearance = _path_clearance((start, goal), obstacles)
+        static_map = _production_static_planner().StaticMap.load(
+            _OFFICE_MAP_YAML_PATH,
+            _OFFICE_MAP_IMAGE_PATH,
+        )
+        direct_pgm_clear = static_map.segment_is_clear(
+            start,
+            goal,
+            static_map.inflated_blocked_cells(required),
+        )
         if plan_clearance + _EPS < required:
             self._fail("NAV2_PLAN_CLEARANCE_FAILED", f"plan boundary clearance is {plan_clearance:.4f}m; {required:.4f}m required")
         if realized_clearance + _EPS < realized_required:
@@ -3676,8 +3693,11 @@ class StrictMotionEvaluator:
                 f"{realized_clearance:.4f}m; {realized_required:.4f}m "
                 "physical footprint clearance required",
             )
-        if direct_clearance + _EPS >= required:
-            self._fail("DETOUR_NOT_PROVEN", "the direct start/goal segment is not blocked by the static obstacle set")
+        if direct_pgm_clear:
+            self._fail(
+                "DETOUR_NOT_PROVEN",
+                "the direct start/goal segment is not blocked in the generated occupancy map",
+            )
         goal_obj = _mapping(action.get("goal"), "action.goal")
         goal_xy = (_finite(goal_obj.get("x"), "action.goal.x"), _finite(goal_obj.get("y"), "action.goal.y"))
         goal_yaw = _finite(goal_obj.get("yaw"), "action.goal.yaw")
@@ -3686,7 +3706,13 @@ class StrictMotionEvaluator:
         final_yaw = float(self._parsed_samples[-1]["yaw"])
         if abs(_angle_delta(final_yaw, goal_yaw)) > self.contract.final_yaw_tolerance_rad + _EPS:
             self._fail("FINAL_YAW_MISSED", "detour final yaw missed the goal")
-        if math.dist(poses[0], start) > self.contract.final_position_tolerance_m + _EPS or math.dist(poses[-1], goal_xy) > self.contract.final_position_tolerance_m + _EPS:
+        route_start_tolerance_m = max(
+            self.contract.final_position_tolerance_m,
+            _ROUTE_START_POSITION_TOLERANCE_M.get(
+                str(self.document.get("routeId")), 0.0
+            ),
+        )
+        if math.dist(poses[0], start) > route_start_tolerance_m + _EPS or math.dist(poses[-1], goal_xy) > self.contract.final_position_tolerance_m + _EPS:
             self._fail("NAV2_PLAN_ENDPOINT_MISMATCH", "Nav2 plan endpoints do not match recorded start/goal")
         self.metrics["nav2Plan"] = {
             "applicable": True,
@@ -3700,6 +3726,7 @@ class StrictMotionEvaluator:
             "minimumPlanBoundaryClearanceM": plan_clearance,
             "minimumRealizedBoundaryClearanceM": realized_clearance,
             "directBoundaryClearanceM": direct_clearance,
+            "directPgmLineOfSightClear": direct_pgm_clear,
             "requiredBoundaryClearanceM": required,
             "requiredRealizedBoundaryClearanceM": realized_required,
         }
