@@ -1,6 +1,6 @@
 {
   "schema_version": "h-ide.sonic-model-lock/1",
-  "repository_revision_at_audit": "9189611d55b3657326045b0733427fdcc704dff7",
+  "repository_revision_at_audit": "72237820f70e9b2826fb7423aced0e4a5af10ade",
   "model_repository": {
     "repo_id": "nvidia/GEAR-SONIC",
     "revision": "9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2",
@@ -19,14 +19,14 @@
   "audited_runtime": {
     "config": {
       "path": "config/ros-headless.yaml",
-      "size": 3675,
-      "sha256": "b4958783481fc8ca4dce793fa6bbd95ce761e3888f98ef98a09d37058120f12e"
+      "size": 3834,
+      "sha256": "cc98b6228627413e208da3041303848e26b0d4d9c3d327419bcb43d5eb722e9d"
     },
     "declared_model_revision": "9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2",
     "declared_lerobot_revision": "f5fdcb61cda272b866ca81f72ce6f1f76b87fad9",
     "observed_lerobot_revision": "f5fdcb61cda272b866ca81f72ce6f1f76b87fad9",
     "lock_safe": true,
-    "reason": "The reviewed ros-headless runtime selectors, ROS/Nav2 domain 232, isolated Unitree LowState/LowCmd domain 230, SONIC model bundle, exact LeRobot cold-start history and control source, official direction-speed mapping, actuator handoff, exact-epoch policy-owned fall-arrest release, history-preserving controlled IDLE stopping at the live planner-reference cursor facing, and terminal IDLE reference readaptation are reproducibly anchored by repository commit 9189611d55b3657326045b0733427fdcc704dff7."
+    "reason": "The reviewed ros-headless runtime selectors, ROS/Nav2 domain 232, isolated Unitree LowState/LowCmd domain 230, SONIC model bundle, exact LeRobot cold-start history and control source, official direction-speed mapping, actuator handoff, exact-epoch policy-owned fall-arrest release, the bounded one-second stationary planner-reference wait, history-preserving controlled IDLE stopping at the live planner-reference cursor facing, and terminal IDLE reference readaptation are reproducibly anchored by repository commit 72237820f70e9b2826fb7423aced0e4a5af10ade."
   },
   "profiles": {
     "sonic-official-default": {
