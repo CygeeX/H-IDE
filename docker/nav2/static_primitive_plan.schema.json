@@ -83,7 +83,7 @@
         "extra_clearance_m": {"const": 0.05},
         "clearance_radius_m": {"const": 0.42},
         "min_segment_m": {"const": 0.16},
-        "max_segment_m": {"const": 0.75}
+        "max_segment_m": {"const": 0.5}
       },
       "additionalProperties": false
     },
@@ -108,7 +108,7 @@
         "fresh_pose_frame": {"const": "map"},
         "revalidate_line_of_sight_before_drive": {"const": true},
         "endpoint_tolerance_m": {"const": 0.15},
-        "heading_tolerance_rad": {"const": 0.06},
+        "heading_tolerance_rad": {"const": 0.09},
         "drive_speed_mps": {"const": 0.3},
         "spin_min_angular_rps": {"const": 0.1},
         "spin_max_angular_rps": {"const": 0.2},
@@ -183,7 +183,7 @@
         "path_end_index": {"type": "integer", "minimum": 1, "maximum": 999999},
         "start_map": {"$ref": "#/$defs/point"},
         "end_map": {"$ref": "#/$defs/point"},
-        "distance_m": {"type": "number", "minimum": 0.05, "maximum": 0.75},
+        "distance_m": {"type": "number", "minimum": 0.05, "maximum": 0.5},
         "heading_map_yaw_rad": {"$ref": "#/$defs/yaw"}
       },
       "additionalProperties": false

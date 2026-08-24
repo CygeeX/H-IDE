@@ -1481,16 +1481,21 @@ class FakeStaticPlanner:
         self,
         *,
         skip: bool = False,
+        skip_spin_only: bool = False,
         realign_once: bool = False,
     ) -> None:
         self.skip = skip
+        self.skip_spin_only = skip_spin_only
         self.realign_once = realign_once
         self.spin_resolutions = 0
         self.drive_resolutions = 0
 
     def build_primitive_plan(self, _path, **_kwargs) -> dict:
         return {
-            "primitives": [{"sequence": 0}, {"sequence": 1}],
+            "primitives": [
+                {"sequence": 0, "kind": "spin"},
+                {"sequence": 1, "kind": "drive_on_heading"},
+            ],
             "plan_sha256": "a" * 64,
             "map_provenance": {"image_sha256": "b" * 64},
         }
@@ -1499,7 +1504,7 @@ class FakeStaticPlanner:
         return plan
 
     def resolve_live_primitive(self, _plan, index, _path, _pose, **_kwargs):
-        if self.skip:
+        if self.skip or (self.skip_spin_only and index == 0):
             return {
                 "primitive_sequence": index,
                 "plan_sha256": "a" * 64,
@@ -1721,6 +1726,54 @@ def test_detour_executor_uses_only_fresh_resolved_official_primitives(
     )
     assert "send_spin" in backend.calls and "send_drive" in backend.calls
     assert backend.calls[:4] == ["ready", "compute_path", "normal_stop", "arm"]
+    assert evidence.calls == ["begin", "finalize"]
+
+
+def test_detour_executor_skips_subresolution_alignment_before_drive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = FakeDetourBackend()
+    samples = [_executor_sample(index / 10.0) for index in range(60)]
+    samples[2]["motionIntentActive"] = True
+    samples[2]["nav2Actions"]["driveOnHeadingActive"] = True
+    samples[2]["command"]["vx"] = 0.3
+    collector = FakeExecutorCollector(samples)
+    evidence = FakeDetourEvidence()
+    planner = FakeStaticPlanner(skip_spin_only=True)
+
+    def load(name: str, _path: Path):
+        if "planner" in name:
+            return planner
+        return SimpleNamespace(
+            evaluate_trace=lambda trace: {
+                "pass": [
+                    (item["primitiveSequence"], item["type"])
+                    for item in trace["action"]["segments"]
+                ]
+                == [(1, "DriveOnHeading")]
+            }
+        )
+
+    monkeypatch.setattr(runner, "_load_file_module", load)
+    executor = runner.StrictMotionCaseExecutor(
+        backend,
+        collector,
+        evidence,
+        clock=lambda: 1.0,
+    )
+
+    trace, result = executor.run_detour(
+        case_id="detour-skip-small-spin",
+        route_id="office_waste_bin_s_to_g",
+    )
+
+    assert result == {"pass": True}
+    assert [
+        (item["primitiveSequence"], item["type"])
+        for item in trace["action"]["segments"]
+    ] == [(1, "DriveOnHeading")]
+    assert "send_spin" not in backend.calls
+    assert backend.calls.count("send_drive") == 1
     assert evidence.calls == ["begin", "finalize"]
 
 
@@ -1946,7 +1999,9 @@ def test_detour_executor_rejects_resolver_skip_and_stops(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     backend = FakeDetourBackend()
-    collector = FakeExecutorCollector([_executor_sample(0.0)])
+    collector = FakeExecutorCollector(
+        [_executor_sample(0.0), _executor_sample(0.1)]
+    )
     evidence = FakeDetourEvidence()
     planner = FakeStaticPlanner(skip=True)
     monkeypatch.setattr(runner, "_load_file_module", lambda *_args: planner)

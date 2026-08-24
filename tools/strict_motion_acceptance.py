@@ -189,12 +189,12 @@ class FormalContract:
     # position envelope used by the motion contract, while the independent
     # 0.42 m inflated-clearance and contact gates remain strict.
     detour_endpoint_tolerance_m: float = 0.15
-    # Nav2's official Spin has a 0.10 rad/s minimum command.  Live r84 showed
-    # that forcing a separate 0.06 rad learned whole-body Spin is less precise
-    # than driving the already-clear short segment.  This tolerance remains
-    # geometrically bounded: 0.75 * sin(0.06) = 0.04497 m, strictly below the
-    # 0.05 m extra inflated-path clearance.
-    detour_heading_tolerance_rad: float = 0.06
+    # Nav2's official Spin has a 0.10 rad/s minimum command.  Live column-route
+    # r142 showed that separate +/-0.07..0.08 rad learned whole-body Spins are
+    # less precise than driving the already-clear short segment.  Pairing this
+    # tolerance with 0.50 m segments keeps the drift geometrically bounded:
+    # 0.50 * sin(0.09) = 0.04494 m, below the 0.05 m clearance reserve.
+    detour_heading_tolerance_rad: float = 0.09
     robot_radius_m: float = 0.35
     footprint_padding_m: float = 0.02
     map_resolution_m: float = 0.05
@@ -2786,7 +2786,7 @@ class StrictMotionEvaluator:
             self.contract.footprint_padding_m,
             self.contract.map_resolution_m,
             0.16,
-            0.75,
+            0.50,
             self.contract.drive_on_heading_max_vx_mps,
             self.contract.detour_endpoint_tolerance_m,
             self.contract.detour_heading_tolerance_rad,
@@ -2893,7 +2893,7 @@ class StrictMotionEvaluator:
             "extra_clearance_m": self.contract.map_resolution_m,
             "clearance_radius_m": self.contract.required_obstacle_boundary_clearance_m,
             "min_segment_m": 0.16,
-            "max_segment_m": 0.75,
+            "max_segment_m": 0.5,
         }
         if set(segmenter) != {"source_sha256", *expected_segmenter}:
             raise TraceContractError("static primitive segmenter fields are invalid")
@@ -3013,7 +3013,7 @@ class StrictMotionEvaluator:
                     or math.dist(end, expected_end) > 1e-6
                     or abs(distance - expected_distance) > 1e-6
                     or abs(_angle_delta(heading, expected_heading)) > 1e-6
-                    or not 0.16 - _EPS <= distance <= 0.75 + _EPS
+                    or not 0.16 - _EPS <= distance <= 0.5 + _EPS
                 )
             if mismatch:
                 self._fail(
@@ -3173,72 +3173,150 @@ class StrictMotionEvaluator:
         # each correction must materially contract the preceding heading
         # error so an oscillating controller cannot consume the larger budget.
         expanded_expected_actions: list[tuple[int, str]] = []
+        skipped_resolver_results: list[dict[str, Any]] = []
         actual_cursor = 0
         realignment_spin_count = 0
         for primitive_sequence, expected_type in expected_actions:
-            if expected_type == "DriveOnHeading":
-                correction_count = 0
-                previous_alignment_error_abs: float | None = None
-                if actual_cursor > 0:
-                    prior = self.detour_segments[actual_cursor - 1]
-                    if (
-                        prior.get("type") == "Spin"
-                        and prior.get("primitiveSequence")
-                        == primitive_sequence - 1
-                    ):
-                        prior_goal = _mapping(
-                            prior.get("goal"),
-                            "detour realignment preceding Spin goal",
-                        )
-                        previous_alignment_error_abs = abs(
-                            _finite(
-                                prior_goal.get("targetYawRad"),
-                                "detour realignment preceding heading error",
-                            )
-                        )
-                while actual_cursor < len(self.detour_segments):
-                    candidate = self.detour_segments[actual_cursor]
-                    if not (
-                        candidate.get("type") == "Spin"
-                        and candidate.get("primitiveSequence")
-                        == primitive_sequence - 1
-                    ):
-                        break
-                    correction_count += 1
-                    realignment_spin_count += 1
-                    if correction_count > MAX_DRIVE_REALIGNMENT_SPINS:
-                        self._fail(
-                            "DETOUR_REALIGNMENT_BUDGET_EXCEEDED",
-                            "DriveOnHeading used more than four corrective Spins",
-                        )
-                    candidate_goal = _mapping(
-                        candidate.get("goal"),
-                        "detour corrective Spin goal",
-                    )
-                    correction_error_abs = abs(
-                        _finite(
-                            candidate_goal.get("targetYawRad"),
-                            "detour corrective Spin heading error",
-                        )
-                    )
-                    if (
-                        previous_alignment_error_abs is not None
-                        and correction_error_abs
-                        > previous_alignment_error_abs
-                        * MAX_DRIVE_REALIGNMENT_RETAINED_ERROR_RATIO
-                    ):
-                        self._fail(
-                            "DETOUR_REALIGNMENT_NOT_CONVERGING",
-                            "DriveOnHeading corrective Spin did not contract heading error by at least 10%",
-                        )
-                    previous_alignment_error_abs = correction_error_abs
+            if expected_type == "Spin":
+                candidate = (
+                    self.detour_segments[actual_cursor]
+                    if actual_cursor < len(self.detour_segments)
+                    else None
+                )
+                if (
+                    candidate is not None
+                    and candidate.get("type") == "Spin"
+                    and candidate.get("primitiveSequence") == primitive_sequence
+                ):
                     expanded_expected_actions.append(
-                        (primitive_sequence - 1, "Spin")
+                        (primitive_sequence, expected_type)
                     )
                     actual_cursor += 1
+                    continue
+
+                # A planned alignment checkpoint is evidence-bearing even when
+                # it emits no ROS action.  Re-evaluate it from the immediately
+                # following DriveOnHeading's fresh pose; that same pose must
+                # prove the Spin was within tolerance and the Drive executable.
+                if (
+                    candidate is not None
+                    and candidate.get("type") == "DriveOnHeading"
+                    and candidate.get("primitiveSequence")
+                    == primitive_sequence + 1
+                ):
+                    fresh = _mapping(
+                        candidate.get("freshOdometry"),
+                        "detour skipped Spin freshOdometry",
+                    )
+                    fresh_pose = {
+                        "x": _finite(fresh.get("x"), "detour skipped Spin fresh x"),
+                        "y": _finite(fresh.get("y"), "detour skipped Spin fresh y"),
+                        "yaw": _finite(
+                            fresh.get("yaw"), "detour skipped Spin fresh yaw"
+                        ),
+                    }
+                    try:
+                        skipped = dict(
+                            _resolve_production_static_primitive_cached(
+                                plan_json,
+                                navfn_path_json,
+                                primitive_sequence,
+                                _canonical_json(fresh_pose),
+                                production_parameters,
+                            )
+                        )
+                    except (OSError, TypeError, ValueError) as exc:
+                        self._fail(
+                            "DETOUR_PRODUCTION_RESOLUTION_FAILED",
+                            f"production resolver rejected skipped primitive {primitive_sequence}: {exc}",
+                        )
+                    else:
+                        if (
+                            skipped.get("disposition")
+                            == "skip_within_heading_tolerance"
+                            and skipped.get("action_goal") is None
+                        ):
+                            skipped_resolver_results.append(skipped)
+                            continue
+                        self._fail(
+                            "DETOUR_CHECKPOINT_NOT_EXECUTABLE",
+                            f"omitted Spin primitive {primitive_sequence} was not within heading tolerance",
+                        )
+
+                # Keep the unmatched checkpoint in the expected sequence so
+                # the ordinary count/order gates fail closed below.
+                expanded_expected_actions.append(
+                    (primitive_sequence, expected_type)
+                )
+                continue
+
+            correction_count = 0
+            previous_alignment_error_abs: float | None = None
+            if actual_cursor > 0:
+                prior = self.detour_segments[actual_cursor - 1]
+                if (
+                    prior.get("type") == "Spin"
+                    and prior.get("primitiveSequence")
+                    == primitive_sequence - 1
+                ):
+                    prior_goal = _mapping(
+                        prior.get("goal"),
+                        "detour realignment preceding Spin goal",
+                    )
+                    previous_alignment_error_abs = abs(
+                        _finite(
+                            prior_goal.get("targetYawRad"),
+                            "detour realignment preceding heading error",
+                        )
+                    )
+            while actual_cursor < len(self.detour_segments):
+                candidate = self.detour_segments[actual_cursor]
+                if not (
+                    candidate.get("type") == "Spin"
+                    and candidate.get("primitiveSequence")
+                    == primitive_sequence - 1
+                ):
+                    break
+                correction_count += 1
+                realignment_spin_count += 1
+                if correction_count > MAX_DRIVE_REALIGNMENT_SPINS:
+                    self._fail(
+                        "DETOUR_REALIGNMENT_BUDGET_EXCEEDED",
+                        "DriveOnHeading used more than four corrective Spins",
+                    )
+                candidate_goal = _mapping(
+                    candidate.get("goal"),
+                    "detour corrective Spin goal",
+                )
+                correction_error_abs = abs(
+                    _finite(
+                        candidate_goal.get("targetYawRad"),
+                        "detour corrective Spin heading error",
+                    )
+                )
+                if (
+                    previous_alignment_error_abs is not None
+                    and correction_error_abs
+                    > previous_alignment_error_abs
+                    * MAX_DRIVE_REALIGNMENT_RETAINED_ERROR_RATIO
+                ):
+                    self._fail(
+                        "DETOUR_REALIGNMENT_NOT_CONVERGING",
+                        "DriveOnHeading corrective Spin did not contract heading error by at least 10%",
+                    )
+                previous_alignment_error_abs = correction_error_abs
+                expanded_expected_actions.append(
+                    (primitive_sequence - 1, "Spin")
+                )
+                actual_cursor += 1
             expanded_expected_actions.append((primitive_sequence, expected_type))
             if actual_cursor < len(self.detour_segments):
-                actual_cursor += 1
+                candidate = self.detour_segments[actual_cursor]
+                if (
+                    candidate.get("type") == expected_type
+                    and candidate.get("primitiveSequence") == primitive_sequence
+                ):
+                    actual_cursor += 1
 
         if actual_cursor != len(self.detour_segments):
             self._fail(
@@ -3252,7 +3330,7 @@ class StrictMotionEvaluator:
                 "DETOUR_SEQUENCE_PLAN_MISMATCH",
                 "executed action count does not match static-plan checkpoints",
             )
-        resolved_results: list[dict[str, Any]] = []
+        resolved_results: list[dict[str, Any]] = list(skipped_resolver_results)
         for index, (expected, actual) in enumerate(zip(expected_actions, self.detour_segments)):
             primitive_sequence, expected_type = expected
             fresh = _mapping(actual.get("freshOdometry"), "detourSegment.freshOdometry")

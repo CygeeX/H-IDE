@@ -167,13 +167,13 @@ def _assert_primitive_plan(module, navfn_path, plan) -> None:
     # any new motion segment must be longer than that endpoint envelope. Its
     # command speed remains NVIDIA's exact 0.30 m/s Slow Walk command.
     assert plan["segmenter"]["min_segment_m"] == 0.16
-    assert plan["segmenter"]["max_segment_m"] == 0.75
+    assert plan["segmenter"]["max_segment_m"] == 0.50
     assert plan["execution_policy"] == {
         "fresh_odometry_required": True,
         "fresh_pose_frame": "map",
         "revalidate_line_of_sight_before_drive": True,
         "endpoint_tolerance_m": 0.15,
-        "heading_tolerance_rad": 0.06,
+        "heading_tolerance_rad": 0.09,
         "drive_speed_mps": 0.30,
         "spin_min_angular_rps": 0.10,
         "spin_max_angular_rps": 0.20,
@@ -214,7 +214,7 @@ def _assert_primitive_plan(module, navfn_path, plan) -> None:
         if previous_end is not None:
             assert segment["start_map"] == previous_end
         previous_end = segment["end_map"]
-        assert 0.16 <= segment["distance_m"] <= 0.75
+        assert 0.16 <= segment["distance_m"] <= 0.50
         assert static_map.segment_is_clear(
             (source_start["x"], source_start["y"]),
             (source_end["x"], source_end["y"]),
@@ -322,7 +322,10 @@ def test_live_resolver_uses_fresh_pose_and_never_emits_zero_or_subfloor_goals() 
         segment["distance_m"]
     )
 
-    misaligned_pose = {**segment["start_map"], "yaw": heading + 0.20}
+    misaligned_pose = {
+        **segment["start_map"],
+        "yaw": module._wrap_angle(heading + 0.20),
+    }
     realignment = module.resolve_live_primitive(
         plan,
         2 * short_segment_index + 1,
@@ -354,11 +357,11 @@ def test_live_resolver_uses_fresh_pose_and_never_emits_zero_or_subfloor_goals() 
 
     # A residual at the reviewed whole-body resolution is skipped instead of
     # asking the official >=0.10 rad/s Spin to execute a one-step correction.
-    # The maximum 0.75 m segment then drifts <0.05 m, inside the independently
+    # The maximum 0.50 m segment then drifts <0.05 m, inside the independently
     # inflated clearance reserve. Anything just outside remains a Spin.
     within_resolution = {
         **segment["start_map"],
-        "yaw": heading - 0.06,
+        "yaw": heading - 0.09,
     }
     resolved_within = module.resolve_live_primitive(
         plan,
@@ -372,7 +375,7 @@ def test_live_resolver_uses_fresh_pose_and_never_emits_zero_or_subfloor_goals() 
 
     outside_resolution = {
         **segment["start_map"],
-        "yaw": heading - 0.0601,
+        "yaw": heading - 0.0901,
     }
     resolved_outside = module.resolve_live_primitive(
         plan,
@@ -430,7 +433,7 @@ def test_heading_tolerance_cannot_consume_reserved_path_clearance() -> None:
     module = _planner()
     navfn_path = _astar_fixture_navfn_path(module, START, GOAL)
     plan_kwargs = _plan_kwargs()
-    plan_kwargs["max_segment_m"] = 0.84
+    plan_kwargs["max_segment_m"] = 0.56
 
     with pytest.raises(
         ValueError,

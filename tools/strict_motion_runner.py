@@ -44,7 +44,12 @@ OFFICIAL_SPIN_MIN_RPS = 0.10
 # opens successive pure-rotation references at 0.30 rad, so 0.30 / 0.20 =
 # 1.50 s remains outside the pinned 44-frame / 30 Hz planner clip horizon.
 OFFICIAL_SPIN_MAX_RPS = 0.20
-DETOUR_HEADING_TOLERANCE_RAD = 0.06
+# Live corridor-column r142 showed that separate +/-0.07..0.08 rad Spin goals
+# cause learned whole-body overshoot and counter-correction instead of useful
+# path progress.  Pair a 0.09 rad resolution with 0.50 m segments: the maximum
+# uncorrected cross-track drift is 0.50*sin(0.09)=0.04494 m, no larger than the
+# previous 0.75*sin(0.06)=0.04497 m and still below the reserved 0.05 m.
+DETOUR_HEADING_TOLERANCE_RAD = 0.09
 # The command values above are NVIDIA/Nav2 setpoints and remain unchanged. Live
 # r18 evidence measured 0.2913 m over 6.964 s of commanded reverse motion
 # (0.04183 m/s), while an earlier isolated physics run measured about 0.0507
@@ -2965,6 +2970,20 @@ class StrictMotionCaseExecutor:
                         self._diagnostic_phase = (
                             f"detour_segment_{primitive_index}_realign_{realignment_count}"
                         )
+                    elif (
+                        isinstance(_primitive, Mapping)
+                        and _primitive.get("kind") == "spin"
+                        and resolved.get("disposition")
+                        == "skip_within_heading_tolerance"
+                    ):
+                        # Alignment checkpoints are deliberately present before
+                        # every DriveOnHeading so fresh odometry can request a
+                        # correction after drift.  When the measured heading is
+                        # already within the reviewed resolution there is no
+                        # physical action to execute; the following Drive
+                        # checkpoint samples again and will request the same
+                        # Spin if the pose moved in the meantime.
+                        break
                     elif resolved.get("disposition") != "send_action":
                         raise StrictMotionRunnerError(
                             "locked detour checkpoint resolved to a skip; a new reviewed plan is required"

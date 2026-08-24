@@ -52,12 +52,14 @@ _MOTION_PROFILE_MANIFEST = (
 )
 _OFFICE_FORWARD_PATH = [
     (-6.45, 0.0),
+    (-6.75, -0.06),
     (-7.075, -0.125),
     (-7.30, -0.30),
 ]
 _OFFICE_REVERSE_PATH = [
     (-7.30, -0.30),
     (-7.075, -0.125),
+    (-6.75, -0.06),
     (-6.45, 0.0),
 ]
 _OFFICE_OBSTACLES = [
@@ -489,6 +491,21 @@ def _rebuild_detour_trace(
 ) -> None:
     if final_yaw is None:
         final_yaw = float(trace["action"]["goal"]["yaw"])
+    # Execute the production segmenter's endpoints, not the sparse NavFn
+    # fixture poses.  The production planner may shorten its maximum segment
+    # while retaining the exact NavFn path provenance.
+    static_plan = trace.get("staticPrimitivePlan")
+    if isinstance(static_plan, dict) and isinstance(
+        static_plan.get("segments"), list
+    ):
+        plan_segments = static_plan["segments"]
+        if plan_segments:
+            first_start = plan_segments[0]["start_map"]
+            path = [(float(first_start["x"]), float(first_start["y"]))]
+            path.extend(
+                (float(segment["end_map"]["x"]), float(segment["end_map"]["y"]))
+                for segment in plan_segments
+            )
     task_start_tick = 80_000
     cursor_tick = task_start_tick
     current_yaw = initial_yaw
@@ -539,7 +556,10 @@ def _rebuild_detour_trace(
         spin_delta = _angle_delta(heading, current_yaw)
         spin_sequence = 2 * path_segment_index
         drive_sequence = spin_sequence + 1
-        if abs(spin_delta) > 1e-6:
+        if (
+            abs(spin_delta)
+            > strict.FormalContract().detour_heading_tolerance_rad
+        ):
             correction_count = (
                 first_drive_realignment_spins if path_segment_index == 0 else 0
             )
