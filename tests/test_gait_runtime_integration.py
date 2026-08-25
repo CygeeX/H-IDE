@@ -19,6 +19,7 @@ from hide_mujoco_sonic.ros_bridge import (
     _gait_observation_timeout_s,
     _intent_payload,
     _observe_health_reference_authority,
+    _retain_sonic_on_automatic_fault_enabled,
     _ros_stamp_in_monotonic_domain,
 )
 from hide_mujoco_sonic.motion_fault import (
@@ -76,6 +77,21 @@ def test_gait_observation_timeout_matches_atomic_capture_validity() -> None:
     for value in (True, 0, -1, float("nan"), float("inf"), None):
         with pytest.raises(ValueError, match="finite and positive"):
             _gait_observation_timeout_s(value)
+
+
+def test_automatic_fault_experiment_environment_is_explicit_and_reversible() -> None:
+    assert _retain_sonic_on_automatic_fault_enabled({}) is False
+    assert _retain_sonic_on_automatic_fault_enabled(
+        {"HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT": "0"}
+    ) is False
+    assert _retain_sonic_on_automatic_fault_enabled(
+        {"HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT": "1"}
+    ) is True
+    for invalid in ("", "true", "yes", "2", " 1"):
+        with pytest.raises(ValueError, match="must be exactly 0 or 1"):
+            _retain_sonic_on_automatic_fault_enabled(
+                {"HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT": invalid}
+            )
 
 
 def test_motion_observation_survives_one_bounded_capture_miss_but_not_500ms() -> None:
@@ -2699,7 +2715,7 @@ def test_activation_routes_admitted_heading_only_through_planner_state() -> None
         # This intermediate raw sample is below the gate threshold and must
         # not influence the final planner evidence.
         MovementIntent("SLOW_WALK", 0.2, 0.0, 0.12, True, False),
-        MovementIntent("SLOW_WALK", 0.2, 0.0, 0.41, True, False),
+        MovementIntent("SLOW_WALK", 0.2, 0.0, 0.48, True, False),
     ]
     driver.guard = SimpleNamespace(
         intent=lambda **_kwargs: intents.pop(0),
@@ -2712,12 +2728,12 @@ def test_activation_routes_admitted_heading_only_through_planner_state() -> None
 
     assert first.facing_angle_rad == pytest.approx(0.10)
     assert rejected.facing_angle_rad == pytest.approx(0.12)
-    assert latest.facing_angle_rad == pytest.approx(0.41)
+    assert latest.facing_angle_rad == pytest.approx(0.48)
     assert driver._intent_gate.last is latest
     assert controller.controller.reinit_heading is True
     assert controller.controller.delta_heading == 0.0
     assert driver._pending_decoder_heading_delta_rad == pytest.approx(0.0)
-    assert controller.ms.facing_angle == pytest.approx(0.41)
+    assert controller.ms.facing_angle == pytest.approx(0.48)
     assert evidence.intent_generation == 0
     assert driver._reference_request_pending is False
 
@@ -2776,7 +2792,7 @@ def test_same_spin_replan_preserves_vendor_cursor_instead_of_rebasing_measured_h
     """A cumulative Spin goal must stay in one planner reference frame.
 
     The live r128 failure requested a fresh measured reference for every
-    0.30-rad facing segment.  The measured rebase resets planner heading to
+    0.375-rad facing segment. The measured rebase resets planner heading to
     zero, so the next cumulative target repeats the yaw already executed.  The
     first segment remains a fresh transaction; every later segment of the same
     action must use the vendor's frozen-cursor continuous transaction.
@@ -2802,7 +2818,7 @@ def test_same_spin_replan_preserves_vendor_cursor_instead_of_rebasing_measured_h
     driver._controller = controller
     intents = [
         MovementIntent("SLOW_WALK", 0.0, 0.052, 0.052, False, False),
-        MovementIntent("SLOW_WALK", 0.0, 0.356, 0.356, False, False),
+        MovementIntent("SLOW_WALK", 0.0, 0.432, 0.432, False, False),
     ]
     driver.guard = SimpleNamespace(
         intent=lambda **_kwargs: intents.pop(0),
@@ -2828,7 +2844,7 @@ def test_same_spin_replan_preserves_vendor_cursor_instead_of_rebasing_measured_h
     )
 
     second = driver._apply_intent(0.02, simulation_now_s=1.40)
-    assert second.facing_angle_rad == pytest.approx(0.356)
+    assert second.facing_angle_rad == pytest.approx(0.432)
     assert driver._reference_request_continuous_motion is True
     assert driver._vendor_revoke_pending is False
     assert driver._reference_authority.snapshot.phase == "REQUIRED"
@@ -2874,7 +2890,7 @@ def test_zero_command_waits_for_inflight_motion_refresh_then_enters_learned_idle
     driver._controller = controller
 
     first = MovementIntent("SLOW_WALK", 0.0, 0.052, 0.052, False, False)
-    second = MovementIntent("SLOW_WALK", 0.0, 0.356, 0.356, False, False)
+    second = MovementIntent("SLOW_WALK", 0.0, 0.432, 0.432, False, False)
     intents = [first, second]
     driver.guard = SimpleNamespace(
         intent=lambda **_kwargs: intents.pop(0),

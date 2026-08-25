@@ -311,10 +311,11 @@ def _wrap_angle(value: float) -> float:
         "motion_timeout_s",
     ),
     (
-        # Exact direction-dependent SLOW_WALK speeds from NVIDIA's pinned
-        # ROS2 input handler: forward=.30, lateral=.35, backward=.20 m/s.
-        ("forward_1m", 0.30, 0.0, 0.0, True, (1.0, 0.0), 0, 1.0, 30.0),
-        ("forward_3m", 0.30, 0.0, 0.0, True, (1.0, 0.0), 0, 3.0, 60.0),
+        # The workstation fast profile uses NVIDIA's official gamepad default
+        # SLOW_WALK speed for forward travel; lateral/reverse retain the pinned
+        # ROS2 input handler's direction-specific values.
+        ("forward_1m", 0.40, 0.0, 0.0, True, (1.0, 0.0), 0, 1.0, 30.0),
+        ("forward_3m", 0.40, 0.0, 0.0, True, (1.0, 0.0), 0, 3.0, 60.0),
         ("reverse", 0.20, math.pi, 0.0, True, (-1.0, 0.0), 0, 0.5, 30.0),
         (
             "reverse_early_stop",

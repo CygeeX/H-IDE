@@ -5,7 +5,7 @@
       "license": "CC0-1.0",
       "path": "assets/office_v2/generated/tex_01.png",
       "sha256": "bcd3025e9b33a32db4ffb3c3e15ec4684f0053c215e3ac9b155290914f01062d",
-      "source_revision": "office-v2-generator/3",
+      "source_revision": "office-v2-generator/4",
       "source_url": "generated://tools/build_scene.py",
       "third_party": false
     },
@@ -14,7 +14,7 @@
       "license": "CC0-1.0",
       "path": "assets/office_v2/generated/tex_02.png",
       "sha256": "a0e9402be6d6cf7c0a8e668917ccc8f39a8549928be4f0cdeb2c9983e61e9efc",
-      "source_revision": "office-v2-generator/3",
+      "source_revision": "office-v2-generator/4",
       "source_url": "generated://tools/build_scene.py",
       "third_party": false
     },
@@ -23,7 +23,7 @@
       "license": "CC0-1.0",
       "path": "assets/office_v2/generated/tex_03.png",
       "sha256": "77f6b1ec4077f3f7ebb7cb94d995c10be843c473323fbee67d59f8d7084a8c91",
-      "source_revision": "office-v2-generator/3",
+      "source_revision": "office-v2-generator/4",
       "source_url": "generated://tools/build_scene.py",
       "third_party": false
     },
@@ -31,8 +31,8 @@
       "attribution": "H-IDE Office V2 procedural textures, architectural dressing, and signs",
       "license": "CC0-1.0",
       "path": "assets/office_v2/generated/tex_04.png",
-      "sha256": "cc29905bfc685c8bf7e6d1714b822075c61a841976e14510a85201a1fdad91dc",
-      "source_revision": "office-v2-generator/3",
+      "sha256": "dfac91964200f02f5dd04c0405949ac95719e7bd077707f8cafe8af8d4c0f122",
+      "source_revision": "office-v2-generator/4",
       "source_url": "generated://tools/build_scene.py",
       "third_party": false
     },
@@ -40,8 +40,8 @@
       "attribution": "H-IDE Office V2 procedural textures, architectural dressing, and signs",
       "license": "CC0-1.0",
       "path": "assets/office_v2/generated/tex_05.png",
-      "sha256": "27cc4c2c9f75881f2a779760caa4cf88a4e8b3e7a5c562ee569b04a8cdbb38d0",
-      "source_revision": "office-v2-generator/3",
+      "sha256": "91a652def325494b1bee1341ce030ffb4c00f5c73e33cc0812e12686fdd16d5f",
+      "source_revision": "office-v2-generator/4",
       "source_url": "generated://tools/build_scene.py",
       "third_party": false
     },
@@ -49,8 +49,8 @@
       "attribution": "H-IDE Office V2 procedural textures, architectural dressing, and signs",
       "license": "CC0-1.0",
       "path": "assets/office_v2/generated/tex_06.png",
-      "sha256": "98eb4aaee92f1d058ad3635047b238b0babdfbe7335d1e58d28341d0be57be19",
-      "source_revision": "office-v2-generator/3",
+      "sha256": "5a1de1c6363bcf00056c35b465b15e2a72de8e0027b0b714e34883aa9d2fcdb5",
+      "source_revision": "office-v2-generator/4",
       "source_url": "generated://tools/build_scene.py",
       "third_party": false
     },
@@ -58,8 +58,8 @@
       "attribution": "H-IDE Office V2 procedural textures, architectural dressing, and signs",
       "license": "CC0-1.0",
       "path": "assets/office_v2/generated/tex_07.png",
-      "sha256": "2b1c301e894b47835c5c7d89748c375fdf5f53cff3391d1f8688d2b89f748172",
-      "source_revision": "office-v2-generator/3",
+      "sha256": "8122b94bd778af3e7509481036278b9a5294e8347d6a8a30f02216e12949faae",
+      "source_revision": "office-v2-generator/4",
       "source_url": "generated://tools/build_scene.py",
       "third_party": false
     },
@@ -68,7 +68,7 @@
       "license": "CC0-1.0",
       "path": "assets/office_v2/generated/tex_08.png",
       "sha256": "70d955589546de91208573f380ce36956af81ee4a15ccddf8206c75ee9f092e2",
-      "source_revision": "office-v2-generator/3",
+      "source_revision": "office-v2-generator/4",
       "source_url": "generated://tools/build_scene.py",
       "third_party": false
     },
@@ -76,8 +76,8 @@
       "attribution": "H-IDE Office V2 procedural textures, architectural dressing, and signs",
       "license": "CC0-1.0",
       "path": "assets/office_v2/generated/tex_09.png",
-      "sha256": "89088693ed897d25ad0b3779e508da424f6e3c97166cfdca7978406a745beb9b",
-      "source_revision": "office-v2-generator/3",
+      "sha256": "53e9e6c837c21891b80225cf21e96ed02f82c662a471209eb6dec2ad94d79b99",
+      "source_revision": "office-v2-generator/4",
       "source_url": "generated://tools/build_scene.py",
       "third_party": false
     },
@@ -85,10 +85,119 @@
       "attribution": "H-IDE Office V2 procedural textures, architectural dressing, and signs",
       "license": "CC0-1.0",
       "path": "assets/office_v2/generated/tex_10.png",
-      "sha256": "e80e4eafd570b1fd402e0e4183e0d3b0bfd2509563667639e8629848a8b0e803",
-      "source_revision": "office-v2-generator/3",
+      "sha256": "019f25e4e36d9d076d9e8da277dc5e4bebe970b819b6cb02a3b61fe458cf4b1b",
+      "source_revision": "office-v2-generator/4",
       "source_url": "generated://tools/build_scene.py",
       "third_party": false
+    },
+    {
+      "attribution": "Furniture Kit by Kenney (CC0)",
+      "license": "CC0-1.0",
+      "path": "assets/office_v2/third_party/kenney_furniture_kit/mesh_01.obj",
+      "sha256": "adc380163216870f8386bf15af63f12762713e4a3ba50956e7f3c41331708d61",
+      "source_archive_sha256": "e67652d0932cee41683f74711c03d3e192a2af9979ef8e6b237711f5482d46b0",
+      "source_member": "Models/DAE format/chairDesk.dae",
+      "source_revision": "2.0",
+      "source_url": "https://kenney.nl/assets/furniture-kit",
+      "third_party": true
+    },
+    {
+      "attribution": "Furniture Kit by Kenney (CC0)",
+      "license": "CC0-1.0",
+      "path": "assets/office_v2/third_party/kenney_furniture_kit/mesh_02.obj",
+      "sha256": "8847fe2fee0c8c47ed4562875f5f11c7316002826c6e2b80990504425e02759c",
+      "source_archive_sha256": "e67652d0932cee41683f74711c03d3e192a2af9979ef8e6b237711f5482d46b0",
+      "source_member": "Models/DAE format/loungeDesignSofa.dae",
+      "source_revision": "2.0",
+      "source_url": "https://kenney.nl/assets/furniture-kit",
+      "third_party": true
+    },
+    {
+      "attribution": "Furniture Kit by Kenney (CC0)",
+      "license": "CC0-1.0",
+      "path": "assets/office_v2/third_party/kenney_furniture_kit/mesh_03.obj",
+      "sha256": "0e532a55c294f752ed7686144d59ce9b4348c5a3fc29ac16b7e01a6238f0c0c2",
+      "source_archive_sha256": "e67652d0932cee41683f74711c03d3e192a2af9979ef8e6b237711f5482d46b0",
+      "source_member": "Models/DAE format/pottedPlant.dae",
+      "source_revision": "2.0",
+      "source_url": "https://kenney.nl/assets/furniture-kit",
+      "third_party": true
+    },
+    {
+      "attribution": "Furniture Kit by Kenney (CC0)",
+      "license": "CC0-1.0",
+      "path": "assets/office_v2/third_party/kenney_furniture_kit/mesh_04.obj",
+      "sha256": "75b659a4f7bfd5811985d9f269f01b9083b86e707ff5fa563161872ee3c180bd",
+      "source_archive_sha256": "e67652d0932cee41683f74711c03d3e192a2af9979ef8e6b237711f5482d46b0",
+      "source_member": "Models/DAE format/kitchenCoffeeMachine.dae",
+      "source_revision": "2.0",
+      "source_url": "https://kenney.nl/assets/furniture-kit",
+      "third_party": true
+    },
+    {
+      "attribution": "Furniture Kit by Kenney (CC0)",
+      "license": "CC0-1.0",
+      "path": "assets/office_v2/third_party/kenney_furniture_kit/mesh_05.obj",
+      "sha256": "ab07f9ceea07dc584c40a8c5e42ae04f9edcdb31baa797b27f436499c2a763e9",
+      "source_archive_sha256": "e67652d0932cee41683f74711c03d3e192a2af9979ef8e6b237711f5482d46b0",
+      "source_member": "Models/DAE format/kitchenFridge.dae",
+      "source_revision": "2.0",
+      "source_url": "https://kenney.nl/assets/furniture-kit",
+      "third_party": true
+    },
+    {
+      "attribution": "Furniture Kit by Kenney (CC0)",
+      "license": "CC0-1.0",
+      "path": "assets/office_v2/third_party/kenney_furniture_kit/mesh_06.obj",
+      "sha256": "f10f5eb97591f55889739f6bfa0f8502c397ca53042b612c75f05798a80ce20c",
+      "source_archive_sha256": "e67652d0932cee41683f74711c03d3e192a2af9979ef8e6b237711f5482d46b0",
+      "source_member": "Models/DAE format/bookcaseOpen.dae",
+      "source_revision": "2.0",
+      "source_url": "https://kenney.nl/assets/furniture-kit",
+      "third_party": true
+    },
+    {
+      "attribution": "Furniture Kit by Kenney (CC0)",
+      "license": "CC0-1.0",
+      "path": "assets/office_v2/third_party/kenney_furniture_kit/mesh_07.obj",
+      "sha256": "83523d66a1526162909ea0ab633fbd1655a93d87ca2b812745555537a0cc6bfe",
+      "source_archive_sha256": "e67652d0932cee41683f74711c03d3e192a2af9979ef8e6b237711f5482d46b0",
+      "source_member": "Models/DAE format/cardboardBoxClosed.dae",
+      "source_revision": "2.0",
+      "source_url": "https://kenney.nl/assets/furniture-kit",
+      "third_party": true
+    },
+    {
+      "attribution": "Furniture Kit by Kenney (CC0)",
+      "license": "CC0-1.0",
+      "path": "assets/office_v2/third_party/kenney_furniture_kit/mesh_08.obj",
+      "sha256": "afaa6be5b574ea6d81b637c5624c6a684d73cfaf8ce680ca6be91df94e1533f4",
+      "source_archive_sha256": "e67652d0932cee41683f74711c03d3e192a2af9979ef8e6b237711f5482d46b0",
+      "source_member": "Models/DAE format/laptop.dae",
+      "source_revision": "2.0",
+      "source_url": "https://kenney.nl/assets/furniture-kit",
+      "third_party": true
+    },
+    {
+      "attribution": "Furniture Kit by Kenney (CC0)",
+      "license": "CC0-1.0",
+      "path": "assets/office_v2/third_party/kenney_furniture_kit/mesh_09.obj",
+      "sha256": "ff1cae31cea508dec27ab99cb5ca9d06afe50dee4a572cb9d2358125e6e2cac7",
+      "source_archive_sha256": "e67652d0932cee41683f74711c03d3e192a2af9979ef8e6b237711f5482d46b0",
+      "source_member": "Models/DAE format/trashcan.dae",
+      "source_revision": "2.0",
+      "source_url": "https://kenney.nl/assets/furniture-kit",
+      "third_party": true
+    },
+    {
+      "attribution": "Furniture Kit by Kenney (CC0)",
+      "content_type": "license",
+      "license": "CC0-1.0",
+      "path": "assets/office_v2/third_party/kenney_furniture_kit/LICENSE.txt",
+      "sha256": "bc0de1a0742cb490f9ed4bae0bd284286ebb27e23149b9917c7d8c0d590b8b29",
+      "source_revision": "2.0",
+      "source_url": "https://kenney.nl/assets/furniture-kit",
+      "third_party": true
     }
   ],
   "design_references_only_no_files_copied": [
@@ -122,7 +231,20 @@
     }
   ],
   "scene_id": "office_v2",
-  "scene_source_sha256": "76ee5cd945aab28f034075eab65e5e104085c904048bf2d7085495796b46c379",
+  "scene_source_sha256": "7c30b7c4bb3e8136659688c80b8bef97724aae79aa7fd0f82deb96b227ca98ff",
   "schema_version": "h-ide.asset-licenses/1",
-  "third_party_assets": []
+  "third_party_assets": [
+    {
+      "attribution": "Furniture Kit by Kenney (CC0)",
+      "download_url": "https://kenney.nl/media/pages/assets/furniture-kit/440e0608a4-1677580847/kenney_furniture-kit.zip",
+      "id": "kenney_furniture_kit",
+      "license": "CC0-1.0",
+      "license_path": "assets/office_v2/third_party/kenney_furniture_kit/LICENSE.txt",
+      "license_sha256": "bc0de1a0742cb490f9ed4bae0bd284286ebb27e23149b9917c7d8c0d590b8b29",
+      "project": "Kenney Furniture Kit",
+      "source_archive_sha256": "e67652d0932cee41683f74711c03d3e192a2af9979ef8e6b237711f5482d46b0",
+      "source_url": "https://kenney.nl/assets/furniture-kit",
+      "version": "2.0"
+    }
+  ]
 }

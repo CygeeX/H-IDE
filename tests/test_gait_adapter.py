@@ -957,6 +957,165 @@ def test_tilt_and_non_finite_observations_fail_closed(bad_event: BaseObservation
     assert fault.motion_enabled is False
 
 
+def test_simulation_tilt_experiment_retains_sonic_motion_authority() -> None:
+    adapter = armed_adapter(
+        config=GaitAdapterConfig(
+            command_timeout_s=5.0,
+            observation_timeout_s=5.0,
+            trip_on_excessive_tilt=False,
+        )
+    )
+    starting = adapter.ingest_twist(twist(10.02, vx=0.2), now=10.02)
+    grant_reference(adapter, starting)
+
+    walking = adapter.ingest_observation(
+        observation(10.03, vx=0.06, x=0.002, roll=0.70),
+        now=10.03,
+    )
+    assert walking.state == "WALKING"
+    assert walking.motion_enabled is True
+    assert walking.stop_requested is False
+
+    still_walking = adapter.ingest_observation(
+        observation(10.05, vx=0.06, x=0.004, pitch=-0.80),
+        now=10.05,
+    )
+    assert still_walking.state == "WALKING"
+    assert still_walking.motion_enabled is True
+    assert still_walking.stop_requested is False
+
+
+def test_simulation_tilt_experiment_keeps_non_finite_observation_hard_fault() -> None:
+    adapter = armed_adapter(
+        config=GaitAdapterConfig(trip_on_excessive_tilt=False)
+    )
+    adapter.ingest_twist(twist(10.015, vx=0.2), now=10.015)
+    fault = adapter.ingest_observation(
+        observation(10.02, vx=math.nan, roll=0.70),
+        now=10.02,
+    )
+    assert fault.state == "FAULT"
+    assert fault.motion_enabled is False
+    assert fault.stop_requested is True
+
+
+def test_simulation_tilt_experiment_switch_requires_boolean() -> None:
+    with pytest.raises(ValueError, match="trip_on_excessive_tilt"):
+        GaitAdapterConfig(trip_on_excessive_tilt=1)  # type: ignore[arg-type]
+
+
+def test_uninterrupted_simulation_retains_last_valid_motion_on_automatic_faults() -> None:
+    adapter = armed_adapter(
+        config=GaitAdapterConfig(
+            command_timeout_s=0.05,
+            observation_timeout_s=5.0,
+            trip_on_excessive_tilt=False,
+            trip_on_automatic_fault=False,
+        )
+    )
+    starting = adapter.ingest_twist(twist(10.02, vx=0.2), now=10.02)
+    grant_reference(adapter, starting)
+    walking = adapter.ingest_observation(
+        observation(10.03, vx=0.06, x=0.002),
+        now=10.03,
+    )
+    assert walking.state == "WALKING"
+
+    stale = adapter.tick(now=10.09)
+    assert stale.state == "WALKING"
+    assert stale.motion_enabled is True
+    assert stale.velocity_x_mps == pytest.approx(0.2)
+    assert stale.stop_requested is False
+    assert adapter.last_automatic_fault_reason == "Nav2 velocity command became stale"
+
+    invalid_observation = adapter.ingest_observation(
+        observation(10.10, vx=math.nan),
+        now=10.10,
+    )
+    assert invalid_observation.state == "WALKING"
+    assert invalid_observation.motion_enabled is True
+    assert adapter.automatic_fault_count >= 2
+
+
+def test_uninterrupted_simulation_never_masks_explicit_cancel() -> None:
+    adapter = armed_adapter(
+        config=GaitAdapterConfig(
+            command_timeout_s=5.0,
+            observation_timeout_s=5.0,
+            trip_on_automatic_fault=False,
+        )
+    )
+    starting = adapter.ingest_twist(twist(10.02, vx=0.2), now=10.02)
+    grant_reference(adapter, starting)
+    adapter.ingest_observation(
+        observation(10.03, vx=0.06, x=0.002),
+        now=10.03,
+    )
+
+    cancelled = adapter.cancel(1, 10.04, now=10.04)
+    assert cancelled.state == "STOPPING"
+    assert cancelled.motion_enabled is False
+    assert cancelled.stop_requested is True
+    assert "cancelled" in (cancelled.reason or "")
+
+
+def test_uninterrupted_simulation_retains_start_and_direction_faults() -> None:
+    adapter = armed_adapter(
+        config=GaitAdapterConfig(
+            command_timeout_s=5.0,
+            observation_timeout_s=5.0,
+            start_timeout_s=0.05,
+            trip_on_excessive_tilt=False,
+            trip_on_automatic_fault=False,
+        )
+    )
+    starting = adapter.ingest_twist(twist(10.02, vx=0.2), now=10.02)
+    grant_reference(adapter, starting)
+
+    unacknowledged = adapter.tick(now=10.08)
+    assert unacknowledged.state == "STARTING"
+    assert unacknowledged.motion_enabled is True
+    assert "acknowledge gait start" in (
+        adapter.last_automatic_fault_reason or ""
+    )
+
+    opposite = adapter.ingest_observation(
+        observation(10.09, x=-0.31, vx=0.06),
+        now=10.09,
+    )
+    assert opposite.state == "WALKING"
+    assert opposite.motion_enabled is True
+    assert opposite.stop_requested is False
+    assert "opposes Nav2" in (adapter.last_automatic_fault_reason or "")
+
+
+def test_uninterrupted_simulation_never_masks_explicit_safe_stop() -> None:
+    adapter = armed_adapter(
+        config=GaitAdapterConfig(
+            command_timeout_s=5.0,
+            observation_timeout_s=5.0,
+            trip_on_automatic_fault=False,
+        )
+    )
+    starting = adapter.ingest_twist(twist(10.02, vx=0.2), now=10.02)
+    grant_reference(adapter, starting)
+    adapter.ingest_observation(
+        observation(10.03, vx=0.06, x=0.002),
+        now=10.03,
+    )
+
+    stopped = adapter.request_safe_stop(1, now=10.04)
+    assert stopped.state == "STOPPING"
+    assert stopped.motion_enabled is False
+    assert stopped.stop_requested is True
+    assert "safe-stop" in (stopped.reason or "")
+
+
+def test_uninterrupted_simulation_switch_requires_boolean() -> None:
+    with pytest.raises(ValueError, match="trip_on_automatic_fault"):
+        GaitAdapterConfig(trip_on_automatic_fault=1)  # type: ignore[arg-type]
+
+
 def test_non_finite_or_non_nav2_command_fails_closed() -> None:
     adapter = armed_adapter()
     fault = adapter.ingest_twist(twist(10.02, vx=math.nan), now=10.02)

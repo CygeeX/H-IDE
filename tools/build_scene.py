@@ -9,10 +9,11 @@ intentionally emits three different trust domains from that inventory:
 * ``evaluation/manifest.json`` contains privileged semantic ground truth and
   must never be mounted into a product service.
 
-No downloaded mesh or texture is required.  The small PNG textures and the
-lightweight architectural dressing are generated deterministically with the
-Python standard library.  Detailed visual dressing deliberately keeps simple
-collision proxies so perception fidelity cannot perturb navigation physics.
+The small PNG textures are generated deterministically with the Python
+standard library.  A curated set of normalized CC0 furniture meshes is copied
+from the repository's pinned third-party asset directory.  Detailed visual
+dressing deliberately keeps simple collision proxies so perception fidelity
+cannot perturb navigation physics.
 """
 
 from __future__ import annotations
@@ -35,8 +36,8 @@ from typing import Any, Iterable, Mapping, Sequence
 import yaml
 
 
-BUILD_VERSION = "office-v2-generator/3"
-SCHEMA_VERSION = "h-ide.office-scene/3"
+BUILD_VERSION = "office-v2-generator/4"
+SCHEMA_VERSION = "h-ide.office-scene/4"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SCENE = REPO_ROOT / "scenes" / "office_v2" / "scene.yaml"
 SUPPORTED_TEMPLATES = {
@@ -57,8 +58,10 @@ SUPPORTED_TEMPLATES = {
     "sofa",
     "whiteboard",
     "waste_bin",
+    "imported_mesh",
 }
 ID_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
+SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
 class SceneBuildError(ValueError):
@@ -232,6 +235,89 @@ def _validate_scene(scene: Mapping[str, Any]) -> None:
         if any(channel < 0 or channel > 1 for channel in rgba):
             raise SceneBuildError(f"materials.{material_id}.rgba must be normalized")
 
+    provenance = scene.get("provenance")
+    if not isinstance(provenance, Mapping):
+        raise SceneBuildError("provenance must be an object")
+    third_party_assets = provenance.get("third_party_assets")
+    if not isinstance(third_party_assets, list):
+        raise SceneBuildError("provenance.third_party_assets must be an array")
+    third_party_by_id: dict[str, Mapping[str, Any]] = {}
+    for asset in third_party_assets:
+        if not isinstance(asset, Mapping):
+            raise SceneBuildError("third-party asset entries must be objects")
+        asset_id = asset.get("id")
+        if not isinstance(asset_id, str) or not ID_PATTERN.fullmatch(asset_id):
+            raise SceneBuildError(f"invalid third-party asset ID: {asset_id!r}")
+        if asset_id in third_party_by_id:
+            raise SceneBuildError(f"duplicate third-party asset ID: {asset_id}")
+        if asset.get("license") != "CC0-1.0":
+            raise SceneBuildError(f"third-party asset {asset_id} must be CC0-1.0")
+        archive_sha = asset.get("source_archive_sha256")
+        license_sha = asset.get("license_sha256")
+        if not isinstance(archive_sha, str) or not SHA256_PATTERN.fullmatch(archive_sha):
+            raise SceneBuildError(f"third-party asset {asset_id} archive SHA-256 is invalid")
+        if not isinstance(license_sha, str) or not SHA256_PATTERN.fullmatch(license_sha):
+            raise SceneBuildError(f"third-party asset {asset_id} license SHA-256 is invalid")
+        license_relative = Path(str(asset.get("license_path", "")))
+        if license_relative.is_absolute() or license_relative.parts[:3] != (
+            "assets",
+            "office_v2",
+            "third_party",
+        ):
+            raise SceneBuildError(f"third-party asset {asset_id} license path is outside the asset boundary")
+        license_path = (REPO_ROOT / license_relative).resolve()
+        try:
+            license_path.relative_to(REPO_ROOT / "assets" / "office_v2" / "third_party")
+        except ValueError as exc:
+            raise SceneBuildError(
+                f"third-party asset {asset_id} license path escapes the asset boundary"
+            ) from exc
+        if not license_path.is_file() or _sha256_path(license_path) != license_sha:
+            raise SceneBuildError(f"third-party asset {asset_id} license file is missing or changed")
+        third_party_by_id[asset_id] = asset
+
+    mesh_assets = scene.get("mesh_assets")
+    if not isinstance(mesh_assets, list) or not mesh_assets:
+        raise SceneBuildError("mesh_assets must be a non-empty array")
+    mesh_by_id: dict[str, Mapping[str, Any]] = {}
+    for mesh in mesh_assets:
+        if not isinstance(mesh, Mapping):
+            raise SceneBuildError("mesh asset entries must be objects")
+        mesh_id = mesh.get("id")
+        if not isinstance(mesh_id, str) or not ID_PATTERN.fullmatch(mesh_id):
+            raise SceneBuildError(f"invalid mesh asset ID: {mesh_id!r}")
+        if mesh_id in mesh_by_id:
+            raise SceneBuildError(f"duplicate mesh asset ID: {mesh_id}")
+        if mesh.get("source_asset") not in third_party_by_id:
+            raise SceneBuildError(f"mesh asset {mesh_id} references an unknown source asset")
+        if not isinstance(mesh.get("source_member"), str) or not mesh["source_member"].strip():
+            raise SceneBuildError(f"mesh asset {mesh_id} source member is invalid")
+        mesh_sha = mesh.get("sha256")
+        if not isinstance(mesh_sha, str) or not SHA256_PATTERN.fullmatch(mesh_sha):
+            raise SceneBuildError(f"mesh asset {mesh_id} SHA-256 is invalid")
+        relative = Path(str(mesh.get("path", "")))
+        if relative.is_absolute() or relative.parts[:3] != (
+            "assets",
+            "office_v2",
+            "third_party",
+        ):
+            raise SceneBuildError(f"mesh asset {mesh_id} path is outside the asset boundary")
+        source_path = (REPO_ROOT / relative).resolve()
+        try:
+            source_path.relative_to(REPO_ROOT / "assets" / "office_v2" / "third_party")
+        except ValueError as exc:
+            raise SceneBuildError(f"mesh asset {mesh_id} path escapes the asset boundary") from exc
+        if not source_path.is_file() or _sha256_path(source_path) != mesh_sha:
+            raise SceneBuildError(f"mesh asset {mesh_id} file is missing or changed")
+        mesh_by_id[mesh_id] = mesh
+
+    template_meshes = scene.get("template_meshes")
+    if not isinstance(template_meshes, Mapping):
+        raise SceneBuildError("template_meshes must be an object")
+    for template, mesh_id in template_meshes.items():
+        if template not in SUPPORTED_TEMPLATES or mesh_id not in mesh_by_id:
+            raise SceneBuildError(f"template mesh mapping {template!r} is invalid")
+
     all_ids: set[str] = set()
     for group in (
         "structures",
@@ -297,6 +383,11 @@ def _validate_scene(scene: Mapping[str, Any]) -> None:
             raise SceneBuildError(f"object {item['id']} uses unsupported visual template")
         if visual.get("material") not in material_ids:
             raise SceneBuildError(f"object {item['id']} references an unknown material")
+        effective_mesh = visual.get("mesh_asset", template_meshes.get(visual.get("template")))
+        if effective_mesh is not None and effective_mesh not in mesh_by_id:
+            raise SceneBuildError(f"object {item['id']} references an unknown mesh asset")
+        if visual.get("template") == "imported_mesh" and "mesh_asset" not in visual:
+            raise SceneBuildError(f"object {item['id']} imported mesh must be explicit")
         collision = item["collision"]
         if collision.get("shape") not in {"box", "circle", "none"}:
             raise SceneBuildError(f"object {item['id']} has unsupported collision shape")
@@ -504,16 +595,32 @@ class MjcfBuilder:
     def add(self, indent: int, text: str) -> None:
         self.lines.append("  " * indent + text)
 
-    def geom(self, indent: int, name: str, *, geom_type: str, pos: Sequence[float], size: Sequence[float], material: str | None = None, collision: bool = False, euler: Sequence[float] | None = None, rgba: Sequence[float] | None = None) -> None:
+    def geom(
+        self,
+        indent: int,
+        name: str,
+        *,
+        geom_type: str,
+        pos: Sequence[float],
+        size: Sequence[float] | None = None,
+        mesh: str | None = None,
+        material: str | None = None,
+        collision: bool = False,
+        euler: Sequence[float] | None = None,
+        rgba: Sequence[float] | None = None,
+    ) -> None:
         attributes: dict[str, Any] = {
             "name": name,
             "type": geom_type,
             "pos": _vec(pos),
-            "size": _vec(size),
             "contype": "1" if collision else "0",
             "conaffinity": "1" if collision else "0",
             "group": "3" if collision else "2",
         }
+        if size is not None:
+            attributes["size"] = _vec(size)
+        if mesh is not None:
+            attributes["mesh"] = mesh
         if collision:
             attributes["rgba"] = "0 0 0 0"
             attributes["friction"] = "0.85 0.02 0.001"
@@ -548,6 +655,21 @@ class MjcfBuilder:
         def cylinder(pos: Sequence[float], radius: float, component_height: float, mat: str = material, euler: Sequence[float] | None = None) -> None:
             names.append(self.visual_cylinder(indent, prefix, len(names) + 1, pos, radius, component_height, mat, euler=euler))
 
+        mesh_asset = item["visual"].get(
+            "mesh_asset", self.scene["template_meshes"].get(template)
+        )
+        if mesh_asset is not None:
+            name = f"{prefix}_visual_01"
+            self.geom(
+                indent,
+                name,
+                geom_type="mesh",
+                pos=[0, 0, 0],
+                mesh=f"{prefix}_mesh",
+                material=material,
+            )
+            return [name]
+
         if template == "column":
             cylinder([0, 0, height / 2], width / 2, height)
             cylinder([0, 0, 0.08], width * 0.58, 0.16, "charcoal")
@@ -577,7 +699,16 @@ class MjcfBuilder:
             box([0, 0.01, height / 2], [width, depth, height], "charcoal")
             box([0, -depth * 0.53, height / 2], [width * 0.91, depth * 0.10, height * 0.84], material)
         elif template == "sign":
-            box([0, 0, height / 2], [width, depth, height], material)
+            name = f"{prefix}_visual_{len(names) + 1:02d}"
+            self.geom(
+                indent,
+                name,
+                geom_type="mesh",
+                pos=[0, 0, 0],
+                mesh=f"{prefix}_sign_surface",
+                material=material,
+            )
+            names.append(name)
             box([0, depth * 0.52, height / 2], [width * 1.04, depth * 0.15, height * 1.08], "brushed_metal")
         elif template == "cup":
             cylinder([0, 0, height / 2], width * 0.42, height)
@@ -678,6 +809,33 @@ class MjcfBuilder:
         for texture in self.scene["textures"]:
             texture_id = texture["id"]
             self.add(2, f'<texture name="office_v2_{texture_id}" type="2d" file="textures/{texture_id}.png"/>')
+        template_meshes = self.scene["template_meshes"]
+        for index, item in enumerate(self.scene["objects"], start=1):
+            template = item["visual"]["template"]
+            mesh_id = item["visual"].get("mesh_asset", template_meshes.get(template))
+            prefix = f"office_fixture_{index:03d}"
+            if mesh_id is not None:
+                mesh_file = (
+                    "../../../../scenes/office_v2/generated/mujoco/meshes/"
+                    f"{mesh_id}.obj"
+                )
+                self.add(
+                    2,
+                    f'<mesh name="{prefix}_mesh" file="{mesh_file}" '
+                    f'scale="{_vec(item["dimensions"])}"/>',
+                )
+            if template == "sign":
+                width, depth, height = [float(axis) for axis in item["dimensions"]]
+                self.add(
+                    2,
+                    f'<mesh name="{prefix}_sign_surface" '
+                    'vertex="-0.5 -0.5 0 0.5 -0.5 0 0.5 -0.5 1 -0.5 -0.5 1 '
+                    '-0.5 0.5 0 0.5 0.5 0 0.5 0.5 1 -0.5 0.5 1" '
+                    'texcoord="0 1 1 1 1 0 0 0 1 1 0 1 0 0 1 0" '
+                    'face="0 1 2 0 2 3 4 7 6 4 6 5 0 4 5 0 5 1 '
+                    '3 2 6 3 6 7 0 3 7 0 7 4 1 5 6 1 6 2" '
+                    f'scale="{_vec([width, depth * 0.30, height])}"/>',
+                )
         for material_id, material in self.scene["materials"].items():
             attributes: dict[str, Any] = {"name": f"office_v2_mat_{material_id}", "rgba": _vec(material["rgba"])}
             if "texture" in material:
@@ -921,7 +1079,13 @@ def _asset_label(texture_id: str) -> str:
     return f"assets/office_v2/generated/{texture_id}.png"
 
 
-def _output_inventory(paths: BuildPaths, texture_ids: Sequence[str]) -> list[tuple[str, Path]]:
+def _mesh_source_path(mesh: Mapping[str, Any]) -> Path:
+    return (REPO_ROOT / str(mesh["path"])).resolve()
+
+
+def _output_inventory(
+    paths: BuildPaths, scene: Mapping[str, Any]
+) -> list[tuple[str, Path]]:
     inventory = [
         ("scenes/office_v2/generated/mujoco/office_v2.include.xml", paths.generated / "mujoco" / "office_v2.include.xml"),
         ("scenes/office_v2/generated/mujoco/office_v2.preview.xml", paths.generated / "mujoco" / "office_v2.preview.xml"),
@@ -934,9 +1098,22 @@ def _output_inventory(paths: BuildPaths, texture_ids: Sequence[str]) -> list[tup
         ("scenes/office_v2/evaluation/manifest.json", paths.evaluation / "manifest.json"),
         ("assets/office_v2/ASSET_LICENSES.json", paths.assets.parent / "ASSET_LICENSES.json"),
     ]
-    for texture_id in texture_ids:
+    for texture in scene["textures"]:
+        texture_id = texture["id"]
         inventory.append((_asset_label(texture_id), paths.assets / f"{texture_id}.png"))
         inventory.append((f"scenes/office_v2/generated/mujoco/textures/{texture_id}.png", paths.generated / "mujoco" / "textures" / f"{texture_id}.png"))
+    for mesh in scene["mesh_assets"]:
+        inventory.append((str(mesh["path"]), _mesh_source_path(mesh)))
+        inventory.append(
+            (
+                f"scenes/office_v2/generated/mujoco/meshes/{mesh['id']}.obj",
+                paths.generated / "mujoco" / "meshes" / f"{mesh['id']}.obj",
+            )
+        )
+    for asset in scene["provenance"]["third_party_assets"]:
+        inventory.append(
+            (str(asset["license_path"]), (REPO_ROOT / str(asset["license_path"])).resolve())
+        )
     return inventory
 
 
@@ -950,6 +1127,13 @@ def build_scene(paths: BuildPaths | None = None) -> dict[str, str]:
         texture_hashes[texture_id] = _sha256_bytes(png)
         _atomic_write(paths.assets / f"{texture_id}.png", png)
         _atomic_write(paths.generated / "mujoco" / "textures" / f"{texture_id}.png", png)
+
+    mesh_hashes: dict[str, str] = {}
+    for mesh in scene["mesh_assets"]:
+        mesh_id = mesh["id"]
+        data = _mesh_source_path(mesh).read_bytes()
+        mesh_hashes[mesh_id] = _sha256_bytes(data)
+        _atomic_write(paths.generated / "mujoco" / "meshes" / f"{mesh_id}.obj", data)
 
     mjcf_builder = MjcfBuilder(scene, source_sha)
     mjcf, mappings = mjcf_builder.build()
@@ -1100,24 +1284,56 @@ def build_scene(paths: BuildPaths | None = None) -> dict[str, str]:
 
     provenance = scene["provenance"]
     generated_provenance = provenance["generated_assets"]
+    asset_license_entries = [
+        {
+            "path": _asset_label(texture["id"]),
+            "sha256": texture_hashes[texture["id"]],
+            "source_url": generated_provenance["source_url"],
+            "source_revision": generated_provenance["source_revision"],
+            "license": generated_provenance["license"],
+            "attribution": generated_provenance["attribution"],
+            "third_party": False,
+        }
+        for texture in scene["textures"]
+    ]
+    third_party_by_id = {
+        asset["id"]: asset for asset in provenance["third_party_assets"]
+    }
+    for mesh in scene["mesh_assets"]:
+        source = third_party_by_id[mesh["source_asset"]]
+        asset_license_entries.append(
+            {
+                "path": mesh["path"],
+                "sha256": mesh_hashes[mesh["id"]],
+                "source_url": source["source_url"],
+                "source_revision": source["version"],
+                "source_archive_sha256": source["source_archive_sha256"],
+                "source_member": mesh["source_member"],
+                "license": source["license"],
+                "attribution": source["attribution"],
+                "third_party": True,
+            }
+        )
+    for source in provenance["third_party_assets"]:
+        asset_license_entries.append(
+            {
+                "path": source["license_path"],
+                "sha256": source["license_sha256"],
+                "source_url": source["source_url"],
+                "source_revision": source["version"],
+                "license": source["license"],
+                "attribution": source["attribution"],
+                "third_party": True,
+                "content_type": "license",
+            }
+        )
     asset_licenses = {
         "schema_version": "h-ide.asset-licenses/1",
         "scene_id": scene["scene_id"],
         "scene_source_sha256": source_sha,
         "third_party_assets": provenance["third_party_assets"],
         "design_references_only_no_files_copied": provenance["design_references"],
-        "assets": [
-            {
-                "path": _asset_label(texture["id"]),
-                "sha256": texture_hashes[texture["id"]],
-                "source_url": generated_provenance["source_url"],
-                "source_revision": generated_provenance["source_revision"],
-                "license": generated_provenance["license"],
-                "attribution": generated_provenance["attribution"],
-                "third_party": False,
-            }
-            for texture in scene["textures"]
-        ],
+        "assets": asset_license_entries,
     }
     license_path = paths.assets.parent / "ASSET_LICENSES.json"
     _write_text(license_path, _canonical_json(asset_licenses))
@@ -1149,6 +1365,13 @@ def build_scene(paths: BuildPaths | None = None) -> dict[str, str]:
                     "sha256": texture_hashes[texture["id"]],
                 }
                 for texture in scene["textures"]
+            ]
+            + [
+                {
+                    "path": f"mujoco/meshes/{mesh['id']}.obj",
+                    "sha256": mesh_hashes[mesh["id"]],
+                }
+                for mesh in scene["mesh_assets"]
             ],
         },
         "map": {
@@ -1203,6 +1426,13 @@ def build_scene(paths: BuildPaths | None = None) -> dict[str, str]:
         "render_assets": [
             {"path": f"generated/mujoco/textures/{texture['id']}.png", "sha256": texture_hashes[texture["id"]]}
             for texture in scene["textures"]
+        ]
+        + [
+            {
+                "path": f"generated/mujoco/meshes/{mesh['id']}.obj",
+                "sha256": mesh_hashes[mesh["id"]],
+            }
+            for mesh in scene["mesh_assets"]
         ],
         "counts": {
             "structures": len(scene["structures"]),
@@ -1211,13 +1441,13 @@ def build_scene(paths: BuildPaths | None = None) -> dict[str, str]:
             "visual_geoms": sum(len(entry["visual_geoms"]) for entry in mappings)
             + len(mjcf_builder.decor_visual_names),
             "collision_geoms": sum(len(entry["collision_geoms"]) for entry in mappings),
+            "mesh_assets": len(scene["mesh_assets"]),
         },
     }
     visual_path = paths.generated / "visual_manifest.json"
     _write_text(visual_path, _canonical_json(visual_manifest))
 
-    texture_ids = [item["id"] for item in scene["textures"]]
-    inventory = _output_inventory(paths, texture_ids)
+    inventory = _output_inventory(paths, scene)
     missing = [label for label, path in inventory if not path.is_file()]
     if missing:
         raise SceneBuildError(f"generator failed to create: {', '.join(missing)}")
@@ -1229,7 +1459,6 @@ def build_scene(paths: BuildPaths | None = None) -> dict[str, str]:
 
 def _compare_build(paths: BuildPaths) -> list[str]:
     scene, _ = load_scene(paths.scene)
-    texture_ids = [item["id"] for item in scene["textures"]]
     with tempfile.TemporaryDirectory(prefix="office-v2-check-") as temporary:
         root = Path(temporary)
         candidate = BuildPaths(
@@ -1239,8 +1468,8 @@ def _compare_build(paths: BuildPaths) -> list[str]:
             assets=root / "assets" / "office_v2" / "generated",
         )
         build_scene(candidate)
-        expected = dict(_output_inventory(paths, texture_ids))
-        actual = dict(_output_inventory(candidate, texture_ids))
+        expected = dict(_output_inventory(paths, scene))
+        actual = dict(_output_inventory(candidate, scene))
         differences = [label for label in expected if not expected[label].is_file() or expected[label].read_bytes() != actual[label].read_bytes()]
         expected_sums = paths.generated / "SHA256SUMS"
         actual_sums = candidate.generated / "SHA256SUMS"

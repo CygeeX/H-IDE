@@ -16,9 +16,9 @@
     "nav2_msgs/action/DriveOnHeading"
   ],
   "primitive_action_contract": {
-    "drive_on_heading_speed_mps": 0.3,
+    "drive_on_heading_speed_mps": 0.4,
     "spin_min_angular_rps": 0.1,
-    "spin_max_angular_rps": 0.2,
+    "spin_max_angular_rps": 0.25,
     "spin_angular_accel_rps2": 0.3
   },
   "forbidden_product_actions": [

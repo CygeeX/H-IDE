@@ -1544,7 +1544,7 @@ class ReplanIntentGate:
         *,
         min_update_interval_s: float = 0.35,
         min_speed_delta_mps: float = 0.05,
-        min_angle_delta_rad: float = 0.30,
+        min_angle_delta_rad: float = 0.375,
         min_rotation_start_angle_rad: float = 0.05,
         clock=time.monotonic,
     ) -> None:
@@ -1658,6 +1658,7 @@ class BodyStabilityGuard:
         max_tilt_rad: float = 0.55,
         violation_s: float = 0.05,
         recovery_s: float = 0.75,
+        latch_on_excessive_tilt: bool = True,
         clock=time.monotonic,
     ) -> None:
         values = (max_tilt_rad, violation_s, recovery_s)
@@ -1665,9 +1666,12 @@ class BodyStabilityGuard:
             raise ValueError("body stability limits must be finite and positive")
         if float(max_tilt_rad) >= math.pi / 2:
             raise ValueError("body stability tilt limit must be below pi/2")
+        if not isinstance(latch_on_excessive_tilt, bool):
+            raise ValueError("latch_on_excessive_tilt must be a boolean")
         self.max_tilt_rad = float(max_tilt_rad)
         self.violation_s = float(violation_s)
         self.recovery_s = float(recovery_s)
+        self.latch_on_excessive_tilt = latch_on_excessive_tilt
         self._clock = clock
         self.latched = False
         self.reason: str | None = None
@@ -1686,7 +1690,11 @@ class BodyStabilityGuard:
             self._stable_since = None
             if self._violation_since is None:
                 self._violation_since = current
-            if not self.latched and current - self._violation_since >= self.violation_s:
+            if (
+                self.latch_on_excessive_tilt
+                and not self.latched
+                and current - self._violation_since >= self.violation_s
+            ):
                 self.latched = True
                 self.reason = (
                     "measured G1 body tilt exceeded safety envelope "
@@ -1745,7 +1753,11 @@ class CmdVelGuard:
     _OFFICIAL_DIRECTION_BIN_RAD = math.pi / 4.0
     _OFFICIAL_TRANSLATION_DEADBAND_MPS = 0.01
     _OFFICIAL_SLOW_WALK_SPEED_BY_ABS_BIN = {
-        0: 0.30,
+        # NVIDIA's gamepad manager selects 0.40 m/s as the default SLOW_WALK
+        # speed. Use that reviewed default for forward room-to-room travel;
+        # retain the ROS2 handler's more conservative direction-specific
+        # speeds for diagonal, lateral and reverse motion.
+        0: 0.40,
         1: 0.30,
         2: 0.35,
         3: 0.25,
@@ -1889,15 +1901,14 @@ class CmdVelGuard:
         if not all(math.isfinite(value) for value in values):
             raise ValueError("cmd_vel values must be finite")
         norm = math.hypot(values[0], values[1])
-        # Match NVIDIA's pinned ROS2 input adapter instead of interpreting a
-        # continuous Nav2 magnitude as a learned-policy speed.  SONIC's
-        # SLOW_WALK interface quantizes every active planar command to one of
-        # eight directions and assigns a direction-specific reviewed speed:
-        # forward/forward-diagonal=.30, lateral=.35,
-        # backward-diagonal=.25 and backward=.20 m/s.  The upstream adapter
-        # uses 0.01 m/s solely as its active/idle threshold.  Rejecting all
-        # Nav2 ramp samples below .20 was an H-IDE invention which could stop a
-        # valid controller before the official adapter would start walking.
+        # Match NVIDIA's discrete SLOW_WALK interface instead of interpreting
+        # a continuous Nav2 magnitude as an arbitrary learned-policy speed.
+        # The workstation fast profile uses the official gamepad manager's
+        # 0.40 m/s forward default and the pinned ROS2 handler's conservative
+        # direction-specific values elsewhere. The upstream ROS2 adapter uses
+        # 0.01 m/s solely as its active/idle threshold. Rejecting all Nav2 ramp
+        # samples below .20 was an H-IDE invention which could stop a valid
+        # controller before the official adapter would start walking.
         if norm <= self._OFFICIAL_TRANSLATION_DEADBAND_MPS:
             values = (0.0, 0.0, values[2])
             norm = 0.0

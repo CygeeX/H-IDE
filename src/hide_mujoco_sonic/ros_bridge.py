@@ -64,6 +64,31 @@ class RosBridgeUnavailable(RuntimeError):
 
 BRIDGE_HEALTH_SCHEMA_VERSION = "h-ide.ros-bridge-health/v1"
 BRIDGE_HEALTH_MAX_PROGRESS_AGE_S = 0.10
+RETAIN_SONIC_ON_AUTOMATIC_FAULT_ENV = (
+    "HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT"
+)
+
+
+def _retain_sonic_on_automatic_fault_enabled(
+    environ: Mapping[str, str] | None = None,
+) -> bool:
+    """Return the explicit simulation-only automatic-fault experiment.
+
+    The default remains the reviewed fail-closed behavior.  The workstation
+    launcher opts into the experiment with ``1`` and can roll back without a
+    source change by launching with ``0``.  Reject ambiguous spellings so a
+    typo cannot silently select either control policy.
+    """
+
+    source = os.environ if environ is None else environ
+    value = source.get(RETAIN_SONIC_ON_AUTOMATIC_FAULT_ENV, "0")
+    if value == "1":
+        return True
+    if value == "0":
+        return False
+    raise ValueError(
+        f"{RETAIN_SONIC_ON_AUTOMATIC_FAULT_ENV} must be exactly 0 or 1"
+    )
 
 
 def _gait_observation_timeout_s(observation_hz: object) -> float:
@@ -86,6 +111,44 @@ def _gait_observation_timeout_s(observation_hz: object) -> float:
         raise ValueError("observation_hz must be finite and positive")
     capture_validity_s = MAX_CAPTURE_AGE_NS / 1_000_000_000.0
     return max(capture_validity_s, 3.0 / hz)
+
+
+def _resident_policy_reentry_generation(
+    *,
+    health: SonicHealth,
+    gait_state: GaitState,
+    bridge_generation: int | None,
+    gait_generation: int | None,
+    observation_generation: int | None,
+) -> int | None:
+    """Return the exact already-armed generation, or reject split identity.
+
+    A physical safe hold still follows the ordinary rearm path.  Only the
+    driver's strict balanced-policy-IDLE health shape can reuse a generation,
+    and the ROS bridge, gait adapter, and latest measured observation must all
+    agree with SONIC's matched reference generation.
+    """
+
+    if not health.confirmed_balanced_policy_idle:
+        return None
+    if gait_state is not GaitState.IDLE:
+        raise ValueError("resident balanced policy requires bridge gait IDLE")
+    authority_generation = health.reference_authority_generation
+    identities = (
+        authority_generation,
+        bridge_generation,
+        gait_generation,
+        observation_generation,
+    )
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in identities
+    ):
+        raise ValueError("resident balanced policy generation is incomplete")
+    assert authority_generation is not None
+    if any(value != authority_generation for value in identities[1:]):
+        raise ValueError("resident balanced policy generation identity mismatch")
+    return authority_generation
 
 
 class BridgeRuntimeHealth:
@@ -576,6 +639,9 @@ def run_ros_bridge(config: SimConfig) -> None:
             "<AllowMulticast>true</AllowMulticast>"
             "</General></Domain></CycloneDDS>"
         )
+    retain_sonic_on_automatic_fault = (
+        _retain_sonic_on_automatic_fault_enabled()
+    )
     try:
         import rclpy
         from action_msgs.msg import GoalStatusArray
@@ -645,6 +711,8 @@ def run_ros_bridge(config: SimConfig) -> None:
             balanced_idle_stop_max_linear_mps=0.20,
             balanced_idle_stop_max_angular_rps=0.24,
             max_facing_delta_rad=config.max_facing_lead_rad,
+            trip_on_excessive_tilt=not retain_sonic_on_automatic_fault,
+            trip_on_automatic_fault=not retain_sonic_on_automatic_fault,
         )
     )
     # GaitAdapter may recover a never-moved IDLE observation reconnect within
@@ -663,6 +731,10 @@ def run_ros_bridge(config: SimConfig) -> None:
     bridge_fault: dict[str, str | float | None] = {
         "reason": None,
         "latched_at_s": None,
+    }
+    retained_automatic_fault: dict[str, str | int | None] = {
+        "count": 0,
+        "last": None,
     }
     normal_stop_coordinator: dict[
         str, BridgeNormalStopCoordinator | None
@@ -692,7 +764,15 @@ def run_ros_bridge(config: SimConfig) -> None:
         max_translation_m=config.max_spin_translation_m,
         translation_violation_s=config.spin_translation_violation_s,
     )
-    stability_guard = BodyStabilityGuard()
+    stability_guard = BodyStabilityGuard(
+        latch_on_excessive_tilt=not retain_sonic_on_automatic_fault,
+    )
+    if retain_sonic_on_automatic_fault:
+        node.get_logger().warning(
+            "simulation uninterrupted-SONIC experiment enabled: automatic "
+            "gait, navigation and health observations will be logged without "
+            "revoking actuator authority; explicit cancel and safe-stop remain active"
+        )
     navigation_guard_authority_identity: dict[
         str,
         tuple[int, int, int, int] | None,
@@ -753,6 +833,39 @@ def run_ros_bridge(config: SimConfig) -> None:
         ]
         return "; ".join(reasons) if reasons else None
 
+    def record_retained_automatic_fault(
+        *,
+        source: str,
+        code: str,
+        reason: str,
+    ) -> None:
+        """Record an experiment-only warning without changing authority."""
+
+        bounded = str(reason).strip()[:512] or "automatic motion observation"
+        signature = f"{source}/{code}: {bounded}"
+        count = int(retained_automatic_fault["count"] or 0) + 1
+        previous = retained_automatic_fault["last"]
+        retained_automatic_fault["count"] = count
+        retained_automatic_fault["last"] = signature
+        # Repeated health samples can report the same observation at high rate.
+        # Keep it visible without flooding the journal.
+        if signature != previous or count & (count - 1) == 0:
+            node.get_logger().warning(
+                "automatic SONIC cutoff suppressed by simulation experiment "
+                f"count={count} {signature}"
+            )
+
+    def clear_navigation_guard_latches() -> None:
+        for guard in (
+            direction_guard,
+            goal_guard,
+            heading_guard,
+            rotation_guard,
+            stability_guard,
+        ):
+            if guard.latched:
+                guard.clear()
+
     def send_intent(intent: SonicIntent) -> None:
         send_json(
             config.command_host,
@@ -780,6 +893,13 @@ def run_ros_bridge(config: SimConfig) -> None:
         """Publish one immutable fault, then enforce the stronger local stop."""
 
         bounded_reason = str(reason).strip()[:512] or "motion safety fault"
+        if retain_sonic_on_automatic_fault:
+            record_retained_automatic_fault(
+                source=source,
+                code=code,
+                reason=bounded_reason,
+            )
+            return
         if bridge_fault["reason"] is None:
             bridge_fault["reason"] = f"{source}/{code}: {bounded_reason}"
             bridge_fault["latched_at_s"] = time.monotonic()
@@ -888,6 +1008,15 @@ def run_ros_bridge(config: SimConfig) -> None:
         """Log the transition and terminalize an expired/confirmed fence."""
 
         log_health_transport_transition(decision, context=context)
+        if retain_sonic_on_automatic_fault:
+            cause = decision.confirmed_cause
+            if cause is not None:
+                record_retained_automatic_fault(
+                    source=cause.source,
+                    code=cause.code,
+                    reason=f"{cause.reason} during {context}",
+                )
+            return False
         cause = decision.confirmed_cause
         if cause is None:
             return decision.pending is not None
@@ -1153,7 +1282,7 @@ def run_ros_bridge(config: SimConfig) -> None:
             or stability_tripped
         ):
             reason = interlock_reason() or "measured navigation motion mismatch"
-            node.get_logger().error(f"SONIC navigation interlock latched: {reason}")
+            node.get_logger().error(f"SONIC navigation interlock observed: {reason}")
             try:
                 latch_stop(
                     source="navigation_guard",
@@ -1162,6 +1291,8 @@ def run_ros_bridge(config: SimConfig) -> None:
                 )
             except Exception as exc:
                 node.get_logger().error(f"failed to deliver navigation interlock stop: {exc}")
+            if retain_sonic_on_automatic_fault:
+                clear_navigation_guard_latches()
 
     def on_odom(message: Odometry):
         """Feed authoritative base_link velocity/pose into the gait adapter."""
@@ -1387,7 +1518,10 @@ def run_ros_bridge(config: SimConfig) -> None:
                 )
             except Exception as exc:
                 node.get_logger().error(f"failed to maintain navigation interlock stop: {exc}")
-            return
+            if retain_sonic_on_automatic_fault:
+                clear_navigation_guard_latches()
+            else:
+                return
         intent = gait.ingest_twist(
             Nav2Twist(
                 generation=generation["value"],
@@ -1499,6 +1633,30 @@ def run_ros_bridge(config: SimConfig) -> None:
         if not gait._is_stationary(measured):
             response.success = False
             response.message = "control arm rejected while the measured base is moving"
+            return response
+
+        try:
+            resident_generation = _resident_policy_reentry_generation(
+                health=health,
+                gait_state=gait.state,
+                bridge_generation=generation["value"],
+                gait_generation=gait.generation,
+                observation_generation=measured.generation,
+            )
+        except ValueError as exc:
+            response.success = False
+            response.message = f"control arm rejected: {exc}"
+            return response
+        if resident_generation is not None:
+            # RobotAgent released only its remote lease after the previous
+            # command.  SONIC, the gait adapter, and DDS still own one exact
+            # stationary learned-IDLE generation, so creating a new physical
+            # rearm transaction would contradict that deliberate residency.
+            response.success = True
+            response.message = (
+                "resident balanced policy generation "
+                f"{resident_generation} re-authorized at stationary IDLE"
+            )
             return response
 
         next_generation = max(
@@ -1821,6 +1979,8 @@ def run_ros_bridge(config: SimConfig) -> None:
             # actuator authority.  Revoke that incomplete start immediately;
             # an old/late DDS grant must not land inside the timeout window.
             if (
+                not retain_sonic_on_automatic_fault
+                and
                 attempt.transport.confirmed_cause is None
                 and gait.state is GaitState.STARTING
             ):

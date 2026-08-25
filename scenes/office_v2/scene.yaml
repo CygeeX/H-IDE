@@ -1,4 +1,4 @@
-schema_version: h-ide.office-scene/3
+schema_version: h-ide.office-scene/4
 scene_id: office_v2
 title: H-IDE Office V2
 description: >-
@@ -6,12 +6,13 @@ description: >-
   navigation. This file is the only content manifest: MuJoCo visuals and
   collision proxies, the Nav2 map, and isolated evaluation truth are all
   generated from it.
-generator_version: office-v2-generator/3
+generator_version: office-v2-generator/4
 
 runtime_boundary:
   product_may_read:
     - generated/mujoco/office_v2.include.xml
     - generated/mujoco/office_v2.runtime.xml
+    - generated/mujoco/meshes/*.obj
     - generated/mujoco/textures/*.png
     - generated/nav2/office_v2.yaml
     - generated/nav2/office_v2.pgm
@@ -30,9 +31,19 @@ provenance:
     author: H-IDE contributors
     license: CC0-1.0
     source_url: generated://tools/build_scene.py
-    source_revision: office-v2-generator/3
+    source_revision: office-v2-generator/4
     attribution: H-IDE Office V2 procedural textures, architectural dressing, and signs
-  third_party_assets: []
+  third_party_assets:
+    - id: kenney_furniture_kit
+      project: Kenney Furniture Kit
+      version: "2.0"
+      source_url: https://kenney.nl/assets/furniture-kit
+      download_url: https://kenney.nl/media/pages/assets/furniture-kit/440e0608a4-1677580847/kenney_furniture-kit.zip
+      source_archive_sha256: e67652d0932cee41683f74711c03d3e192a2af9979ef8e6b237711f5482d46b0
+      license: CC0-1.0
+      license_path: assets/office_v2/third_party/kenney_furniture_kit/LICENSE.txt
+      license_sha256: bc0de1a0742cb490f9ed4bae0bd284286ebb27e23149b9917c7d8c0d590b8b29
+      attribution: Furniture Kit by Kenney (CC0)
   design_references:
     - project: MuJoCo
       url: https://github.com/google-deepmind/mujoco
@@ -206,13 +217,37 @@ textures:
   - {id: tex_01, kind: carpet, size: [256, 256], colors: [[112, 112, 108], [91, 93, 92], [134, 131, 122]]}
   - {id: tex_02, kind: wood, size: [256, 128], colors: [[151, 105, 63], [98, 61, 35], [187, 142, 88]]}
   - {id: tex_03, kind: fabric, size: [128, 128], colors: [[42, 57, 76], [68, 83, 102], [27, 37, 51]]}
-  - {id: tex_04, kind: sign, size: [512, 128], text: MEETING, colors: [[239, 235, 221], [44, 48, 55], [153, 132, 88]]}
-  - {id: tex_05, kind: sign, size: [512, 128], text: PANTRY, colors: [[239, 235, 221], [44, 48, 55], [91, 128, 118]]}
-  - {id: tex_06, kind: sign, size: [512, 128], text: OPEN OFFICE, colors: [[239, 235, 221], [44, 48, 55], [109, 114, 145]]}
-  - {id: tex_07, kind: sign, size: [512, 128], text: RECEPTION, colors: [[239, 235, 221], [44, 48, 55], [133, 105, 146]]}
+  - {id: tex_04, kind: sign, size: [768, 192], text: MEETING ROOM, colors: [[244, 241, 229], [30, 34, 40], [153, 132, 88]]}
+  - {id: tex_05, kind: sign, size: [768, 192], text: PANTRY, colors: [[244, 241, 229], [30, 34, 40], [91, 128, 118]]}
+  - {id: tex_06, kind: sign, size: [768, 192], text: OPEN OFFICE, colors: [[244, 241, 229], [30, 34, 40], [109, 114, 145]]}
+  - {id: tex_07, kind: sign, size: [768, 192], text: RECEPTION, colors: [[244, 241, 229], [30, 34, 40], [133, 105, 146]]}
   - {id: tex_08, kind: screen, size: [320, 180], colors: [[20, 27, 37], [67, 137, 158], [225, 193, 113]]}
-  - {id: tex_09, kind: sign, size: [512, 128], text: FOCUS OFFICE, colors: [[239, 235, 221], [44, 48, 55], [104, 123, 151]]}
-  - {id: tex_10, kind: sign, size: [512, 128], text: STORAGE, colors: [[239, 235, 221], [44, 48, 55], [145, 113, 77]]}
+  - {id: tex_09, kind: sign, size: [768, 192], text: FOCUS OFFICE, colors: [[244, 241, 229], [30, 34, 40], [104, 123, 151]]}
+  - {id: tex_10, kind: sign, size: [768, 192], text: STORAGE, colors: [[244, 241, 229], [30, 34, 40], [145, 113, 77]]}
+
+# Curated, normalized visual-only meshes.  IDs and output filenames are
+# intentionally neutral in the product bundle; source names and attribution
+# stay here and in ASSET_LICENSES.json.  Collision and Nav2 continue to use the
+# canonical primitives below.
+mesh_assets:
+  - {id: mesh_01, source_asset: kenney_furniture_kit, source_member: "Models/DAE format/chairDesk.dae", path: assets/office_v2/third_party/kenney_furniture_kit/mesh_01.obj, sha256: adc380163216870f8386bf15af63f12762713e4a3ba50956e7f3c41331708d61}
+  - {id: mesh_02, source_asset: kenney_furniture_kit, source_member: "Models/DAE format/loungeDesignSofa.dae", path: assets/office_v2/third_party/kenney_furniture_kit/mesh_02.obj, sha256: 8847fe2fee0c8c47ed4562875f5f11c7316002826c6e2b80990504425e02759c}
+  - {id: mesh_03, source_asset: kenney_furniture_kit, source_member: "Models/DAE format/pottedPlant.dae", path: assets/office_v2/third_party/kenney_furniture_kit/mesh_03.obj, sha256: 0e532a55c294f752ed7686144d59ce9b4348c5a3fc29ac16b7e01a6238f0c0c2}
+  - {id: mesh_04, source_asset: kenney_furniture_kit, source_member: "Models/DAE format/kitchenCoffeeMachine.dae", path: assets/office_v2/third_party/kenney_furniture_kit/mesh_04.obj, sha256: 75b659a4f7bfd5811985d9f269f01b9083b86e707ff5fa563161872ee3c180bd}
+  - {id: mesh_05, source_asset: kenney_furniture_kit, source_member: "Models/DAE format/kitchenFridge.dae", path: assets/office_v2/third_party/kenney_furniture_kit/mesh_05.obj, sha256: ab07f9ceea07dc584c40a8c5e42ae04f9edcdb31baa797b27f436499c2a763e9}
+  - {id: mesh_06, source_asset: kenney_furniture_kit, source_member: "Models/DAE format/bookcaseOpen.dae", path: assets/office_v2/third_party/kenney_furniture_kit/mesh_06.obj, sha256: f10f5eb97591f55889739f6bfa0f8502c397ca53042b612c75f05798a80ce20c}
+  - {id: mesh_07, source_asset: kenney_furniture_kit, source_member: "Models/DAE format/cardboardBoxClosed.dae", path: assets/office_v2/third_party/kenney_furniture_kit/mesh_07.obj, sha256: 83523d66a1526162909ea0ab633fbd1655a93d87ca2b812745555537a0cc6bfe}
+  - {id: mesh_08, source_asset: kenney_furniture_kit, source_member: "Models/DAE format/laptop.dae", path: assets/office_v2/third_party/kenney_furniture_kit/mesh_08.obj, sha256: afaa6be5b574ea6d81b637c5624c6a684d73cfaf8ce680ca6be91df94e1533f4}
+  - {id: mesh_09, source_asset: kenney_furniture_kit, source_member: "Models/DAE format/trashcan.dae", path: assets/office_v2/third_party/kenney_furniture_kit/mesh_09.obj, sha256: ff1cae31cea508dec27ab99cb5ca9d06afe50dee4a572cb9d2358125e6e2cac7}
+
+template_meshes:
+  chair: mesh_01
+  sofa: mesh_02
+  plant: mesh_03
+  coffee_machine: mesh_04
+  fridge: mesh_05
+  cabinet: mesh_06
+  waste_bin: mesh_09
 
 materials:
   commercial_carpet: {rgba: [0.62, 0.62, 0.59, 1.0], texture: tex_01, repeat: [16, 12], reflectance: 0.03}
@@ -226,6 +261,7 @@ materials:
   ceramic: {rgba: [0.92, 0.90, 0.84, 1.0], reflectance: 0.12}
   plant_leaf: {rgba: [0.15, 0.36, 0.20, 1.0], reflectance: 0.02}
   terracotta: {rgba: [0.48, 0.24, 0.14, 1.0], reflectance: 0.02}
+  cardboard: {rgba: [0.58, 0.39, 0.20, 1.0], reflectance: 0.01}
   screen_glow: {rgba: [0.35, 0.60, 0.72, 1.0], texture: tex_08, repeat: [1, 1], texuniform: false, emission: 0.18}
   glass: {rgba: [0.48, 0.63, 0.67, 0.34], reflectance: 0.25}
   sign_01: {rgba: [1.0, 1.0, 1.0, 1.0], texture: tex_04, repeat: [1, 1], texuniform: false, emission: 0.03}
@@ -347,7 +383,7 @@ objects:
   - id: meeting_sign
     room: corridor
     pose: [-0.80, 1.24, 1.78, 0.0]
-    dimensions: [1.08, 0.07, 0.32]
+    dimensions: [1.28, 0.07, 0.40]
     visual: {template: sign, material: sign_01}
     collision: {shape: none, nav_obstacle: false}
     semantic: {class: room_sign, labels: [会议室标牌, meeting sign], aliases: [MEETING]}
@@ -358,6 +394,13 @@ objects:
     visual: {template: cup, material: ceramic}
     collision: {shape: none, nav_obstacle: false}
     semantic: {class: coffee_cup, labels: [咖啡杯, coffee cup], aliases: [杯子, cup, mug]}
+  - id: meeting_laptop
+    room: meeting_room
+    pose: [0.70, 3.72, 0.77, 3.14159]
+    dimensions: [0.42, 0.30, 0.26]
+    visual: {template: imported_mesh, material: charcoal, mesh_asset: mesh_08}
+    collision: {shape: none, nav_obstacle: false}
+    semantic: {class: laptop_computer, labels: [会议笔记本电脑, meeting-room laptop], aliases: [笔记本电脑, laptop]}
   - id: pantry_counter
     room: pantry
     pose: [5.48, 5.42, 0.0, 0.0]
@@ -396,7 +439,7 @@ objects:
   - id: pantry_sign
     room: corridor
     pose: [4.40, 1.24, 1.78, 0.0]
-    dimensions: [1.08, 0.07, 0.32]
+    dimensions: [1.20, 0.07, 0.40]
     visual: {template: sign, material: sign_02}
     collision: {shape: none, nav_obstacle: false}
     semantic: {class: room_sign, labels: [茶水间标牌, pantry sign], aliases: [PANTRY]}
@@ -414,6 +457,13 @@ objects:
     visual: {template: office_desk, material: oak_veneer}
     collision: {shape: box, size: [1.55, 0.72], height: 0.76, nav_obstacle: true}
     semantic: {class: office_desk, labels: [二号办公桌, office desk two], aliases: [办公桌, desk]}
+  - id: open_office_laptop
+    room: open_office
+    pose: [-3.25, 4.65, 0.77, 3.14159]
+    dimensions: [0.42, 0.30, 0.26]
+    visual: {template: imported_mesh, material: charcoal, mesh_asset: mesh_08}
+    collision: {shape: none, nav_obstacle: false}
+    semantic: {class: laptop_computer, labels: [办公笔记本电脑, office laptop], aliases: [笔记本电脑, laptop]}
   - id: open_office_chair_01
     room: open_office
     pose: [-5.75, 3.75, 0.0, 0.0]
@@ -445,7 +495,7 @@ objects:
   - id: open_office_sign
     room: corridor
     pose: [-4.30, 1.24, 1.78, 0.0]
-    dimensions: [1.28, 0.07, 0.32]
+    dimensions: [1.28, 0.07, 0.40]
     visual: {template: sign, material: sign_03}
     collision: {shape: none, nav_obstacle: false}
     semantic: {class: room_sign, labels: [开放办公区标牌, open-office sign], aliases: [OPEN OFFICE]}
@@ -466,7 +516,7 @@ objects:
   - id: reception_sign
     room: corridor
     pose: [-5.10, -1.24, 1.78, 3.14159]
-    dimensions: [1.20, 0.07, 0.32]
+    dimensions: [1.24, 0.07, 0.40]
     visual: {template: sign, material: sign_04}
     collision: {shape: none, nav_obstacle: false}
     semantic: {class: room_sign, labels: [前台标牌, reception sign], aliases: [RECEPTION]}
@@ -477,6 +527,13 @@ objects:
     visual: {template: office_desk, material: oak_veneer}
     collision: {shape: box, size: [1.70, 0.76], height: 0.76, nav_obstacle: true}
     semantic: {class: office_desk, labels: [独立办公室桌子, focus-office desk], aliases: [办公桌, desk]}
+  - id: focus_laptop
+    room: focus_office
+    pose: [0.45, -4.60, 0.77, 3.14159]
+    dimensions: [0.42, 0.30, 0.26]
+    visual: {template: imported_mesh, material: charcoal, mesh_asset: mesh_08}
+    collision: {shape: none, nav_obstacle: false}
+    semantic: {class: laptop_computer, labels: [独立办公室笔记本电脑, focus-office laptop], aliases: [笔记本电脑, laptop]}
   - id: focus_chair
     room: focus_office
     pose: [0.45, -3.65, 0.0, 0.0]
@@ -494,7 +551,7 @@ objects:
   - id: focus_office_sign
     room: corridor
     pose: [1.20, -1.24, 1.78, 3.14159]
-    dimensions: [1.28, 0.07, 0.32]
+    dimensions: [1.28, 0.07, 0.40]
     visual: {template: sign, material: sign_05}
     collision: {shape: none, nav_obstacle: false}
     semantic: {class: room_sign, labels: [独立办公室标牌, focus-office sign], aliases: [FOCUS OFFICE]}
@@ -512,10 +569,24 @@ objects:
     visual: {template: cabinet, material: brushed_metal}
     collision: {shape: box, size: [0.72, 1.50], height: 1.82, nav_obstacle: true}
     semantic: {class: storage_cabinet, labels: [工具柜, utility cabinet], aliases: [柜子, cabinet]}
+  - id: storage_box_01
+    room: storage
+    pose: [7.35, -4.70, 1.83, 0.10]
+    dimensions: [0.48, 0.40, 0.34]
+    visual: {template: imported_mesh, material: cardboard, mesh_asset: mesh_07}
+    collision: {shape: none, nav_obstacle: false}
+    semantic: {class: cardboard_box, labels: [纸箱, cardboard box], aliases: [箱子, box]}
+  - id: storage_box_02
+    room: storage
+    pose: [5.90, -5.38, 1.83, 1.70]
+    dimensions: [0.44, 0.36, 0.31]
+    visual: {template: imported_mesh, material: cardboard, mesh_asset: mesh_07}
+    collision: {shape: none, nav_obstacle: false}
+    semantic: {class: cardboard_box, labels: [工具纸箱, utility cardboard box], aliases: [箱子, box]}
   - id: storage_sign
     room: corridor
     pose: [5.20, -1.24, 1.78, 3.14159]
-    dimensions: [1.08, 0.07, 0.32]
+    dimensions: [1.20, 0.07, 0.40]
     visual: {template: sign, material: sign_06}
     collision: {shape: none, nav_obstacle: false}
     semantic: {class: room_sign, labels: [储物间标牌, storage sign], aliases: [STORAGE]}

@@ -72,6 +72,27 @@ def test_default_body_stability_guard_matches_gait_adapter_tilt_envelope() -> No
     assert guard.admit_command(0.2, 0.0, 0.0) is False
 
 
+def test_body_stability_guard_can_monitor_tilt_without_revoking_sonic() -> None:
+    now = [10.0]
+    guard = BodyStabilityGuard(
+        max_tilt_rad=0.55,
+        violation_s=0.05,
+        latch_on_excessive_tilt=False,
+        clock=lambda: now[0],
+    )
+
+    assert guard.observe(0.70, 0.0) is False
+    now[0] += 0.20
+    assert guard.observe(0.80, -0.70) is False
+    assert guard.latched is False
+    assert guard.admit_command(0.2, 0.0, 0.25) is True
+
+
+def test_body_stability_monitor_only_switch_requires_boolean() -> None:
+    with pytest.raises(ValueError, match="latch_on_excessive_tilt"):
+        BodyStabilityGuard(latch_on_excessive_tilt=1)  # type: ignore[arg-type]
+
+
 def test_plant_tick_guard_distinguishes_delayed_sample_from_restart():
     guard = PlantTickGuard(rollback_threshold_ms=1_000)
     assert guard.observe(50_000) is False
@@ -955,7 +976,7 @@ def test_command_zero_is_read_only_and_requires_the_filtered_tail_to_stop():
 
 
 @pytest.mark.parametrize("raw_speed", [0.011, 0.05, 0.199])
-def test_active_nav2_ramp_uses_official_forward_slow_walk_speed(raw_speed):
+def test_active_nav2_ramp_uses_official_default_forward_slow_walk_speed(raw_speed):
     now = [100.0]
     guard = CmdVelGuard(
         timeout_s=0.25,
@@ -963,24 +984,24 @@ def test_active_nav2_ramp_uses_official_forward_slow_walk_speed(raw_speed):
         smoothing_alpha=1.0,
     )
     accepted = guard.accept(raw_speed, 0.0, 0.0)
-    assert accepted.vx == pytest.approx(0.30)
+    assert accepted.vx == pytest.approx(0.40)
     intent = guard.intent(now=100.01, dt=0.02)
-    assert intent.speed_mps == pytest.approx(0.30)
+    assert intent.speed_mps == pytest.approx(0.40)
     assert intent.movement_angle_rad == pytest.approx(0.0)
 
 
-def test_official_forward_slow_walk_speed_is_reached_on_first_filtered_tick():
+def test_official_default_forward_speed_is_reached_on_first_filtered_tick():
     guard = CmdVelGuard(smoothing_alpha=0.35, clock=lambda: 100.0)
     guard.accept(0.20, 0.0, 0.0)
     intent = guard.intent(now=100.01, dt=0.02)
-    assert intent.speed_mps == pytest.approx(0.30)
+    assert intent.speed_mps == pytest.approx(0.40)
     assert intent.has_movement is True
 
 
 @pytest.mark.parametrize(
     ("angle", "expected_speed"),
     (
-        (0.0, 0.30),
+        (0.0, 0.40),
         (math.pi / 4.0, 0.30),
         (-math.pi / 4.0, 0.30),
         (math.pi / 2.0, 0.35),
@@ -1309,23 +1330,25 @@ def test_spin_command_integral_spaces_planner_segments_beyond_clip_horizon():
     assert gate.admit(idle, now=0.0)
 
     guard.observe_heading(0.0)
-    guard.accept(0.0, 0.0, 0.20)
+    guard.accept(0.0, 0.0, 0.25)
     admitted_segments = []
     # Reproduce cold INIT: the command integral keeps advancing for 3 s while
     # measured yaw remains near the starting pose.  The replan gate emits each
-    # new absolute planner target after its 0.05-rad/0.30-rad thresholds.
+    # new absolute planner target after its 0.05-rad/0.375-rad thresholds.
     for frame in range(150):
         now[0] += 0.02
         guard.observe_heading(0.0)
-        guard.accept(0.0, 0.0, 0.20)
+        guard.accept(0.0, 0.0, 0.25)
         candidate = guard.intent(now=now[0], dt=0.02)
         if gate.admit(candidate, now=(frame + 1) * 0.02):
             admitted_segments.append(candidate.facing_angle_rad)
-    assert admitted_segments == pytest.approx([0.052, 0.352])
-    assert guard.command_facing == pytest.approx(0.60)
+    # 50 Hz integration advances in exact 5 mrad increments. The second
+    # admission is therefore the first sample beyond the 0.375 rad threshold.
+    assert admitted_segments == pytest.approx([0.05, 0.43])
+    assert guard.command_facing == pytest.approx(0.75)
     assert gate.last is not None
-    assert gate.last.facing_angle_rad == pytest.approx(0.352)
-    assert 0.30 / 0.20 >= 44.0 / 30.0
+    assert gate.last.facing_angle_rad == pytest.approx(0.43)
+    assert 0.375 / 0.25 >= 44.0 / 30.0
 
 
 @pytest.mark.parametrize("invalid_dt", [float("nan"), 0.0, 0.10])
@@ -1394,7 +1417,7 @@ def test_replan_gate_debounces_small_nav2_corrections_but_stops_immediately():
     tiny_correction = MovementIntent("SLOW_WALK", 0.21, 0.01, 0.02, True, False)
     assert gate.admit(tiny_correction) is False
 
-    significant = MovementIntent("SLOW_WALK", 0.25, 0.0, 0.31, True, False)
+    significant = MovementIntent("SLOW_WALK", 0.25, 0.0, 0.38, True, False)
     assert gate.admit(significant) is True
 
     now[0] = 10.41
@@ -1407,9 +1430,9 @@ def test_replan_gate_rate_limits_significant_in_motion_change():
     gate = ReplanIntentGate(clock=lambda: now[0])
     assert gate.admit(MovementIntent("SLOW_WALK", 0.20, 0.0, 0.0, True, False))
     now[0] = 20.10
-    assert not gate.admit(MovementIntent("SLOW_WALK", 0.25, 0.0, 0.31, True, False))
+    assert not gate.admit(MovementIntent("SLOW_WALK", 0.25, 0.0, 0.38, True, False))
     now[0] = 20.36
-    assert gate.admit(MovementIntent("SLOW_WALK", 0.25, 0.0, 0.31, True, False))
+    assert gate.admit(MovementIntent("SLOW_WALK", 0.25, 0.0, 0.38, True, False))
 
 
 @pytest.mark.parametrize("sign", [-1.0, 1.0])

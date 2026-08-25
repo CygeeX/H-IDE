@@ -15,6 +15,11 @@ import pytest
 import yaml
 
 from tools.build_scene import BuildPaths, build_scene
+from tools.import_office_v2_kenney_assets import (
+    SOURCE_ARCHIVE_SHA256 as KENNEY_ARCHIVE_SHA256,
+    SOURCE_MEMBERS as KENNEY_SOURCE_MEMBERS,
+    SOURCE_URL as KENNEY_DOWNLOAD_URL,
+)
 from hide_mujoco_sonic.config import SimConfig
 from hide_mujoco_sonic.motion_fault import (
     SONIC_HEALTH_TRANSPORT_TIMEOUT_CONFIRMATION_PROBES,
@@ -35,6 +40,12 @@ SCENE_SOURCE = SCENE_ROOT / "scene.yaml"
 GENERATED = SCENE_ROOT / "generated"
 EVALUATION = SCENE_ROOT / "evaluation" / "manifest.json"
 G1_MODEL = ROOT / "models" / "unitree-g1-mujoco" / "assets" / "g1_29dof_no_hand.xml"
+OFFICE_V2_COLLISION_CONTRACT_SHA256 = (
+    "cda5508f7404334e7fcd33f8921a8081b30d7c03b24abfeabebdfce7fab9c313"
+)
+OFFICE_V2_PGM_SHA256 = (
+    "47b2ddd54d9f0aa2a220d5b79afcee367cbaa7a57068e4809189f24ab207360d"
+)
 
 
 def _sha(path: Path) -> str:
@@ -154,7 +165,12 @@ def test_build_is_idempotent_and_matches_committed_outputs(tmp_path: Path) -> No
 def test_collision_manifest_nav2_map_and_navigation_points_agree() -> None:
     scene = yaml.safe_load(SCENE_SOURCE.read_text(encoding="utf-8"))
     evaluation = json.loads(EVALUATION.read_text(encoding="utf-8"))
+    runtime = json.loads(
+        (GENERATED / "runtime_manifest.json").read_text(encoding="utf-8")
+    )
     width, height, pixels = _pgm(GENERATED / "nav2" / "office_v2.pgm")
+    assert runtime["collision_contract_sha256"] == OFFICE_V2_COLLISION_CONTRACT_SHA256
+    assert _sha(GENERATED / "nav2" / "office_v2.pgm") == OFFICE_V2_PGM_SHA256
     assert width == round(scene["map"]["size"][0] / scene["map"]["resolution"])
     assert height == round(scene["map"]["size"][1] / scene["map"]["resolution"])
 
@@ -211,6 +227,7 @@ def test_every_static_entry_generates_visual_and_matching_collision_contract() -
 
 def test_visual_dressing_is_collision_free_and_all_room_signs_are_present() -> None:
     scene = yaml.safe_load(SCENE_SOURCE.read_text(encoding="utf-8"))
+    evaluation = json.loads(EVALUATION.read_text(encoding="utf-8"))
     xml = ET.parse(GENERATED / "mujoco" / "office_v2.include.xml")
     geoms = {geom.attrib["name"]: geom for geom in xml.findall(".//geom")}
 
@@ -239,6 +256,35 @@ def test_visual_dressing_is_collision_free_and_all_room_signs_are_present() -> N
     assert {item["visual"]["material"] for item in signs.values()} == {
         f"sign_{index:02d}" for index in range(1, 7)
     }
+    mappings = {
+        item["id"]: item["mjcf"] for item in evaluation["objects"]
+    }
+    for sign_id in expected_signs:
+        sign_geoms = [geoms[name] for name in mappings[sign_id]["visual_geoms"]]
+        textured_faces = [
+            geom
+            for geom in sign_geoms
+            if geom.attrib.get("mesh", "").endswith("_sign_surface")
+        ]
+        assert len(textured_faces) == 1
+        assert textured_faces[0].attrib["type"] == "mesh"
+        assert textured_faces[0].attrib["contype"] == "0"
+        assert textured_faces[0].attrib["conaffinity"] == "0"
+
+    sign_meshes = [
+        mesh
+        for mesh in xml.findall("./asset/mesh")
+        if mesh.attrib["name"].endswith("_sign_surface")
+    ]
+    assert len(sign_meshes) == 6
+    assert all("texcoord" in mesh.attrib for mesh in sign_meshes)
+
+    imported_mesh_geoms = [
+        geom for geom in geoms.values() if geom.attrib.get("mesh", "").endswith("_mesh")
+    ]
+    assert imported_mesh_geoms
+    assert all(geom.attrib["contype"] == "0" for geom in imported_mesh_geoms)
+    assert all(geom.attrib["conaffinity"] == "0" for geom in imported_mesh_geoms)
 
 
 def test_product_inspection_catalog_is_complete_safe_and_map_bound() -> None:
@@ -349,6 +395,7 @@ def test_product_manifest_contains_no_privileged_semantic_answers() -> None:
 
 
 def test_checksum_and_asset_license_inventory_are_complete() -> None:
+    scene = yaml.safe_load(SCENE_SOURCE.read_text(encoding="utf-8"))
     checksum_lines = (GENERATED / "SHA256SUMS").read_text(encoding="utf-8").splitlines()
     checksums = dict(line.split("  ", 1)[::-1] for line in checksum_lines)
     assert checksums
@@ -358,11 +405,46 @@ def test_checksum_and_asset_license_inventory_are_complete() -> None:
         assert _sha(path) == digest
 
     licenses = json.loads((ROOT / "assets" / "office_v2" / "ASSET_LICENSES.json").read_text(encoding="utf-8"))
-    assert licenses["third_party_assets"] == []
+    assert licenses["third_party_assets"] == scene["provenance"]["third_party_assets"]
+    assert licenses["third_party_assets"] == [
+        {
+            "attribution": "Furniture Kit by Kenney (CC0)",
+            "download_url": KENNEY_DOWNLOAD_URL,
+            "id": "kenney_furniture_kit",
+            "license": "CC0-1.0",
+            "license_path": "assets/office_v2/third_party/kenney_furniture_kit/LICENSE.txt",
+            "license_sha256": "bc0de1a0742cb490f9ed4bae0bd284286ebb27e23149b9917c7d8c0d590b8b29",
+            "project": "Kenney Furniture Kit",
+            "source_archive_sha256": KENNEY_ARCHIVE_SHA256,
+            "source_url": "https://kenney.nl/assets/furniture-kit",
+            "version": "2.0",
+        }
+    ]
     assert all(item["license"] == "CC0-1.0" for item in licenses["assets"])
-    assert all(item["third_party"] is False for item in licenses["assets"])
     assert {item["path"] for item in licenses["assets"]}.issubset(checksums)
     assert all(item["sha256"] == checksums[item["path"]] for item in licenses["assets"])
+
+    procedural = [item for item in licenses["assets"] if not item["third_party"]]
+    imported = [item for item in licenses["assets"] if item["third_party"]]
+    assert len(procedural) == len(scene["textures"]) == 10
+    assert len(imported) == len(scene["mesh_assets"]) + 1
+    assert all(
+        item.get("source_archive_sha256") == KENNEY_ARCHIVE_SHA256
+        for item in imported
+        if item.get("content_type") != "license"
+    )
+    license_entry = [item for item in imported if item.get("content_type") == "license"]
+    assert len(license_entry) == 1
+    assert license_entry[0]["path"] == licenses["third_party_assets"][0]["license_path"]
+
+    expected_members = {
+        Path(mesh["path"]).name: mesh["source_member"] for mesh in scene["mesh_assets"]
+    }
+    assert expected_members == KENNEY_SOURCE_MEMBERS
+    for mesh in scene["mesh_assets"]:
+        source = ROOT / mesh["path"]
+        generated = GENERATED / "mujoco" / "meshes" / f"{mesh['id']}.obj"
+        assert _sha(source) == mesh["sha256"] == _sha(generated)
 
 
 def test_generated_preview_loads_with_mujoco() -> None:
@@ -372,6 +454,15 @@ def test_generated_preview_loads_with_mujoco() -> None:
     assert model.nbody == 1 + len(scene["structures"]) + len(scene["objects"])
     assert model.ngeom > len(scene["objects"]) * 2
     assert model.ntex == 1 + len(scene["textures"])
+    expected_office_meshes = sum(
+        1
+        for item in scene["objects"]
+        if item["visual"].get(
+            "mesh_asset", scene["template_meshes"].get(item["visual"]["template"])
+        )
+        is not None
+    ) + sum(item["visual"]["template"] == "sign" for item in scene["objects"])
+    assert model.nmesh == expected_office_meshes
     assert model.ncam == len(scene["render"]["cameras"])
 
 
@@ -568,7 +659,10 @@ def test_runtime_loader_hashes_every_included_office_asset_and_fails_closed(
     shutil.copytree(GENERATED, copied)
     runtime = load_runtime_scene(copied / "runtime_manifest.json")
     assert runtime.model_office_include.name == "office_v2.include.xml"
-    assert len(runtime.model_render_assets) == 10
+    scene = yaml.safe_load(SCENE_SOURCE.read_text(encoding="utf-8"))
+    assert len(runtime.model_render_assets) == len(scene["textures"]) + len(
+        scene["mesh_assets"]
+    )
     assert runtime.inspection_catalog.name == "inspection_catalog.json"
 
     runtime.model_office_include.write_text(

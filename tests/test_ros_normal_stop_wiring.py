@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+from dataclasses import replace
 from pathlib import Path
 from uuid import UUID
 
@@ -11,6 +12,7 @@ from hide_mujoco_sonic.ros_bridge import (
     _actions_confirmed_inactive_after,
     _create_safety_timers,
     _global_goal_progress_active,
+    _resident_policy_reentry_generation,
     _suppress_for_correlated_stop,
     BridgeRuntimeHealth,
 )
@@ -47,6 +49,76 @@ def ready_sonic_health() -> SonicHealth:
         reference_authority_granted_at_monotonic_s=None,
         reference_authority_granted_tick_ms=None,
         reference_authority_dds_target_sequence=None,
+    )
+
+
+def balanced_policy_idle_health() -> SonicHealth:
+    return replace(
+        ready_sonic_health(),
+        plant_support_mode="idle",
+        plant_support_safety_latched=False,
+        static_hold_active=False,
+        motion_authorized=True,
+        controlled_policy_stop_active=True,
+        matched_reference_actuator_authority=True,
+        reference_authority_state="GRANTED",
+        reference_authority_generation=42,
+        reference_authority_source_sequence=7,
+        reference_authority_intent_generation=3,
+        reference_authority_epoch=2,
+        reference_authority_granted_at_monotonic_s=100.25,
+        reference_authority_granted_tick_ms=2500,
+        reference_authority_dds_target_sequence=11,
+    )
+
+
+def test_resident_balanced_policy_reentry_reuses_only_exact_generation() -> None:
+    health = balanced_policy_idle_health()
+
+    assert (
+        _resident_policy_reentry_generation(
+            health=health,
+            gait_state=GaitState.IDLE,
+            bridge_generation=42,
+            gait_generation=42,
+            observation_generation=42,
+        )
+        == 42
+    )
+
+    for field in (
+        "bridge_generation",
+        "gait_generation",
+        "observation_generation",
+    ):
+        values = {
+            "bridge_generation": 42,
+            "gait_generation": 42,
+            "observation_generation": 42,
+        }
+        values[field] = 43
+        try:
+            _resident_policy_reentry_generation(
+                health=health,
+                gait_state=GaitState.IDLE,
+                **values,
+            )
+        except ValueError as exc:
+            assert "generation identity mismatch" in str(exc)
+        else:
+            raise AssertionError(f"{field} mismatch must fail closed")
+
+
+def test_physical_safe_hold_still_uses_new_generation_rearm_path() -> None:
+    assert (
+        _resident_policy_reentry_generation(
+            health=ready_sonic_health(),
+            gait_state=GaitState.IDLE,
+            bridge_generation=42,
+            gait_generation=42,
+            observation_generation=42,
+        )
+        is None
     )
 
 

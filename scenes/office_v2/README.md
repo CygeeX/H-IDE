@@ -17,11 +17,26 @@ stations, and camera headings. It contains no object inventory, evaluator
 target, or expected VLM answer; perception must still derive every reported
 fixture from first-person RGB-D evidence.
 
-The current scene uses original procedural textures, collision-free
-architectural dressing, and compound MuJoCo primitives.  Its visual language
-was reviewed against MuJoCo/MuJoCo Menagerie, RoboCasa, and Poly Haven's CC0
-office catalogue, but no third-party mesh or texture file is copied.  Keeping
-the canonical collision proxies independent from the richer visual geometry
-preserves the reviewed Nav2 map and 50 Hz locomotion dynamics while making all
-six functional regions, their doorway signs, and their furniture recognizable
-to the first-person VLM.
+The current scene uses original procedural textures, explicit UV-mapped room
+signs, collision-free architectural dressing, and a curated subset of
+[Kenney's Furniture Kit](https://kenney.nl/assets/furniture-kit).  The imported
+meshes are CC0, normalized to neutral OBJ files, pinned to the source archive
+SHA-256, and recorded with their original archive members in `scene.yaml` and
+`assets/office_v2/ASSET_LICENSES.json`.  MuJoCo, MuJoCo Menagerie, RoboCasa,
+and Poly Haven were also reviewed as design references; no files from those
+projects were copied into this scene.
+
+To reproduce the curated mesh import, download the exact archive URL recorded
+in `scene.yaml`, install the maintainer-only `trimesh`, `pycollada`, and `lxml`
+packages in a scratch environment, then run:
+
+```sh
+python tools/import_office_v2_kenney_assets.py /path/to/kenney_furniture-kit.zip
+```
+
+Imported meshes are render geometry only.  The canonical primitive collision
+proxies remain the sole source for MuJoCo contacts and the Nav2 occupancy map,
+so visual refinement cannot silently change the reviewed navigation geometry
+or 50 Hz locomotion dynamics.  All six functional regions now have large,
+front-facing English doorway plaques and more recognizable furniture for the
+first-person VLM.

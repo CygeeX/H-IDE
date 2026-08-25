@@ -28,7 +28,10 @@ MOTION_MODE = "static_spin_drive_primitives"
 COMPUTE_PATH_ACTION = "nav2_msgs/action/ComputePathToPose"
 SPIN_ACTION = "nav2_msgs/action/Spin"
 DRIVE_ACTION = "nav2_msgs/action/DriveOnHeading"
-OFFICIAL_FORWARD_SPEED_MPS = 0.30
+# NVIDIA's official gamepad profile uses 0.40 m/s as the default SLOW_WALK
+# speed. This fast workstation profile remains inside the model's documented
+# 0.20--0.80 m/s SLOW_WALK range.
+OFFICIAL_FORWARD_SPEED_MPS = 0.40
 OFFICIAL_REVERSE_SPEED_MPS = 0.20
 # NavFn and the immutable primitive plan retain the 0.42 m inflated planning
 # clearance.  Fresh odometry can land inside that conservative contour after a
@@ -399,7 +402,7 @@ def _validate_runtime_bindings(
     expected_primitive_contract = {
         "drive_on_heading_speed_mps": OFFICIAL_FORWARD_SPEED_MPS,
         "spin_min_angular_rps": 0.10,
-        "spin_max_angular_rps": 0.20,
+        "spin_max_angular_rps": 0.25,
         "spin_angular_accel_rps2": 0.30,
     }
     _require(
@@ -859,7 +862,7 @@ def build_primitive_plan(
             OFFICIAL_FORWARD_SPEED_MPS,
             abs_tol=1e-12,
         ),
-        "DriveOnHeading speed must equal NVIDIA's forward Slow Walk 0.30 m/s",
+        "DriveOnHeading speed must equal NVIDIA's default Slow Walk 0.40 m/s",
     )
     frame_id, poses = _normalise_path(navfn_path)
     static_map = StaticMap.load(map_yaml_path, map_image_path)
@@ -1000,7 +1003,7 @@ def build_primitive_plan(
             "heading_tolerance_rad": heading_tolerance_rad,
             "drive_speed_mps": drive_speed_mps,
             "spin_min_angular_rps": 0.10,
-            "spin_max_angular_rps": 0.20,
+            "spin_max_angular_rps": 0.25,
             "spin_angular_accel_rps2": 0.30,
             "zero_spin_policy": "skip_within_heading_tolerance",
             "final_heading_policy": (

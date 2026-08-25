@@ -147,9 +147,9 @@ def verify_motion_profile(path: Path) -> None:
     _require(
         profile.get("primitive_action_contract")
         == {
-            "drive_on_heading_speed_mps": 0.3,
+            "drive_on_heading_speed_mps": 0.4,
             "spin_min_angular_rps": 0.1,
-            "spin_max_angular_rps": 0.2,
+            "spin_max_angular_rps": 0.25,
             "spin_angular_accel_rps2": 0.3,
         },
         "official primitive action limits do not match the reviewed envelope",

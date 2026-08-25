@@ -155,6 +155,16 @@ class GaitAdapterConfig:
     startup_min_progress_m: float = 0.01
     reverse_rotation_rad: float = 0.05
     max_tilt_rad: float = 0.55
+    # Simulation experiment switch.  When disabled, an excessive but finite
+    # roll/pitch observation remains visible to monitoring while the learned
+    # whole-body policy keeps actuator authority.  Invalid/non-finite state,
+    # stale input, cancellation and all other fault classes remain unchanged.
+    trip_on_excessive_tilt: bool = True
+    # Reversible simulation-only experiment.  When false, automatic adapter
+    # observations remain diagnostic and the most recent valid SONIC command
+    # retains authority.  Explicit Nav2 cancel and correlated safe-stop do not
+    # use ``_trip_fault`` and therefore remain authoritative stop operations.
+    trip_on_automatic_fault: bool = True
     direction_restart_rad: float = math.radians(100.0)
     turn_preview_s: float = 0.20
     max_facing_delta_rad: float = 0.15
@@ -195,6 +205,10 @@ class GaitAdapterConfig:
         )
         if not all(math.isfinite(float(value)) and float(value) > 0 for value in positive):
             raise ValueError("gait adapter limits must be finite and positive")
+        if not isinstance(self.trip_on_excessive_tilt, bool):
+            raise ValueError("trip_on_excessive_tilt must be a boolean")
+        if not isinstance(self.trip_on_automatic_fault, bool):
+            raise ValueError("trip_on_automatic_fault must be a boolean")
         if (
             isinstance(self.stop_ack_samples, bool)
             or not isinstance(self.stop_ack_samples, int)
@@ -291,6 +305,8 @@ class GaitAdapter:
         self.state = GaitState.DISARMED
         self.generation: int | None = None
         self.reason: str | None = "awaiting plant generation and arm"
+        self.automatic_fault_count = 0
+        self.last_automatic_fault_reason: str | None = None
 
         self._sequence = 0
         self._last_now: float | None = None
@@ -370,7 +386,13 @@ class GaitAdapter:
         self._observation = observation
         self._last_observation_timestamp = observation.timestamp_s
 
-        if abs(observation.roll) > self.config.max_tilt_rad or abs(observation.pitch) > self.config.max_tilt_rad:
+        if (
+            self.config.trip_on_excessive_tilt
+            and (
+                abs(observation.roll) > self.config.max_tilt_rad
+                or abs(observation.pitch) > self.config.max_tilt_rad
+            )
+        ):
             self._trip_fault(
                 "base tilt exceeds navigation gait envelope "
                 f"(roll={observation.roll:.3f}, pitch={observation.pitch:.3f})",
@@ -678,6 +700,11 @@ class GaitAdapter:
             return
 
         if self._command is None or self._command_is_stale(now):
+            if not self.config.trip_on_automatic_fault:
+                self._record_automatic_fault(
+                    "Nav2 velocity command became stale",
+                )
+                return
             self._requires_new_generation = True
             self._request_stop(
                 "Nav2 velocity command became stale",
@@ -883,6 +910,9 @@ class GaitAdapter:
             self._last_command_timestamp = None
 
     def _trip_fault(self, reason: str, now: float) -> None:
+        if not self.config.trip_on_automatic_fault:
+            self._record_automatic_fault(reason)
+            return
         if self.state is not GaitState.FAULT:
             self._reset_stop_ack()
         self.state = GaitState.FAULT
@@ -897,6 +927,13 @@ class GaitAdapter:
         self._reference_authority_dds_sequence = None
         self._startup_positive_progress_seen = False
         self._safe_stop_requested = False
+
+    def _record_automatic_fault(self, reason: str) -> None:
+        """Retain the current valid policy while preserving diagnostics."""
+
+        bounded = str(reason).strip()[:512] or "automatic gait fault"
+        self.automatic_fault_count += 1
+        self.last_automatic_fault_reason = bounded
 
     def _observe_stop_ack(self, observation: BaseObservation, now: float) -> None:
         # Callback arrival after a stop request is not enough: a queued ROS

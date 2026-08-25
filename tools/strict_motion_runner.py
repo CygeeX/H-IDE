@@ -33,17 +33,19 @@ RUNNER_SCHEMA_VERSION = "h-ide.strict-motion-runner/v1"
 STRICT_NODE_NAME = "strict_motion_runner"
 NAV2_INPUT_TOPIC = "/h_ide/strict_motion/input"
 BRIDGE_CMD_VEL_TOPIC = "/cmd_vel"
-OFFICIAL_DRIVE_SPEED_MPS = 0.30
+# NVIDIA's official gamepad manager selects 0.40 m/s as its default
+# SLOW_WALK speed; this remains inside the model's 0.20--0.80 m/s range.
+OFFICIAL_DRIVE_SPEED_MPS = 0.40
 OFFICIAL_REVERSE_SPEED_MPS = 0.20
 # NVIDIA's planner keyboard contract recommends about 0.4 m/s for strafing.
 # Keep the model input at that published value; endpoint control is handled by
 # measured odometry below, not by inventing a smaller pseudo-speed.
 OFFICIAL_LATERAL_SPEED_MPS = 0.40
 OFFICIAL_SPIN_MIN_RPS = 0.10
-# Preserve the previously live-proven Nav2 Spin envelope.  Runtime SONIC now
-# opens successive pure-rotation references at 0.30 rad, so 0.30 / 0.20 =
+# Use the workstation fast Spin envelope. Runtime SONIC opens successive
+# pure-rotation references at 0.375 rad, so 0.375 / 0.25 =
 # 1.50 s remains outside the pinned 44-frame / 30 Hz planner clip horizon.
-OFFICIAL_SPIN_MAX_RPS = 0.20
+OFFICIAL_SPIN_MAX_RPS = 0.25
 # Live corridor-column r142 showed that separate +/-0.07..0.08 rad Spin goals
 # cause learned whole-body overshoot and counter-correction instead of useful
 # path progress.  Retain the measured 0.09 rad action resolution, but let the
@@ -63,10 +65,17 @@ TRANSLATION_STARTUP_STOP_MARGIN_S = 10.0
 # Live r131 at the temporary 0.10 rad/s cap achieved 0.913 rad over the
 # complete 25.8 wall-second action window (0.0354 rad/s including activation
 # and reference latency).  Size only the wall-time allowance from that direct
-# evidence; the relayed Nav2 command remains the reviewed 0.10..0.20 ramp.
+# evidence; the relayed Nav2 command remains the reviewed 0.10..0.25 ramp.
 OBSERVED_SPIN_PROGRESS_FLOOR_RPS = 0.035
 SPIN_STARTUP_STOP_MARGIN_S = 10.0
 NAV2_COMMAND_STALE_S = 0.15
+# ``/localization/pose`` is an authoritative 10 Hz stream in the workstation
+# profile.  A 100 ms age gate sits exactly on its nominal period and rejected
+# healthy samples when the observed DDS interval reached 107 ms.  Permit at
+# most 2.5 source periods and wait for no more than one second at a stopped
+# primitive boundary; older or absent localization still fails closed.
+MAP_LOCALIZATION_MAX_AGE_S = 0.25
+MAP_LOCALIZATION_WAIT_TIMEOUT_S = 1.0
 LATERAL_ODOMETRY_STALE_S = 0.15
 # Nav2's reviewed controller loop is 20 Hz.  Relaying an unconditional 50 Hz
 # zero command doubled the bridge-to-SONIC control-plane traffic before an
@@ -468,7 +477,7 @@ class StrictCommandRelay:
             ):
                 raise StrictMotionRunnerError(
                     "Spin command has the wrong sign or exceeds the reviewed "
-                    "0.20 rad/s cap"
+                    "0.25 rad/s cap"
                 )
         else:
             raise StrictMotionRunnerError(
@@ -996,7 +1005,11 @@ class RosLiveBackend:
             raise StrictMotionRunnerError("fresh odometry is unavailable")
         return value
 
-    def latest_map_pose(self, *, max_age_s: float = 0.10) -> PoseObservation:
+    def latest_map_pose(
+        self,
+        *,
+        max_age_s: float = MAP_LOCALIZATION_MAX_AGE_S,
+    ) -> PoseObservation:
         with self._lock:
             value = self._latest_map_pose
         if value is None or value.age_s(self._clock()) > max_age_s:
@@ -1006,16 +1019,15 @@ class RosLiveBackend:
     def wait_fresh_map_pose(
         self,
         *,
-        max_age_s: float = 0.10,
-        timeout_s: float = 0.50,
+        max_age_s: float = MAP_LOCALIZATION_MAX_AGE_S,
+        timeout_s: float = MAP_LOCALIZATION_WAIT_TIMEOUT_S,
     ) -> PoseObservation:
         """Wait between actions for a genuinely fresh localization sample.
 
-        The source publishes at 25 Hz, but the six-source evidence join and X11
-        viewers can occasionally schedule the checkpoint read just beyond the
-        100 ms authority age.  Never consume that stale pose and never wait
-        while an action owns motion: callers use this only at a zero-command
-        primitive boundary, for at most half a second.
+        The workstation source publishes at 10 Hz and live DDS intervals reach
+        107 ms.  Never consume a pose older than 2.5 source periods and never
+        wait while an action owns motion: callers use this only at a
+        zero-command primitive boundary, for at most one second.
         """
 
         deadline = self._clock() + float(timeout_s)

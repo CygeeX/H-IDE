@@ -62,9 +62,11 @@ non-semantic integrity manifest.
 * The adapter never selects a physical Robot Agent and never exposes a
   physical-execution flag.
 * Every mission-level replan is still held at H-IDE's human approval gate.
-* `cmd_vel` is clamped to `0.25 m/s` linear and `0.5 rad/s` angular, smoothed,
-  and expires after `250 ms`. Linear commands below `0.10 m/s` are held idle
-  because SONIC's slow-walk model cannot execute Nav2-style creeping reliably.
+* `cmd_vel` is bounded to `0.40 m/s` linear and `0.25 rad/s` angular and expires
+  after `250 ms`. Any active forward ramp is quantized to NVIDIA's official
+  `0.40 m/s` gamepad-default SLOW_WALK speed; diagonal/lateral/reverse commands
+  retain the pinned ROS2 adapter's direction-specific speeds. Inputs at or
+  below the official `0.01 m/s` translation deadband remain idle.
 * The current navigation-only profile bounds SONIC's arm targets around the
   nominal stance and rate-limits them before `rt/lowcmd`; manipulation-sized
   whole-body output is not permitted until H-IDE exposes an explicit arm skill.
@@ -206,8 +208,8 @@ The accepted standalone modes are `forward` (1 m), `forward_3m`, `reverse`
 (1 m), `lateral_left`, `lateral_right` (0.5 m), `turn_left`, and
 `turn_right` (90 degrees). `detour` additionally requires one of the two
 locked Office V2 waste-bin routes. DriveOnHeading uses NVIDIA/Nav2's reviewed
-0.20 m/s, true lateral uses NVIDIA's 0.40 m/s, and Spin stays within
-0.10–0.20 rad/s. A trace path is created only after its matching evaluated
+0.40 m/s, true lateral uses NVIDIA's reviewed 0.40 m/s speed, and Spin stays
+within 0.10–0.25 rad/s. A trace path is created only after its matching evaluated
 result is durable; any fault stops, cancels, aborts evidence, and never retries
 automatically. This proves the isolated `motion_core` tier only—not the H-IDE
 RobotAgent full chain.

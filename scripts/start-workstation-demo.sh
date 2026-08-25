@@ -21,6 +21,17 @@ HIDE_DOCKER_OBSERVATION_BIND_REQUEST="${HIDE_DOCKER_OBSERVATION_BIND_HOST:-auto}
 HIDE_DEMO_REBUILD=false
 HIDE_DEMO_MOTION_CORE=false
 HIDE_MUJOCO_ONSCREEN_VIEWER=0
+# Reversible simulation experiment: keep the learned SONIC whole-body policy
+# in control through automatic gait/navigation/health observations. Explicit
+# operator cancel and correlated safe-stop remain authoritative. Set this to 0
+# before launch to restore the reviewed fail-closed behavior.
+HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT="${HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT:-1}"
+
+if [[ "${HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT}" != "0" \
+  && "${HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT}" != "1" ]]; then
+  printf '%s\n' 'HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT must be exactly 0 or 1' >&2
+  exit 2
+fi
 
 for argument in "$@"; do
   case "${argument}" in
@@ -57,6 +68,7 @@ fi
 export HIDE_DEMO_H_IDE_ROOT HIDE_DEMO_SIM_ROOT HIDE_DEMO_ROBOT_ROOT HIDE_DEMO_VISION_ROOT
 export HIDE_DEMO_CONFIG HIDE_DEMO_ROBOT_CONFIG HIDE_DEMO_OBSERVATION_CONFIG
 export HIDE_DEMO_CYCLONE DISPLAY="${DISPLAY:-:0}"
+export HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT
 HIDE_DEMO_XAUTHORITY="${XAUTHORITY:-${XDG_RUNTIME_DIR}/gdm/Xauthority}"
 if [[ "${HIDE_MUJOCO_ONSCREEN_VIEWER}" == "1" ]]; then
   HIDE_DEMO_XAUTHORITY_RESOLVED="$(
@@ -359,6 +371,7 @@ start_process() {
     --setenv="HIDE_DEMO_CYCLONE=${HIDE_DEMO_CYCLONE}" \
     --setenv="HIDE_DEMO_GATEWAY_TOKEN=${HIDE_DEMO_GATEWAY_TOKEN}" \
     --setenv="HIDE_DOCKER_OBSERVATION_BIND_HOST=${HIDE_DOCKER_OBSERVATION_BIND_HOST}" \
+    --setenv="HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT=${HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT}" \
     /bin/bash -lc "${command}" >/dev/null
 
   for _ in {1..30}; do
@@ -1083,7 +1096,7 @@ start_process \
   strict-navigation-adapter \
   'tools/strict_navigation_adapter.py' \
   "${HIDE_DEMO_SIM_ROOT}" \
-  'source /opt/ros/jazzy/setup.bash; source "$HIDE_DEMO_ROBOT_ROOT/tools/activate-local-nav2-jazzy.bash"; export ROS_DOMAIN_ID=232 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp CYCLONEDDS_URI="$HIDE_DEMO_CYCLONE"; export PYTHONPATH="$HIDE_DEMO_SIM_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"; exec /usr/bin/python3 -u "$HIDE_DEMO_SIM_ROOT/tools/strict_navigation_adapter.py" --command-timeout-seconds 600'
+  'source /opt/ros/jazzy/setup.bash; source "$HIDE_DEMO_ROBOT_ROOT/tools/activate-local-nav2-jazzy.bash"; export ROS_DOMAIN_ID=232 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp CYCLONEDDS_URI="$HIDE_DEMO_CYCLONE"; export PYTHONPATH="$HIDE_DEMO_SIM_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"; exec /usr/bin/python3 -u "$HIDE_DEMO_SIM_ROOT/tools/strict_navigation_adapter.py" --command-timeout-seconds 2400'
 
 if ! wait_for_strict_navigation_adapter 30; then
   exit 1

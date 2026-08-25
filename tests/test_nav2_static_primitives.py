@@ -145,7 +145,7 @@ def _assert_primitive_plan(module, navfn_path, plan) -> None:
         navfn_path["poses"]
     )
     assert plan["map_provenance"]["scene_source_sha256"] == (
-        "76ee5cd945aab28f034075eab65e5e104085c904048bf2d7085495796b46c379"
+        "7c30b7c4bb3e8136659688c80b8bef97724aae79aa7fd0f82deb96b227ca98ff"
     )
     assert all(
         len(plan["map_provenance"][name]) == 64
@@ -165,7 +165,7 @@ def _assert_primitive_plan(module, navfn_path, plan) -> None:
     )
     # Residuals within the measured whole-body braking envelope are complete;
     # any new motion segment must be longer than that endpoint envelope. Its
-    # command speed remains NVIDIA's exact 0.30 m/s Slow Walk command.
+    # command speed uses NVIDIA's official 0.40 m/s default Slow Walk command.
     assert plan["segmenter"]["min_segment_m"] == 0.16
     assert plan["segmenter"]["max_segment_m"] == 2.0
     assert plan["execution_policy"] == {
@@ -174,9 +174,9 @@ def _assert_primitive_plan(module, navfn_path, plan) -> None:
         "revalidate_line_of_sight_before_drive": True,
         "endpoint_tolerance_m": 0.15,
         "heading_tolerance_rad": 0.09,
-        "drive_speed_mps": 0.30,
+        "drive_speed_mps": 0.40,
         "spin_min_angular_rps": 0.10,
-        "spin_max_angular_rps": 0.20,
+        "spin_max_angular_rps": 0.25,
         "spin_angular_accel_rps2": 0.30,
         "zero_spin_policy": "skip_within_heading_tolerance",
         "final_heading_policy": (
@@ -243,7 +243,7 @@ def _assert_primitive_plan(module, navfn_path, plan) -> None:
         assert drive["segment_id"] == segment["id"]
         assert drive["end_map"] == segment["end_map"]
         assert drive["path_end_index"] == segment["path_end_index"]
-        assert drive["speed_mps"] == 0.30
+        assert drive["speed_mps"] == 0.40
     assert all(item["requires_fresh_odometry"] for item in plan["primitives"])
     # Stored checkpoints contain only absolute references. Relative action
     # goals are created by resolve_live_primitive from fresh odometry.
@@ -490,7 +490,7 @@ def test_live_resolver_uses_fresh_pose_and_never_emits_zero_or_subfloor_goals() 
     )
     assert drive["disposition"] == "send_action"
     assert drive["action_type"] == "nav2_msgs/action/DriveOnHeading"
-    assert drive["action_goal"]["speed_mps"] == 0.30
+    assert drive["action_goal"]["speed_mps"] == 0.40
     assert drive["action_goal"]["target"]["x"] == pytest.approx(
         segment["distance_m"]
     )
@@ -880,9 +880,9 @@ def test_schema_and_motion_manifest_forbid_unaccepted_follow_path_motion() -> No
         "nav2_msgs/action/DriveOnHeading",
     ]
     assert manifest["primitive_action_contract"] == {
-        "drive_on_heading_speed_mps": 0.3,
+        "drive_on_heading_speed_mps": 0.4,
         "spin_min_angular_rps": 0.1,
-        "spin_max_angular_rps": 0.2,
+        "spin_max_angular_rps": 0.25,
         "spin_angular_accel_rps2": 0.3,
     }
     assert {
@@ -899,7 +899,7 @@ def test_schema_and_motion_manifest_forbid_unaccepted_follow_path_motion() -> No
         Draft202012Validator(schema).validate(plan)
 
 
-def test_runtime_quantizes_nav2_ramp_to_official_forward_speed() -> None:
+def test_runtime_quantizes_nav2_ramp_to_official_default_forward_speed() -> None:
     guard = CmdVelGuard(
         max_linear_mps=0.40,
         min_walk_command_mps=0.20,
@@ -908,5 +908,5 @@ def test_runtime_quantizes_nav2_ramp_to_official_forward_speed() -> None:
     )
 
     intent = guard.accept(0.199, 0.0, 0.25)
-    assert intent.vx == pytest.approx(0.30)
+    assert intent.vx == pytest.approx(0.40)
     assert intent.vy == pytest.approx(0.0)

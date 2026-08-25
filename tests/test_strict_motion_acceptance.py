@@ -157,11 +157,11 @@ def _point_on_path(path: list[tuple[float, float]], progress: float) -> tuple[fl
 
 def _goal(mode: str) -> dict[str, float]:
     if mode == "forward_probe":
-        return {"distanceM": 0.2, "speedMps": 0.3}
+        return {"distanceM": 0.2, "speedMps": 0.4}
     if mode == "forward":
-        return {"distanceM": 1.0, "speedMps": 0.3}
+        return {"distanceM": 1.0, "speedMps": 0.4}
     if mode == "forward_3m":
-        return {"distanceM": 3.0, "speedMps": 0.3}
+        return {"distanceM": 3.0, "speedMps": 0.4}
     if mode == "reverse":
         return {"distanceM": -1.0, "speedMps": 0.2}
     if mode == "lateral_left":
@@ -209,7 +209,7 @@ def _command(mode: str, active: bool) -> dict[str, float]:
     if not active:
         return {"vx": 0.0, "vy": 0.0, "wz": 0.0}
     if mode in {"forward_probe", "forward", "forward_3m"}:
-        return {"vx": 0.3, "vy": 0.0, "wz": 0.0}
+        return {"vx": 0.4, "vy": 0.0, "wz": 0.0}
     if mode == "reverse":
         return {"vx": -0.2, "vy": 0.0, "wz": 0.0}
     if mode == "lateral_left":
@@ -217,10 +217,10 @@ def _command(mode: str, active: bool) -> dict[str, float]:
     if mode == "lateral_right":
         return {"vx": 0.0, "vy": -0.40, "wz": 0.0}
     if mode == "turn_left":
-        return {"vx": 0.0, "vy": 0.0, "wz": 0.2}
+        return {"vx": 0.0, "vy": 0.0, "wz": 0.25}
     if mode == "turn_right":
-        return {"vx": 0.0, "vy": 0.0, "wz": -0.2}
-    return {"vx": 0.3, "vy": 0.0, "wz": 0.2}
+        return {"vx": 0.0, "vy": 0.0, "wz": -0.25}
+    return {"vx": 0.4, "vy": 0.0, "wz": 0.25}
 
 
 def _feet(progress: float) -> tuple[dict[str, int], dict[str, int]]:
@@ -268,12 +268,12 @@ def _sample(mode: str, t_s: float, progress: float, active: bool, sequence: int)
         0.40
         if active and mode in {"lateral_left", "lateral_right"}
         else (
-            (0.2 if mode == "reverse" else 0.3)
+            (0.2 if mode == "reverse" else 0.4)
             if active and mode not in {"turn_left", "turn_right"}
             else 0.0
         )
     )
-    angular_speed = 0.2 if active and mode in {"turn_left", "turn_right", "detour"} else 0.0
+    angular_speed = 0.25 if active and mode in {"turn_left", "turn_right", "detour"} else 0.0
     isolation_manifest = _isolation_manifest(mode)
     dynamics_sequence = 10_000 + sequence
     return {
@@ -582,7 +582,7 @@ def _rebuild_detour_trace(
             append_segment(
                 spin_sequence,
                 "Spin",
-                {"targetYawRad": spin_delta, "maxWzRps": 0.2},
+                {"targetYawRad": spin_delta, "maxWzRps": 0.25},
                 (before[0], before[1], current_yaw),
                 (before[0], before[1], settled_spin_yaw),
                 abs(spin_delta),
@@ -602,7 +602,7 @@ def _rebuild_detour_trace(
                 append_segment(
                     spin_sequence,
                     "Spin",
-                    {"targetYawRad": correction, "maxWzRps": 0.2},
+                    {"targetYawRad": correction, "maxWzRps": 0.25},
                     (before[0], before[1], current_yaw),
                     (before[0], before[1], corrected_yaw),
                     abs(correction),
@@ -612,7 +612,7 @@ def _rebuild_detour_trace(
         append_segment(
             drive_sequence,
             "DriveOnHeading",
-            {"distanceM": distance, "speedMps": 0.3},
+            {"distanceM": distance, "speedMps": 0.4},
             (before[0], before[1], heading),
             (after[0], after[1], heading),
             distance,
@@ -624,7 +624,7 @@ def _rebuild_detour_trace(
         append_segment(
             2 * (len(path) - 1),
             "Spin",
-            {"targetYawRad": final_spin, "maxWzRps": 0.2},
+            {"targetYawRad": final_spin, "maxWzRps": 0.25},
             (endpoint[0], endpoint[1], current_yaw),
             (endpoint[0], endpoint[1], final_yaw),
             abs(final_spin),
@@ -675,8 +675,8 @@ def _rebuild_detour_trace(
                 else None
             )
         elif active_segment["type"] == "DriveOnHeading":
-            command = {"vx": 0.3, "vy": 0.0, "wz": 0.0}
-            linear_speed, angular_speed = 0.3, 0.0
+            command = {"vx": 0.4, "vy": 0.0, "wz": 0.0}
+            linear_speed, angular_speed = 0.4, 0.0
             nav2_actions = {
                 "driveOnHeadingActive": True,
                 "navigateToPoseActive": False,
@@ -686,8 +686,8 @@ def _rebuild_detour_trace(
             segment_index = active_segment["sequenceIndex"]
         else:
             spin_sign = math.copysign(1.0, active_segment["goal"]["targetYawRad"])
-            command = {"vx": 0.0, "vy": 0.0, "wz": spin_sign * 0.2}
-            linear_speed, angular_speed = 0.0, 0.2
+            command = {"vx": 0.0, "vy": 0.0, "wz": spin_sign * 0.25}
+            linear_speed, angular_speed = 0.0, 0.25
             nav2_actions = {
                 "driveOnHeadingActive": False,
                 "navigateToPoseActive": False,
@@ -2038,12 +2038,12 @@ def test_normal_fast_motion_is_not_misclassified_as_a_pose_jump() -> None:
 @pytest.mark.parametrize(
     ("mode", "mutation", "expected_code"),
     [
-        ("forward", {"vx": 0.301}, "DRIVE_ON_HEADING_COMMAND_ENVELOPE"),
+        ("forward", {"vx": 0.401}, "DRIVE_ON_HEADING_COMMAND_ENVELOPE"),
         ("reverse", {"vy": 0.001}, "DRIVE_ON_HEADING_COMMAND_ENVELOPE"),
         ("turn_left", {"vx": 0.001}, "SPIN_COMMAND_ENVELOPE"),
-        ("turn_right", {"wz": -0.201}, "SPIN_COMMAND_ENVELOPE"),
+        ("turn_right", {"wz": -0.251}, "SPIN_COMMAND_ENVELOPE"),
         ("detour", {"vy": 0.001}, "SPIN_COMMAND_ENVELOPE"),
-        ("detour", {"wz": 0.201}, "SPIN_COMMAND_ENVELOPE"),
+        ("detour", {"wz": 0.251}, "SPIN_COMMAND_ENVELOPE"),
     ],
 )
 def test_official_command_envelopes_reject_overspeed_and_mixed_axes(
@@ -2062,14 +2062,14 @@ def test_ros_float32_command_roundoff_is_not_material_overspeed() -> None:
     trace = _trace("forward")
     for sample in trace["samples"]:
         if sample["motionIntentActive"]:
-            sample["command"]["vx"] = 0.30000001192092896
+            sample["command"]["vx"] = 0.4000000059604645
     assert strict.evaluate_trace(trace)["pass"] is True
 
     overspeed = copy.deepcopy(trace)
     active = next(
         sample for sample in overspeed["samples"] if sample["motionIntentActive"]
     )
-    active["command"]["vx"] = 0.3000011
+    active["command"]["vx"] = 0.4000011
     assert "DRIVE_ON_HEADING_COMMAND_ENVELOPE" in _failure_codes(overspeed)
 
 
@@ -2137,7 +2137,7 @@ def test_detour_drive_segment_rejects_overspeed_and_mixed_axes() -> None:
         for sample in trace["samples"]
         if sample["nav2Actions"]["driveOnHeadingActive"]
     )
-    drive_sample["command"].update(vx=0.301, wz=0.001)
+    drive_sample["command"].update(vx=0.401, wz=0.001)
 
     assert "DRIVE_ON_HEADING_COMMAND_ENVELOPE" in _failure_codes(trace)
 

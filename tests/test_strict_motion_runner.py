@@ -104,9 +104,9 @@ def test_sonic_evidence_client_polls_async_materialization_to_completion(
 @pytest.mark.parametrize(
     ("mode", "vx"),
     (
-        ("forward_probe", 0.3),
-        ("forward", 0.3),
-        ("forward_3m", 0.3),
+        ("forward_probe", 0.4),
+        ("forward", 0.4),
+        ("forward_3m", 0.4),
         ("reverse", -0.2),
     ),
 )
@@ -258,7 +258,7 @@ def test_translation_deadline_uses_observed_progress_without_changing_command() 
         (math.pi / 2.0) / runner.OBSERVED_SPIN_PROGRESS_FLOOR_RPS
         + runner.SPIN_STARTUP_STOP_MARGIN_S
     )
-    assert runner.OFFICIAL_SPIN_MAX_RPS == pytest.approx(0.20)
+    assert runner.OFFICIAL_SPIN_MAX_RPS == pytest.approx(0.25)
 
 
 def test_drive_on_heading_goal_speed_has_the_same_sign_as_distance() -> None:
@@ -297,8 +297,10 @@ def test_drive_on_heading_rejects_wrong_sign_and_mixed_axes() -> None:
     (
         ("turn_left", 0.1),
         ("turn_left", 0.2),
+        ("turn_left", 0.25),
         ("turn_right", -0.1),
         ("turn_right", -0.2),
+        ("turn_right", -0.25),
     ),
 )
 def test_spin_relays_the_reviewed_acceleration_envelope(mode: str, wz: float) -> None:
@@ -311,12 +313,12 @@ def test_spin_relays_the_reviewed_acceleration_envelope(mode: str, wz: float) ->
 def test_spin_accepts_nav2_acceleration_ramp_but_rejects_unsafe_commands() -> None:
     relay = runner.StrictCommandRelay()
     relay.begin("turn_left")
-    for ramped in (0.001, 0.03, 0.075, 0.1, 0.15, 0.2):
+    for ramped in (0.001, 0.03, 0.075, 0.1, 0.15, 0.2, 0.25):
         relay.observe_nav2(command(wz=ramped), observed_at_s=1.0)
     for invalid in (
         command(wz=-0.2),
-        command(wz=0.201),
-        command(vx=0.01, wz=0.2),
+        command(wz=0.251),
+        command(vx=0.01, wz=0.25),
     ):
         with pytest.raises(runner.StrictMotionRunnerError):
             relay.observe_nav2(invalid, observed_at_s=1.0)
@@ -325,7 +327,7 @@ def test_spin_accepts_nav2_acceleration_ramp_but_rejects_unsafe_commands() -> No
 def test_nav2_output_fails_closed_when_source_stalls() -> None:
     relay = runner.StrictCommandRelay()
     relay.begin("forward")
-    relay.observe_nav2(command(vx=0.3), observed_at_s=2.0)
+    relay.observe_nav2(command(vx=runner.OFFICIAL_DRIVE_SPEED_MPS), observed_at_s=2.0)
     with pytest.raises(runner.StrictMotionRunnerError, match="stale"):
         relay.nav2_output(now_s=2.151)
 
@@ -432,6 +434,25 @@ def test_map_checkpoint_waits_for_new_sample_without_accepting_stale_pose(
 
     assert sleeps == 1
     assert observed.pose == runner.PlanarPose(-6.45, 0.0, 0.0)
+
+
+def test_default_map_checkpoint_accepts_bounded_ten_hz_jitter() -> None:
+    now = [1.0]
+    backend = runner.RosLiveBackend.__new__(runner.RosLiveBackend)
+    backend._clock = lambda: now[0]
+    backend._lock = threading.RLock()
+    backend._fatal = None
+    backend._latest_map_pose = runner.PoseObservation(
+        runner.PlanarPose(-6.45, 0.0, 0.0),
+        "map",
+        now[0] - 0.107,
+    )
+
+    observed = backend.wait_fresh_map_pose()
+
+    assert runner.MAP_LOCALIZATION_MAX_AGE_S == pytest.approx(0.25)
+    assert runner.MAP_LOCALIZATION_WAIT_TIMEOUT_S == pytest.approx(1.0)
+    assert observed.age_s(now[0]) == pytest.approx(0.107)
 
 
 def test_map_checkpoint_fails_closed_when_freshness_never_recovers(
@@ -746,7 +767,7 @@ class FakeReader:
 
 class FakeRos:
     def __init__(self) -> None:
-        self.command = command(vx=0.3)
+        self.command = command(vx=runner.OFFICIAL_DRIVE_SPEED_MPS)
 
     def bridge_health(self) -> dict:
         return {
@@ -988,7 +1009,11 @@ def test_snapshot_collector_binds_every_runtime_identity_and_isolation(
     assert sample["isolationProof"]["cmdVelPublisher"]["nodeName"] == (
         "/strict_motion_runner"
     )
-    assert sample["command"] == {"vx": 0.3, "vy": 0.0, "wz": 0.0}
+    assert sample["command"] == {
+        "vx": runner.OFFICIAL_DRIVE_SPEED_MPS,
+        "vy": 0.0,
+        "wz": 0.0,
+    }
     assert sample["plantSequence"] == 100
     assert sample["plantDynamicsEvidence"]["sampleSequence"] == 12_345
     assert sample["tS"] == pytest.approx(12.52)
@@ -1668,7 +1693,7 @@ class FakeStaticPlanner:
             "action_type": "nav2_msgs/action/DriveOnHeading",
             "action_goal": {
                 "target": {"x": 0.5, "y": 0.0, "z": 0.0},
-                "speed_mps": 0.3,
+                "speed_mps": runner.OFFICIAL_DRIVE_SPEED_MPS,
             },
             "fresh_distance_to_endpoint_m": 0.5,
             "command_distance_m": 0.5,
@@ -1717,7 +1742,10 @@ def test_standalone_executor_orders_authority_evidence_action_and_stop(
     trace, result = executor.run_standalone(mode="forward", case_id="forward-run-1")
 
     assert result == {"pass": True}
-    assert trace["action"]["goal"] == {"distanceM": 1.0, "speedMps": 0.3}
+    assert trace["action"]["goal"] == {
+        "distanceM": 1.0,
+        "speedMps": runner.OFFICIAL_DRIVE_SPEED_MPS,
+    }
     assert trace["action"]["activationProvenance"] == "initial_support_release"
     assert backend.calls == [
         "ready",
@@ -1814,10 +1842,10 @@ def test_detour_executor_uses_only_fresh_resolved_official_primitives(
     # Each primitive has one active sample; the remaining samples are stops.
     samples[1]["motionIntentActive"] = True
     samples[1]["nav2Actions"]["spinActive"] = True
-    samples[1]["command"]["wz"] = -0.2
+    samples[1]["command"]["wz"] = -runner.OFFICIAL_SPIN_MAX_RPS
     samples[19]["motionIntentActive"] = True
     samples[19]["nav2Actions"]["driveOnHeadingActive"] = True
-    samples[19]["command"]["vx"] = 0.3
+    samples[19]["command"]["vx"] = runner.OFFICIAL_DRIVE_SPEED_MPS
     collector = FakeExecutorCollector(samples)
     evidence = FakeDetourEvidence()
     planner = FakeStaticPlanner()
@@ -1862,7 +1890,7 @@ def test_detour_executor_skips_subresolution_alignment_before_drive(
     samples = [_executor_sample(index / 10.0) for index in range(60)]
     samples[2]["motionIntentActive"] = True
     samples[2]["nav2Actions"]["driveOnHeadingActive"] = True
-    samples[2]["command"]["vx"] = 0.3
+    samples[2]["command"]["vx"] = runner.OFFICIAL_DRIVE_SPEED_MPS
     collector = FakeExecutorCollector(samples)
     evidence = FakeDetourEvidence()
     planner = FakeStaticPlanner(skip_spin_only=True)
@@ -1925,7 +1953,7 @@ def test_detour_executor_skips_alignment_when_prior_action_reached_endpoint(
     samples = [_executor_sample(index / 10.0) for index in range(60)]
     samples[2]["motionIntentActive"] = True
     samples[2]["nav2Actions"]["driveOnHeadingActive"] = True
-    samples[2]["command"]["vx"] = 0.3
+    samples[2]["command"]["vx"] = runner.OFFICIAL_DRIVE_SPEED_MPS
     evidence = FakeDetourEvidence()
     planner = EndpointReachedPlanner()
 
@@ -1994,7 +2022,7 @@ def test_detour_executor_repeats_bounded_drive_until_endpoint_confirmation(
                 "action_type": "nav2_msgs/action/DriveOnHeading",
                 "action_goal": {
                     "target": {"x": 0.5, "y": 0.0, "z": 0.0},
-                    "speed_mps": 0.3,
+                    "speed_mps": runner.OFFICIAL_DRIVE_SPEED_MPS,
                 },
                 "fresh_distance_to_endpoint_m": remaining,
                 "command_distance_m": 0.5,
@@ -2006,7 +2034,7 @@ def test_detour_executor_repeats_bounded_drive_until_endpoint_confirmation(
     for index in (2, 20):
         samples[index]["motionIntentActive"] = True
         samples[index]["nav2Actions"]["driveOnHeadingActive"] = True
-        samples[index]["command"]["vx"] = 0.3
+        samples[index]["command"]["vx"] = runner.OFFICIAL_DRIVE_SPEED_MPS
     collector = FakeExecutorCollector(samples)
     evidence = FakeDetourEvidence()
     planner = ChunkedDrivePlanner()
@@ -2070,7 +2098,7 @@ def test_detour_executor_accepts_successful_drive_inside_relaxed_physical_endpoi
                 "action_type": "nav2_msgs/action/DriveOnHeading",
                 "action_goal": {
                     "target": {"x": 0.5, "y": 0.0, "z": 0.0},
-                    "speed_mps": 0.3,
+                    "speed_mps": runner.OFFICIAL_DRIVE_SPEED_MPS,
                 },
                 "fresh_distance_to_endpoint_m": remaining,
                 "command_distance_m": 0.5,
@@ -2081,7 +2109,7 @@ def test_detour_executor_accepts_successful_drive_inside_relaxed_physical_endpoi
     samples = [_executor_sample(index / 10.0) for index in range(90)]
     samples[2]["motionIntentActive"] = True
     samples[2]["nav2Actions"]["driveOnHeadingActive"] = True
-    samples[2]["command"]["vx"] = 0.3
+    samples[2]["command"]["vx"] = runner.OFFICIAL_DRIVE_SPEED_MPS
     evidence = FakeDetourEvidence()
     planner = SuccessfulEndpointPlanner()
 
@@ -2140,7 +2168,7 @@ def test_detour_executor_rejects_nonprogressing_drive_chunk(
                     "action_type": "nav2_msgs/action/DriveOnHeading",
                     "action_goal": {
                         "target": {"x": 0.5, "y": 0.0, "z": 0.0},
-                        "speed_mps": 0.3,
+                        "speed_mps": runner.OFFICIAL_DRIVE_SPEED_MPS,
                     },
                     "fresh_distance_to_endpoint_m": 0.5,
                     "command_distance_m": 0.5,
@@ -2152,7 +2180,7 @@ def test_detour_executor_rejects_nonprogressing_drive_chunk(
     samples = [_executor_sample(index / 10.0) for index in range(40)]
     samples[2]["motionIntentActive"] = True
     samples[2]["nav2Actions"]["driveOnHeadingActive"] = True
-    samples[2]["command"]["vx"] = 0.3
+    samples[2]["command"]["vx"] = runner.OFFICIAL_DRIVE_SPEED_MPS
     evidence = FakeDetourEvidence()
     monkeypatch.setattr(
         runner,
@@ -2188,10 +2216,10 @@ def test_detour_executor_realigns_drive_from_fresh_pose_with_bounded_spin(
         samples[index]["motionIntentActive"] = True
         if primitive == "spin":
             samples[index]["nav2Actions"]["spinActive"] = True
-            samples[index]["command"]["wz"] = -0.2
+            samples[index]["command"]["wz"] = -runner.OFFICIAL_SPIN_MAX_RPS
         else:
             samples[index]["nav2Actions"]["driveOnHeadingActive"] = True
-            samples[index]["command"]["vx"] = 0.3
+            samples[index]["command"]["vx"] = runner.OFFICIAL_DRIVE_SPEED_MPS
     collector = FakeExecutorCollector(samples)
     evidence = FakeDetourEvidence()
     planner = FakeStaticPlanner(realign_once=True)
@@ -2273,7 +2301,7 @@ def test_detour_executor_fails_closed_after_four_drive_realignment_spins(
     for index in (1, 19, 37, 55, 73):
         samples[index]["motionIntentActive"] = True
         samples[index]["nav2Actions"]["spinActive"] = True
-        samples[index]["command"]["wz"] = -0.2
+        samples[index]["command"]["wz"] = -runner.OFFICIAL_SPIN_MAX_RPS
     collector = FakeExecutorCollector(samples)
     evidence = FakeDetourEvidence()
     planner = AlwaysRealignPlanner()
@@ -2323,7 +2351,7 @@ def test_detour_executor_fails_closed_when_realignment_error_does_not_contract(
     for index in (1, 19):
         samples[index]["motionIntentActive"] = True
         samples[index]["nav2Actions"]["spinActive"] = True
-        samples[index]["command"]["wz"] = -0.2
+        samples[index]["command"]["wz"] = -runner.OFFICIAL_SPIN_MAX_RPS
     collector = FakeExecutorCollector(samples)
     evidence = FakeDetourEvidence()
     planner = StalledRealignPlanner()

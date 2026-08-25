@@ -500,6 +500,31 @@ class SonicHealth:
             and not self.controlled_policy_stop_active
         )
 
+    @property
+    def confirmed_balanced_policy_idle(self) -> bool:
+        """Whether the resident learned controller proves stationary IDLE.
+
+        A normal navigation stop intentionally keeps SONIC's matched policy
+        reference on DDS so the untethered humanoid can continue balancing.
+        RobotAgent may relinquish only its remote command authority at that
+        boundary.  A later remote acquire may reuse this exact resident
+        generation, but must not mistake policy braking, a pending Plant stop,
+        or active navigation for the same condition.
+        """
+
+        return (
+            self.plant_support_mode == "idle"
+            and not self.plant_support_safety_latched
+            and not self.plant_support_stop_pending
+            and not self.static_hold_active
+            and not self.navigation_task_active
+            and self.motion_authorized
+            and self.nav2_command_zero
+            and self.controlled_policy_stop_active
+            and self.matched_reference_actuator_authority
+            and self.reference_authority_state == "GRANTED"
+        )
+
     @classmethod
     def from_response(
         cls,
@@ -1308,9 +1333,13 @@ def require_fresh_motion_health(
     )
     if cause is not None:
         raise ValueError(f"{cause.code}: {cause.reason}")
-    if not health.confirmed_safe_hold:
+    if not (
+        health.confirmed_safe_hold
+        or health.confirmed_balanced_policy_idle
+    ):
         raise ValueError(
-            "SONIC control acquisition requires a confirmed settled safety hold"
+            "SONIC control acquisition requires a confirmed settled safety "
+            "hold or resident balanced policy IDLE"
         )
 
 

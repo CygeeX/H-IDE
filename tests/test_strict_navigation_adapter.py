@@ -453,3 +453,4 @@ def test_adapter_import_has_no_ros_or_motion_side_effects() -> None:
     assert adapter.NAVIGATE_ACTION == "/h_ide/strict/navigate_to_pose"
     assert adapter.ROTATE_ACTION == "/h_ide/strict/spin"
     assert adapter.MAX_PRODUCT_REPLANS == 2
+    assert adapter.DEFAULT_COMMAND_TIMEOUT_S == 2_400.0

@@ -948,7 +948,31 @@ def test_control_acquisition_requires_fresh_confirmed_safe_hold() -> None:
             plant_lowstate_stale_s=0.10,
             sonic_control_step_stale_s=0.10,
         )
-    with pytest.raises(ValueError, match="confirmed settled safety hold"):
+    balanced = parse_health(
+        plant_support_mode="idle",
+        static_hold_active=False,
+        navigation_task_active=False,
+        motion_authorized=True,
+        nav2_command_zero=True,
+        controlled_policy_stop_active=True,
+        matched_reference_actuator_authority=True,
+        reference_authority_state="GRANTED",
+        reference_authority_generation=42,
+        reference_authority_source_sequence=7,
+        reference_authority_intent_generation=3,
+        reference_authority_epoch=2,
+        reference_authority_granted_at_monotonic_s=100.25,
+        reference_authority_granted_tick_ms=2500,
+        reference_authority_dds_target_sequence=11,
+    )
+    assert balanced.confirmed_balanced_policy_idle is True
+    require_fresh_motion_health(
+        balanced,
+        plant_lowstate_stale_s=0.10,
+        sonic_control_step_stale_s=0.10,
+    )
+
+    with pytest.raises(ValueError, match="resident balanced policy IDLE"):
         require_fresh_motion_health(
             parse_health(),
             plant_lowstate_stale_s=0.10,

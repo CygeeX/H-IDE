@@ -183,13 +183,13 @@ class FormalContract:
     command_zero_epsilon: float = 1e-6
     # ROS Twist uses float64, but several official Nav2 behavior parameters and
     # intermediate messages originate as float32.  Admit only serialization
-    # noise around a code-owned cap (0.3f is 0.30000001192092896), not a
+    # noise around a code-owned cap (0.4f is 0.4000000059604645), not a
     # materially faster command.
     command_serialization_tolerance: float = 1e-6
     steady_target_tolerance: float = 0.01
-    drive_on_heading_max_vx_mps: float = 0.30
+    drive_on_heading_max_vx_mps: float = 0.40
     lateral_step_max_vy_mps: float = 0.40
-    spin_max_wz_rps: float = 0.20
+    spin_max_wz_rps: float = 0.25
     max_fresh_odometry_age_s: float = 0.10
     max_first_person_capture_age_ms: float = 2000.0
     # The official constant-speed primitive hands off to learned IDLE before
@@ -1909,13 +1909,13 @@ class StrictMotionEvaluator:
                 ):
                     self._fail(
                         "SPIN_COMMAND_ENVELOPE",
-                        "Spin requires |vx|,|vy|<=1e-6 and |wz|<=0.20rad/s",
+                        "Spin requires |vx|,|vy|<=1e-6 and |wz|<=0.25rad/s",
                         float(sample["t"]),
                     )
             if max(signed_commands) < self.contract.spin_max_wz_rps - self.contract.steady_target_tolerance - _EPS:
                 self._fail(
                     "SPIN_STEADY_TARGET_MISSING",
-                    "no signed 0.20rad/s Spin steady command was observed",
+                    "no signed 0.25rad/s Spin steady command was observed",
                 )
         else:
             cumulative_translation = [0.0]
@@ -2417,7 +2417,7 @@ class StrictMotionEvaluator:
                 if distance <= 0 or abs(speed - self.contract.drive_on_heading_max_vx_mps) > _EPS:
                     self._fail(
                         "DETOUR_SEGMENT_GOAL_INVALID",
-                        "DriveOnHeading detour goals require positive distance and locked 0.30m/s speed",
+                        "DriveOnHeading detour goals require positive distance and locked 0.40m/s speed",
                     )
                 if line_of_sight is not True:
                     self._fail(
@@ -2442,7 +2442,7 @@ class StrictMotionEvaluator:
                 ) > _EPS:
                     self._fail(
                         "DETOUR_SEGMENT_GOAL_INVALID",
-                        "Spin detour goals require non-zero target yaw and locked 0.20rad/s speed",
+                        "Spin detour goals require non-zero target yaw and locked 0.25rad/s speed",
                     )
                 normalized_goal = {
                     "targetYawRad": target_yaw,
@@ -2636,7 +2636,7 @@ class StrictMotionEvaluator:
                 ):
                     self._fail(
                         "DRIVE_ON_HEADING_COMMAND_ENVELOPE",
-                        "detour DriveOnHeading requires 0<vx<=0.30m/s and zero vy/wz",
+                        "detour DriveOnHeading requires 0<vx<=0.40m/s and zero vy/wz",
                         float(sample["t"]),
                     )
             else:
@@ -2652,7 +2652,7 @@ class StrictMotionEvaluator:
                 ):
                     self._fail(
                         "SPIN_COMMAND_ENVELOPE",
-                        "detour Spin requires target-signed 0<|wz|<=0.20rad/s and zero vx/vy",
+                        "detour Spin requires target-signed 0<|wz|<=0.25rad/s and zero vx/vy",
                         float(sample["t"]),
                     )
 
@@ -2743,7 +2743,7 @@ class StrictMotionEvaluator:
             if steady < target - self.contract.steady_target_tolerance - _EPS:
                 self._fail(
                     "DETOUR_SEGMENT_STEADY_TARGET_MISSING",
-                    f"detour segment {index} never observed its locked 0.30 steady target",
+                    f"detour segment {index} never observed its locked {target:.2f} steady target",
                 )
             if index + 1 < len(self.detour_segments):
                 next_observed = observed_by_segment[index + 1]
