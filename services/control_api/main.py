@@ -118,6 +118,7 @@ from .developer_diagnostics import (
     DeveloperDiagnosticsService,
     create_developer_diagnostics_router,
 )
+from .daaam_memory import DaaamMemoryRepository, create_daaam_memory_router
 from .auth import (
     AuthService,
     AuthorizationDenied,
@@ -1260,6 +1261,7 @@ def create_app(
     if not math.isfinite(draft_ttl_seconds) or draft_ttl_seconds <= 0:
         raise ValueError("ASSISTANT_DRAFT_TTL_SECONDS must be finite and greater than zero")
     mission_runtime = MissionRuntime(store)
+    daaam_memory_repository = DaaamMemoryRepository(store)
     mission_service = MissionService(
         store,
         mission_runtime,
@@ -1268,6 +1270,7 @@ def create_app(
             "robot_agent" not in context.adapters
             and _environment_flag("MISSION_V2_ALLOW_SYNTHETIC_PROFILE", default=True)
         ),
+        semantic_memory_repository=daaam_memory_repository,
     )
     mission_service.scene_context_client = scene_adapter
     conversation_adapter = conversation_client or conversation_client_from_env()
@@ -1420,6 +1423,7 @@ def create_app(
     app.state.mission_runtime = mission_runtime
     app.state.mission = mission_service
     app.state.mission_policy = mission_service.policy
+    app.state.daaam_memory = daaam_memory_repository
     app.state.speech = speech_adapter
     app.state.realtime_speech = realtime_speech
     app.state.visual_mission = VisualMissionRuntime(
@@ -1435,6 +1439,7 @@ def create_app(
     )
     app.include_router(create_auth_router(auth_service))
     app.include_router(create_scene_memory_router(store))
+    app.include_router(create_daaam_memory_router(daaam_memory_repository))
     app.include_router(
         create_developer_diagnostics_router(
             developer_diagnostics_service or DeveloperDiagnosticsService(store)

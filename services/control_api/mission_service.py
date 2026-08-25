@@ -49,6 +49,7 @@ from packages.mission_core import (
     WorldRecordKind,
 )
 
+from .daaam_memory import DaaamMemoryRepository
 from .mission_client import MissionPlanningClient, MissionPlanningUnavailable
 from .office_inspection import (
     MISSION_REPORT_SKILL,
@@ -114,12 +115,14 @@ class MissionService:
         *,
         allow_synthetic_profile: bool = False,
         policy: MissionPolicy | None = None,
+        semantic_memory_repository: DaaamMemoryRepository | None = None,
     ) -> None:
         self.store = store
         self.runtime = runtime
         self.planner = planner
         self.allow_synthetic_profile = allow_synthetic_profile
         self.policy = policy or MissionPolicy(store)
+        self.semantic_memory_repository = semantic_memory_repository
         self.store.recover_mission_draft_approvals()
         self.robot_refresher: Callable[[str | None], None] | None = None
         self.skill_dispatcher: Callable[[Any], Mapping[str, Any]] | None = None
@@ -660,7 +663,112 @@ class MissionService:
             )
         return records
 
-    def build_brief(self, body: Mapping[str, Any]) -> dict[str, Any]:
+    def _daaam_world_records(
+        self,
+        *,
+        mission_id: str,
+        robot_id: str,
+        scene_refs: list[Any],
+        allowed_region_ids: list[str],
+        actor: PolicyActor | None,
+    ) -> list[WorldRecord]:
+        """Project durable DAAAM memory as non-executable hypotheses.
+
+        DAAAM centroids are deliberately discarded by the repository query.
+        A semantic-memory outage is availability-neutral for Mission planning:
+        the existing scene and live-observation paths remain authoritative.
+        """
+
+        repository = self.semantic_memory_repository
+        if repository is None or actor is None or actor.is_legacy:
+            return []
+        if len(scene_refs) != 1:
+            return []
+        try:
+            scene_ref = SceneRef.model_validate(scene_refs[0])
+            entities = repository.mission_context_entities(
+                owner_user_id=actor.user_id,
+                site_id=actor.site_id,
+                robot_id=robot_id,
+                scene_ref=scene_ref,
+                limit=50,
+            )
+        except Exception:
+            return []
+
+        allowed_regions = set(allowed_region_ids)
+        records: list[WorldRecord] = []
+        for entity in entities:
+            region_id = entity.get("regionId")
+            if not isinstance(region_id, str) or region_id not in allowed_regions:
+                continue
+            label = entity.get("label")
+            import_id = entity.get("importId")
+            payload_sha256 = entity.get("payloadSha256")
+            observed_at = entity.get("lastObservedAt")
+            if not all(
+                isinstance(value, str) and value.strip()
+                for value in (label, import_id, payload_sha256, observed_at)
+            ):
+                continue
+            try:
+                observed = datetime.fromisoformat(
+                    observed_at.replace("Z", "+00:00")
+                )
+                confidence_value = entity.get("confidence")
+                confidence = (
+                    float(confidence_value)
+                    if confidence_value is not None
+                    else 0.0
+                )
+                semantic_id = int(entity["semanticId"])
+                observation_count = int(entity["observationCount"])
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
+            identity = _sha256(
+                {
+                    "missionId": mission_id,
+                    "importId": import_id,
+                    "entityId": entity.get("entityId"),
+                    "payloadSha256": payload_sha256,
+                }
+            ).removeprefix("sha256:")[:24]
+            records.append(
+                WorldRecord(
+                    recordId=f"world-{mission_id}-daaam-{identity}",
+                    missionId=mission_id,
+                    robotId=robot_id,
+                    kind=WorldRecordKind.HYPOTHESIS,
+                    subject=label,
+                    predicate="semantic_memory_observation",
+                    value={
+                        "semanticId": semantic_id,
+                        "regionId": region_id,
+                        "observationCount": observation_count,
+                        "firstObservedAt": entity.get("firstObservedAt"),
+                        "lastObservedAt": observed_at,
+                        "inHydraDsg": bool(entity.get("inHydraDsg")),
+                        "memoryImportId": import_id,
+                        "confidenceCalibrated": confidence_value is not None,
+                        "authority": "observation_only",
+                        "executionEligible": False,
+                    },
+                    source="daaam",
+                    sourceRef=f"daaam:{import_id}:{payload_sha256}",
+                    confidence=confidence,
+                    observedAt=observed,
+                    frameId=None,
+                    sceneRef=scene_ref,
+                )
+            )
+        return records
+
+    def build_brief(
+        self,
+        body: Mapping[str, Any],
+        *,
+        actor: PolicyActor | None = None,
+    ) -> dict[str, Any]:
         robot_id = _id(body.get("robotId", os.getenv("ROBOT_AGENT_ID", "robot-1")), "robotId")
         if self.robot_refresher is not None:
             self.robot_refresher(robot_id)
@@ -780,6 +888,20 @@ class MissionService:
             modelPins=model_pins,
             expiresAt=utc_now() + timedelta(seconds=duration_seconds),
         )
+        world_records = self._scene_world_records(
+            mission_id=mission_id,
+            robot_id=robot_id,
+            scene_refs=scene_refs,
+        )
+        world_records.extend(
+            self._daaam_world_records(
+                mission_id=mission_id,
+                robot_id=robot_id,
+                scene_refs=scene_refs,
+                allowed_region_ids=list(envelope.allowedRegionIds),
+                actor=actor,
+            )
+        )
         context_version = _id(
             body.get("contextVersion")
             or _sha256({
@@ -787,17 +909,15 @@ class MissionService:
                 "manifest": manifest.manifestDigest,
                 "profile": profile.profileDigest,
                 "sceneRefs": scene_refs,
+                "worldRecordSources": [
+                    item.sourceRef for item in world_records
+                ],
             })[:29],
             "contextVersion",
         )
         history = body.get("history", [])
         if not isinstance(history, list):
             raise MissionServiceError("history must be a list")
-        world_records = self._scene_world_records(
-            mission_id=mission_id,
-            robot_id=robot_id,
-            scene_refs=scene_refs,
-        )
         return {
             "requestId": request_id,
             "missionId": mission_id,
@@ -827,7 +947,7 @@ class MissionService:
         )
         if actor is not None:
             self.policy.require_robot_access(robot_id, actor)
-        brief = self.build_brief(body)
+        brief = self.build_brief(body, actor=actor)
         if is_full_office_inspection(brief.get("objective")):
             try:
                 resume_from = body.get("resumeFromMissionId")

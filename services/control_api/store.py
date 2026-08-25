@@ -969,6 +969,61 @@ class SQLiteStore:
                     """,
                 ),
             ),
+            (
+                8,
+                "daaam_observation_only_semantic_memory",
+                (
+                    """
+                    CREATE TABLE daaam_memory_imports (
+                        import_id TEXT PRIMARY KEY,
+                        mission_id TEXT NOT NULL,
+                        robot_id TEXT NOT NULL,
+                        owner_user_id TEXT NOT NULL,
+                        site_id TEXT NOT NULL,
+                        robot_boot_id TEXT NOT NULL,
+                        localization_epoch_id TEXT NOT NULL,
+                        observation_session_id TEXT NOT NULL,
+                        scene_id TEXT NOT NULL,
+                        scene_revision TEXT NOT NULL,
+                        captured_from TEXT NOT NULL,
+                        captured_through TEXT NOT NULL,
+                        payload_sha256 TEXT NOT NULL UNIQUE,
+                        payload_json TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        FOREIGN KEY(mission_id) REFERENCES missions(mission_id),
+                        FOREIGN KEY(owner_user_id) REFERENCES users(user_id)
+                    )
+                    """,
+                    """
+                    CREATE TABLE daaam_memory_entities (
+                        import_id TEXT NOT NULL,
+                        entity_id TEXT NOT NULL,
+                        semantic_id INTEGER NOT NULL CHECK(semantic_id >= 0),
+                        normalized_label TEXT NOT NULL,
+                        region_id TEXT,
+                        last_observed_at TEXT NOT NULL,
+                        payload_json TEXT NOT NULL,
+                        PRIMARY KEY(import_id, entity_id),
+                        UNIQUE(import_id, semantic_id),
+                        FOREIGN KEY(import_id)
+                            REFERENCES daaam_memory_imports(import_id)
+                    )
+                    """,
+                    """
+                    CREATE INDEX daaam_memory_owner_scene_time_idx
+                        ON daaam_memory_imports(
+                            owner_user_id, site_id, robot_id,
+                            scene_id, scene_revision, captured_through DESC
+                        )
+                    """,
+                    """
+                    CREATE INDEX daaam_memory_entity_region_label_idx
+                        ON daaam_memory_entities(
+                            region_id, normalized_label, last_observed_at DESC
+                        )
+                    """,
+                ),
+            ),
         )
         for version, name, statements in migrations:
             applied = self._connection.execute(

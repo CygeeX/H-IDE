@@ -498,6 +498,7 @@ class WorldRecord(ContractModel):
         "scene",
         "operator",
         "verifier",
+        "daaam",
     ]
     sourceRef: str
     confidence: float = Field(ge=0, le=1)
@@ -542,9 +543,9 @@ class WorldRecord(ContractModel):
     def _validity(self):
         if self.validUntil is not None and self.validUntil <= self.observedAt:
             raise ValueError("validUntil must be later than observedAt")
-        if self.kind is WorldRecordKind.FACT and self.source == "qwen":
+        if self.kind is WorldRecordKind.FACT and self.source in {"qwen", "daaam"}:
             raise ValueError(
-                "semantic grounding output cannot be promoted directly to a fact"
+                "semantic observation output cannot be promoted directly to a fact"
             )
         return self
 
