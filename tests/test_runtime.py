@@ -311,7 +311,7 @@ async def test_control_acquire_is_the_only_latched_rearm_and_duplicates_are_idem
 
 
 @pytest.mark.asyncio
-async def test_control_release_confirms_one_physical_stop_and_is_idempotent(
+async def test_control_release_relinquishes_remote_authority_without_stopping_sonic(
     tmp_path: Path,
 ) -> None:
     ros = FakeRosAdapter()
@@ -346,8 +346,9 @@ async def test_control_release_confirms_one_physical_stop_and_is_idempotent(
     assert released.state is ControlState.SAFE_HOLD
     assert released.authority_revoked is True
     assert released.safe_stop_state.value == "confirmed"
-    assert released.safe_stop_epoch == before.safe_stop_epoch + 1
-    assert ros.safe_stop_reasons == initial_stops + 1
+    assert released.safe_stop_epoch == before.safe_stop_epoch
+    assert released.can_acquire is True
+    assert ros.safe_stop_reasons == initial_stops
     outbound = []
     while runtime._outbound.qsize:
         outbound.append((await runtime._outbound.get()).payload)
@@ -356,18 +357,15 @@ async def test_control_release_confirms_one_physical_stop_and_is_idempotent(
         for item in outbound
         if getattr(item, "type", None) == "control.status"
     ]
-    assert [item.safe_stop_state for item in release_statuses] == [
-        "requested",
-        "confirmed",
-    ]
+    assert [item.safe_stop_state for item in release_statuses] == ["confirmed"]
     assert all(item.authority_revoked is True for item in release_statuses)
     assert all(item.safe_stop_epoch == released.safe_stop_epoch for item in release_statuses)
 
-    # A retried wire message acknowledges the already-confirmed boundary.  It
-    # cannot execute another physical stop or advance the durable epoch.
+    # A retried wire message is still a logical release.  It cannot execute a
+    # physical stop or advance the durable physical-stop epoch.
     await runtime._route_message(release, session_id)
     assert runtime._session.snapshot.safe_stop_epoch == released.safe_stop_epoch
-    assert ros.safe_stop_reasons == initial_stops + 1
+    assert ros.safe_stop_reasons == initial_stops
     await runtime.shutdown()
 
 
@@ -404,7 +402,7 @@ async def test_control_release_rejects_active_command_without_revoking_authority
 
 
 @pytest.mark.asyncio
-async def test_control_release_failure_stays_revoked_and_cannot_rearm(
+async def test_control_release_never_calls_a_failing_physical_stop_adapter(
     tmp_path: Path,
 ) -> None:
     ros = FakeRosAdapter()
@@ -423,15 +421,15 @@ async def test_control_release_failure_stays_revoked_and_cannot_rearm(
     await runtime._route_message(acquire, session_id)
     ros.safe_stop_succeeded = False
 
-    with pytest.raises(RuntimeSafetyError, match="rejected"):
-        await runtime._route_message(release, session_id)
+    initial_stops = ros.safe_stop_reasons
+    await runtime._route_message(release, session_id)
 
     snapshot = runtime._session.snapshot
     assert snapshot.state is ControlState.SAFE_HOLD
     assert snapshot.authority_revoked is True
-    assert snapshot.safe_stop_state.value == "failed"
-    with pytest.raises(SessionStateError, match="safety fault is latched"):
-        await runtime._route_message(acquire, session_id)
+    assert snapshot.safe_stop_state.value == "confirmed"
+    assert snapshot.can_acquire is True
+    assert ros.safe_stop_reasons == initial_stops
     await runtime.shutdown()
 
 
@@ -467,7 +465,7 @@ async def test_control_release_maximum_reason_keeps_status_wire_valid(
 
 
 @pytest.mark.asyncio
-async def test_failed_control_arm_relatches_stop_and_keeps_safe_hold(
+async def test_failed_control_arm_latches_remote_fault_without_stopping_sonic(
     tmp_path: Path,
 ) -> None:
     ros = FakeRosAdapter()
@@ -488,13 +486,13 @@ async def test_failed_control_arm_relatches_stop_and_keeps_safe_hold(
         await runtime._route_message(message, session_id)
     assert runtime._session.state is ControlState.SAFE_HOLD
     assert ros.control_arm_calls == 1
-    # Startup stop plus the failure relatch.
-    assert ros.safe_stop_reasons == 2
+    # Only the explicit process-start boundary used the physical stop.
+    assert ros.safe_stop_reasons == 1
     await runtime.shutdown()
 
 
 @pytest.mark.asyncio
-async def test_timed_out_control_arm_does_not_block_the_failure_relatch(
+async def test_timed_out_control_arm_latches_fault_without_stopping_sonic(
     tmp_path: Path,
 ) -> None:
     ros = FakeRosAdapter()
@@ -519,10 +517,11 @@ async def test_timed_out_control_arm_does_not_block_the_failure_relatch(
         await runtime._route_message(message, session_id)
     assert runtime._session.state is ControlState.SAFE_HOLD
     assert ros.control_arm_calls == 1
-    # The timed-out arm task is isolated from the mandatory safety-operation
-    # tracker, so startup stop plus the acquire-failure relatch both execute.
-    assert ros.safe_stop_reasons == 2
-    await asyncio.sleep(0)
+    assert ros.safe_stop_reasons == 1
+    for _ in range(4):
+        if not runtime._detached_control_arm_tasks:
+            break
+        await asyncio.sleep(0)
     assert runtime._detached_control_arm_tasks == set()
     await runtime.shutdown()
 
@@ -552,7 +551,7 @@ async def test_control_arm_rejects_any_preexisting_active_command(
         await runtime._route_message(message, session_id)
     assert runtime._session.state is ControlState.SAFE_HOLD
     assert ros.control_arm_calls == 0
-    assert ros.safe_stop_reasons == 2
+    assert ros.safe_stop_reasons == 1
     runtime._coordinator._arbiter.release(command_id)
     await runtime.shutdown()
 
@@ -717,7 +716,7 @@ async def test_runtime_configures_and_publishes_observation_health_state(
 
 
 @pytest.mark.asyncio
-async def test_observation_watchdog_cancellation_failure_forces_safe_stop(
+async def test_observation_watchdog_failure_latches_remote_fault_without_stopping_sonic(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -768,7 +767,10 @@ async def test_observation_watchdog_cancellation_failure_forces_safe_stop(
     initial_safe_stops = ros.safe_stop_reasons
     try:
         await runtime._check_observation_watchdog()
-        assert ros.safe_stop_reasons == initial_safe_stops + 1
+        assert ros.safe_stop_reasons == initial_safe_stops
+        assert runtime._session.snapshot.authority_revoked is True
+        assert runtime._session.snapshot.safe_stop_state.value == "confirmed"
+        assert runtime._session.snapshot.can_acquire is False
     finally:
         await runtime.shutdown()
 
@@ -850,14 +852,14 @@ async def test_runtime_handshake_control_lease_command_and_disconnect(tmp_path: 
         inbound("session.goodbye", session_id, {"reason": "test complete"})
     )
     await asyncio.wait_for(handler, timeout=2)
-    assert ros.safe_stop_reasons == 2
+    assert ros.safe_stop_reasons == 1
 
     await runtime.shutdown()
     assert ros.closed is True
 
 
 @pytest.mark.asyncio
-async def test_runtime_lease_expiry_emits_safety_and_returns_to_safe_hold(
+async def test_runtime_lease_expiry_quiesces_without_physical_sonic_stop(
     tmp_path: Path,
 ) -> None:
     config = runtime_config(tmp_path, lease_interval_ms=100, lease_timeout_ms=500)
@@ -886,13 +888,11 @@ async def test_runtime_lease_expiry_emits_safety_and_returns_to_safe_hold(
     )
     await next_message(connection)
 
-    safety = await next_message(connection)
-    assert safety.type == "safety.event"
-    assert safety.payload.code == "LEASE_EXPIRED"
     status = await next_message(connection)
     assert status.type == "control.status"
     assert status.payload.state == "SAFE_HOLD"
-    assert ros.safe_stop_reasons == 2
+    assert status.payload.safe_stop_state == "confirmed"
+    assert ros.safe_stop_reasons == 1
 
     await connection.incoming.put(inbound("session.goodbye", session_id, {"reason": "done"}))
     await asyncio.wait_for(handler, timeout=2)
@@ -1234,7 +1234,7 @@ async def test_runtime_prunes_terminal_ledger_periodically(
 
 
 @pytest.mark.asyncio
-async def test_lease_monitor_safe_stop_failure_terminates_connection_promptly(
+async def test_lease_monitor_never_consults_physical_stop_adapter(
     tmp_path: Path,
 ) -> None:
     config = runtime_config(tmp_path, lease_interval_ms=100, lease_timeout_ms=500)
@@ -1266,9 +1266,14 @@ async def test_lease_monitor_safe_stop_failure_terminates_connection_promptly(
 
     try:
         await asyncio.sleep(0.7)
-        assert handler.done() is True
-        with pytest.raises(RuntimeSafetyError, match="mandatory safe stop"):
-            await handler
+        assert handler.done() is False
+        assert runtime._session.state is ControlState.SAFE_HOLD
+        assert runtime._session.snapshot.safe_stop_state.value == "confirmed"
+        assert ros.safe_stop_reasons == 1
+        await connection.incoming.put(
+            inbound("session.goodbye", session_id, {"reason": "done"})
+        )
+        await asyncio.wait_for(handler, timeout=1)
     finally:
         if not handler.done():
             handler.cancel()
@@ -1282,8 +1287,7 @@ class FaultAwareFakeRosAdapter(FakeRosAdapter):
         self.motion_fault_callback: Any = None
         self.motion_fault_config: MotionSafetyFaultConfig | None = None
         self.execution_started = asyncio.Event()
-        self.fault_stop_started = asyncio.Event()
-        self.release_fault_stop = asyncio.Event()
+        self.fault_cancelled = asyncio.Event()
         self.exact_fault_cancels: list[UUID] = []
 
     def configure_motion_safety_fault(
@@ -1317,6 +1321,7 @@ class FaultAwareFakeRosAdapter(FakeRosAdapter):
         assert cancel_begin_deadline_ms == 100
         assert nav2_terminal_deadline_ms == 300
         self.exact_fault_cancels.append(command_id)
+        self.fault_cancelled.set()
         begin = time.monotonic_ns()
         terminal = time.monotonic_ns()
         return MotionFaultCancelEvidence(
@@ -1327,13 +1332,6 @@ class FaultAwareFakeRosAdapter(FakeRosAdapter):
             nav2_terminal_monotonic_ns=terminal,
             outcome="nav2_terminal",
         )
-
-    async def safe_stop(self, config: SafeStopConfig) -> ExecutionResult:
-        if self.safe_stop_reasons >= 1:
-            self.fault_stop_started.set()
-            await self.release_fault_stop.wait()
-        return await super().safe_stop(config)
-
 
 def fault_runtime_config(tmp_path: Path) -> AgentConfig:
     base = runtime_config(tmp_path)
@@ -1402,7 +1400,7 @@ def motion_fault_json(
 
 
 @pytest.mark.asyncio
-async def test_motion_fault_isolated_exact_cancel_and_terminal_after_physical_stop(
+async def test_motion_fault_cancels_exact_action_without_stopping_sonic(
     tmp_path: Path,
 ) -> None:
     config = fault_runtime_config(tmp_path)
@@ -1468,25 +1466,19 @@ async def test_motion_fault_isolated_exact_cancel_and_terminal_after_physical_st
     )
     ros.motion_fault_callback(retained_event, time.monotonic_ns())
     ros.motion_fault_callback(retained_event, time.monotonic_ns())
-    await asyncio.wait_for(ros.fault_stop_started.wait(), timeout=1)
-
-    # The Nav2 terminal is known, but public command truth remains RUNNING
-    # until the independent physical safe-stop confirms.
-    pending = runtime._ledger.get(command_id)
-    assert pending.state is CommandState.RUNNING
-    assert command_id in runtime._coordinator.pending_cancel_confirmations
-    assert ros.exact_fault_cancels == [command_id]
-    assert runtime._session.snapshot.safe_stop_state.value == "requested"
-
-    ros.release_fault_stop.set()
+    await asyncio.wait_for(ros.fault_cancelled.wait(), timeout=1)
     await asyncio.wait_for(submission, timeout=1)
     await asyncio.gather(*tuple(runtime._motion_fault_tasks))
 
+    assert ros.exact_fault_cancels == [command_id]
+    assert runtime._coordinator.pending_cancel_confirmations == frozenset()
+
     terminal = runtime._ledger.get(command_id)
     assert terminal.state is CommandState.CANCELLED
-    assert "physical safe-stop confirmed" in terminal.detail
+    assert "physical safe-stop" not in terminal.detail
     assert runtime._session.snapshot.safe_stop_state.value == "confirmed"
     assert runtime._session.snapshot.can_acquire is False
+    assert ros.safe_stop_reasons == 1
     assert runtime._motion_fault_counters["wrongRobot"] == 1
     assert runtime._motion_fault_counters["wrongEpoch"] == 1
     assert runtime._motion_fault_counters["accepted"] == 1
@@ -1494,7 +1486,7 @@ async def test_motion_fault_isolated_exact_cancel_and_terminal_after_physical_st
     audit = runtime._ledger.motion_fault_events()[-1]
     assert audit.event_id == event_id
     assert audit.command_id == command_id
-    assert audit.safe_stop_epoch == runtime._session.snapshot.safe_stop_epoch
+    assert audit.safe_stop_epoch is None
     assert audit.source == "mujoco_plant"
     assert audit.code == "BASE_FALL_DETECTED"
     assert audit.control_generation == 12
@@ -1505,10 +1497,9 @@ async def test_motion_fault_isolated_exact_cancel_and_terminal_after_physical_st
     assert diagnostics["motionSafetyFault"]["commandId"] == str(command_id)
     await runtime.shutdown()
 
-    # A fresh process/deduplicator must accept the transient-local replay and
-    # create a newer durable safe-stop epoch instead of clearing the latch.
+    # A fresh process/deduplicator accepts the transient-local replay, but the
+    # automatic handler still cannot create a physical safe-stop epoch.
     replay_ros = FaultAwareFakeRosAdapter()
-    replay_ros.release_fault_stop.set()
     replay_runtime = RobotAgentRuntime(config, ros_adapter=replay_ros)
     await replay_runtime.initialize()
     before_replay_epoch = replay_runtime._session.snapshot.safe_stop_epoch
@@ -1516,9 +1507,10 @@ async def test_motion_fault_isolated_exact_cancel_and_terminal_after_physical_st
     replay_ros.motion_fault_callback(retained_event, time.monotonic_ns())
     await asyncio.sleep(0)
     await asyncio.gather(*tuple(replay_runtime._motion_fault_tasks))
-    assert replay_runtime._session.snapshot.safe_stop_epoch > before_replay_epoch
+    assert replay_runtime._session.snapshot.safe_stop_epoch == before_replay_epoch
     assert replay_runtime._session.snapshot.can_acquire is False
     assert len(replay_runtime._ledger.motion_fault_events()) == 2
+    assert replay_ros.safe_stop_reasons == 1
     await replay_runtime.shutdown()
 
 
@@ -1623,13 +1615,12 @@ async def test_motion_fault_at_observation_await_tail_interlocks_final_dispatch(
     assert observation.finished.is_set() is True
     assert runtime._motion_fault_ingress_latched.is_set() is True
 
-    await asyncio.wait_for(ros.fault_stop_started.wait(), timeout=1)
-    assert runtime._session.snapshot.safe_stop_state.value == "requested"
-    ros.release_fault_stop.set()
+    await asyncio.sleep(0)
     await asyncio.gather(*tuple(runtime._motion_fault_tasks))
 
     assert runtime._session.snapshot.safe_stop_state.value == "confirmed"
     assert runtime._session.snapshot.can_acquire is False
+    assert ros.safe_stop_reasons == 1
     audit = runtime._ledger.motion_fault_events()[-1]
     assert audit.event_id == event_id
     assert audit.command_id is None
@@ -1668,7 +1659,7 @@ async def test_ros_executor_failure_terminates_active_connection(tmp_path: Path)
     try:
         with pytest.raises(RuntimeError, match="ROS executor failed"):
             await asyncio.wait_for(handler, timeout=0.5)
-        assert ros.safe_stop_reasons == 2
+        assert ros.safe_stop_reasons == 1
     finally:
         if not handler.done():
             handler.cancel()
@@ -1677,7 +1668,7 @@ async def test_ros_executor_failure_terminates_active_connection(tmp_path: Path)
 
 
 @pytest.mark.asyncio
-async def test_safe_stop_invokes_physical_stop_even_when_action_cancel_hangs(
+async def test_disconnect_cancel_hang_latches_remote_fault_without_stopping_sonic(
     tmp_path: Path,
 ) -> None:
     class HangingCancelAdapter(FakeRosAdapter):
@@ -1753,9 +1744,9 @@ async def test_safe_stop_invokes_physical_stop_even_when_action_cancel_hangs(
 
     try:
         await asyncio.wait_for(ros.cancel_started.wait(), timeout=1)
-        assert ros.safe_stop_called.is_set() is True
-        with pytest.raises(RuntimeSafetyError, match="preempt"):
-            await asyncio.wait_for(handler, timeout=2)
+        await asyncio.wait_for(handler, timeout=2)
+        assert ros.safe_stop_called.is_set() is False
+        assert ros.safe_stop_reasons == 1
         replacement = uuid4()
         await runtime._session.connected(replacement)
         with pytest.raises(SessionStateError, match="safety fault is latched"):
@@ -1896,21 +1887,13 @@ async def test_back_to_back_request_and_cancel_never_dispatches_command(
     revoked = await next_message(connection)
     assert revoked.type == "control.status"
     assert revoked.payload.authority_revoked is True
-    assert revoked.payload.safe_stop_state == "requested"
-    pending = await next_message(connection)
-    assert pending.type == "command.status"
-    assert pending.payload.command_id == command_id
-    assert pending.payload.state == "RECEIVED"
+    assert revoked.payload.safe_stop_state == "confirmed"
     cancelled = await next_message(connection)
     assert cancelled.type == "command.status"
     assert cancelled.payload.command_id == command_id
     assert cancelled.payload.state == "CANCELLED"
     assert ros.executions == []
-    safety = await next_message(connection)
-    assert safety.type == "safety.event"
-    status = await next_message(connection)
-    assert status.type == "control.status"
-    assert status.payload.state == "SAFE_HOLD"
+    assert ros.safe_stop_reasons == 1
 
     await connection.incoming.put(
         inbound("session.goodbye", session_id, {"reason": "test complete"})
@@ -1920,15 +1903,13 @@ async def test_back_to_back_request_and_cancel_never_dispatches_command(
 
 
 @pytest.mark.asyncio
-async def test_cancel_is_not_terminal_until_physical_safe_stop_confirms(
+async def test_cancel_terminalizes_after_adapter_quiescence_without_stopping_sonic(
     tmp_path: Path,
 ) -> None:
     class BlockingCancelBoundaryAdapter(FakeRosAdapter):
         def __init__(self) -> None:
             super().__init__()
             self.execute_started = asyncio.Event()
-            self.stop_started = asyncio.Event()
-            self.release_stop = asyncio.Event()
 
         async def execute(
             self,
@@ -1940,12 +1921,6 @@ async def test_cancel_is_not_terminal_until_physical_safe_stop_confirms(
             self.execute_started.set()
             await asyncio.Event().wait()
             raise AssertionError("unreachable")
-
-        async def safe_stop(self, config: SafeStopConfig) -> ExecutionResult:
-            if self.safe_stop_reasons:
-                self.stop_started.set()
-                await self.release_stop.wait()
-            return await super().safe_stop(config)
 
     ros = BlockingCancelBoundaryAdapter()
     runtime = RobotAgentRuntime(runtime_config(tmp_path), ros_adapter=ros)
@@ -1986,24 +1961,15 @@ async def test_cancel_is_not_terminal_until_physical_safe_stop_confirms(
         runtime._coordinator.submit(command, at=datetime.now(timezone.utc))
     )
     await asyncio.wait_for(ros.execute_started.wait(), timeout=1)
-    cancelling = asyncio.create_task(runtime._route_message(cancellation, session_id))
-    await asyncio.wait_for(ros.stop_started.wait(), timeout=1)
-
-    pending = runtime._ledger.get(command_id)
-    assert pending.state is CommandState.RUNNING
-    assert command_id in runtime._coordinator.pending_cancel_confirmations
-    assert runtime._session.snapshot.authority_revoked is True
-    assert runtime._session.snapshot.safe_stop_state.value == "requested"
-    assert runtime._ledger.safe_stop_events()[-1].state.value == "requested"
-
-    ros.release_stop.set()
-    await asyncio.wait_for(cancelling, timeout=1)
+    await runtime._route_message(cancellation, session_id)
     await asyncio.wait_for(submission, timeout=1)
     terminal = runtime._ledger.get(command_id)
     assert terminal.state is CommandState.CANCELLED
-    assert "physical safe-stop confirmed at epoch 2" in terminal.detail
+    assert "physical safe-stop" not in terminal.detail
     assert runtime._session.snapshot.safe_stop_state.value == "confirmed"
     assert runtime._ledger.safe_stop_events()[-1].state.value == "confirmed"
+    assert len(runtime._ledger.safe_stop_events()) == 1
+    assert ros.safe_stop_reasons == 1
     await runtime.shutdown()
 
 
@@ -2121,7 +2087,7 @@ async def test_command_background_failure_terminates_active_connection(
         assert handler.done() is True
         with pytest.raises(RuntimeError, match="outbound command status failed"):
             await handler
-        assert ros.safe_stop_reasons == 2
+        assert ros.safe_stop_reasons == 1
     finally:
         if not handler.done():
             handler.cancel()

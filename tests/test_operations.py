@@ -59,6 +59,19 @@ def test_mujoco_safe_stop_deadline_is_conservative_and_profile_scoped() -> None:
     assert mujoco.safety.control_arm.timeout_ms == 1_000
 
 
+def test_mujoco_navigation_uses_the_bounded_strict_primitive_adapter() -> None:
+    mujoco = load_config(MUJOCO_CONFIG)
+    navigate = mujoco.commands["navigation.navigate_to_pose"]
+    rotate = mujoco.commands["navigation.rotate"]
+
+    assert navigate.ros_name == "/h_ide/strict/navigate_to_pose"
+    assert rotate.ros_name == "/h_ide/strict/spin"
+    assert navigate.executor_profile == "nav2.strict_static_primitives"
+    assert rotate.executor_profile == "nav2.strict_spin"
+    assert navigate.max_ttl_ms == navigate.timeout_ms == 2_400_000
+    assert rotate.max_ttl_ms == rotate.timeout_ms == 300_000
+
+
 def test_doctor_is_read_only_and_reports_ros_types(capsys: pytest.CaptureFixture[str]) -> None:
     config = load_config(LOCAL_CONFIG)
     ledger = Path(config.storage.ledger_path)

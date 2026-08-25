@@ -50,7 +50,13 @@ ControlArmCallback = Callable[[], Awaitable[None]]
 
 
 class SessionController:
-    """Own one session and latch SAFE_HOLD on disconnect or lease expiry."""
+    """Own one remote session without conflating it with actuator shutdown.
+
+    A lease, transport, or command lifecycle boundary revokes the remote
+    session's authority, but it must not stop the resident locomotion policy.
+    The physical safe-stop callback is reserved for an explicit developer
+    boundary (and the process-start boundary invoked by the runtime).
+    """
 
     def __init__(
         self,
@@ -128,7 +134,7 @@ class SessionController:
                     # the final state transition.
                     await before_activate()
                 except Exception as exc:
-                    await self._enter_safe_hold(
+                    self._latch_control_fault(
                         f"control activation failed closed: {exc}"
                     )
                     raise
@@ -167,7 +173,11 @@ class SessionController:
             return self.snapshot
 
     async def check_lease(self, at: datetime) -> bool:
-        """Enter SAFE_HOLD once when the active lease deadline is reached."""
+        """Relinquish remote authority once when its lease expires.
+
+        Command cancellation and zero-motion quiescence are owned by the
+        runtime.  Expiry never calls the physical safe-stop callback.
+        """
         _require_aware(at)
         async with self._lock:
             if (
@@ -176,7 +186,7 @@ class SessionController:
                 or at < self._lease_deadline
             ):
                 return False
-            await self._enter_safe_hold("lease expired")
+            self._relinquish_control("lease expired")
             return True
 
     async def disconnected(self, reason: str) -> SessionSnapshot:
@@ -184,7 +194,7 @@ class SessionController:
             had_session = self._session_id is not None
             try:
                 if had_session:
-                    await self._enter_safe_hold(reason)
+                    self._relinquish_control(reason)
             finally:
                 self._session_id = None
                 self._operator_id = None
@@ -226,30 +236,35 @@ class SessionController:
             return self.snapshot
 
     async def revoke_authority(self, reason: str) -> SessionSnapshot:
-        """Immediately revoke command authority without claiming a physical stop."""
+        """Immediately revoke only the remote command authority."""
 
         async with self._lock:
-            if self._safe_stop_state is not SafeStopState.REQUESTED:
-                self._begin_safe_stop(reason)
-            else:
-                self._state = ControlState.SAFE_HOLD
-                self._authority_revoked = True
-                self._lease_deadline = None
-                self._reason = reason
+            self._relinquish_control(reason)
             return self.snapshot
 
     async def latch_safety_fault(self, reason: str) -> SessionSnapshot:
-        """Block all command dispatch immediately when execution state is uncertain."""
+        """Block remote dispatch without stopping the resident policy."""
         async with self._lock:
-            self._state = ControlState.SAFE_HOLD
-            self._authority_revoked = True
-            self._lease_deadline = None
-            self._safety_fault = reason[:231]
-            if self._safe_stop_state is not SafeStopState.REQUESTED:
-                self._safe_stop_epoch += 1
-            self._safe_stop_state = SafeStopState.REQUESTED
-            self._reason = self._latched_fault_reason()
+            self._latch_control_fault(reason)
             return self.snapshot
+
+    def _relinquish_control(self, reason: str) -> None:
+        """Enter logical SAFE_HOLD while preserving physical stop truth."""
+
+        self._state = ControlState.SAFE_HOLD
+        self._authority_revoked = True
+        self._operator_id = None
+        self._lease_sequence = None
+        self._lease_deadline = None
+        self._reason = (
+            self._latched_fault_reason()
+            if self._safety_fault is not None
+            else reason
+        )
+
+    def _latch_control_fault(self, reason: str) -> None:
+        self._safety_fault = reason[:231]
+        self._relinquish_control(self._latched_fault_reason())
 
     async def _enter_safe_hold(self, reason: str) -> None:
         self._begin_safe_stop(reason)

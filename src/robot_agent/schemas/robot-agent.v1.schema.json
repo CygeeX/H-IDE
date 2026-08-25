@@ -153,7 +153,7 @@
         },
         "ttl_ms": {
           "exclusiveMinimum": 0,
-          "maximum": 60000,
+          "maximum": 2400000,
           "title": "Ttl Ms",
           "type": "integer"
         }

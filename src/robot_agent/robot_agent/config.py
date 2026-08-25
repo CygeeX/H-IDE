@@ -262,8 +262,12 @@ class CommandConfig(StrictConfigModel):
     ros_name: str = Field(pattern=ROS_NAME_PATTERN)
     ros_type: str = Field(pattern=ROS_TYPE_PATTERN)
     request_schema: dict[str, JsonValue]
-    max_ttl_ms: int = Field(gt=0, le=60_000)
-    timeout_ms: int = Field(gt=0, le=60_000)
+    # Long synthetic humanoid routes execute as several official
+    # Spin/DriveOnHeading primitives under one RobotAgent command.  Keep the
+    # protocol finite, but allow the simulation profile to own that complete
+    # lifecycle instead of expiring midway through a healthy 5-10 m route.
+    max_ttl_ms: int = Field(gt=0, le=2_400_000)
+    timeout_ms: int = Field(gt=0, le=2_400_000)
     resources: tuple[str, ...] = Field(min_length=1, max_length=32)
     skill_version: str = Field(
         default="1.0.0",

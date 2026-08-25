@@ -144,7 +144,7 @@
         },
         "max_ttl_ms": {
           "exclusiveMinimum": 0,
-          "maximum": 60000,
+          "maximum": 2400000,
           "title": "Max Ttl Ms",
           "type": "integer"
         },
@@ -231,7 +231,7 @@
         },
         "timeout_ms": {
           "exclusiveMinimum": 0,
-          "maximum": 60000,
+          "maximum": 2400000,
           "title": "Timeout Ms",
           "type": "integer"
         }

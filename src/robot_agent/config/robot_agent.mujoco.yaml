@@ -97,7 +97,7 @@ diagnostics:
 commands:
   navigation.navigate_to_pose:
     adapter: action
-    ros_name: /navigate_to_pose
+    ros_name: /h_ide/strict/navigate_to_pose
     ros_type: nav2_msgs/action/NavigateToPose
     goal_transform: navigate_to_pose_v1
     request_schema:
@@ -161,11 +161,12 @@ commands:
                 - {required: [visualResolutionId]}
                 - {required: [spatialResolutionId]}
                 - {required: [sceneRef]}
-    # A reviewed 5 m G1 walk needs up to 50 s at the 0.10 m/s gait floor,
-    # plus Nav2 startup/settling time. Use the protocol's bounded 60 s ceiling
-    # for this synthetic profile; real-robot limits remain unchanged.
-    max_ttl_ms: 60000
-    timeout_ms: 60000
+    # The strict adapter owns one NavFn plan plus several official
+    # Spin/DriveOnHeading actions. Whole-body progress is intentionally much
+    # slower than the command setpoint, so keep the complete semantic route
+    # under one finite RobotAgent cancellation/lease lifecycle.
+    max_ttl_ms: 2400000
+    timeout_ms: 2400000
     resources: [motion, navigation, observation]
     skill_version: 2.0.0
     description: Navigate with Nav2 to an H-IDE-reviewed MuJoCo map pose
@@ -173,7 +174,7 @@ commands:
     risk_level: medium
     cancellable: true
     interruptible: true
-    executor_profile: nav2.navigate_to_pose.default_bt
+    executor_profile: nav2.strict_static_primitives
     requires_observation: true
     observation_sensor_ids: [head_rgbd]
     observation_session_parameter: observationSessionId
@@ -184,7 +185,7 @@ commands:
 
   navigation.rotate:
     adapter: action
-    ros_name: /spin
+    ros_name: /h_ide/strict/spin
     ros_type: nav2_msgs/action/Spin
     goal_transform: nav2_spin_v2
     request_schema:
@@ -195,7 +196,7 @@ commands:
       required: [targetYawRad, timeAllowanceMs, missionId, revisionId, nodeId, authorizationId, skillRequestId, idempotencyKey, robotBootId, localizationEpochId]
       properties:
         targetYawRad: {type: number, minimum: -6.283185307179586, maximum: 6.283185307179586, not: {const: 0}}
-        timeAllowanceMs: {type: integer, minimum: 100, maximum: 60000}
+        timeAllowanceMs: {type: integer, minimum: 100, maximum: 300000}
         missionId: {type: string, minLength: 1, maxLength: 256}
         revisionId: {type: string, minLength: 1, maxLength: 256}
         nodeId: {type: string, minLength: 1, maxLength: 256}
@@ -204,8 +205,8 @@ commands:
         idempotencyKey: {type: string, minLength: 1, maxLength: 256}
         robotBootId: {type: string, minLength: 1, maxLength: 256}
         localizationEpochId: {type: string, minLength: 1, maxLength: 256}
-    max_ttl_ms: 60000
-    timeout_ms: 60000
+    max_ttl_ms: 300000
+    timeout_ms: 300000
     resources: [motion, navigation]
     skill_version: 2.0.0
     description: Rotate the MuJoCo mobile base through Nav2 Spin
@@ -213,7 +214,7 @@ commands:
     risk_level: medium
     cancellable: true
     interruptible: true
-    executor_profile: nav2.behaviors.spin
+    executor_profile: nav2.strict_spin
     local_only_parameters: [missionId, revisionId, nodeId, authorizationId, skillRequestId, idempotencyKey, robotBootId, localizationEpochId]
 
 state_sources:

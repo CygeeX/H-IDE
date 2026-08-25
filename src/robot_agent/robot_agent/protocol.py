@@ -99,7 +99,7 @@ class CommandRequestPayload(StrictModel):
     command_id: UUID
     kind: str = Field(min_length=3, max_length=128, pattern=LOGICAL_COMMAND_PATTERN)
     issued_at: AwareDatetime
-    ttl_ms: int = Field(gt=0, le=60_000)
+    ttl_ms: int = Field(gt=0, le=2_400_000)
     params: dict[str, JsonValue]
 
 

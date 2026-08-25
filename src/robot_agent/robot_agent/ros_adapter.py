@@ -140,8 +140,8 @@ def nav2_spin_goal_values(params: Mapping[str, Any]) -> dict[str, Any]:
     allowance_ms = params.get("timeAllowanceMs")
     if isinstance(allowance_ms, bool) or not isinstance(allowance_ms, int):
         raise RosTypeError("navigation timeAllowanceMs must be an integer")
-    if not 100 <= allowance_ms <= 60_000:
-        raise RosTypeError("navigation timeAllowanceMs must be within [100, 60000]")
+    if not 100 <= allowance_ms <= 300_000:
+        raise RosTypeError("navigation timeAllowanceMs must be within [100, 300000]")
     return {
         "target_yaw": target_yaw_value,
         "time_allowance": {

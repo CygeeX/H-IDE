@@ -442,7 +442,7 @@ async def test_server_mode_allows_only_one_controlling_connection(
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_client_reconnect_starts_unarmed_and_requires_new_acquire(
+async def test_client_reconnect_starts_unarmed_without_stopping_resident_policy(
     certificates: Certificates,
 ) -> None:
     server_context = build_server_ssl_context(tls_config(certificates, server=True))
@@ -508,7 +508,7 @@ async def test_client_reconnect_starts_unarmed_and_requires_new_acquire(
 
     assert bff_connections == 2
     assert states_on_connect == [ControlState.SAFE_HOLD, ControlState.SAFE_HOLD]
-    assert stop_reasons == ["websocket closed", "websocket closed"]
+    assert stop_reasons == []
 
 
 @pytest.mark.integration

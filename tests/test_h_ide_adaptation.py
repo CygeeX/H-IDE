@@ -200,7 +200,7 @@ def test_orientation_change_is_nav2_spin_and_never_velocity_or_head_motion() -> 
         ({"targetYawRad": math.tau + 0.01, "timeAllowanceMs": 1_000}, "2pi"),
         ({"targetYawRad": math.nan, "timeAllowanceMs": 1_000}, "finite"),
         ({"targetYawRad": 1.0, "timeAllowanceMs": True}, "integer"),
-        ({"targetYawRad": 1.0, "timeAllowanceMs": 60_001}, "60000"),
+        ({"targetYawRad": 1.0, "timeAllowanceMs": 300_001}, "300000"),
     ],
 )
 def test_nav2_spin_transform_fails_closed(

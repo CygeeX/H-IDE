@@ -350,7 +350,7 @@ class CommandLedger:
         self,
         handling_id: int,
         *,
-        safe_stop_epoch: int,
+        safe_stop_epoch: int | None,
         command_id: UUID | None,
         cancel_begin_monotonic_ns: int | None,
         ros_cancel_call_monotonic_ns: int | None,

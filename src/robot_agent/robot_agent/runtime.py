@@ -474,6 +474,19 @@ class RobotAgentRuntime:
         finally:
             try:
                 await self._session.disconnected(disconnect_reason)
+                try:
+                    await self._coordinator.preempt_all(
+                        reason=disconnect_reason,
+                        at=_now(),
+                        defer_terminal_until_safe_stop=False,
+                    )
+                except Exception as exc:
+                    reason = (
+                        "transport disconnect could not quiesce all commands: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    LOGGER.error(reason)
+                    await self._session.latch_safety_fault(reason)
             finally:
                 for command_task in tuple(self._command_tasks):
                     if not command_task.done():
@@ -603,13 +616,11 @@ class RobotAgentRuntime:
             # local provenance prefix must not make the outbound
             # ControlStatusPayload exceed its own 256-character contract.
             reason = f"remote control released: {message.payload.reason}"[:256]
-            await self._revoke_authority_for_safe_stop(reason)
-            try:
-                await self._session.ensure_safe_hold(reason, refresh=False)
-            finally:
-                # Success advertises the confirmed physical boundary. Failure
-                # advertises FAILED while authority remains revoked.
-                await self._enqueue_control_status()
+            await self._session.revoke_authority(reason)
+            # A terminal action has already returned the motion adapter to
+            # zero/learned-IDLE.  Releasing the remote session must not call
+            # the developer-only physical safe-stop endpoint.
+            await self._enqueue_control_status()
             return None
         if isinstance(message, LeaseRenew):
             snapshot = await self._session.renew(
@@ -682,25 +693,22 @@ class RobotAgentRuntime:
             cancel_reason = (
                 f"remote operator cancelled command {message.payload.command_id}"
             )
-            await self._revoke_authority_for_safe_stop(cancel_reason)
+            await self._revoke_remote_authority(cancel_reason)
             try:
                 cancelled = await self._coordinator.cancel(
                     message.payload.command_id,
                     reason=f"remote_operator: {message.payload.reason}",
                     at=_now(),
-                    defer_terminal_until_safe_stop=True,
+                    defer_terminal_until_safe_stop=False,
                 )
             except CommandCancellationError as exc:
                 LOGGER.error("command cancellation was not acknowledged: %s", exc)
-                await self._enter_safe_hold_after_cancel(cancel_reason)
+                await self._latch_remote_control_fault(str(exc))
                 return None
-            if cancelled:
-                await self._enter_safe_hold_after_cancel(cancel_reason)
-            else:
+            if not cancelled:
                 # The command may have completed between the active preflight
-                # and cancellation.  Authority was already revoked, so finish
-                # that requested physical boundary before reporting anything.
-                await self._enter_safe_hold_after_cancel(cancel_reason)
+                # and cancellation.  Remote authority remains relinquished,
+                # while SONIC stays resident in learned-IDLE.
                 record = await self._coordinator.record(message.payload.command_id)
                 if record is not None and record.state in TERMINAL_STATES:
                     await self._enqueue_command_status(record)
@@ -732,7 +740,7 @@ class RobotAgentRuntime:
             return
         except CommandCancellationError as exc:
             await self._enqueue_command_status(exc.record)
-            await self._enter_safe_hold_after_cancel(str(exc))
+            await self._latch_remote_control_fault(str(exc))
             return
         await self._enqueue_command_status(record)
 
@@ -886,6 +894,17 @@ class RobotAgentRuntime:
             self._ros.check_health()
             await self._check_observation_watchdog()
             if await self._session.check_lease(_now()):
+                try:
+                    await self._coordinator.preempt_all(
+                        reason="lease expired",
+                        at=_now(),
+                        defer_terminal_until_safe_stop=False,
+                    )
+                except Exception as exc:
+                    await self._latch_remote_control_fault(
+                        "lease expiry could not quiesce all commands: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
                 await self._enqueue_control_status()
 
     async def _state_emitter(self) -> None:
@@ -1068,45 +1087,26 @@ class RobotAgentRuntime:
             safe_stop_epoch=epoch,
         )
 
-    async def _enter_safe_hold_after_cancel(self, reason: str) -> None:
-        """A cancellation revokes the current control arm until reacquired."""
+    async def _latch_remote_control_fault(self, reason: str) -> None:
+        """Block new remote commands without invoking physical safe-stop."""
 
-        try:
-            await self._session.ensure_safe_hold(reason, refresh=True)
-        finally:
-            # A failed physical stop must be visible as failed, never as a
-            # confirmed SAFE_HOLD.  The session has already revoked authority.
-            await self._enqueue_control_status()
+        await self._session.latch_safety_fault(reason)
+        await self._enqueue_control_status()
 
-    async def _revoke_authority_for_safe_stop(
+    async def _revoke_remote_authority(
         self,
         reason: str,
         *,
         latch_fault: bool = False,
     ) -> None:
+        """Relinquish RobotAgent ownership while SONIC remains resident."""
+
         revoked = (
             await self._session.latch_safety_fault(reason)
             if latch_fault
             else await self._session.revoke_authority(reason)
         )
-        try:
-            await asyncio.to_thread(
-                self._ledger.begin_safe_stop,
-                epoch=revoked.safe_stop_epoch,
-                reason=reason,
-                at=_now(),
-            )
-        except Exception as exc:
-            # Never delay authority revocation or the physical stop for an
-            # audit write. _perform_safe_stop retries and then fails closed
-            # after exercising the physical adapter if storage stays down.
-            LOGGER.error(
-                "failed to persist safe-stop request epoch %s: %s",
-                revoked.safe_stop_epoch,
-                exc,
-            )
-        # Advertise authority revocation immediately, while truthfully
-        # retaining safe_stop_state=requested until the physical boundary.
+        del revoked
         await self._enqueue_control_status()
 
     async def _perform_control_arm(self) -> None:
@@ -1125,9 +1125,9 @@ class RobotAgentRuntime:
             operation,
             timeout=timeout_seconds,
             description="local control arm",
-            # A timed-out arm may still be unwinding inside the ROS executor,
-            # but it must never suppress the stronger safe-stop used to
-            # re-latch the Plant after a lost acknowledgement.
+            # A timed-out arm may still be unwinding inside the ROS executor.
+            # Track it independently while the remote control fault is latched;
+            # automatic recovery never calls the developer-only SONIC stop.
             detached_tasks=self._detached_control_arm_tasks,
         )
         if error is None and result is not None and result.succeeded:
@@ -1250,7 +1250,7 @@ class RobotAgentRuntime:
                 )
             )
             revoke_task = asyncio.create_task(
-                self._revoke_authority_for_safe_stop(reason, latch_fault=True)
+                self._revoke_remote_authority(reason, latch_fault=True)
             )
 
             command_ids = self._coordinator.active_nav2_commands
@@ -1274,7 +1274,7 @@ class RobotAgentRuntime:
                     command_id,
                     reason=reason,
                     at=received_at,
-                    defer_terminal_until_safe_stop=True,
+                    defer_terminal_until_safe_stop=False,
                     external_cancel_task=cancel_task,
                 )
                 if prepared:
@@ -1283,7 +1283,7 @@ class RobotAgentRuntime:
                             command_id,
                             reason=reason,
                             at=received_at,
-                            defer_terminal_until_safe_stop=True,
+                            defer_terminal_until_safe_stop=False,
                             external_cancel_task=cancel_task,
                         )
                     )
@@ -1324,22 +1324,13 @@ class RobotAgentRuntime:
                 outcome = "fault_cancel_failed"
                 detail = f"{type(exc).__name__}: {exc}"
 
-            # Authority revocation and its epoch audit run concurrently with
-            # the 300 ms cancellation boundary, never in front of it.
+            # Remote authority revocation runs concurrently with the bounded
+            # command cancellation.  It never invokes the developer-only
+            # physical SONIC stop endpoint.
             with contextlib.suppress(Exception):
                 await revoke_task
-            safe_stop_epoch = self._session.snapshot.safe_stop_epoch
-            with self._motion_fault_lock:
-                self._motion_fault_latest_evidence = evidence
-                self._motion_fault_latest_outcome = outcome
-                self._motion_fault_latest_detail = detail[:1024]
-                self._motion_fault_latest_safe_stop_epoch = safe_stop_epoch
-            try:
-                await self._enter_safe_hold_after_cancel(reason)
-            except Exception as exc:
-                outcome = f"{outcome}:safe_stop_failed"
-                detail = f"{detail}; physical safe-stop failed: {type(exc).__name__}: {exc}"
-
+            safe_stop_epoch = None
+            detail = f"{detail}; SONIC retained in resident learned-IDLE"
             with self._motion_fault_lock:
                 self._motion_fault_latest_evidence = evidence
                 self._motion_fault_latest_outcome = outcome
@@ -1427,26 +1418,25 @@ class RobotAgentRuntime:
             reason = f"observation_watchdog: {detail}"
             if not self._coordinator.is_command_active(binding.command_id):
                 continue
-            await self._revoke_authority_for_safe_stop(reason)
+            await self._revoke_remote_authority(reason)
             try:
                 cancelled = await self._coordinator.cancel(
                     binding.command_id,
                     reason=reason,
                     at=_now(),
-                    defer_terminal_until_safe_stop=True,
+                    defer_terminal_until_safe_stop=False,
                 )
             except CommandCancellationError as exc:
                 LOGGER.error("watchdog cancellation was not acknowledged: %s", exc)
-                await self._enter_safe_hold_after_cancel(reason)
+                await self._latch_remote_control_fault(str(exc))
             else:
-                # A race to command completion does not restore authority once
-                # this safety boundary has been requested.
+                # A race to command completion does not restore remote
+                # authority once watchdog quiescence has been requested.
                 if not cancelled:
                     LOGGER.info(
                         "watchdog command %s completed while cancellation raced",
                         binding.command_id,
                     )
-                await self._enter_safe_hold_after_cancel(reason)
 
     def _schedule_feedback(self, command_id: UUID, feedback: dict[str, Any]) -> None:
         session_id = self._connection_session_id

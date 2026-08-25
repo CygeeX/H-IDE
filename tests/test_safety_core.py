@@ -47,7 +47,7 @@ def test_resource_claim_is_idempotent_only_for_same_resource_set() -> None:
 
 
 @pytest.mark.asyncio
-async def test_lease_expiry_preempts_all_resources_and_latches_safe_hold() -> None:
+async def test_lease_expiry_relinquishes_remote_authority_without_physical_stop() -> None:
     arbiter = ResourceArbiter()
     active = (uuid4(), uuid4())
     arbiter.claim(active[0], ("motion",))
@@ -76,9 +76,13 @@ async def test_lease_expiry_preempts_all_resources_and_latches_safe_hold() -> No
     assert await controller.check_lease(NOW + timedelta(seconds=2.49)) is False
     assert await controller.check_lease(NOW + timedelta(seconds=2.5)) is True
     assert controller.state is ControlState.SAFE_HOLD
-    assert stop_reasons == ["lease expired"]
-    assert set(preempted[0]) == set(active)
-    assert arbiter.active_commands == frozenset()
+    assert controller.snapshot.authority_revoked is True
+    assert controller.snapshot.safe_stop_state is SafeStopState.CONFIRMED
+    assert stop_reasons == []
+    assert preempted == []
+    # The pure session state machine never owns adapters.  RobotAgentRuntime
+    # cancels them and publishes zero motion at the same logical boundary.
+    assert arbiter.active_commands == frozenset(active)
     assert await controller.check_lease(NOW + timedelta(seconds=3)) is False
 
 
@@ -101,7 +105,7 @@ async def test_disconnect_and_reconnect_require_explicit_acquire() -> None:
 
     await controller.disconnected("websocket closed")
     assert controller.state is ControlState.SAFE_HOLD
-    assert stop_reasons == ["websocket closed"]
+    assert stop_reasons == []
 
     await controller.connected(second)
     with pytest.raises(SessionStateError, match=r"explicit control\.acquire"):
@@ -147,7 +151,7 @@ async def test_disconnect_cannot_race_atomic_control_activation() -> None:
     await disconnecting
     assert controller.state is ControlState.SAFE_HOLD
     assert controller.session_id is None
-    assert stop_reasons == ["websocket closed"]
+    assert stop_reasons == []
 
 
 @pytest.mark.asyncio
@@ -234,8 +238,7 @@ async def test_safe_stop_failure_latches_fault_and_blocks_reacquire() -> None:
             at=NOW + timedelta(seconds=3),
         )
 
-    with pytest.raises(RuntimeError, match="safe-stop unavailable"):
-        await controller.disconnected("websocket closed")
+    await controller.disconnected("websocket closed")
     replacement_session = uuid4()
     await controller.connected(replacement_session)
     with pytest.raises(SessionStateError, match="safety fault is latched"):
@@ -278,7 +281,7 @@ async def test_cancelling_safe_hold_latches_fault_and_blocks_reacquire() -> None
 
 
 @pytest.mark.asyncio
-async def test_authority_revocation_precedes_physical_safe_stop_confirmation() -> None:
+async def test_remote_revocation_is_distinct_from_explicit_physical_safe_stop() -> None:
     started = asyncio.Event()
     release = asyncio.Event()
 
@@ -298,12 +301,13 @@ async def test_authority_revocation_precedes_physical_safe_stop_confirmation() -
 
     revoked = await controller.revoke_authority("operator cancel")
     assert revoked.authority_revoked is True
-    assert revoked.safe_stop_state is SafeStopState.REQUESTED
-    assert revoked.safe_stop_epoch == 5
-    assert revoked.can_acquire is False
+    assert revoked.safe_stop_state is SafeStopState.CONFIRMED
+    assert revoked.safe_stop_epoch == 4
+    assert revoked.can_acquire is True
+    assert started.is_set() is False
 
     confirmation = asyncio.create_task(
-        controller.ensure_safe_hold("operator cancel", refresh=False)
+        controller.ensure_safe_hold("operator cancel", refresh=True)
     )
     await asyncio.wait_for(started.wait(), timeout=1)
     assert controller.snapshot.safe_stop_state is SafeStopState.REQUESTED

@@ -618,8 +618,19 @@ class CommandCoordinator:
         except CommandNotFound:
             return None
 
-    async def preempt_all(self, *, reason: str, at: datetime) -> tuple[UUID, ...]:
-        """Bypass locks, request adapter cancellation, and terminalize all commands."""
+    async def preempt_all(
+        self,
+        *,
+        reason: str,
+        at: datetime,
+        defer_terminal_until_safe_stop: bool = True,
+    ) -> tuple[UUID, ...]:
+        """Bypass locks, cancel every adapter, and terminalize all commands.
+
+        An explicit developer safe-stop keeps the historical terminal
+        deferral.  Automatic lease/transport quiescence terminalizes after
+        adapter cancellation and never waits for a physical SONIC revoke.
+        """
         claimed_ids = self._arbiter.preempt_all()
         pending_ids = tuple(
             command_id
@@ -628,7 +639,8 @@ class CommandCoordinator:
         )
         command_ids = tuple(dict.fromkeys((*claimed_ids, *pending_ids)))
         self._preempting.update(command_ids)
-        self._defer_terminal.update(command_ids)
+        if defer_terminal_until_safe_stop:
+            self._defer_terminal.update(command_ids)
         tasks: list[asyncio.Task[Any]] = []
         for command_id in command_ids:
             task = self._tasks.get(command_id)
