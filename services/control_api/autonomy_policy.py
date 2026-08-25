@@ -250,6 +250,18 @@ DEFAULT_SKILL_RULES: Mapping[str, SkillRule] = MappingProxyType(
             capability=Capability.NAV2,
             minimum_risk=RiskLevel.MEDIUM,
         ),
+        "inspection.scan_station": SkillRule(
+            skill="inspection.scan_station",
+            action_class=ActionClass.BASE_MOTION,
+            capability=Capability.NAV2,
+            minimum_risk=RiskLevel.MEDIUM,
+        ),
+        "mission.report": SkillRule(
+            skill="mission.report",
+            action_class=ActionClass.READ_ONLY_OBSERVATION,
+            capability=Capability.NONE,
+            minimum_risk=RiskLevel.LOW,
+        ),
     }
 )
 
@@ -315,7 +327,7 @@ DEFAULT_ROLE_LIMITS: Mapping[tuple[Role, ExecutionTarget], MotionLimits] = (
     MappingProxyType(
         {
             (Role.USER, ExecutionTarget.SIM): _limits(
-                RiskLevel.MEDIUM, 10.0, 0.50, 2 * math.pi, 0.70
+                RiskLevel.MEDIUM, 20.0, 0.50, 2 * math.pi, 0.70
             ),
             (Role.USER, ExecutionTarget.REAL): _limits(
                 RiskLevel.MEDIUM, 5.0, 0.35, math.pi, 0.50

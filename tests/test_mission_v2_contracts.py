@@ -77,6 +77,16 @@ def _navigate_capability() -> CapabilityDescriptor:
     )
 
 
+def test_simulation_navigation_capability_supports_a_finite_forty_minute_timeout() -> None:
+    payload = _navigate_capability().model_dump(mode="json")
+    payload["timeoutMs"] = 2_400_000
+    assert CapabilityDescriptor.model_validate(payload).timeoutMs == 2_400_000
+
+    payload["timeoutMs"] = 2_400_001
+    with pytest.raises(ValidationError, match="less than or equal to 2400000"):
+        CapabilityDescriptor.model_validate(payload)
+
+
 def _envelope(**updates) -> MissionEnvelope:
     values = {
         "robotId": "robot-1",

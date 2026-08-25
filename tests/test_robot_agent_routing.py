@@ -73,3 +73,18 @@ def test_robot_agent_gateway_router_keeps_simulation_commands_on_the_sim_peer() 
     assert simulation.dispatched == ["command-sim-1"]
     assert live.dispatched == []
     assert router.query("command-sim-1").result["driver"] == "simulation"
+
+
+def test_robot_agent_gateway_router_restores_persisted_simulation_command_route() -> None:
+    live = _Driver("live")
+    simulation = _Driver("simulation")
+    router = _RobotAgentGatewayRouter(live, {"g1-sim": simulation})
+
+    assert router.query("command-sim-recovered").status == "unknown"
+
+    router.restore_command_route("command-sim-recovered", "g1-sim")
+
+    assert router.query("command-sim-recovered").result == {
+        "driver": "simulation",
+        "commandId": "command-sim-recovered",
+    }

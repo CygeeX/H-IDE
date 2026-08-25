@@ -11,7 +11,8 @@ from packages.control_core.adapters import AdapterResult, RobotAgentAdapter
 from packages.control_core.validation import utc_now
 from services.control_api.main import create_app
 from services.control_api.auth import Role
-from services.control_api.mission_policy import PolicyActor
+from services.control_api.autonomy_policy import ExecutionTarget
+from services.control_api.mission_policy import MissionPolicy, PolicyActor
 from services.control_api.mission_service import MissionServiceError
 from services.control_api.store import SQLiteStore
 from tests.test_mission_v2_api import (
@@ -30,6 +31,22 @@ PASSWORD = "correct horse battery staple"
 def policy_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MISSION_V2_INTERNAL_TOKEN", INTERNAL_TOKEN)
     monkeypatch.delenv("MISSION_POLICY_ALLOW_LEGACY_REAL", raising=False)
+
+
+def test_simulation_grant_ttl_is_long_without_weakening_real_target_ttl(
+    tmp_path,
+) -> None:
+    store = SQLiteStore(tmp_path / "policy-ttl.sqlite3")
+    policy = MissionPolicy(
+        store,
+        grant_ttl_seconds=600,
+        simulation_grant_ttl_seconds=3600,
+    )
+
+    assert policy.grant_ttl_seconds == 600
+    assert policy.simulation_grant_ttl_seconds == 3600
+    assert policy.grant_ttl_for_target(ExecutionTarget.SIM) == 3600
+    assert policy.grant_ttl_for_target(ExecutionTarget.REAL) == 600
 
 
 def _register_login(

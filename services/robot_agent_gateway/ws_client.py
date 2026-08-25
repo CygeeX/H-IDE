@@ -172,24 +172,31 @@ class RobotAgentWebSocketPeer:
                         "Robot Agent restarted before control release was confirmed"
                     )
                 epoch = status.safe_stop_epoch
-                fresh = epoch is not None and epoch > baseline_epoch
+                epoch_valid = epoch is not None and epoch >= baseline_epoch
                 if (
-                    fresh
+                    epoch_valid
                     and status.state == "SAFE_HOLD"
                     and status.authority_revoked is True
                     and status.safe_stop_state == "confirmed"
                 ):
+                    physical_stop_advanced = epoch > baseline_epoch
                     result = {
                         "state": "SAFE_HOLD",
                         "authorityRevoked": True,
                         "safeStopState": "confirmed",
                         "safeStopEpoch": epoch,
+                        "releaseMode": (
+                            "physical_safe_stop"
+                            if physical_stop_advanced
+                            else "remote_authority"
+                        ),
+                        "physicalSafeStopAdvanced": physical_stop_advanced,
                     }
                     self._release_baseline_epoch = None
                     self._release_baseline_boot_id = None
                     return result
                 if (
-                    fresh
+                    epoch_valid
                     and status.state == "SAFE_HOLD"
                     and status.authority_revoked is True
                     and status.safe_stop_state == "failed"

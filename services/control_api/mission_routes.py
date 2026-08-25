@@ -195,10 +195,19 @@ def create_mission_router(
 
     @router.post("/missions/drafts", status_code=status.HTTP_201_CREATED)
     def create_draft(
+        request: Request,
         body: dict[str, Any],
         principal: Principal = Depends(mission_user),
     ):
         payload = reject_server_identity(body)
+        resume_from = payload.get("resumeFromMissionId")
+        if resume_from is not None:
+            if not isinstance(resume_from, str) or not resume_from.strip():
+                raise HTTPException(
+                    status_code=422,
+                    detail="resumeFromMissionId must be a non-empty string",
+                )
+            access(request, principal, "mission", resume_from)
         payload["requestedBy"] = principal.user_id
         return invoke(
             lambda: service.create_draft(payload, actor=actor(principal))

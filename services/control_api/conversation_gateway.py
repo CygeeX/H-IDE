@@ -15,6 +15,7 @@ from packages.control_core.assistant_models import (
 
 from .conversation_client import ConversationClient
 from .mission_policy import PolicyActor
+from .office_inspection import is_full_office_inspection
 
 
 MissionDraftCreator = Callable[[Mapping[str, Any]], Mapping[str, Any]]
@@ -105,6 +106,33 @@ class ConversationGateway:
         mission_history: list[Mapping[str, Any]],
         mission_actor: PolicyActor | None = None,
     ) -> ConversationGatewayResult:
+        # This reviewed product intent has a deterministic, SceneRef-bound
+        # compiler downstream.  Routing it through a remote text classifier
+        # adds no authority check and makes the fixed acceptance flow depend
+        # on an unrelated model/network timeout.  The shortcut still creates
+        # only a reviewable Mission draft; it cannot dispatch motion.
+        if is_full_office_inspection(request.text):
+            if request.robotId is None:
+                return self._result(
+                    task_id=task_id,
+                    request=request,
+                    intent=ConversationIntent.ROBOT_ACTION,
+                    route=ConversationRoute.MISSION_REVIEW,
+                    route_status="needs_robot",
+                    assistant_message=(
+                        "请先选择要巡检的机器人；未绑定机器人时不会创建行动方案。"
+                    ),
+                )
+            return self._create_mission_review(
+                task_id=task_id,
+                request=request,
+                requested_by=requested_by,
+                modality=modality,
+                mission_history=mission_history,
+                mission_actor=mission_actor,
+                assistant_message="办公室巡检方案已生成，等待你审核后执行。",
+            )
+
         routed = self.client.route_turn(request)
         if routed.conversationId != request.conversationId:
             raise ConversationGatewayError("conversation router changed conversationId")
@@ -226,17 +254,39 @@ class ConversationGateway:
             raise ConversationGatewayError(
                 "conversation router did not authorize Mission draft creation"
             )
+        return self._create_mission_review(
+            task_id=task_id,
+            request=request,
+            requested_by=requested_by,
+            modality=modality,
+            mission_history=mission_history,
+            mission_actor=mission_actor,
+            assistant_message=routed.assistantMessage,
+        )
+
+    def _create_mission_review(
+        self,
+        *,
+        task_id: str,
+        request: ConversationTurnRequest,
+        requested_by: str,
+        modality: str,
+        mission_history: list[Mapping[str, Any]],
+        mission_actor: PolicyActor | None,
+        assistant_message: str,
+    ) -> ConversationGatewayResult:
         if self.mission_draft_creator is None:
             raise ConversationGatewayError("Mission V2 draft service is unavailable")
-        assert request.robotId is not None
+        if request.robotId is None:
+            raise ConversationGatewayError("Mission V2 requires a bound robot")
         brief = {
-                "robotId": request.robotId,
-                "requestedBy": requested_by,
-                "objective": request.text,
-                "locale": request.locale,
-                "modality": modality,
-                "history": [dict(item) for item in mission_history],
-            }
+            "robotId": request.robotId,
+            "requestedBy": requested_by,
+            "objective": request.text,
+            "locale": request.locale,
+            "modality": modality,
+            "history": [dict(item) for item in mission_history],
+        }
         creator_parameters = inspect.signature(
             self.mission_draft_creator
         ).parameters.values()
@@ -255,10 +305,10 @@ class ConversationGateway:
         return self._result(
             task_id=task_id,
             request=request,
-            intent=routed.intent,
-            route=route,
+            intent=ConversationIntent.ROBOT_ACTION,
+            route=ConversationRoute.MISSION_REVIEW,
             route_status="review",
-            assistant_message=routed.assistantMessage,
+            assistant_message=assistant_message,
             mission_draft_id=draft_id,
         )
 

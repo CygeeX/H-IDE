@@ -174,7 +174,10 @@ class MissionEnvelope(ContractModel):
     maximumDurationSeconds: int = Field(default=600, gt=0, le=7_200)
     maximumAutoRevisions: int = Field(default=3, ge=0, le=20)
     maximumStageAttempts: int = Field(default=3, ge=1, le=10)
-    maximumScanYawRad: float = Field(default=math.tau, gt=0, le=math.tau)
+    # This is a cumulative Mission budget. A multi-room inspection may perform
+    # many individually bounded scans while every single physical action
+    # remains constrained by the role/grant limits.
+    maximumScanYawRad: float = Field(default=math.tau, gt=0, le=40 * math.pi)
     modelPins: list[ModelPin] = Field(min_length=2, max_length=16)
     expiresAt: datetime
 

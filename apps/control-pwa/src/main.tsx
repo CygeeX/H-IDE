@@ -40,6 +40,10 @@ import {
   MissionVisualEvidenceDrawer,
   MissionVisualSummary,
 } from "./mission-visual-evidence";
+import {
+  currentMissionOfficeReport,
+  MissionOfficeReportCard,
+} from "./mission-office-report";
 import "./app.css";
 import "./chat-shell.css";
 
@@ -1095,8 +1099,10 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
       ...current.filter((item) => item.missionId !== advanced.mission.missionId),
     ]);
     const status = advanced.mission.snapshot.status;
+    const officeReport = currentMissionOfficeReport(advanced.mission);
     const message = status === "completed"
-      ? "任务已完成。视觉模型只提供语义假设，发送给 Robot Agent 的目标点来自 RGB-D / 场景几何事实。"
+      ? officeReport?.narrativeZhCN
+        ?? "任务已完成。视觉模型只提供语义假设，发送给 Robot Agent 的目标点来自 RGB-D / 场景几何事实。"
       : status === "needs_input"
         ? advanced.mission.snapshot.detail ?? "任务需要补充信息。"
         : status === "awaiting_review"
@@ -2790,6 +2796,7 @@ function MissionExecutionCard({ mission, busy, onContinue, onCancel, onApproveRe
   );
   const visualResult = latestMissionVisualResult(mission);
   const currentVisualAmbiguity = currentMissionVisualAmbiguity(mission);
+  const officeReport = currentMissionOfficeReport(mission);
   const presentedVisualResult = status === "needs_input"
     ? currentVisualAmbiguity
     : visualResult;
@@ -2822,6 +2829,7 @@ function MissionExecutionCard({ mission, busy, onContinue, onCancel, onApproveRe
       observationOnly={observationOnly}
       onOpen={() => setVisualEvidenceOpen(true)}
     /> : null}
+    {officeReport ? <MissionOfficeReportCard report={officeReport} /> : null}
     {mission.snapshot.detail ? <p className={`mission-runtime-notice notice-${status}`}><Icon name={status === "needs_input" ? "warning" : "activity"} />{mission.snapshot.detail}</p> : null}
     <ol className="plan-step-list mission-node-list">
       {mission.activeRevision.nodes.map((node, index) => {

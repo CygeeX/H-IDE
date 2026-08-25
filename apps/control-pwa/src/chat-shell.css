@@ -445,6 +445,20 @@ button:focus-visible, textarea:focus-visible, input:focus-visible, select:focus-
 .mission-visual-summary .no-motion strong { color: #8dd7b7; }
 .mission-visual-summary .nav2-boundary strong { color: #dfc27f; }
 .mission-visual-summary button { width: fit-content; margin-top: 3px; padding: 5px 8px; border: 1px solid #386554; border-radius: 6px; color: #c8eadc; background: #142820; font-size: 9px; cursor: pointer; }
+.mission-office-report { margin-top: 12px; padding: 13px; display: grid; gap: 12px; border: 1px solid #315849; border-radius: 10px; background: #0d1714; }
+.mission-office-report > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.mission-office-report > header div { display: grid; gap: 3px; }
+.mission-office-report > header small { color: #78a893; font: 9px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.mission-office-report > header strong { color: #d9eee5; font-size: 12px; }
+.mission-office-report > header > span { color: #9cc9b6; font-size: 9px; }
+.mission-office-report > pre { margin: 0; padding: 10px; overflow: auto; border: 1px solid #27453a; border-radius: 7px; color: #cde1d8; background: #0a100e; font: 10px/1.65 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; }
+.mission-office-region-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.mission-office-region-grid article { min-width: 0; padding: 9px; border: 1px solid #263d35; border-radius: 7px; background: #101c18; }
+.mission-office-region-grid article > div { display: flex; justify-content: space-between; gap: 8px; }
+.mission-office-region-grid article strong { color: #d8e8e1; font-size: 10px; }
+.mission-office-region-grid article span, .mission-office-region-grid p { color: #7fa091; font-size: 9px; }
+.mission-office-region-grid ul { margin: 7px 0 0; padding-left: 15px; color: #aebfb7; font-size: 9px; line-height: 1.55; }
+.mission-office-report-gap { margin: 0; color: #e3bd83; font-size: 9px; }
 
 .visual-mission-card {
   position: relative;
@@ -984,6 +998,13 @@ body {
 .mission-visual-summary { border-color: #cfe1d8; background: #f3faf6; }
 .mission-visual-summary > div + div { border-color: #d7e7df; }
 .mission-visual-summary strong { color: #3f6655; }
+.mission-office-report { border-color: #c9dfd5; background: #f3faf6; }
+.mission-office-report > header strong { color: #3e6655; }
+.mission-office-report > header small, .mission-office-report > header > span { color: #6d927f; }
+.mission-office-report > pre { color: #50665d; border-color: #d3e5dc; background: #fbfdfc; }
+.mission-office-region-grid article { border-color: #d7e7df; background: #f9fcfa; }
+.mission-office-region-grid article strong { color: #4c675b; }
+.mission-office-region-grid ul { color: #687a72; }
 
 .composer-region { padding-bottom: max(12px, env(safe-area-inset-bottom)); background: linear-gradient(180deg, transparent, rgba(248, 243, 233, .96) 22px); }
 .chat-composer { border-color: #d9cde0; background: rgba(255, 253, 249, .95); box-shadow: 0 16px 48px rgba(76, 56, 88, .13); backdrop-filter: blur(16px); }

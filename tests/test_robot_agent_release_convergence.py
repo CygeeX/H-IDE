@@ -26,6 +26,7 @@ class _ScriptedPeer:
         self.acquire_calls = 0
         self.release_calls = 0
         self.epoch = 0
+        self.advance_safe_stop_epoch = True
         self.release_started = threading.Event()
         self.release_continue = threading.Event()
         self.block_release = False
@@ -64,7 +65,7 @@ class _ScriptedPeer:
         assert robot_id == "robot-1"
         assert reason
         self.release_calls += 1
-        if self.release_calls == 1:
+        if self.release_calls == 1 and self.advance_safe_stop_epoch:
             self.epoch += 1
         self.release_started.set()
         if self.block_release:
@@ -74,6 +75,12 @@ class _ScriptedPeer:
             "authorityRevoked": True,
             "safeStopState": "confirmed",
             "safeStopEpoch": self.epoch,
+            "releaseMode": (
+                "physical_safe_stop"
+                if self.advance_safe_stop_epoch
+                else "remote_authority"
+            ),
+            "physicalSafeStopAdvanced": self.advance_safe_stop_epoch,
         }
         if self.lose_first_release_response and self.release_calls == 1:
             raise TimeoutError("confirmed response was lost")
@@ -134,6 +141,29 @@ def test_two_commands_release_only_after_last_terminal_and_cache_truth() -> None
         mapping(),
     )
     assert conflict.status == "rejected"
+    assert peer.release_calls == 1
+
+
+def test_terminal_release_accepts_logical_authority_relinquish_without_new_stop() -> None:
+    peer = _ScriptedPeer()
+    peer.epoch = 7
+    peer.advance_safe_stop_epoch = False
+    driver = RobotAgentGatewayDriver(peer)
+    command_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+
+    assert driver.dispatch(request(command_id), mapping()).status == "running"
+    peer.terminal(command_id)
+    terminal = driver.query(command_id)
+
+    assert terminal.status == "succeeded"
+    assert terminal.result["controlRelease"] == {
+        "state": "SAFE_HOLD",
+        "authorityRevoked": True,
+        "safeStopState": "confirmed",
+        "safeStopEpoch": 7,
+        "releaseMode": "remote_authority",
+        "physicalSafeStopAdvanced": False,
+    }
     assert peer.release_calls == 1
 
 
@@ -245,6 +275,39 @@ def test_inbound_release_retry_keeps_the_first_epoch_baseline(
         "authorityRevoked": True,
         "safeStopState": "confirmed",
         "safeStopEpoch": 8,
+        "releaseMode": "physical_safe_stop",
+        "physicalSafeStopAdvanced": True,
+    }
+
+
+def test_inbound_release_accepts_fresh_logical_release_with_same_stop_epoch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    peer = _release_peer(monkeypatch)
+    with pytest.raises(TimeoutError):
+        peer.release("g1-dev", "terminal command complete")
+
+    peer._record_message(
+        {
+            "type": "control.status",
+            "payload": {
+                "state": "SAFE_HOLD",
+                "reason": "remote authority released; SONIC remains resident",
+                "lease_sequence": None,
+                "authority_revoked": True,
+                "safe_stop_state": "confirmed",
+                "safe_stop_epoch": 7,
+            },
+        }
+    )
+
+    assert peer.release("g1-dev", "terminal command complete") == {
+        "state": "SAFE_HOLD",
+        "authorityRevoked": True,
+        "safeStopState": "confirmed",
+        "safeStopEpoch": 7,
+        "releaseMode": "remote_authority",
+        "physicalSafeStopAdvanced": False,
     }
 
 

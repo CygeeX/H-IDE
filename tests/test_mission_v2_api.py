@@ -4,6 +4,7 @@ from datetime import timedelta
 import hashlib
 import math
 import threading
+import time
 from typing import Any, Mapping
 from uuid import uuid4
 
@@ -32,7 +33,7 @@ from packages.scene_core import (
     TargetMapCheck,
     robot_navigation_command_schema,
 )
-from services.control_api.main import create_app
+from services.control_api.main import _minimum_travel_heading_order, create_app
 from services.control_api.mission_client import MissionPlanningUnavailable
 from services.control_api.mission_service import MissionService
 
@@ -720,6 +721,30 @@ class FakeVisualTaskClient:
         return self.evidence_body, "image/jpeg"
 
 
+class OfficeSceneDescriptionVisualTaskClient(FakeVisualTaskClient):
+    def analyze(self, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        result = dict(super().analyze(request))
+        sequence = len(self.requests)
+        source = dict(result["source"])
+        source["observationSessionId"] = "observation-live-1"
+        result.update(
+            analysisId=f"analysis-office-heading-{sequence}",
+            source=source,
+            hypotheses=[
+                {
+                    "hypothesisId": f"office-visible-item-{sequence}",
+                    "source": "qwen",
+                    "label": "可见办公区域",
+                    "pixelBox": [100, 80, 500, 420],
+                    "score": 0.92,
+                }
+            ],
+            geometryCandidates=[],
+            observationSummary=f"方向 {sequence} 可见办公室门牌、家具和通道",
+        )
+        return result
+
+
 class AmbiguousThenSelectedVisualTaskClient(FakeVisualTaskClient):
     source_analysis_id = "analysis-ambiguous-robot-1"
     first_candidate_id = "candidate-ambiguous-left"
@@ -924,6 +949,81 @@ class RunningMissionRobotDriver(MissionRobotDriver):
             status="succeeded",
             result={"commandId": command_id, "goalReached": True},
         )
+
+
+class OfficeInspectionMissionRobotDriver(MissionRobotDriver):
+    def __init__(self) -> None:
+        super().__init__()
+        rotate = CapabilityDescriptor(
+            skillId="navigation.rotate",
+            skillVersion="2.0.0",
+            description="Rotate through the strict Nav2 Spin adapter",
+            kind=CapabilityKind.MOTION,
+            riskLevel=RiskLevel.MEDIUM,
+            inputSchema={
+                "type": "object",
+                "additionalProperties": False,
+                "required": [
+                    "targetYawRad",
+                    "timeAllowanceMs",
+                    "missionId",
+                    "revisionId",
+                    "nodeId",
+                    "authorizationId",
+                    "skillRequestId",
+                    "idempotencyKey",
+                    "robotBootId",
+                    "localizationEpochId",
+                ],
+                "properties": {
+                    "targetYawRad": {"type": "number"},
+                    "timeAllowanceMs": {"type": "integer"},
+                    "missionId": {"type": "string"},
+                    "revisionId": {"type": "string"},
+                    "nodeId": {"type": "string"},
+                    "authorizationId": {"type": "string"},
+                    "skillRequestId": {"type": "string"},
+                    "idempotencyKey": {"type": "string"},
+                    "robotBootId": {"type": "string"},
+                    "localizationEpochId": {"type": "string"},
+                },
+            },
+            resources=["motion", "navigation"],
+            cancellable=True,
+            interruptible=True,
+            timeoutMs=300_000,
+            requiredSensorIds=["head_rgbd"],
+            executor="nav2",
+            executorProfile="nav2.strict_static_primitives",
+        )
+        self.manifest = CapabilityManifest.build(
+            robotId="robot-1",
+            agentVersion="mission-test-office-1",
+            robotProfileDigest=self.profile.profileDigest,
+            capabilities=[*self.manifest.capabilities, rotate],
+        )
+
+    def discover(self, robot_id: str | None = None) -> AdapterResult:
+        discovered = super().discover(robot_id)
+        result = dict(discovered.result)
+        result["capabilities"] = [
+            NAVIGATION_COMMAND_KEY,
+            "navigation.rotate",
+        ]
+        result["capabilitiesDigest"] = self.manifest.manifestDigest
+        result["capabilityManifest"] = self.manifest.model_dump(mode="json")
+        return AdapterResult(status=discovered.status, result=result)
+
+
+class RunningOfficeInspectionMissionRobotDriver(OfficeInspectionMissionRobotDriver):
+    def dispatch(self, request, mapping) -> AdapterResult:
+        self.dispatches.append((request, mapping))
+        if request.commandKey == "navigation.rotate":
+            return AdapterResult(status="running", result={"accepted": True})
+        return AdapterResult(status="succeeded", result={"goalReached": True})
+
+    def query(self, command_id: str) -> AdapterResult:
+        return AdapterResult(status="running", result={"commandId": command_id})
 
 
 class NoPoseMissionRobotDriver(MissionRobotDriver):
@@ -1169,6 +1269,62 @@ def test_mission_v2_publishes_pcd_semantic_region_as_static_scene_target_fact() 
         assert request["input"]["goalPose"]["x"] == 1.5
         assert request["input"]["sceneRef"] == {"sceneId": "scene-lab", "revision": 3}
         assert "path" not in request["input"]
+
+
+def test_simulation_draft_inherits_the_current_published_scene_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class AutoBoundScene(FakeSceneContextClient):
+        def get_context(
+            self,
+            robot_id,
+            *,
+            current_pose,
+            expected_ref=None,
+            selected_point=None,
+        ):
+            assert expected_ref is None or expected_ref == self.scene_ref
+            return super().get_context(
+                robot_id,
+                current_pose=current_pose,
+                expected_ref=self.scene_ref,
+                selected_point=selected_point,
+            )
+
+    class CapturingPlanner(FakeMissionPlanningClient):
+        brief: Mapping[str, Any] | None = None
+
+        def create_draft(self, brief: Mapping[str, Any]) -> Mapping[str, Any]:
+            self.brief = brief
+            return super().create_draft(brief)
+
+    monkeypatch.setenv("MISSION_V2_AUTO_USE_BOUND_SCENE", "true")
+    scene = AutoBoundScene()
+    planner = CapturingPlanner()
+    app = create_app(
+        auth_token=TOKEN,
+        mission_planning_client=planner,
+        scene_context_client=scene,
+    )
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v2/missions/drafts",
+            headers=headers(),
+            json={
+                "requestId": "request-auto-bound-scene-1",
+                "objective": "巡检所有区域",
+            },
+        )
+    assert created.status_code == 201, created.text
+    assert planner.brief is not None
+    assert planner.brief["envelope"]["sceneRefs"] == [
+        scene.scene_ref.model_dump(mode="json")
+    ]
+    assert planner.brief["envelope"]["allowedRegionIds"] == ["kitchen"]
+    assert {item["predicate"] for item in planner.brief["worldRecords"]} == {
+        "semantic_region",
+        "target_pose",
+    }
 
 
 def test_mission_v2_operator_message_creates_a_reviewed_plan_revision() -> None:
@@ -2911,3 +3067,301 @@ def test_mission_v2_cancel_stops_active_nav2_command_before_terminalizing_missio
 
     assert driver.cancellations == [active_request_id]
     assert len(driver.dispatches) == 1
+
+
+def test_office_station_composite_rotates_observes_and_completes_parent(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("ROBOT_AGENT_ID", "robot-1")
+    monkeypatch.setenv("ROBOT_AGENT_LOCALIZATION_EPOCH_ID", "epoch-live-1")
+    monkeypatch.setenv("HIDE_VISION_SOURCE_MODE", "live")
+    from services.control_api import mission_service as mission_service_module
+    from services.control_api.mission_client import UnavailableMissionPlanningClient
+    from services.control_api.office_inspection import (
+        catalog as office_catalog,
+        envelope_defaults as office_envelope_defaults,
+    )
+
+    fast_catalog = office_catalog()
+    fast_catalog["capturePolicy"] = {
+        **fast_catalog["capturePolicy"],
+        "stopBeforeCaptureS": 0.0,
+    }
+    monkeypatch.setattr(
+        mission_service_module,
+        "office_inspection_catalog",
+        lambda: fast_catalog,
+    )
+    monkeypatch.setattr(
+        mission_service_module,
+        "office_inspection_envelope_defaults",
+        lambda objective: {
+            **office_envelope_defaults(objective),
+            "maximumGoalDistanceM": 10.0,
+        },
+    )
+    driver = OfficeInspectionMissionRobotDriver()
+    visual = OfficeSceneDescriptionVisualTaskClient()
+    app = create_app(
+        auth_token=TOKEN,
+        adapters={"robot_agent": RobotAgentAdapter(driver=driver)},
+        mission_planning_client=UnavailableMissionPlanningClient(
+            "deterministic office inspection must not call the text planner"
+        ),
+        visual_task_client=visual,
+        mission_supervisor_interval=3600,
+    )
+    mission_id = "mission-office-composite-1"
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v2/missions/drafts",
+            headers=headers(),
+            json={
+                "requestId": "request-office-composite-1",
+                "missionId": mission_id,
+                "robotId": "robot-1",
+                "objective": (
+                    "走遍所有办公室，并把所有办公室里面的信息和路上的信息都给我"
+                ),
+                "requestedBy": "operator-test",
+            },
+        )
+        assert created.status_code == 201, created.text
+        assert len(created.json()["plan"]["nodes"]) == 41
+        approved = client.post(
+            f"/api/v2/missions/drafts/{mission_id}/approve",
+            headers=headers(),
+            json={"approvedBy": "operator-test"},
+        )
+        assert approved.status_code == 200, approved.text
+        assert client.post(
+            f"/api/v2/missions/{mission_id}/start",
+            headers=headers(),
+        ).status_code == 200
+        target = client.post(
+            f"/api/v2/missions/{mission_id}/world-records",
+            headers=headers(),
+            json={
+                "recordId": (
+                    f"world-{mission_id}-scene-target-corridor_west"
+                ),
+                "robotId": "robot-1",
+                "kind": "fact",
+                "subject": "corridor_west",
+                "predicate": "target_pose",
+                "value": {
+                    "goalPose": {
+                        "frameId": "map",
+                        "x": -6.15,
+                        "y": 0.35,
+                        "z": 0.0,
+                        "yaw": 0.0,
+                    }
+                },
+                "source": "operator",
+                "sourceRef": "reviewed-office-catalog-fixture",
+                "confidence": 1.0,
+                "observedAt": utc_now().isoformat(),
+                "frameId": "map",
+            },
+        )
+        assert target.status_code == 200, target.text
+        navigation = client.post(
+            f"/api/v2/missions/{mission_id}/nodes/"
+            "office-nav-01-corridor_west/skill-requests",
+            headers=headers(),
+        )
+        assert navigation.status_code == 202, navigation.text
+        assert navigation.json()["mission"]["snapshot"]["activeNodeId"] == (
+            "office-scan-01-corridor_west"
+        )
+        scan = client.post(
+            f"/api/v2/missions/{mission_id}/nodes/"
+            "office-scan-01-corridor_west/skill-requests",
+            headers=headers(),
+        )
+        assert scan.status_code == 202, scan.text
+        assert scan.json()["dispatch"]["mode"] == "office_inspection_pending"
+
+        deadline = time.monotonic() + 5.0
+        mission: dict[str, Any] | None = None
+        while time.monotonic() < deadline:
+            response = client.get(
+                f"/api/v2/missions/{mission_id}",
+                headers=headers(),
+            )
+            assert response.status_code == 200, response.text
+            mission = response.json()
+            if mission["snapshot"]["activeNodeId"] != (
+                "office-scan-01-corridor_west"
+            ):
+                break
+            time.sleep(0.02)
+        assert mission is not None
+        assert mission["snapshot"]["status"] == "ready"
+        assert mission["snapshot"]["activeNodeId"] == (
+            "office-nav-02-reception_entry"
+        )
+        execution = next(
+            item
+            for item in mission["skillExecutions"]
+            if item["request"]["skillId"] == "inspection.scan_station"
+        )
+        inspection = execution["result"]["result"]["inspectionResult"]
+        assert execution["result"]["status"] == "succeeded"
+        assert inspection["stationId"] == "corridor_west"
+        assert len(inspection["headings"]) == 4
+        assert inspection["cumulativeYawRad"] == pytest.approx(math.tau)
+
+    assert len(visual.requests) == 4
+    assert [item["nodeId"] for item in visual.requests] == [
+        "office-scan-01-corridor_west-view-01",
+        "office-scan-01-corridor_west-view-02",
+        "office-scan-01-corridor_west-view-03",
+        "office-scan-01-corridor_west-view-04",
+    ]
+    assert len(
+        {
+            (item["missionId"], item["revisionId"], item["nodeId"], item["attempt"])
+            for item in visual.requests
+        }
+    ) == 4
+    assert [item[0].commandKey for item in driver.dispatches] == [
+        NAVIGATION_COMMAND_KEY,
+        "navigation.rotate",
+        "navigation.rotate",
+        "navigation.rotate",
+    ]
+
+
+def test_office_heading_order_minimizes_yaw_and_preserves_catalog_indexes() -> None:
+    headings = [0.0, math.pi / 2, math.pi, -math.pi / 2]
+
+    ordered = _minimum_travel_heading_order(
+        headings,
+        current_yaw=-math.pi / 2 - 0.02,
+    )
+
+    assert [index for index, _ in ordered] == [4, 1, 2, 3]
+    assert sorted(ordered) == list(enumerate(headings, start=1))
+    yaw = -math.pi / 2 - 0.02
+    travel = 0.0
+    for _, heading in ordered:
+        travel += abs(math.atan2(math.sin(heading - yaw), math.cos(heading - yaw)))
+        yaw = heading
+    assert travel == pytest.approx(3 * math.pi / 2 + 0.02)
+    assert travel < math.tau
+
+
+def test_cancelling_office_station_composite_cancels_active_rotation(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("ROBOT_AGENT_ID", "robot-1")
+    monkeypatch.setenv("ROBOT_AGENT_LOCALIZATION_EPOCH_ID", "epoch-live-1")
+    monkeypatch.setenv("HIDE_VISION_SOURCE_MODE", "live")
+    from services.control_api import mission_service as mission_service_module
+    from services.control_api.office_inspection import (
+        envelope_defaults as office_envelope_defaults,
+    )
+
+    monkeypatch.setattr(
+        mission_service_module,
+        "office_inspection_envelope_defaults",
+        lambda objective: {
+            **office_envelope_defaults(objective),
+            "maximumGoalDistanceM": 10.0,
+        },
+    )
+    driver = RunningOfficeInspectionMissionRobotDriver()
+    app = create_app(
+        auth_token=TOKEN,
+        adapters={"robot_agent": RobotAgentAdapter(driver=driver)},
+        mission_planning_client=FakeMissionPlanningClient(),
+        visual_task_client=OfficeSceneDescriptionVisualTaskClient(),
+        mission_supervisor_interval=3600,
+    )
+    mission_id = "mission-office-composite-cancel-1"
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v2/missions/drafts",
+            headers=headers(),
+            json={
+                "requestId": "request-office-composite-cancel-1",
+                "missionId": mission_id,
+                "robotId": "robot-1",
+                "objective": (
+                    "走遍所有办公室，并把所有办公室里面的信息和路上的信息都给我"
+                ),
+                "requestedBy": "operator-test",
+            },
+        )
+        assert created.status_code == 201, created.text
+        assert client.post(
+            f"/api/v2/missions/drafts/{mission_id}/approve",
+            headers=headers(),
+            json={"approvedBy": "operator-test"},
+        ).status_code == 200
+        assert client.post(
+            f"/api/v2/missions/{mission_id}/start",
+            headers=headers(),
+        ).status_code == 200
+        target = client.post(
+            f"/api/v2/missions/{mission_id}/world-records",
+            headers=headers(),
+            json={
+                "recordId": f"world-{mission_id}-scene-target-corridor_west",
+                "robotId": "robot-1",
+                "kind": "fact",
+                "subject": "corridor_west",
+                "predicate": "target_pose",
+                "value": {
+                    "goalPose": {
+                        "frameId": "map",
+                        "x": -6.15,
+                        "y": 0.35,
+                        "z": 0.0,
+                        "yaw": 0.0,
+                    }
+                },
+                "source": "operator",
+                "sourceRef": "reviewed-office-catalog-fixture",
+                "confidence": 1.0,
+                "observedAt": utc_now().isoformat(),
+                "frameId": "map",
+            },
+        )
+        assert target.status_code == 200, target.text
+        navigation = client.post(
+            f"/api/v2/missions/{mission_id}/nodes/"
+            "office-nav-01-corridor_west/skill-requests",
+            headers=headers(),
+        )
+        assert navigation.status_code == 202, navigation.text
+        scan = client.post(
+            f"/api/v2/missions/{mission_id}/nodes/"
+            "office-scan-01-corridor_west/skill-requests",
+            headers=headers(),
+        )
+        assert scan.status_code == 202, scan.text
+
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if len(driver.dispatches) >= 2:
+                break
+            time.sleep(0.01)
+        assert len(driver.dispatches) == 2
+        rotation_request = driver.dispatches[-1][0]
+        assert rotation_request.commandKey == "navigation.rotate"
+
+        cancelled = client.post(
+            f"/api/v2/missions/{mission_id}/cancel",
+            headers=headers(),
+            json={"requestedBy": "operator-test", "reason": "停止办公室巡检"},
+        )
+        assert cancelled.status_code == 200, cancelled.text
+        assert cancelled.json()["mission"]["snapshot"]["status"] == "cancelled"
+        assert driver.cancellations == [rotation_request.commandId]
+
+        time.sleep(0.05)
+        mission = app.state.mission_runtime.get(mission_id)
+        assert mission["snapshot"]["activeSkillRequestId"] is None

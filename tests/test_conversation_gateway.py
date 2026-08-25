@@ -61,6 +61,14 @@ class RoutedConversationClient:
         )
 
 
+class FailingConversationClient:
+    configured = True
+
+    def route_turn(self, request: ConversationTurnRequest) -> ConversationTurnResponse:
+        del request
+        raise AssertionError("deterministic office inspection must not call the router")
+
+
 class VisualFixture:
     def __init__(self):
         self.requests: list[dict[str, Any]] = []
@@ -142,6 +150,45 @@ def test_typed_http_client_uses_internal_v2_endpoint_and_validates_flags(monkeyp
     assert calls[0][0].endswith("/internal/v2/conversation-turns")
     assert calls[0][1]["trust_env"] is False
     assert calls[0][1]["json"].get("robotId") is None
+
+
+def test_exact_office_inspection_bypasses_remote_conversation_router() -> None:
+    briefs: list[dict[str, Any]] = []
+
+    def create_draft(brief: Mapping[str, Any]) -> Mapping[str, Any]:
+        briefs.append(dict(brief))
+        return {"draftId": "mission-office-deterministic-1"}
+
+    result = ConversationGateway(
+        FailingConversationClient(),
+        mission_draft_creator=create_draft,
+    ).handle(
+        task_id="task-office-deterministic-1",
+        request=ConversationTurnRequest(
+            conversationId="conversation-office-deterministic-1",
+            robotId="g1-sim",
+            locale="zh-CN",
+            text="走遍所有办公室，并把所有办公室里面的信息和路上的信息都给我",
+        ),
+        requested_by="operator-test",
+        modality="text",
+        mission_history=[],
+    )
+
+    assert result.intent is ConversationIntent.ROBOT_ACTION
+    assert result.route.value == "mission_review"
+    assert result.routeStatus == "review"
+    assert result.missionDraftId == "mission-office-deterministic-1"
+    assert briefs == [
+        {
+            "robotId": "g1-sim",
+            "requestedBy": "operator-test",
+            "objective": "走遍所有办公室，并把所有办公室里面的信息和路上的信息都给我",
+            "locale": "zh-CN",
+            "modality": "text",
+            "history": [],
+        }
+    ]
 
 
 def test_typed_http_client_falls_back_once_for_pre_memory_agent(monkeypatch):

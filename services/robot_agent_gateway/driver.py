@@ -314,7 +314,7 @@ class RobotAgentGatewayDriver:
         robot_id: str,
         wire_command_id: str,
     ) -> AdapterResult:
-        """Expose a terminal command only after idle control is released.
+        """Expose a terminal command only after remote control is released.
 
         A second command may share the same Robot Agent control session.  In
         that case the first terminal must not revoke authority underneath the
@@ -369,7 +369,25 @@ class RobotAgentGatewayDriver:
                 error="Robot Agent terminal control release returned invalid safe-stop epoch",
                 details={"protocolState": status.state},
             )
-        release_truth = {**expected, "safeStopEpoch": epoch}
+        release_mode = released.get("releaseMode")
+        physical_stop_advanced = released.get("physicalSafeStopAdvanced")
+        if (
+            release_mode not in {"remote_authority", "physical_safe_stop"}
+            or type(physical_stop_advanced) is not bool
+            or physical_stop_advanced
+            != (release_mode == "physical_safe_stop")
+        ):
+            return AdapterResult(
+                status="unavailable",
+                error="Robot Agent terminal control release returned invalid release provenance",
+                details={"protocolState": status.state},
+            )
+        release_truth = {
+            **expected,
+            "safeStopEpoch": epoch,
+            "releaseMode": release_mode,
+            "physicalSafeStopAdvanced": physical_stop_advanced,
+        }
         for terminal_command_id in self._terminal_unreleased.pop(
             robot_id, set()
         ):

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta, timezone
 import hmac
+from itertools import permutations
 import json
 import math
 import os
@@ -66,7 +67,14 @@ from packages.visual_mission_core.clients import (
     visual_stage_client_from_env,
 )
 from packages.visual_mission_core.runtime import VisualMissionRuntime
-from packages.mission_core import MissionRuntime, SkillRequest
+from packages.mission_core import (
+    MissionPlanDraft,
+    MissionRuntime,
+    MissionSnapshot,
+    SkillProgress,
+    SkillRequest,
+    SkillResult,
+)
 from packages.simulation_core import (
     SimulationEvent,
     SimulationEventType,
@@ -98,6 +106,12 @@ from .conversation_client import (
     ConversationClient,
     UnavailableConversationClient,
     conversation_client_from_env,
+)
+from .office_inspection import (
+    MISSION_REPORT_SKILL,
+    OFFICE_INSPECTION_SKILL,
+    build_report as build_office_inspection_report,
+    is_full_office_inspection,
 )
 from .conversation_gateway import ConversationGateway
 from .developer_diagnostics import (
@@ -363,6 +377,45 @@ def _motion_safety_error(robot: Mapping[str, Any], definition: CommandDefinition
     return None
 
 
+def _minimum_travel_heading_order(
+    headings: list[float],
+    *,
+    current_yaw: float,
+) -> list[tuple[int, float]]:
+    """Order one reviewed heading set without changing its report identity.
+
+    Station headings are absolute map yaws, while RobotAgent Spin accepts a
+    relative yaw.  Visiting a fixed four-heading set in catalog order can cost
+    a full 2*pi plus small physical correction, even though the same reviewed
+    set needs only 3*pi/2 when entered at the nearest heading.  Exhaustive
+    ordering is bounded by the skill schema's eight-heading maximum and gives
+    a deterministic, minimum-yaw route.  The original one-based indexes are
+    retained so evidence can be sorted back into immutable catalog order.
+    """
+
+    if not math.isfinite(current_yaw) or any(
+        not math.isfinite(value) for value in headings
+    ):
+        raise ValueError("Office inspection headings must be finite")
+    indexed = tuple(enumerate(headings, start=1))
+    if not indexed:
+        return []
+
+    def route_key(
+        route: tuple[tuple[int, float], ...],
+    ) -> tuple[float, tuple[int, ...]]:
+        yaw = current_yaw
+        travel = 0.0
+        for _, target in route:
+            travel += abs(
+                math.atan2(math.sin(target - yaw), math.cos(target - yaw))
+            )
+            yaw = target
+        return travel, tuple(index for index, _ in route)
+
+    return list(min(permutations(indexed), key=route_key))
+
+
 class _RobotAgentGatewayRouter:
     """Route one Robot Agent transport across live and isolated sim peers.
 
@@ -402,6 +455,26 @@ class _RobotAgentGatewayRouter:
     def _command_driver(self, command_id: str) -> RobotAgentGatewayHttpDriver | None:
         with self._lock:
             return self._command_drivers.get(command_id)
+
+    def restore_command_route(self, command_id: str, robot_id: str) -> None:
+        """Restore one durable command route after a Control API restart.
+
+        The immutable CommandRequest remains the routing authority.  Without
+        this restoration a restarted process cannot query a simulation command
+        that is still owned by the independently running gateway, even though
+        the persisted request contains the exact robot identity.
+        """
+
+        if not isinstance(command_id, str) or not command_id.strip():
+            raise ValueError("command route identity is invalid")
+        if not isinstance(robot_id, str) or not robot_id.strip():
+            raise ValueError("command robot route identity is invalid")
+        driver = self._for_robot(robot_id)
+        with self._lock:
+            existing = self._command_drivers.get(command_id)
+            if existing is not None and existing is not driver:
+                raise ValueError("command route is already bound to another robot")
+            self._command_drivers[command_id] = driver
 
     def cancel(self, command_id: str) -> AdapterResult:
         driver = self._command_driver(command_id)
@@ -1672,7 +1745,11 @@ def create_app(
             )
         )
 
-    def dispatch_mission_skill(skill: SkillRequest) -> dict[str, Any]:
+    def dispatch_mission_skill(
+        skill: SkillRequest,
+        *,
+        inspection_parent: SkillRequest | None = None,
+    ) -> dict[str, Any]:
         """Bridge one authorized skill to Robot Agent through ActionRuntime."""
 
         if skill.expiresAt <= utc_now():
@@ -1741,7 +1818,13 @@ def create_app(
         # refreshed Robot Agent snapshot immediately before ActionRuntime.
         # A stale/revoked/cross-revision grant or changed health can therefore
         # never ride on an earlier successful decision.
-        mission_service.policy.authorize_dispatch(skill)
+        if inspection_parent is None:
+            mission_service.policy.authorize_dispatch(skill)
+        else:
+            mission_service.policy.authorize_inspection_child(
+                inspection_parent,
+                skill,
+            )
         mapping = MappingVersion(
             mappingId=(
                 f"mission-{descriptor.skillId.replace('.', '-')}-"
@@ -1775,7 +1858,7 @@ def create_app(
             command,
             definition,
             mapping,
-            lease_seconds=min(descriptor.timeoutMs / 1000, 600),
+            lease_seconds=min(descriptor.timeoutMs / 1000, 2_400),
         )
         context.store.save_command(command, receipt)
         project_succeeded_navigation_pose(skill, receipt)
@@ -1861,7 +1944,7 @@ def create_app(
     if conversation_gateway is not None:
         conversation_gateway.visual_observer = dispatch_assistant_observation
 
-    def dispatch_workstation_skill(skill: SkillRequest) -> dict[str, Any]:
+    def dispatch_visual_workstation_skill(skill: SkillRequest) -> dict[str, Any]:
         if skill.expiresAt <= utc_now():
             raise ValueError("Mission workstation skill request has expired")
         if skill.skillId != "vision.observe":
@@ -1958,6 +2041,694 @@ def create_app(
         result = visual_task_adapter.analyze(request_payload)
         return {"mode": "h_ide_vision", "visualResult": dict(result)}
 
+    office_inspection_lock = threading.RLock()
+    office_inspection_workers: dict[str, dict[str, Any]] = {}
+
+    class _OfficeInspectionCancelled(RuntimeError):
+        pass
+
+    def _wrapped_yaw_delta(target: float, current: float) -> float:
+        return math.atan2(math.sin(target - current), math.cos(target - current))
+
+    def _inspection_parent_is_active(skill: SkillRequest) -> bool:
+        mission = context.store.get_mission(skill.missionId)
+        snapshot = mission.get("snapshot") if isinstance(mission, Mapping) else None
+        if not isinstance(snapshot, Mapping):
+            return False
+        if snapshot.get("activeSkillRequestId") != skill.requestId:
+            return False
+        execution = next(
+            (
+                item
+                for item in mission.get("skillExecutions", [])
+                if isinstance(item, Mapping)
+                and item.get("requestId") == skill.requestId
+            ),
+            None,
+        )
+        return isinstance(execution, Mapping) and execution.get("result") is None
+
+    def _inspection_progress(
+        skill: SkillRequest,
+        *,
+        sequence: int,
+        progress: float | None,
+        phase: str,
+        detail: str,
+    ) -> None:
+        mission_service.runtime.record_progress(
+            skill.missionId,
+            SkillProgress(
+                requestId=skill.requestId,
+                sequence=sequence,
+                progress=progress,
+                phase=phase,
+                observedAt=utc_now(),
+                detail=detail,
+            ),
+        )
+
+    def _inspection_child_rotation(
+        parent: SkillRequest,
+        *,
+        heading_index: int,
+        target_heading: float,
+    ) -> SkillRequest | None:
+        pose = mission_service._current_robot_pose(parent.robotId)
+        delta = _wrapped_yaw_delta(float(target_heading), float(pose.yaw))
+        if abs(delta) <= 0.05:
+            return None
+        issued_at = utc_now()
+        expires_at = min(parent.expiresAt, issued_at + timedelta(seconds=180))
+        if expires_at <= issued_at:
+            raise ValueError("Office inspection rotation lifetime has expired")
+        request_id = f"{parent.requestId}-rotate-{heading_index:02d}"
+        mission = mission_service.runtime.get(parent.missionId)
+        plan = mission.get("plan")
+        envelope = plan.get("envelope") if isinstance(plan, Mapping) else None
+        if not isinstance(envelope, Mapping):
+            raise ValueError("Office inspection Mission envelope is unavailable")
+        robot_boot_id = envelope.get("robotBootId")
+        localization_epoch_id = envelope.get("localizationEpochId")
+        if not isinstance(robot_boot_id, str) or not isinstance(
+            localization_epoch_id, str
+        ):
+            raise ValueError("Office inspection motion identity is unavailable")
+        return SkillRequest(
+            requestId=request_id,
+            missionId=parent.missionId,
+            revisionId=parent.revisionId,
+            nodeId=parent.nodeId,
+            robotId=parent.robotId,
+            skillId="navigation.rotate",
+            skillVersion="2.0.0",
+            input={
+                "targetYawRad": delta,
+                "timeAllowanceMs": 180_000,
+                "missionId": parent.missionId,
+                "revisionId": parent.revisionId,
+                "nodeId": parent.nodeId,
+                "authorizationId": parent.authorizationId,
+                "skillRequestId": request_id,
+                "idempotencyKey": request_id,
+                "robotBootId": robot_boot_id,
+                "localizationEpochId": localization_epoch_id,
+            },
+            capabilityManifestDigest=parent.capabilityManifestDigest,
+            authorizationId=parent.authorizationId,
+            idempotencyKey=request_id,
+            issuedAt=issued_at,
+            expiresAt=expires_at,
+        )
+
+    def _inspection_wait_for_rotation(
+        parent: SkillRequest,
+        child: SkillRequest,
+        state: dict[str, Any],
+    ) -> dict[str, Any]:
+        with state["commandLock"]:
+            if state["cancelEvent"].is_set():
+                raise _OfficeInspectionCancelled()
+            state["activeChild"] = child
+            dispatch = dispatch_mission_skill(
+                child,
+                inspection_parent=parent,
+            )
+            if state["cancelEvent"].is_set():
+                cancel_robot_agent_skill(child)
+                state["activeChild"] = None
+                raise _OfficeInspectionCancelled()
+        receipt = dispatch.get("receipt") if isinstance(dispatch, Mapping) else None
+        if not isinstance(receipt, Mapping):
+            raise ValueError("Office inspection rotation returned no receipt")
+        deadline = min(
+            time.monotonic() + 185.0,
+            time.monotonic() + max(0.0, (child.expiresAt - utc_now()).total_seconds()),
+        )
+        try:
+            while str(receipt.get("status") or "").lower() in {
+                "accepted",
+                "running",
+                "pending",
+            }:
+                if state["cancelEvent"].wait(0.5):
+                    raise _OfficeInspectionCancelled()
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        "Office inspection rotation did not finish in time"
+                    )
+                refreshed = reconcile_mission_skill(child)
+                receipt = (
+                    refreshed.get("receipt")
+                    if isinstance(refreshed, Mapping)
+                    else None
+                )
+                if not isinstance(receipt, Mapping):
+                    raise ValueError(
+                        "Office inspection rotation reconciliation failed"
+                    )
+        except Exception:
+            # The child is a real RobotAgent motion command.  Never let the
+            # background worker clear its in-memory pointer before the owning
+            # command has reached a cancelled/terminal state: the public
+            # Mission cancel path and this wake-up path deliberately race.
+            with state["commandLock"]:
+                if state.get("activeChild") is child:
+                    cancel_robot_agent_skill(child)
+                    state["activeChild"] = None
+            raise
+        with state["commandLock"]:
+            if state.get("activeChild") is child:
+                state["activeChild"] = None
+        if str(receipt.get("status") or "").lower() != "succeeded":
+            receipt_error = receipt.get("error")
+            suffix = (
+                f": {receipt_error}"
+                if isinstance(receipt_error, str) and receipt_error.strip()
+                else ""
+            )
+            raise RuntimeError(
+                f"Office inspection rotation did not succeed{suffix}"
+            )
+        return dict(receipt)
+
+    def _inspection_visual_request(
+        parent: SkillRequest,
+        *,
+        heading_index: int,
+        target_heading: float,
+        attempt: int,
+    ) -> SkillRequest:
+        issued_at = utc_now()
+        expires_at = min(parent.expiresAt, issued_at + timedelta(seconds=150))
+        if expires_at <= issued_at:
+            raise ValueError("Office inspection observation lifetime has expired")
+        request_id = (
+            f"{parent.requestId}-vision-h{heading_index:02d}-{attempt}"
+        )
+        station_id = str(parent.input["stationId"])
+        region_id = str(parent.input["regionId"])
+        return SkillRequest(
+            requestId=request_id,
+            missionId=parent.missionId,
+            revisionId=parent.revisionId,
+            # VisualTaskResult is durably unique on
+            # (missionId, revisionId, nodeId, attempt). A station scan is a
+            # composite node with several independently auditable camera
+            # views, so every heading owns a distinct child-node identity.
+            nodeId=f"{parent.nodeId}-view-{heading_index:02d}",
+            robotId=parent.robotId,
+            skillId="vision.observe",
+            skillVersion="2.0.0",
+            input={
+                "mode": "scene_description",
+                "instruction": (
+                    "请只根据当前固定头 RGB-D 画面，客观描述这个巡检方向可见的"
+                    "房间标牌、家具、设备、通道、障碍物和其他沿途信息。"
+                    "不要猜测画面外内容；无法确认的内容必须明确标为不确定。"
+                    f"当前产品目录区域为 {region_id}，巡检站为 {station_id}，"
+                    f"目标地图朝向为 {target_heading:.6f} 弧度。"
+                ),
+                "targetDescription": f"{region_id}/{station_id}",
+            },
+            capabilityManifestDigest=parent.capabilityManifestDigest,
+            authorizationId=parent.authorizationId,
+            idempotencyKey=request_id,
+            issuedAt=issued_at,
+            expiresAt=expires_at,
+        )
+
+    def _validate_inspection_visual(
+        request: SkillRequest,
+        dispatch: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        visual = dispatch.get("visualResult")
+        if not isinstance(visual, Mapping):
+            raise ValueError("Office inspection observation returned no visual result")
+        if visual.get("schemaVersion") != "h-ide.visual-result/2":
+            raise ValueError("Office inspection observation schema is invalid")
+        for field, expected in {
+            "requestId": request.requestId,
+            "missionId": request.missionId,
+            "revisionId": request.revisionId,
+            "nodeId": request.nodeId,
+            "mode": "scene_description",
+        }.items():
+            if visual.get(field) != expected:
+                raise ValueError(
+                    f"Office inspection visual result changed {field}"
+                )
+        try:
+            expected_attempt = int(request.requestId.rsplit("-", 1)[1])
+        except (IndexError, ValueError) as exc:
+            raise ValueError("Office inspection visual attempt is invalid") from exc
+        if visual.get("attempt") != expected_attempt:
+            raise ValueError("Office inspection visual attempt changed")
+        mission = mission_service.runtime.get(request.missionId)
+        plan = mission.get("plan")
+        envelope = plan.get("envelope") if isinstance(plan, Mapping) else None
+        source = visual.get("source")
+        robot = context.store.get_robot(request.robotId)
+        robot_details = (
+            robot.get("details")
+            if isinstance(robot, Mapping) and isinstance(robot.get("details"), Mapping)
+            else None
+        )
+        if not isinstance(envelope, Mapping) or not isinstance(source, Mapping):
+            raise ValueError("Office inspection visual source identity is unavailable")
+        if (
+            source.get("robotId") != request.robotId
+            or source.get("robotBootId") != envelope.get("robotBootId")
+            or source.get("localizationEpochId")
+            != envelope.get("localizationEpochId")
+            or not isinstance(source.get("observationSessionId"), str)
+            or not source.get("observationSessionId")
+            or not isinstance(source.get("sensorId"), str)
+            or not source.get("sensorId")
+        ):
+            raise ValueError("Office inspection visual source identity changed")
+        expected_observation_session = (
+            robot_details.get("observationSessionId")
+            if isinstance(robot_details, Mapping)
+            else None
+        )
+        if (
+            isinstance(expected_observation_session, str)
+            and expected_observation_session
+            and source.get("observationSessionId") != expected_observation_session
+        ):
+            raise ValueError("Office inspection visual observation session changed")
+        analysis_id = visual.get("analysisId")
+        request_sha256 = visual.get("requestSha256")
+        if (
+            not isinstance(analysis_id, str)
+            or not analysis_id.strip()
+            or not isinstance(request_sha256, str)
+            or len(request_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in request_sha256.lower())
+        ):
+            raise ValueError("Office inspection visual analysis identity is invalid")
+        versions = visual.get("versions")
+        if (
+            not isinstance(versions, Mapping)
+            or versions.get("vlmProvider") != "qwen"
+            or versions.get("vlmModel") != "qwen3-vl-plus"
+            or versions.get("segmentationProvider") != "sam2"
+            or versions.get("poseModel") not in {None, ""}
+        ):
+            raise ValueError("Office inspection visual model profile changed")
+        if str(visual.get("status") or "").lower() != "succeeded":
+            raise ValueError("Office inspection visual task did not succeed")
+        summary = visual.get("observationSummary")
+        if not isinstance(summary, str) or not summary.strip():
+            raise ValueError("Office inspection visual result has no summary")
+        if visual.get("geometryCandidates"):
+            raise ValueError("Office scene description returned motion geometry")
+        evidence = visual.get("evidence")
+        if not isinstance(evidence, list) or not evidence:
+            raise ValueError("Office inspection visual result has no evidence")
+        for item in evidence:
+            sha256 = item.get("sha256") if isinstance(item, Mapping) else None
+            if (
+                not isinstance(item, Mapping)
+                or not isinstance(sha256, str)
+                or len(sha256) != 64
+                or any(character not in "0123456789abcdef" for character in sha256.lower())
+                or not isinstance(item.get("mediaType"), str)
+            ):
+                raise ValueError("Office inspection visual evidence is invalid")
+        return dict(visual)
+
+    def _run_office_inspection(
+        parent: SkillRequest,
+        state: dict[str, Any],
+    ) -> None:
+        headings = [float(value) for value in parent.input["scanHeadingsRad"]]
+        initial_pose = mission_service._current_robot_pose(parent.robotId)
+        ordered_headings = _minimum_travel_heading_order(
+            headings,
+            current_yaw=float(initial_pose.yaw),
+        )
+        maximum_yaw = float(parent.input["maximumCumulativeYawRad"])
+        capture_policy = parent.input.get("capturePolicy")
+        if not isinstance(capture_policy, Mapping):
+            raise ValueError("Office inspection capture policy is unavailable")
+        settle_seconds = float(capture_policy.get("stopBeforeCaptureS", 1.0))
+        if not math.isfinite(settle_seconds) or not 0.0 <= settle_seconds <= 5.0:
+            raise ValueError("Office inspection settle time is invalid")
+        heading_results: list[dict[str, Any]] = []
+        cumulative_yaw = 0.0
+        evidence_ids: list[str] = []
+        try:
+            for scan_sequence, (heading_index, heading) in enumerate(
+                ordered_headings,
+                start=1,
+            ):
+                if state["cancelEvent"].is_set() or not _inspection_parent_is_active(parent):
+                    raise _OfficeInspectionCancelled()
+                state["failureStage"] = "rotation"
+                state["headingIndex"] = heading_index
+                state["scanSequence"] = scan_sequence
+                child = _inspection_child_rotation(
+                    parent,
+                    heading_index=heading_index,
+                    target_heading=heading,
+                )
+                receipt: dict[str, Any] | None = None
+                if child is not None:
+                    delta = abs(float(child.input["targetYawRad"]))
+                    cumulative_yaw += delta
+                    if cumulative_yaw > maximum_yaw + 1e-6:
+                        raise ValueError("Office inspection exceeded its yaw reservation")
+                    receipt = _inspection_wait_for_rotation(parent, child, state)
+                if state["cancelEvent"].wait(settle_seconds):
+                    raise _OfficeInspectionCancelled()
+                state["failureStage"] = "visual_observation"
+                visual: dict[str, Any] | None = None
+                visual_request: SkillRequest | None = None
+                attempts = 0
+                for attempt in (1, 2):
+                    attempts = attempt
+                    visual_request = _inspection_visual_request(
+                        parent,
+                        heading_index=heading_index,
+                        target_heading=heading,
+                        attempt=attempt,
+                    )
+                    try:
+                        visual = _validate_inspection_visual(
+                            visual_request,
+                            dispatch_visual_workstation_skill(visual_request),
+                        )
+                    except Exception:
+                        if attempt == 2:
+                            raise
+                        if state["cancelEvent"].wait(1.0):
+                            raise _OfficeInspectionCancelled()
+                        continue
+                    break
+                assert visual is not None and visual_request is not None
+                for evidence in visual.get("evidence", []):
+                    sha = evidence.get("sha256") if isinstance(evidence, Mapping) else None
+                    if isinstance(sha, str) and sha not in evidence_ids:
+                        evidence_ids.append(sha)
+                heading_results.append(
+                    {
+                        "headingIndex": heading_index,
+                        "headingRad": heading,
+                        "rotationRequestId": child.requestId if child is not None else None,
+                        "rotationReceipt": receipt,
+                        "visualRequestId": visual_request.requestId,
+                        "visualAttempts": attempts,
+                        "visualResult": visual,
+                    }
+                )
+                _inspection_progress(
+                    parent,
+                    sequence=scan_sequence,
+                    progress=scan_sequence / len(headings),
+                    phase="captured_heading",
+                    detail=(
+                        f"Captured heading {scan_sequence} of {len(headings)}"
+                    ),
+                )
+                state["failureStage"] = "heading_complete"
+            if state["cancelEvent"].is_set() or not _inspection_parent_is_active(parent):
+                raise _OfficeInspectionCancelled()
+            mission_service.runtime.record_result(
+                parent.missionId,
+                SkillResult(
+                    requestId=parent.requestId,
+                    status="succeeded",
+                    completedAt=utc_now(),
+                    result={
+                        "inspectionResult": {
+                            "schemaVersion": "h-ide.office-inspection/1",
+                            "stationId": parent.input["stationId"],
+                            "regionId": parent.input["regionId"],
+                            "cumulativeYawRad": cumulative_yaw,
+                            "headings": sorted(
+                                heading_results,
+                                key=lambda item: int(item["headingIndex"]),
+                            ),
+                        }
+                    },
+                    evidenceIds=evidence_ids[:50],
+                ),
+            )
+            state["status"] = "completed"
+        except _OfficeInspectionCancelled:
+            state["status"] = "cancelled"
+        except Exception as exc:
+            state["status"] = "failed"
+            context.runtime.diagnostics.append(
+                {
+                    "message": "office inspection worker failed",
+                    "requestId": parent.requestId,
+                    "errorType": type(exc).__name__,
+                    "error": str(exc),
+                }
+            )
+            if _inspection_parent_is_active(parent) and not state["cancelEvent"].is_set():
+                try:
+                    mission_service.runtime.record_result(
+                        parent.missionId,
+                        SkillResult(
+                            requestId=parent.requestId,
+                            status="failed",
+                            completedAt=utc_now(),
+                            result={
+                                "dispatchAuthority": "workstation",
+                                "stationId": parent.input.get("stationId"),
+                                "failure": {
+                                    "stage": str(
+                                        state.get("failureStage") or "unknown"
+                                    ),
+                                    "headingIndex": state.get("headingIndex"),
+                                    "scanSequence": state.get("scanSequence"),
+                                    "errorType": type(exc).__name__,
+                                },
+                            },
+                            errorCode="OFFICE_INSPECTION_FAILED",
+                            detail=(
+                                "Office station inspection did not complete "
+                                f"during {state.get('failureStage') or 'unknown'}"
+                            ),
+                        ),
+                    )
+                except Exception:
+                    mission_service.runtime.record_recovery_required(
+                        parent.missionId,
+                        request_id=parent.requestId,
+                        error_code="WORKSTATION_INSPECTION_RECOVERY_REQUIRED",
+                        detail=(
+                            "Office inspection result persistence was interrupted; "
+                            "manual recovery is required"
+                        ),
+                    )
+        finally:
+            # An unexpected exception outside the normal rotation wait must
+            # not orphan a physical child.  Clear ownership only after the
+            # RobotAgent cancellation boundary confirms a terminal receipt.
+            try:
+                with state["commandLock"]:
+                    child = state.get("activeChild")
+                    if isinstance(child, SkillRequest):
+                        cancel_robot_agent_skill(child)
+                        state["activeChild"] = None
+            except Exception:
+                context.runtime.diagnostics.append(
+                    {
+                        "message": (
+                            "office inspection active child could not be "
+                            "cancelled during worker cleanup"
+                        ),
+                        "requestId": parent.requestId,
+                    }
+                )
+                if _inspection_parent_is_active(parent):
+                    try:
+                        mission_service.runtime.record_recovery_required(
+                            parent.missionId,
+                            request_id=parent.requestId,
+                            error_code=(
+                                "WORKSTATION_INSPECTION_RECOVERY_REQUIRED"
+                            ),
+                            detail=(
+                                "Office inspection child motion ownership could "
+                                "not be released; manual recovery is required"
+                            ),
+                        )
+                    except Exception:
+                        pass
+            state["doneEvent"].set()
+
+    def _start_office_inspection(skill: SkillRequest) -> dict[str, Any]:
+        with office_inspection_lock:
+            existing = office_inspection_workers.get(skill.requestId)
+            if existing is not None:
+                return {
+                    "mode": "office_inspection_pending",
+                    "requestId": skill.requestId,
+                    "status": str(existing.get("status") or "running"),
+                }
+            _inspection_progress(
+                skill,
+                sequence=0,
+                progress=0.0,
+                phase="inspection_started",
+                detail="Office station inspection started",
+            )
+            state: dict[str, Any] = {
+                "parent": skill,
+                "cancelEvent": threading.Event(),
+                "doneEvent": threading.Event(),
+                "commandLock": threading.Lock(),
+                "activeChild": None,
+                "status": "running",
+                "failureStage": "inspection_start",
+                "headingIndex": None,
+                "scanSequence": None,
+            }
+            worker = threading.Thread(
+                target=_run_office_inspection,
+                args=(skill, state),
+                name=f"office-inspection-{skill.requestId[-24:]}",
+                daemon=True,
+            )
+            state["thread"] = worker
+            office_inspection_workers[skill.requestId] = state
+            try:
+                worker.start()
+            except Exception:
+                office_inspection_workers.pop(skill.requestId, None)
+                raise
+        return {
+            "mode": "office_inspection_pending",
+            "requestId": skill.requestId,
+            "status": "running",
+        }
+
+    def reconcile_workstation_skill(skill: SkillRequest) -> dict[str, Any]:
+        if skill.skillId != OFFICE_INSPECTION_SKILL:
+            return {"status": "lost"}
+        with office_inspection_lock:
+            state = office_inspection_workers.get(skill.requestId)
+            if state is None:
+                return {"status": "lost"}
+            status = str(state.get("status") or "running")
+        return {
+            "mode": "office_inspection_pending",
+            "requestId": skill.requestId,
+            "status": "pending" if status == "running" else status,
+        }
+
+    def dispatch_workstation_skill(skill: SkillRequest) -> dict[str, Any]:
+        if skill.expiresAt <= utc_now():
+            raise ValueError("Mission workstation skill request has expired")
+        if skill.skillId == "vision.observe":
+            return dispatch_visual_workstation_skill(skill)
+        if skill.skillId == OFFICE_INSPECTION_SKILL:
+            return _start_office_inspection(skill)
+        if skill.skillId == MISSION_REPORT_SKILL:
+            mission = mission_service.runtime.get(skill.missionId)
+            if mission.get("snapshot", {}).get("activeSkillRequestId") != skill.requestId:
+                raise ValueError("Office report no longer owns the active Mission request")
+            source_missions: list[Mapping[str, Any]] = []
+            raw_source_ids = skill.input.get("sourceMissionIds")
+            if raw_source_ids is not None:
+                if (
+                    not isinstance(raw_source_ids, list)
+                    or not raw_source_ids
+                    or len(raw_source_ids) > 4
+                    or len(set(raw_source_ids)) != len(raw_source_ids)
+                    or any(
+                        not isinstance(item, str)
+                        or not item
+                        or item == skill.missionId
+                        for item in raw_source_ids
+                    )
+                ):
+                    raise ValueError("Office report source Mission binding is invalid")
+                current_plan = MissionPlanDraft.model_validate(mission["plan"])
+                for source_mission_id in raw_source_ids:
+                    source = mission_service.runtime.get(source_mission_id)
+                    source_plan = MissionPlanDraft.model_validate(source["plan"])
+                    source_snapshot = MissionSnapshot.model_validate(source["snapshot"])
+                    if (
+                        source_plan.robotId != current_plan.robotId
+                        or source_plan.objective != current_plan.objective
+                        or not is_full_office_inspection(source_plan.objective)
+                        or source_snapshot.activeSkillRequestId is not None
+                    ):
+                        raise ValueError(
+                            "Office report source Mission identity is incompatible"
+                        )
+                    source_missions.append(source)
+            return {
+                "mode": "office_mission_report",
+                "missionReport": build_office_inspection_report(
+                    mission,
+                    source_missions=source_missions,
+                ),
+            }
+        raise ValueError(f"unsupported workstation skill: {skill.skillId}")
+
+    def stop_office_inspection_workers() -> None:
+        with office_inspection_lock:
+            states = list(office_inspection_workers.values())
+            for state in states:
+                state["cancelEvent"].set()
+        for state in states:
+            parent = state.get("parent")
+            command_lock = state.get("commandLock")
+            acquired = False
+            if callable(getattr(command_lock, "acquire", None)):
+                acquired = bool(command_lock.acquire(timeout=5.0))
+            try:
+                if acquired:
+                    child = state.get("activeChild")
+                    if isinstance(child, SkillRequest):
+                        try:
+                            cancel_robot_agent_skill(child)
+                        except Exception:
+                            context.runtime.diagnostics.append(
+                                {
+                                    "message": (
+                                        "office inspection child cancellation failed "
+                                        "during Control API shutdown"
+                                    ),
+                                    "requestId": child.requestId,
+                                }
+                            )
+                        state["activeChild"] = None
+            finally:
+                if acquired:
+                    command_lock.release()
+            worker = state.get("thread")
+            if isinstance(worker, threading.Thread) and worker.is_alive():
+                worker.join(timeout=2.0)
+            if isinstance(parent, SkillRequest) and _inspection_parent_is_active(parent):
+                try:
+                    mission_service.runtime.record_recovery_required(
+                        parent.missionId,
+                        request_id=parent.requestId,
+                        error_code="WORKSTATION_INSPECTION_RECOVERY_REQUIRED",
+                        detail=(
+                            "Office inspection was interrupted by Control API shutdown; "
+                            "manual recovery is required"
+                        ),
+                    )
+                except Exception:
+                    context.runtime.diagnostics.append(
+                        {
+                            "message": (
+                                "office inspection shutdown recovery marker failed"
+                            ),
+                            "requestId": parent.requestId,
+                        }
+                    )
+
     def reconcile_mission_skill(skill: SkillRequest) -> dict[str, Any]:
         record = context.store.get_command_record(skill.requestId)
         if record is None:
@@ -1986,6 +2757,13 @@ def create_app(
             adapter = context.adapters.get(Transport.ROBOT_AGENT.value)
             if adapter is None:
                 return {"mode": "robot_agent", "receipt": dict(persisted)}
+            restore_route = getattr(
+                getattr(adapter, "driver", None),
+                "restore_command_route",
+                None,
+            )
+            if callable(restore_route):
+                restore_route(command.commandId, command.robotId)
             outcome = adapter.query(command.commandId)
             outcome_status = str(outcome.status).strip().lower()
             if outcome_status in {"unavailable", "running", "accepted", "pending"}:
@@ -2056,7 +2834,7 @@ def create_app(
         project_succeeded_navigation_pose(skill, receipt)
         return {"mode": "robot_agent", "receipt": _receipt_json(receipt)}
 
-    def cancel_mission_skill(skill: SkillRequest) -> dict[str, Any]:
+    def cancel_robot_agent_skill(skill: SkillRequest) -> dict[str, Any]:
         record = context.store.get_command_record(skill.requestId)
         if record is None:
             raise MissionServiceError(
@@ -2093,6 +2871,44 @@ def create_app(
             context.store.save_command(command, receipt)
         return {"mode": "robot_agent", "receipt": _receipt_json(receipt)}
 
+    def cancel_mission_skill(skill: SkillRequest) -> dict[str, Any]:
+        if skill.skillId != OFFICE_INSPECTION_SKILL:
+            return cancel_robot_agent_skill(skill)
+        with office_inspection_lock:
+            state = office_inspection_workers.get(skill.requestId)
+            if state is None:
+                raise MissionServiceError(
+                    "office inspection worker ownership is unavailable after restart"
+                )
+            state["cancelEvent"].set()
+        child_receipt: Mapping[str, Any] | None = None
+        with state["commandLock"]:
+            child = state.get("activeChild")
+            if isinstance(child, SkillRequest):
+                child_receipt = cancel_robot_agent_skill(child).get("receipt")
+                state["activeChild"] = None
+        state["status"] = "cancelled"
+        now = utc_now().isoformat()
+        return {
+            "mode": "office_inspection",
+            "receipt": {
+                "commandId": skill.requestId,
+                "robotId": skill.robotId,
+                "status": "cancelled",
+                "acceptedAt": skill.issuedAt.isoformat(),
+                "completedAt": now,
+                "result": {
+                    "dispatchAuthority": "workstation",
+                    "activeChildReceipt": (
+                        dict(child_receipt)
+                        if isinstance(child_receipt, Mapping)
+                        else None
+                    ),
+                },
+                "error": None,
+            },
+        }
+
     app.state.refresh_robot_agent_snapshot = refresh_robot_agent_snapshot
     app.state.require_current_capability = require_current_capability
     app.state.require_robot_agent_capability = require_robot_agent_capability
@@ -2102,6 +2918,7 @@ def create_app(
         mission_service.skill_reconciler = reconcile_mission_skill
         mission_service.skill_canceller = cancel_mission_skill
     mission_service.workstation_skill_dispatcher = dispatch_workstation_skill
+    mission_service.workstation_skill_reconciler = reconcile_workstation_skill
 
     def resolve_simulation_review(session_id: str, revision_id: str | None) -> dict[str, Any]:
         """Resolve a simulation gate only after Mission V2 is no longer pending."""
@@ -2238,6 +3055,7 @@ def create_app(
     app.state.stop_watchdog = stop_watchdog
     app.state.watchdog_thread = watchdog_thread
     app.state.mission_supervisor_thread = mission_supervisor_thread
+    app.router.add_event_handler("shutdown", stop_office_inspection_workers)
     app.router.add_event_handler("shutdown", stop_watchdog)
     app.router.add_event_handler("shutdown", assistant_service.close)
     app.router.add_event_handler("shutdown", simulation.close)

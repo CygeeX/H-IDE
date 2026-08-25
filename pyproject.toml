@@ -19,6 +19,7 @@ dependencies = [
 
 [project.scripts]
 h-ide-admin-bootstrap = "services.control_api.admin_cli:cli"
+h-ide-office-v2-bootstrap = "services.scene_api.office_v2_bootstrap:main"
 
 [project.optional-dependencies]
 scene = [
@@ -38,3 +39,6 @@ addopts = "-q"
 
 [tool.setuptools.packages.find]
 include = ["packages*", "services*"]
+
+[tool.setuptools.package-data]
+"services.scene_api" = ["builtin/office_v2/*"]

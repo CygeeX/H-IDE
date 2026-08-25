@@ -94,7 +94,7 @@ class CapabilityDescriptor(ContractModel):
     resources: list[str] = Field(min_length=1, max_length=32)
     cancellable: bool
     interruptible: bool
-    timeoutMs: int = Field(gt=0, le=600_000)
+    timeoutMs: int = Field(gt=0, le=2_400_000)
     requiredSensorIds: list[str] = Field(default_factory=list, max_length=16)
     preconditions: list[ConditionSpec] = Field(default_factory=list, max_length=32)
     postconditions: list[ConditionSpec] = Field(default_factory=list, max_length=32)

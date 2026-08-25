@@ -258,28 +258,48 @@ class MissionRuntime:
     def _reserved_scan_yaw(
         record: Mapping[str, Any],
         next_input: Mapping[str, Any],
+        *,
+        next_skill_id: str,
     ) -> float:
-        values: list[Any] = []
+        values: list[tuple[str, Any]] = []
         for execution in record.get("skillExecutions", []):
             if not isinstance(execution, Mapping):
                 continue
             request = execution.get("request")
-            if not isinstance(request, Mapping) or request.get("skillId") != "navigation.rotate":
+            if not isinstance(request, Mapping):
+                continue
+            skill_id = request.get("skillId")
+            if skill_id not in {"navigation.rotate", "inspection.scan_station"}:
                 continue
             skill_input = request.get("input")
-            values.append(
-                skill_input.get("targetYawRad")
-                if isinstance(skill_input, Mapping)
-                else None
+            field = (
+                "targetYawRad"
+                if skill_id == "navigation.rotate"
+                else "maximumCumulativeYawRad"
             )
-        values.append(next_input.get("targetYawRad"))
+            values.append(
+                (
+                    str(skill_id),
+                    skill_input.get(field) if isinstance(skill_input, Mapping) else None,
+                )
+            )
+        next_field = (
+            "targetYawRad"
+            if next_skill_id == "navigation.rotate"
+            else "maximumCumulativeYawRad"
+        )
+        values.append((next_skill_id, next_input.get(next_field)))
         total = 0.0
-        for value in values:
+        for skill_id, value in values:
             if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise MissionConflict("rotation budget requires a finite targetYawRad")
+                raise MissionConflict(
+                    f"rotation budget requires a finite value for {skill_id}"
+                )
             yaw = float(value)
             if not math.isfinite(yaw) or yaw == 0:
-                raise MissionConflict("rotation budget requires a non-zero finite targetYawRad")
+                raise MissionConflict(
+                    f"rotation budget requires a non-zero finite value for {skill_id}"
+                )
             total += abs(yaw)
         return total
 
@@ -449,6 +469,217 @@ class MissionRuntime:
             node_id=node_id,
         )
         return self._commit(record, next_snapshot, event)
+
+    def retry_failed_skill(
+        self,
+        mission_id: str,
+        *,
+        request_id: str,
+        reason: str,
+        source_intervention: MissionIntervention | Mapping[str, Any] | None = None,
+        source_request_sha256: str | None = None,
+    ) -> dict[str, Any]:
+        """Ready one unchanged failed node for its next bounded attempt.
+
+        This transition is intentionally narrower than replanning: it cannot
+        change the active revision, authorization, node, or input.  The next
+        immutable SkillRequest is rebuilt from trusted Mission state, so a
+        long-running simulator route may continue from the robot's fresh pose
+        without asking a text planner to rewrite reviewed geometry.
+
+        A failed-skill planner claim may already own the durable suspension
+        fence.  Supplying that exact claim completes it and schedules the
+        retry in the same transaction; there is never an intermediate state
+        in which the failed revision can be dispatched accidentally.
+        """
+
+        identifier = non_empty_id(request_id, "requestId")
+        retry_reason = non_empty_id(reason, "reason")
+        supplied_source = (
+            source_intervention is not None,
+            source_request_sha256 is not None,
+        )
+        if any(supplied_source) and not all(supplied_source):
+            raise MissionConflict("failed skill retry source binding is incomplete")
+
+        record = self.get(mission_id)
+        snapshot = self._snapshot(record)
+        source_value: MissionIntervention | None = None
+        source_digest: str | None = None
+        source_state: dict[str, Any] | None = None
+        base_snapshot = snapshot
+        if source_intervention is not None:
+            source_value = (
+                source_intervention
+                if isinstance(source_intervention, MissionIntervention)
+                else MissionIntervention.model_validate(source_intervention)
+            )
+            if source_value.missionId != mission_id:
+                raise MissionConflict("failed skill retry source mission is stale")
+            source_digest = non_empty_id(
+                source_request_sha256, "sourceRequestSha256"
+            )
+            source_state = self._planned_intervention_state(
+                record, source_value, source_digest
+            )
+            if source_state["state"] == "completed":
+                current_state = next(
+                    (
+                        item
+                        for item in record.get("nodeStates", [])
+                        if isinstance(item, Mapping)
+                        and isinstance(item.get("state"), Mapping)
+                        and item["state"].get("retryScheduledFromRequestId")
+                        == identifier
+                    ),
+                    None,
+                )
+                if current_state is not None:
+                    return record
+                raise MissionConflict("failed skill retry source is already completed")
+            if source_state["state"] != "pending":
+                raise MissionConflict("failed skill retry source was not claimed")
+            self._assert_planned_intervention_fence(snapshot, source_value)
+            base_snapshot = self._restore_planned_intervention_snapshot(
+                snapshot,
+                source_value,
+                source_state.get("claimEvent"),
+            )
+        else:
+            self._assert_no_planned_intervention_fence(snapshot)
+
+        if base_snapshot.status is not MissionStatus.PLANNING:
+            raise MissionConflict(
+                f"mission cannot retry a failed skill from {base_snapshot.status.value}"
+            )
+        if base_snapshot.activeSkillRequestId is not None:
+            raise MissionConflict("failed skill retry cannot replace active work")
+
+        revision = self._revision(record)
+        execution = next(
+            (
+                item
+                for item in record.get("skillExecutions", [])
+                if isinstance(item, Mapping) and item.get("requestId") == identifier
+            ),
+            None,
+        )
+        if execution is None:
+            raise MissionConflict("failed skill request is unavailable")
+        request = execution.get("request")
+        result = execution.get("result")
+        if not isinstance(request, Mapping) or not isinstance(result, Mapping):
+            raise MissionConflict("failed skill request has no terminal result")
+        node_id = request.get("nodeId")
+        if (
+            request.get("missionId") != mission_id
+            or request.get("revisionId") != revision.revisionId
+            or not isinstance(node_id, str)
+            or node_id != execution.get("nodeId")
+            or node_id != base_snapshot.activeNodeId
+            or result.get("requestId") != identifier
+            or result.get("status") == SkillResultStatus.SUCCEEDED.value
+        ):
+            raise MissionConflict("failed skill retry identity is stale")
+        node = next((item for item in revision.nodes if item.nodeId == node_id), None)
+        if node is None or node.skillId != request.get("skillId"):
+            raise MissionConflict("failed skill node is unavailable")
+
+        states = self._node_states(record, revision.revisionId)
+        current = states.get(node_id)
+        current_payload = current.get("state") if isinstance(current, Mapping) else None
+        if (
+            not isinstance(current, Mapping)
+            or current.get("status") != result.get("status")
+            or not isinstance(current_payload, Mapping)
+            or current_payload.get("skillRequestId") != identifier
+            or current_payload.get("resultStatus") != result.get("status")
+        ):
+            raise MissionConflict("failed skill node state is stale")
+        attempt = int(current.get("attempt", 0))
+        plan = MissionPlanDraft.model_validate(record["plan"])
+        if attempt < 1 or attempt >= plan.envelope.maximumStageAttempts:
+            raise MissionConflict("mission node attempt budget is exhausted")
+        completed = {
+            item_id
+            for item_id, item in states.items()
+            if item.get("status") in {"succeeded", "skipped"}
+        }
+        if not set(node.dependsOn).issubset(completed):
+            raise MissionConflict("failed skill dependencies are no longer complete")
+
+        now = utc_now()
+        next_snapshot = base_snapshot.model_copy(
+            update={
+                "status": MissionStatus.READY,
+                "lastSequence": snapshot.lastSequence + 1,
+                "activeNodeId": node_id,
+                "activeSkillRequestId": None,
+                "updatedAt": now,
+                "errorCode": None,
+                "detail": None,
+            }
+        )
+        retry_payload = {
+            "requestId": identifier,
+            "nodeId": node_id,
+            "attempt": attempt,
+            "nextAttempt": attempt + 1,
+            "reason": retry_reason,
+        }
+        if source_value is not None and source_digest is not None:
+            decision = {
+                "kind": "continue",
+                "reason": retry_reason,
+                "deterministicRetry": retry_payload,
+            }
+            event = self._event(
+                snapshot,
+                event_type="operator.intervention.completed",
+                correlation_id=source_value.interventionId,
+                causation_id=(
+                    source_state["claimEvent"].get("eventId")
+                    if source_state is not None
+                    and isinstance(source_state.get("claimEvent"), Mapping)
+                    else None
+                ),
+                node_id=node_id,
+                payload={
+                    **_plain(source_value),
+                    "operationType": _PLANNED_INTERVENTION_OPERATION,
+                    "phase": "completed",
+                    "requestSha256": source_digest,
+                    "decision": decision,
+                },
+            )
+        else:
+            event = self._event(
+                snapshot,
+                event_type="skill.retry_scheduled",
+                correlation_id=f"retry:{identifier}:{attempt + 1}",
+                causation_id=identifier,
+                node_id=node_id,
+                payload=retry_payload,
+            )
+        return self._commit(
+            record,
+            next_snapshot,
+            event,
+            node_states=[
+                {
+                    "revisionId": revision.revisionId,
+                    "nodeId": node_id,
+                    "status": "ready",
+                    "attempt": attempt,
+                    "state": {
+                        **dict(current_payload),
+                        "retryScheduledFromRequestId": identifier,
+                        "retryReason": retry_reason,
+                        "nextAttempt": attempt + 1,
+                    },
+                }
+            ],
+        )
 
     def retry_visual_candidate(
         self,
@@ -1070,7 +1301,7 @@ class MissionRuntime:
             raise MissionConflict("skill request lifetime must be finite and positive")
         expires = min(
             authorization.expiresAt,
-            now + timedelta(seconds=min(lifetime_seconds, 600.0)),
+            now + timedelta(seconds=min(lifetime_seconds, 2_400.0)),
         )
         request_id = f"skill-{mission_id}-{revision.sequence}-{node_id}-{attempt}"
         bound_input = dict(input)
@@ -1110,8 +1341,12 @@ class MissionRuntime:
             cumulative_distance = self._reserved_navigation_distance(record, bound_input)
             if cumulative_distance > plan.envelope.maximumCumulativeDistanceM + 1e-9:
                 raise MissionConflict("navigation command exceeds the cumulative distance envelope")
-        elif node.skillId == "navigation.rotate":
-            cumulative_scan_yaw = self._reserved_scan_yaw(record, bound_input)
+        elif node.skillId in {"navigation.rotate", "inspection.scan_station"}:
+            cumulative_scan_yaw = self._reserved_scan_yaw(
+                record,
+                bound_input,
+                next_skill_id=node.skillId,
+            )
             if cumulative_scan_yaw > plan.envelope.maximumScanYawRad + 1e-9:
                 raise MissionConflict("rotation command exceeds the cumulative scan-yaw envelope")
         request = SkillRequest(

@@ -128,6 +128,8 @@ class ProtocolSimulator:
                 "authorityRevoked": True,
                 "safeStopState": "confirmed",
                 "safeStopEpoch": self.safe_stop_epoch,
+                "releaseMode": "physical_safe_stop",
+                "physicalSafeStopAdvanced": True,
             }
 
     def submit(self, command: ProtocolCommand) -> ProtocolCommandStatus:

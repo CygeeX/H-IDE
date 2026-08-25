@@ -22,6 +22,10 @@ services:
     environment:
       SIMULATION_DB_PATH: /data/control.db
       MISSION_V2_ALLOW_SYNTHETIC_PROFILE: "true"
+      # Simulation Missions must inherit the immutable Office V2 Scene API
+      # binding.  A missing/stale binding fails draft creation instead of
+      # allowing the planner to invent room names or map coordinates.
+      MISSION_V2_AUTO_USE_BOUND_SCENE: "true"
       VISUAL_MISSION_MODE: ${VISUAL_MISSION_MODE:-observe}
       SIMULATION_ROBOT_AGENT_GATEWAY_URL: ${SIMULATION_ROBOT_AGENT_GATEWAY_URL:-http://host.docker.internal:8094}
       SIMULATION_ROBOT_AGENT_GATEWAY_TOKEN: ${SIMULATION_ROBOT_AGENT_GATEWAY_TOKEN:-dev-sim-gateway-token}

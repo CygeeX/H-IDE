@@ -48,7 +48,11 @@ from .store import SQLiteStore
 
 
 _PHYSICAL_SKILLS = frozenset(
-    {"navigation.navigate_to_pose", "navigation.rotate"}
+    {
+        "navigation.navigate_to_pose",
+        "navigation.rotate",
+        "inspection.scan_station",
+    }
 )
 _RISK = {
     ContractRiskLevel.LOW: RiskLevel.LOW,
@@ -127,6 +131,7 @@ class MissionPolicy:
         *,
         gate: PolicyGate | None = None,
         grant_ttl_seconds: float | None = None,
+        simulation_grant_ttl_seconds: float | None = None,
         allow_legacy_real: bool | None = None,
     ) -> None:
         self.store = store
@@ -142,11 +147,36 @@ class MissionPolicy:
             raise ValueError("MISSION_POLICY_GRANT_TTL_SECONDS must be a number") from exc
         if not math.isfinite(self.grant_ttl_seconds) or not 30 <= self.grant_ttl_seconds <= 3600:
             raise ValueError("MISSION_POLICY_GRANT_TTL_SECONDS must be between 30 and 3600")
+        raw_sim_ttl: Any = (
+            simulation_grant_ttl_seconds
+            if simulation_grant_ttl_seconds is not None
+            else os.getenv("MISSION_POLICY_SIM_GRANT_TTL_SECONDS", "3600")
+        )
+        try:
+            self.simulation_grant_ttl_seconds = float(raw_sim_ttl)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "MISSION_POLICY_SIM_GRANT_TTL_SECONDS must be a number"
+            ) from exc
+        if (
+            not math.isfinite(self.simulation_grant_ttl_seconds)
+            or not 30 <= self.simulation_grant_ttl_seconds <= 3600
+        ):
+            raise ValueError(
+                "MISSION_POLICY_SIM_GRANT_TTL_SECONDS must be between 30 and 3600"
+            )
         if allow_legacy_real is None:
             allow_legacy_real = os.getenv(
                 "MISSION_POLICY_ALLOW_LEGACY_REAL", "false"
             ).strip().casefold() in {"1", "true", "yes", "on"}
         self.allow_legacy_real = bool(allow_legacy_real)
+
+    def grant_ttl_for_target(self, target: ExecutionTarget) -> float:
+        return (
+            self.simulation_grant_ttl_seconds
+            if target is ExecutionTarget.SIM
+            else self.grant_ttl_seconds
+        )
 
     def preference(self, actor: PolicyActor, target: ExecutionTarget) -> AutonomyMode:
         value = self.store.get_autonomy_preference(
@@ -224,9 +254,14 @@ class MissionPolicy:
             sensor.fixedMount and (sensor.depthCapable or sensor.kind.value in {"rgb", "rgbd"})
             for sensor in profile.sensors
         )
+        workstation_composite = (
+            descriptor.metadata.get("authority") == "workstation"
+            and descriptor.metadata.get("containsPhysicalChildren") is True
+        )
         nav2 = (
             descriptor.kind is not CapabilityKind.MOTION
             or descriptor.executor == "nav2"
+            or workstation_composite
         )
         adapter = details.get("adapter")
         if adapter == "robot_agent":
@@ -332,6 +367,14 @@ class MissionPolicy:
                 rotation = abs(float(raw or 0))
             except (TypeError, ValueError, OverflowError):
                 rotation = math.inf
+        elif node.skillId == "inspection.scan_station":
+            raw = payload.get("maximumCumulativeYawRad")
+            if raw is None and input_payload is None:
+                raw = math.tau
+            try:
+                rotation = abs(float(raw))
+            except (TypeError, ValueError, OverflowError):
+                rotation = math.inf
         speed = float(payload.get("maximumSpeedMps", plan.envelope.maximumSpeedMps))
         angular = 0.5 if rotation > 0 else 0.0
         return distance, speed if distance > 0 else 0.0, rotation, angular
@@ -405,7 +448,15 @@ class MissionPolicy:
         )
         if descriptor is None:
             raise MissionPolicyDenied("skill is absent from the trusted live catalog")
-        if descriptor.kind is CapabilityKind.MOTION and descriptor.executor != "nav2":
+        workstation_composite = (
+            descriptor.metadata.get("authority") == "workstation"
+            and descriptor.metadata.get("containsPhysicalChildren") is True
+        )
+        if (
+            descriptor.kind is CapabilityKind.MOTION
+            and descriptor.executor != "nav2"
+            and not workstation_composite
+        ):
             raise MissionPolicyDenied("all base motion, including rotation, is Nav2-only")
         return descriptor
 
@@ -507,10 +558,11 @@ class MissionPolicy:
         assert chosen is not None
         node, request, decision = chosen
         now = datetime.now(timezone.utc)
+        grant_ttl_seconds = self.grant_ttl_for_target(target)
         expiry = min(
             _utc(plan.expiresAt),
             _utc(plan.envelope.expiresAt),
-            now + timedelta(seconds=self.grant_ttl_seconds),
+            now + timedelta(seconds=grant_ttl_seconds),
         )
         if expiry <= now:
             raise MissionPolicyDenied("mission confirmation grant would already be expired")
@@ -524,6 +576,12 @@ class MissionPolicy:
             node_id=node.nodeId,
             grant_id=grant_id,
         )
+        action_scope = {item.skillId for item in physical}
+        if "inspection.scan_station" in action_scope:
+            # The composite station scan owns only reviewed relative Spin
+            # children. Keep that delegated action explicit in the immutable
+            # grant instead of treating a workstation thread as new authority.
+            action_scope.add("navigation.rotate")
         grant = {
             "grantId": grant_id,
             "authorizationId": authorization_id,
@@ -534,7 +592,7 @@ class MissionPolicy:
             "executionTarget": target.value,
             "planId": plan.planId,
             "planRevision": revision,
-            "actionScope": sorted({item.skillId for item in physical}),
+            "actionScope": sorted(action_scope),
             "maxRisk": min(limits.max_risk, _RISK[plan.envelope.maximumRiskLevel]).name,
             "maxDistanceM": min(limits.max_distance_m, plan.envelope.maximumGoalDistanceM),
             "maxSpeedMps": min(limits.max_speed_mps, plan.envelope.maximumSpeedMps),
@@ -827,6 +885,79 @@ class MissionPolicy:
             profile=profile,
             manifest=manifest,
             operation="skill.dispatch",
+        )
+
+    def authorize_inspection_child(
+        self,
+        parent: SkillRequest,
+        child: SkillRequest,
+    ) -> None:
+        """Authorize one bounded Spin owned by an active station-scan node."""
+
+        if child.skillId != "navigation.rotate" or child.skillVersion != "2.0.0":
+            raise MissionPolicyDenied("inspection child must be navigation.rotate@2.0.0")
+        exact = (
+            "missionId",
+            "revisionId",
+            "nodeId",
+            "robotId",
+            "capabilityManifestDigest",
+            "authorizationId",
+        )
+        mismatched = [
+            field
+            for field in exact
+            if getattr(child, field) != getattr(parent, field)
+        ]
+        if mismatched:
+            raise MissionPolicyDenied(
+                "inspection child identity changed: " + ", ".join(mismatched)
+            )
+        record = self.store.get_mission(parent.missionId)
+        if record is None:
+            raise MissionPolicyDenied("inspection Mission is unavailable")
+        snapshot = record.get("snapshot")
+        if not isinstance(snapshot, Mapping) or snapshot.get("activeSkillRequestId") != parent.requestId:
+            raise MissionPolicyDenied("inspection parent no longer owns the active request")
+        revision = PlanRevision.model_validate(record["activeRevision"])
+        parent_node = next(
+            (item for item in revision.nodes if item.nodeId == parent.nodeId),
+            None,
+        )
+        if (
+            parent_node is None
+            or parent_node.skillId != "inspection.scan_station"
+            or parent_node.skillVersion != parent.skillVersion
+        ):
+            raise MissionPolicyDenied("inspection parent does not match the active revision")
+        robot = self.store.get_robot(child.robotId)
+        if robot is None:
+            raise MissionPolicyDenied("inspection robot is unavailable")
+        details = robot.get("details") if isinstance(robot.get("details"), Mapping) else {}
+        try:
+            profile = RobotProfile.model_validate(details.get("robotProfile"))
+            manifest = CapabilityManifest.model_validate(details.get("capabilityManifest"))
+        except Exception as exc:
+            raise MissionPolicyDenied(
+                f"trusted Robot Agent profile/manifest is unavailable: {exc}"
+            ) from exc
+        child_node = MissionNode(
+            nodeId=parent.nodeId,
+            skillId=child.skillId,
+            skillVersion=child.skillVersion,
+            purpose="Office inspection heading scan",
+            intent={},
+            riskLevel=ContractRiskLevel.MEDIUM,
+        )
+        self.authorize_skill(
+            record=record,
+            node=child_node,
+            input_payload=child.input,
+            actor=None,
+            robot=robot,
+            profile=profile,
+            manifest=manifest,
+            operation="inspection.child.dispatch",
         )
 
 

@@ -69,6 +69,18 @@ _CANCEL_CONFIRMATION_TIMEOUT_SECONDS = 5.0
 # may shorten it, while deployments cannot silently widen the safety budget.
 _CONTROL_RELEASE_CONFIRMATION_TIMEOUT_SECONDS = 5.0
 
+# A terminal Nav2 result and its confirmed SAFE_HOLD boundary may precede the
+# final decay of the measured base velocity by a handful of simulator frames.
+# Robot Agent correctly rejects control.acquire during that interval.  Treat
+# only that explicit measured-motion reason as transient and re-issue the
+# acquire after a short delay; every other rejection remains immediate and
+# fail-closed.
+_CONTROL_ACQUIRE_CONFIRMATION_TIMEOUT_SECONDS = 5.0
+_CONTROL_ACQUIRE_TRANSIENT_RETRY_SECONDS = 0.25
+_TRANSIENT_CONTROL_ARM_REASON = (
+    "control arm rejected while the measured base is moving"
+)
+
 
 @dataclass
 class _PendingTerminalPose:
@@ -465,20 +477,43 @@ class RobotAgentInboundPeer:
             if self._control_state == "ACTIVE" and self._connected:
                 return {"state": "ACTIVE", "leaseSequence": max(0, self._lease_sequence)}
             revision = self._control_revision
-        self._send("control.acquire", {"operator_id": "h-ide-gateway"})
-        deadline = time.monotonic() + 5.0
-        with self._condition:
-            while self._connected and (
-                self._control_revision <= revision or self._control_state != "ACTIVE"
-            ):
+        deadline = (
+            time.monotonic() + _CONTROL_ACQUIRE_CONFIRMATION_TIMEOUT_SECONDS
+        )
+        while True:
+            self._send("control.acquire", {"operator_id": "h-ide-gateway"})
+            with self._condition:
+                while self._connected and self._control_revision <= revision:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(
+                            "timed out waiting for Robot Agent control.status"
+                        )
+                    self._condition.wait(remaining)
+                if not self._connected:
+                    raise RuntimeError(
+                        "Robot Agent disconnected while acquiring control"
+                    )
+                revision = self._control_revision
+                if self._control_state == "ACTIVE":
+                    break
+                reason = self._control_reason
+                if _TRANSIENT_CONTROL_ARM_REASON not in reason.casefold():
+                    raise RuntimeError(
+                        f"Robot Agent control is not active: {reason}"
+                    )
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise TimeoutError("timed out waiting for Robot Agent control.status")
-                self._condition.wait(remaining)
-            if not self._connected:
-                raise RuntimeError("Robot Agent disconnected while acquiring control")
-            if self._control_state != "ACTIVE":
-                raise RuntimeError(f"Robot Agent control is not active: {self._control_reason}")
+                    raise TimeoutError(
+                        "timed out waiting for measured base motion to settle"
+                    )
+                self._condition.wait(
+                    min(_CONTROL_ACQUIRE_TRANSIENT_RETRY_SECONDS, remaining)
+                )
+                if not self._connected:
+                    raise RuntimeError(
+                        "Robot Agent disconnected while acquiring control"
+                    )
         self._start_heartbeat()
         return {"state": "ACTIVE", "leaseSequence": max(0, self._lease_sequence)}
 
@@ -506,13 +541,16 @@ class RobotAgentInboundPeer:
             return {"sequence": current, "expiresAt": expires_at}
 
     def release(self, robot_id: str, reason: str) -> Mapping[str, Any]:
-        """Relinquish control and prove a fresh physical SAFE_HOLD boundary.
+        """Relinquish remote control and prove a fresh SAFE_HOLD response.
 
         Stopping the heartbeat first prevents a concurrent renewal from
-        restoring an ACTIVE lease after ``control.release``.  Legacy peers do
-        not expose enough physical truth to acknowledge a normal release, so
-        they fail closed while the stopped heartbeat still lets their lease
-        watchdog remove authority.
+        restoring an ACTIVE lease after ``control.release``.  The response
+        must be newer than the request, from the same Robot Agent boot, and
+        retain confirmed physical safe-stop truth.  A normal terminal release
+        is allowed to keep the already-confirmed safe-stop epoch unchanged:
+        it relinquishes only remote authority while the resident locomotion
+        policy remains in learned-IDLE.  An explicit physical stop is still
+        represented by an increased epoch.
         """
 
         if robot_id != self.robot_id:
@@ -560,22 +598,27 @@ class RobotAgentInboundPeer:
                         "Robot Agent restarted before control release was confirmed"
                     )
                 epoch = self._control_safe_stop_epoch
-                fresh = (
-                    self._control_revision > baseline_revision
-                    and epoch is not None
-                    and epoch > baseline_epoch
-                )
+                fresh = self._control_revision > baseline_revision
+                epoch_valid = epoch is not None and epoch >= baseline_epoch
                 if (
                     fresh
+                    and epoch_valid
                     and self._control_state == "SAFE_HOLD"
                     and self._control_authority_revoked is True
                     and self._control_safe_stop_state == "confirmed"
                 ):
+                    physical_stop_advanced = epoch > baseline_epoch
                     result = {
                         "state": "SAFE_HOLD",
                         "authorityRevoked": True,
                         "safeStopState": "confirmed",
                         "safeStopEpoch": epoch,
+                        "releaseMode": (
+                            "physical_safe_stop"
+                            if physical_stop_advanced
+                            else "remote_authority"
+                        ),
+                        "physicalSafeStopAdvanced": physical_stop_advanced,
                     }
                     self._release_baseline_revision = None
                     self._release_baseline_epoch = None
@@ -583,6 +626,7 @@ class RobotAgentInboundPeer:
                     return result
                 if (
                     fresh
+                    and epoch_valid
                     and self._control_state == "SAFE_HOLD"
                     and self._control_authority_revoked is True
                     and self._control_safe_stop_state == "failed"
@@ -593,7 +637,7 @@ class RobotAgentInboundPeer:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError(
-                        "timed out waiting for a new confirmed SAFE_HOLD control release"
+                        "timed out waiting for a fresh confirmed SAFE_HOLD control release"
                     )
                 self._condition.wait(remaining)
 
@@ -825,7 +869,7 @@ class RobotAgentInboundPeer:
                         and self._control_authority_revoked is True
                         and self._control_safe_stop_state == "confirmed"
                         and self._control_safe_stop_epoch is not None
-                        and self._control_safe_stop_epoch > safe_stop_epoch
+                        and self._control_safe_stop_epoch >= safe_stop_epoch
                     ):
                         return status
                     if (
@@ -836,7 +880,7 @@ class RobotAgentInboundPeer:
                         and self._control_authority_revoked is True
                         and self._control_safe_stop_state == "failed"
                         and self._control_safe_stop_epoch is not None
-                        and self._control_safe_stop_epoch > safe_stop_epoch
+                        and self._control_safe_stop_epoch >= safe_stop_epoch
                     ):
                         return ProtocolCommandStatus(
                             command_id,

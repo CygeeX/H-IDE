@@ -66,6 +66,7 @@ def run_fake_agent(
     observation_status: str = "USABLE",
     received_types: list[str] | None = None,
     hello_payload_overrides: dict[str, object] | None = None,
+    transient_control_arm_rejections: int = 0,
 ) -> None:
     hello_payload = {
         "agent_version": "test-agent",
@@ -124,6 +125,7 @@ def run_fake_agent(
             },
         },
     ))
+    control_acquire_attempt = 0
     while True:
         incoming = parse_message(
             websocket.receive_text(),
@@ -134,6 +136,22 @@ def run_fake_agent(
             received_types.append(incoming["type"])
         payload = incoming["payload"]
         if incoming["type"] == "control.acquire":
+            control_acquire_attempt += 1
+            if control_acquire_attempt <= transient_control_arm_rejections:
+                websocket.send_text(build_message(
+                    "control.status",
+                    robot_id="g1-dev",
+                    session_id=session_id,
+                    payload={
+                        "state": "SAFE_HOLD",
+                        "reason": (
+                            "control arm failed closed: control arm rejected "
+                            "while the measured base is moving"
+                        ),
+                        "lease_sequence": None,
+                    },
+                ))
+                continue
             websocket.send_text(build_message(
                 "control.status",
                 robot_id="g1-dev",
@@ -748,7 +766,9 @@ def test_cancel_failed_safe_stop_returns_unknown_immediately(monkeypatch) -> Non
     assert "safe-stop confirmation failed" in results[0].detail
 
 
-def test_cancel_stale_confirmed_epoch_does_not_confirm(monkeypatch) -> None:
+def test_cancel_accepts_fresh_logical_release_with_unchanged_stop_epoch(
+    monkeypatch,
+) -> None:
     peer, command_id, sent = _cancel_test_peer(
         monkeypatch,
         timeout_seconds=0.05,
@@ -763,7 +783,7 @@ def test_cancel_stale_confirmed_epoch_does_not_confirm(monkeypatch) -> None:
             "type": "control.status",
             "payload": {
                 "state": "SAFE_HOLD",
-                "reason": "stale safe stop confirmation",
+                "reason": "remote authority released; SONIC remains resident",
                 "lease_sequence": None,
                 "authority_revoked": True,
                 "safe_stop_state": "confirmed",
@@ -771,6 +791,36 @@ def test_cancel_stale_confirmed_epoch_does_not_confirm(monkeypatch) -> None:
             },
         }
     )
+
+    worker.join(timeout=0.5)
+    assert not worker.is_alive()
+    assert results[0].state == "CANCELLED"
+
+
+def test_cancel_rejects_regressed_safe_stop_epoch(monkeypatch) -> None:
+    peer, command_id, sent = _cancel_test_peer(
+        monkeypatch,
+        timeout_seconds=0.05,
+    )
+    results: list[ProtocolCommandStatus] = []
+    worker = threading.Thread(target=lambda: results.append(peer.cancel(command_id)))
+    worker.start()
+    assert sent.wait(timeout=0.5)
+    _record_command_status(peer, command_id, "CANCELLED")
+    with pytest.raises(ValueError, match="safe_stop_epoch decreased"):
+        peer._record_message(
+            {
+                "type": "control.status",
+                "payload": {
+                    "state": "SAFE_HOLD",
+                    "reason": "regressed safe stop epoch",
+                    "lease_sequence": None,
+                    "authority_revoked": True,
+                    "safe_stop_state": "confirmed",
+                    "safe_stop_epoch": 6,
+                },
+            }
+        )
 
     worker.join(timeout=0.5)
     assert not worker.is_alive()
@@ -981,6 +1031,40 @@ def test_inbound_gateway_accepts_agent_client_and_tracks_terminal_status() -> No
         assert status.result["finalPoseRelation"] == "stable_after_terminal"
         # Repeated dispatch is a ledger lookup, never a second robot request.
         assert peer.submit(command(command_id)) == status
+        peer.close()
+        agent.join(timeout=1)
+
+
+def test_inbound_gateway_retries_only_transient_measured_motion_control_arm() -> None:
+    peer = RobotAgentInboundPeer(
+        robot_id="g1-dev",
+        expected_capabilities_digest=CAPABILITY_DIGEST,
+        capabilities=CAPABILITIES,
+        allow_plaintext_loopback=True,
+        heartbeat=False,
+    )
+    received_types: list[str] = []
+    with (
+        TestClient(create_app(peer, internal_token="test-token")) as client,
+        client.websocket_connect("/agent", subprotocols=[SUBPROTOCOL]) as websocket,
+    ):
+        agent = threading.Thread(
+            target=run_fake_agent,
+            args=(websocket,),
+            kwargs={
+                "received_types": received_types,
+                "transient_control_arm_rejections": 2,
+            },
+            daemon=True,
+        )
+        agent.start()
+        deadline = time.monotonic() + 1.0
+        while not peer.discover("g1-dev").get("available") and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        assert peer.acquire("g1-dev")["state"] == "ACTIVE"
+        assert received_types.count("control.acquire") == 3
+
         peer.close()
         agent.join(timeout=1)
 

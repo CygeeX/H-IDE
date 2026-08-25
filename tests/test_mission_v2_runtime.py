@@ -132,6 +132,128 @@ def _issue_current(
     )
 
 
+@pytest.mark.parametrize(
+    ("result_status", "error_code", "receipt_status", "receipt_error"),
+    [
+        (
+            "timed_out",
+            "ROBOT_AGENT_EXPIRED",
+            "expired",
+            "motion lease expired",
+        ),
+        (
+            "failed",
+            "ROBOT_AGENT_FAILED",
+            "failed",
+            "action finished with status ABORTED",
+        ),
+        (
+            "unknown",
+            "ROBOT_AGENT_UNKNOWN",
+            "unknown",
+            "cancellation confirmation pending",
+        ),
+    ],
+)
+def test_office_route_retry_accepts_only_bound_terminal_transport_outcomes(
+    result_status: str,
+    error_code: str,
+    receipt_status: str,
+    receipt_error: str,
+) -> None:
+    mission_id = "mission-office-route-retry"
+    now = utc_now()
+    envelope = _envelope().model_copy(
+        update={
+            "maximumStageAttempts": 3,
+            "expiresAt": now + timedelta(minutes=30),
+        }
+    )
+    node = MissionNode(
+        nodeId="office-nav-01-corridor_west",
+        skillId="navigation.navigate_to_pose",
+        skillVersion="2.0.0",
+        purpose="前往巡检站 corridor_west",
+        intent={
+            "targetRecordId": (
+                f"world-{mission_id}-scene-target-corridor_west"
+            ),
+            "targetDescription": "corridor_west",
+            "regionId": "corridor",
+        },
+        riskLevel=RiskLevel.MEDIUM,
+    )
+    plan = MissionPlanDraft(
+        planId=mission_id,
+        robotId="robot-1",
+        objective="走遍所有办公室，并把所有办公室里面的信息和路上的信息都给我",
+        nodes=[node],
+        envelope=envelope,
+        createdAt=now,
+        expiresAt=now + timedelta(minutes=30),
+    )
+    runtime = MissionRuntime(SQLiteStore(":memory:"))
+    runtime.approve(plan, approved_by="tester")
+    runtime.record_world(
+        WorldRecord(
+            recordId=f"world-{mission_id}-origin",
+            missionId=mission_id,
+            robotId="robot-1",
+            kind="fact",
+            subject="robot-1",
+            predicate="mission_origin",
+            value={
+                "frameId": "map",
+                "x": -6.45,
+                "y": 0.0,
+                "z": 0.0,
+                "yaw": 0.0,
+            },
+            source="operator",
+            sourceRef="reviewed-office-origin",
+            confidence=1.0,
+            observedAt=utc_now(),
+            frameId="map",
+        )
+    )
+    runtime.start(mission_id)
+    request = _issue_current(
+        runtime,
+        mission_id,
+        node.nodeId,
+        {
+            "goalPose": {
+                "frameId": "map",
+                "x": -6.15,
+                "y": 0.35,
+                "z": 0.0,
+                "yaw": 0.0,
+            }
+        },
+    )
+    record = runtime.record_result(
+        mission_id,
+        SkillResult(
+            requestId=request.requestId,
+            status=result_status,
+            completedAt=utc_now(),
+            result={
+                "commandReceipt": {
+                    "status": receipt_status,
+                    "error": receipt_error,
+                }
+            },
+            errorCode=error_code,
+            detail=receipt_error,
+        ),
+    )
+
+    eligible = MissionService._office_navigation_retry_execution(record)
+
+    assert eligible is not None
+    assert eligible["requestId"] == request.requestId
+
+
 def _intervention(
     intervention_id: str,
     kind: str,
@@ -214,6 +336,129 @@ def test_resume_accepts_unconsumed_pause_after_generic_continue() -> None:
         _intervention("resume-after-message", "resume", "继续")
     )
     assert resumed["snapshot"]["status"] == "ready"
+
+
+def test_failed_skill_retry_atomically_consumes_planner_fence_and_preserves_attempt() -> None:
+    runtime = MissionRuntime(SQLiteStore(":memory:"))
+    runtime.approve(_plan(), approved_by="tester")
+    runtime.start("plan-1")
+    observe = _issue_current(
+        runtime,
+        "plan-1",
+        "observe",
+        {"mode": "scene_description", "instruction": "观察"},
+    )
+    runtime.record_result(
+        "plan-1",
+        SkillResult(
+            requestId=observe.requestId,
+            status="succeeded",
+            completedAt=utc_now(),
+            result={"observation": "ok"},
+        ),
+    )
+    runtime.record_world(
+        WorldRecord(
+            recordId="origin-for-timeout-retry",
+            missionId="plan-1",
+            robotId="robot-1",
+            kind="fact",
+            subject="robot-1",
+            predicate="mission_origin",
+            value={"x": 0.0, "y": 0.0},
+            source="robot_agent",
+            sourceRef="pose-1",
+            confidence=1.0,
+            observedAt=utc_now(),
+            frameId="map",
+        )
+    )
+    first = _issue_current(
+        runtime,
+        "plan-1",
+        "approach",
+        {
+            "goalPose": {
+                "frameId": "map",
+                "x": 0.5,
+                "y": 0.0,
+                "z": 0.0,
+                "yaw": 0.0,
+            }
+        },
+    )
+    failed = runtime.record_result(
+        "plan-1",
+        SkillResult(
+            requestId=first.requestId,
+            status="timed_out",
+            completedAt=utc_now(),
+            result={"commandReceipt": {"status": "expired"}},
+            errorCode="ROBOT_AGENT_EXPIRED",
+            detail="motion lease expired",
+        ),
+    )
+    assert failed["snapshot"]["status"] == "planning"
+
+    intervention = MissionIntervention(
+        interventionId=f"event-evaluation:{first.requestId}",
+        missionId="plan-1",
+        kind="modify_goal",
+        text="evaluate_event: skill.result: motion lease expired",
+        requestedBy="mission-runtime",
+    )
+    digest = "sha256:" + "e" * 64
+    claimed = runtime.claim_planned_intervention(
+        intervention,
+        request_sha256=digest,
+        expected_last_sequence=failed["snapshot"]["lastSequence"],
+    )
+    assert claimed["mission"]["snapshot"]["status"] == "suspended"
+
+    retried = runtime.retry_failed_skill(
+        "plan-1",
+        request_id=first.requestId,
+        reason="continue unchanged route from fresh pose",
+        source_intervention=intervention,
+        source_request_sha256=digest,
+    )
+    assert retried["snapshot"]["status"] == "ready"
+    state = next(
+        item for item in retried["nodeStates"] if item["nodeId"] == "approach"
+    )
+    assert state["status"] == "ready"
+    assert state["attempt"] == 1
+    assert state["state"]["retryScheduledFromRequestId"] == first.requestId
+    assert retried["events"][-1]["payload"]["phase"] == "completed"
+
+    replay = runtime.retry_failed_skill(
+        "plan-1",
+        request_id=first.requestId,
+        reason="continue unchanged route from fresh pose",
+        source_intervention=intervention,
+        source_request_sha256=digest,
+    )
+    assert replay["snapshot"]["lastSequence"] == retried["snapshot"]["lastSequence"]
+    second = _issue_current(
+        runtime,
+        "plan-1",
+        "approach",
+        {
+            "goalPose": {
+                "frameId": "map",
+                "x": 0.5,
+                "y": 0.0,
+                "z": 0.0,
+                "yaw": 0.0,
+            }
+        },
+    )
+    assert second.requestId.endswith("-approach-2")
+    issued = runtime.get("plan-1")
+    issued_state = next(
+        item for item in issued["nodeStates"] if item["nodeId"] == "approach"
+    )
+    assert issued_state["attempt"] == 2
 
 
 def test_resume_rejects_a_consumed_operator_pause() -> None:
@@ -836,6 +1081,68 @@ def test_mission_runtime_reserves_rotation_budget_across_actions() -> None:
         _issue_current(runtime, plan.planId, "rotate-2", {"targetYawRad": 0.5})
 
 
+def test_mission_runtime_reserves_composite_station_scan_yaw_budget() -> None:
+    now = utc_now()
+    envelope = _envelope().model_copy(
+        update={
+            "allowedSkillIds": ["inspection.scan_station"],
+            "maximumScanYawRad": 1.5,
+        }
+    )
+    plan = MissionPlanDraft(
+        planId="plan-composite-scan-budget",
+        robotId="robot-1",
+        objective="scan two reviewed stations",
+        nodes=[
+            MissionNode(
+                nodeId="scan-1",
+                skillId="inspection.scan_station",
+                skillVersion="1.0.0",
+                purpose="first station",
+                riskLevel=RiskLevel.MEDIUM,
+            ),
+            MissionNode(
+                nodeId="scan-2",
+                skillId="inspection.scan_station",
+                skillVersion="1.0.0",
+                purpose="second station",
+                dependsOn=["scan-1"],
+                riskLevel=RiskLevel.MEDIUM,
+            ),
+        ],
+        envelope=envelope,
+        createdAt=now,
+        expiresAt=now + timedelta(minutes=10),
+    )
+    runtime = MissionRuntime(SQLiteStore(":memory:"))
+    runtime.approve(plan, approved_by="tester")
+    runtime.start(plan.planId)
+
+    first = _issue_current(
+        runtime,
+        plan.planId,
+        "scan-1",
+        {"maximumCumulativeYawRad": 1.0},
+    )
+    assert runtime.get(plan.planId)["snapshot"]["cumulativeScanYawRad"] == 1.0
+    runtime.record_result(
+        plan.planId,
+        SkillResult(
+            requestId=first.requestId,
+            status="succeeded",
+            completedAt=utc_now(),
+        ),
+    )
+
+    with pytest.raises(MissionConflict, match="cumulative scan-yaw"):
+        _issue_current(
+            runtime,
+            plan.planId,
+            "scan-2",
+            {"maximumCumulativeYawRad": 1.0},
+        )
+
+
 def test_mission_runtime_binds_skill_lifetime_to_capability_timeout() -> None:
     runtime = MissionRuntime(SQLiteStore(":memory:"))
     runtime.approve(_plan(), approved_by="tester")
@@ -850,6 +1157,32 @@ def test_mission_runtime_binds_skill_lifetime_to_capability_timeout() -> None:
     )
 
     assert (request.expiresAt - request.issuedAt).total_seconds() == 30.0
+
+
+def test_mission_runtime_allows_the_reviewed_forty_minute_skill_lifetime() -> None:
+    now = utc_now()
+    plan = _plan().model_copy(
+        update={
+            "envelope": _envelope().model_copy(
+                update={"expiresAt": now + timedelta(hours=2)}
+            ),
+            "createdAt": now,
+            "expiresAt": now + timedelta(hours=2),
+        }
+    )
+    runtime = MissionRuntime(SQLiteStore(":memory:"))
+    runtime.approve(plan, approved_by="tester")
+    runtime.start("plan-1")
+
+    request = _issue_current(
+        runtime,
+        "plan-1",
+        "observe",
+        {"targetDescription": "silver robot"},
+        expires_in_seconds=3_600.0,
+    )
+
+    assert (request.expiresAt - request.issuedAt).total_seconds() == 2_400.0
 
 
 @pytest.mark.parametrize("lifetime", [0, -1, float("inf"), float("nan")])
