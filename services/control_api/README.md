@@ -89,11 +89,29 @@ configured.
   deletes messages, turns, Mission records, or evidence. Lists omit archived
   and deleted records by default; authenticated recovery tools may opt in with
   `includeArchived=true` and `includeDeleted=true`, then clear the flags through
-  `PATCH`. Every read and mutation remains owner/site scoped and Cookie writes
+  `PATCH`. The product history uses cursor-paged `GET
+  /api/v2/assistant/conversations` (`lifecycle`, `q`, `limit`, `cursor`) and
+  returns one root row per conversation with its durable Mission draft/Mission
+  links; Mission records are never projected as duplicate conversations.
+  `POST /api/v2/assistant/conversations/bulk-delete` soft-deletes up to 100
+  authorized terminal conversations and reports active turns or active Missions
+  as skipped. A lifecycle mutation is rejected while either kind of work is
+  active. Every read and mutation remains owner/site scoped and Cookie writes
   require CSRF validation.
 - Generated drafts support `POST /api/v1/assistant/drafts/{draftId}/revise`
   with feedback and `POST .../reject` with a reason. Revision creates a new
   planning turn and never mutates the original plan payload.
+- Conversation detail returns server-assigned `turnSequence` values and
+  `missionLinks[]` (`taskId -> missionDraftId -> missionId`). Product clients
+  render messages, evidence, plans, Mission progress and terminal reports
+  under that originating turn instead of selecting one global latest card.
+- Qwen visual hypotheses are projected into coordinate-free
+  `SemanticReferent` records for immediate same-conversation names/pronouns.
+  They are `SEMANTIC_ONLY`, filtered by Robot Agent boot/localization epoch and
+  must be freshly re-grounded before object navigation.
+- Known Office object approach, room exit and active object search use
+  deterministic Mission templates. Malformed planner geometry or invented
+  record IDs are not accepted as a fallback.
 - Scene upload, conversion, calibration, annotations, publishing and robot
   bindings are owned by the separate Scene API and exposed through the
   same-origin gateway. For planning, Control API reads only the internal

@@ -44,6 +44,12 @@
 .diag-hold-reason { color: var(--diag-amber) !important; border: 1px solid #e4cfaa; background: var(--diag-amber-soft); }
 .diag-summary-fault { color: var(--diag-red) !important; border: 1px solid #e9c1c7; background: var(--diag-red-soft); }
 .diag-stale-warning { padding: 10px 12px; display: flex; gap: 8px; border: 1px solid #e9c1c7; border-radius: 9px; color: var(--diag-red); background: var(--diag-red-soft); font-size: 10px; }
+.diag-client-issue { padding: 12px; display: grid; gap: 9px; border: 1px solid #e9c1c7; border-radius: 12px; background: var(--diag-red-soft); }
+.diag-client-issue > header { display: grid; gap: 3px; }
+.diag-client-issue > header span { color: var(--diag-red); font-size: 8px; font-weight: 800; letter-spacing: .1em; }
+.diag-client-issue > header strong { font-size: 12px; }
+.diag-client-issue dl { margin: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; overflow: hidden; border: 1px solid #edcfd3; border-radius: 8px; background: #edcfd3; }
+.diag-client-issue pre { margin: 0; padding: 9px; overflow: auto; border-radius: 7px; color: #7f3843; background: rgba(255, 255, 255, .55); font-size: 9px; white-space: pre-wrap; overflow-wrap: anywhere; }
 
 .diag-context-bar { min-width: 0; padding: 10px 12px; display: flex; flex-wrap: wrap; gap: 8px; border: 1px solid var(--diag-line); border-radius: 12px; background: var(--diag-card); }
 .diag-context-bar > span { min-width: 100px; padding: 4px 10px; display: grid; grid-template-columns: auto auto; align-items: center; justify-content: start; gap: 2px 7px; border-left: 2px solid #d6c7df; }

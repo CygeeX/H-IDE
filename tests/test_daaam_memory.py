@@ -22,6 +22,9 @@ from packages.semantic_memory import (
 from services.control_api.auth import CSRF_COOKIE, Role
 from services.control_api.main import create_app
 from services.control_api.mission_policy import PolicyActor
+from services.control_api.object_semantic_navigation import (
+    parse_object_semantic_request,
+)
 
 
 TOKEN = "daaam-memory-developer-token"
@@ -297,6 +300,13 @@ def test_import_is_owner_scoped_idempotent_and_never_changes_mission_or_dispatch
         assert len(memory_records) == 1
         assert memory_records[0]["value"]["executionEligible"] is False
         assert "centroid" not in str(memory_records).casefold()
+        request = parse_object_semantic_request(
+            "去显示屏旁边站着",
+            semantic_priors=memory_records,
+        )
+        assert request is not None
+        assert request.region_id == "meeting_room"
+        assert request.semantic_referent_id is None
 
         changed = _payload()
         changed["entities"][0]["description"] = "另一份证据"

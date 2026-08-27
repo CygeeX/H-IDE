@@ -55,6 +55,10 @@ export interface SemanticRegion {
   locationId: string;
   name: string;
   aliases: string[];
+  parentLocationId?: string | null;
+  anchorRoles?: Array<"region" | "entry" | "interior" | "observation_vantage">;
+  purpose?: string | null;
+  scanHeadingsRad?: number[];
   polygonXY: Point2D[];
   zMin: number;
   zMax: number;
@@ -635,6 +639,7 @@ export interface PlanSpatialCheck {
 
 export interface AssistantDraft {
   draftId: string;
+  taskId?: string | null;
   status: string;
   plan: PlanDraft;
   review?: PlanReview;
@@ -645,6 +650,7 @@ export interface AssistantDraft {
 export interface AssistantMessage {
   messageId: string;
   taskId?: string | null;
+  turnSequence?: number | null;
   role: "user" | "assistant" | "system";
   content: string;
   modality: "text" | "voice";
@@ -655,6 +661,7 @@ export interface AssistantMessage {
 export interface AssistantTurn {
   taskId: string;
   conversationId: string;
+  turnSequence?: number | null;
   status: string;
   result?: {
     schemaVersion?: "h-ide.assistant-result/2";
@@ -670,8 +677,26 @@ export interface AssistantTurn {
     evidence?: Array<Record<string, unknown>>;
   } | null;
   error?: string | null;
+  failure?: {
+    errorCode: string;
+    category: string;
+    recoverable: boolean;
+    dependencyUnavailable: boolean;
+    userMessage: string;
+  } | null;
   cancellationRequested?: boolean;
   draft?: AssistantDraft;
+}
+
+export interface AssistantMissionLink {
+  taskId: string;
+  turnSequence?: number | null;
+  missionDraftId: string;
+  missionId?: string | null;
+  draftStatus?: string | null;
+  missionStatus?: string | null;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface AssistantConversation {
@@ -686,11 +711,30 @@ export interface AssistantConversation {
   archivedAt?: string | null;
   deleted?: boolean;
   deletedAt?: string | null;
+  missionDraftIds?: string[];
+  missionIds?: string[];
+  missionLinks?: AssistantMissionLink[];
+  activeMissionId?: string | null;
+  lifecycleMutable?: boolean;
+  lifecycleBlockedReason?: "active_turn" | "active_mission" | string | null;
   createdAt?: string;
   updatedAt?: string;
   messages?: AssistantMessage[];
   turns?: AssistantTurn[];
   drafts?: AssistantDraft[];
+}
+
+export interface AssistantConversationPage {
+  items: AssistantConversation[];
+  nextCursor: string | null;
+}
+
+export interface AssistantConversationBulkDeleteResult {
+  deletedConversationIds: string[];
+  skipped: Array<{
+    conversationId: string;
+    reason: "active_turn" | "active_mission" | "not_found" | string;
+  }>;
 }
 
 export interface SpeechTranscription {
@@ -906,7 +950,7 @@ export function statusLabel(status: string | undefined): string {
     confirming: "确认中",
     completed: "已完成",
     approved: "已审核",
-    ready: "准备执行",
+    ready: "下一节点已就绪",
     observing: "视觉观察中",
     resolving: "视觉解析中",
     dispatching: "发送目标中",

@@ -145,6 +145,12 @@ export type DeveloperDiagnosticsProps = {
   apiFetch: <T>(path: string, init?: RequestInit) => Promise<T>;
   robotId?: string;
   pollIntervalMs?: number;
+  clientIssue?: {
+    occurredAt: string;
+    operation: string;
+    detail: string;
+    taskId?: string;
+  } | null;
 };
 
 function ms(value: number | null | undefined): string {
@@ -189,6 +195,7 @@ export function DeveloperDiagnostics({
   apiFetch,
   robotId,
   pollIntervalMs = 5_000,
+  clientIssue = null,
 }: DeveloperDiagnosticsProps) {
   const [snapshot, setSnapshot] = useState<DiagnosticSnapshot | null>(null);
   const [loading, setLoading] = useState(true);
@@ -257,6 +264,12 @@ export function DeveloperDiagnostics({
     </header>
 
     {error ? <div className="diag-stale-warning" role="alert"><strong>刷新失败，当前显示上一份快照</strong>{error}</div> : null}
+
+    {clientIssue ? <section className="diag-client-issue" aria-label="最近一次 PWA Assistant 故障">
+      <header><span>PWA ASSISTANT</span><strong>最近一次客户端请求故障</strong></header>
+      <dl><Fact label="操作" value={clientIssue.operation} /><Fact label="发生时间" value={new Date(clientIssue.occurredAt).toLocaleString()} /><Fact label="任务" value={clientIssue.taskId ?? "未分配"} /></dl>
+      <pre>{clientIssue.detail}</pre>
+    </section> : null}
 
     <div className="diag-context-bar">
       <span><small>目标</small><strong>{snapshot.target.robotId}</strong><em>{snapshot.target.kind === "simulation" ? "仿真" : "真机"}</em></span>

@@ -284,6 +284,10 @@ def _annotations(catalog: Mapping[str, Any]) -> list[dict[str, Any]]:
                 "locationId": region["regionId"],
                 "name": region["name"],
                 "aliases": list(region["aliases"]),
+                "parentLocationId": None,
+                "anchorRoles": ["region"],
+                "purpose": "region",
+                "scanHeadingsRad": [],
                 "polygonXY": list(region["polygonXY"]),
                 "zMin": 0.0,
                 "zMax": 3.0,
@@ -308,6 +312,14 @@ def _annotations(catalog: Mapping[str, Any]) -> list[dict[str, Any]]:
                         station_id,
                         f"{station_id} scan station",
                     ],
+                    "parentLocationId": region["regionId"],
+                    "anchorRoles": (
+                        ["entry"]
+                        if station.get("purpose") == "entrance"
+                        else ["interior", "observation_vantage"]
+                    ),
+                    "purpose": str(station.get("purpose") or "interior"),
+                    "scanHeadingsRad": list(station.get("scanHeadingsRad", [])),
                     "polygonXY": [
                         {"x": x - 0.10, "y": y - 0.10},
                         {"x": x + 0.10, "y": y - 0.10},

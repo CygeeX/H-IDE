@@ -14,8 +14,11 @@ from packages.control_core.assistant_models import (
 )
 
 from .conversation_client import ConversationClient
+from .conversation_client import ConversationRoutingUnavailable
 from .mission_policy import PolicyActor
 from .office_inspection import is_full_office_inspection
+from .object_semantic_navigation import parse_object_semantic_request
+from .office_semantic_navigation import parse_office_place_request
 
 
 MissionDraftCreator = Callable[[Mapping[str, Any]], Mapping[str, Any]]
@@ -133,11 +136,77 @@ class ConversationGateway:
                 assistant_message="办公室巡检方案已生成，等待你审核后执行。",
             )
 
-        routed = self.client.route_turn(request)
+        semantic_referents = (
+            [item.model_dump(mode="json") for item in request.memoryContext.semanticReferents]
+            if request.memoryContext is not None
+            else []
+        )
+        known_place = parse_office_place_request(request.text)
+        known_object = parse_object_semantic_request(
+            request.text,
+            semantic_referents=semantic_referents,
+        )
+        known_physical_action = known_place is not None or known_object is not None
+        try:
+            routed = self.client.route_turn(request)
+        except ConversationRoutingUnavailable:
+            if not known_physical_action:
+                raise
+            # A known product template can still produce a reviewable Mission
+            # when the conversational classifier is temporarily unavailable;
+            # geometry and execution remain behind the normal Mission gates.
+            routed = None
+        if known_physical_action and routed is None:
+            if request.robotId is None:
+                return self._result(
+                    task_id=task_id,
+                    request=request,
+                    intent=ConversationIntent.ROBOT_ACTION,
+                    route=ConversationRoute.MISSION_REVIEW,
+                    route_status="needs_robot",
+                    assistant_message="请先选择要使用的机器人；已识别为行动任务。",
+                )
+            return self._create_mission_review(
+                task_id=task_id,
+                request=request,
+                requested_by=requested_by,
+                modality=modality,
+                mission_history=mission_history,
+                mission_actor=mission_actor,
+                assistant_message="行动方案已按当前场景模板生成，等待你审核。",
+            )
         if routed.conversationId != request.conversationId:
             raise ConversationGatewayError("conversation router changed conversationId")
         if routed.robotId != request.robotId:
             raise ConversationGatewayError("conversation router changed robotId")
+
+        # The classifier supplies language, not execution semantics.  Once a
+        # known Office place/object action is recognized deterministically,
+        # preserve the action boundary even if the model overweights words such
+        # as “看/观察” or asks an irrelevant clarification.
+        if known_physical_action:
+            if request.robotId is None:
+                return self._result(
+                    task_id=task_id,
+                    request=request,
+                    intent=ConversationIntent.ROBOT_ACTION,
+                    route=ConversationRoute.MISSION_REVIEW,
+                    route_status="needs_robot",
+                    assistant_message="请先选择要使用的机器人；已识别为行动任务。",
+                )
+            return self._create_mission_review(
+                task_id=task_id,
+                request=request,
+                requested_by=requested_by,
+                modality=modality,
+                mission_history=mission_history,
+                mission_actor=mission_actor,
+                assistant_message=(
+                    routed.assistantMessage
+                    if routed.assistantMessage and routed.clarification is None
+                    else "行动方案已按当前场景模板生成，等待你审核。"
+                ),
+            )
 
         route = {
             ConversationIntent.SOCIAL_CHAT: ConversationRoute.REPLY,
@@ -280,6 +349,8 @@ class ConversationGateway:
         if request.robotId is None:
             raise ConversationGatewayError("Mission V2 requires a bound robot")
         brief = {
+            "conversationId": request.conversationId,
+            "sourceTaskId": task_id,
             "robotId": request.robotId,
             "requestedBy": requested_by,
             "objective": request.text,

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from base64 import urlsafe_b64decode, urlsafe_b64encode
+from collections.abc import Callable
 from datetime import timedelta
 import hashlib
 import json
@@ -37,6 +39,10 @@ from .planning_client import PlanningClient
 from .conversation_gateway import ConversationGateway
 from .conversation_memory import ConversationMemoryContextBuilder
 from .scene_client import SceneContextClient, SceneContextUnavailable
+from .semantic_referents import (
+    extract_semantic_referents,
+    semantic_referents_enabled,
+)
 from .store import (
     AssistantConversationConflict,
     AssistantTurnConflict,
@@ -67,6 +73,88 @@ def _conversation_title(value: Any) -> str | None:
     if len(title) > 120:
         raise ValueError("title is too long")
     return title
+
+
+def _assistant_failure_projection(error: object) -> dict[str, Any]:
+    """Map internal planning failures to stable, user-actionable outcomes.
+
+    The raw diagnostic stays on the durable turn for developer inspection, but
+    product clients must not collapse target, schema, and concurrency failures
+    into a false dependency outage.
+    """
+
+    detail = str(error or "").strip()
+    normalized = detail.casefold()
+    if any(
+        marker in normalized
+        for marker in (
+            "has no unique trusted target",
+            "trusted_target_pose_required",
+            "trusted target pose",
+            "no unique target",
+        )
+    ):
+        return {
+            "errorCode": "TARGET_RESOLUTION_REQUIRED",
+            "category": "target_resolution",
+            "recoverable": True,
+            "dependencyUnavailable": False,
+            "userMessage": "目标还没有形成可导航的可信位置；我会重新观察或展示候选，不会发送猜测坐标。",
+        }
+    if any(
+        marker in normalized
+        for marker in (
+            "structured_output_schema_validation_failed",
+            "violated its contract",
+            "schema validation",
+            "mission navigation intent uses retired fields",
+            "mission v2 planning request failed: server error '500",
+            'mission v2 planning request failed: server error "500',
+        )
+    ):
+        return {
+            "errorCode": "PLANNER_CONTRACT_INVALID",
+            "category": "planner_contract",
+            "recoverable": True,
+            "dependencyUnavailable": False,
+            "userMessage": "规划结果没有通过执行协议校验；机器人没有移动。可以重新规划，系统不会把它伪装成服务离线。",
+        }
+    if "already has an active turn" in normalized:
+        return {
+            "errorCode": "TURN_ALREADY_ACTIVE",
+            "category": "conversation_busy",
+            "recoverable": True,
+            "dependencyUnavailable": False,
+            "userMessage": "上一轮仍在处理；新的行动会在当前轮结束后继续，而不是丢失。",
+        }
+    dependency_markers = (
+        "connection refused",
+        "connecterror",
+        "connection reset",
+        "name or service not known",
+        "temporary failure in name resolution",
+        "timed out",
+        "timeout",
+        "502 bad gateway",
+        "503 service unavailable",
+        "504 gateway timeout",
+        "is not configured",
+    )
+    if any(marker in normalized for marker in dependency_markers):
+        return {
+            "errorCode": "DEPENDENCY_UNAVAILABLE",
+            "category": "dependency",
+            "recoverable": True,
+            "dependencyUnavailable": True,
+            "userMessage": "机器人工作站的一个依赖当前不可用；请查看组件诊断后重试。",
+        }
+    return {
+        "errorCode": "INTERNAL_TURN_FAILURE",
+        "category": "internal",
+        "recoverable": True,
+        "dependencyUnavailable": False,
+        "userMessage": "本轮没有完成，机器人没有移动。错误已保留供诊断，可以安全重试。",
+    }
 
 
 class AssistantService:
@@ -120,6 +208,165 @@ class AssistantService:
             include_deleted=include_deleted,
         )
 
+    @staticmethod
+    def _history_cursor(updated_at: str, conversation_id: str) -> str:
+        payload = json.dumps(
+            {"updatedAt": updated_at, "conversationId": conversation_id},
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+    @staticmethod
+    def _decode_history_cursor(cursor: str | None) -> tuple[str | None, str | None]:
+        if cursor is None:
+            return None, None
+        if not isinstance(cursor, str) or not cursor or len(cursor) > 1024:
+            raise ValueError("conversation cursor is invalid")
+        try:
+            raw = urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
+            payload = json.loads(raw.decode("utf-8"))
+        except Exception as exc:
+            raise ValueError("conversation cursor is invalid") from exc
+        if not isinstance(payload, Mapping):
+            raise ValueError("conversation cursor is invalid")
+        updated_at = payload.get("updatedAt")
+        conversation_id = payload.get("conversationId")
+        if not all(
+            isinstance(value, str) and value and value == value.strip()
+            for value in (updated_at, conversation_id)
+        ):
+            raise ValueError("conversation cursor is invalid")
+        return updated_at, conversation_id
+
+    def _conversation_history_projection(
+        self,
+        conversation: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        projected = dict(conversation)
+        conversation_id = str(conversation["conversationId"])
+        links = self.store.get_assistant_conversation_mission_links(conversation_id)
+        mission_draft_ids = [str(item["missionDraftId"]) for item in links]
+        mission_ids = [
+            str(item["missionId"])
+            for item in links
+            if isinstance(item.get("missionId"), str)
+        ]
+        active_link = next(
+            (
+                item
+                for item in reversed(links)
+                if isinstance(item.get("missionId"), str)
+                and item.get("missionStatus") not in {"completed", "failed", "cancelled"}
+            ),
+            None,
+        )
+        latest_mission = next(
+            (item for item in reversed(links) if item.get("missionStatus") is not None),
+            None,
+        )
+        latest_draft = next(
+            (item for item in reversed(links) if item.get("draftStatus") is not None),
+            None,
+        )
+        if active_link is not None:
+            projected["status"] = str(active_link["missionStatus"])
+        elif latest_mission is not None:
+            projected["status"] = str(latest_mission["missionStatus"])
+        elif latest_draft is not None and latest_draft.get("draftStatus") in {
+            "draft",
+            "rejected",
+            "failed",
+        }:
+            projected["status"] = (
+                "review"
+                if latest_draft["draftStatus"] == "draft"
+                else str(latest_draft["draftStatus"])
+            )
+        blocker = self.store.assistant_conversation_lifecycle_blocker(conversation_id)
+        projected.update(
+            {
+                "missionLinks": links,
+                "missionDraftIds": mission_draft_ids,
+                "missionIds": mission_ids,
+                "activeMissionId": (
+                    None if active_link is None else active_link.get("missionId")
+                ),
+                "lifecycleMutable": blocker is None,
+                "lifecycleBlockedReason": blocker,
+            }
+        )
+        return projected
+
+    def list_conversation_page(
+        self,
+        *,
+        lifecycle: str = "active",
+        query: str | None = None,
+        cursor: str | None = None,
+        limit: int = 30,
+        visible: Callable[[str], bool] | None = None,
+    ) -> dict[str, Any]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("conversation page limit must be between 1 and 100")
+        normalized_query = None if query is None else query.strip()
+        if normalized_query is not None and len(normalized_query) > 120:
+            raise ValueError("conversation search query is too long")
+        before_updated_at, before_conversation_id = self._decode_history_cursor(cursor)
+        visible_items: list[dict[str, Any]] = []
+        scan_updated_at = before_updated_at
+        scan_conversation_id = before_conversation_id
+        batch_size = 100
+        exhausted = False
+        while len(visible_items) <= limit and not exhausted:
+            batch = self.store.list_assistant_conversation_page(
+                lifecycle=lifecycle,
+                query=normalized_query,
+                before_updated_at=scan_updated_at,
+                before_conversation_id=scan_conversation_id,
+                limit=batch_size,
+            )
+            if not batch:
+                exhausted = True
+                break
+            for conversation in batch:
+                conversation_id = str(conversation["conversationId"])
+                scan_updated_at = str(conversation["updatedAt"])
+                scan_conversation_id = conversation_id
+                if visible is None or visible(conversation_id):
+                    visible_items.append(
+                        self._conversation_history_projection(conversation)
+                    )
+                    if len(visible_items) > limit:
+                        break
+            if len(visible_items) > limit:
+                break
+            exhausted = len(batch) < batch_size
+        items = visible_items[:limit]
+        next_cursor = None
+        if len(visible_items) > limit and items:
+            tail = items[-1]
+            next_cursor = self._history_cursor(
+                str(tail["updatedAt"]), str(tail["conversationId"])
+            )
+        return {"items": items, "nextCursor": next_cursor}
+
+    def delete_conversations(self, conversation_ids: list[str]) -> dict[str, Any]:
+        if not isinstance(conversation_ids, list) or not 1 <= len(conversation_ids) <= 100:
+            raise ValueError("conversationIds must contain between 1 and 100 entries")
+        normalized: list[str] = []
+        for value in conversation_ids:
+            if (
+                not isinstance(value, str)
+                or not value
+                or value != value.strip()
+                or len(value) > 256
+            ):
+                raise ValueError("conversationIds contains an invalid identifier")
+            if value not in normalized:
+                normalized.append(value)
+        return self.store.delete_assistant_conversations(normalized)
+
     def update_conversation(
         self,
         conversation_id: str,
@@ -162,8 +409,12 @@ class AssistantService:
         conversation = self.store.get_assistant_conversation(conversation_id)
         if conversation is None:
             raise AssistantNotFound("assistant conversation not found")
+        conversation = self._conversation_history_projection(conversation)
         conversation["messages"] = self.store.list_assistant_messages(conversation_id)
-        conversation["turns"] = self.store.list_assistant_turns(conversation_id)
+        conversation["turns"] = [
+            self._turn_projection(item)
+            for item in self.store.list_assistant_turns(conversation_id)
+        ]
         conversation["drafts"] = self.store.list_assistant_conversation_drafts(conversation_id)
         return conversation
 
@@ -243,9 +494,10 @@ class AssistantService:
                 "modality": modality,
                 "transcriptionId": transcription_id,
             }
-            self.store.create_assistant_turn(
+            message_id = _new_id("message")
+            created_turn = self.store.create_assistant_turn(
                 stored_request,
-                message_id=_new_id("message"),
+                message_id=message_id,
             )
             thread = threading.Thread(
                 target=self._execute_conversation_turn,
@@ -261,6 +513,16 @@ class AssistantService:
                 "conversationId": conversation_id,
                 "status": "queued",
                 "eventsUrl": f"/api/v1/assistant/turns/{task_id}/events",
+                "userMessage": {
+                    "messageId": message_id,
+                    "taskId": task_id,
+                    "turnSequence": created_turn.get("turnSequence"),
+                    "role": "user",
+                    "content": str(text),
+                    "modality": modality,
+                    "transcriptionId": transcription_id,
+                    "createdAt": created_turn["createdAt"],
+                },
             }
         selection = body.get("sceneSelection")
         expected_ref = None
@@ -299,8 +561,9 @@ class AssistantService:
                 "sceneContext": scene_context,
             }
         )
-        self.store.create_assistant_turn(
-            request.model_dump(mode="json", by_alias=False), message_id=_new_id("message")
+        message_id = _new_id("message")
+        created_turn = self.store.create_assistant_turn(
+            request.model_dump(mode="json", by_alias=False), message_id=message_id
         )
         thread = threading.Thread(
             target=self._execute_turn,
@@ -311,16 +574,40 @@ class AssistantService:
         with self._threads_lock:
             self._threads[request.taskId] = thread
         thread.start()
-        return {"taskId": request.taskId, "conversationId": conversation_id, "status": "queued"}
+        return {
+            "taskId": request.taskId,
+            "conversationId": conversation_id,
+            "status": "queued",
+            "userMessage": {
+                "messageId": message_id,
+                "taskId": request.taskId,
+                "turnSequence": created_turn.get("turnSequence"),
+                "role": "user",
+                "content": request.text,
+                "modality": modality,
+                "transcriptionId": transcription_id,
+                "createdAt": created_turn["createdAt"],
+            },
+        }
 
     def get_turn(self, task_id: str) -> dict[str, Any]:
         turn = self.store.get_assistant_turn(task_id)
         if turn is None:
             raise AssistantNotFound("assistant turn not found")
+        turn = self._turn_projection(turn)
         draft = self.store.get_assistant_draft_for_task(task_id)
         if draft is not None:
             turn["draft"] = draft
         return turn
+
+    @staticmethod
+    def _turn_projection(turn: Mapping[str, Any]) -> dict[str, Any]:
+        projected = dict(turn)
+        if projected.get("status") in {"failed", "unknown"}:
+            projected["failure"] = _assistant_failure_projection(
+                projected.get("error")
+            )
+        return projected
 
     def get_turn_events(self, task_id: str, *, after_sequence: int = 0) -> list[dict[str, Any]]:
         if self.store.get_assistant_turn(task_id) is None:
@@ -429,7 +716,7 @@ class AssistantService:
                 "needs_robot": "awaiting_user",
                 "awaiting_confirmation": "teaching",
             }.get(result.routeStatus, "idle")
-            self.store.complete_assistant_turn(
+            completed = self.store.complete_assistant_turn(
                 task_id,
                 status=terminal_status,
                 result=result.model_dump(mode="json", by_alias=False, exclude_none=True),
@@ -437,6 +724,31 @@ class AssistantService:
                 message_id=_new_id("message"),
                 conversation_status=conversation_status,
             )
+            if (
+                completed
+                and semantic_referents_enabled()
+                and result.visualResult is not None
+                and isinstance(result.robotId, str)
+            ):
+                try:
+                    referents = extract_semantic_referents(
+                        conversation_id=conversation_id,
+                        task_id=task_id,
+                        robot_id=result.robotId,
+                        visual_result=result.visualResult,
+                    )
+                    self.store.record_assistant_semantic_referents(
+                        conversation_id=conversation_id,
+                        robot_id=result.robotId,
+                        referents=[
+                            item.model_dump(mode="json") for item in referents
+                        ],
+                    )
+                except Exception:
+                    # Semantic continuity is availability-neutral. The visual
+                    # turn and its immutable evidence remain complete even if
+                    # the optional referent projection needs repair.
+                    pass
         except Exception as exc:
             self.store.fail_assistant_turn(task_id, str(exc)[:2000] or type(exc).__name__)
         finally:

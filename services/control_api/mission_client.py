@@ -81,6 +81,30 @@ class MastraMissionPlanningClient:
                 )
             response.raise_for_status()
             value = response.json()
+        except httpx.HTTPStatusError as exc:
+            # Keep the planner's bounded validation detail in the durable
+            # diagnostic without exposing the request body.  A bare 4xx/5xx
+            # made every semantic miss look like a generic outage and hid
+            # whether the planner rejected a schema or was unavailable.
+            response = exc.response
+            detail: str | None = None
+            try:
+                decoded = response.json()
+            except ValueError:
+                decoded = None
+            if isinstance(decoded, Mapping):
+                raw_detail = decoded.get("detail") or decoded.get("error")
+                if isinstance(raw_detail, str) and raw_detail.strip():
+                    detail = raw_detail.strip()
+            if detail is None:
+                raw_text = response.text.strip()
+                detail = raw_text or None
+            if detail is not None:
+                detail = detail[:1_000]
+            suffix = f": {detail}" if detail else ""
+            raise MissionPlanningUnavailable(
+                f"Mission V2 planning request failed ({response.status_code}){suffix}"
+            ) from exc
         except (httpx.HTTPError, ValueError) as exc:
             raise MissionPlanningUnavailable(f"Mission V2 planning request failed: {exc}") from exc
         if not isinstance(value, Mapping):
@@ -121,4 +145,3 @@ __all__ = [
     "UnavailableMissionPlanningClient",
     "mission_planning_client_from_env",
 ]
-

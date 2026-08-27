@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from datetime import datetime
 import math
 import re
 from typing import Any
@@ -383,11 +384,191 @@ def build_report(
     }
 
 
+def build_location_report(
+    mission: Mapping[str, Any],
+    *,
+    region_id: str,
+    station_id: str,
+    inspection_catalog: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build one evidence-complete report from post-arrival fresh frames."""
+
+    source = catalog() if inspection_catalog is None else dict(inspection_catalog)
+    stations = station_index(source)
+    station = stations.get(station_id)
+    if station is None or station.get("regionId") != region_id:
+        raise ValueError("location report station is not bound to the requested region")
+    region = next(
+        (
+            item
+            for item in source.get("regions", [])
+            if isinstance(item, Mapping) and item.get("regionId") == region_id
+        ),
+        None,
+    )
+    if not isinstance(region, Mapping):
+        raise ValueError("location report region is not in the Office V2 catalog")
+
+    verified_at = None
+    for execution in mission.get("skillExecutions", []):
+        if not isinstance(execution, Mapping):
+            continue
+        request = execution.get("request")
+        terminal = execution.get("result")
+        if (
+            not isinstance(request, Mapping)
+            or request.get("skillId") != "scene.verify_inside_region"
+            or not isinstance(terminal, Mapping)
+            or terminal.get("status") != "succeeded"
+        ):
+            continue
+        result = terminal.get("result")
+        inside = (
+            result.get("insideRegionResult")
+            if isinstance(result, Mapping)
+            else None
+        )
+        if (
+            not isinstance(inside, Mapping)
+            or inside.get("schemaVersion") != "h-ide.inside-region/1"
+            or inside.get("verified") is not True
+            or inside.get("regionId") != region_id
+            or inside.get("stationId") != station_id
+        ):
+            continue
+        raw_verified_at = inside.get("verifiedAt")
+        if not isinstance(raw_verified_at, str):
+            continue
+        try:
+            candidate = datetime.fromisoformat(raw_verified_at.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if verified_at is None or candidate > verified_at:
+            verified_at = candidate
+    if verified_at is None:
+        raise ValueError("location report has no successful inside-region verification")
+
+    scan = None
+    for execution in mission.get("skillExecutions", []):
+        if not isinstance(execution, Mapping):
+            continue
+        request = execution.get("request")
+        terminal = execution.get("result")
+        if (
+            not isinstance(request, Mapping)
+            or request.get("skillId") != OFFICE_INSPECTION_SKILL
+            or request.get("input", {}).get("stationId") != station_id
+            or not isinstance(terminal, Mapping)
+            or terminal.get("status") != "succeeded"
+        ):
+            continue
+        result = terminal.get("result")
+        candidate_scan = (
+            result.get("inspectionResult")
+            if isinstance(result, Mapping)
+            else None
+        )
+        if isinstance(candidate_scan, Mapping):
+            scan = candidate_scan
+    if not isinstance(scan, Mapping):
+        raise ValueError("location report has no completed station observation")
+
+    expected_headings = station.get("scanHeadingsRad")
+    raw_headings = scan.get("headings")
+    if (
+        not isinstance(expected_headings, list)
+        or not expected_headings
+        or not isinstance(raw_headings, list)
+        or len(raw_headings) != len(expected_headings)
+    ):
+        raise ValueError("location report observation headings are incomplete")
+    summaries: list[str] = []
+    evidence: list[dict[str, Any]] = []
+    for expected_yaw, heading in zip(expected_headings, raw_headings, strict=True):
+        if not isinstance(heading, Mapping):
+            raise ValueError("location report heading is invalid")
+        raw_yaw = heading.get("headingRad")
+        visual = heading.get("visualResult")
+        if (
+            isinstance(raw_yaw, bool)
+            or not isinstance(raw_yaw, (int, float))
+            or abs(float(raw_yaw) - float(expected_yaw)) > 1e-9
+            or not isinstance(visual, Mapping)
+            or visual.get("schemaVersion") != "h-ide.visual-result/2"
+            or visual.get("status") != "succeeded"
+            or visual.get("mode") != "scene_description"
+        ):
+            raise ValueError("location report contains an invalid visual heading")
+        source_payload = visual.get("source")
+        captured_at = (
+            source_payload.get("capturedAt")
+            if isinstance(source_payload, Mapping)
+            else None
+        )
+        if not isinstance(captured_at, str):
+            raise ValueError("location report visual frame has no capture time")
+        try:
+            captured = datetime.fromisoformat(captured_at.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("location report visual capture time is invalid") from exc
+        if captured <= verified_at:
+            raise ValueError("location report attempted to reuse a pre-arrival frame")
+        summary = str(visual.get("observationSummary") or "").strip()
+        if not summary:
+            raise ValueError("location report visual heading has no observation summary")
+        summaries.append(summary)
+        analysis_id = visual.get("analysisId")
+        for item in visual.get("evidence", []):
+            if not isinstance(item, Mapping) or not isinstance(item.get("sha256"), str):
+                continue
+            evidence.append(
+                {
+                    "stationId": station_id,
+                    "analysisId": analysis_id,
+                    "sha256": item["sha256"],
+                    "mediaType": item.get("mediaType"),
+                    "capturedAt": captured_at,
+                }
+            )
+    name = str(region.get("name") or region_id)
+    return {
+        "schemaVersion": "h-ide.office-report/1",
+        "missionId": mission.get("missionId")
+        or mission.get("snapshot", {}).get("missionId"),
+        "reportScope": "current_location",
+        "locationId": region_id,
+        "stationId": station_id,
+        "insideVerifiedAt": verified_at.isoformat(),
+        "status": "completed",
+        "fullChainAccepted": True,
+        "regions": [
+            {
+                "regionId": region_id,
+                "name": name,
+                "kind": str(region.get("kind") or "room"),
+                "status": "observed",
+                "summaries": summaries,
+                "stations": [
+                    {
+                        "stationId": station_id,
+                        "status": "observed",
+                        "headings": list(raw_headings),
+                    }
+                ],
+            }
+        ],
+        "missingStations": [],
+        "evidence": evidence,
+        "narrativeZhCN": f"{name}观察报告\n- " + "；".join(summaries),
+    }
+
+
 __all__ = [
     "MISSION_REPORT_SKILL",
     "OFFICE_INSPECTION_SKILL",
     "catalog",
     "build_report",
+    "build_location_report",
     "compile_plan",
     "envelope_defaults",
     "is_full_office_inspection",

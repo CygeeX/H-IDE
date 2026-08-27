@@ -87,9 +87,30 @@ class VisualFixture:
             "attempt": 1,
             "mode": "scene_description",
             "status": "succeeded",
-            "source": "qwen",
+            "source": {
+                "robotId": payload["robotId"],
+                "robotBootId": "boot-readonly-1",
+                "localizationEpochId": "epoch-readonly-1",
+                "observationSessionId": "observation-readonly-1",
+                "capturedAt": "2026-08-27T00:00:00Z",
+            },
             "versions": {},
-            "hypotheses": [],
+            "hypotheses": [
+                {
+                    "hypothesisId": "hypothesis-chair-readonly-1",
+                    "source": "qwen",
+                    "label": "chair",
+                    "pixelBox": [10, 20, 110, 220],
+                    "score": 0.95,
+                },
+                {
+                    "hypothesisId": "hypothesis-shelf-readonly-1",
+                    "source": "qwen",
+                    "label": "shelf",
+                    "pixelBox": [130, 20, 300, 240],
+                    "score": 0.91,
+                },
+            ],
             "geometryCandidates": [],
             "observationSummary": "我看到一张会议桌和两把椅子。",
             "evidence": [
@@ -97,6 +118,7 @@ class VisualFixture:
                     "evidenceId": "evidence-rgb-1",
                     "kind": "input_rgb",
                     "sha256": "b" * 64,
+                    "mediaType": "image/jpeg",
                 }
             ],
             "warnings": [],
@@ -181,6 +203,8 @@ def test_exact_office_inspection_bypasses_remote_conversation_router() -> None:
     assert result.missionDraftId == "mission-office-deterministic-1"
     assert briefs == [
         {
+            "conversationId": "conversation-office-deterministic-1",
+            "sourceTaskId": "task-office-deterministic-1",
             "robotId": "g1-sim",
             "requestedBy": "operator-test",
             "objective": "走遍所有办公室，并把所有办公室里面的信息和路上的信息都给我",
@@ -188,6 +212,38 @@ def test_exact_office_inspection_bypasses_remote_conversation_router() -> None:
             "modality": "text",
             "history": [],
         }
+    ]
+
+
+def test_known_object_and_exit_actions_override_a_misclassified_router_result() -> None:
+    calls: list[dict[str, Any]] = []
+    router = RoutedConversationClient(
+        lambda request: (ConversationIntent.ROBOT_OBSERVE, "我只看看。")
+    )
+    gateway = ConversationGateway(
+        router,
+        mission_draft_creator=lambda brief: calls.append(dict(brief))
+        or {"draftId": f"mission-known-{len(calls) + 1}"},
+    )
+
+    for index, text in enumerate(("去椅子旁边站着", "走出开放办公室"), start=1):
+        result = gateway.handle(
+            task_id=f"task-known-{index}",
+            request=ConversationTurnRequest(
+                conversationId=f"conversation-known-{index}",
+                robotId="g1-sim",
+                text=text,
+            ),
+            requested_by="operator-test",
+            modality="text",
+            mission_history=[],
+        )
+        assert result.intent is ConversationIntent.ROBOT_ACTION
+        assert result.routeStatus == "review"
+
+    assert [item["objective"] for item in calls] == [
+        "去椅子旁边站着",
+        "走出开放办公室",
     ]
 
 
@@ -337,6 +393,8 @@ def test_gateway_only_robot_action_can_create_a_mission_draft():
     assert result.missionDraftId == "mission-1"
     assert calls == [
         {
+            "conversationId": "conversation-1",
+            "sourceTaskId": "task-1",
             "robotId": "robot-1",
             "requestedBy": "user-1",
             "objective": "向前走一米",
@@ -459,6 +517,11 @@ def test_observe_is_read_only_visual_task_and_scene_teach_stays_pending():
         assert visual.requests[0]["authorizationId"].startswith("assistant-readonly-")
         assert app.state.store.list_mission_drafts() == []
         assert client.get("/api/v1/commands", headers=auth()).json() == []
+        referents = app.state.store.list_assistant_semantic_referents(
+            conversation["conversationId"]
+        )
+        assert {item["label"] for item in referents} == {"chair", "shelf"}
+        assert all(item["executionEligible"] is False for item in referents)
 
         teaching = client.post(
             f"/api/v1/assistant/conversations/{conversation['conversationId']}/messages",

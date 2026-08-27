@@ -14,7 +14,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from packages.scene_core import SceneContext
+from packages.scene_core import SceneContext, SceneRef
 from packages.visual_mission_core.models import VisualMissionSpec
 
 from .models import CapabilitySnapshot, CommandKind, RobotState
@@ -132,6 +132,79 @@ class ConversationMemorySnippet(AssistantContract):
         return as_utc(value)
 
 
+class SemanticReferentEvidence(AssistantContract):
+    kind: str = Field(min_length=1, max_length=80)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    mediaType: str = Field(min_length=1, max_length=120)
+
+    @field_validator("kind", "mediaType")
+    @classmethod
+    def _strings(cls, value: str, info):
+        return non_empty_id(value, info.field_name)
+
+
+class SemanticReferent(AssistantContract):
+    """Evidence-bound conversational entity with no execution authority."""
+
+    schemaVersion: Literal["h-ide.semantic-referent/1"] = (
+        "h-ide.semantic-referent/1"
+    )
+    referentId: str = Field(min_length=1, max_length=200)
+    sourceTaskId: str = Field(min_length=1, max_length=200)
+    sourceMissionId: str | None = Field(default=None, min_length=1, max_length=200)
+    analysisId: str = Field(min_length=1, max_length=200)
+    hypothesisId: str = Field(min_length=1, max_length=200)
+    label: str = Field(min_length=1, max_length=200)
+    aliases: list[str] = Field(default_factory=list, max_length=30)
+    regionId: str | None = Field(default=None, min_length=1, max_length=200)
+    pixelBox: tuple[int, int, int, int] | None = None
+    confidence: float | None = Field(default=None, ge=0, le=1)
+    evidence: list[SemanticReferentEvidence] = Field(default_factory=list, max_length=20)
+    capturedAt: datetime
+    robotBootId: str = Field(min_length=1, max_length=200)
+    localizationEpochId: str = Field(min_length=1, max_length=200)
+    observationSessionId: str | None = Field(default=None, min_length=1, max_length=200)
+    sceneRef: SceneRef | None = None
+    authority: Literal["SEMANTIC_ONLY"] = "SEMANTIC_ONLY"
+    executionEligible: Literal[False] = False
+
+    @field_validator(
+        "referentId",
+        "sourceTaskId",
+        "sourceMissionId",
+        "analysisId",
+        "hypothesisId",
+        "label",
+        "regionId",
+        "robotBootId",
+        "localizationEpochId",
+        "observationSessionId",
+    )
+    @classmethod
+    def _ids(cls, value: str | None, info):
+        return None if value is None else non_empty_id(value, info.field_name)
+
+    @field_validator("aliases")
+    @classmethod
+    def _aliases(cls, value: list[str]):
+        normalized = [non_empty_id(item, "aliases") for item in value]
+        if len(set(item.casefold() for item in normalized)) != len(normalized):
+            raise ValueError("semantic referent aliases must be unique")
+        return FrozenList(normalized)
+
+    @field_validator("pixelBox")
+    @classmethod
+    def _box(cls, value: tuple[int, int, int, int] | None):
+        if value is not None and (value[0] >= value[2] or value[1] >= value[3]):
+            raise ValueError("semantic referent pixelBox is invalid")
+        return value
+
+    @field_validator("capturedAt")
+    @classmethod
+    def _captured_at(cls, value: datetime) -> datetime:
+        return as_utc(value)
+
+
 class ConversationMemoryContext(AssistantContract):
     """Server-selected, non-physical context for conversation continuity."""
 
@@ -146,6 +219,10 @@ class ConversationMemoryContext(AssistantContract):
     relevantMemories: list[ConversationMemorySnippet] = Field(
         default_factory=list,
         max_length=8,
+    )
+    semanticReferents: list[SemanticReferent] = Field(
+        default_factory=list,
+        max_length=20,
     )
 
     @field_validator("resourceId")

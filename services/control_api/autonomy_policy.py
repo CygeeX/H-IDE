@@ -232,6 +232,12 @@ DEFAULT_SKILL_RULES: Mapping[str, SkillRule] = MappingProxyType(
             capability=Capability.OBSERVATION,
             minimum_risk=RiskLevel.LOW,
         ),
+        "scene.verify_inside_region": SkillRule(
+            skill="scene.verify_inside_region",
+            action_class=ActionClass.READ_ONLY_OBSERVATION,
+            capability=Capability.OBSERVATION,
+            minimum_risk=RiskLevel.LOW,
+        ),
         "navigation.navigate_to_pose": SkillRule(
             skill="navigation.navigate_to_pose",
             action_class=ActionClass.BASE_MOTION,

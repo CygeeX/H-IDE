@@ -11,7 +11,7 @@ from packages.control_core.adapters import AdapterResult, RobotAgentAdapter
 from packages.control_core.validation import utc_now
 from services.control_api.main import create_app
 from services.control_api.auth import Role
-from services.control_api.autonomy_policy import ExecutionTarget
+from services.control_api.autonomy_policy import Capability, ExecutionTarget
 from services.control_api.mission_policy import MissionPolicy, PolicyActor
 from services.control_api.mission_service import MissionServiceError
 from services.control_api.store import SQLiteStore
@@ -47,6 +47,13 @@ def test_simulation_grant_ttl_is_long_without_weakening_real_target_ttl(
     assert policy.simulation_grant_ttl_seconds == 3600
     assert policy.grant_ttl_for_target(ExecutionTarget.SIM) == 3600
     assert policy.grant_ttl_for_target(ExecutionTarget.REAL) == 600
+
+
+def test_inside_region_verifier_uses_read_only_observation_capability() -> None:
+    assert (
+        MissionPolicy._capability("scene.verify_inside_region")
+        is Capability.OBSERVATION
+    )
 
 
 def _register_login(

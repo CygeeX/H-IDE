@@ -120,14 +120,20 @@ def test_conversation_is_allowed_without_robot_health_or_confirmation(skill: str
     assert decision.code is DecisionCode.ALLOW_CONVERSATION
 
 
-def test_read_only_observation_does_not_require_localization_or_nav2() -> None:
+@pytest.mark.parametrize(
+    "skill",
+    ["vision.observe", "scene.verify_inside_region"],
+)
+def test_read_only_observation_does_not_require_localization_or_nav2(
+    skill: str,
+) -> None:
     health = replace(
         HEALTHY,
         localization=HealthStatus.UNAVAILABLE,
         nav2=HealthStatus.STALE,
     )
     request = motion_request(
-        skill="vision.observe",
+        skill=skill,
         capability=Capability.OBSERVATION,
         health=health,
         distance_m=0,

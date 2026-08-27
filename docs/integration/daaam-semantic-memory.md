@@ -3,6 +3,13 @@
 Status: integrated as an optional, post-Mission, observation-only memory
 source. It is not part of the motion or safety path.
 
+H-IDE also owns an immediate per-conversation `SemanticReferent` layer. A
+successful Qwen observation writes evidence-bound object identities there as
+soon as the turn or Mission completes. This fixes immediate follow-ups such as
+"去刚才看到的椅子旁边" without waiting for a DAAAM batch. The referent stores
+labels, aliases, source task/Mission, analysis/hypothesis IDs, image boxes,
+evidence hashes, region and observation identity, but never a map pose.
+
 ## Decision
 
 DAAAM is useful to H-IDE for one missing capability: associating repeatedly
@@ -66,6 +73,12 @@ region-level `hypothesis` with `authority=observation_only` and
 observation, but it can never become a pose, path, skill request, command,
 lease, or dispatch.
 
+The deterministic object-action compiler may use that coordinate-free region
+as a `search_prior`: it first navigates only to published Scene observation
+stations, then performs fresh `object_approach` RGB-D grounding. Only the new
+verified `target_pose` may reach Nav2. DAAAM entity IDs, centroids and historical
+viewpoints never become Mission targets.
+
 This also avoids trusting DAAAM-ROS's latest-TF fallback as exact execution
 geometry. The H-IDE envelope identities remain authoritative.
 
@@ -120,6 +133,13 @@ The Control API also exposes:
 6. A later Mission owned by the same user/site, robot and Scene revision may
    receive the coordinate-free hypotheses in its planning brief.
 7. Require live visual confirmation before acting on any remembered object.
+
+The two memory layers therefore have separate latency and authority:
+
+- `SemanticReferent`: immediate, same conversation/current boot+epoch,
+  discourse resolution only;
+- DAAAM: asynchronous, cross-Mission aggregation and region-level semantic
+  retrieval only.
 
 Rollback is simple: stop producing/importing DAAAM records, or remove the
 repository/router wiring. Existing Missions, Nav2, SONIC, MuJoCo and live

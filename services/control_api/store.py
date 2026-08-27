@@ -425,6 +425,7 @@ class SQLiteStore:
             )
             self._backfill_mapping_pointers()
             self._apply_schema_migrations()
+            self._backfill_assistant_conversation_mission_links()
             self._connection.commit()
 
     def _apply_schema_migrations(self) -> None:
@@ -1024,6 +1025,104 @@ class SQLiteStore:
                     """,
                 ),
             ),
+            (
+                9,
+                "assistant_v2_conversation_mission_history",
+                (
+                    """
+                    CREATE TABLE assistant_conversation_missions (
+                        conversation_id TEXT NOT NULL,
+                        task_id TEXT NOT NULL,
+                        mission_draft_id TEXT NOT NULL UNIQUE,
+                        mission_id TEXT UNIQUE,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        PRIMARY KEY(conversation_id, mission_draft_id),
+                        FOREIGN KEY(conversation_id)
+                            REFERENCES assistant_conversations(conversation_id),
+                        FOREIGN KEY(task_id) REFERENCES assistant_turns(task_id)
+                    )
+                    """,
+                    """
+                    CREATE INDEX assistant_conversation_missions_conversation_idx
+                        ON assistant_conversation_missions(
+                            conversation_id, updated_at DESC, mission_draft_id
+                        )
+                    """,
+                ),
+            ),
+            (
+                10,
+                "assistant_v2_turn_ordering",
+                (
+                    "ALTER TABLE assistant_turns ADD COLUMN turn_sequence INTEGER",
+                    """
+                    UPDATE assistant_turns AS current
+                    SET turn_sequence = (
+                        SELECT COUNT(*)
+                        FROM assistant_turns AS prior
+                        WHERE prior.conversation_id = current.conversation_id
+                          AND (
+                            prior.created_at < current.created_at
+                            OR (
+                                prior.created_at = current.created_at
+                                AND prior.task_id <= current.task_id
+                            )
+                          )
+                    )
+                    """,
+                    """
+                    CREATE UNIQUE INDEX assistant_turns_conversation_sequence_uq
+                        ON assistant_turns(conversation_id, turn_sequence)
+                        WHERE turn_sequence IS NOT NULL
+                    """,
+                    """
+                    CREATE INDEX assistant_messages_task_idx
+                        ON assistant_messages(conversation_id, task_id, created_at)
+                    """,
+                ),
+            ),
+            (
+                11,
+                "assistant_v2_semantic_referents",
+                (
+                    """
+                    CREATE TABLE assistant_semantic_referents (
+                        referent_id TEXT PRIMARY KEY,
+                        conversation_id TEXT NOT NULL,
+                        task_id TEXT NOT NULL,
+                        mission_id TEXT,
+                        robot_id TEXT NOT NULL,
+                        analysis_id TEXT NOT NULL,
+                        hypothesis_id TEXT NOT NULL,
+                        normalized_label TEXT NOT NULL,
+                        region_id TEXT,
+                        captured_at TEXT NOT NULL,
+                        robot_boot_id TEXT NOT NULL,
+                        localization_epoch_id TEXT NOT NULL,
+                        scene_id TEXT,
+                        scene_revision TEXT,
+                        payload_json TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        UNIQUE(conversation_id, analysis_id, hypothesis_id),
+                        FOREIGN KEY(conversation_id)
+                            REFERENCES assistant_conversations(conversation_id),
+                        FOREIGN KEY(task_id) REFERENCES assistant_turns(task_id)
+                    )
+                    """,
+                    """
+                    CREATE INDEX assistant_semantic_referents_recent_idx
+                        ON assistant_semantic_referents(
+                            conversation_id, captured_at DESC, referent_id)
+                    """,
+                    """
+                    CREATE INDEX assistant_semantic_referents_label_idx
+                        ON assistant_semantic_referents(
+                            conversation_id, normalized_label, captured_at DESC)
+                    """,
+                ),
+            ),
         )
         for version, name, statements in migrations:
             applied = self._connection.execute(
@@ -1123,6 +1222,56 @@ class SQLiteStore:
                     "mapping_id=excluded.mapping_id, version=excluded.version, updated_at=excluded.updated_at",
                     (command_key, row["mapping_id"], row["version"], row["updated_at"]),
                 )
+
+    def _backfill_assistant_conversation_mission_links(self) -> None:
+        """Recover durable Mission ownership for pre-migration Assistant turns."""
+
+        rows = self._connection.execute(
+            "SELECT task_id, conversation_id, result_json, created_at, updated_at "
+            "FROM assistant_turns WHERE result_json IS NOT NULL "
+            "ORDER BY created_at, task_id"
+        ).fetchall()
+        for row in rows:
+            try:
+                result = _decode(row["result_json"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(result, Mapping):
+                continue
+            mission_draft_id = result.get("missionDraftId")
+            if not isinstance(mission_draft_id, str) or not mission_draft_id:
+                continue
+            existing = self._connection.execute(
+                "SELECT conversation_id, task_id FROM assistant_conversation_missions "
+                "WHERE mission_draft_id = ?",
+                (mission_draft_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    str(existing["conversation_id"]) != str(row["conversation_id"])
+                    or str(existing["task_id"]) != str(row["task_id"])
+                ):
+                    raise RuntimeError(
+                        "Mission draft history is bound to conflicting Assistant turns"
+                    )
+                continue
+            mission = self._connection.execute(
+                "SELECT mission_id FROM missions WHERE mission_id = ?",
+                (mission_draft_id,),
+            ).fetchone()
+            self._connection.execute(
+                "INSERT INTO assistant_conversation_missions("
+                "conversation_id, task_id, mission_draft_id, mission_id, "
+                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    row["conversation_id"],
+                    row["task_id"],
+                    mission_draft_id,
+                    None if mission is None else mission_draft_id,
+                    row["created_at"],
+                    row["updated_at"],
+                ),
+            )
 
     @staticmethod
     def _now() -> str:
@@ -2501,6 +2650,258 @@ class SQLiteStore:
             ).fetchall()
         return [self._assistant_conversation_row(row) for row in rows]
 
+    @staticmethod
+    def _assistant_history_search_pattern(value: str) -> str:
+        escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        return f"%{escaped}%"
+
+    def list_assistant_conversation_page(
+        self,
+        *,
+        lifecycle: str = "active",
+        query: str | None = None,
+        before_updated_at: str | None = None,
+        before_conversation_id: str | None = None,
+        limit: int = 30,
+    ) -> list[dict[str, Any]]:
+        """Return one stable, cursor-addressable page of conversation roots.
+
+        Mission drafts and Mission executions are deliberately not projected as
+        synthetic conversations.  Callers may enrich each root through
+        :meth:`get_assistant_conversation_mission_links`.
+        """
+
+        lifecycle_predicates = {
+            "active": ("deleted_at IS NULL", "archived_at IS NULL"),
+            "archived": ("deleted_at IS NULL", "archived_at IS NOT NULL"),
+            "deleted": ("deleted_at IS NOT NULL",),
+        }
+        if lifecycle not in lifecycle_predicates:
+            raise ValueError("conversation lifecycle must be active, archived, or deleted")
+        if (before_updated_at is None) != (before_conversation_id is None):
+            raise ValueError("conversation cursor requires updatedAt and conversationId")
+        bounded_limit = max(1, min(int(limit), 100))
+        predicates = list(lifecycle_predicates[lifecycle])
+        parameters: list[Any] = []
+        normalized_query = None if query is None else query.strip()
+        if normalized_query:
+            pattern = self._assistant_history_search_pattern(normalized_query)
+            predicates.append(
+                "(COALESCE(title, '') LIKE ? ESCAPE '\\' OR EXISTS ("
+                "SELECT 1 FROM assistant_messages message "
+                "WHERE message.conversation_id = assistant_conversations.conversation_id "
+                "AND message.role = 'user' AND message.content LIKE ? ESCAPE '\\'))"
+            )
+            parameters.extend((pattern, pattern))
+        if before_updated_at is not None and before_conversation_id is not None:
+            predicates.append(
+                "(updated_at < ? OR (updated_at = ? AND conversation_id < ?))"
+            )
+            parameters.extend(
+                (before_updated_at, before_updated_at, before_conversation_id)
+            )
+        where = " AND ".join(predicates)
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM assistant_conversations "
+                f"WHERE {where} ORDER BY updated_at DESC, conversation_id DESC LIMIT ?",
+                (*parameters, bounded_limit),
+            ).fetchall()
+        return [self._assistant_conversation_row(row) for row in rows]
+
+    def get_assistant_conversation_mission_links(
+        self,
+        conversation_id: str,
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT link.task_id, link.mission_draft_id, link.mission_id, "
+                "draft.status AS draft_status, mission.status AS mission_status, "
+                "turn.turn_sequence, link.created_at, link.updated_at "
+                "FROM assistant_conversation_missions link "
+                "JOIN assistant_turns turn ON turn.task_id = link.task_id "
+                "LEFT JOIN mission_drafts draft "
+                "ON draft.draft_id = link.mission_draft_id "
+                "LEFT JOIN missions mission "
+                "ON mission.mission_id = COALESCE(link.mission_id, link.mission_draft_id) "
+                "WHERE link.conversation_id = ? "
+                "ORDER BY COALESCE(turn.turn_sequence, 2147483647), "
+                "link.created_at, link.mission_draft_id",
+                (conversation_id,),
+            ).fetchall()
+        return [
+            {
+                "taskId": row["task_id"],
+                "turnSequence": row["turn_sequence"],
+                "missionDraftId": row["mission_draft_id"],
+                "missionId": (
+                    row["mission_id"]
+                    if row["mission_id"] is not None
+                    else row["mission_draft_id"]
+                    if row["mission_status"] is not None
+                    else None
+                ),
+                "draftStatus": row["draft_status"],
+                "missionStatus": row["mission_status"],
+                "createdAt": row["created_at"],
+                "updatedAt": row["updated_at"],
+            }
+            for row in rows
+        ]
+
+    def bind_assistant_conversation_mission(
+        self,
+        *,
+        conversation_id: str,
+        task_id: str,
+        mission_draft_id: str,
+        mission_id: str | None = None,
+    ) -> None:
+        """Idempotently bind one Mission identity to its conversation turn."""
+
+        now = self._now()
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                existing = self._connection.execute(
+                    "SELECT conversation_id, task_id, mission_id "
+                    "FROM assistant_conversation_missions WHERE mission_draft_id = ?",
+                    (mission_draft_id,),
+                ).fetchone()
+                if existing is None:
+                    self._connection.execute(
+                        "INSERT INTO assistant_conversation_missions("
+                        "conversation_id, task_id, mission_draft_id, mission_id, "
+                        "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            conversation_id,
+                            task_id,
+                            mission_draft_id,
+                            mission_id,
+                            now,
+                            now,
+                        ),
+                    )
+                else:
+                    if (
+                        str(existing["conversation_id"]) != conversation_id
+                        or str(existing["task_id"]) != task_id
+                    ):
+                        raise AssistantConversationConflict(
+                            "Mission draft is already bound to another conversation turn"
+                        )
+                    existing_mission_id = existing["mission_id"]
+                    if (
+                        existing_mission_id is not None
+                        and mission_id is not None
+                        and str(existing_mission_id) != mission_id
+                    ):
+                        raise AssistantConversationConflict(
+                            "Mission draft is already bound to another Mission"
+                        )
+                    if existing_mission_id is None and mission_id is not None:
+                        self._connection.execute(
+                            "UPDATE assistant_conversation_missions "
+                            "SET mission_id = ?, updated_at = ? "
+                            "WHERE mission_draft_id = ?",
+                            (mission_id, now, mission_draft_id),
+                        )
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+
+    def bind_approved_mission_to_conversation(
+        self,
+        mission_draft_id: str,
+        mission_id: str,
+    ) -> bool:
+        with self._lock:
+            cursor = self._connection.execute(
+                "UPDATE assistant_conversation_missions "
+                "SET mission_id = ?, updated_at = ? "
+                "WHERE mission_draft_id = ? "
+                "AND (mission_id IS NULL OR mission_id = ?)",
+                (mission_id, self._now(), mission_draft_id, mission_id),
+            )
+            self._connection.commit()
+            return cursor.rowcount == 1
+
+    def _assistant_conversation_lifecycle_blocker_locked(
+        self,
+        conversation_id: str,
+    ) -> str | None:
+        active_turn = self._connection.execute(
+            "SELECT task_id FROM assistant_turns WHERE conversation_id = ? "
+            "AND status IN ('queued', 'running') LIMIT 1",
+            (conversation_id,),
+        ).fetchone()
+        if active_turn is not None:
+            return "active_turn"
+        active_mission = self._connection.execute(
+            "SELECT mission.mission_id FROM assistant_conversation_missions link "
+            "JOIN missions mission "
+            "ON mission.mission_id = COALESCE(link.mission_id, link.mission_draft_id) "
+            "WHERE link.conversation_id = ? "
+            "AND mission.status NOT IN ('completed', 'failed', 'cancelled') LIMIT 1",
+            (conversation_id,),
+        ).fetchone()
+        return "active_mission" if active_mission is not None else None
+
+    def assistant_conversation_lifecycle_blocker(
+        self,
+        conversation_id: str,
+    ) -> str | None:
+        with self._lock:
+            return self._assistant_conversation_lifecycle_blocker_locked(
+                conversation_id
+            )
+
+    def delete_assistant_conversations(
+        self,
+        conversation_ids: Iterable[str],
+    ) -> dict[str, Any]:
+        """Soft-delete an authorized batch while skipping active work."""
+
+        normalized = list(dict.fromkeys(str(item) for item in conversation_ids))
+        now = self._now()
+        deleted: list[str] = []
+        skipped: list[dict[str, str]] = []
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                for conversation_id in normalized:
+                    row = self._connection.execute(
+                        "SELECT deleted_at FROM assistant_conversations "
+                        "WHERE conversation_id = ?",
+                        (conversation_id,),
+                    ).fetchone()
+                    if row is None:
+                        skipped.append(
+                            {"conversationId": conversation_id, "reason": "not_found"}
+                        )
+                        continue
+                    blocker = self._assistant_conversation_lifecycle_blocker_locked(
+                        conversation_id
+                    )
+                    if blocker is not None:
+                        skipped.append(
+                            {"conversationId": conversation_id, "reason": blocker}
+                        )
+                        continue
+                    if row["deleted_at"] is None:
+                        self._connection.execute(
+                            "UPDATE assistant_conversations "
+                            "SET deleted_at = ?, updated_at = ? WHERE conversation_id = ?",
+                            (now, now, conversation_id),
+                        )
+                    deleted.append(conversation_id)
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+        return {"deletedConversationIds": deleted, "skipped": skipped}
+
     def get_assistant_conversation(self, conversation_id: str) -> dict[str, Any] | None:
         with self._lock:
             row = self._connection.execute(
@@ -2545,13 +2946,13 @@ class SQLiteStore:
                         "deleted conversation must be restored before it can be changed"
                     )
 
-                active = None
-                if lifecycle_requested:
-                    active = self._connection.execute(
-                        "SELECT task_id FROM assistant_turns WHERE conversation_id = ? "
-                        "AND status IN ('queued', 'running') LIMIT 1",
-                        (conversation_id,),
-                    ).fetchone()
+                lifecycle_blocker = (
+                    self._assistant_conversation_lifecycle_blocker_locked(
+                        conversation_id
+                    )
+                    if lifecycle_requested
+                    else None
+                )
                 desired_archived_at = row["archived_at"]
                 desired_deleted_at = row["deleted_at"]
                 if archived is True and desired_archived_at is None:
@@ -2567,9 +2968,20 @@ class SQLiteStore:
                     desired_archived_at != row["archived_at"]
                     or desired_deleted_at != row["deleted_at"]
                 )
-                if lifecycle_changed and active is not None:
+                hiding_conversation = (
+                    desired_archived_at is not None
+                    and desired_archived_at != row["archived_at"]
+                ) or (
+                    desired_deleted_at is not None
+                    and desired_deleted_at != row["deleted_at"]
+                )
+                if hiding_conversation and lifecycle_blocker == "active_turn":
                     raise AssistantConversationConflict(
                         "conversation lifecycle cannot change while a turn is active"
+                    )
+                if hiding_conversation and lifecycle_blocker == "active_mission":
+                    raise AssistantConversationConflict(
+                        "conversation lifecycle cannot change while a linked Mission is active"
                     )
 
                 desired_title = row["title"] if title is _ASSISTANT_TITLE_UNSET else title
@@ -2604,15 +3016,21 @@ class SQLiteStore:
     def list_assistant_messages(self, conversation_id: str) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._connection.execute(
-                "SELECT message_id, task_id, role, content, modality, transcription_id, created_at "
-                "FROM assistant_messages WHERE conversation_id = ? "
-                "ORDER BY created_at, message_id",
+                "SELECT message.message_id, message.task_id, message.role, "
+                "message.content, message.modality, message.transcription_id, "
+                "message.created_at, turn.turn_sequence "
+                "FROM assistant_messages AS message "
+                "LEFT JOIN assistant_turns AS turn ON turn.task_id = message.task_id "
+                "WHERE message.conversation_id = ? "
+                "ORDER BY COALESCE(turn.turn_sequence, 2147483647), "
+                "message.created_at, message.message_id",
                 (conversation_id,),
             ).fetchall()
         return [
             {
                 "messageId": row["message_id"],
                 "taskId": row["task_id"],
+                "turnSequence": row["turn_sequence"],
                 "role": row["role"],
                 "content": row["content"],
                 "modality": row["modality"],
@@ -2621,6 +3039,218 @@ class SQLiteStore:
             }
             for row in rows
         ]
+
+    def record_assistant_semantic_referents(
+        self,
+        *,
+        conversation_id: str,
+        robot_id: str,
+        referents: Iterable[Mapping[str, Any]],
+    ) -> int:
+        """Idempotently persist coordinate-free visual entities for one turn."""
+
+        payloads = [dict(item) for item in referents]
+        if not payloads:
+            return 0
+        now = self._now()
+        inserted = 0
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                conversation = self._connection.execute(
+                    "SELECT robot_id FROM assistant_conversations "
+                    "WHERE conversation_id = ?",
+                    (conversation_id,),
+                ).fetchone()
+                if conversation is None or str(conversation["robot_id"]) != robot_id:
+                    raise ValueError("semantic referent conversation binding is invalid")
+                for payload in payloads:
+                    referent_id = str(payload.get("referentId") or "")
+                    task_id = str(payload.get("sourceTaskId") or "")
+                    analysis_id = str(payload.get("analysisId") or "")
+                    hypothesis_id = str(payload.get("hypothesisId") or "")
+                    label = str(payload.get("label") or "")
+                    captured_at = str(payload.get("capturedAt") or "")
+                    robot_boot_id = str(payload.get("robotBootId") or "")
+                    localization_epoch_id = str(
+                        payload.get("localizationEpochId") or ""
+                    )
+                    if not all(
+                        value and value == value.strip()
+                        for value in (
+                            referent_id,
+                            task_id,
+                            analysis_id,
+                            hypothesis_id,
+                            label,
+                            captured_at,
+                            robot_boot_id,
+                            localization_epoch_id,
+                        )
+                    ):
+                        raise ValueError("semantic referent identity is incomplete")
+                    turn = self._connection.execute(
+                        "SELECT conversation_id FROM assistant_turns WHERE task_id = ?",
+                        (task_id,),
+                    ).fetchone()
+                    if turn is None or str(turn["conversation_id"]) != conversation_id:
+                        raise ValueError("semantic referent task binding is invalid")
+                    existing = self._connection.execute(
+                        "SELECT referent_id, payload_json "
+                        "FROM assistant_semantic_referents "
+                        "WHERE conversation_id = ? AND analysis_id = ? "
+                        "AND hypothesis_id = ?",
+                        (conversation_id, analysis_id, hypothesis_id),
+                    ).fetchone()
+                    encoded = _encode(payload)
+                    if existing is not None:
+                        if (
+                            str(existing["referent_id"]) != referent_id
+                            or str(existing["payload_json"]) != encoded
+                        ):
+                            raise ValueError(
+                                "semantic referent identity is bound to different evidence"
+                            )
+                        continue
+                    scene_ref = payload.get("sceneRef")
+                    scene_id = (
+                        scene_ref.get("sceneId")
+                        if isinstance(scene_ref, Mapping)
+                        else None
+                    )
+                    scene_revision = (
+                        _encode(scene_ref.get("revision"))
+                        if isinstance(scene_ref, Mapping)
+                        and scene_ref.get("revision") is not None
+                        else None
+                    )
+                    self._connection.execute(
+                        "INSERT INTO assistant_semantic_referents("
+                        "referent_id, conversation_id, task_id, mission_id, robot_id, "
+                        "analysis_id, hypothesis_id, normalized_label, region_id, "
+                        "captured_at, robot_boot_id, localization_epoch_id, scene_id, "
+                        "scene_revision, payload_json, created_at, updated_at"
+                        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            referent_id,
+                            conversation_id,
+                            task_id,
+                            payload.get("sourceMissionId"),
+                            robot_id,
+                            analysis_id,
+                            hypothesis_id,
+                            " ".join(label.split()).casefold(),
+                            payload.get("regionId"),
+                            captured_at,
+                            robot_boot_id,
+                            localization_epoch_id,
+                            scene_id,
+                            scene_revision,
+                            encoded,
+                            now,
+                            now,
+                        ),
+                    )
+                    inserted += 1
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+        return inserted
+
+    def list_assistant_semantic_referents(
+        self,
+        conversation_id: str,
+        *,
+        robot_boot_id: str | None = None,
+        localization_epoch_id: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        predicates = ["conversation_id = ?"]
+        parameters: list[Any] = [conversation_id]
+        if robot_boot_id is not None:
+            predicates.append("robot_boot_id = ?")
+            parameters.append(robot_boot_id)
+        if localization_epoch_id is not None:
+            predicates.append("localization_epoch_id = ?")
+            parameters.append(localization_epoch_id)
+        parameters.append(max(1, min(int(limit), 100)))
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT payload_json FROM assistant_semantic_referents WHERE "
+                + " AND ".join(predicates)
+                + " ORDER BY captured_at DESC, referent_id DESC LIMIT ?",
+                tuple(parameters),
+            ).fetchall()
+        return [_decode(row["payload_json"]) for row in rows]
+
+    def get_assistant_conversation_mission_link_by_mission(
+        self,
+        mission_id: str,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT conversation_id, task_id, mission_draft_id, mission_id, "
+                "created_at, updated_at FROM assistant_conversation_missions "
+                "WHERE mission_id = ? OR mission_draft_id = ? LIMIT 1",
+                (mission_id, mission_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "conversationId": str(row["conversation_id"]),
+            "taskId": str(row["task_id"]),
+            "missionDraftId": str(row["mission_draft_id"]),
+            "missionId": row["mission_id"],
+            "createdAt": str(row["created_at"]),
+            "updatedAt": str(row["updated_at"]),
+        }
+
+    def append_assistant_mission_message(
+        self,
+        *,
+        mission_id: str,
+        message_id: str,
+        content: str,
+        conversation_status: str = "idle",
+    ) -> bool:
+        now = self._now()
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                link = self._connection.execute(
+                    "SELECT conversation_id, task_id FROM "
+                    "assistant_conversation_missions "
+                    "WHERE mission_id = ? OR mission_draft_id = ? LIMIT 1",
+                    (mission_id, mission_id),
+                ).fetchone()
+                if link is None:
+                    self._connection.rollback()
+                    return False
+                cursor = self._connection.execute(
+                    "INSERT OR IGNORE INTO assistant_messages("
+                    "message_id, conversation_id, task_id, role, content, modality, "
+                    "transcription_id, created_at) VALUES (?, ?, ?, 'assistant', ?, "
+                    "'text', NULL, ?)",
+                    (
+                        message_id,
+                        str(link["conversation_id"]),
+                        str(link["task_id"]),
+                        content,
+                        now,
+                    ),
+                )
+                if cursor.rowcount == 1:
+                    self._connection.execute(
+                        "UPDATE assistant_conversations SET status = ?, updated_at = ? "
+                        "WHERE conversation_id = ?",
+                        (conversation_status, now, str(link["conversation_id"])),
+                    )
+                self._connection.commit()
+                return cursor.rowcount == 1
+            except Exception:
+                self._connection.rollback()
+                raise
 
     @staticmethod
     def _assistant_conversation_summary_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -2806,6 +3436,7 @@ class SQLiteStore:
         return {
             "taskId": row["task_id"],
             "conversationId": row["conversation_id"],
+            "turnSequence": row["turn_sequence"],
             "status": row["status"],
             "request": _decode(row["request_json"]),
             "result": result,
@@ -2819,7 +3450,7 @@ class SQLiteStore:
         with self._lock:
             rows = self._connection.execute(
                 "SELECT * FROM assistant_turns WHERE conversation_id = ? "
-                "ORDER BY created_at, task_id",
+                "ORDER BY COALESCE(turn_sequence, 2147483647), created_at, task_id",
                 (conversation_id,),
             ).fetchall()
         return [self._assistant_turn_row(row) for row in rows]
@@ -3009,6 +3640,12 @@ class SQLiteStore:
                 ).fetchone()
                 if active is not None:
                     raise AssistantTurnConflict("assistant conversation already has an active turn")
+                sequence_row = self._connection.execute(
+                    "SELECT COALESCE(MAX(turn_sequence), 0) + 1 AS next_sequence "
+                    "FROM assistant_turns WHERE conversation_id = ?",
+                    (conversation_id,),
+                ).fetchone()
+                turn_sequence = int(sequence_row["next_sequence"])
                 if isinstance(revision_of, str) and revision_of:
                     draft = self._connection.execute(
                         "SELECT d.status, m.conversation_id FROM assistant_drafts d "
@@ -3036,9 +3673,16 @@ class SQLiteStore:
                 self._connection.execute(
                     "INSERT INTO assistant_turns("
                     "task_id, conversation_id, request_json, status, result_json, error, "
-                    "cancellation_requested, created_at, updated_at"
-                    ") VALUES (?, ?, ?, 'queued', NULL, NULL, 0, ?, ?)",
-                    (task_id, conversation_id, _encode(task_request), now, now),
+                    "cancellation_requested, created_at, updated_at, turn_sequence"
+                    ") VALUES (?, ?, ?, 'queued', NULL, NULL, 0, ?, ?, ?)",
+                    (
+                        task_id,
+                        conversation_id,
+                        _encode(task_request),
+                        now,
+                        now,
+                        turn_sequence,
+                    ),
                 )
                 self._connection.execute(
                     "UPDATE assistant_conversations SET status = 'planning', updated_at = ? "
@@ -3205,6 +3849,34 @@ class SQLiteStore:
                     (conversation_status, now, conversation_id),
                 )
                 if result.get("schemaVersion") == "h-ide.assistant-result/2":
+                    mission_draft_id = result.get("missionDraftId")
+                    if isinstance(mission_draft_id, str) and mission_draft_id:
+                        existing_link = self._connection.execute(
+                            "SELECT conversation_id, task_id "
+                            "FROM assistant_conversation_missions "
+                            "WHERE mission_draft_id = ?",
+                            (mission_draft_id,),
+                        ).fetchone()
+                        if existing_link is None:
+                            self._connection.execute(
+                                "INSERT INTO assistant_conversation_missions("
+                                "conversation_id, task_id, mission_draft_id, mission_id, "
+                                "created_at, updated_at) VALUES (?, ?, ?, NULL, ?, ?)",
+                                (
+                                    conversation_id,
+                                    task_id,
+                                    mission_draft_id,
+                                    now,
+                                    now,
+                                ),
+                            )
+                        elif (
+                            str(existing_link["conversation_id"]) != conversation_id
+                            or str(existing_link["task_id"]) != task_id
+                        ):
+                            raise AssistantConversationConflict(
+                                "Mission draft is already bound to another conversation turn"
+                            )
                     route_event = {
                         key: result[key]
                         for key in (
@@ -3329,6 +4001,7 @@ class SQLiteStore:
             draft = self.get_assistant_draft(row["draft_id"])
             if draft is not None:
                 metadata = self.get_assistant_draft_review(row["draft_id"])
+                draft["taskId"] = (metadata or {}).get("taskId")
                 draft["review"] = (metadata or {}).get("review", {})
                 draft["revisionOfDraftId"] = (metadata or {}).get("revisionOfDraftId")
                 result.append(draft)
@@ -3346,6 +4019,7 @@ class SQLiteStore:
         if draft is None:
             return None
         metadata = self.get_assistant_draft_review(row["draft_id"])
+        draft["taskId"] = (metadata or {}).get("taskId")
         draft["review"] = (metadata or {}).get("review", {})
         draft["revisionOfDraftId"] = (metadata or {}).get("revisionOfDraftId")
         return draft
