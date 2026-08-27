@@ -1,0 +1,94 @@
+[
+  {
+    "name": "idle_safe_hold_passes",
+    "phase": "idle",
+    "expected_pass": true,
+    "samples": [
+      {"t": 0.0, "state": "safe_hold", "x": 0.0, "y": 0.0, "z": 0.78, "yaw": 0.0},
+      {"t": 2.0, "state": "safe_hold", "x": 0.0004, "y": -0.0002, "z": 0.781, "yaw": 0.0003},
+      {"t": 4.0, "state": "safe_hold", "x": 0.0005, "y": -0.0001, "z": 0.780, "yaw": 0.0002}
+    ]
+  },
+  {
+    "name": "half_meter_straight_passes",
+    "phase": "straight",
+    "expected_pass": true,
+    "samples": [
+      {"t": 0.0, "state": "safe_hold", "x": 0.0, "y": 0.0, "z": 0.78, "yaw": 0.0},
+      {"t": 1.0, "state": "active", "x": 0.02, "y": 0.001, "z": 0.782, "yaw": 0.002},
+      {"t": 4.0, "state": "active", "x": 0.18, "y": 0.006, "z": 0.779, "yaw": 0.008},
+      {"t": 7.0, "state": "active", "x": 0.38, "y": 0.009, "z": 0.781, "yaw": 0.012},
+      {"t": 9.0, "state": "active", "x": 0.49, "y": 0.011, "z": 0.780, "yaw": 0.010},
+      {"t": 10.0, "state": "safe_hold", "x": 0.50, "y": 0.011, "z": 0.780, "yaw": 0.009}
+    ]
+  },
+  {
+    "name": "post_motion_contradictory_safe_hold_fails",
+    "phase": "straight",
+    "expected_pass": false,
+    "expected_failure_codes": [
+      "SONIC_LAST_ERROR",
+      "SAFE_HOLD_AFTER_MOTION",
+      "NOT_SETTLED_AT_END"
+    ],
+    "samples": [
+      {"t": 0.0, "state": "safe_hold", "x": 0.0, "y": 0.0, "z": 0.78, "yaw": 0.0},
+      {"t": 1.0, "state": "active", "x": 0.02, "y": 0.0, "z": 0.78, "yaw": 0.0},
+      {"t": 4.0, "state": "active", "x": 0.20, "y": 0.004, "z": 0.78, "yaw": 0.005},
+      {"t": 8.0, "state": "active", "x": 0.48, "y": 0.007, "z": 0.78, "yaw": 0.008},
+      {
+        "t": 9.0,
+        "state": "safe_hold",
+        "x": 0.50,
+        "y": 0.008,
+        "z": 0.78,
+        "yaw": 0.008,
+        "static_hold_active": false
+      }
+    ]
+  },
+  {
+    "name": "negative_ninety_degree_turn_passes",
+    "phase": "turn",
+    "expected_turn_deg": -90.0,
+    "expected_pass": true,
+    "samples": [
+      {"t": 0.0, "state": "safe_hold", "x": 0.0, "y": 0.0, "z": 0.78, "yaw": 0.0},
+      {"t": 1.0, "state": "active", "x": 0.002, "y": 0.0, "z": 0.781, "yaw": -0.05},
+      {"t": 3.0, "state": "active", "x": 0.005, "y": -0.002, "z": 0.779, "yaw": -0.45},
+      {"t": 5.0, "state": "active", "x": 0.008, "y": -0.004, "z": 0.780, "yaw": -0.85},
+      {"t": 7.0, "state": "active", "x": 0.010, "y": -0.006, "z": 0.782, "yaw": -1.25},
+      {"t": 9.0, "state": "active", "x": 0.012, "y": -0.007, "z": 0.780, "yaw": -1.56},
+      {"t": 10.0, "state": "settled", "x": 0.012, "y": -0.007, "z": 0.780, "yaw": -1.56}
+    ]
+  },
+  {
+    "name": "teleport_fall_fault_and_arm_spike_fail",
+    "phase": "straight",
+    "expected_pass": false,
+    "expected_failure_codes": [
+      "ROOT_HEIGHT_OUT_OF_RANGE",
+      "SOURCE_TIME_OR_GENERATION_ROLLBACK",
+      "POSITION_JUMP_OR_TELEPORT",
+      "ARM_TELEMETRY_SPIKE",
+      "SONIC_FAULT_TRACE",
+      "RESET_OR_NUMERICAL_FAULT_CLUE"
+    ],
+    "samples": [
+      {"t": 0.0, "state": "safe_hold", "x": 0.0, "y": 0.0, "z": 0.78, "yaw": 0.0, "sequence": 10},
+      {"t": 1.0, "state": "active", "x": 0.02, "y": 0.0, "z": 0.78, "yaw": 0.0, "sequence": 11},
+      {
+        "t": 2.0,
+        "state": "fault",
+        "x": 0.95,
+        "y": 0.40,
+        "z": 0.42,
+        "yaw": 0.8,
+        "sequence": 3,
+        "arm_velocity": 12.0,
+        "fault_trace_count": 20,
+        "last_error": "MuJoCo QACC numerical instability caused an implicit reset"
+      }
+    ]
+  }
+]

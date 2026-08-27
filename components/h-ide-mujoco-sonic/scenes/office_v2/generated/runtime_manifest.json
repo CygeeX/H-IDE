@@ -1,0 +1,143 @@
+{
+  "bounds": {
+    "max": [
+      8.0,
+      6.0,
+      3.0
+    ],
+    "min": [
+      -8.0,
+      -6.0,
+      0.0
+    ]
+  },
+  "collision_contract_sha256": "cda5508f7404334e7fcd33f8921a8081b30d7c03b24abfeabebdfce7fab9c313",
+  "content_class": "runtime_geometry",
+  "default_spawn": {
+    "clearance_radius_m": 0.55,
+    "x": -6.45,
+    "y": 0.0,
+    "yaw": 0.0
+  },
+  "generator_version": "office-v2-generator/4",
+  "inspection_catalog": {
+    "contains_object_answers": false,
+    "path": "inspection_catalog.json",
+    "sha256": "86b0271bdc7a17b800abfa12f5120480a47fc2c87f41b78dbfe67f7f8cbd9cc7"
+  },
+  "map": {
+    "frame_id": "map",
+    "height_cells": 240,
+    "image": {
+      "path": "nav2/office_v2.pgm",
+      "sha256": "47b2ddd54d9f0aa2a220d5b79afcee367cbaa7a57068e4809189f24ab207360d"
+    },
+    "origin": [
+      -8.0,
+      -6.0,
+      0.0
+    ],
+    "resolution": 0.05,
+    "size": [
+      16.0,
+      12.0
+    ],
+    "width_cells": 320,
+    "yaml": {
+      "path": "nav2/office_v2.yaml",
+      "sha256": "50b8a333887413053c6ddd3d6888819fc6c78093969948d980a1346a540ff71f"
+    }
+  },
+  "model": {
+    "office_include": {
+      "path": "mujoco/office_v2.include.xml",
+      "sha256": "a768e1a3098b69d2267008fa81a30c441cfb73a6d777b3ba3243d4a906031e47"
+    },
+    "render_assets": [
+      {
+        "path": "mujoco/textures/tex_01.png",
+        "sha256": "bcd3025e9b33a32db4ffb3c3e15ec4684f0053c215e3ac9b155290914f01062d"
+      },
+      {
+        "path": "mujoco/textures/tex_02.png",
+        "sha256": "a0e9402be6d6cf7c0a8e668917ccc8f39a8549928be4f0cdeb2c9983e61e9efc"
+      },
+      {
+        "path": "mujoco/textures/tex_03.png",
+        "sha256": "77f6b1ec4077f3f7ebb7cb94d995c10be843c473323fbee67d59f8d7084a8c91"
+      },
+      {
+        "path": "mujoco/textures/tex_04.png",
+        "sha256": "dfac91964200f02f5dd04c0405949ac95719e7bd077707f8cafe8af8d4c0f122"
+      },
+      {
+        "path": "mujoco/textures/tex_05.png",
+        "sha256": "91a652def325494b1bee1341ce030ffb4c00f5c73e33cc0812e12686fdd16d5f"
+      },
+      {
+        "path": "mujoco/textures/tex_06.png",
+        "sha256": "5a1de1c6363bcf00056c35b465b15e2a72de8e0027b0b714e34883aa9d2fcdb5"
+      },
+      {
+        "path": "mujoco/textures/tex_07.png",
+        "sha256": "8122b94bd778af3e7509481036278b9a5294e8347d6a8a30f02216e12949faae"
+      },
+      {
+        "path": "mujoco/textures/tex_08.png",
+        "sha256": "70d955589546de91208573f380ce36956af81ee4a15ccddf8206c75ee9f092e2"
+      },
+      {
+        "path": "mujoco/textures/tex_09.png",
+        "sha256": "53e9e6c837c21891b80225cf21e96ed02f82c662a471209eb6dec2ad94d79b99"
+      },
+      {
+        "path": "mujoco/textures/tex_10.png",
+        "sha256": "019f25e4e36d9d076d9e8da277dc5e4bebe970b819b6cb02a3b61fe458cf4b1b"
+      },
+      {
+        "path": "mujoco/meshes/mesh_01.obj",
+        "sha256": "adc380163216870f8386bf15af63f12762713e4a3ba50956e7f3c41331708d61"
+      },
+      {
+        "path": "mujoco/meshes/mesh_02.obj",
+        "sha256": "8847fe2fee0c8c47ed4562875f5f11c7316002826c6e2b80990504425e02759c"
+      },
+      {
+        "path": "mujoco/meshes/mesh_03.obj",
+        "sha256": "0e532a55c294f752ed7686144d59ce9b4348c5a3fc29ac16b7e01a6238f0c0c2"
+      },
+      {
+        "path": "mujoco/meshes/mesh_04.obj",
+        "sha256": "75b659a4f7bfd5811985d9f269f01b9083b86e707ff5fa563161872ee3c180bd"
+      },
+      {
+        "path": "mujoco/meshes/mesh_05.obj",
+        "sha256": "ab07f9ceea07dc584c40a8c5e42ae04f9edcdb31baa797b27f436499c2a763e9"
+      },
+      {
+        "path": "mujoco/meshes/mesh_06.obj",
+        "sha256": "f10f5eb97591f55889739f6bfa0f8502c397ca53042b612c75f05798a80ce20c"
+      },
+      {
+        "path": "mujoco/meshes/mesh_07.obj",
+        "sha256": "83523d66a1526162909ea0ab633fbd1655a93d87ca2b812745555537a0cc6bfe"
+      },
+      {
+        "path": "mujoco/meshes/mesh_08.obj",
+        "sha256": "afaa6be5b574ea6d81b637c5624c6a684d73cfaf8ce680ca6be91df94e1533f4"
+      },
+      {
+        "path": "mujoco/meshes/mesh_09.obj",
+        "sha256": "ff1cae31cea508dec27ab99cb5ca9d06afe50dee4a572cb9d2358125e6e2cac7"
+      }
+    ],
+    "scene": {
+      "path": "mujoco/office_v2.runtime.xml",
+      "sha256": "6f0b23717b725262ab1aa6196e9c7e9bf8a16c5906453f475bb124175d189211"
+    }
+  },
+  "reset_policy": "explicit_process_restart",
+  "scene_id": "office_v2",
+  "scene_source_sha256": "7c30b7c4bb3e8136659688c80b8bef97724aae79aa7fd0f82deb96b227ca98ff",
+  "schema_version": "h-ide.office-v2-runtime/1"
+}

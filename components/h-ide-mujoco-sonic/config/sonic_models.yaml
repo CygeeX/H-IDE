@@ -1,0 +1,62 @@
+schema_version: h-ide.sonic-model-catalog/1
+
+# This catalog is descriptive.  A profile is not executable until the
+# machine-readable lock has been verified by tools/verify_model_lock.py.
+lock_file: config/sonic-models.lock.json
+
+selection:
+  production: null
+  evaluation_candidates:
+    - sonic-official-default
+    - sonic-official-v1_1
+  current_experimental: sonic-python-experimental
+
+policy:
+  require_lock_verification_before_activation: true
+  distinguish_bundle_integrity_from_runtime_executability: true
+  allow_floating_revisions: false
+  allow_mixed_encoder_decoder_observation_config: false
+  allow_unavailable_profile: false
+  production_requires_motion_acceptance: true
+
+profiles:
+  sonic-official-default:
+    manifest: profiles/sonic-official-default.yaml
+    status: runtime_unavailable
+    model_bundle: complete
+    runtime_executable: false
+    reason: >-
+      The fixed-revision default planner, encoder, decoder, and matching
+      observation_config.yaml are cached and hashable.  The official C++
+      controller is not built or connected to the H-IDE adapter.
+  sonic-official-v1_1:
+    manifest: profiles/sonic-official-v1_1.yaml
+    status: runtime_unavailable
+    model_bundle: complete
+    runtime_executable: false
+    reason: >-
+      The fixed-revision shared planner, v1.1 encoder, decoder, and matching
+      observation config are cached and hashable.  A matching controller build
+      and Nav2/SONIC adapter integration are still absent.
+  sonic-python-experimental:
+    manifest: profiles/sonic-python-experimental.yaml
+    status: evaluation_available
+    model_bundle: complete
+    runtime_executable: true
+    reason: >-
+      One internally consistent, hash-locked combination exists: the cached
+      default SONIC ONNX triplet plus the pinned LeRobot Python observation and
+      controller implementation.  It remains evaluation-only until locomotion
+      acceptance passes.
+
+audit_findings:
+  - >-
+    Runtime YAML files now select a named profile and the fixed GEAR-SONIC
+    revision.  start-workstation-demo.sh verifies the complete config/lock/source
+    tuple before any motion-capable process starts.
+  - >-
+    The experimental runtime is pinned to the actual nested LeRobot revision
+    cab2c37a....  Any source checkout drift causes startup to fail closed.
+  - >-
+    Integrity verification only proves artifact/source identity.  It does not
+    prove that the controller is dynamically stable or safe to activate.

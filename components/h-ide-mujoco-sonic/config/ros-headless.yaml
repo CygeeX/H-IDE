@@ -1,0 +1,90 @@
+schema_version: h-ide.mujoco-sonic-config/1
+robot_id: g1-sim
+robot_profile: unitree_g1_29dof
+localization_epoch_id: g1-sim-map-epoch-1
+ros_domain_id: 232
+unitree_domain_id: 230
+interface: lo
+cmd_vel_topic: /cmd_vel
+odom_topic: /odom
+localization_topic: /localization/pose
+nav_path_topic: /plan
+motion_fault_topic: /h_ide/g1_sim/motion_safety_fault
+lowstate_topic: rt/lowstate
+lowcmd_topic: rt/lowcmd
+telemetry_host: 127.0.0.1
+telemetry_port: 8792
+plant_port: 8794
+command_host: 127.0.0.1
+command_port: 8793
+sonic_health_probe_period_s: 0.025
+sonic_health_probe_timeout_s: 0.040
+plant_lowstate_stale_s: 0.10
+sonic_control_step_stale_s: 0.10
+max_linear_mps: 0.40
+min_walk_command_mps: 0.20
+max_angular_rps: 0.25
+max_facing_lead_rad: 0.15
+# Curved Nav2 paths may accumulate heading. Bound only the emitted facing lead
+# relative to the latest measured yaw, never the cumulative command goal.
+max_translation_facing_offset_rad: 0.05
+max_translation_heading_error_rad: 0.25
+translation_heading_violation_s: 0.25
+# A G1 turns by changing its support feet, so raw pelvis x/y is not stationary.
+# Keep its center inside the 0.35 m Nav2 footprint.  The learned whole-body
+# controller may counter-sway while changing support feet.  The deployment
+# gait adapter already permits a 0.35 rad startup counter-turn; keep this
+# redundant bridge guard on the same boundary instead of terminating at the
+# previously tighter 0.20 rad threshold.  Strict support-off profiles retain
+# the tighter 0.05 rad acceptance bound.
+max_spin_reverse_rad: 0.35
+max_spin_translation_m: 0.30
+spin_translation_violation_s: 0.50
+command_timeout_s: 0.25
+# The async planner waits on an exact 50 Hz boundary while the actuator target
+# remains held; 0.75 s falls between ticks and produced a false 0.76 s timeout.
+planner_reference_timeout_s: 1.00
+# Mirror the official controller's distinct INIT phase after the first motion
+# authorization: exact actuator boundary to nominal pose over three seconds,
+# before any planner or policy state is consumed.
+policy_activation_s: 3.0
+# These legacy binary handoff timings remain schema-bound. They do not grant
+# authority; policy_activation_s owns the first authorized posture ramp.
+motion_handoff_warmup_s: 0.35
+motion_handoff_blend_s: 0.40
+control_hz: 50
+camera_hz: 30
+# Publish faster than the workstation's 5 Hz accepted stream so one delayed
+# MuJoCo render/poll does not create an observation watchdog gap.
+observation_hz: 10
+# Keep browser preview and RGB-D evidence bandwidth bounded while preserving
+# enough visual detail for the product VLM. No simulator-truth annotations are
+# generated or exposed by the plant.
+observation_jpeg_quality: 85
+# RTX/CUDA is available on the workstation; keeping SONIC on the GPU leaves
+# enough CPU time for MuJoCo's 250 Hz physics and the ROS bridge.
+force_cpu: false
+# Disable the optional native viewer for acceptance; required offscreen RGB-D
+# remains enabled for H-IDE Vision and mission evidence.
+onscreen: false
+offscreen: true
+# Disable the legacy time-based release.  The workstation integration profile
+# deliberately retains only MuJoCo's non-propulsive vertical/roll/pitch fall
+# arrest after the one-time INIT and tethered settle.  It contributes no
+# world-X/Y force or yaw torque, so translation and turning still have to come
+# from SONIC, while normal room-to-room stops no longer re-run INIT.  The
+# support-off profiles remain available for the stricter balance acceptance.
+startup_support_s: 0.0
+policy_release_fall_arrest: false
+# Model/controller resynchronization is slower than a normal cold start. Keep
+# the root over its initial footprint until the new static hold is established;
+# horizontal support is removed before any navigation acceptance begins.
+startup_horizontal_support_s: 15.0
+reset_policy: explicit_process_restart
+model_scene: /home/phi/learn-projects/h-ide-mujoco-sonic/scenes/office_v2/generated/mujoco/office_v2.runtime.xml
+scene_runtime_manifest: /home/phi/learn-projects/h-ide-mujoco-sonic/scenes/office_v2/generated/runtime_manifest.json
+sonic_model_profile: sonic-python-experimental
+sonic_model_lock: /home/phi/learn-projects/h-ide-mujoco-sonic/config/sonic-models.lock.json
+sonic_model_repo: nvidia/GEAR-SONIC
+sonic_model_revision: 9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2
+lerobot_commit: 56b4087c40d7ee8e78e3485f78fe21e88679355b

@@ -1,0 +1,67 @@
+schema_version: h-ide.mujoco-sonic-config/1
+robot_id: g1-sim
+robot_profile: unitree_g1_29dof
+localization_epoch_id: g1-sim-map-epoch-1
+ros_domain_id: 232
+unitree_domain_id: 230
+interface: lo
+cmd_vel_topic: /cmd_vel
+odom_topic: /odom
+localization_topic: /localization/pose
+nav_path_topic: /plan
+motion_fault_topic: /h_ide/g1_sim/motion_safety_fault
+lowstate_topic: rt/lowstate
+lowcmd_topic: rt/lowcmd
+telemetry_host: 127.0.0.1
+telemetry_port: 8792
+plant_port: 8794
+command_host: 127.0.0.1
+command_port: 8793
+# Read-only checks remain on the existing loopback command boundary. These
+# bounds leave ample time for Robot Agent to cancel its exact Nav2 goal within
+# the 300 ms end-to-end safety budget.
+sonic_health_probe_period_s: 0.025
+sonic_health_probe_timeout_s: 0.040
+plant_lowstate_stale_s: 0.10
+sonic_control_step_stale_s: 0.10
+max_linear_mps: 0.40
+min_walk_command_mps: 0.20
+max_angular_rps: 0.25
+max_facing_lead_rad: 0.15
+max_translation_facing_offset_rad: 0.05
+max_translation_heading_error_rad: 0.25
+translation_heading_violation_s: 0.25
+max_spin_reverse_rad: 0.05
+max_spin_translation_m: 0.30
+spin_translation_violation_s: 0.50
+command_timeout_s: 0.25
+# A newly required Nav2 intent must receive a generation-matched SONIC
+# reference within this much authoritative MuJoCo time.  Use an exact 50 Hz
+# boundary: the planner is asynchronous and a 0.75 s half-tick deadline caused
+# a healthy generation to be killed at the next observable tick (0.76 s).
+# The robot remains on its exact published hold throughout this wait, and this
+# still expires before the ROS bridge's 1.5 s measured gait-start deadline.
+planner_reference_timeout_s: 1.00
+policy_activation_s: 3.0
+motion_handoff_warmup_s: 0.35
+motion_handoff_blend_s: 0.40
+# Apply SONIC's learned IDLE transition only for this bounded interval after a
+# normal Nav2 stop, then latch the settled posture. Safety-interlock stops skip it.
+control_hz: 50
+camera_hz: 30
+observation_hz: 5
+observation_jpeg_quality: 85
+force_cpu: false
+onscreen: true
+offscreen: true
+startup_support_s: 3.5
+policy_release_fall_arrest: true
+startup_horizontal_support_s: 6.0
+reset_policy: explicit_process_restart
+model_scene: /home/phi/learn-projects/h-ide-mujoco-sonic/scenes/office_v2/generated/mujoco/office_v2.runtime.xml
+scene_runtime_manifest: /home/phi/learn-projects/h-ide-mujoco-sonic/scenes/office_v2/generated/runtime_manifest.json
+sonic_model_profile: sonic-python-experimental
+sonic_model_lock: /home/phi/learn-projects/h-ide-mujoco-sonic/config/sonic-models.lock.json
+sonic_model_repo: nvidia/GEAR-SONIC
+sonic_model_revision: 9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2
+lerobot_commit: 56b4087c40d7ee8e78e3485f78fe21e88679355b

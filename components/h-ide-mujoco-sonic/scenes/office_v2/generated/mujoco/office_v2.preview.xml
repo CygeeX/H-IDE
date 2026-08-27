@@ -1,0 +1,5 @@
+<mujoco model="H-IDE Office V2 preview">
+  <compiler angle="radian"/>
+  <option timestep="0.002" gravity="0 0 -9.81"/>
+  <include file="office_v2.include.xml"/>
+</mujoco>

@@ -1,0 +1,68 @@
+# Local environments and dependency trees
+.venv/
+venv/
+env/
+node_modules/
+
+# Python/build caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+*.egg-info/
+build/
+dist/
+install/
+target/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+
+# Model weights and external model caches
+*.onnx
+*.engine
+*.plan
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+models/**/.cache/
+.huggingface/
+hf_cache/
+
+# Runtime state, logs, databases, and generated evidence
+logs/
+log/
+var/
+runs/
+artifacts/
+recordings/
+captures/
+MUJOCO_LOG.TXT
+*.log
+*.db
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+
+# Large generated recordings and sensor captures
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.webm
+*.bag
+*.mcap
+
+# Editor/OS state
+.DS_Store
+.idea/
+.vscode/
+*.swp

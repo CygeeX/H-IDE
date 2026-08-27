@@ -1,0 +1,535 @@
+from __future__ import annotations
+
+import importlib.util
+import json
+import math
+from pathlib import Path
+import sys
+
+import pytest
+
+_MONITOR_PATH = Path(__file__).parents[1] / "tools" / "motion_acceptance_monitor.py"
+_SPEC = importlib.util.spec_from_file_location("motion_acceptance_monitor", _MONITOR_PATH)
+assert _SPEC is not None and _SPEC.loader is not None
+_MONITOR = importlib.util.module_from_spec(_SPEC)
+sys.modules[_SPEC.name] = _MONITOR
+_SPEC.loader.exec_module(_MONITOR)
+AcceptanceLimits = _MONITOR.AcceptanceLimits
+MotionAcceptanceEvaluator = _MONITOR.MotionAcceptanceEvaluator
+ReadonlyHttpSampler = _MONITOR.ReadonlyHttpSampler
+
+
+FIXTURE_PATH = Path(__file__).parent / "fixtures" / "motion_acceptance_cases.json"
+
+
+def _payloads(sample: dict[str, object], index: int) -> tuple[dict, dict]:
+    timestamp = 1_800_000_000.0 + float(sample["t"])
+    yaw = float(sample["yaw"])
+    state = str(sample["state"])
+    safe_hold = state == "safe_hold"
+    active = state in {"active", "fault"}
+    faulted = state == "fault"
+    sequence = int(sample.get("sequence", 100 + index))
+    linear_speed = 0.15 if active else 0.0
+    angular_speed = 0.20 if active else 0.0
+    support_mode = "safety_stop" if safe_hold else ("locomotion" if active else "idle")
+    arm_velocity = float(sample.get("arm_velocity", 1.2 if active else 0.05))
+    fault_trace_count = int(sample.get("fault_trace_count", 0))
+    last_error = sample.get("last_error")
+    if safe_hold:
+        last_error = "plant safety_stop requires explicit control.acquire rearm"
+    plant = {
+        "status": "running",
+        "schemaVersion": "h-ide.mujoco-capture/1",
+        "robotId": "g1-sim",
+        "sourceId": "mujoco:unitree-g1:g1-sim",
+        "localizationEpochId": "g1-sim-map-epoch-1",
+        "sequence": sequence,
+        "capturedAtUnixNs": int(timestamp * 1_000_000_000),
+        "pose": {
+            "x": float(sample["x"]),
+            "y": float(sample["y"]),
+            "z": float(sample["z"]),
+            "qw": math.cos(yaw / 2.0),
+            "qx": 0.0,
+            "qy": 0.0,
+            "qz": math.sin(yaw / 2.0),
+        },
+        "rootVelocity": {
+            "frameId": "base_link",
+            "vx": linear_speed,
+            "vy": 0.0,
+            "vz": 0.0,
+            "wx": 0.0,
+            "wy": 0.0,
+            "wz": angular_speed,
+            "linearSpeedMps": linear_speed,
+            "angularSpeedRps": angular_speed,
+        },
+        "support": {
+            "mode": support_mode,
+            "updatedAt": timestamp,
+            "fault": None,
+            "safetyStopLatched": safe_hold,
+            "safetyStopEpoch": 1,
+            "lastRearmGeneration": None if safe_hold else 1,
+        },
+    }
+    sonic = {
+        "status": "running",
+        "robot_id": "g1-sim",
+        "motion_ready": True,
+        "updated_at": timestamp,
+        "plant_tick": int(float(sample["t"]) * 1000) + 5000,
+        "control_tick_ms": int(float(sample["t"]) * 1000) + 5000,
+        "control_clock_status": "simulation_time_50hz_motion_ready",
+        "nav2_state": "safety_stop" if safe_hold else ("commanding" if active else "idle"),
+        "sonic_mode": "IDLE" if not active else "WALK",
+        "sonic_speed_mps": linear_speed,
+        "sonic_policy_speed_mps": linear_speed,
+        "last_cmd_vx": float(sample.get("last_cmd_vx", linear_speed if active else 0.0)),
+        "last_cmd_vy": 0.0,
+        "last_cmd_wz": angular_speed if active else 0.0,
+        "navigation_task_active": active,
+        "static_hold_active": bool(sample.get("static_hold_active", not active)),
+        "motion_handoff_active": active,
+        "motion_handoff_ratio": 1.0 if active else 0.0,
+        "sonic_planner_reference_ready": active,
+        "sonic_planner_required_pending": False,
+        "sonic_reference_authority_state": "GRANTED" if active else "REVOKED",
+        "sonic_reference_actuator_authority": active,
+        "sonic_reference_authority_dds_target_sequence": 1 if active else None,
+        "sonic_execution_feedback_pending": False,
+        "plant_support_mode": support_mode,
+        "plant_support_requested_mode": support_mode,
+        "plant_support_confirmed_mode": support_mode,
+        "plant_support_stop_pending": False,
+        "plant_support_safety_latched": safe_hold,
+        "plant_support_stop_generation": 1 if safe_hold else None,
+        "fault_trace_path": "/tmp/sonic-fault-trace.json" if fault_trace_count else None,
+        "fault_trace_sample_count": fault_trace_count,
+        "last_error": last_error,
+        "navigation_arm_constrained_joints": 0,
+        "navigation_arm_max_step_rad": 0.04,
+        "navigation_arm_raw_max_deviation_rad": 1.0,
+        "navigation_arm_raw_max_error_from_measured_rad": 0.20,
+        "navigation_arm_measured_max_deviation_rad": 1.0,
+        "navigation_arm_max_velocity_rps": arm_velocity,
+        "navigation_arm_max_estimated_torque_nm": 8.0,
+        "navigation_task_peak_arm_constrained_joints": 0,
+        "navigation_task_peak_arm_raw_deviation_rad": 1.0,
+        "navigation_task_peak_arm_tracking_error_rad": 0.20,
+        "navigation_task_peak_arm_measured_deviation_rad": 1.0,
+        "navigation_task_peak_arm_velocity_rps": arm_velocity,
+        "navigation_task_peak_arm_estimated_torque_nm": 8.0,
+    }
+    if faulted:
+        sonic["nav2_state"] = "fault_latched"
+    return plant, sonic
+
+
+@pytest.mark.parametrize("case", json.loads(FIXTURE_PATH.read_text(encoding="utf-8")), ids=lambda case: case["name"])
+def test_offline_acceptance_fixtures(case: dict[str, object]) -> None:
+    limits = AcceptanceLimits(
+        phase=str(case["phase"]),
+        expected_turn_rad=math.radians(float(case.get("expected_turn_deg", 90.0))),
+    )
+    evaluator = MotionAcceptanceEvaluator(limits)
+    for index, sample in enumerate(case["samples"]):
+        plant, sonic = _payloads(sample, index)
+        evaluator.observe(plant, sonic, observed_s=float(sample["t"]))
+
+    result = evaluator.finalize()
+
+    assert result["pass"] is case["expected_pass"]
+    actual_codes = {failure["code"] for failure in result["failures"]}
+    assert actual_codes.issuperset(case.get("expected_failure_codes", []))
+
+
+@pytest.mark.parametrize(
+    "schema_version",
+    ["h-ide.mujoco-capture/1", "h-ide.mujoco-capture/2"],
+)
+def test_supported_plant_capture_schemas_keep_strict_physical_evaluation(
+    schema_version: str,
+) -> None:
+    evaluator = MotionAcceptanceEvaluator(AcceptanceLimits(phase="idle"))
+    for index, observed_s in enumerate((0.0, 0.2)):
+        plant, sonic = _payloads(
+            {
+                "t": observed_s,
+                "state": "safe_hold",
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.78,
+                "yaw": 0.0,
+            },
+            index,
+        )
+        plant["schemaVersion"] = schema_version
+        evaluator.observe(plant, sonic, observed_s=observed_s)
+
+    assert evaluator.finalize()["pass"] is True
+
+
+def test_unknown_plant_capture_schema_remains_rejected() -> None:
+    plant, sonic = _payloads(
+        {"t": 0.0, "state": "safe_hold", "x": 0.0, "y": 0.0, "z": 0.78, "yaw": 0.0},
+        0,
+    )
+    plant["schemaVersion"] = "h-ide.mujoco-capture/3"
+    evaluator = MotionAcceptanceEvaluator(AcceptanceLimits(phase="idle"))
+
+    evaluator.observe(plant, sonic, observed_s=0.0)
+    result = evaluator.finalize()
+
+    schema_failure = next(
+        failure for failure in result["failures"] if failure["code"] == "SCHEMA_INVALID"
+    )
+    assert "h-ide.mujoco-capture/3" in schema_failure["detail"]
+
+
+def test_motion_acceptance_rejects_crossed_robot_identity_globally() -> None:
+    case = next(
+        item
+        for item in json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+        if item["name"] == "negative_ninety_degree_turn_passes"
+    )
+    evaluator = MotionAcceptanceEvaluator(
+        AcceptanceLimits(
+            phase="turn",
+            expected_turn_rad=math.radians(float(case["expected_turn_deg"])),
+        )
+    )
+    for index, sample in enumerate(case["samples"]):
+        plant, sonic = _payloads(sample, index)
+        plant["robotId"] = "g1-other"
+        evaluator.observe(plant, sonic, observed_s=float(sample["t"]))
+
+    result = evaluator.finalize()
+
+    assert result["pass"] is False
+    assert {failure["code"] for failure in result["failures"]}.issuperset(
+        {"SOURCE_IDENTITY_MISMATCH"}
+    )
+
+
+def test_nonfinite_source_value_fails_and_can_still_be_recorded_safely() -> None:
+    plant, sonic = _payloads(
+        {"t": 0.0, "state": "safe_hold", "x": 0.0, "y": 0.0, "z": 0.78, "yaw": 0.0},
+        0,
+    )
+    sonic["navigation_arm_max_velocity_rps"] = float("nan")
+    evaluator = MotionAcceptanceEvaluator(AcceptanceLimits(phase="idle"))
+
+    evaluator.observe(plant, sonic, observed_s=0.0)
+    result = evaluator.finalize()
+
+    assert result["pass"] is False
+    assert {failure["code"] for failure in result["failures"]}.issuperset(
+        {"NONFINITE_TELEMETRY", "SCHEMA_INVALID"}
+    )
+
+
+@pytest.mark.parametrize(
+    "hold_reason",
+    [
+        "Robot Agent requested simulation safe-stop",
+        "plant safety_stop requires explicit control.acquire rearm",
+        "operator authorization is required before motion",
+    ],
+)
+def test_idle_safe_hold_uses_structure_not_reason_allowlist(hold_reason: str) -> None:
+    plant, sonic = _payloads(
+        {"t": 0.0, "state": "safe_hold", "x": 0.0, "y": 0.0, "z": 0.78, "yaw": 0.0},
+        0,
+    )
+    sonic["last_error"] = hold_reason
+    evaluator = MotionAcceptanceEvaluator(AcceptanceLimits(phase="idle"))
+
+    derived = evaluator.observe(plant, sonic, observed_s=0.0)
+    evaluator.observe(plant, sonic, observed_s=0.2)
+    result = evaluator.finalize()
+
+    assert derived["healthy_settled_safe_hold"] is True
+    assert derived["hold_reason"] == hold_reason
+    assert result["pass"] is True
+    assert result["holdReason"] == hold_reason
+
+
+@pytest.mark.parametrize(
+    ("plant_robot_id", "sonic_robot_id"),
+    [
+        ("", ""),
+        ("g1-sim", "other-robot"),
+        (1, 1),
+    ],
+)
+def test_safe_hold_requires_matching_nonempty_string_robot_identity(
+    plant_robot_id: object,
+    sonic_robot_id: object,
+) -> None:
+    plant, sonic = _payloads(
+        {"t": 0.0, "state": "safe_hold", "x": 0.0, "y": 0.0, "z": 0.78, "yaw": 0.0},
+        0,
+    )
+    plant["robotId"] = plant_robot_id
+    sonic["robot_id"] = sonic_robot_id
+    evaluator = MotionAcceptanceEvaluator(AcceptanceLimits(phase="idle"))
+
+    derived = evaluator.observe(plant, sonic, observed_s=0.0)
+    result = evaluator.finalize()
+
+    assert derived["healthy_settled_safe_hold"] is False
+    assert {failure["code"] for failure in result["failures"]}.issuperset(
+        {"SAFE_HOLD_STATE_CONTRADICTION"}
+    )
+
+
+@pytest.mark.parametrize(
+    "last_rearm_generation",
+    [True, -1, 1.0, "1", 2],
+)
+def test_safe_hold_rejects_invalid_or_newer_plant_rearm_generation(
+    last_rearm_generation: object,
+) -> None:
+    plant, sonic = _payloads(
+        {"t": 0.0, "state": "safe_hold", "x": 0.0, "y": 0.0, "z": 0.78, "yaw": 0.0},
+        0,
+    )
+    plant["support"]["lastRearmGeneration"] = last_rearm_generation
+    evaluator = MotionAcceptanceEvaluator(AcceptanceLimits(phase="idle"))
+
+    derived = evaluator.observe(plant, sonic, observed_s=0.0)
+    result = evaluator.finalize()
+
+    assert derived["healthy_settled_safe_hold"] is False
+    assert {failure["code"] for failure in result["failures"]}.issuperset(
+        {"SAFE_HOLD_STATE_CONTRADICTION"}
+    )
+
+
+def test_safe_hold_accepts_correlated_nonnegative_plant_rearm_generation() -> None:
+    plant, sonic = _payloads(
+        {"t": 0.0, "state": "safe_hold", "x": 0.0, "y": 0.0, "z": 0.78, "yaw": 0.0},
+        0,
+    )
+    plant["support"]["lastRearmGeneration"] = 1
+    evaluator = MotionAcceptanceEvaluator(AcceptanceLimits(phase="idle"))
+
+    derived = evaluator.observe(plant, sonic, observed_s=0.0)
+    evaluator.observe(plant, sonic, observed_s=0.2)
+    result = evaluator.finalize()
+
+    assert derived["healthy_settled_safe_hold"] is True
+    assert result["pass"] is True
+
+
+@pytest.mark.parametrize(
+    ("mutations", "expected_codes"),
+    [
+        (
+            {"last_cmd_vx": 0.1},
+            {"UNEXPECTED_MOTION_INTENT", "SAFE_HOLD_STATE_CONTRADICTION"},
+        ),
+        (
+            {"navigation_task_active": True},
+            {"UNEXPECTED_MOTION_INTENT", "SAFE_HOLD_STATE_CONTRADICTION"},
+        ),
+        (
+            {"fault_trace_path": "/tmp/fault.json", "fault_trace_sample_count": 1},
+            {"SONIC_FAULT_TRACE", "SAFE_HOLD_STATE_CONTRADICTION"},
+        ),
+        (
+            {"status": "failed"},
+            {"SONIC_NOT_RUNNING", "SAFE_HOLD_STATE_CONTRADICTION"},
+        ),
+        (
+            {"plant_support_confirmed_mode": "idle"},
+            {"SAFE_HOLD_STATE_CONTRADICTION"},
+        ),
+        (
+            {"sonic_reference_authority_state": "PRIMED"},
+            {"SAFE_HOLD_STATE_CONTRADICTION"},
+        ),
+        (
+            {"sonic_reference_actuator_authority": True},
+            {"SAFE_HOLD_STATE_CONTRADICTION"},
+        ),
+        (
+            {"sonic_reference_authority_dds_target_sequence": 7},
+            {"SAFE_HOLD_STATE_CONTRADICTION"},
+        ),
+        (
+            {"sonic_execution_feedback_pending": True},
+            {"SAFE_HOLD_STATE_CONTRADICTION"},
+        ),
+        (
+            {"last_cmd_vx": 0.001},
+            {"SAFE_HOLD_STATE_CONTRADICTION"},
+        ),
+        (
+            {"motion_handoff_ratio": 0.001},
+            {"SAFE_HOLD_STATE_CONTRADICTION"},
+        ),
+        (
+            {"plant_support_stop_generation": None},
+            {"SAFE_HOLD_STATE_CONTRADICTION"},
+        ),
+    ],
+)
+def test_safe_hold_reason_cannot_mask_structural_faults(
+    mutations: dict[str, object],
+    expected_codes: set[str],
+) -> None:
+    plant, sonic = _payloads(
+        {"t": 0.0, "state": "safe_hold", "x": 0.0, "y": 0.0, "z": 0.78, "yaw": 0.0},
+        0,
+    )
+    sonic["last_error"] = "Robot Agent requested simulation safe-stop"
+    sonic.update(mutations)
+    evaluator = MotionAcceptanceEvaluator(AcceptanceLimits(phase="idle"))
+
+    evaluator.observe(plant, sonic, observed_s=0.0)
+    result = evaluator.finalize()
+
+    assert result["pass"] is False
+    assert {failure["code"] for failure in result["failures"]}.issuperset(
+        expected_codes
+    )
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "sonic_reference_authority_state",
+        "sonic_reference_actuator_authority",
+        "sonic_reference_authority_dds_target_sequence",
+        "sonic_execution_feedback_pending",
+        "plant_support_stop_generation",
+    ],
+)
+def test_safe_hold_requires_complete_authority_and_support_telemetry(
+    field: str,
+) -> None:
+    plant, sonic = _payloads(
+        {"t": 0.0, "state": "safe_hold", "x": 0.0, "y": 0.0, "z": 0.78, "yaw": 0.0},
+        0,
+    )
+    del sonic[field]
+    evaluator = MotionAcceptanceEvaluator(AcceptanceLimits(phase="idle"))
+
+    evaluator.observe(plant, sonic, observed_s=0.0)
+    result = evaluator.finalize()
+
+    assert {failure["code"] for failure in result["failures"]}.issuperset(
+        {"SCHEMA_INVALID", "SAFE_HOLD_STATE_CONTRADICTION"}
+    )
+
+
+def test_safe_hold_requires_a_positive_plant_stop_epoch() -> None:
+    plant, sonic = _payloads(
+        {"t": 0.0, "state": "safe_hold", "x": 0.0, "y": 0.0, "z": 0.78, "yaw": 0.0},
+        0,
+    )
+    plant["support"]["safetyStopEpoch"] = 0
+    evaluator = MotionAcceptanceEvaluator(AcceptanceLimits(phase="idle"))
+
+    evaluator.observe(plant, sonic, observed_s=0.0)
+    result = evaluator.finalize()
+
+    assert {failure["code"] for failure in result["failures"]}.issuperset(
+        {"SAFE_HOLD_STATE_CONTRADICTION"}
+    )
+
+
+def test_safe_hold_reset_clue_is_rejected_even_when_structure_is_healthy() -> None:
+    plant, sonic = _payloads(
+        {"t": 0.0, "state": "safe_hold", "x": 0.0, "y": 0.0, "z": 0.78, "yaw": 0.0},
+        0,
+    )
+    sonic["last_error"] = "implicit reset was attempted"
+    evaluator = MotionAcceptanceEvaluator(AcceptanceLimits(phase="idle"))
+
+    evaluator.observe(plant, sonic, observed_s=0.0)
+    result = evaluator.finalize()
+
+    assert result["pass"] is False
+    assert {failure["code"] for failure in result["failures"]}.issuperset(
+        {"RESET_OR_NUMERICAL_FAULT_CLUE"}
+    )
+
+
+def test_safe_hold_structured_motion_fault_is_never_treated_as_hold_reason() -> None:
+    plant, sonic = _payloads(
+        {"t": 0.0, "state": "safe_hold", "x": 0.0, "y": 0.0, "z": 0.78, "yaw": 0.0},
+        0,
+    )
+    sonic["last_error"] = (
+        "sonic_driver/SONIC_CONTROL_STALE: control step exceeded the safety bound"
+    )
+    evaluator = MotionAcceptanceEvaluator(AcceptanceLimits(phase="idle"))
+
+    evaluator.observe(plant, sonic, observed_s=0.0)
+    result = evaluator.finalize()
+
+    assert result["pass"] is False
+    assert result["holdReason"] is None
+    assert {failure["code"] for failure in result["failures"]}.issuperset(
+        {"SONIC_LAST_ERROR"}
+    )
+
+
+class _Response:
+    status = 200
+
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def read(self, _limit: int) -> bytes:
+        return self._body
+
+
+def test_http_sampler_is_structurally_get_only_and_bodyless() -> None:
+    requests = []
+    bodies = iter((b'{"status":"running"}', b'{"status":"running"}'))
+
+    def opener(request, *, timeout):
+        requests.append((request, timeout))
+        return _Response(next(bodies))
+
+    sampler = ReadonlyHttpSampler(
+        "http://127.0.0.1:8794/state",
+        "http://127.0.0.1:8792/telemetry",
+        opener=opener,
+    )
+
+    plant, sonic = sampler.sample()
+
+    assert plant == sonic == {"status": "running"}
+    assert len(requests) == 2
+    assert all(request.method == "GET" for request, _timeout in requests)
+    assert all(request.data is None for request, _timeout in requests)
+    assert [request.full_url for request, _timeout in requests] == [
+        "http://127.0.0.1:8794/state",
+        "http://127.0.0.1:8792/telemetry",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("plant", "sonic"),
+    [
+        ("http://127.0.0.1:8794/support", "http://127.0.0.1:8792/telemetry"),
+        ("http://127.0.0.1:8794/state", "http://127.0.0.1:8793/cmd_vel"),
+        ("http://127.0.0.1:8794/state?write=true", "http://127.0.0.1:8792/telemetry"),
+    ],
+)
+def test_http_sampler_rejects_every_non_readonly_path(plant: str, sonic: str) -> None:
+    with pytest.raises(ValueError):
+        ReadonlyHttpSampler(plant, sonic)

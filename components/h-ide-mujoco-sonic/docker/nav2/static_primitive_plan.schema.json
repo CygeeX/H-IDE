@@ -1,0 +1,268 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://h-ide.local/schemas/nav2-static-primitives-v1.json",
+  "title": "H-IDE Nav2 Static Primitive Plan",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "motion_mode",
+    "planner_source",
+    "map_provenance",
+    "runtime_provenance",
+    "segmenter",
+    "execution_policy",
+    "segment_endpoint_indices",
+    "segments",
+    "primitives",
+    "plan_sha256"
+  ],
+  "properties": {
+    "schema_version": {"const": "h-ide.nav2-static-primitives/1"},
+    "motion_mode": {"const": "static_spin_drive_primitives"},
+    "planner_source": {
+      "type": "object",
+      "required": [
+        "action_type",
+        "planner_id",
+        "plugin",
+        "navfn_path_sha256",
+        "navfn_path_pose_count"
+      ],
+      "properties": {
+        "action_type": {"const": "nav2_msgs/action/ComputePathToPose"},
+        "planner_id": {"const": "GridBased"},
+        "plugin": {"const": "nav2_navfn_planner::NavfnPlanner"},
+        "navfn_path_sha256": {"$ref": "#/$defs/sha256"},
+        "navfn_path_pose_count": {"type": "integer", "minimum": 2, "maximum": 1000000}
+      },
+      "additionalProperties": false
+    },
+    "map_provenance": {
+      "type": "object",
+      "required": ["yaml_sha256", "image_sha256", "scene_source_sha256"],
+      "properties": {
+        "yaml_sha256": {"$ref": "#/$defs/sha256"},
+        "image_sha256": {"$ref": "#/$defs/sha256"},
+        "scene_source_sha256": {"$ref": "#/$defs/sha256"}
+      },
+      "additionalProperties": false
+    },
+    "runtime_provenance": {
+      "type": "object",
+      "required": [
+        "runtime_manifest_sha256",
+        "runtime_schema_version",
+        "motion_profile_manifest_sha256",
+        "motion_profile_schema_version",
+        "follow_path_motion_accepted"
+      ],
+      "properties": {
+        "runtime_manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "runtime_schema_version": {"const": "h-ide.office-v2-runtime/1"},
+        "motion_profile_manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "motion_profile_schema_version": {"const": "h-ide.nav2-motion-profile/1"},
+        "follow_path_motion_accepted": {"const": false}
+      },
+      "additionalProperties": false
+    },
+    "segmenter": {
+      "type": "object",
+      "required": [
+        "source_sha256",
+        "robot_radius_m",
+        "footprint_padding_m",
+        "extra_clearance_m",
+        "clearance_radius_m",
+        "min_segment_m",
+        "max_segment_m"
+      ],
+      "properties": {
+        "source_sha256": {"$ref": "#/$defs/sha256"},
+        "robot_radius_m": {"const": 0.35},
+        "footprint_padding_m": {"const": 0.02},
+        "extra_clearance_m": {"const": 0.05},
+        "clearance_radius_m": {"const": 0.42},
+        "min_segment_m": {"const": 0.16},
+        "max_segment_m": {"const": 2.0}
+      },
+      "additionalProperties": false
+    },
+    "execution_policy": {
+      "type": "object",
+      "required": [
+        "fresh_odometry_required",
+        "fresh_pose_frame",
+        "revalidate_line_of_sight_before_drive",
+        "endpoint_tolerance_m",
+        "heading_tolerance_rad",
+        "drive_speed_mps",
+        "spin_min_angular_rps",
+        "spin_max_angular_rps",
+        "spin_angular_accel_rps2",
+        "zero_spin_policy",
+        "final_heading_policy",
+        "short_residual_policy"
+      ],
+      "properties": {
+        "fresh_odometry_required": {"const": true},
+        "fresh_pose_frame": {"const": "map"},
+        "revalidate_line_of_sight_before_drive": {"const": true},
+        "endpoint_tolerance_m": {"const": 0.15},
+        "heading_tolerance_rad": {"const": 0.09},
+        "drive_speed_mps": {"const": 0.4},
+        "spin_min_angular_rps": {"const": 0.1},
+        "spin_max_angular_rps": {"const": 0.25},
+        "spin_angular_accel_rps2": {"const": 0.3},
+        "zero_spin_policy": {"const": "skip_within_heading_tolerance"},
+        "final_heading_policy": {"const": "omit_checkpoint_if_within_heading_tolerance"},
+        "short_residual_policy": {"const": "skip_within_endpoint_tolerance_else_fail_below_min_segment"}
+      },
+      "additionalProperties": false
+    },
+    "segment_endpoint_indices": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 1000000,
+      "uniqueItems": true,
+      "items": {"type": "integer", "minimum": 0, "maximum": 999999}
+    },
+    "segments": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 999999,
+      "items": {"$ref": "#/$defs/segment"}
+    },
+    "primitives": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 1999999,
+      "items": {
+        "oneOf": [
+          {"$ref": "#/$defs/align_spin"},
+          {"$ref": "#/$defs/drive"},
+          {"$ref": "#/$defs/final_spin"}
+        ]
+      }
+    },
+    "plan_sha256": {"$ref": "#/$defs/sha256"}
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "point": {
+      "type": "object",
+      "required": ["x", "y"],
+      "properties": {
+        "x": {"type": "number", "minimum": -1000000, "maximum": 1000000},
+        "y": {"type": "number", "minimum": -1000000, "maximum": 1000000}
+      },
+      "additionalProperties": false
+    },
+    "yaw": {
+      "type": "number",
+      "minimum": -3.141592653589793,
+      "maximum": 3.141592653589793
+    },
+    "segment": {
+      "type": "object",
+      "required": [
+        "id",
+        "path_start_index",
+        "path_end_index",
+        "start_map",
+        "end_map",
+        "distance_m",
+        "heading_map_yaw_rad"
+      ],
+      "properties": {
+        "id": {"type": "string", "pattern": "^segment-[0-9]{3,6}$"},
+        "path_start_index": {"type": "integer", "minimum": 0, "maximum": 999999},
+        "path_end_index": {"type": "integer", "minimum": 1, "maximum": 999999},
+        "start_map": {"$ref": "#/$defs/point"},
+        "end_map": {"$ref": "#/$defs/point"},
+        "distance_m": {"type": "number", "minimum": 0.05, "maximum": 2.0},
+        "heading_map_yaw_rad": {"$ref": "#/$defs/yaw"}
+      },
+      "additionalProperties": false
+    },
+    "align_spin": {
+      "type": "object",
+      "required": [
+        "sequence",
+        "kind",
+        "checkpoint_role",
+        "action_type",
+        "segment_id",
+        "path_index",
+        "reference_end_map",
+        "planned_target_map_yaw_rad",
+        "requires_fresh_odometry"
+      ],
+      "properties": {
+        "sequence": {"type": "integer", "minimum": 0, "maximum": 1999998},
+        "kind": {"const": "spin"},
+        "checkpoint_role": {"const": "align_segment"},
+        "action_type": {"const": "nav2_msgs/action/Spin"},
+        "segment_id": {"type": "string", "pattern": "^segment-[0-9]{3,6}$"},
+        "path_index": {"type": "integer", "minimum": 0, "maximum": 999999},
+        "reference_end_map": {"$ref": "#/$defs/point"},
+        "planned_target_map_yaw_rad": {"$ref": "#/$defs/yaw"},
+        "requires_fresh_odometry": {"const": true}
+      },
+      "additionalProperties": false
+    },
+    "drive": {
+      "type": "object",
+      "required": [
+        "sequence",
+        "kind",
+        "checkpoint_role",
+        "action_type",
+        "segment_id",
+        "path_end_index",
+        "end_map",
+        "speed_mps",
+        "requires_fresh_odometry"
+      ],
+      "properties": {
+        "sequence": {"type": "integer", "minimum": 1, "maximum": 1999998},
+        "kind": {"const": "drive_on_heading"},
+        "checkpoint_role": {"const": "reach_segment_endpoint"},
+        "action_type": {"const": "nav2_msgs/action/DriveOnHeading"},
+        "segment_id": {"type": "string", "pattern": "^segment-[0-9]{3,6}$"},
+        "path_end_index": {"type": "integer", "minimum": 1, "maximum": 999999},
+        "end_map": {"$ref": "#/$defs/point"},
+        "speed_mps": {"const": 0.4},
+        "requires_fresh_odometry": {"const": true}
+      },
+      "additionalProperties": false
+    },
+    "final_spin": {
+      "type": "object",
+      "required": [
+        "sequence",
+        "kind",
+        "checkpoint_role",
+        "action_type",
+        "path_index",
+        "reference_end_map",
+        "planned_target_map_yaw_rad",
+        "requires_fresh_odometry"
+      ],
+      "properties": {
+        "sequence": {"type": "integer", "minimum": 2, "maximum": 1999998},
+        "kind": {"const": "spin"},
+        "checkpoint_role": {"const": "final_heading"},
+        "action_type": {"const": "nav2_msgs/action/Spin"},
+        "path_index": {"type": "integer", "minimum": 1, "maximum": 999999},
+        "reference_end_map": {"$ref": "#/$defs/point"},
+        "planned_target_map_yaw_rad": {"$ref": "#/$defs/yaw"},
+        "requires_fresh_odometry": {"const": true}
+      },
+      "additionalProperties": false
+    }
+  }
+}

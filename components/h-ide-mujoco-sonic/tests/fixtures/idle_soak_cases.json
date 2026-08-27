@@ -1,0 +1,29 @@
+[
+  {
+    "name": "clean_nonzero_baseline",
+    "plant_delta": 0,
+    "sonic_delta": 0,
+    "robot_ready": true,
+    "safe_hold_pass": true,
+    "movement_release_allowed": true,
+    "quarantine_exercised": false
+  },
+  {
+    "name": "safe_hold_quarantines_runtime_stall",
+    "plant_delta": 1,
+    "sonic_delta": 1,
+    "robot_ready": true,
+    "safe_hold_pass": true,
+    "movement_release_allowed": false,
+    "quarantine_exercised": true
+  },
+  {
+    "name": "runtime_stall_latches_robot_agent",
+    "plant_delta": 1,
+    "sonic_delta": 1,
+    "robot_ready": false,
+    "safe_hold_pass": false,
+    "movement_release_allowed": false,
+    "quarantine_exercised": false
+  }
+]
