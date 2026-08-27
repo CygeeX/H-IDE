@@ -3,7 +3,7 @@ schema_version: skillstore.integration-lock/1
 release:
   id: skillstore-office-v2-e2e-20260827
   branch: main
-  tag: integration/office-v2-e2e-20260827
+  tag: integration/office-v2-e2e-20260827-r1
   status: frozen-integration
   root_commit: recorded-by-release-tag
   validation_contract: L0-L1-L2

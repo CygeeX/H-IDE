@@ -3,7 +3,9 @@
 当前主任务流为 [Mission V2 连续 Supervisor–Worker 架构](docs/architecture/mission-v2-continuous-supervisor-worker.md)。真实 Robot Agent / D435i / Mock Nav2 的整链步骤见 [Mission V2 联调与验收清单](docs/integration/mission-v2-real-validation.md)。
 
 
-需要从跨仓库、端到端视角理解当前 PWA、Mission、Vision、Robot Agent、Nav2、SONIC、MuJoCo、DAAAM 与开源依赖时，请从 [H-IDE 联调开发者手册](docs/developer/README.md) 开始。
+需要从跨仓库、端到端视角理解当前 PWA、Mission、Vision、Robot Agent、Nav2、SONIC、MuJoCo、DAAAM 与开源依赖时，请从仓库根目录的
+[Skillstore 组件开发者索引](../../docs/components/README.md) 和
+[架构与信任边界](../../docs/architecture/README.md) 开始。
 Robot Action Console 是工作站上的机器人行动控制平面。它不是机器人侧
 Robot Agent，也不是 Agent 依赖框架；它把手动控制、已确认的 Agent 计划和
 接口映射管理统一收敛到一个可审计的 `ActionRuntime`。

@@ -127,7 +127,7 @@ cd components/h-ide-mujoco-sonic
 
 ## 变更和回退
 
-当前 `main` 和 `integration/office-v2-e2e-20260827` 标签代表同一冻结版。实验变更
+当前 `main` 和 `integration/office-v2-e2e-20260827-r1` 标签代表同一冻结版。实验变更
 从 feature 分支开始；合入前必须通过 L0/L1，涉及 live motion 时保存 L2 证据。
 回退时检出冻结标签并重新执行 bootstrap/preflight，不要把旧 worktree 的 `.env`
 或数据库提交进来。

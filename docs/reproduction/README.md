@@ -10,8 +10,8 @@
 git clone http://192.168.50.189:37085/zhongwenjun/skillstore.git
 cd skillstore
 git status --short
-git tag --verify integration/office-v2-e2e-20260827 2>/dev/null || \
-  git show --no-patch integration/office-v2-e2e-20260827
+git tag --verify integration/office-v2-e2e-20260827-r1 2>/dev/null || \
+  git show --no-patch integration/office-v2-e2e-20260827-r1
 ./integration/acceptance.sh --level L0
 ```
 
