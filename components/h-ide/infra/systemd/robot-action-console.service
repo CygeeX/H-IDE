@@ -1,0 +1,37 @@
+[Unit]
+Description=Robot Action Console workstation control plane
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=robot-control
+Group=robot-control
+WorkingDirectory=/opt/robot-action-console
+EnvironmentFile=-/etc/robot-action-console/control-api.env
+Environment=CONTROL_API_PORT=8080
+Environment=CONTROL_DB_PATH=/var/lib/robot-action-console/control.db
+StateDirectory=robot-action-console
+# Use the module-level app so importing the service does not initialize a
+# second store/watchdog through a factory call.
+ExecStart=/opt/robot-action-console/.venv/bin/uvicorn services.control_api.main:app --host 127.0.0.1 --port ${CONTROL_API_PORT} --workers 1
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=20s
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/robot-action-console /var/log/robot-action-console
+LimitNOFILE=65536
+# The API's runtime watchdog expires robot leases; systemd restarts a wedged
+# process. If a deployment adds an sd_notify wrapper, set Type=notify and a
+# positive WatchdogSec here; uvicorn itself does not emit watchdog pings.
+WatchdogSec=0
+
+[Install]
+WantedBy=multi-user.target

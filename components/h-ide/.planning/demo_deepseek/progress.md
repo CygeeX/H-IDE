@@ -1,0 +1,23 @@
+# Progress
+
+- 2026-08-07：收到用户授权，目标为 DeepSeek + Whisper + FakeAdapter 本地演示。
+- 2026-08-07：确认仓库没有 `.codegraph/`，按 AGENTS.md 跳过 CodeGraph。
+- 2026-08-07：查证 Mastra 源码与 DeepSeek 官方文档，确定模型标识 `deepseek/deepseek-v4-flash` 和凭证变量 `DEEPSEEK_API_KEY`。
+- 2026-08-07：新增 DeepSeek 凭证就绪测试并观察到预期失败（1 failed, 5 passed）；随后补齐 Agent 配置、Compose 透传与示例文档。
+- 2026-08-07：生成 64 字符 Mastra 内部 Token，创建 mode 600 的本地 `.env`；Compose 配置校验通过。
+- 2026-08-07：官方 DeepSeek `/models` 对用户 Key 返回 401；查明是阿里云套餐专用 Key，停止进一步调用并将完整规划演示标记为外部凭证阻塞。
+- 2026-08-07：按用户要求替换为 DeepSeek 官方 Key；官方 `/models` 认证成功并确认 `deepseek-v4-flash` 可用，`.env` 保持 mode 600，Compose 校验通过。
+- 2026-08-07：恢复执行部署计划，凭证阻塞已解除；剩余目标为 Whisper 下载、完整栈启动和端到端验收。
+- 2026-08-07：Whisper 模型下载完成；初次错误使用 CDN ETag 做哈希断言导致退出，诊断确认实际 SHA-256 与 Hugging Face `x-linked-etag` 完全一致。
+- 2026-08-07：Whisper `ggml-small.bin` 已完成大小和 SHA-256 校验，并从 `.part` 原子改名为最终文件。
+- 2026-08-07：使用 `speech` profile 构建并启动五个服务；Planning Agent/PostgreSQL healthy，网页、规划就绪和 Whisper HTTP 边界均可访问。
+- 2026-08-07：首次真实文本任务完成 LLM 规划但在严格结构校验处失败（merged plan omitted or invented a worker fragment step）；未生成草案、未执行任何 FakeAdapter 命令。
+- 2026-08-07：读取 Mastra 原始结构化输出，定位到 manipulation-worker 越权规划了 move.forward，导致重复片段步骤与 Structuring 去重结果不一致。
+- 2026-08-07：新增“内置 Worker 输入命令隔离”和“越权输出拒绝”两条回归测试，确认 RED 后实现最小修复；h-ide-agent 27/27 测试与 typecheck 通过。
+- 2026-08-07：重建 Planning Agent 后就绪检查 200；首次复验在 TLS 建连前被 DeepSeek 端断开，尚未进入模型输出阶段，开始分层网络诊断。
+- 2026-08-07：Planning Agent 容器内重新访问 DeepSeek `/models` 返回 200；日志确认前次为 retryable ECONNRESET，当前网络链路恢复。
+- 2026-08-07：第二次逻辑复验中 Worker 越权未再出现，但 Structuring 顶层夹爪步骤与原片段不一致，被严格校验拒绝；FakeAdapter 仍未触发。
+- 2026-08-07：将 Structuring 输出收敛为 merge advice，代码确定性组装 PlanProposal；新增“保留不可变字段”和“拒绝遗漏步骤”测试，h-ide-agent 29/29 与 typecheck 通过。
+- 2026-08-07：重建后真实 DeepSeek Supervisor–Worker 规划返回 draft_ready；确认后两步 FakeAdapter 执行均 succeeded，核心端到端链路跑通。
+- 2026-08-07：使用本地合成语音完成 Control API→Whisper small 实际转写，格式与推理结果均通过；临时 WAV 已删除。
+- 2026-08-07：最终验收通过：Python 全套测试、PWA 8/8+build、Agent 29/29+typecheck+build；五服务运行、网页/健康/就绪 200、匿名业务接口 401、持久化草案 confirmed、两条 receipt succeeded、模型哈希正确、diff check 通过。

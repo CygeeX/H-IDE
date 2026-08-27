@@ -1,0 +1,21 @@
+# Findings
+
+- H-IDE 与 h-ide-agent 均位于非主分支，但当前必要功能尚未统一提交；本轮必须原地增量实现。
+- 基线：Python 130 tests、PWA 8 tests + build、Agent 29 tests + typecheck + build 全部通过。
+- PDAL 2.10.0 的 PcdReader 支持 ascii/binary，但明确拒绝 binary_compressed；压缩格式需先用 PCL 转为 binary PCD。
+- PotreeConverter 2.1.3 输出 metadata.json、hierarchy.bin、octree.bin，Potree 2.0 loader 对后两者使用 Range fetch。
+- 当前 Control API 直接暴露 8080 并托管 PWA；大文件流量必须经独立网关进入 scene-api。
+- SceneContext.selectedPoint 必须作为选点任务的权威坐标；intent 中重复坐标仅用于一致性校验。
+- Pydantic 默认集合字段必须启用 validate_default 才能保持嵌套不可变；RobotState 使用兼容 Pydantic 2.7 的 wrap serializer 保持旧序列化形状。
+- 交互标定同时验证双向逆矩阵，并拒绝远离拟合地面的原点。
+- Scene API 的转换产物清单固定为 Potree 2.0 的 metadata.json、hierarchy.bin、octree.bin；完成作业时校验存储键和真实普通文件，发布版本后通过路径隔离的 HttpOnly 短时会话读取并支持 Range。
+- PotreeConverter 会额外生成 log.txt；Worker 只把三个浏览器必需文件移动到独立 publish 目录后再原子 rename，避免日志和半成品进入可见资产。
+- 统一网关不对 Potree 二进制资产启用内容压缩，避免改变 hierarchy/octree 的 Range 字节语义。
+- H-IDE 使用本地 Potree 1.8.2（提交 `5636cd47`）的精简运行时加载 PotreeConverter 2.0 产物；点云 URL 只交给浏览器，LLM 仅接收已发布且绑定版本的紧凑场景引用、map 边界、语义区域、当前位姿和可选目标点。
+- PWA 离线缓存只覆盖应用壳和静态运行时；控制 API、分片上传、受保护点云资产及 Range 请求始终走工作站网络。
+- Mastra 的 `RequestContext` 用来向 `resolve_spatial_target` 工具注入服务端验证过的 SceneContext；模型只能提交空间意图，工具输出的 `goalPose + spatialResolution` 在 Agent 合并、Control API 草案落库和人工确认三个边界保持不可改写。
+- 人工确认不会直接信任草案坐标：它从草案元数据恢复原始场景快照，再读取当前机器人绑定与 pose；场景版本改变、payload 篡改或默认超过 0.5 m/0.35 rad 的漂移都会在任何 adapter dispatch 前失败。
+- 浏览器分片上传必须把 `uploadId + offset` 按文件指纹持久化，并以 Scene API 返回的 offset 为准；这样刷新页面、网络丢失 PATCH 响应或重复选择同一文件都能继续上传而不是重新建会话。
+- PotreeConverter 2.1.3 在容器中既依赖随源码构建的 `liblaszip.so`，也会根据 `argv[0]` 推导自身路径；仅把命令目录加入 PATH 不够，Worker 必须传入绝对可执行路径。
+- Gateway 对 Scene API 使用 `service_started` 而非健康依赖；场景转换故障不应阻止 Control API 与 stop/cancel 安全路径启动和对外提供服务。
+- 真实 27 点压缩 PCD 验收验证了从上传、转换、标定、标注、发布、绑定到受保护 Range 资产读取的完整链路，未发现半成品资产泄漏。

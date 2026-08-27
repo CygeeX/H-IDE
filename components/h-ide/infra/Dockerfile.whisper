@@ -1,0 +1,27 @@
+FROM debian:bookworm-slim AS build
+
+ARG WHISPER_CPP_VERSION=v1.9.2
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates cmake g++ git make \
+    && rm -rf /var/lib/apt/lists/*
+RUN git clone --depth 1 --branch "${WHISPER_CPP_VERSION}" \
+    https://github.com/ggml-org/whisper.cpp.git /src
+WORKDIR /src
+RUN cmake -S . -B build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DBUILD_SHARED_LIBS=OFF \
+      -DWHISPER_BUILD_TESTS=OFF \
+      -DWHISPER_BUILD_EXAMPLES=ON \
+    && cmake --build build --config Release --target whisper-server -j2
+
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/build/bin/whisper-server /usr/local/bin/whisper-server
+
+USER 65532:65532
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/whisper-server"]
+CMD ["--host", "0.0.0.0", "--port", "8080", "--model", "/models/ggml-small.bin"]

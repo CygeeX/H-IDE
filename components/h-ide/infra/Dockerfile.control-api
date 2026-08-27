@@ -1,0 +1,30 @@
+# Multi-stage local image: build the PWA once, then serve it from the BFF.
+FROM node:24-alpine AS pwa-build
+WORKDIR /src/apps/control-pwa
+COPY apps/control-pwa/package*.json ./
+RUN npm ci
+COPY apps/control-pwa/ ./
+RUN npm run build
+
+FROM python:3.12-slim
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+WORKDIR /app
+# Keep third-party wheels in a source-independent layer.  Previously every
+# Python edit invalidated `pip install .` and redownloaded the full runtime,
+# turning a one-line Control API fix into a multi-minute rebuild.
+COPY services/control-api/requirements.txt /tmp/control-api-requirements.txt
+RUN pip install --no-cache-dir "setuptools>=68" -r /tmp/control-api-requirements.txt
+COPY pyproject.toml ./
+COPY packages/ ./packages/
+COPY services/ ./services/
+RUN pip install --no-cache-dir --no-deps --no-build-isolation .
+COPY --from=pwa-build /src/apps/control-pwa/dist ./apps/control-pwa/dist
+RUN useradd --create-home --uid 10001 control && mkdir -p /data && chown -R control:control /app /data
+USER control
+ENV CONTROL_DB_PATH=/data/control.db
+EXPOSE 8080
+# The module exposes one initialized ``app`` object.  Using it directly avoids
+# importing the module once for ``app = create_app()`` and a second time for a
+# factory invocation (which would create duplicate SQLite connections and
+# runtime watchdogs).
+CMD ["uvicorn", "services.control_api.main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]

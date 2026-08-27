@@ -1,0 +1,19 @@
+{
+  "name": "H-IDE Robot Workspace",
+  "short_name": "H-IDE",
+  "description": "聊天优先的机器人任务规划与控制工作站",
+  "start_url": "/app",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f8f3e9",
+  "theme_color": "#f8f3e9",
+  "lang": "zh-CN",
+  "icons": [
+    {
+      "src": "/icons/h-ide.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

@@ -1,0 +1,47 @@
+# Optional overlay for the H-IDE-owned simulation profiles.  The MuJoCo/SONIC
+# processes and the isolated ROS 2 Robot Agent stay on the host; this overlay
+# gives control-api an explicit read-only observation path through Docker's
+# host-gateway. The simulator binds that path only on Docker's validated bridge
+# address; command authority remains host-loopback Robot Agent + Nav2.
+# Use it together with the base file:
+#   docker compose -f infra/docker-compose.yml -f infra/docker-compose.simulation.yml up
+# profile.  The deterministic backend remains available until the MuJoCo
+# acceptance checklist is complete.
+services:
+  planning-agent:
+    environment:
+      # Simulation RGB-D is grounded by the same host GPU product service as
+      # live observations; simulator truth is not a selectable provider.
+      HIDE_VISION_URL: http://host.docker.internal:8092
+      HIDE_VISION_VLM_PROVIDER: qwen
+      HIDE_VISION_VLM_MODEL: qwen3-vl-plus
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  control-api:
+    environment:
+      SIMULATION_DB_PATH: /data/control.db
+      MISSION_V2_ALLOW_SYNTHETIC_PROFILE: "true"
+      # Simulation Missions must inherit the immutable Office V2 Scene API
+      # binding.  A missing/stale binding fails draft creation instead of
+      # allowing the planner to invent room names or map coordinates.
+      MISSION_V2_AUTO_USE_BOUND_SCENE: "true"
+      VISUAL_MISSION_MODE: ${VISUAL_MISSION_MODE:-observe}
+      SIMULATION_ROBOT_AGENT_GATEWAY_URL: ${SIMULATION_ROBOT_AGENT_GATEWAY_URL:-http://host.docker.internal:8094}
+      SIMULATION_ROBOT_AGENT_GATEWAY_TOKEN: ${SIMULATION_ROBOT_AGENT_GATEWAY_TOKEN:-dev-sim-gateway-token}
+      SIMULATION_ROBOT_AGENT_ID: ${SIMULATION_ROBOT_AGENT_ID:-g1-sim}
+      # The Robot Agent binds its privileged diagnostics service to host
+      # loopback on 8796.  Docker reaches the read-only bridge published by
+      # the workstation launcher on 8797; pointing the container at 8796
+      # makes an otherwise healthy Nav2/Robot Agent chain look unreachable.
+      SIMULATION_ROBOT_AGENT_DIAGNOSTICS_URL: ${SIMULATION_ROBOT_AGENT_DIAGNOSTICS_URL:-http://host.docker.internal:8797}
+      # Server-side GET-only health/telemetry/RGB-D transport. Neither URL is
+      # a command surface; browser-facing media remains the loopback URL below.
+      HIDE_MUJOCO_SONIC_TELEMETRY_URL: ${HIDE_MUJOCO_SONIC_TELEMETRY_URL:-http://host.docker.internal:8792}
+      HIDE_MUJOCO_SONIC_PLANT_URL: ${HIDE_MUJOCO_SONIC_PLANT_URL:-http://host.docker.internal:8794}
+      HIDE_MUJOCO_SONIC_PUBLIC_PLANT_URL: ${HIDE_MUJOCO_SONIC_PUBLIC_PLANT_URL:-http://127.0.0.1:8794}
+      HIDE_VISION_URL: http://host.docker.internal:8092
+      HIDE_MISSION_VISION_PROVIDER: qwen
+      HIDE_MISSION_VISION_MODEL: qwen3-vl-plus
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
