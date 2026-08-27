@@ -1,0 +1,332 @@
+syntax = "proto3";
+
+package robot.observation.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// Observation-only data plane. It intentionally defines no command RPC.
+service RobotObservationService {
+  rpc Stream(stream GatewayToWorkstation) returns (stream WorkstationToGateway);
+}
+
+message ProtocolVersion {
+  uint32 major = 1;
+  uint32 minor = 2;
+  string schema_sha256 = 3;
+}
+
+enum PurposeCode {
+  PURPOSE_CODE_UNSPECIFIED = 0;
+  PURPOSE_CODE_VISUAL_TARGET_RESOLUTION = 1;
+  PURPOSE_CODE_REMOTE_DIAGNOSTICS = 2;
+  PURPOSE_CODE_LOCAL_TEST = 3;
+}
+
+enum SourceMode {
+  SOURCE_MODE_UNSPECIFIED = 0;
+  SOURCE_MODE_LIVE = 1;
+  SOURCE_MODE_REPLAY = 2;
+  SOURCE_MODE_SYNTHETIC = 3;
+}
+
+enum ClockDomain {
+  CLOCK_DOMAIN_UNSPECIFIED = 0;
+  CLOCK_DOMAIN_GLOBAL_TIME = 1;
+  CLOCK_DOMAIN_HARDWARE_CLOCK = 2;
+  CLOCK_DOMAIN_SYSTEM_TIME = 3;
+}
+
+enum RgbEncoding {
+  RGB_ENCODING_UNSPECIFIED = 0;
+  RGB_ENCODING_JPEG = 1;
+}
+
+enum DepthEncoding {
+  DEPTH_ENCODING_UNSPECIFIED = 0;
+  DEPTH_ENCODING_ZSTD_Z16_LE = 1;
+}
+
+enum AckResult {
+  ACK_RESULT_UNSPECIFIED = 0;
+  ACK_RESULT_ACCEPTED = 1;
+  ACK_RESULT_REJECTED = 2;
+}
+
+enum AckRejectReason {
+  ACK_REJECT_REASON_NONE = 0;
+  ACK_REJECT_REASON_STALE = 1;
+  ACK_REJECT_REASON_BAD_CHECKSUM = 2;
+  ACK_REJECT_REASON_DECODE_ERROR = 3;
+  ACK_REJECT_REASON_OUT_OF_ORDER = 4;
+  ACK_REJECT_REASON_SCENE_MISMATCH = 5;
+  ACK_REJECT_REASON_TOO_LARGE = 6;
+  ACK_REJECT_REASON_UNSUPPORTED_ENCODING = 7;
+  ACK_REJECT_REASON_IDENTITY_MISMATCH = 8;
+  ACK_REJECT_REASON_INVALID_METADATA = 9;
+  ACK_REJECT_REASON_PROTOCOL_MISMATCH = 10;
+  ACK_REJECT_REASON_CALIBRATION_MISMATCH = 11;
+  ACK_REJECT_REASON_LOCALIZATION_MISMATCH = 12;
+}
+
+enum SessionEndReason {
+  SESSION_END_REASON_UNSPECIFIED = 0;
+  SESSION_END_REASON_REQUESTED = 1;
+  SESSION_END_REASON_TRANSPORT_LOST = 2;
+  SESSION_END_REASON_KEEPALIVE_EXPIRED = 3;
+  SESSION_END_REASON_SCENE_CHANGED = 4;
+  SESSION_END_REASON_CALIBRATION_CHANGED = 5;
+  SESSION_END_REASON_LOCALIZATION_CHANGED = 6;
+  SESSION_END_REASON_PROFILE_CHANGED = 7;
+  SESSION_END_REASON_WRITE_TIMEOUT = 8;
+  SESSION_END_REASON_SHUTDOWN = 9;
+}
+
+enum GatewayErrorCode {
+  GATEWAY_ERROR_CODE_UNSPECIFIED = 0;
+  GATEWAY_ERROR_CODE_PROTOCOL_VIOLATION = 1;
+  GATEWAY_ERROR_CODE_SESSION_CONFLICT = 2;
+  GATEWAY_ERROR_CODE_CAMERA_UNAVAILABLE = 3;
+  GATEWAY_ERROR_CODE_FRAME_TOO_LARGE = 4;
+  GATEWAY_ERROR_CODE_INTERNAL = 5;
+}
+
+message Vector3 { double x = 1; double y = 2; double z = 3; }
+message Quaternion { double x = 1; double y = 2; double z = 3; double w = 4; }
+
+message PoseTransform {
+  string parent_frame_id = 1;
+  string child_frame_id = 2;
+  Vector3 translation = 3;
+  Quaternion rotation = 4;
+}
+
+message RegionOfInterest {
+  uint32 x_offset = 1;
+  uint32 y_offset = 2;
+  uint32 width = 3;
+  uint32 height = 4;
+  bool do_rectify = 5;
+}
+
+message CameraIntrinsics {
+  uint32 width = 1;
+  uint32 height = 2;
+  double fx = 3;
+  double fy = 4;
+  double cx = 5;
+  double cy = 6;
+  string distortion_model = 7;
+  repeated double distortion_coefficients = 8;
+  uint32 binning_x = 9;
+  uint32 binning_y = 10;
+  RegionOfInterest roi = 11;
+}
+
+message CameraCalibration {
+  string sensor_id = 1;
+  string device_serial = 2;
+  string device_model = 3;
+  string firmware_version = 4;
+  string color_profile = 5;
+  string depth_profile = 6;
+  CameraIntrinsics rgb_intrinsics = 7;
+  CameraIntrinsics aligned_depth_intrinsics = 8;
+  double depth_scale_meters_per_unit = 9;
+  string calibration_sha256 = 10;
+}
+
+message LocalizationEstimate {
+  google.protobuf.Timestamp observed_at = 1;
+  string frame_id = 2;
+  repeated double covariance = 3; // Exactly 36 row-major values.
+  double age_ms = 4;
+}
+
+message DropCounters {
+  uint64 raw_overwritten = 1;
+  uint64 metadata_missing = 2;
+  uint64 tf_missing = 3;
+  uint64 localization_missing = 4;
+  uint64 stale_before_encode = 5;
+  uint64 encode_failed = 6;
+  uint64 encoded_overwritten = 7;
+  uint64 frame_too_large = 8;
+  uint64 write_timeout = 9;
+  uint64 workstation_rejected = 10;
+  uint64 invalid_frame = 11;
+}
+
+message FrameMetrics {
+  double capture_age_ms = 1;
+  double encode_ms = 2;
+  double queue_ms = 3;
+  uint64 drop_count = 4;
+}
+
+message SensorDescriptor {
+  string sensor_id = 1;
+  string source_id = 2;
+  string device_serial = 3;
+  string device_model = 4;
+  repeated RgbEncoding rgb_encodings = 5;
+  repeated DepthEncoding depth_encodings = 6;
+  double max_rate_hz = 7;
+  uint32 max_frame_bytes = 8;
+}
+
+message GatewayHello {
+  ProtocolVersion protocol = 1;
+  string robot_id = 2;
+  string robot_boot_id = 3;
+  string gateway_instance_id = 4;
+  string gateway_version = 5;
+  repeated string features = 6;
+  repeated SensorDescriptor sensors = 7;
+  SourceMode source_mode = 8;
+  string source_id = 9;
+}
+
+message SessionStarted {
+  string request_id = 1;
+  string robot_id = 2;
+  string robot_boot_id = 3;
+  string gateway_instance_id = 4;
+  string observation_session_id = 5;
+  string sensor_id = 6;
+  optional string scene_version = 7;
+  double effective_rate_hz = 8;
+  google.protobuf.Timestamp started_at = 9;
+  CameraCalibration calibration = 10;
+  string localization_epoch_id = 11;
+  SourceMode source_mode = 12;
+  string source_id = 13;
+}
+
+message ObservationFrame {
+  string robot_id = 1;
+  string robot_boot_id = 2;
+  string gateway_instance_id = 3;
+  string observation_session_id = 4;
+  uint64 sequence = 5;
+  string sensor_id = 6;
+  optional string scene_version = 7;
+  google.protobuf.Timestamp capture_time = 8;
+  uint64 rgb_frame_number = 9;
+  uint64 depth_frame_number = 10;
+  double rgb_sensor_timestamp_ms = 11;
+  double depth_sensor_timestamp_ms = 12;
+  ClockDomain clock_domain = 13;
+  RgbEncoding rgb_encoding = 14;
+  bytes rgb = 15;
+  uint32 rgb_crc32c = 16;
+  DepthEncoding depth_encoding = 17;
+  bytes aligned_depth = 18;
+  uint32 depth_crc32c = 19;
+  double depth_scale_meters_per_unit = 20;
+  CameraIntrinsics intrinsics = 21;
+  string calibration_sha256 = 22;
+  PoseTransform t_map_camera = 23;
+  PoseTransform t_base_camera = 24;
+  LocalizationEstimate localization = 25;
+  FrameMetrics metrics = 26;
+  uint32 jpeg_quality = 27;
+  int32 zstd_level = 28;
+  uint32 uncompressed_rgb_bytes = 29;
+  uint32 uncompressed_depth_bytes = 30;
+  string localization_epoch_id = 31;
+  SourceMode source_mode = 32;
+  string source_id = 33;
+  double clock_uncertainty_ms = 34;
+}
+
+message SessionEnded {
+  string observation_session_id = 1;
+  SessionEndReason reason = 2;
+  string detail = 3;
+  google.protobuf.Timestamp ended_at = 4;
+}
+
+message GatewayTelemetry {
+  string observation_session_id = 1;
+  google.protobuf.Timestamp emitted_at = 2;
+  double actual_send_fps = 3;
+  double bandwidth_mbps = 4;
+  double ack_rtt_ms = 5;
+  double ack_rtt_p50_ms = 6;
+  double ack_rtt_p95_ms = 7;
+  double ack_rtt_max_ms = 8;
+  double write_blocked_ms = 9;
+  double clock_uncertainty_ms = 10;
+  bool cross_machine_age_valid = 11;
+  DropCounters drops = 12;
+  uint64 last_sent_sequence = 13;
+  uint64 last_accepted_sequence = 14;
+  double network_ms = 15;
+}
+
+message GatewayError {
+  GatewayErrorCode code = 1;
+  string detail = 2;
+  string related_session_id = 3;
+  optional uint64 related_sequence = 4;
+}
+
+message WorkstationWelcome {
+  ProtocolVersion accepted_protocol = 1;
+  string server_instance_id = 2;
+  uint32 observation_keepalive_interval_ms = 3;
+  uint32 observation_keepalive_timeout_ms = 4;
+  uint32 max_frame_bytes = 5;
+}
+
+message StartObservation {
+  string request_id = 1;
+  string requester_id = 2;
+  PurposeCode purpose_code = 3;
+  string trace_id = 4;
+  string sensor_id = 5;
+  optional string scene_version = 6;
+  double requested_rate_hz = 7;
+  optional string required_localization_epoch_id = 8;
+}
+
+message StopObservation { string observation_session_id = 1; string reason = 2; }
+
+message ObservationAck {
+  string observation_session_id = 1;
+  uint64 sequence = 2;
+  AckResult result = 3;
+  AckRejectReason reject_reason = 4;
+  google.protobuf.Timestamp received_at = 5;
+  uint64 sequence_gap = 6;
+  optional double ingest_age_ms = 7;
+  optional double clock_uncertainty_ms = 8;
+  double server_processing_ms = 9;
+  string detail = 10;
+}
+
+message ObservationKeepalive { uint64 sequence = 1; google.protobuf.Timestamp sent_at = 2; }
+message RateHint { string observation_session_id = 1; double target_rate_hz = 2; string reason = 3; }
+
+message GatewayToWorkstation {
+  oneof body {
+    GatewayHello hello = 1;
+    SessionStarted session_started = 2;
+    ObservationFrame frame = 3;
+    SessionEnded session_ended = 4;
+    GatewayTelemetry telemetry = 5;
+    GatewayError error = 6;
+  }
+}
+
+message WorkstationToGateway {
+  oneof body {
+    WorkstationWelcome welcome = 1;
+    StartObservation start = 2;
+    StopObservation stop = 3;
+    ObservationAck ack = 4;
+    ObservationKeepalive keepalive = 5;
+    RateHint rate_hint = 6;
+  }
+}
+

@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://h-ide.local/contracts/visual_evidence.v1.schema.json",
+  "title": "H-IDE Vision JSON evidence",
+  "oneOf": [
+    {"$ref": "#/$defs/qwenGrounding"},
+    {"$ref": "#/$defs/rgbdTfGate"}
+  ],
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "pose": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["frameId", "x", "y", "z", "yaw"],
+      "properties": {
+        "frameId": {"type": "string", "minLength": 1},
+        "x": {"type": "number"},
+        "y": {"type": "number"},
+        "z": {"type": "number"},
+        "yaw": {"type": "number"}
+      }
+    },
+    "qwenGrounding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion", "inputRgbSha256", "provider", "model",
+        "promptVersion", "targetText", "candidates"
+      ],
+      "properties": {
+        "schemaVersion": {"const": "h-ide.visual-semantic-evidence/1"},
+        "inputRgbSha256": {"$ref": "#/$defs/sha256"},
+        "provider": {"const": "qwen"},
+        "model": {"type": "string", "minLength": 1},
+        "promptVersion": {"type": "string", "minLength": 1},
+        "targetText": {"type": "string"},
+        "candidates": {
+          "type": "array",
+          "maxItems": 5,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["candidateId", "label", "pixelBox", "score", "source"],
+            "properties": {
+              "candidateId": {"type": "string", "minLength": 1},
+              "label": {"type": "string", "minLength": 1},
+              "pixelBox": {
+                "type": "array", "minItems": 4, "maxItems": 4,
+                "items": {"type": "integer", "minimum": 0}
+              },
+              "score": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+              "source": {"const": "qwen"}
+            }
+          }
+        }
+      }
+    },
+    "rgbdTfGate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion", "producer", "frames", "safetyGates",
+        "landmarkPose", "targetPose"
+      ],
+      "properties": {
+        "schemaVersion": {"const": "h-ide.rgbd-tf-gate-evidence/1"},
+        "producer": {"const": "deterministic_rgbd"},
+        "frames": {
+          "type": "array", "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "bundleId", "depthZ16Sha256", "depthScale",
+              "calibrationSha256", "tMapCamera", "tBaseCamera",
+              "localizationAgeMs"
+            ],
+            "properties": {
+              "bundleId": {"type": "string", "minLength": 1},
+              "depthZ16Sha256": {"$ref": "#/$defs/sha256"},
+              "depthScale": {"type": "number", "exclusiveMinimum": 0},
+              "calibrationSha256": {"$ref": "#/$defs/sha256"},
+              "tMapCamera": {"type": "array", "minItems": 4, "maxItems": 4},
+              "tBaseCamera": {"type": "array", "minItems": 4, "maxItems": 4},
+              "localizationAgeMs": {"type": "number", "minimum": 0}
+            }
+          }
+        },
+        "safetyGates": {"type": "array", "minItems": 1},
+        "landmarkPose": {"$ref": "#/$defs/pose"},
+        "targetPose": {"$ref": "#/$defs/pose"}
+      }
+    }
+  }
+}
