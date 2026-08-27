@@ -62,7 +62,10 @@ run_pytest_if_ready() {
     printf 'missing %s; run the environment setup in docs/reproduction/README.md\n' "${python_bin}" >&2
     return 1
   fi
-  (cd "${dir}" && "${python_bin}" -m pytest -q "$@")
+  # ROS installs optional pytest entry points into the system interpreter. They
+  # can import packages absent from a component venv before collection starts;
+  # contract tests must only load plugins declared by that component.
+  (cd "${dir}" && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 "${python_bin}" -m pytest -q "$@")
 }
 
 printf '%s\n' 'Acceptance: deterministic component contracts'
