@@ -1,0 +1,1437 @@
+{
+  "$defs": {
+    "CommandCancel": {
+      "additionalProperties": false,
+      "properties": {
+        "message_id": {
+          "format": "uuid",
+          "title": "Message Id",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/CommandCancelPayload"
+        },
+        "robot_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+          "title": "Robot Id",
+          "type": "string"
+        },
+        "sent_at": {
+          "format": "date-time",
+          "title": "Sent At",
+          "type": "string"
+        },
+        "session_id": {
+          "format": "uuid",
+          "title": "Session Id",
+          "type": "string"
+        },
+        "type": {
+          "const": "command.cancel",
+          "title": "Type",
+          "type": "string"
+        },
+        "version": {
+          "const": "1.0",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "message_id",
+        "robot_id",
+        "sent_at",
+        "type",
+        "session_id",
+        "payload"
+      ],
+      "title": "CommandCancel",
+      "type": "object"
+    },
+    "CommandCancelPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "command_id": {
+          "format": "uuid",
+          "title": "Command Id",
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "command_id",
+        "reason"
+      ],
+      "title": "CommandCancelPayload",
+      "type": "object"
+    },
+    "CommandRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "message_id": {
+          "format": "uuid",
+          "title": "Message Id",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/CommandRequestPayload"
+        },
+        "robot_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+          "title": "Robot Id",
+          "type": "string"
+        },
+        "sent_at": {
+          "format": "date-time",
+          "title": "Sent At",
+          "type": "string"
+        },
+        "session_id": {
+          "format": "uuid",
+          "title": "Session Id",
+          "type": "string"
+        },
+        "type": {
+          "const": "command.request",
+          "title": "Type",
+          "type": "string"
+        },
+        "version": {
+          "const": "1.0",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "message_id",
+        "robot_id",
+        "sent_at",
+        "type",
+        "session_id",
+        "payload"
+      ],
+      "title": "CommandRequest",
+      "type": "object"
+    },
+    "CommandRequestPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "command_id": {
+          "format": "uuid",
+          "title": "Command Id",
+          "type": "string"
+        },
+        "issued_at": {
+          "format": "date-time",
+          "title": "Issued At",
+          "type": "string"
+        },
+        "kind": {
+          "maxLength": 128,
+          "minLength": 3,
+          "pattern": "^[a-z][a-z0-9_]*(?:\\.[a-z][a-z0-9_]*)+$",
+          "title": "Kind",
+          "type": "string"
+        },
+        "params": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "title": "Params",
+          "type": "object"
+        },
+        "ttl_ms": {
+          "exclusiveMinimum": 0,
+          "maximum": 2400000,
+          "title": "Ttl Ms",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "command_id",
+        "kind",
+        "issued_at",
+        "ttl_ms",
+        "params"
+      ],
+      "title": "CommandRequestPayload",
+      "type": "object"
+    },
+    "CommandStatus": {
+      "additionalProperties": false,
+      "properties": {
+        "message_id": {
+          "format": "uuid",
+          "title": "Message Id",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/CommandStatusPayload"
+        },
+        "robot_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+          "title": "Robot Id",
+          "type": "string"
+        },
+        "sent_at": {
+          "format": "date-time",
+          "title": "Sent At",
+          "type": "string"
+        },
+        "session_id": {
+          "format": "uuid",
+          "title": "Session Id",
+          "type": "string"
+        },
+        "type": {
+          "const": "command.status",
+          "title": "Type",
+          "type": "string"
+        },
+        "version": {
+          "const": "1.0",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "message_id",
+        "robot_id",
+        "sent_at",
+        "type",
+        "session_id",
+        "payload"
+      ],
+      "title": "CommandStatus",
+      "type": "object"
+    },
+    "CommandStatusPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "command_id": {
+          "format": "uuid",
+          "title": "Command Id",
+          "type": "string"
+        },
+        "detail": {
+          "maxLength": 512,
+          "minLength": 1,
+          "title": "Detail",
+          "type": "string"
+        },
+        "progress": {
+          "anyOf": [
+            {
+              "maximum": 1.0,
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Progress"
+        },
+        "result": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JsonValue"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "state": {
+          "enum": [
+            "RECEIVED",
+            "RUNNING",
+            "SUCCEEDED",
+            "FAILED",
+            "CANCELLED",
+            "REJECTED",
+            "TIMED_OUT",
+            "ABORTED_AGENT_RESTART"
+          ],
+          "title": "State",
+          "type": "string"
+        }
+      },
+      "required": [
+        "command_id",
+        "state",
+        "detail"
+      ],
+      "title": "CommandStatusPayload",
+      "type": "object"
+    },
+    "ControlAcquire": {
+      "additionalProperties": false,
+      "properties": {
+        "message_id": {
+          "format": "uuid",
+          "title": "Message Id",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/ControlAcquirePayload"
+        },
+        "robot_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+          "title": "Robot Id",
+          "type": "string"
+        },
+        "sent_at": {
+          "format": "date-time",
+          "title": "Sent At",
+          "type": "string"
+        },
+        "session_id": {
+          "format": "uuid",
+          "title": "Session Id",
+          "type": "string"
+        },
+        "type": {
+          "const": "control.acquire",
+          "title": "Type",
+          "type": "string"
+        },
+        "version": {
+          "const": "1.0",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "message_id",
+        "robot_id",
+        "sent_at",
+        "type",
+        "session_id",
+        "payload"
+      ],
+      "title": "ControlAcquire",
+      "type": "object"
+    },
+    "ControlAcquirePayload": {
+      "additionalProperties": false,
+      "properties": {
+        "operator_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._@-]*$",
+          "title": "Operator Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "operator_id"
+      ],
+      "title": "ControlAcquirePayload",
+      "type": "object"
+    },
+    "ControlRelease": {
+      "additionalProperties": false,
+      "description": "Explicitly return control authority after all owned work is terminal.",
+      "properties": {
+        "message_id": {
+          "format": "uuid",
+          "title": "Message Id",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/ControlReleasePayload"
+        },
+        "robot_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+          "title": "Robot Id",
+          "type": "string"
+        },
+        "sent_at": {
+          "format": "date-time",
+          "title": "Sent At",
+          "type": "string"
+        },
+        "session_id": {
+          "format": "uuid",
+          "title": "Session Id",
+          "type": "string"
+        },
+        "type": {
+          "const": "control.release",
+          "title": "Type",
+          "type": "string"
+        },
+        "version": {
+          "const": "1.0",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "message_id",
+        "robot_id",
+        "sent_at",
+        "type",
+        "session_id",
+        "payload"
+      ],
+      "title": "ControlRelease",
+      "type": "object"
+    },
+    "ControlReleasePayload": {
+      "additionalProperties": false,
+      "properties": {
+        "reason": {
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason"
+      ],
+      "title": "ControlReleasePayload",
+      "type": "object"
+    },
+    "ControlStatus": {
+      "additionalProperties": false,
+      "properties": {
+        "message_id": {
+          "format": "uuid",
+          "title": "Message Id",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/ControlStatusPayload"
+        },
+        "robot_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+          "title": "Robot Id",
+          "type": "string"
+        },
+        "sent_at": {
+          "format": "date-time",
+          "title": "Sent At",
+          "type": "string"
+        },
+        "session_id": {
+          "format": "uuid",
+          "title": "Session Id",
+          "type": "string"
+        },
+        "type": {
+          "const": "control.status",
+          "title": "Type",
+          "type": "string"
+        },
+        "version": {
+          "const": "1.0",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "message_id",
+        "robot_id",
+        "sent_at",
+        "type",
+        "session_id",
+        "payload"
+      ],
+      "title": "ControlStatus",
+      "type": "object"
+    },
+    "ControlStatusPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "authority_revoked": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Authority Revoked"
+        },
+        "lease_sequence": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Lease Sequence"
+        },
+        "reason": {
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        },
+        "safe_stop_epoch": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Safe Stop Epoch"
+        },
+        "safe_stop_state": {
+          "anyOf": [
+            {
+              "enum": [
+                "requested",
+                "confirmed",
+                "failed"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Safe Stop State"
+        },
+        "state": {
+          "enum": [
+            "UNARMED",
+            "ACTIVE",
+            "SAFE_HOLD"
+          ],
+          "title": "State",
+          "type": "string"
+        }
+      },
+      "required": [
+        "state",
+        "reason"
+      ],
+      "title": "ControlStatusPayload",
+      "type": "object"
+    },
+    "ErrorMessage": {
+      "additionalProperties": false,
+      "properties": {
+        "message_id": {
+          "format": "uuid",
+          "title": "Message Id",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/ErrorPayload"
+        },
+        "robot_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+          "title": "Robot Id",
+          "type": "string"
+        },
+        "sent_at": {
+          "format": "date-time",
+          "title": "Sent At",
+          "type": "string"
+        },
+        "session_id": {
+          "anyOf": [
+            {
+              "format": "uuid",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Session Id"
+        },
+        "type": {
+          "const": "error",
+          "title": "Type",
+          "type": "string"
+        },
+        "version": {
+          "const": "1.0",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "message_id",
+        "robot_id",
+        "sent_at",
+        "type",
+        "session_id",
+        "payload"
+      ],
+      "title": "ErrorMessage",
+      "type": "object"
+    },
+    "ErrorPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Z][A-Z0-9_]*$",
+          "title": "Code",
+          "type": "string"
+        },
+        "message": {
+          "maxLength": 512,
+          "minLength": 1,
+          "title": "Message",
+          "type": "string"
+        },
+        "related_message_id": {
+          "anyOf": [
+            {
+              "format": "uuid",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Related Message Id"
+        },
+        "retryable": {
+          "title": "Retryable",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "code",
+        "message",
+        "retryable"
+      ],
+      "title": "ErrorPayload",
+      "type": "object"
+    },
+    "JsonValue": {},
+    "LeaseRenew": {
+      "additionalProperties": false,
+      "properties": {
+        "message_id": {
+          "format": "uuid",
+          "title": "Message Id",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/LeaseRenewPayload"
+        },
+        "robot_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+          "title": "Robot Id",
+          "type": "string"
+        },
+        "sent_at": {
+          "format": "date-time",
+          "title": "Sent At",
+          "type": "string"
+        },
+        "session_id": {
+          "format": "uuid",
+          "title": "Session Id",
+          "type": "string"
+        },
+        "type": {
+          "const": "lease.renew",
+          "title": "Type",
+          "type": "string"
+        },
+        "version": {
+          "const": "1.0",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "message_id",
+        "robot_id",
+        "sent_at",
+        "type",
+        "session_id",
+        "payload"
+      ],
+      "title": "LeaseRenew",
+      "type": "object"
+    },
+    "LeaseRenewPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "sequence": {
+          "minimum": 0,
+          "title": "Sequence",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "sequence"
+      ],
+      "title": "LeaseRenewPayload",
+      "type": "object"
+    },
+    "LeaseStatus": {
+      "additionalProperties": false,
+      "properties": {
+        "message_id": {
+          "format": "uuid",
+          "title": "Message Id",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/LeaseStatusPayload"
+        },
+        "robot_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+          "title": "Robot Id",
+          "type": "string"
+        },
+        "sent_at": {
+          "format": "date-time",
+          "title": "Sent At",
+          "type": "string"
+        },
+        "session_id": {
+          "format": "uuid",
+          "title": "Session Id",
+          "type": "string"
+        },
+        "type": {
+          "const": "lease.status",
+          "title": "Type",
+          "type": "string"
+        },
+        "version": {
+          "const": "1.0",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "message_id",
+        "robot_id",
+        "sent_at",
+        "type",
+        "session_id",
+        "payload"
+      ],
+      "title": "LeaseStatus",
+      "type": "object"
+    },
+    "LeaseStatusPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "expires_at": {
+          "format": "date-time",
+          "title": "Expires At",
+          "type": "string"
+        },
+        "sequence": {
+          "minimum": 0,
+          "title": "Sequence",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "sequence",
+        "expires_at"
+      ],
+      "title": "LeaseStatusPayload",
+      "type": "object"
+    },
+    "SafetyEvent": {
+      "additionalProperties": false,
+      "properties": {
+        "message_id": {
+          "format": "uuid",
+          "title": "Message Id",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/SafetyEventPayload"
+        },
+        "robot_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+          "title": "Robot Id",
+          "type": "string"
+        },
+        "sent_at": {
+          "format": "date-time",
+          "title": "Sent At",
+          "type": "string"
+        },
+        "session_id": {
+          "format": "uuid",
+          "title": "Session Id",
+          "type": "string"
+        },
+        "type": {
+          "const": "safety.event",
+          "title": "Type",
+          "type": "string"
+        },
+        "version": {
+          "const": "1.0",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "message_id",
+        "robot_id",
+        "sent_at",
+        "type",
+        "session_id",
+        "payload"
+      ],
+      "title": "SafetyEvent",
+      "type": "object"
+    },
+    "SafetyEventPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "authority_revoked": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Authority Revoked"
+        },
+        "code": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Z][A-Z0-9_]*$",
+          "title": "Code",
+          "type": "string"
+        },
+        "latched": {
+          "title": "Latched",
+          "type": "boolean"
+        },
+        "reason": {
+          "maxLength": 512,
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        },
+        "safe_stop_epoch": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Safe Stop Epoch"
+        },
+        "safe_stop_state": {
+          "anyOf": [
+            {
+              "enum": [
+                "requested",
+                "confirmed",
+                "failed"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Safe Stop State"
+        },
+        "state": {
+          "enum": [
+            "UNARMED",
+            "ACTIVE",
+            "SAFE_HOLD"
+          ],
+          "title": "State",
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "state",
+        "reason",
+        "latched"
+      ],
+      "title": "SafetyEventPayload",
+      "type": "object"
+    },
+    "SessionGoodbye": {
+      "additionalProperties": false,
+      "properties": {
+        "message_id": {
+          "format": "uuid",
+          "title": "Message Id",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/SessionGoodbyePayload"
+        },
+        "robot_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+          "title": "Robot Id",
+          "type": "string"
+        },
+        "sent_at": {
+          "format": "date-time",
+          "title": "Sent At",
+          "type": "string"
+        },
+        "session_id": {
+          "format": "uuid",
+          "title": "Session Id",
+          "type": "string"
+        },
+        "type": {
+          "const": "session.goodbye",
+          "title": "Type",
+          "type": "string"
+        },
+        "version": {
+          "const": "1.0",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "message_id",
+        "robot_id",
+        "sent_at",
+        "type",
+        "session_id",
+        "payload"
+      ],
+      "title": "SessionGoodbye",
+      "type": "object"
+    },
+    "SessionGoodbyePayload": {
+      "additionalProperties": false,
+      "properties": {
+        "reason": {
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason"
+      ],
+      "title": "SessionGoodbyePayload",
+      "type": "object"
+    },
+    "SessionHello": {
+      "additionalProperties": false,
+      "properties": {
+        "message_id": {
+          "format": "uuid",
+          "title": "Message Id",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/SessionHelloPayload"
+        },
+        "robot_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+          "title": "Robot Id",
+          "type": "string"
+        },
+        "sent_at": {
+          "format": "date-time",
+          "title": "Sent At",
+          "type": "string"
+        },
+        "session_id": {
+          "title": "Session Id",
+          "type": "null"
+        },
+        "type": {
+          "const": "session.hello",
+          "title": "Type",
+          "type": "string"
+        },
+        "version": {
+          "const": "1.0",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "message_id",
+        "robot_id",
+        "sent_at",
+        "type",
+        "session_id",
+        "payload"
+      ],
+      "title": "SessionHello",
+      "type": "object"
+    },
+    "SessionHelloPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "agent_version": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Agent Version",
+          "type": "string"
+        },
+        "boot_id": {
+          "format": "uuid",
+          "title": "Boot Id",
+          "type": "string"
+        },
+        "capabilities_digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Capabilities Digest",
+          "type": "string"
+        },
+        "capability_manifest": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "$ref": "#/$defs/JsonValue"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Capability Manifest"
+        },
+        "robot_profile": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "$ref": "#/$defs/JsonValue"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Robot Profile"
+        },
+        "supported_versions": {
+          "items": {
+            "const": "1.0",
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Supported Versions",
+          "type": "array"
+        },
+        "transport_mode": {
+          "enum": [
+            "client",
+            "server"
+          ],
+          "title": "Transport Mode",
+          "type": "string"
+        }
+      },
+      "required": [
+        "agent_version",
+        "boot_id",
+        "supported_versions",
+        "transport_mode",
+        "capabilities_digest"
+      ],
+      "title": "SessionHelloPayload",
+      "type": "object"
+    },
+    "SessionWelcome": {
+      "additionalProperties": false,
+      "properties": {
+        "message_id": {
+          "format": "uuid",
+          "title": "Message Id",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/SessionWelcomePayload"
+        },
+        "robot_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+          "title": "Robot Id",
+          "type": "string"
+        },
+        "sent_at": {
+          "format": "date-time",
+          "title": "Sent At",
+          "type": "string"
+        },
+        "session_id": {
+          "format": "uuid",
+          "title": "Session Id",
+          "type": "string"
+        },
+        "type": {
+          "const": "session.welcome",
+          "title": "Type",
+          "type": "string"
+        },
+        "version": {
+          "const": "1.0",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "message_id",
+        "robot_id",
+        "sent_at",
+        "type",
+        "session_id",
+        "payload"
+      ],
+      "title": "SessionWelcome",
+      "type": "object"
+    },
+    "SessionWelcomePayload": {
+      "additionalProperties": false,
+      "properties": {
+        "accepted_version": {
+          "const": "1.0",
+          "title": "Accepted Version",
+          "type": "string"
+        },
+        "control_state": {
+          "enum": [
+            "UNARMED",
+            "ACTIVE",
+            "SAFE_HOLD"
+          ],
+          "title": "Control State",
+          "type": "string"
+        },
+        "lease_interval_ms": {
+          "exclusiveMinimum": 0,
+          "maximum": 5000,
+          "title": "Lease Interval Ms",
+          "type": "integer"
+        },
+        "lease_timeout_ms": {
+          "exclusiveMinimum": 0,
+          "maximum": 30000,
+          "title": "Lease Timeout Ms",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "accepted_version",
+        "lease_interval_ms",
+        "lease_timeout_ms",
+        "control_state"
+      ],
+      "title": "SessionWelcomePayload",
+      "type": "object"
+    },
+    "StateSnapshot": {
+      "additionalProperties": false,
+      "properties": {
+        "message_id": {
+          "format": "uuid",
+          "title": "Message Id",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/StateSnapshotPayload"
+        },
+        "robot_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+          "title": "Robot Id",
+          "type": "string"
+        },
+        "sent_at": {
+          "format": "date-time",
+          "title": "Sent At",
+          "type": "string"
+        },
+        "session_id": {
+          "format": "uuid",
+          "title": "Session Id",
+          "type": "string"
+        },
+        "type": {
+          "const": "state.snapshot",
+          "title": "Type",
+          "type": "string"
+        },
+        "version": {
+          "const": "1.0",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "message_id",
+        "robot_id",
+        "sent_at",
+        "type",
+        "session_id",
+        "payload"
+      ],
+      "title": "StateSnapshot",
+      "type": "object"
+    },
+    "StateSnapshotPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "observed_at": {
+          "format": "date-time",
+          "title": "Observed At",
+          "type": "string"
+        },
+        "sequence": {
+          "minimum": 0,
+          "title": "Sequence",
+          "type": "integer"
+        },
+        "state": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "title": "State",
+          "type": "object"
+        }
+      },
+      "required": [
+        "sequence",
+        "observed_at",
+        "state"
+      ],
+      "title": "StateSnapshotPayload",
+      "type": "object"
+    },
+    "StateUpdate": {
+      "additionalProperties": false,
+      "properties": {
+        "message_id": {
+          "format": "uuid",
+          "title": "Message Id",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/StateUpdatePayload"
+        },
+        "robot_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+          "title": "Robot Id",
+          "type": "string"
+        },
+        "sent_at": {
+          "format": "date-time",
+          "title": "Sent At",
+          "type": "string"
+        },
+        "session_id": {
+          "format": "uuid",
+          "title": "Session Id",
+          "type": "string"
+        },
+        "type": {
+          "const": "state.update",
+          "title": "Type",
+          "type": "string"
+        },
+        "version": {
+          "const": "1.0",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "message_id",
+        "robot_id",
+        "sent_at",
+        "type",
+        "session_id",
+        "payload"
+      ],
+      "title": "StateUpdate",
+      "type": "object"
+    },
+    "StateUpdatePayload": {
+      "additionalProperties": false,
+      "properties": {
+        "changes": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "title": "Changes",
+          "type": "object"
+        },
+        "observed_at": {
+          "format": "date-time",
+          "title": "Observed At",
+          "type": "string"
+        },
+        "sequence": {
+          "minimum": 0,
+          "title": "Sequence",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "sequence",
+        "observed_at",
+        "changes"
+      ],
+      "title": "StateUpdatePayload",
+      "type": "object"
+    }
+  },
+  "$id": "https://phibotics.local/schemas/robot-agent.v1.schema.json",
+  "discriminator": {
+    "mapping": {
+      "command.cancel": "#/$defs/CommandCancel",
+      "command.request": "#/$defs/CommandRequest",
+      "command.status": "#/$defs/CommandStatus",
+      "control.acquire": "#/$defs/ControlAcquire",
+      "control.release": "#/$defs/ControlRelease",
+      "control.status": "#/$defs/ControlStatus",
+      "error": "#/$defs/ErrorMessage",
+      "lease.renew": "#/$defs/LeaseRenew",
+      "lease.status": "#/$defs/LeaseStatus",
+      "safety.event": "#/$defs/SafetyEvent",
+      "session.goodbye": "#/$defs/SessionGoodbye",
+      "session.hello": "#/$defs/SessionHello",
+      "session.welcome": "#/$defs/SessionWelcome",
+      "state.snapshot": "#/$defs/StateSnapshot",
+      "state.update": "#/$defs/StateUpdate"
+    },
+    "propertyName": "type"
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/SessionHello"
+    },
+    {
+      "$ref": "#/$defs/SessionWelcome"
+    },
+    {
+      "$ref": "#/$defs/SessionGoodbye"
+    },
+    {
+      "$ref": "#/$defs/ControlAcquire"
+    },
+    {
+      "$ref": "#/$defs/ControlRelease"
+    },
+    {
+      "$ref": "#/$defs/ControlStatus"
+    },
+    {
+      "$ref": "#/$defs/LeaseRenew"
+    },
+    {
+      "$ref": "#/$defs/LeaseStatus"
+    },
+    {
+      "$ref": "#/$defs/CommandRequest"
+    },
+    {
+      "$ref": "#/$defs/CommandCancel"
+    },
+    {
+      "$ref": "#/$defs/CommandStatus"
+    },
+    {
+      "$ref": "#/$defs/StateSnapshot"
+    },
+    {
+      "$ref": "#/$defs/StateUpdate"
+    },
+    {
+      "$ref": "#/$defs/SafetyEvent"
+    },
+    {
+      "$ref": "#/$defs/ErrorMessage"
+    }
+  ],
+  "title": "robot-agent.v1"
+}

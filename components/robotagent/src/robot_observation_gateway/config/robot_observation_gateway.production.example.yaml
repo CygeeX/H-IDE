@@ -1,0 +1,75 @@
+schema_version: "1"
+
+identity:
+  robot_id: g1-dev
+
+transport:
+  target: observations.example.com:443
+  reconnect_initial_ms: 250
+  reconnect_max_ms: 5000
+  connect_timeout_ms: 5000
+  write_timeout_ms: 400
+  ack_timeout_ms: 750
+  grpc_max_message_bytes: 4194304
+  http2_keepalive_time_ms: 60000
+  http2_keepalive_timeout_ms: 20000
+
+tls:
+  enabled: true
+  ca_file: /etc/robot-observation-gateway/tls/ca.pem
+  cert_file: /etc/robot-observation-gateway/tls/gateway.pem
+  key_file: /etc/robot-observation-gateway/tls/gateway.key
+  server_name: observations.example.com
+  allow_plaintext_loopback: false
+
+sensor:
+  sensor_id: head_rgbd
+  source_mode: live
+  source_id: realsense:d435i:REPLACE_WITH_DEVICE_SERIAL
+  localization_epoch_id: REPLACE_WITH_LOCALIZATION_EPOCH_ID
+  device_serial: "REPLACE_WITH_DEVICE_SERIAL"
+  device_model: Intel RealSense D435i
+  firmware_version: REPLACE_WITH_FIRMWARE_VERSION
+  rgbd_topic: /camera/camera/rgbd
+  color_metadata_topic: /camera/camera/color/metadata
+  depth_metadata_topic: /camera/camera/depth/metadata
+  localization_topic: /localization/pose
+  localization_epoch_topic: /localization/epoch_id
+  map_frame: map
+  base_frame: base_link
+  rgbd_frame: camera_rgbd_optical_frame
+  camera_frame: camera_color_optical_frame
+  color_profile: 640x480x30
+  depth_profile: 640x480x30
+  depth_scale_meters_per_unit: 0.001
+  strict_localization: true
+
+stream:
+  target_rate_hz: 5.0
+  minimum_rate_hz: 1.0
+  jpeg_quality: 85
+  zstd_level: 3
+  max_frame_bytes: 3145728
+  max_bandwidth_mbps: 20.0
+  stale_frame_ms: 500
+  encode_p95_budget_ms: 80
+  tf_lookup_timeout_ms: 100
+  localization_max_age_ms: 100
+  metadata_max_delta_ms: 50
+  metadata_ttl_ms: 1000
+  metadata_cache_size: 8
+  localization_ttl_ms: 2000
+  localization_cache_size: 32
+
+observation_lease:
+  keepalive_interval_ms: 250
+  keepalive_timeout_ms: 1000
+
+clock:
+  cross_machine_age_valid: true
+  estimated_uncertainty_ms: 10.0
+
+health_bridge:
+  demand_topic: /robot_agent/observation_demand
+  health_topic: /robot_observation_gateway/health
+  heartbeat_period_ms: 100

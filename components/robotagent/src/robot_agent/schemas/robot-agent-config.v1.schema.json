@@ -1,0 +1,988 @@
+{
+  "$defs": {
+    "ClientTransportConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "connect_timeout_ms": {
+          "default": 5000,
+          "maximum": 60000,
+          "minimum": 100,
+          "title": "Connect Timeout Ms",
+          "type": "integer"
+        },
+        "mode": {
+          "const": "client",
+          "title": "Mode",
+          "type": "string"
+        },
+        "reconnect_initial_ms": {
+          "default": 250,
+          "maximum": 30000,
+          "minimum": 50,
+          "title": "Reconnect Initial Ms",
+          "type": "integer"
+        },
+        "reconnect_max_ms": {
+          "default": 5000,
+          "maximum": 300000,
+          "minimum": 100,
+          "title": "Reconnect Max Ms",
+          "type": "integer"
+        },
+        "uri": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Uri",
+          "type": "string"
+        }
+      },
+      "required": [
+        "mode",
+        "uri"
+      ],
+      "title": "ClientTransportConfig",
+      "type": "object"
+    },
+    "CommandConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "adapter": {
+          "enum": [
+            "service",
+            "action"
+          ],
+          "title": "Adapter",
+          "type": "string"
+        },
+        "cancellable": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cancellable"
+        },
+        "capability_kind": {
+          "default": "non_motion",
+          "enum": [
+            "motion",
+            "observation",
+            "manipulation",
+            "safety",
+            "non_motion"
+          ],
+          "title": "Capability Kind",
+          "type": "string"
+        },
+        "description": {
+          "anyOf": [
+            {
+              "maxLength": 512,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Description"
+        },
+        "executor_profile": {
+          "anyOf": [
+            {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Executor Profile"
+        },
+        "goal_transform": {
+          "default": "direct",
+          "enum": [
+            "direct",
+            "navigate_to_pose_v1",
+            "nav2_spin_v2"
+          ],
+          "title": "Goal Transform",
+          "type": "string"
+        },
+        "interruptible": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Interruptible"
+        },
+        "local_only_parameters": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Local Only Parameters",
+          "type": "array"
+        },
+        "localization_epoch_parameter": {
+          "default": "localization_epoch_id",
+          "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$",
+          "title": "Localization Epoch Parameter",
+          "type": "string"
+        },
+        "max_ttl_ms": {
+          "exclusiveMinimum": 0,
+          "maximum": 2400000,
+          "title": "Max Ttl Ms",
+          "type": "integer"
+        },
+        "observation_sensor_ids": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Observation Sensor Ids",
+          "type": "array"
+        },
+        "observation_session_parameter": {
+          "default": "observation_session_id",
+          "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$",
+          "title": "Observation Session Parameter",
+          "type": "string"
+        },
+        "request_schema": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "title": "Request Schema",
+          "type": "object"
+        },
+        "requires_observation": {
+          "default": false,
+          "title": "Requires Observation",
+          "type": "boolean"
+        },
+        "resources": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 32,
+          "minItems": 1,
+          "title": "Resources",
+          "type": "array"
+        },
+        "risk_level": {
+          "default": "medium",
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "critical"
+          ],
+          "title": "Risk Level",
+          "type": "string"
+        },
+        "robot_boot_parameter": {
+          "default": "robot_boot_id",
+          "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$",
+          "title": "Robot Boot Parameter",
+          "type": "string"
+        },
+        "ros_name": {
+          "pattern": "^/[A-Za-z0-9_]+(?:/[A-Za-z0-9_]+)*$",
+          "title": "Ros Name",
+          "type": "string"
+        },
+        "ros_type": {
+          "pattern": "^[A-Za-z][A-Za-z0-9_]*/(?:srv|action|msg)/[A-Za-z][A-Za-z0-9_]*$",
+          "title": "Ros Type",
+          "type": "string"
+        },
+        "scene_version_parameter": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": "scene_version",
+          "title": "Scene Version Parameter"
+        },
+        "skill_version": {
+          "default": "1.0.0",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?$",
+          "title": "Skill Version",
+          "type": "string"
+        },
+        "timeout_ms": {
+          "exclusiveMinimum": 0,
+          "maximum": 2400000,
+          "title": "Timeout Ms",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "adapter",
+        "ros_name",
+        "ros_type",
+        "request_schema",
+        "max_ttl_ms",
+        "timeout_ms",
+        "resources"
+      ],
+      "title": "CommandConfig",
+      "type": "object"
+    },
+    "DiagnosticsConfig": {
+      "additionalProperties": false,
+      "description": "Loopback-only, read-only runtime diagnostics endpoint.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "host": {
+          "default": "127.0.0.1",
+          "title": "Host",
+          "type": "string"
+        },
+        "localization_max_age_ms": {
+          "default": 1000,
+          "maximum": 30000,
+          "minimum": 50,
+          "title": "Localization Max Age Ms",
+          "type": "integer"
+        },
+        "port": {
+          "default": 8795,
+          "maximum": 65535,
+          "minimum": 1,
+          "title": "Port",
+          "type": "integer"
+        },
+        "probe_timeout_ms": {
+          "default": 500,
+          "maximum": 5000,
+          "minimum": 50,
+          "title": "Probe Timeout Ms",
+          "type": "integer"
+        },
+        "request_timeout_ms": {
+          "default": 1000,
+          "maximum": 10000,
+          "minimum": 100,
+          "title": "Request Timeout Ms",
+          "type": "integer"
+        }
+      },
+      "title": "DiagnosticsConfig",
+      "type": "object"
+    },
+    "JsonValue": {},
+    "MotionSafetyFaultConfig": {
+      "additionalProperties": false,
+      "description": "Robot-scoped, latched simulator/driver motion-fault ingress.",
+      "properties": {
+        "cancel_begin_deadline_ms": {
+          "const": 100,
+          "default": 100,
+          "title": "Cancel Begin Deadline Ms",
+          "type": "integer"
+        },
+        "enabled": {
+          "default": false,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "localization_epoch_id": {
+          "anyOf": [
+            {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Localization Epoch Id"
+        },
+        "nav2_terminal_deadline_ms": {
+          "const": 300,
+          "default": 300,
+          "title": "Nav2 Terminal Deadline Ms",
+          "type": "integer"
+        },
+        "topic": {
+          "default": "/robot_agent/motion_safety_fault",
+          "pattern": "^/[A-Za-z0-9_]+(?:/[A-Za-z0-9_]+)*$",
+          "title": "Topic",
+          "type": "string"
+        }
+      },
+      "title": "MotionSafetyFaultConfig",
+      "type": "object"
+    },
+    "ObservationConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "admission_max_age_ms": {
+          "default": 500,
+          "maximum": 5000,
+          "minimum": 50,
+          "title": "Admission Max Age Ms",
+          "type": "integer"
+        },
+        "demand_topic": {
+          "default": "/robot_agent/observation_demand",
+          "pattern": "^/[A-Za-z0-9_]+(?:/[A-Za-z0-9_]+)*$",
+          "title": "Demand Topic",
+          "type": "string"
+        },
+        "enabled": {
+          "default": false,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "health_topic": {
+          "default": "/robot_observation_gateway/health",
+          "pattern": "^/[A-Za-z0-9_]+(?:/[A-Za-z0-9_]+)*$",
+          "title": "Health Topic",
+          "type": "string"
+        },
+        "watchdog_timeout_ms": {
+          "default": 750,
+          "maximum": 10000,
+          "minimum": 100,
+          "title": "Watchdog Timeout Ms",
+          "type": "integer"
+        }
+      },
+      "title": "ObservationConfig",
+      "type": "object"
+    },
+    "QoSConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "depth": {
+          "maximum": 1000,
+          "minimum": 1,
+          "title": "Depth",
+          "type": "integer"
+        },
+        "durability": {
+          "enum": [
+            "volatile",
+            "transient_local"
+          ],
+          "title": "Durability",
+          "type": "string"
+        },
+        "reliability": {
+          "enum": [
+            "reliable",
+            "best_effort"
+          ],
+          "title": "Reliability",
+          "type": "string"
+        }
+      },
+      "required": [
+        "reliability",
+        "durability",
+        "depth"
+      ],
+      "title": "QoSConfig",
+      "type": "object"
+    },
+    "RobotProfileConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "base_frame_id": {
+          "default": "base_link",
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Base Frame Id",
+          "type": "string"
+        },
+        "base_type": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Base Type",
+          "type": "string"
+        },
+        "head_motion": {
+          "const": "fixed",
+          "title": "Head Motion",
+          "type": "string"
+        },
+        "map_frame_id": {
+          "default": "map",
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Map Frame Id",
+          "type": "string"
+        },
+        "metadata": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "title": "Metadata",
+          "type": "object"
+        },
+        "sensors": {
+          "items": {
+            "$ref": "#/$defs/RobotSensorConfig"
+          },
+          "maxItems": 32,
+          "minItems": 1,
+          "title": "Sensors",
+          "type": "array"
+        }
+      },
+      "required": [
+        "base_type",
+        "head_motion",
+        "sensors"
+      ],
+      "title": "RobotProfileConfig",
+      "type": "object"
+    },
+    "RobotSensorConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "calibration_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Calibration Sha256"
+        },
+        "depth_capable": {
+          "default": false,
+          "title": "Depth Capable",
+          "type": "boolean"
+        },
+        "fixed_mount": {
+          "const": true,
+          "title": "Fixed Mount",
+          "type": "boolean"
+        },
+        "frame_id": {
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Frame Id",
+          "type": "string"
+        },
+        "horizontal_fov_rad": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "maximum": 6.283185307179586,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Horizontal Fov Rad"
+        },
+        "kind": {
+          "enum": [
+            "rgb",
+            "depth",
+            "rgbd",
+            "lidar",
+            "imu",
+            "other"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "sensor_id": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+          "title": "Sensor Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sensor_id",
+        "kind",
+        "frame_id",
+        "fixed_mount"
+      ],
+      "title": "RobotSensorConfig",
+      "type": "object"
+    },
+    "SafeStopConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "adapter": {
+          "enum": [
+            "service",
+            "action"
+          ],
+          "title": "Adapter",
+          "type": "string"
+        },
+        "request": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "title": "Request",
+          "type": "object"
+        },
+        "ros_name": {
+          "pattern": "^/[A-Za-z0-9_]+(?:/[A-Za-z0-9_]+)*$",
+          "title": "Ros Name",
+          "type": "string"
+        },
+        "ros_type": {
+          "pattern": "^[A-Za-z][A-Za-z0-9_]*/(?:srv|action|msg)/[A-Za-z][A-Za-z0-9_]*$",
+          "title": "Ros Type",
+          "type": "string"
+        },
+        "timeout_ms": {
+          "exclusiveMinimum": 0,
+          "maximum": 30000,
+          "title": "Timeout Ms",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "adapter",
+        "ros_name",
+        "ros_type",
+        "request",
+        "timeout_ms"
+      ],
+      "title": "SafeStopConfig",
+      "type": "object"
+    },
+    "SafetyConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "control_arm": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SafeStopConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "heartbeat_period_ms": {
+          "default": 250,
+          "maximum": 1000,
+          "minimum": 50,
+          "title": "Heartbeat Period Ms",
+          "type": "integer"
+        },
+        "heartbeat_topic": {
+          "pattern": "^/[A-Za-z0-9_]+(?:/[A-Za-z0-9_]+)*$",
+          "title": "Heartbeat Topic",
+          "type": "string"
+        },
+        "motion_safety_fault": {
+          "$ref": "#/$defs/MotionSafetyFaultConfig",
+          "default": {
+            "cancel_begin_deadline_ms": 100,
+            "enabled": false,
+            "localization_epoch_id": null,
+            "nav2_terminal_deadline_ms": 300,
+            "topic": "/robot_agent/motion_safety_fault"
+          }
+        },
+        "safe_stop": {
+          "$ref": "#/$defs/SafeStopConfig"
+        }
+      },
+      "required": [
+        "safe_stop",
+        "heartbeat_topic"
+      ],
+      "title": "SafetyConfig",
+      "type": "object"
+    },
+    "ServerTransportConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "handshake_timeout_ms": {
+          "default": 5000,
+          "maximum": 60000,
+          "minimum": 100,
+          "title": "Handshake Timeout Ms",
+          "type": "integer"
+        },
+        "host": {
+          "maxLength": 255,
+          "minLength": 1,
+          "title": "Host",
+          "type": "string"
+        },
+        "mode": {
+          "const": "server",
+          "title": "Mode",
+          "type": "string"
+        },
+        "port": {
+          "maximum": 65535,
+          "minimum": 1,
+          "title": "Port",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "mode",
+        "host",
+        "port"
+      ],
+      "title": "ServerTransportConfig",
+      "type": "object"
+    },
+    "SessionConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "lease_interval_ms": {
+          "default": 500,
+          "maximum": 5000,
+          "minimum": 100,
+          "title": "Lease Interval Ms",
+          "type": "integer"
+        },
+        "lease_timeout_ms": {
+          "default": 2000,
+          "maximum": 30000,
+          "minimum": 500,
+          "title": "Lease Timeout Ms",
+          "type": "integer"
+        },
+        "max_future_skew_ms": {
+          "default": 5000,
+          "maximum": 60000,
+          "minimum": 0,
+          "title": "Max Future Skew Ms",
+          "type": "integer"
+        },
+        "max_message_age_ms": {
+          "default": 30000,
+          "maximum": 300000,
+          "minimum": 1000,
+          "title": "Max Message Age Ms",
+          "type": "integer"
+        }
+      },
+      "title": "SessionConfig",
+      "type": "object"
+    },
+    "StateOutputConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "change_hz": {
+          "default": 5.0,
+          "exclusiveMinimum": 0.0,
+          "maximum": 50.0,
+          "title": "Change Hz",
+          "type": "number"
+        },
+        "outbound_queue_size": {
+          "default": 256,
+          "maximum": 65536,
+          "minimum": 8,
+          "title": "Outbound Queue Size",
+          "type": "integer"
+        },
+        "snapshot_hz": {
+          "default": 1.0,
+          "exclusiveMinimum": 0.0,
+          "maximum": 10.0,
+          "title": "Snapshot Hz",
+          "type": "number"
+        }
+      },
+      "title": "StateOutputConfig",
+      "type": "object"
+    },
+    "StateSourceConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "field": {
+          "maxLength": 256,
+          "minLength": 1,
+          "pattern": "^[A-Za-z][A-Za-z0-9_.]*$",
+          "title": "Field",
+          "type": "string"
+        },
+        "qos": {
+          "$ref": "#/$defs/QoSConfig"
+        },
+        "ros_type": {
+          "pattern": "^[A-Za-z][A-Za-z0-9_]*/(?:srv|action|msg)/[A-Za-z][A-Za-z0-9_]*$",
+          "title": "Ros Type",
+          "type": "string"
+        },
+        "topic": {
+          "pattern": "^/[A-Za-z0-9_]+(?:/[A-Za-z0-9_]+)*$",
+          "title": "Topic",
+          "type": "string"
+        }
+      },
+      "required": [
+        "topic",
+        "ros_type",
+        "field",
+        "qos"
+      ],
+      "title": "StateSourceConfig",
+      "type": "object"
+    },
+    "StorageConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "ledger_path": {
+          "minLength": 1,
+          "title": "Ledger Path",
+          "type": "string"
+        },
+        "retention_days": {
+          "default": 30,
+          "maximum": 3650,
+          "minimum": 1,
+          "title": "Retention Days",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "ledger_path"
+      ],
+      "title": "StorageConfig",
+      "type": "object"
+    },
+    "TLSConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "allow_plaintext_loopback": {
+          "default": false,
+          "title": "Allow Plaintext Loopback",
+          "type": "boolean"
+        },
+        "ca_file": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ca File"
+        },
+        "cert_file": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cert File"
+        },
+        "enabled": {
+          "default": true,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "key_file": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Key File"
+        },
+        "peer_certificate_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9A-Fa-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Peer Certificate Sha256"
+        },
+        "server_name": {
+          "anyOf": [
+            {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Server Name"
+        }
+      },
+      "title": "TLSConfig",
+      "type": "object"
+    }
+  },
+  "$id": "https://phibotics.local/schemas/robot-agent-config.v1.schema.json",
+  "additionalProperties": false,
+  "properties": {
+    "agent_version": {
+      "default": "0.1.0",
+      "maxLength": 64,
+      "minLength": 1,
+      "title": "Agent Version",
+      "type": "string"
+    },
+    "commands": {
+      "additionalProperties": {
+        "$ref": "#/$defs/CommandConfig"
+      },
+      "maxProperties": 256,
+      "minProperties": 1,
+      "title": "Commands",
+      "type": "object"
+    },
+    "diagnostics": {
+      "$ref": "#/$defs/DiagnosticsConfig",
+      "default": {
+        "enabled": false,
+        "host": "127.0.0.1",
+        "localization_max_age_ms": 1000,
+        "port": 8795,
+        "probe_timeout_ms": 500,
+        "request_timeout_ms": 1000
+      }
+    },
+    "observation": {
+      "$ref": "#/$defs/ObservationConfig",
+      "default": {
+        "admission_max_age_ms": 500,
+        "demand_topic": "/robot_agent/observation_demand",
+        "enabled": false,
+        "health_topic": "/robot_observation_gateway/health",
+        "watchdog_timeout_ms": 750
+      }
+    },
+    "robot_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "title": "Robot Id",
+      "type": "string"
+    },
+    "robot_profile": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RobotProfileConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "safety": {
+      "$ref": "#/$defs/SafetyConfig"
+    },
+    "schema_version": {
+      "enum": [
+        "1",
+        "2"
+      ],
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "session": {
+      "$ref": "#/$defs/SessionConfig"
+    },
+    "state": {
+      "$ref": "#/$defs/StateOutputConfig"
+    },
+    "state_sources": {
+      "additionalProperties": {
+        "$ref": "#/$defs/StateSourceConfig"
+      },
+      "title": "State Sources",
+      "type": "object"
+    },
+    "storage": {
+      "$ref": "#/$defs/StorageConfig"
+    },
+    "tls": {
+      "$ref": "#/$defs/TLSConfig"
+    },
+    "transport": {
+      "discriminator": {
+        "mapping": {
+          "client": "#/$defs/ClientTransportConfig",
+          "server": "#/$defs/ServerTransportConfig"
+        },
+        "propertyName": "mode"
+      },
+      "oneOf": [
+        {
+          "$ref": "#/$defs/ClientTransportConfig"
+        },
+        {
+          "$ref": "#/$defs/ServerTransportConfig"
+        }
+      ],
+      "title": "Transport"
+    }
+  },
+  "required": [
+    "schema_version",
+    "robot_id",
+    "transport",
+    "tls",
+    "session",
+    "storage",
+    "state",
+    "safety",
+    "commands"
+  ],
+  "title": "robot-agent-config.v1",
+  "type": "object"
+}

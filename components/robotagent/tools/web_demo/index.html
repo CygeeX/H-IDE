@@ -1,0 +1,537 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <meta
+      name="description"
+      content="Robot Agent 本地可视化测试驾驶舱：展示 WebSocket、租约、安全停机、命令与 ROS 2 状态链路。"
+    >
+    <title>Robot Agent · Visual Test Deck</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <div class="ambient ambient-one" aria-hidden="true"></div>
+    <div class="ambient ambient-two" aria-hidden="true"></div>
+    <div class="noise" aria-hidden="true"></div>
+
+    <header class="topbar">
+      <a class="brand" href="#top" aria-label="Robot Agent 可视化测试台首页">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 40 40" role="img">
+            <path d="M10 13.5 20 7l10 6.5v13L20 33l-10-6.5z"></path>
+            <circle cx="20" cy="20" r="4.2"></circle>
+            <path d="m7 9 3 4.5M33 9l-3 4.5M20 3v4"></path>
+          </svg>
+        </span>
+        <span>
+          <strong>ROBOT AGENT</strong>
+          <small>VISUAL TEST DECK · V1</small>
+        </span>
+      </a>
+
+      <div class="topbar-status" aria-label="链路状态">
+        <span class="status-pill is-online" id="uiStatus">
+          <i></i>BFF UI 已连接
+        </span>
+        <span class="status-pill" id="agentStatus">
+          <i></i>等待 Agent
+        </span>
+        <span class="mode-badge" id="modeBadge">REAL LINK</span>
+      </div>
+
+      <div class="topbar-actions">
+        <button class="button button-ghost button-small" id="modeToggle" type="button">
+          进入浏览器演示
+        </button>
+        <button class="button button-accent button-small" id="autoDemoBtn" type="button">
+          自动演示
+        </button>
+      </div>
+    </header>
+
+    <main id="top">
+      <section class="hero shell">
+        <div class="hero-copy">
+          <p class="eyebrow"><span>01</span> ROBOT-SIDE CONTROL GATEWAY</p>
+          <h1>让远程命令<br><em>安全地抵达真机。</em></h1>
+          <p class="hero-description">
+            这个测试台把 Robot Agent 的作用变成可观察的链路：浏览器只发送逻辑命令，
+            Agent 在机器人侧完成身份、租约、TTL、资源仲裁与 ROS 2 协议翻译。
+          </p>
+          <div class="hero-facts">
+            <span><b>64 KiB</b> 严格文本帧</span>
+            <span><b>2 s</b> 本地失联保护</span>
+            <span><b>0</b> 任意 ROS 透传</span>
+          </div>
+        </div>
+
+        <div class="robot-stage" aria-label="机器人安全状态可视化">
+          <div class="stage-grid" aria-hidden="true"></div>
+          <div class="stage-orbit orbit-one" aria-hidden="true"></div>
+          <div class="stage-orbit orbit-two" aria-hidden="true"></div>
+          <div class="robot-halo" id="robotHalo" aria-hidden="true"></div>
+          <svg class="robot-figure" viewBox="0 0 420 360" role="img" aria-label="四足机器人抽象图">
+            <g class="robot-shadow">
+              <ellipse cx="210" cy="316" rx="132" ry="19"></ellipse>
+            </g>
+            <g class="robot-wire">
+              <path d="M128 126 93 178l22 62-34 64M292 126l35 52-22 62 34 64"></path>
+              <path d="M153 205 136 250l24 54M267 205l17 45-24 54"></path>
+            </g>
+            <g class="robot-body">
+              <path d="M121 116 164 89h93l45 28-17 94-50 22h-66l-51-22z"></path>
+              <path d="m164 89 17-28h60l16 28"></path>
+              <path d="M178 125h64l18 48-33 25h-35l-33-25z"></path>
+            </g>
+            <g class="robot-joints">
+              <circle cx="128" cy="126" r="13"></circle>
+              <circle cx="292" cy="126" r="13"></circle>
+              <circle cx="114" cy="239" r="11"></circle>
+              <circle cx="306" cy="239" r="11"></circle>
+              <circle cx="153" cy="205" r="10"></circle>
+              <circle cx="267" cy="205" r="10"></circle>
+            </g>
+            <g class="robot-sensors">
+              <rect x="184" y="69" width="52" height="13" rx="6.5"></rect>
+              <circle cx="194" cy="76" r="3"></circle>
+              <circle cx="226" cy="76" r="3"></circle>
+              <circle cx="210" cy="159" r="16"></circle>
+              <circle cx="210" cy="159" r="6"></circle>
+            </g>
+            <g class="robot-feet">
+              <path d="M65 304h36M319 304h36M145 304h30M245 304h30"></path>
+            </g>
+          </svg>
+          <div class="stage-state" id="stageState">
+            <small>CONTROL STATE</small>
+            <strong>SAFE_HOLD</strong>
+            <span id="stageReason">等待 Robot Agent 连接</span>
+          </div>
+          <div class="scan-label label-a">WS / mTLS</div>
+          <div class="scan-label label-b">ROS 2 OWNER THREAD</div>
+          <div class="scan-label label-c">LOCAL SAFE-STOP</div>
+        </div>
+      </section>
+
+      <section class="architecture shell" aria-labelledby="architectureTitle">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow"><span>02</span> LIVE DATA PATH</p>
+            <h2 id="architectureTitle">一条看得见的安全边界</h2>
+          </div>
+          <p>动态光点表示当前消息方向；链路变灰时，控制不会被静默恢复。</p>
+        </div>
+
+        <div class="flow" id="architectureFlow">
+          <article class="flow-node is-active" data-node="browser">
+            <span class="node-index">01</span>
+            <div class="node-icon">UI</div>
+            <h3>浏览器</h3>
+            <p>只发逻辑操作</p>
+            <small>CONTROL DESK</small>
+          </article>
+          <div class="flow-link" data-link="ui-bff"><i></i><span>JSON</span></div>
+          <article class="flow-node is-active" data-node="bff">
+            <span class="node-index">02</span>
+            <div class="node-icon">BF</div>
+            <h3>测试 BFF</h3>
+            <p>会话与续租</p>
+            <small>POLICY PEER</small>
+          </article>
+          <div class="flow-link" data-link="bff-agent"><i></i><span>WS</span></div>
+          <article class="flow-node" data-node="agent">
+            <span class="node-index">03</span>
+            <div class="node-icon">RA</div>
+            <h3>Robot Agent</h3>
+            <p>验证与仲裁</p>
+            <small>SAFETY GATE</small>
+          </article>
+          <div class="flow-link" data-link="agent-ros"><i></i><span>ROS 2</span></div>
+          <article class="flow-node" data-node="ros">
+            <span class="node-index">04</span>
+            <div class="node-icon">R2</div>
+            <h3>ROS 2</h3>
+            <p>Service / Action</p>
+            <small>LOCAL GRAPH</small>
+          </article>
+          <div class="flow-link" data-link="ros-robot"><i></i><span>I/O</span></div>
+          <article class="flow-node" data-node="robot">
+            <span class="node-index">05</span>
+            <div class="node-icon">HW</div>
+            <h3>真机 / Mock</h3>
+            <p>执行与状态</p>
+            <small>PHYSICAL SIDE</small>
+          </article>
+        </div>
+      </section>
+
+      <section class="cockpit shell">
+        <div class="panel controls-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="panel-kicker">CONTROL / 控制</p>
+              <h2>受限命令台</h2>
+            </div>
+            <span class="panel-led" id="controlLed"><i></i>LOCKED</span>
+          </div>
+
+          <div class="control-state-card" id="controlStateCard">
+            <div>
+              <small>SESSION CONTROL</small>
+              <strong id="controlState">SAFE_HOLD</strong>
+              <p id="controlReason">等待 Agent 建立会话</p>
+            </div>
+            <button class="button button-primary" id="acquireBtn" type="button">
+              获取控制权
+            </button>
+          </div>
+
+          <div class="command-block">
+            <div class="command-copy">
+              <span class="command-number">A</span>
+              <div>
+                <h3>动力使能</h3>
+                <p><code>power.enable</code> → <code>std_srvs/SetBool</code></p>
+              </div>
+            </div>
+            <div class="button-pair">
+              <button class="button button-positive command-button" id="powerOnBtn" type="button">
+                ENABLE
+              </button>
+              <button class="button button-neutral command-button" id="powerOffBtn" type="button">
+                DISABLE
+              </button>
+            </div>
+          </div>
+
+          <div class="command-block command-action-block">
+            <div class="command-copy">
+              <span class="command-number">B</span>
+              <div>
+                <h3>Action 任务</h3>
+                <p><code>task.execute</code> → Fibonacci Action + feedback</p>
+              </div>
+            </div>
+            <label class="number-field">
+              <span>ORDER</span>
+              <input id="taskOrder" type="number" min="1" max="100" value="12" inputmode="numeric">
+            </label>
+            <div class="button-pair">
+              <button class="button button-positive command-button" id="taskBtn" type="button">
+                EXECUTE
+              </button>
+              <button class="button button-danger" id="cancelBtn" type="button">
+                CANCEL
+              </button>
+            </div>
+          </div>
+
+          <div class="command-block command-action-block vln-command-block">
+            <div class="command-copy">
+              <span class="command-number">C</span>
+              <div>
+                <h3>H-IDE map 目标 → Mock Nav2</h3>
+                <p><code>navigation.navigate_to_pose</code> · 运动为模拟，不驱动真机</p>
+              </div>
+            </div>
+            <label class="number-field">
+              <span>MAP X / Y / YAW</span>
+              <input id="navX" type="number" step="0.1" value="1.0" inputmode="decimal">
+              <input id="navY" type="number" step="0.1" value="0.5" inputmode="decimal">
+              <input id="navYaw" type="number" min="-3.14159" max="3.14159" step="0.1" value="0" inputmode="decimal">
+            </label>
+            <div class="button-pair">
+              <button class="button button-positive command-button" id="vlnBtn" type="button">
+                SEND TO MOCK NAV2
+              </button>
+            </div>
+          </div>
+
+          <div class="safety-test">
+            <div class="safety-symbol" aria-hidden="true">!</div>
+            <div>
+              <strong>失联保护测试</strong>
+              <p>暂停续租，观察约 2 秒后 Agent 本地进入 SAFE_HOLD。</p>
+            </div>
+            <button class="button button-warning" id="leaseBtn" type="button">暂停续租</button>
+          </div>
+        </div>
+
+        <div class="panel telemetry-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="panel-kicker">TELEMETRY / 状态</p>
+              <h2>机器人侧观测</h2>
+            </div>
+            <span class="freshness" id="freshness">NO DATA</span>
+          </div>
+
+          <div class="telemetry-main">
+            <div class="mode-readout">
+              <small>ROBOT.MODE</small>
+              <strong id="robotMode">—</strong>
+              <span id="robotModeHint">等待 /robot/mode</span>
+            </div>
+            <div class="lease-gauge">
+              <div class="gauge-ring">
+                <progress id="leaseProgress" max="2000" value="0">0</progress>
+                <div>
+                  <strong id="leaseCountdown">—</strong>
+                  <small>LEASE</small>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="metric-grid">
+            <article>
+              <small>AGENT RX</small>
+              <strong id="rxMetric">0</strong>
+              <span>messages</span>
+            </article>
+            <article>
+              <small>AGENT TX</small>
+              <strong id="txMetric">0</strong>
+              <span>messages</span>
+            </article>
+            <article>
+              <small>LEASE SEQ</small>
+              <strong id="leaseSequence">—</strong>
+              <span>monotonic</span>
+            </article>
+            <article>
+              <small>COMMANDS</small>
+              <strong id="commandMetric">0</strong>
+              <span>bounded history</span>
+            </article>
+          </div>
+
+          <div class="identity-card">
+            <div class="identity-icon">ID</div>
+            <dl>
+              <div><dt>ROBOT</dt><dd id="robotId">g1-dev</dd></div>
+              <div><dt>BOOT</dt><dd id="bootId">—</dd></div>
+              <div><dt>CAPABILITY</dt><dd id="capabilityId">—</dd></div>
+            </dl>
+          </div>
+        </div>
+      </section>
+
+      <section class="observation-deck shell" aria-labelledby="observationTitle">
+        <div class="section-heading observation-heading">
+          <div>
+            <p class="eyebrow"><span>03</span> RGB-D OBSERVATION PLANE</p>
+            <h2 id="observationTitle">看见机器人真正发出的观测</h2>
+          </div>
+          <div class="observation-heading-status">
+            <span class="observation-status" id="observationStatus"><i></i>等待观测网关</span>
+            <small id="observationSource">SOURCE · —</small>
+          </div>
+        </div>
+
+        <div class="observation-separation">
+          <div>
+            <strong>控制面</strong>
+            <span>WebSocket · JSON · 64 KiB · 2 s 租约</span>
+          </div>
+          <i aria-hidden="true"></i>
+          <div>
+            <strong>观测面</strong>
+            <span>反向 gRPC · Protobuf · RGB + Z16 深度</span>
+          </div>
+          <p>两条链路彼此隔离：图片阻塞或断流，不会挤占安全控制消息。</p>
+        </div>
+
+        <div class="observation-grid">
+          <article class="panel camera-panel">
+            <div class="panel-heading compact-heading">
+              <div>
+                <p class="panel-kicker">ALIGNED PAIR / 同步帧</p>
+                <h2>RGB 与对齐深度</h2>
+              </div>
+              <span class="freshness" id="observationFreshness">NO FRAME</span>
+            </div>
+            <div class="camera-pair">
+              <figure class="camera-feed">
+                <div class="camera-screen">
+                  <img id="rgbImage" alt="RealSense 彩色图" hidden>
+                  <div class="camera-placeholder" id="rgbPlaceholder"><span>RGB</span>等待 JPEG 帧</div>
+                  <div class="camera-reticle" aria-hidden="true"></div>
+                </div>
+                <figcaption><strong>COLOR</strong><span>JPEG · QUALITY 85</span></figcaption>
+              </figure>
+              <figure class="camera-feed depth-feed">
+                <div class="camera-screen">
+                  <img id="depthImage" alt="RealSense 对齐深度伪彩色图" hidden>
+                  <div class="camera-placeholder" id="depthPlaceholder"><span>Z16</span>等待深度帧</div>
+                  <div class="depth-scale" aria-hidden="true"><i></i><span>NEAR</span><span>FAR</span></div>
+                </div>
+                <figcaption><strong>ALIGNED DEPTH</strong><span>ZSTD Z16 · LOSSLESS</span></figcaption>
+              </figure>
+            </div>
+            <div class="frame-identity">
+              <span>SEQ <b id="observationSequence">—</b></span>
+              <span>RGB #<b id="rgbFrameNumber">—</b></span>
+              <span>DEPTH #<b id="depthFrameNumber">—</b></span>
+              <span>SIZE <b id="frameBytes">—</b></span>
+              <span>TF <b id="frameTf">—</b></span>
+            </div>
+          </article>
+
+          <article class="panel observation-metrics-panel">
+            <div class="panel-heading compact-heading">
+              <div>
+                <p class="panel-kicker">FRESHNESS / 时延</p>
+                <h2>一帧经过了什么</h2>
+              </div>
+              <span class="panel-led" id="observationLed"><i></i>OFFLINE</span>
+            </div>
+            <div class="latency-bars">
+              <div class="latency-row">
+                <span>采集年龄</span><div><i id="captureAgeBar"></i></div><b id="captureAgeMetric">—</b>
+              </div>
+              <div class="latency-row">
+                <span>编码</span><div><i id="encodeBar"></i></div><b id="encodeMetric">—</b>
+              </div>
+              <div class="latency-row">
+                <span>排队</span><div><i id="queueBar"></i></div><b id="queueMetric">—</b>
+              </div>
+              <div class="latency-row">
+                <span>ACK 往返</span><div><i id="ackBar"></i></div><b id="ackMetric">—</b>
+              </div>
+              <div class="latency-row">
+                <span>估算网络</span><div><i id="networkBar"></i></div><b id="networkMetric">—</b>
+              </div>
+            </div>
+            <div class="observation-metric-grid">
+              <article><small>SEND RATE</small><strong id="sendFpsMetric">—</strong><span>fps</span></article>
+              <article><small>BANDWIDTH</small><strong id="bandwidthMetric">—</strong><span>Mbps</span></article>
+              <article><small>ACCEPTED</small><strong id="acceptedMetric">0</strong><span>frames</span></article>
+              <article><small>DROPPED</small><strong id="dropMetric">0</strong><span>newest-only</span></article>
+              <article><small>SEQ GAP</small><strong id="gapMetric">0</strong><span>latest ACK</span></article>
+              <article><small>REJECTED</small><strong id="rejectedMetric">0</strong><span>workstation</span></article>
+            </div>
+            <dl class="observation-binding">
+              <div><dt>SESSION</dt><dd id="observationSession">—</dd></div>
+              <div><dt>SCENE</dt><dd id="observationScene">—</dd></div>
+              <div><dt>CALIBRATION</dt><dd id="observationCalibration">—</dd></div>
+              <div><dt>HEALTH REASON</dt><dd id="observationReason">—</dd></div>
+            </dl>
+          </article>
+        </div>
+
+        <div class="observation-pipeline" aria-label="RGB-D 处理流水线">
+          <article data-observation-node="camera"><span>01</span><strong>RealSense</strong><small>SYNC RGB-D</small></article>
+          <i></i>
+          <article data-observation-node="enrich"><span>02</span><strong>采集时刻 TF</strong><small>MAP + BASE</small></article>
+          <i></i>
+          <article data-observation-node="queue"><span>03</span><strong>NEWEST ONLY</strong><small>CAPACITY = 1</small></article>
+          <i></i>
+          <article data-observation-node="encode"><span>04</span><strong>JPEG + ZSTD</strong><small>CRC32C</small></article>
+          <i></i>
+          <article data-observation-node="grpc"><span>05</span><strong>反向 gRPC</strong><small>ONE IN-FLIGHT</small></article>
+          <i></i>
+          <article data-observation-node="ack"><span>06</span><strong>ACK_ACCEPTED</strong><small>HEALTH REFRESH</small></article>
+        </div>
+
+        <div class="panel fault-panel">
+          <div>
+            <p class="panel-kicker">FAULT LAB / 故障演示</p>
+            <h3>主动破坏观测链路，观察本地健康降级</h3>
+            <p>暂停 ACK 超过 750 ms 会让观测不可用；只影响标记了 <code>requires_observation</code> 的导航目标。</p>
+          </div>
+          <div class="fault-actions">
+            <button class="button button-warning" id="ackFaultBtn" type="button">暂停 ACK</button>
+            <button class="button button-danger" id="rejectFrameBtn" type="button">拒绝下一帧</button>
+            <button class="button button-neutral" id="sessionFaultBtn" type="button">停止观测会话</button>
+            <button class="button button-neutral" id="cameraFaultBtn" type="button">暂停模拟相机</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="observability shell">
+        <div class="panel command-history-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="panel-kicker">COMMAND LEDGER / 命令</p>
+              <h2>生命周期</h2>
+            </div>
+            <span class="legend"><i></i>SQLite 与线上终态应一致</span>
+          </div>
+          <div class="command-table-head" aria-hidden="true">
+            <span>COMMAND</span><span>STATE</span><span>DETAIL / RESULT</span><span>UPDATED</span>
+          </div>
+          <div class="command-list" id="commandList">
+            <div class="empty-state">
+              <span>⌁</span>
+              <strong>还没有命令</strong>
+              <p>获取控制权，然后发送动力或 Action 任务。</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel event-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="panel-kicker">PROTOCOL TRACE / 事件</p>
+              <h2>安全时间线</h2>
+            </div>
+            <button class="text-button" id="clearEventsBtn" type="button">清空</button>
+          </div>
+          <div class="event-list" id="eventList" aria-live="polite"></div>
+        </div>
+      </section>
+
+      <section class="explain shell">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow"><span>04</span> WHAT THIS PROVES</p>
+            <h2>这个页面能看到什么</h2>
+          </div>
+        </div>
+        <div class="explain-grid">
+          <article>
+            <span>01</span>
+            <h3>白名单翻译</h3>
+            <p>网页只知道 <code>power.enable</code>，ROS 名称与类型始终留在机器人本地配置。</p>
+          </article>
+          <article>
+            <span>02</span>
+            <h3>控制租约</h3>
+            <p>只有 ACTIVE 会话可发命令；续租停止后，Robot Agent 在本地触发安全态。</p>
+          </article>
+          <article>
+            <span>03</span>
+            <h3>幂等与终态</h3>
+            <p>命令 ID、TTL、资源仲裁和 SQLite 台账共同避免重复下发与状态漂移。</p>
+          </article>
+          <article>
+            <span>04</span>
+            <h3>数据收敛</h3>
+            <p>控制面只上传归一化状态；RGB-D 通过独立 sidecar 与二进制观测面传输。</p>
+          </article>
+          <article>
+            <span>05</span>
+            <h3>新鲜度优先</h3>
+            <p>容量 1 队列让旧帧被新帧覆盖，网络变慢时不会把过期画面排队重放。</p>
+          </article>
+          <article>
+            <span>06</span>
+            <h3>观测依赖导航保护</h3>
+            <p>只有工作站接受的新观测才刷新健康；超时仅取消依赖观测的 NavigateToPose。</p>
+          </article>
+        </div>
+      </section>
+    </main>
+
+    <footer class="shell">
+      <span>ROBOT AGENT V1 · LOCAL VISUAL ACCEPTANCE</span>
+      <span id="footerClock">—</span>
+    </footer>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  </body>
+</html>

@@ -1,0 +1,85 @@
+schema_version: "1"
+
+identity:
+  robot_id: g1-sim
+
+transport:
+  # H-IDE Vision's plaintext observation ingress is published on host port
+  # 50061.  Port 50062 is reserved for a future explicit relay and must not be
+  # used until such a relay is actually running.
+  target: 127.0.0.1:50061
+  reconnect_initial_ms: 250
+  reconnect_max_ms: 5000
+  connect_timeout_ms: 5000
+  write_timeout_ms: 400
+  ack_timeout_ms: 750
+  grpc_max_message_bytes: 4194304
+  http2_keepalive_time_ms: 60000
+  http2_keepalive_timeout_ms: 20000
+
+tls:
+  enabled: false
+  ca_file: null
+  cert_file: null
+  key_file: null
+  server_name: null
+  allow_plaintext_loopback: true
+
+sensor:
+  # ROS RGB-D/TF ingress backed by the MuJoCo observation bridge.  The
+  # gateway labels the resulting protocol frames SOURCE_MODE_SYNTHETIC.
+  sensor_id: head_rgbd
+  source_mode: mujoco
+  source_id: mujoco:unitree-g1:g1-sim
+  localization_epoch_id: g1-sim-map-epoch-1
+  device_serial: mujoco-g1-sim
+  device_model: MuJoCo Unitree G1 29-DoF
+  firmware_version: simulation
+  rgbd_topic: /camera/camera/rgbd
+  color_metadata_topic: /camera/camera/color/metadata
+  depth_metadata_topic: /camera/camera/depth/metadata
+  localization_topic: /localization/pose
+  localization_epoch_topic: /localization/epoch_id
+  map_frame: map
+  base_frame: base_link
+  rgbd_frame: camera_rgbd_optical_frame
+  camera_frame: camera_color_optical_frame
+  color_profile: 640x480x30
+  depth_profile: 640x480x30
+  depth_scale_meters_per_unit: 0.001
+  strict_localization: true
+
+stream:
+  target_rate_hz: 5.0
+  minimum_rate_hz: 1.0
+  jpeg_quality: 85
+  zstd_level: 3
+  max_frame_bytes: 3145728
+  max_bandwidth_mbps: 20.0
+  stale_frame_ms: 750
+  encode_p95_budget_ms: 80
+  tf_lookup_timeout_ms: 100
+  # ROS delivers the synchronized RGB-D payload and the small pose/metadata
+  # topics on independent reliable channels.  They can arrive a few tens of
+  # milliseconds apart even though their capture timestamps are identical.
+  # Keep the timestamp matching strict while allowing that bounded queueing
+  # delay; this is not a fallback localization source.
+  localization_max_age_ms: 300
+  metadata_max_delta_ms: 250
+  metadata_ttl_ms: 1000
+  metadata_cache_size: 8
+  localization_ttl_ms: 2000
+  localization_cache_size: 32
+
+observation_lease:
+  keepalive_interval_ms: 250
+  keepalive_timeout_ms: 1000
+
+clock:
+  cross_machine_age_valid: true
+  estimated_uncertainty_ms: 1.0
+
+health_bridge:
+  demand_topic: /robot_agent/observation_demand
+  health_topic: /robot_observation_gateway/health
+  heartbeat_period_ms: 100

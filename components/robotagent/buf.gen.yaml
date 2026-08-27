@@ -1,0 +1,6 @@
+version: v2
+plugins:
+  - remote: buf.build/protocolbuffers/python
+    out: src/robot_observation_gateway
+  - remote: buf.build/grpc/python
+    out: src/robot_observation_gateway
