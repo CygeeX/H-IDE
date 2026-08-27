@@ -5,6 +5,7 @@ import hashlib
 import importlib
 import json
 import math
+import os
 import sys
 from pathlib import Path
 
@@ -31,8 +32,26 @@ from robot_observation_gateway.runtime import GatewayRuntime
 from robot_observation_gateway.synthetic_source import SyntheticObservationSource
 
 WORKSPACE = Path(__file__).resolve().parents[1]
-H_IDE_VISION = Path("/home/phi/learn-projects/h-ide-vision")
-H_IDE = Path("/home/phi/learn-projects/h-ide")
+
+
+def _sibling_or_monorepo_component(name: str) -> Path:
+    candidates = []
+    if os.getenv("SKILLSTORE_ROOT"):
+        candidates.append(Path(os.environ["SKILLSTORE_ROOT"]) / "components" / name)
+    candidates.extend(
+        [
+            WORKSPACE.parents[1] / "components" / name,
+            WORKSPACE.parents[1] / name,
+        ]
+    )
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    return candidates[0]
+
+
+H_IDE_VISION = _sibling_or_monorepo_component("h-ide-vision")
+H_IDE = _sibling_or_monorepo_component("h-ide")
 
 
 def test_observation_contract_is_the_h_ide_vision_contract() -> None:

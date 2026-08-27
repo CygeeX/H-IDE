@@ -1,9 +1,20 @@
 #!/usr/bin/env bash
 set -u
 
-HIDE_STATUS_H_IDE_ROOT="/home/phi/learn-projects/h-ide"
-HIDE_STATUS_SIM_ROOT="/home/phi/learn-projects/h-ide-mujoco-sonic"
-HIDE_STATUS_ENV="${HIDE_STATUS_H_IDE_ROOT}/.env"
+HIDE_STATUS_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+HIDE_STATUS_SIM_ROOT="${HIDE_STATUS_SIM_ROOT:-$(cd -- "${HIDE_STATUS_SCRIPT_DIR}/.." && pwd -P)}"
+HIDE_STATUS_SIM_ROOT="$(cd -- "${HIDE_STATUS_SIM_ROOT}" && pwd -P)"
+if [[ -n "${SKILLSTORE_ROOT:-}" ]]; then
+  HIDE_STATUS_LAYOUT_ROOT="$(cd -- "${SKILLSTORE_ROOT}" && pwd -P)"
+else
+  HIDE_STATUS_LAYOUT_ROOT="$(cd -- "${HIDE_STATUS_SIM_ROOT}/.." && pwd -P)"
+fi
+if [[ -d "${HIDE_STATUS_LAYOUT_ROOT}/h-ide" ]]; then
+  HIDE_STATUS_H_IDE_ROOT="${HIDE_STATUS_H_IDE_ROOT:-${HIDE_STATUS_LAYOUT_ROOT}/h-ide}"
+else
+  HIDE_STATUS_H_IDE_ROOT="${HIDE_STATUS_H_IDE_ROOT:-${HIDE_STATUS_LAYOUT_ROOT}/components/h-ide}"
+fi
+HIDE_STATUS_ENV="${HIDE_STATUS_ENV:-${HIDE_STATUS_H_IDE_ROOT}/.env}"
 
 env_value() {
   local key="$1"

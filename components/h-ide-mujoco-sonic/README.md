@@ -19,11 +19,12 @@ stale or cancelled.
 
 ## What is vendored and what is downloaded
 
-* `vendor/lerobot` is pinned to `f5fdcb61cda272b866ca81f72ce6f1f76b87fad9`.
-  The source is Apache-2.0.
-* `models/unitree-g1-mujoco` is the public `lerobot/unitree-g1-mujoco`
-  repository. Its simulator bridge and no-hand G1 asset match NVIDIA's current
-  SONIC MuJoCo deployment model, including the full-sole collision boxes.
+* `vendor/lerobot` resolves to the monorepo's `third_party/lerobot` snapshot,
+  pinned to `56b4087c40d7ee8e78e3485f78fe21e88679355b`. The source is Apache-2.0.
+* `models/unitree-g1-mujoco` is an operator-created link to the pinned public
+  `lerobot/unitree-g1-mujoco` checkout plus the reviewed Office overlay. The
+  mesh license is not assumed; run `integration/bootstrap.sh --fetch-g1-model`
+  only after reviewing `manifests/vendor/g1-model.json`.
 * SONIC ONNX weights are downloaded at runtime from `nvidia/GEAR-SONIC` and
   must not be committed or baked into an image.  The weights are covered by
   NVIDIA's Open Model License, which is separate from the LeRobot license.
@@ -152,7 +153,7 @@ simulation Robot Agent Gateway, `g1-sim`, and its Observation Gateway. It is
 idempotent: already running components are reported and left alone.
 
 ```bash
-cd /home/phi/learn-projects/h-ide-mujoco-sonic
+cd $SKILLSTORE_ROOT/components/h-ide-mujoco-sonic
 scripts/start-workstation-demo.sh
 
 # Rebuild changed H-IDE container images first when source changed:
@@ -188,9 +189,9 @@ two passive viewers. It exits with the robot stationary and sends no motion.
 Run exactly one explicitly authorized case from a second terminal:
 
 ```bash
-cd /home/phi/learn-projects/h-ide-mujoco-sonic
+cd $SKILLSTORE_ROOT/components/h-ide-mujoco-sonic
 source /opt/ros/jazzy/setup.bash
-source /home/phi/learn-projects/robotagent/tools/activate-local-nav2-jazzy.bash
+source $SKILLSTORE_ROOT/components/robotagent/tools/activate-local-nav2-jazzy.bash
 export ROS_DOMAIN_ID=232
 export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 export CYCLONEDDS_URI='<CycloneDDS><Domain><General><Interfaces><NetworkInterface name="lo"/></Interfaces><AllowMulticast>true</AllowMulticast></General></Domain></CycloneDDS>'
@@ -217,7 +218,7 @@ RobotAgent full chain.
 ## Manual component start (for debugging)
 
 ```bash
-cd /home/phi/learn-projects/h-ide-mujoco-sonic
+cd $SKILLSTORE_ROOT/components/h-ide-mujoco-sonic
 source .venv/bin/activate
 
 # Validate imports, pins, model and safety configuration (no simulator start)
@@ -315,7 +316,7 @@ ten-minute pre-motion record without sending a control, Nav2, reset, stop, or
 rearm request:
 
 ```bash
-cd /home/phi/learn-projects/h-ide-mujoco-sonic
+cd $SKILLSTORE_ROOT/components/h-ide-mujoco-sonic
 .venv/bin/python tools/idle_soak_monitor.py \
   --output var/acceptance/$(date -u +%Y%m%dT%H%M%SZ)-safe-hold/idle-soak.jsonl
 ```

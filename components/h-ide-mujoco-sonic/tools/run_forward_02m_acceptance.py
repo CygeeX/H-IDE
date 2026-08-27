@@ -28,7 +28,14 @@ from uuid import uuid4
 
 
 SCHEMA_VERSION = "h-ide.forward-02m-acceptance/1"
-ENV_PATH = Path("/home/phi/learn-projects/h-ide/.env")
+_THIS_COMPONENT_ROOT = Path(__file__).resolve().parents[1]
+_configured_root = os.getenv("SKILLSTORE_ROOT")
+_SKILLSTORE_ROOT = Path(_configured_root).expanduser() if _configured_root else Path()
+if not _configured_root or not _SKILLSTORE_ROOT.is_dir():
+    _SKILLSTORE_ROOT = _THIS_COMPONENT_ROOT.parents[1]
+ENV_PATH = Path(
+    os.getenv("SKILLSTORE_ENV_FILE", str(_SKILLSTORE_ROOT / ".env"))
+).expanduser()
 TOKEN_KEY = "SIMULATION_ROBOT_AGENT_GATEWAY_TOKEN"
 DEFAULT_GATEWAY_BASE = "http://127.0.0.1:8094"
 PLANT_URL = "http://127.0.0.1:8794/state"

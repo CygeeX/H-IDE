@@ -51,10 +51,10 @@ startup_support_s: 3.5
 policy_release_fall_arrest: true
 startup_horizontal_support_s: 6.0
 reset_policy: explicit_process_restart
-model_scene: /home/phi/learn-projects/h-ide-mujoco-sonic/scenes/office_v2/generated/mujoco/office_v2.runtime.xml
-scene_runtime_manifest: /home/phi/learn-projects/h-ide-mujoco-sonic/scenes/office_v2/generated/runtime_manifest.json
+model_scene: scenes/office_v2/generated/mujoco/office_v2.runtime.xml
+scene_runtime_manifest: scenes/office_v2/generated/runtime_manifest.json
 sonic_model_profile: sonic-python-experimental
-sonic_model_lock: /home/phi/learn-projects/h-ide-mujoco-sonic/config/sonic-models.lock.json
+sonic_model_lock: sonic-models.lock.json
 sonic_model_repo: nvidia/GEAR-SONIC
 sonic_model_revision: 9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2
 lerobot_commit: 56b4087c40d7ee8e78e3485f78fe21e88679355b

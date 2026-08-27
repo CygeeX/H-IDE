@@ -7,14 +7,39 @@ set -euo pipefail
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/${UID}}"
 export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR}/bus}"
 
-HIDE_DEMO_H_IDE_ROOT="/home/phi/learn-projects/h-ide"
-HIDE_DEMO_SIM_ROOT="/home/phi/learn-projects/h-ide-mujoco-sonic"
-HIDE_DEMO_ROBOT_ROOT="/home/phi/learn-projects/robotagent"
-HIDE_DEMO_VISION_ROOT="/home/phi/learn-projects/h-ide-vision"
+HIDE_DEMO_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+HIDE_DEMO_DEFAULT_SIM_ROOT="$(cd -- "${HIDE_DEMO_SCRIPT_DIR}/.." && pwd -P)"
+HIDE_DEMO_SIM_ROOT="${HIDE_DEMO_SIM_ROOT:-${HIDE_DEMO_DEFAULT_SIM_ROOT}}"
+HIDE_DEMO_SIM_ROOT="$(cd -- "${HIDE_DEMO_SIM_ROOT}" && pwd -P)"
+if [[ -n "${SKILLSTORE_ROOT:-}" ]]; then
+  HIDE_DEMO_LAYOUT_ROOT="$(cd -- "${SKILLSTORE_ROOT}" && pwd -P)"
+else
+  HIDE_DEMO_SIBLING_ROOT="$(cd -- "${HIDE_DEMO_SIM_ROOT}/.." && pwd -P)"
+  if [[ -d "${HIDE_DEMO_SIBLING_ROOT}/components/h-ide" ]]; then
+    HIDE_DEMO_LAYOUT_ROOT="${HIDE_DEMO_SIBLING_ROOT}"
+  else
+    HIDE_DEMO_LAYOUT_ROOT="${HIDE_DEMO_SIBLING_ROOT}"
+  fi
+fi
+if [[ -d "${HIDE_DEMO_LAYOUT_ROOT}/components/h-ide" ]]; then
+  HIDE_DEMO_H_IDE_ROOT="${HIDE_DEMO_H_IDE_ROOT:-${HIDE_DEMO_LAYOUT_ROOT}/components/h-ide}"
+  HIDE_DEMO_ROBOT_ROOT="${HIDE_DEMO_ROBOT_ROOT:-${HIDE_DEMO_LAYOUT_ROOT}/components/robotagent}"
+  HIDE_DEMO_VISION_ROOT="${HIDE_DEMO_VISION_ROOT:-${HIDE_DEMO_LAYOUT_ROOT}/components/h-ide-vision}"
+elif [[ -d "${HIDE_DEMO_LAYOUT_ROOT}/h-ide" ]]; then
+  HIDE_DEMO_H_IDE_ROOT="${HIDE_DEMO_H_IDE_ROOT:-${HIDE_DEMO_LAYOUT_ROOT}/h-ide}"
+  HIDE_DEMO_ROBOT_ROOT="${HIDE_DEMO_ROBOT_ROOT:-${HIDE_DEMO_LAYOUT_ROOT}/robotagent}"
+  HIDE_DEMO_VISION_ROOT="${HIDE_DEMO_VISION_ROOT:-${HIDE_DEMO_LAYOUT_ROOT}/h-ide-vision}"
+else
+  # Legacy sibling checkout: retain compatibility without making it the
+  # default for a cloned Skillstore monorepo.
+  HIDE_DEMO_H_IDE_ROOT="${HIDE_DEMO_H_IDE_ROOT:-${HIDE_DEMO_LAYOUT_ROOT}/h-ide}"
+  HIDE_DEMO_ROBOT_ROOT="${HIDE_DEMO_ROBOT_ROOT:-${HIDE_DEMO_LAYOUT_ROOT}/robotagent}"
+  HIDE_DEMO_VISION_ROOT="${HIDE_DEMO_VISION_ROOT:-${HIDE_DEMO_LAYOUT_ROOT}/h-ide-vision}"
+fi
 HIDE_DEMO_RUN_ROOT="${XDG_RUNTIME_DIR:-/tmp}/h-ide-mujoco-demo-${UID}"
-HIDE_DEMO_CONFIG="${HIDE_DEMO_SIM_ROOT}/config/ros-headless.yaml"
-HIDE_DEMO_ROBOT_CONFIG="${HIDE_DEMO_ROBOT_ROOT}/src/robot_agent/config/robot_agent.mujoco.yaml"
-HIDE_DEMO_OBSERVATION_CONFIG="${HIDE_DEMO_ROBOT_ROOT}/src/robot_observation_gateway/config/robot_observation_gateway.mujoco.yaml"
+HIDE_DEMO_CONFIG="${HIDE_DEMO_CONFIG:-${HIDE_DEMO_SIM_ROOT}/config/ros-headless.yaml}"
+HIDE_DEMO_ROBOT_CONFIG="${HIDE_DEMO_ROBOT_CONFIG:-${HIDE_DEMO_ROBOT_ROOT}/src/robot_agent/config/robot_agent.mujoco.yaml}"
+HIDE_DEMO_OBSERVATION_CONFIG="${HIDE_DEMO_OBSERVATION_CONFIG:-${HIDE_DEMO_ROBOT_ROOT}/src/robot_observation_gateway/config/robot_observation_gateway.mujoco.yaml}"
 HIDE_DEMO_CYCLONE='<CycloneDDS><Domain><General><Interfaces><NetworkInterface name="lo"/></Interfaces><AllowMulticast>true</AllowMulticast></General></Domain></CycloneDDS>'
 HIDE_DEMO_SYSTEMD_PREFIX="h-ide-mujoco-demo"
 HIDE_DOCKER_OBSERVATION_BIND_REQUEST="${HIDE_DOCKER_OBSERVATION_BIND_HOST:-auto}"
@@ -860,6 +885,7 @@ wait_for_nav2_active() {
 
 compose=(
   docker compose
+  --project-name "${SKILLSTORE_COMPOSE_PROJECT:-skillstore-e2e}"
   --env-file "${HIDE_DEMO_H_IDE_ROOT}/.env"
   -f "${HIDE_DEMO_H_IDE_ROOT}/infra/docker-compose.yml"
   -f "${HIDE_DEMO_H_IDE_ROOT}/infra/docker-compose.simulation.yml"

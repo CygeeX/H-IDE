@@ -18,8 +18,8 @@
     "attempt to expose a robot command RPC"
   ],
   "runner": {
-    "repository": "/home/phi/learn-projects/h-ide-vision",
-    "command": "uv run pytest tests/contracts tests/unit tests/integration/test_grpc_fixture.py tests/integration/test_fixture_resolution.py",
-    "manualFixture": "uv run python tools/observation_fixture_sender.py --frames 3"
+    "repository": "components/h-ide-vision",
+    "command": "(cd components/h-ide-vision && uv run pytest tests/contracts tests/unit tests/integration/test_grpc_fixture.py tests/integration/test_fixture_resolution.py)",
+    "manualFixture": "(cd components/h-ide-vision && uv run python tools/observation_fixture_sender.py --frames 3)"
   }
 }

@@ -86,7 +86,7 @@ verification commands:
 
 ```bash
 source /opt/ros/jazzy/setup.bash
-source /home/phi/learn-projects/robotagent/tools/activate-local-nav2-jazzy.bash
+source $SKILLSTORE_ROOT/components/robotagent/tools/activate-local-nav2-jazzy.bash
 ```
 
 With that prefix active, the read-only `validate-config` and `doctor` checks

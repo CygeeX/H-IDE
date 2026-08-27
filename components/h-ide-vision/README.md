@@ -45,7 +45,7 @@ gRPC `50061` to this single product service. Start and verify the workstation
 profile from its owning repository:
 
 ```bash
-cd /home/phi/learn-projects/h-ide-mujoco-sonic
+cd $SKILLSTORE_ROOT/components/h-ide-mujoco-sonic
 scripts/start-workstation-demo.sh
 scripts/workstation-demo-status.sh
 ```

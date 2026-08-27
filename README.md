@@ -19,10 +19,9 @@ MuJoCo Office V2 的单仓库联调发行版。它把各组件的冻结源码、
 ```bash
 git clone http://192.168.50.189:37085/zhongwenjun/skillstore.git
 cd skillstore
-cp integration/.env.simulation.example .env
-# 编辑 .env；不要把它加入 Git
-./integration/preflight.sh
 ./integration/bootstrap.sh
+# 编辑 .env；不要把它加入 Git
+./integration/preflight.sh --level L0
 ./integration/start-e2e.sh --viewer
 ```
 
@@ -63,3 +62,6 @@ helper 提供，不能写进 URL 或脚本。
 - [L0/L1/L2 验收清单](docs/acceptance/README.md)
 - [秘密、许可证和第三方边界](docs/security/README.md)
 - [跨项目锁定清单](integration/integration.lock.yaml)
+
+发布边界：代码仓库是公开可读的，但 G1 网格、SONIC/GR00T 权重、API 凭据、账号
+数据库和运行证据仍按各自条款与本机权限处理，不会因为 Git 可读就自动随仓库分发。

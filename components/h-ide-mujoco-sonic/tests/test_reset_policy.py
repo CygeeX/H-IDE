@@ -9,6 +9,11 @@ import pytest
 
 
 MODEL_ROOT = Path(__file__).resolve().parents[1] / "models" / "unitree-g1-mujoco"
+if not MODEL_ROOT.is_dir():
+    pytest.skip(
+        "G1 model checkout is an operator-fetched L2 asset",
+        allow_module_level=True,
+    )
 sys.path.insert(0, str(MODEL_ROOT))
 
 from sim.base_sim import (  # noqa: E402

@@ -1,0 +1,10 @@
+{
+  "schema_version": "skillstore.vendored-source/1",
+  "component": "unitree-sdk2-python",
+  "source_url": "https://github.com/unitreerobotics/unitree_sdk2_python.git",
+  "upstream_revision": "65691c8a8bc53b98d3976dba4dbf9d5d20b2e7f5",
+  "license": "BSD-3-Clause",
+  "redistribution": "source_snapshot",
+  "snapshot_path": "third_party/unitree_sdk2_python",
+  "notes": "The snapshot is used through a relative symlink from the simulator component."
+}

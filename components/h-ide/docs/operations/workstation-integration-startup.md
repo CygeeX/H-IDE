@@ -14,16 +14,16 @@ PWA
 → g1-sim Robot Agent
 → Nav2
 → SONIC
-→ MuJoCo Office V3
+→ MuJoCo Office V2
 ```
 
 适用仓库：
 
-- `/home/phi/learn-projects/h-ide`
-- `/home/phi/learn-projects/h-ide-agent`
-- `/home/phi/learn-projects/h-ide-vision`
-- `/home/phi/learn-projects/robotagent`
-- `/home/phi/learn-projects/h-ide-mujoco-sonic`
+- `$SKILLSTORE_ROOT/components/h-ide`
+- `$SKILLSTORE_ROOT/components/h-ide-agent`
+- `$SKILLSTORE_ROOT/components/h-ide-vision`
+- `$SKILLSTORE_ROOT/components/robotagent`
+- `$SKILLSTORE_ROOT/components/h-ide-mujoco-sonic`
 
 DAAAM 当前不是常驻联调服务，只在离线导入语义记忆时运行工具，不属于本文的
 启动链。
@@ -33,7 +33,7 @@ DAAAM 当前不是常驻联调服务，只在离线导入语义记忆时运行�
 在图形桌面的普通终端中执行：
 
 ```bash
-cd /home/phi/learn-projects/h-ide-mujoco-sonic
+cd $SKILLSTORE_ROOT/components/h-ide-mujoco-sonic
 
 HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT=1 \
   ./scripts/start-workstation-demo.sh --viewer
@@ -50,7 +50,7 @@ HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT=1 \
 修改过 H-IDE、Agent 或 Docker 内源码后执行：
 
 ```bash
-cd /home/phi/learn-projects/h-ide-mujoco-sonic
+cd $SKILLSTORE_ROOT/components/h-ide-mujoco-sonic
 
 HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT=1 \
   ./scripts/start-workstation-demo.sh --rebuild --viewer
@@ -59,7 +59,7 @@ HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT=1 \
 如果不需要桌面 MuJoCo 窗口，可以省略 `--viewer`：
 
 ```bash
-cd /home/phi/learn-projects/h-ide-mujoco-sonic
+cd $SKILLSTORE_ROOT/components/h-ide-mujoco-sonic
 ./scripts/start-workstation-demo.sh
 ```
 
@@ -90,7 +90,7 @@ PWA 已构建到 Control API 镜像中，不存在单独的生产 PWA 进程。
 ## 启动后的状态检查
 
 ```bash
-cd /home/phi/learn-projects/h-ide-mujoco-sonic
+cd $SKILLSTORE_ROOT/components/h-ide-mujoco-sonic
 ./scripts/workstation-demo-status.sh
 ```
 
@@ -135,10 +135,10 @@ systemctl --user list-units 'h-ide-mujoco-demo-*' --all --no-pager
 ## 0. 公共路径与 ROS 环境
 
 ```bash
-export HIDE_ROOT=/home/phi/learn-projects/h-ide
-export SIM_ROOT=/home/phi/learn-projects/h-ide-mujoco-sonic
-export ROBOT_ROOT=/home/phi/learn-projects/robotagent
-export VISION_ROOT=/home/phi/learn-projects/h-ide-vision
+export HIDE_ROOT=$SKILLSTORE_ROOT/components/h-ide
+export SIM_ROOT=$SKILLSTORE_ROOT/components/h-ide-mujoco-sonic
+export ROBOT_ROOT=$SKILLSTORE_ROOT/components/robotagent
+export VISION_ROOT=$SKILLSTORE_ROOT/components/h-ide-vision
 
 export SIM_CONFIG="$SIM_ROOT/config/ros-headless.yaml"
 export ROBOT_CONFIG="$ROBOT_ROOT/src/robot_agent/config/robot_agent.mujoco.yaml"
@@ -580,7 +580,7 @@ cd "$SIM_ROOT"
 启动：
 
 ```bash
-cd /home/phi/learn-projects/h-ide
+cd $SKILLSTORE_ROOT/components/h-ide
 
 docker compose --env-file .env \
   -f infra/docker-compose.yml \
@@ -625,7 +625,7 @@ for HIDE_STOP_UNIT in \
     "h-ide-mujoco-demo-${HIDE_STOP_UNIT}.service" 2>/dev/null || true
 done
 
-cd /home/phi/learn-projects/h-ide
+cd $SKILLSTORE_ROOT/components/h-ide
 
 docker compose --env-file .env \
   -f infra/docker-compose.yml \
@@ -651,7 +651,7 @@ docker stop --timeout 10 robot-action-console-whisper-1
 ## 关闭后的确认
 
 ```bash
-cd /home/phi/learn-projects/h-ide-mujoco-sonic
+cd $SKILLSTORE_ROOT/components/h-ide-mujoco-sonic
 ./scripts/workstation-demo-status.sh
 ```
 
@@ -682,10 +682,10 @@ systemctl --user list-units 'h-ide-mujoco-demo-*' --all --no-pager
 
 ## 相关文件
 
-- 启动脚本：`/home/phi/learn-projects/h-ide-mujoco-sonic/scripts/start-workstation-demo.sh`
-- 状态脚本：`/home/phi/learn-projects/h-ide-mujoco-sonic/scripts/workstation-demo-status.sh`
-- 仿真配置：`/home/phi/learn-projects/h-ide-mujoco-sonic/config/ros-headless.yaml`
-- Robot Agent 配置：`/home/phi/learn-projects/robotagent/src/robot_agent/config/robot_agent.mujoco.yaml`
-- Observation Gateway 配置：`/home/phi/learn-projects/robotagent/src/robot_observation_gateway/config/robot_observation_gateway.mujoco.yaml`
-- H-IDE Compose：`/home/phi/learn-projects/h-ide/infra/docker-compose.yml`
-- 仿真 Compose Overlay：`/home/phi/learn-projects/h-ide/infra/docker-compose.simulation.yml`
+- 启动脚本：`$SKILLSTORE_ROOT/components/h-ide-mujoco-sonic/scripts/start-workstation-demo.sh`
+- 状态脚本：`$SKILLSTORE_ROOT/components/h-ide-mujoco-sonic/scripts/workstation-demo-status.sh`
+- 仿真配置：`$SKILLSTORE_ROOT/components/h-ide-mujoco-sonic/config/ros-headless.yaml`
+- Robot Agent 配置：`$SKILLSTORE_ROOT/components/robotagent/src/robot_agent/config/robot_agent.mujoco.yaml`
+- Observation Gateway 配置：`$SKILLSTORE_ROOT/components/robotagent/src/robot_observation_gateway/config/robot_observation_gateway.mujoco.yaml`
+- H-IDE Compose：`$SKILLSTORE_ROOT/components/h-ide/infra/docker-compose.yml`
+- 仿真 Compose Overlay：`$SKILLSTORE_ROOT/components/h-ide/infra/docker-compose.simulation.yml`

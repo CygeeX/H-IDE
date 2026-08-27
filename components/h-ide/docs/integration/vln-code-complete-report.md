@@ -34,7 +34,7 @@ The protocol simulator demonstrates H-IDE-owned behavior only. It is not evidenc
 
 ## Frozen continuation
 
-Run [robot-agent-deferred-validation.md](robot-agent-deferred-validation.md) only after the Robot Agent owner meets every unfreeze prerequisite. Until then, keep `robot_execute` disabled; use fixture/protocol-simulator modes and label motion as simulated. No files in `/home/phi/learn-projects/robotagent` were changed by this implementation.
+Run [robot-agent-deferred-validation.md](robot-agent-deferred-validation.md) only after the Robot Agent owner meets every unfreeze prerequisite. Until then, keep `robot_execute` disabled; use fixture/protocol-simulator modes and label motion as simulated. No files in `$SKILLSTORE_ROOT/components/robotagent` were changed by this implementation.
 
 ## 2026-08-13 local pre-integration addendum
 

@@ -1,0 +1,12 @@
+{
+  "schema_version": "skillstore.external-asset/1",
+  "component": "unitree-g1-mujoco",
+  "source_url": "https://huggingface.co/lerobot/unitree-g1-mujoco",
+  "base_revision": "a38dc8617f0fca51b38e9354dc58ee35ad850fb5",
+  "overlay": "third_party/g1-model-office.patch",
+  "overlay_sha256": "f7f6ef8939e120269b6e9b77ec9925dbd44d381c3d87bd0a58a1a4ee3f484ca9",
+  "license_status": "operator_must_confirm",
+  "license_note": "The upstream repository does not declare a redistribution license for its robot mesh assets. Do not mirror the meshes in Skillstore without written clearance.",
+  "lfs_required": true,
+  "install_target": "components/h-ide-mujoco-sonic/models/unitree-g1-mujoco"
+}

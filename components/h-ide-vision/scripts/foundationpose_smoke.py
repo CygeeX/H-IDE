@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 
 
 def main() -> None:
-    source = Path("/home/phi/learn-projects/FoundationPose-main")
+    source = Path(
+        os.getenv(
+            "FOUNDATIONPOSE_ROOT",
+            str(Path(__file__).resolve().parents[3] / "external" / "FoundationPose-main"),
+        )
+    ).expanduser()
     required = (
         source / "LICENSE",
         source / "weights/2023-10-28-18-33-37/model_best.pth",

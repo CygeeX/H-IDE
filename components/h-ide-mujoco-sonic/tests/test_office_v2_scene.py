@@ -52,6 +52,11 @@ def _sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _require_g1_model() -> None:
+    if not G1_MODEL.is_file():
+        pytest.skip("G1 mesh checkout is an operator-fetched L2 asset")
+
+
 def _pgm(path: Path) -> tuple[int, int, bytes]:
     raw = path.read_bytes()
     assert raw.startswith(b"P5\n")
@@ -469,6 +474,7 @@ def test_generated_preview_loads_with_mujoco() -> None:
 def test_runtime_g1_uses_official_deployment_full_sole_contact_geometry() -> None:
     """Match NVIDIA's pinned MuJoCo deployment model, not the training MJCF."""
 
+    _require_g1_model()
     raw = G1_MODEL.read_text(encoding="utf-8")
     assert "a0732b642c0333077e127a2f56ab0014c196bca4" in raw
     local_root = ET.parse(G1_MODEL).getroot()
@@ -493,6 +499,7 @@ def test_runtime_g1_uses_official_deployment_full_sole_contact_geometry() -> Non
 
 
 def _standing_runtime_model():
+    _require_g1_model()
     mujoco = pytest.importorskip("mujoco")
     from lerobot.robots.unitree_g1.controllers.sonic_pipeline import (
         DEFAULT_ANGLES_MUJOCO,
@@ -576,6 +583,7 @@ def test_runtime_bundle_loads_g1_at_the_verified_noncolliding_spawn() -> None:
 
 
 def test_runtime_head_and_overview_cameras_render_nonblack_rgb() -> None:
+    _require_g1_model()
     # MuJoCo selects its GL implementation when it is first imported. Run the
     # render probe in a fresh EGL process so this test remains authoritative on
     # headless CI even when another test imported MuJoCo without MUJOCO_GL.

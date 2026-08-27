@@ -76,6 +76,49 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _directory_sha256(path: Path) -> str:
+    """Hash a vendored source tree without requiring nested Git metadata.
+
+    A monorepo intentionally stores some third-party source as ordinary files
+    rather than a Git gitlink.  Hash paths, file bytes, and symlink targets in
+    a stable order so the runtime lock can still detect a partial or modified
+    vendor snapshot after a clean clone.
+    """
+
+    digest = hashlib.sha256()
+    root = path.resolve()
+    if not root.is_dir():
+        raise ValueError(f"vendored source path is not a directory: {root}")
+    for item in sorted(root.rglob("*"), key=lambda value: value.relative_to(root).as_posix()):
+        relative = item.relative_to(root).as_posix()
+        if item.is_dir() and not item.is_symlink():
+            continue
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        if item.is_symlink():
+            digest.update(b"symlink\0")
+            digest.update(item.readlink().as_posix().encode("utf-8"))
+        elif item.is_file():
+            digest.update(b"file\0")
+            with item.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        else:
+            raise ValueError(f"unsupported entry in vendored source: {item}")
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _load_json_object(path: Path, *, label: str) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read {label} {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must contain a JSON object: {path}")
+    return value
+
+
 def _git_head(path: Path) -> str:
     try:
         completed = subprocess.run(
@@ -189,7 +232,16 @@ def _validate_audited_runtime(
         errors.append("lock-safe audited runtime must record a non-empty reason")
 
     revision = lock.get("repository_revision_at_audit")
-    if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
+    audit_mode = lock.get("audit_mode", "git")
+    monorepo_audit = audit_mode == "monorepo_tree" and revision is None
+    if monorepo_audit:
+        # The component is an ordinary directory inside the integration
+        # monorepo, so its source repository no longer has an independent Git
+        # HEAD.  Current-file size/SHA checks below remain mandatory; the
+        # monorepo root commit and vendor hashes are recorded by the top-level
+        # integration manifest instead.
+        pass
+    elif not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
         errors.append("repository_revision_at_audit must be a full 40-character Git SHA")
     else:
         try:
@@ -286,6 +338,11 @@ def _validate_audited_runtime(
         raw_source_path = source_repository.get("path")
     else:
         raw_source_path = None
+    source_kind = (
+        str(source_repository.get("kind", "git"))
+        if isinstance(source_repository, dict)
+        else "git"
+    )
     if not isinstance(raw_source_path, str) or not re.fullmatch(
         r"[A-Za-z0-9_./-]+", raw_source_path
     ):
@@ -294,6 +351,11 @@ def _validate_audited_runtime(
         source_path = Path(raw_source_path)
         if source_path.is_absolute() or ".." in source_path.parts:
             errors.append("audited runtime source repository path must stay within the repository")
+        elif source_kind == "vendored":
+            # Vendored sources are validated by the source-repository entry in
+            # verify_profile.  There is no nested Git gitlink to inspect in a
+            # clean monorepo checkout.
+            pass
         elif isinstance(revision, str) and re.fullmatch(r"[0-9a-f]{40}", revision):
             try:
                 gitlink_revision = _gitlink_revision(
@@ -426,25 +488,61 @@ def verify_profile(
             continue
         try:
             path = _resolve_path(repository.get("path"), root)
-            actual_revision = _git_head(path)
         except ValueError as exc:
             errors.append(f"{repository_id}: {exc}")
             continue
-        if actual_revision != revision:
-            errors.append(
-                f"{repository_id}: revision mismatch: expected {revision}, got {actual_revision}"
-            )
-            continue
-        try:
-            worktree_status = _git_status_porcelain(path)
-        except ValueError as exc:
-            errors.append(f"{repository_id}: {exc}")
-            continue
-        if worktree_status:
-            errors.append(
-                f"{repository_id}: source worktree is dirty; refusing unlocked runtime source"
-            )
-            continue
+        source_kind = str(repository.get("kind", "git"))
+        if source_kind == "vendored":
+            manifest_value = repository.get("manifest")
+            try:
+                manifest_path = _resolve_path(manifest_value, root)
+                manifest = _load_json_object(
+                    manifest_path,
+                    label=f"{repository_id} vendor manifest",
+                )
+                expected_upstream = manifest.get("upstream_revision")
+                if expected_upstream != revision:
+                    errors.append(
+                        f"{repository_id}: vendor manifest revision does not match the lock"
+                    )
+                expected_tree = repository.get("content_sha256")
+                if not isinstance(expected_tree, str) or not SHA256_RE.fullmatch(expected_tree):
+                    errors.append(
+                        f"{repository_id}: vendored source content_sha256 is invalid"
+                    )
+                elif manifest.get("content_sha256") != expected_tree:
+                    errors.append(
+                        f"{repository_id}: vendor manifest content hash does not match the lock"
+                    )
+                actual_tree = _directory_sha256(path)
+                if isinstance(expected_tree, str) and actual_tree != expected_tree:
+                    errors.append(
+                        f"{repository_id}: content hash mismatch: expected {expected_tree}, got {actual_tree}"
+                    )
+            except ValueError as exc:
+                errors.append(f"{repository_id}: {exc}")
+                continue
+        else:
+            try:
+                actual_revision = _git_head(path)
+            except ValueError as exc:
+                errors.append(f"{repository_id}: {exc}")
+                continue
+            if actual_revision != revision:
+                errors.append(
+                    f"{repository_id}: revision mismatch: expected {revision}, got {actual_revision}"
+                )
+                continue
+            try:
+                worktree_status = _git_status_porcelain(path)
+            except ValueError as exc:
+                errors.append(f"{repository_id}: {exc}")
+                continue
+            if worktree_status:
+                errors.append(
+                    f"{repository_id}: source worktree is dirty; refusing unlocked runtime source"
+                )
+                continue
         verified_repositories += 1
 
     entries = profile.get("files")

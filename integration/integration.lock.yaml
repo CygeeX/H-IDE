@@ -1,0 +1,115 @@
+schema_version: skillstore.integration-lock/1
+
+release:
+  id: skillstore-office-v2-e2e-20260827
+  branch: main
+  tag: integration/office-v2-e2e-20260827
+  status: frozen-integration
+  root_commit: recorded-by-release-tag
+  validation_contract: L0-L1-L2
+
+# These are the source commits that were imported into the monorepo. The
+# subtree history remains available in Git; this table makes the intended
+# cross-project set explicit and reviewable.
+components:
+  - id: h-ide
+    path: components/h-ide
+    source_commit: 4f0d535b779f6099907c92d0ec5f3e154d5a4505
+    role: control-api-pwa-scene-api-mission-v2
+  - id: h-ide-agent
+    path: components/h-ide-agent
+    source_commit: 941760317774ecb1dff3e52f3e0a2dbfb23909bd
+    role: assistant-v2-planning-only
+  - id: h-ide-vision
+    path: components/h-ide-vision
+    source_commit: 072a49f9741bed54805656c0358dde54fc998a0f
+    role: qwen-sam2-visual-grounding
+  - id: robotagent
+    path: components/robotagent
+    source_commit: 624dd747a8227daa68ace4b4d17d8a8fc01f5e57
+    role: robot-agent-observation-and-command-boundary
+  - id: h-ide-mujoco-sonic
+    path: components/h-ide-mujoco-sonic
+    source_commit: d8ee5bdcb713380b0830bc89d77b43b67b777f37
+    role: mujoco-office-v2-sonic-nav2-adapter
+  - id: daaam
+    path: optional/DAAAM
+    source_commit: ebd6e3b89763849eb7bce7f75e8d08550ea7344a
+    role: optional-post-mission-semantic-memory
+    runtime_default: false
+
+protocols:
+  mission_api: v2
+  assistant_conversation: v2
+  visual_task: v2
+  robot_observation: v1
+  robot_agent_wire: v1
+  ros_domain_simulation: 232
+  ros_domain_live: 231
+  unitree_dds_simulation: 230
+
+models:
+  text:
+    provider: deepseek
+    model: deepseek/deepseek-v4-flash
+    credential_env: DEEPSEEK_API_KEY
+  vision:
+    provider: qwen
+    model: qwen3-vl-plus
+    credential_env: DASHSCOPE_API_KEY
+  segmentation:
+    provider: sam2
+    checkpoint_sha256: 7402e0d864fa82708a20fbd15bc84245c2f26dff0eb43a4b5b93452deb34be69
+    credential_env: HIDE_VISION_SAM2_CHECKPOINT
+  locomotion:
+    repository: nvidia/GEAR-SONIC
+    revision: 9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2
+    cache_env: SONIC_HF_CACHE
+    lock_file: components/h-ide-mujoco-sonic/config/sonic-models.lock.json
+
+external_sources:
+  g1_model:
+    manifest: manifests/vendor/g1-model.json
+    terms_required: true
+    install_command: SKILLSTORE_ACCEPT_G1_MODEL_TERMS=1 integration/bootstrap.sh --fetch-g1-model
+  groot_wbc:
+    manifest: manifests/vendor/groot-wbc.json
+    install_command: integration/bootstrap.sh --fetch-groot-source
+  sonic_python_runtime:
+    manifest: manifests/vendor/lerobot.json
+    path: third_party/lerobot
+  unitree_sdk2_python:
+    manifest: manifests/vendor/unitree-sdk2-python.json
+    path: third_party/unitree_sdk2_python
+
+runtime:
+  primary_os: Ubuntu 24.04
+  ros_distribution: jazzy
+  python:
+    h_ide: "3.12"
+    mujoco_sonic: "3.12"
+    h_ide_vision: "3.11"
+    robotagent: ">=3.10"
+  node: ">=22.13.0"
+  required_host_services:
+    - Docker Engine + Compose v2
+    - NVIDIA driver/CUDA for Qwen/SAM2 and SONIC
+    - systemd --user (workstation launcher)
+    - X11 only when --viewer is selected
+
+acceptance:
+  l0: repository hygiene, manifests, paths, shell and JSON syntax
+  l1: deterministic component tests, Compose config and Office V2 scene check
+  l2: live health, ROS/GPU/assets, then explicit operator-reviewed motion cases
+  motion_policy: no motion command is sent by a generic health check
+
+secrets:
+  file: .env
+  mode: "0600"
+  source_template: integration/.env.simulation.example
+  forbidden_in_git:
+    - API keys
+    - bearer tokens
+    - SQLite databases
+    - model weights and checkpoints
+    - runtime logs/evidence

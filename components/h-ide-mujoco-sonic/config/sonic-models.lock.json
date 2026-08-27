@@ -1,6 +1,7 @@
 {
   "schema_version": "h-ide.sonic-model-lock/1",
-  "repository_revision_at_audit": "330d9d3a9bdd3e30b815bac57311e5852edbb986",
+  "audit_mode": "monorepo_tree",
+  "repository_revision_at_audit": null,
   "model_repository": {
     "repo_id": "nvidia/GEAR-SONIC",
     "revision": "9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2",
@@ -9,24 +10,31 @@
   "source_repositories": {
     "lerobot-python": {
       "path": "vendor/lerobot",
-      "revision": "56b4087c40d7ee8e78e3485f78fe21e88679355b"
+      "revision": "56b4087c40d7ee8e78e3485f78fe21e88679355b",
+      "kind": "vendored",
+      "manifest": "../../manifests/vendor/lerobot.json",
+      "content_sha256": "4edd8a7478467d60983e0e91dd0105a9d10895bb348d3766071ed46297377006"
     },
     "nvidia-groot-wbc": {
-      "path": "/home/phi/learn-projects/systemed_study/GR00T-WholeBodyControl",
-      "revision": "c374bae5b9039cd0ee71377e654d11ce1bc69e1d"
+      "path": "external/GR00T-WholeBodyControl",
+      "revision": "c374bae5b9039cd0ee71377e654d11ce1bc69e1d",
+      "kind": "git",
+      "upstream_url": "https://github.com/NVlabs/GR00T-WholeBodyControl.git",
+      "manifest": "../../manifests/vendor/groot-wbc.json",
+      "license": "Apache-2.0-source-NVIDIA-Open-Model-weights"
     }
   },
   "audited_runtime": {
     "config": {
       "path": "config/ros-headless.yaml",
-      "size": 4336,
-      "sha256": "ebd1890a30f60f34db90c8daf05b602c099ace4ea8c56de2a4a2b4f7f1d47610"
+      "size": 4197,
+      "sha256": "66e90b5b293b529918db5d1c1e31ac66345787dee234e3041ccfae124a700dba"
     },
     "declared_model_revision": "9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2",
     "declared_lerobot_revision": "56b4087c40d7ee8e78e3485f78fe21e88679355b",
     "observed_lerobot_revision": "56b4087c40d7ee8e78e3485f78fe21e88679355b",
     "lock_safe": true,
-    "reason": "The reviewed ros-headless runtime selectors, ROS/Nav2 domain 232, isolated Unitree LowState/LowCmd domain 230, SONIC model bundle, exact LeRobot cold-start history and control source, official direction-speed mapping, actuator handoff, one-time measured nominal activation with retained non-propulsive vertical/roll/pitch fall arrest, bounded planner-reference waits, cursor-preserving same-action motion and pure-rotation replanning, history-preserving controlled IDLE stopping at the live planner-reference cursor facing, terminal IDLE reference readaptation, a bounded 0.35 rad support-foot counter-sway allowance aligned with the existing gait startup contract, half-metre DriveOnHeading resampling, relaxed start-footprint recovery followed by the unchanged 0.42 m route-clearance verifier, and the strict NavFn-to-Spin/DriveOnHeading adapter are reproducibly anchored by repository commit 330d9d3a9bdd3e30b815bac57311e5852edbb986."
+    "reason": "The reviewed ros-headless runtime selectors, ROS/Nav2 domain 232, isolated Unitree LowState/LowCmd domain 230, SONIC model bundle, vendored LeRobot controller snapshot, official direction-speed mapping, actuator handoff, one-time measured nominal activation with retained non-propulsive vertical/roll/pitch fall arrest, bounded planner-reference waits, cursor-preserving same-action motion and pure-rotation replanning, history-preserving controlled IDLE stopping at the live planner-reference cursor facing, terminal IDLE reference readaptation, a bounded 0.35 rad support-foot counter-sway allowance aligned with the existing gait startup contract, half-metre DriveOnHeading resampling, relaxed start-footprint recovery followed by the unchanged 0.42 m route-clearance verifier, and the strict NavFn-to-Spin/DriveOnHeading adapter are verified by the Skillstore monorepo tree and vendor content hashes."
   },
   "profiles": {
     "sonic-official-default": {
@@ -100,7 +108,7 @@
         {
           "id": "official-controller-entrypoint",
           "role": "controller",
-          "path": "/home/phi/learn-projects/systemed_study/GR00T-WholeBodyControl/gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/src/g1_deploy_onnx_ref.cpp",
+          "path": "external/GR00T-WholeBodyControl/gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/src/g1_deploy_onnx_ref.cpp",
           "present": true,
           "size": 226066,
           "sha256": "adcd05aa6abdde2f849ac3cfef6971f629a6972b680d78fb959b7eb5d8649f33"
@@ -108,7 +116,7 @@
         {
           "id": "official-observation-parser",
           "role": "controller",
-          "path": "/home/phi/learn-projects/systemed_study/GR00T-WholeBodyControl/gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/include/observation_config.hpp",
+          "path": "external/GR00T-WholeBodyControl/gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/include/observation_config.hpp",
           "present": true,
           "size": 21830,
           "sha256": "8085f7dcdd0f265001ab18663ace0353e7f07bfa2fa5f6c005b9c0c8e9c5c9d6"
@@ -119,7 +127,7 @@
           "path": "profiles/sonic-official-default.yaml",
           "present": true,
           "size": 1471,
-          "sha256": "47ac407b06b4e8fb95422113e505e4a635412d04d5eb4af53cb3770ab5fb35b3"
+          "sha256": "a34206828e0148bc58166c11b1fed8de82cd9a867f9fcf553b7c287ce1f1decd"
         }
       ]
     },
@@ -196,7 +204,7 @@
         {
           "id": "v1_1-controller-entrypoint",
           "role": "controller",
-          "path": "/home/phi/learn-projects/systemed_study/GR00T-WholeBodyControl/gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/src/g1_deploy_onnx_ref.cpp",
+          "path": "external/GR00T-WholeBodyControl/gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/src/g1_deploy_onnx_ref.cpp",
           "present": true,
           "size": 226066,
           "sha256": "adcd05aa6abdde2f849ac3cfef6971f629a6972b680d78fb959b7eb5d8649f33"
@@ -204,7 +212,7 @@
         {
           "id": "v1_1-observation-parser",
           "role": "controller",
-          "path": "/home/phi/learn-projects/systemed_study/GR00T-WholeBodyControl/gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/include/observation_config.hpp",
+          "path": "external/GR00T-WholeBodyControl/gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/include/observation_config.hpp",
           "present": true,
           "size": 21830,
           "sha256": "8085f7dcdd0f265001ab18663ace0353e7f07bfa2fa5f6c005b9c0c8e9c5c9d6"
@@ -215,7 +223,7 @@
           "path": "profiles/sonic-official-v1_1.yaml",
           "present": true,
           "size": 1468,
-          "sha256": "bc91d73883eab3897f40e0bbe714febe2ccbaed2378a2607656b94c28fcd8a7e"
+          "sha256": "e8fb41c3314af5bc148036d6ea9f0c9581307df97b3a6d080794b9c25c763b18"
         }
       ]
     },

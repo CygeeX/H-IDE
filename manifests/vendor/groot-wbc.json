@@ -1,0 +1,11 @@
+{
+  "schema_version": "skillstore.external-source/1",
+  "component": "nvidia-groot-wbc",
+  "upstream_url": "https://github.com/NVlabs/GR00T-WholeBodyControl.git",
+  "upstream_revision": "c374bae5b9039cd0ee71377e654d11ce1bc69e1d",
+  "source_license": "Apache-2.0",
+  "model_license": "NVIDIA Open Model License",
+  "redistribution": "operator_fetch",
+  "install_target": "components/h-ide-mujoco-sonic/external/GR00T-WholeBodyControl",
+  "notes": "Only the pinned source checkout is needed for the official-controller provenance. SONIC weights are fetched separately from Hugging Face and remain outside Git."
+}

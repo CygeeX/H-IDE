@@ -172,12 +172,12 @@ H-IDE 与 Mastra 之间的 Assistant V2 路由使用
 开发时分别启动：
 
 ```bash
-# /home/phi/learn-projects/h-ide-agent
+# $SKILLSTORE_ROOT/components/h-ide-agent
 npm ci
 MASTRA_INTERNAL_TOKEN=... SUPERVISOR_MODEL=openai/gpt-5-mini \
 STRUCTURING_MODEL=openai/gpt-5-mini OPENAI_API_KEY=... npm run dev
 
-# /home/phi/learn-projects/h-ide
+# $SKILLSTORE_ROOT/components/h-ide
 CONTROL_API_TOKEN=... CONTROL_DB_PATH=./data/control.db \
 MASTRA_PLANNING_URL=http://127.0.0.1:4111 MASTRA_INTERNAL_TOKEN=... \
 WHISPER_ENDPOINT=http://127.0.0.1:8081/inference \

@@ -4,6 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
+import sys
 
 import yaml
 
@@ -446,26 +447,39 @@ def test_repository_runtime_source_lock_matches_every_runtime_selector() -> None
     source_revision = lock["source_repositories"]["lerobot-python"]["revision"]
     vendor_root = ROOT / "vendor" / "lerobot"
 
-    assert subprocess.check_output(
-        ["git", "-C", str(vendor_root), "rev-parse", "HEAD"],
-        text=True,
-    ).strip() == source_revision
-    assert subprocess.check_output(
-        [
-            "git",
-            "-C",
-            str(vendor_root),
-            "status",
-            "--porcelain=v1",
-            "--untracked-files=all",
-        ],
-        text=True,
-    ) == ""
-    gitlink = subprocess.check_output(
-        ["git", "-C", str(ROOT), "ls-tree", "HEAD", "vendor/lerobot"],
-        text=True,
-    ).split()
-    assert gitlink[:3] == ["160000", "commit", source_revision]
+    source_entry = lock["source_repositories"]["lerobot-python"]
+    if source_entry.get("kind", "git") == "vendored":
+        # The integration release stores this source as ordinary monorepo
+        # files. A deterministic tree hash replaces the nested Git gitlink
+        # check, while the manifest still binds the upstream revision.
+        manifest = json.loads(
+            (ROOT / ".." / ".." / "manifests" / "vendor" / "lerobot.json")
+            .read_text(encoding="utf-8")
+        )
+        assert manifest["upstream_revision"] == source_revision
+        assert manifest["content_sha256"] == source_entry["content_sha256"]
+        assert verify_model_lock._directory_sha256(vendor_root) == source_entry["content_sha256"]
+    else:
+        assert subprocess.check_output(
+            ["git", "-C", str(vendor_root), "rev-parse", "HEAD"],
+            text=True,
+        ).strip() == source_revision
+        assert subprocess.check_output(
+            [
+                "git",
+                "-C",
+                str(vendor_root),
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            ],
+            text=True,
+        ) == ""
+        gitlink = subprocess.check_output(
+            ["git", "-C", str(ROOT), "ls-tree", "HEAD", "vendor/lerobot"],
+            text=True,
+        ).split()
+        assert gitlink[:3] == ["160000", "commit", source_revision]
 
     manifest = yaml.safe_load(
         (ROOT / "profiles" / "sonic-python-experimental.yaml").read_text(
@@ -493,17 +507,22 @@ def test_repository_runtime_source_lock_matches_every_runtime_selector() -> None
     audited_config = ROOT / audited["config"]["path"]
     if audited["lock_safe"] is True:
         audit_revision = lock["repository_revision_at_audit"]
-        assert isinstance(audit_revision, str) and len(audit_revision) == 40
-        anchored = subprocess.check_output(
-            [
-                "git",
-                "-C",
-                str(ROOT),
-                "show",
-                f"{audit_revision}:{audited['config']['path']}",
-            ]
-        )
-        assert anchored == audited_config.read_bytes()
+        if lock.get("audit_mode") == "monorepo_tree" and audit_revision is None:
+            # The top-level Skillstore commit is the release anchor for a
+            # component tree; current size/hash checks remain mandatory.
+            assert audited_config.read_bytes()
+        else:
+            assert isinstance(audit_revision, str) and len(audit_revision) == 40
+            anchored = subprocess.check_output(
+                [
+                    "git",
+                    "-C",
+                    str(ROOT),
+                    "show",
+                    f"{audit_revision}:{audited['config']['path']}",
+                ]
+            )
+            assert anchored == audited_config.read_bytes()
         for runtime_path in (
             ROOT / "config" / "sim.yaml",
             ROOT / "config" / "headless.yaml",
@@ -527,9 +546,14 @@ def test_repository_runtime_source_lock_matches_every_runtime_selector() -> None
         assert not pending.ok
         assert any("not lock-safe" in error for error in pending.errors)
         profile_cli_expected_rc = 1
+    python_bin = ROOT / ".venv" / "bin" / "python"
+    if not python_bin.is_file():
+        # A clean clone can run the pure verifier with the active test
+        # interpreter before the optional runtime venv is provisioned.
+        python_bin = Path(sys.executable)
     profile_cli = subprocess.run(
         [
-            str(ROOT / ".venv" / "bin" / "python"),
+            str(python_bin),
             str(ROOT / "tools" / "verify_model_lock.py"),
             "--lock",
             str(ROOT / "config" / "sonic-models.lock.json"),

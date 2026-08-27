@@ -1,7 +1,7 @@
 # Gazebo simulation profile
 
 This directory is the H-IDE-owned Gazebo world and integration contract. It
-does not modify `/home/phi/learn-projects/robotagent`.
+does not modify `$SKILLSTORE_ROOT/components/robotagent`.
 
 ## What is implemented now
 

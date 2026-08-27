@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import os
 from pathlib import Path
 import sys
 
@@ -15,7 +16,17 @@ from robot_agent.capabilities import (
 from robot_agent.config import AgentConfig, load_config
 
 WORKSPACE = Path(__file__).resolve().parents[1]
-H_IDE = Path("/home/phi/learn-projects/h-ide")
+
+
+def _h_ide_root() -> Path:
+    candidates = []
+    if os.getenv("SKILLSTORE_ROOT"):
+        candidates.append(Path(os.environ["SKILLSTORE_ROOT"]) / "components/h-ide")
+    candidates.extend([WORKSPACE.parents[1] / "components/h-ide", WORKSPACE.parents[1] / "h-ide"])
+    return next((candidate for candidate in candidates if candidate.is_dir()), candidates[0])
+
+
+H_IDE = _h_ide_root()
 
 
 def test_shipped_v2_profile_and_manifest_expose_nav2_as_only_motion_owner() -> None:

@@ -1,0 +1,11 @@
+{
+  "schema_version": "skillstore.vendored-source/1",
+  "component": "lerobot-sonic-runtime",
+  "upstream_url": "https://github.com/huggingface/lerobot.git",
+  "upstream_revision": "56b4087c40d7ee8e78e3485f78fe21e88679355b",
+  "license": "Apache-2.0",
+  "redistribution": "source_snapshot",
+  "content_sha256": "4edd8a7478467d60983e0e91dd0105a9d10895bb348d3766071ed46297377006",
+  "lfs_test_artifacts": "excluded",
+  "notes": "This snapshot contains the SONIC Python controller integration. Test LFS artifacts are intentionally omitted from the Skillstore release."
+}

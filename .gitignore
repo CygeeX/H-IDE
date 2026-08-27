@@ -59,6 +59,11 @@ models/**/.cache/
 hf_cache/
 .huggingface/
 
+# Operator-fetched source trees with separate upstream terms (for example
+# GR00T and the G1 mesh repository). Their identities are recorded in
+# manifests/vendor/*.json; the actual checkouts stay outside Git.
+external/
+
 # Local Git internals accidentally copied into vendor trees
 **/.git/
 **/.gitmodules.local

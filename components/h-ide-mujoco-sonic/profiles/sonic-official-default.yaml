@@ -7,7 +7,7 @@ bundle_integrity: complete
 runtime_executable: false
 
 source:
-  repository: /home/phi/learn-projects/systemed_study/GR00T-WholeBodyControl
+  repository: external/GR00T-WholeBodyControl
   revision: c374bae5b9039cd0ee71377e654d11ce1bc69e1d
 model:
   repository: nvidia/GEAR-SONIC

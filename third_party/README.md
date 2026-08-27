@@ -13,3 +13,6 @@ The current release uses the following strategy:
   are downloaded by the operator because their redistribution license is not
   established.
 - NVIDIA GEAR-SONIC/GR00T weights remain external, revision-pinned artifacts.
+- The pinned GR00T deployment source is fetched by
+  `integration/bootstrap.sh --fetch-groot-source`; its source and model
+  licenses are recorded in `manifests/vendor/groot-wbc.json`.

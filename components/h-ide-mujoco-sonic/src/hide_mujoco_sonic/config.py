@@ -83,7 +83,8 @@ class SimConfig:
 
     @classmethod
     def from_file(cls, path: str | Path) -> "SimConfig":
-        raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+        config_path = Path(path).expanduser().resolve()
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
             raise ValueError("simulation config must be a YAML object")
         required = {
@@ -275,8 +276,29 @@ class SimConfig:
         docker_observation_bind_host = resolve_docker_observation_bind_host(
             os.getenv("HIDE_DOCKER_OBSERVATION_BIND_HOST")
         )
-        model_scene = Path(str(raw["model_scene"])).expanduser().resolve()
-        scene_runtime_manifest = Path(str(raw["scene_runtime_manifest"])).expanduser().resolve()
+        def resolve_config_path(value: object, field: str) -> Path:
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{field} must be a non-empty path")
+            candidate = Path(value).expanduser()
+            if not candidate.is_absolute():
+                # Runtime configs are portable component files. Resolve their
+                # paths from the simulator repository root (the parent of
+                # ``config/``), rather than from whichever directory launched
+                # the process.
+                candidate = config_path.parent.parent / candidate
+            return candidate.resolve()
+
+        model_scene = resolve_config_path(raw["model_scene"], "model_scene")
+        scene_runtime_manifest = resolve_config_path(
+            raw["scene_runtime_manifest"], "scene_runtime_manifest"
+        )
+        raw_lock = raw["sonic_model_lock"]
+        if not isinstance(raw_lock, str) or not raw_lock.strip():
+            raise ValueError("sonic_model_lock must be a non-empty path")
+        sonic_model_lock_candidate = Path(raw_lock).expanduser()
+        if not sonic_model_lock_candidate.is_absolute():
+            sonic_model_lock_candidate = config_path.parent / sonic_model_lock_candidate
+        sonic_model_lock = sonic_model_lock_candidate.resolve()
         runtime_scene = load_runtime_scene(
             scene_runtime_manifest,
             configured_model_scene=model_scene,
@@ -346,7 +368,7 @@ class SimConfig:
             scene_runtime_manifest=scene_runtime_manifest,
             runtime_scene=runtime_scene,
             sonic_model_profile=str(raw["sonic_model_profile"]),
-            sonic_model_lock=Path(str(raw["sonic_model_lock"])),
+            sonic_model_lock=sonic_model_lock,
             sonic_model_repo=str(raw["sonic_model_repo"]),
             sonic_model_revision=model_revision,
             lerobot_commit=lerobot_commit,

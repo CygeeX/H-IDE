@@ -16,6 +16,7 @@ trees.
 - Office V2 furniture assets retain the existing CC0/license files from the
   simulator component.
 
-Before making this repository public, run the license and SBOM checks in
-`integration/preflight.sh` and obtain legal approval for every external model,
-mesh, dataset, and runtime binary.
+Repository visibility does not grant redistribution rights. Before each public
+release or deployment, run the license/SBOM checks and obtain approval for every
+external model, mesh, dataset, and runtime binary. The current release keeps
+uncleared meshes, weights, datasets, and runtime caches outside Git.

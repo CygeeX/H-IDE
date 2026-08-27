@@ -1,6 +1,6 @@
 # Third-party notices
 
-FoundationPose source, weights and sample assets are not copied into this repository by the current implementation. The local reference snapshot is `/home/phi/learn-projects/FoundationPose-main`.
+FoundationPose source, weights and sample assets are not copied into this repository by the current implementation. The local reference snapshot is `$FOUNDATIONPOSE_ROOT`.
 
 Known local artifact hashes:
 

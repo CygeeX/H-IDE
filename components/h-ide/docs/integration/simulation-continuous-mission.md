@@ -28,7 +28,7 @@
 [H-IDE 工作站端到端联调启动与关闭手册](../operations/workstation-integration-startup.md)。
 
 ```bash
-cd /home/phi/learn-projects/h-ide-mujoco-sonic
+cd $SKILLSTORE_ROOT/components/h-ide-mujoco-sonic
 scripts/start-workstation-demo.sh
 
 # 修改过 H-IDE 前后端源码时：

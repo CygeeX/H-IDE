@@ -86,7 +86,8 @@ CORS 配置。若开发时 Control API 和 Scene API 分别运行（例如 18080
 [`docs/architecture/mission-v2-continuous-supervisor-worker.md`](docs/architecture/mission-v2-continuous-supervisor-worker.md)。
 旧 V1 Assistant 的迁移背景仍记录在
 [`docs/architecture/assistant-supervisor-worker.md`](docs/architecture/assistant-supervisor-worker.md)。
-独立 Mastra 服务位于相邻的 `/home/phi/learn-projects/h-ide-agent`。PCD 场景的
+独立 Mastra 服务位于本发行仓库的 `../h-ide-agent`（即
+`components/h-ide-agent`）。PCD 场景的
 导入、标定、标注和空间规划闭环见
 [`docs/architecture/pcd-scene-spatial-agent.md`](docs/architecture/pcd-scene-spatial-agent.md)。
 

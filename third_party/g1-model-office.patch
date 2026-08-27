@@ -1,0 +1,513 @@
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..c4239d5
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,18 @@
++# H-IDE local simulation outputs
++__pycache__/
++*.py[cod]
++.pytest_cache/
++.cache/
++.generated-*
++MUJOCO_LOG.TXT
++*.log
++
++# Local Python environments and model weights
++.venv/
++venv/
++*.onnx
++*.engine
++*.pt
++*.pth
++*.ckpt
++*.safetensors
+diff --git a/assets/g1_29dof_no_hand.xml b/assets/g1_29dof_no_hand.xml
+index 4fd64d1..b5c270c 100644
+--- a/assets/g1_29dof_no_hand.xml
++++ b/assets/g1_29dof_no_hand.xml
+@@ -120,26 +120,12 @@
+                     range="-0.2618 0.2618" actuatorfrcrange="-50 50" class="ankle_motor"/>
+                   <geom type="mesh" contype="0" conaffinity="0" group="1" density="0"
+                     rgba="0.2 0.2 0.2 1" mesh="left_ankle_roll_link" />
+-                  <body name="dummy_lf_1" >
+-                      <inertial pos="0 0 0" mass="0.0001" diaginertia="0 0 0" />
+-                      <geom size="0.005" pos="-0.05 0.025 -0.03" rgba="0.2 0.2 0.2 1" />
+-                      <site name="left_foot_contact_1" pos="-0.05 0.025 -0.03" size="0.005" />
+-                  </body>
+-                  <body name="dummy_lf_2" >
+-                      <inertial pos="0 0 0" mass="0.0001" diaginertia="0 0 0" />
+-                      <geom size="0.005" pos="-0.05 -0.025 -0.03" rgba="0.2 0.2 0.2 1" />
+-                      <site name="left_foot_contact_2" pos="-0.05 -0.025 -0.03" size="0.005" />
+-                  </body>
+-                  <body name="dummy_lf_3" >
+-                      <inertial pos="0 0 0" mass="0.0001" diaginertia="0 0 0" />
+-                      <geom size="0.005" pos="0.12 0.03 -0.03" rgba="0.2 0.2 0.2 1" />
+-                      <site name="left_foot_contact_3" pos="0.12 0.03 -0.03" size="0.005" />
+-                  </body>
+-                  <body name="dummy_lf_4" >
+-                      <inertial pos="0 0 0" mass="0.0001" diaginertia="0 0 0" />
+-                      <geom size="0.005" pos="0.12 -0.03 -0.03" rgba="0.2 0.2 0.2 1" />
+-                      <site name="left_foot_contact_4" pos="0.12 -0.03 -0.03" size="0.005" />
+-                  </body>
++                  <!-- NVIDIA GR00T-WholeBodyControl deployment model at
++                       a0732b642c0333077e127a2f56ab0014c196bca4 uses this
++                       full-sole box. Extents from the original sphere corners:
++                       x in [-0.05, 0.12], y in +/-0.03, z = -0.03. -->
++                  <geom type="box" size="0.085 0.03 0.005" pos="0.035 0 -0.03"
++                    rgba="0.2 0.2 0.2 0.4" />
+                 </body>
+               </body>
+             </body>
+@@ -196,26 +182,12 @@
+                     range="-0.2618 0.2618" actuatorfrcrange="-50 50" class="ankle_motor" />
+                   <geom type="mesh" contype="0" conaffinity="0" group="1" density="0"
+                     rgba="0.2 0.2 0.2 1" mesh="right_ankle_roll_link" />
+-                  <geom size="0.005" pos="-0.05 0.025 -0.03" rgba="0.2 0.2 0.2 1" />
+-                  <geom size="0.005" pos="-0.05 -0.025 -0.03" rgba="0.2 0.2 0.2 1" />
+-                  <geom size="0.005" pos="0.12 0.03 -0.03" rgba="0.2 0.2 0.2 1" />
+-                  <geom size="0.005" pos="0.12 -0.03 -0.03" rgba="0.2 0.2 0.2 1" />
+-                  <body name="dummy_rf_1" >
+-                      <inertial pos="0 0 0" mass="0.0001" diaginertia="0 0 0" />
+-                      <site name="right_foot_contact_1" pos="-0.05 0.025 -0.03" size="0.005" />
+-                  </body>
+-                  <body name="dummy_rf_2" >
+-                      <inertial pos="0 0 0" mass="0.0001" diaginertia="0 0 0" />
+-                      <site name="right_foot_contact_2" pos="-0.05 -0.025 -0.03" size="0.005" />
+-                  </body>
+-                  <body name="dummy_rf_3" >
+-                      <inertial pos="0 0 0" mass="0.0001" diaginertia="0 0 0" />
+-                      <site name="right_foot_contact_3" pos="0.12 0.03 -0.03" size="0.005" />
+-                  </body>
+-                  <body name="dummy_rf_4" >
+-                      <inertial pos="0 0 0" mass="0.0001" diaginertia="0 0 0" />
+-                      <site name="right_foot_contact_4" pos="0.12 -0.03 -0.03" size="0.005" />
+-                  </body>
++                  <!-- NVIDIA GR00T-WholeBodyControl deployment model at
++                       a0732b642c0333077e127a2f56ab0014c196bca4 uses this
++                       full-sole box. Extents from the original sphere corners:
++                       x in [-0.05, 0.12], y in +/-0.03, z = -0.03. -->
++                  <geom type="box" size="0.085 0.03 0.005" pos="0.035 0 -0.03"
++                    rgba="0.2 0.2 0.2 0.4" />
+                 </body>
+               </body>
+             </body>
+@@ -554,15 +526,4 @@
+     <framepos name="frame_pos" objtype="site" objname="imu" />
+     <framelinvel name="frame_vel" objtype="site" objname="imu" />
+   </sensor>
+-  <sensor>
+-      <force site="left_foot_contact_1" />
+-      <force site="left_foot_contact_2" />
+-      <force site="left_foot_contact_3" />
+-      <force site="left_foot_contact_4" />
+-      <force site="right_foot_contact_1" />
+-      <force site="right_foot_contact_2" />
+-      <force site="right_foot_contact_3" />
+-      <force site="right_foot_contact_4" />
+-  </sensor>
+-
+-</mujoco>
+\ No newline at end of file
++</mujoco>
+diff --git a/assets/h_ide_office_29dof.xml b/assets/h_ide_office_29dof.xml
+new file mode 100644
+index 0000000..152bdf1
+--- /dev/null
++++ b/assets/h_ide_office_29dof.xml
+@@ -0,0 +1,72 @@
++<mujoco model="H-IDE office floor with Unitree G1">
++  <!-- H-IDE-owned scene.  The robot model remains the pinned upstream asset. -->
++  <include file="g1_29dof_no_hand.xml"/>
++
++  <statistic center="0 0 1.0" extent="7.5"/>
++
++  <visual>
++    <headlight diffuse="0.55 0.55 0.55" ambient="0.35 0.35 0.35" specular="0.05 0.05 0.05"/>
++    <rgba haze="0.72 0.78 0.86 1"/>
++    <global azimuth="135" elevation="-28"/>
++  </visual>
++
++  <asset>
++    <texture type="skybox" builtin="gradient" rgb1="0.72 0.79 0.88" rgb2="0.18 0.24 0.32" width="512" height="3072"/>
++    <texture type="2d" name="office_floor_texture" builtin="checker" mark="edge"
++      rgb1="0.55 0.58 0.62" rgb2="0.42 0.46 0.50" markrgb="0.75 0.78 0.82"
++      width="512" height="512"/>
++    <material name="office_floor_material" texture="office_floor_texture" texuniform="true" texrepeat="12 8" reflectance="0.08"/>
++    <material name="wall_material" rgba="0.88 0.90 0.93 1"/>
++    <material name="wood_material" rgba="0.42 0.24 0.12 1"/>
++    <material name="kitchen_material" rgba="0.16 0.48 0.52 1"/>
++    <material name="glass_material" rgba="0.28 0.58 0.82 0.55"/>
++    <material name="accent_material" rgba="0.95 0.68 0.18 1"/>
++  </asset>
++
++  <default>
++    <geom friction="0.8 0.02 0.001" condim="3"/>
++  </default>
++
++  <worldbody>
++    <light name="office_key_light" pos="0 0 5.5" dir="0 0 -1" directional="true" diffuse="0.85 0.85 0.82"/>
++    <light name="corridor_light_west" pos="-3 0 3" diffuse="0.55 0.58 0.64"/>
++    <light name="corridor_light_east" pos="3 0 3" diffuse="0.55 0.58 0.64"/>
++
++    <!-- 12 m x 8 m floor, exactly matching the Nav2 occupancy map. -->
++    <geom name="floor" type="plane" size="6 4 0.05" material="office_floor_material"/>
++    <geom name="north_wall" type="box" pos="0 3.95 1.25" size="6 0.05 1.25" material="wall_material"/>
++    <geom name="south_wall" type="box" pos="0 -3.95 1.25" size="6 0.05 1.25" material="wall_material"/>
++    <geom name="west_wall" type="box" pos="-5.95 0 1.25" size="0.05 4 1.25" material="wall_material"/>
++    <geom name="east_wall" type="box" pos="5.95 0 1.25" size="0.05 4 1.25" material="wall_material"/>
++
++    <!-- Corridor divider and its two main door openings near x=-1.5/+1.5. -->
++    <geom name="corridor_divider_west" type="box" pos="-2.9 1.15 1.25" size="0.7 0.05 1.25" material="wall_material"/>
++    <geom name="corridor_divider_middle" type="box" pos="0 1.15 1.25" size="0.8 0.05 1.25" material="wall_material"/>
++    <geom name="corridor_divider_east" type="box" pos="2.9 1.15 1.25" size="0.7 0.05 1.25" material="wall_material"/>
++
++    <!-- Nav2-visible static obstacles. -->
++    <geom name="column_obstacle" type="cylinder" pos="2.0 0.8 0.65" size="0.38 0.65" rgba="0.38 0.41 0.47 1"/>
++    <geom name="meeting_table" type="box" pos="3.8 -0.65 0.45" size="0.8 0.45 0.45" material="wood_material"/>
++    <geom name="kitchen_counter" type="box" pos="4.45 2.2 0.45" size="0.7 0.275 0.45" material="kitchen_material"/>
++    <geom name="desk_anchor" type="box" pos="4.9 -2.1 0.45" size="0.6 0.35 0.45" material="wood_material"/>
++
++    <!-- Visual semantic anchors live inside already occupied footprints and
++         therefore do not introduce geometry absent from the Nav2 map. -->
++    <geom name="water_dispenser" type="cylinder" pos="4.15 2.2 1.18" size="0.18 0.28" contype="0" conaffinity="0" material="glass_material"/>
++    <geom name="water_dispenser_top" type="sphere" pos="4.15 2.2 1.58" size="0.18" contype="0" conaffinity="0" material="glass_material"/>
++    <geom name="coffee_machine" type="box" pos="4.62 2.2 1.08" size="0.18 0.18 0.18" contype="0" conaffinity="0" rgba="0.12 0.13 0.15 1"/>
++    <geom name="meeting_screen" type="box" pos="3.8 -0.65 1.22" size="0.42 0.04 0.26" contype="0" conaffinity="0" rgba="0.08 0.12 0.18 1"/>
++    <geom name="coffee_cup" type="cylinder" pos="3.48 -0.60 1.02" size="0.06 0.12" contype="0" conaffinity="0" material="accent_material"/>
++    <geom name="desk_lamp" type="cylinder" pos="4.9 -2.1 1.05" size="0.07 0.18" contype="0" conaffinity="0" material="accent_material"/>
++
++    <!-- Visual-only floor zones help a VLM distinguish rooms without changing collision. -->
++    <geom name="kitchen_zone" type="box" pos="4.35 2.35 0.006" size="1.35 1.0 0.005" contype="0" conaffinity="0" rgba="0.16 0.45 0.48 0.22"/>
++    <geom name="meeting_zone" type="box" pos="3.8 -0.65 0.006" size="1.45 1.05 0.005" contype="0" conaffinity="0" rgba="0.55 0.34 0.18 0.20"/>
++
++    <site name="kitchen_landmark" pos="4.5 1.3 0.05" size="0.10" rgba="0.1 0.9 0.8 1" type="sphere"/>
++    <site name="meeting_room_landmark" pos="4.5 -1.3 0.05" size="0.10" rgba="0.95 0.65 0.15 1" type="sphere"/>
++    <site name="desk_landmark" pos="4.2 -2.1 0.05" size="0.10" rgba="0.75 0.4 0.15 1" type="sphere"/>
++
++    <camera name="global_view" pos="8 -9 7" xyaxes="0.747 0.664 0 -0.335 0.377 0.863"/>
++  </worldbody>
++</mujoco>
+diff --git a/sim/base_sim.py b/sim/base_sim.py
+index f1bb41d..f657fc5 100644
+--- a/sim/base_sim.py
++++ b/sim/base_sim.py
+@@ -24,6 +24,33 @@ from .unitree_sdk2py_bridge import ElasticBand, UnitreeSdk2Bridge
+ 
+ GR00T_WBC_ROOT = Path(__file__).resolve().parent.parent  # Points to mujoco_sim_g1/
+ 
++RESET_POLICY_AUTOMATIC = "automatic"
++RESET_POLICY_EXPLICIT_PROCESS_RESTART = "explicit_process_restart"
++RESET_POLICIES = frozenset(
++    {RESET_POLICY_AUTOMATIC, RESET_POLICY_EXPLICIT_PROCESS_RESTART}
++)
++
++
++class SimulationRestartRequired(RuntimeError):
++    """The plant cannot recover without an operator-visible process restart."""
++
++
++def reset_policy(config: Dict[str, any]) -> str:
++    """Return and validate the simulator reset policy.
++
++    Upstream callers retain their historical automatic-reset behaviour when
++    the field is absent. H-IDE's acceptance profile opts into the strict mode
++    so a fall, numerical fault, or manual reset cannot masquerade as a
++    successful continuous mission by teleporting the robot to its spawn pose.
++    """
++
++    value = str(config.get("RESET_POLICY", RESET_POLICY_AUTOMATIC))
++    if value not in RESET_POLICIES:
++        raise ValueError(
++            "RESET_POLICY must be one of " + ", ".join(sorted(RESET_POLICIES))
++        )
++    return value
++
+ 
+ class DefaultEnv:
+     """Base environment class that handles simulation environment setup and step"""
+@@ -47,6 +74,7 @@ class DefaultEnv:
+                 "width": 400,
+             }
+         self.config = config
++        self.reset_policy = reset_policy(config)
+         self.env_name = env_name
+         self.num_body_dof = self.config["NUM_JOINTS"]
+         self.num_hand_dof = self.config["NUM_HAND_JOINTS"]
+@@ -476,7 +504,7 @@ class DefaultEnv:
+             self.elastic_band.handle_keyboard_button(key)
+ 
+         if key == "backspace":
+-            self.reset()
++            self.reset(reason="operator requested a keyboard reset")
+         if key == "v":
+             self.update_viewer_camera()
+         if key in ["up", "down", "left", "right"]:
+@@ -490,7 +518,12 @@ class DefaultEnv:
+             print(f"Warning: Robot has fallen, height: {self.mj_data.qpos[2]:.3f} m")
+ 
+         if self.fall:
+-            self.reset()
++            self.reset(
++                reason=(
++                    "robot fell below the minimum pelvis height "
++                    f"({self.mj_data.qpos[2]:.3f} m)"
++                )
++            )
+ 
+     def check_self_collision(self):
+         """Check for self-collision of the robot"""
+@@ -502,7 +535,12 @@ class DefaultEnv:
+             print(f"Warning: Self-collision detected: {contact_bodies}")
+         return self_collision
+ 
+-    def reset(self):
++    def reset(self, *, reason: str = "simulation reset requested"):
++        if self.reset_policy == RESET_POLICY_EXPLICIT_PROCESS_RESTART:
++            raise SimulationRestartRequired(
++                f"{reason}; automatic reset is disabled, stop the plant and "
++                "restart it explicitly"
++            )
+         mujoco.mj_resetData(self.mj_model, self.mj_data)
+         # Set valid floating base quaternion (identity: w=1, x=y=z=0)
+         # mj_resetData sets qpos to zeros, which gives invalid [0,0,0,0] quaternion
+@@ -516,6 +554,7 @@ class BaseSimulator:
+ 
+     def __init__(self, config: Dict[str, any], env_name: str = "default", **kwargs):
+         self.config = config
++        self.reset_policy = reset_policy(config)
+         self.env_name = env_name
+ 
+         # Initialize ROS 2 node (optional, only if rclpy is available)
+@@ -629,6 +668,8 @@ class BaseSimulator:
+             import traceback
+             traceback.print_exc()
+             self.close()
++            if self.reset_policy == RESET_POLICY_EXPLICIT_PROCESS_RESTART:
++                raise
+ 
+     def __del__(self):
+         """Clean up resources when simulator is deleted"""
+diff --git a/sim/unitree_sdk2py_bridge.py b/sim/unitree_sdk2py_bridge.py
+index b9323f0..3f098d4 100644
+--- a/sim/unitree_sdk2py_bridge.py
++++ b/sim/unitree_sdk2py_bridge.py
+@@ -1,3 +1,4 @@
++import math
+ import sys
+ import threading
+ from typing import Dict, Tuple
+@@ -19,6 +20,42 @@ from unitree_sdk2py.idl.unitree_go.msg.dds_ import WirelessController_
+ from unitree_sdk2py.idl.unitree_hg.msg.dds_ import HandCmd_, HandState_
+ 
+ 
++# LowCmd.reserve is explicitly available for application-defined transport
++# metadata.  H-IDE uses it only to correlate a simulator LowState tick with the
++# resulting controller command; the actuator values and official CRC remain
++# unchanged.  The async-boundary marker is reserved for a stop/fault write
++# originating outside the 50 Hz owner thread.
++HIDE_CONTROL_TICK_MAGIC = 0x48494445
++HIDE_ASYNC_BOUNDARY_MAGIC = 0x48494446
++
++
++def simulation_time_to_tick_ms(value: object) -> int:
++    """Encode MuJoCo time without truncation drift at control boundaries.
++
++    MuJoCo advances ``data.time`` by repeated floating-point additions.  Using
++    ``int(time * 1000)`` floors values such as ``155.69599999999994`` to
++    155695 ms.  At 4 ms physics / 20 ms control cadence that occasionally turns
++    one authoritative controller interval into 23 or 24 ms.  Rounding to the
++    nearest integer millisecond preserves the configured integral-millisecond
++    physics clock; it does not derive time from wall scheduling.
++    """
++
++    if isinstance(value, bool):
++        raise ValueError("MuJoCo simulation time must be finite and non-negative")
++    try:
++        seconds = float(value)
++    except (TypeError, ValueError, OverflowError) as exc:
++        raise ValueError(
++            "MuJoCo simulation time must be finite and non-negative"
++        ) from exc
++    if not math.isfinite(seconds) or seconds < 0.0:
++        raise ValueError("MuJoCo simulation time must be finite and non-negative")
++    tick_ms = int(round(seconds * 1_000.0))
++    if tick_ms > 0xFFFFFFFF:
++        raise ValueError("MuJoCo simulation time exceeds LowState.tick range")
++    return tick_ms
++
++
+ class UnitreeSdk2Bridge:
+     """
+     Bridge between Unitree SDK2 and the MuJoCo simulation.
+@@ -73,21 +110,27 @@ class UnitreeSdk2Bridge:
+         self.right_hand_state_puber = ChannelPublisher("rt/dex3/right/state", HandState_)
+         self.right_hand_state_puber.Init()
+ 
++        # DDS may deliver a retained/current command immediately from Init().
++        # Create every callback-owned object, lock, and state flag before any
++        # subscriber thread is allowed to run.
++        self.low_cmd_lock = threading.Lock()
++        self.low_cmd_condition = threading.Condition(self.low_cmd_lock)
++        self.low_cmd_sequence = 0
++        self.low_cmd_control_tick_ms = None
++        self.low_cmd_async_boundary = False
++        self.left_hand_cmd_lock = threading.Lock()
++        self.right_hand_cmd_lock = threading.Lock()
++        self.left_hand_cmd = HandCmd_default()
++        self.right_hand_cmd = HandCmd_default()
++        self.reset()
++
+         self.low_cmd_suber = ChannelSubscriber("rt/lowcmd", LowCmd_)
+         self.low_cmd_suber.Init(self.LowCmdHandler, 1)
+-
+-        self.left_hand_cmd = HandCmd_default()
+         self.left_hand_cmd_suber = ChannelSubscriber("rt/dex3/left/cmd", HandCmd_)
+         self.left_hand_cmd_suber.Init(self.LeftHandCmdHandler, 1)
+-
+-        self.right_hand_cmd = HandCmd_default()
+         self.right_hand_cmd_suber = ChannelSubscriber("rt/dex3/right/cmd", HandCmd_)
+         self.right_hand_cmd_suber.Init(self.RightHandCmdHandler, 1)
+ 
+-        self.low_cmd_lock = threading.Lock()
+-        self.left_hand_cmd_lock = threading.Lock()
+-        self.right_hand_cmd_lock = threading.Lock()
+-
+         self.wireless_controller = unitree_go_msg_dds__WirelessController_()
+         self.wireless_controller_puber = ChannelPublisher(
+             "rt/wirelesscontroller", WirelessController_
+@@ -118,7 +161,6 @@ class UnitreeSdk2Bridge:
+         # Store config for initialization
+         self.config = config
+ 
+-        self.reset()
+ 
+     def reset(self):
+         with self.low_cmd_lock:
+@@ -132,10 +174,101 @@ class UnitreeSdk2Bridge:
+             self.new_right_hand_cmd = False
+ 
+     def LowCmdHandler(self, msg):
+-        with self.low_cmd_lock:
++        with self.low_cmd_condition:
+             self.low_cmd = msg
+             self.low_cmd_received = True
+             self.new_low_cmd = True
++            self.low_cmd_sequence += 1
++            reserve = getattr(msg, "reserve", ())
++            marker = int(reserve[0]) if len(reserve) >= 1 else 0
++            self.low_cmd_control_tick_ms = (
++                int(reserve[1])
++                if marker == HIDE_CONTROL_TICK_MAGIC and len(reserve) >= 2
++                else None
++            )
++            self.low_cmd_async_boundary = marker == HIDE_ASYNC_BOUNDARY_MAGIC
++            self.low_cmd_condition.notify_all()
++
++    def LowCmdSequence(self) -> int:
++        """Return the process-local count of DDS actuator commands received."""
++
++        with self.low_cmd_lock:
++            return int(self.low_cmd_sequence)
++
++    def LowCmdIdentity(self):
++        """Atomically snapshot the latest simulator correlation metadata.
++
++        The Plant uses the stamped control tick to learn SONIC's 50 Hz phase.
++        That phase is relative to the first LowState consumed by SONIC and is
++        not necessarily aligned to a global ``tick % 20 == 0`` boundary.
++        """
++
++        with self.low_cmd_lock:
++            return (
++                int(self.low_cmd_sequence),
++                (
++                    None
++                    if self.low_cmd_control_tick_ms is None
++                    else int(self.low_cmd_control_tick_ms)
++                ),
++                bool(self.low_cmd_async_boundary),
++            )
++
++    def WaitForLowCmdAfter(self, sequence: int, timeout_s: float) -> bool:
++        """Wait for a LowCmd newer than ``sequence`` without consuming it.
++
++        The H-IDE Plant uses this only after publishing a 50 Hz LowState and
++        only after the fall-arrest has been released.  Pausing simulation time
++        here preserves the official synchronous observation/action cadence
++        during host scheduling jitter; it never fabricates or replays a
++        controller output.
++        """
++
++        if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
++            raise ValueError("LowCmd sequence must be a non-negative integer")
++        if isinstance(timeout_s, bool):
++            raise ValueError("LowCmd wait timeout must be finite and non-negative")
++        timeout = float(timeout_s)
++        if not math.isfinite(timeout) or timeout < 0.0:
++            raise ValueError("LowCmd wait timeout must be finite and non-negative")
++        with self.low_cmd_condition:
++            return bool(
++                self.low_cmd_condition.wait_for(
++                    lambda: self.low_cmd_sequence > sequence,
++                    timeout=timeout,
++                )
++            )
++
++    def WaitForLowCmdForTick(
++        self,
++        sequence: int,
++        tick_ms: int,
++        timeout_s: float,
++    ) -> bool:
++        """Wait for a fresh command correlated to ``tick_ms`` or an async stop."""
++
++        if isinstance(tick_ms, bool) or not isinstance(tick_ms, int) or tick_ms < 0:
++            raise ValueError("LowCmd correlation tick must be non-negative")
++        if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
++            raise ValueError("LowCmd sequence must be a non-negative integer")
++        if isinstance(timeout_s, bool):
++            raise ValueError("LowCmd wait timeout must be finite and non-negative")
++        timeout = float(timeout_s)
++        if not math.isfinite(timeout) or timeout < 0.0:
++            raise ValueError("LowCmd wait timeout must be finite and non-negative")
++        with self.low_cmd_condition:
++            return bool(
++                self.low_cmd_condition.wait_for(
++                    lambda: (
++                        self.low_cmd_sequence > sequence
++                        and (
++                            self.low_cmd_control_tick_ms == tick_ms
++                            or self.low_cmd_async_boundary
++                        )
++                    ),
++                    timeout=timeout,
++                )
++            )
+ 
+     def LeftHandCmdHandler(self, msg):
+         with self.left_hand_cmd_lock:
+@@ -186,7 +319,7 @@ class UnitreeSdk2Bridge:
+         # acceleration: x, y, z (only available when frame sensor is enabled)
+         if self.have_frame_sensor_:
+             raise NotImplementedError("Frame sensor data is not implemented yet.")
+-        self.low_state.tick = int(obs["time"] * 1e3)
++        self.low_state.tick = simulation_time_to_tick_ms(obs["time"])
+ 
+         # Copy wireless controller data into lowstate for controllers that read from rt/lowstate
+         if self.joystick is not None:
+@@ -221,13 +354,10 @@ class UnitreeSdk2Bridge:
+         self.right_hand_state_puber.Write(self.right_hand_state)
+ 
+     def GetAction(self) -> Tuple[np.ndarray, bool, bool]:
+-        with self.low_cmd_lock:
++        with self.low_cmd_lock, self.left_hand_cmd_lock, self.right_hand_cmd_lock:
+             body_q = [self.low_cmd.motor_cmd[i].q for i in range(self.num_body_motor)]
+-        with self.left_hand_cmd_lock:
+             left_hand_q = [self.left_hand_cmd.motor_cmd[i].q for i in range(self.num_hand_motor)]
+-        with self.right_hand_cmd_lock:
+             right_hand_q = [self.right_hand_cmd.motor_cmd[i].q for i in range(self.num_hand_motor)]
+-        with self.low_cmd_lock and self.left_hand_cmd_lock and self.right_hand_cmd_lock:
+             is_new_action = self.new_low_cmd and self.new_left_hand_cmd and self.new_right_hand_cmd
+             if is_new_action:
+                 self.new_low_cmd = False

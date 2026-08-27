@@ -68,9 +68,10 @@ cp .env.example .env
 npm run dev
 ```
 
-普通阿里云百炼中国区示例：三个模型变量均填写
-`alibaba-cn/qwen3.8-max`，凭证填写到 `DASHSCOPE_API_KEY`。该模型只负责文本调度和
-结构化规划；视觉服务仍单独使用 `qwen3-vl-plus` 理解 RGB 图像。
+冻结版使用 DeepSeek：三个模型变量均填写
+`deepseek/deepseek-v4-flash`，凭证填写到 `DEEPSEEK_API_KEY`。该模型只负责文本调度和
+结构化规划；视觉服务仍单独使用 `qwen3-vl-plus` 理解 RGB 图像。若开发者要切换
+供应商，必须在自己的 feature 分支更新根 `.env`、锁定清单和验收记录。
 
 生产构建和校验：
 

@@ -1,6 +1,6 @@
 # Robot Agent Visual Integration Handoff
 
-This document specifies what H-IDE will deliver to the independently maintained Robot Agent project. The normal ownership rule is that H-IDE does not edit `/home/phi/learn-projects/robotagent`; an explicitly authorized 2026-08-17 exception added only the localization state-source wiring and ROS dependency declarations. Motion adapters, Nav2 execution, watchdogs and safety remain Robot Agent-owned and were not changed by H-IDE.
+This document specifies what H-IDE will deliver to the independently maintained Robot Agent project. The normal ownership rule is that H-IDE does not edit `$SKILLSTORE_ROOT/components/robotagent`; an explicitly authorized 2026-08-17 exception added only the localization state-source wiring and ROS dependency declarations. Motion adapters, Nav2 execution, watchdogs and safety remain Robot Agent-owned and were not changed by H-IDE.
 
 ## Observation boundary
 

@@ -21,7 +21,7 @@ overlay 都不声明视觉推理容器；`control-api` 与 `planning-agent` 统�
 先在 H-IDE Vision 的锁定 Python 3.11/GPU 环境设置以下服务端变量并启动服务：
 
 ```bash
-cd /home/phi/learn-projects/h-ide-vision
+cd $SKILLSTORE_ROOT/components/h-ide-vision
 export DASHSCOPE_API_KEY='由操作者在本机注入'
 export HIDE_VISION_QWEN_MODEL=qwen3-vl-plus
 export HIDE_VISION_SAM2_CHECKPOINT=/absolute/path/to/sam2.1_hiera_tiny.pt
@@ -32,7 +32,7 @@ uv run h-ide-vision serve
 再启动 H-IDE：
 
 ```bash
-cd /home/phi/learn-projects/h-ide
+cd $SKILLSTORE_ROOT/components/h-ide
 docker compose --env-file .env \
   -f infra/docker-compose.yml \
   -f infra/docker-compose.simulation.yml config --quiet

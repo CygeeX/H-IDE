@@ -1,6 +1,10 @@
 schemaVersion: h-ide.release-bom/v1
-releaseId: assistant-v2-development
-status: development
+releaseId: skillstore-office-v2-e2e-20260827
+status: frozen-integration-component
+note: >-
+  The top-level Skillstore integration.lock.yaml and Git tag are authoritative
+  for cross-component reproducibility. This file is retained as the H-IDE
+  component-local protocol BOM.
 baseline:
   id: pre-assistant-v2-20260819
   tag: baseline/pre-assistant-v2-20260819
@@ -8,32 +12,29 @@ baseline:
 
 repositories:
   hIde:
-    path: /home/phi/learn-projects/h-ide
-    baselineCommit: 7276e27218229720506085e391a836e1180ded72
+    path: components/h-ide
+    baselineCommit: 4f0d535b779f6099907c92d0ec5f3e154d5a4505
   hIdeAgent:
-    path: /home/phi/learn-projects/h-ide-agent
-    baselineCommit: 2ed99b25e3355849c6964ab448a087122c4a8b64
+    path: components/h-ide-agent
+    baselineCommit: 941760317774ecb1dff3e52f3e0a2dbfb23909bd
   hIdeVision:
-    path: /home/phi/learn-projects/h-ide-vision
-    baselineCommit: 2dfd8b73e540c30de9f5303de5299094b50bea1f
+    path: components/h-ide-vision
+    baselineCommit: 072a49f9741bed54805656c0358dde54fc998a0f
   hIdeMujocoSonic:
-    path: /home/phi/learn-projects/h-ide-mujoco-sonic
-    baselineCommit: 5719726d7dc1b4f72fb970627bb262ea62384263
+    path: components/h-ide-mujoco-sonic
+    baselineCommit: d8ee5bdcb713380b0830bc89d77b43b67b777f37
   unitreeG1Mujoco:
-    path: /home/phi/learn-projects/h-ide-mujoco-sonic/models/unitree-g1-mujoco
-    baselineCommit: 65f72fcc87c2af2d65d9fabf53e0fc27c8840a1a
+    path: external:manifests/vendor/g1-model.json
+    baselineCommit: a38dc8617f0fca51b38e9354dc58ee35ad850fb5
   lerobotVendor:
-    path: /home/phi/learn-projects/h-ide-mujoco-sonic/vendor/lerobot
-    baselineCommit: b32c6b81ca45ddd93696d0587a970ce65560943f
+    path: third_party/lerobot
+    baselineCommit: 56b4087c40d7ee8e78e3485f78fe21e88679355b
   unitreeSdkVendor:
-    path: /home/phi/learn-projects/h-ide-mujoco-sonic/vendor/unitree_sdk2_python
+    path: third_party/unitree_sdk2_python
     baselineCommit: 65691c8a8bc53b98d3976dba4dbf9d5d20b2e7f5
   robotAgent:
-    path: /home/phi/learn-projects/robotagent
-    baselineCommit: 1a3a66deda4405c3a526ebd60c33d604fb82ad55
-  robotTaskForge:
-    path: /home/phi/learn-projects/robot-task-forge
-    baselineCommit: fdddd0f3fd9afb336e2d90f12efa79942b9563b8
+    path: components/robotagent
+    baselineCommit: 624dd747a8227daa68ace4b4d17d8a8fc01f5e57
 
 protocols:
   robotObservation:
@@ -68,8 +69,8 @@ runtimeTargets:
 
 models:
   text:
-    provider: qwen
-    model: benchmark-before-lock
+    provider: deepseek
+    model: deepseek-v4-flash
   vision:
     provider: qwen
     model: qwen3-vl-plus
