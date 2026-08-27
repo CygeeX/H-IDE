@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+!integration/.env.simulation.example
 *.pem
 *.key
 *.p12
