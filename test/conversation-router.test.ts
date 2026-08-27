@@ -343,6 +343,129 @@ describe("Assistant V2 conversation router", () => {
   });
 
   it.each([
+    "去会议室里观察,看到了什么东西告诉我",
+    "去会议室里看",
+    "去会议室里面站着",
+    "去open office里面站着",
+    "去椅子旁边站着",
+    "走出开放办公室",
+    "走到这个架子前面",
+    "你再观察一下办公室找到电脑",
+    "搜索办公室里的电脑",
+  ])("never downgrades a compound physical request to current-frame observation: %s", async (text) => {
+    const agent = {
+      generate: vi.fn().mockResolvedValue({
+        object: {
+          // Reproduce the observed provider mistake. The domain guard, not a
+          // lucky model response, must preserve the physical-action boundary.
+          intent: "ROBOT_OBSERVE",
+          assistantMessage: "我会观察当前画面。",
+          clarification: null,
+        },
+      }),
+    };
+    const result = await new ConversationRouter(agent as never).route({
+      conversationId: `conversation-compound-${text}`,
+      robotId: "g1-sim",
+      locale: "zh-CN",
+      text,
+    }, signal());
+
+    expect(result).toMatchObject({
+      intent: "ROBOT_ACTION",
+      needsRobot: true,
+      shouldCreateMission: true,
+    });
+    expect(result.assistantMessage).toContain("待审核");
+  });
+
+  it("receives evidence-bound semantic referents without executable geometry", async () => {
+    const agent = {
+      generate: vi.fn().mockResolvedValue({
+        object: {
+          intent: "ROBOT_ACTION",
+          assistantMessage: "我会重新观察这把椅子。",
+          clarification: null,
+        },
+      }),
+    };
+    await new ConversationRouter(agent as never).route({
+      conversationId: "conversation-semantic-referent",
+      robotId: "g1-sim",
+      locale: "zh-CN",
+      text: "去刚才那把椅子旁边站着",
+      memoryContext: {
+        schemaVersion: "h-ide.conversation-memory-context/1",
+        providedBy: "H_IDE_SERVER",
+        authority: "CONVERSATIONAL_ONLY",
+        resourceId: "user-1",
+        revision: 3,
+        relevantMemories: [],
+        semanticReferents: [{
+          schemaVersion: "h-ide.semantic-referent/1",
+          referentId: "referent-chair-1",
+          sourceTaskId: "task-observe-1",
+          sourceMissionId: "mission-observe-1",
+          analysisId: "analysis-chair-1",
+          hypothesisId: "hypothesis-chair-1",
+          label: "chair",
+          aliases: ["chair", "椅子"],
+          regionId: "open_office",
+          pixelBox: [10, 20, 110, 220],
+          confidence: 0.95,
+          evidence: [{
+            kind: "input_rgb",
+            sha256: "a".repeat(64),
+            mediaType: "image/jpeg",
+          }],
+          capturedAt: "2026-08-27T00:00:00.000Z",
+          robotBootId: "boot-1",
+          localizationEpochId: "epoch-1",
+          observationSessionId: "observation-1",
+          sceneRef: { sceneId: "office", revision: 1 },
+          authority: "SEMANTIC_ONLY",
+          executionEligible: false,
+        }],
+      },
+    }, signal());
+
+    const [prompt] = agent.generate.mock.calls[0]!;
+    expect(prompt).toContain("referent-chair-1");
+    expect(prompt).toContain("SEMANTIC_ONLY");
+    expect(prompt).not.toContain("goalPose");
+  });
+
+  it("keeps an explicit stationary current-frame request observation-only", async () => {
+    const agent = {
+      generate: vi.fn().mockResolvedValue({
+        object: {
+          intent: "ROBOT_OBSERVE",
+          assistantMessage: "我会查看当前画面。",
+          clarification: null,
+        },
+      }),
+    };
+    const result = await new ConversationRouter(agent as never).route({
+      conversationId: "conversation-current-frame-only",
+      robotId: "g1-sim",
+      locale: "zh-CN",
+      text: "只观察当前画面里有什么，不要移动",
+    }, signal());
+
+    expect(result).toMatchObject({
+      intent: "ROBOT_OBSERVE",
+      needsRobot: true,
+      shouldCreateMission: false,
+    });
+    expect(conversationRouterInternals.requiresPhysicalAction(
+      "去会议室里观察",
+    )).toBe(true);
+    expect(conversationRouterInternals.requiresPhysicalAction(
+      "只观察当前画面",
+    )).toBe(false);
+  });
+
+  it.each([
     ["SOCIAL_CHAT", false, false],
     ["GENERAL_QA", false, false],
     ["ROBOT_OBSERVE", true, false],

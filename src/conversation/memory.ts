@@ -9,6 +9,7 @@ import {
   type ConversationDurableSummary,
   type ConversationHistoryMessage,
   type ConversationMemorySnippet,
+  type SemanticReferent,
   type ConversationTurnRequest,
   type ConversationTurnResponse,
 } from "./contracts.js";
@@ -42,6 +43,7 @@ export interface PreparedConversationContext {
   recentMessages: ConversationHistoryMessage[];
   durableSummary?: ConversationDurableSummary;
   relevantMemories: ConversationMemorySnippet[];
+  semanticReferents: SemanticReferent[];
   audit: ConversationContextAudit;
 }
 
@@ -411,18 +413,23 @@ function threadWithState(
 export function requestOnlyContext(input: ConversationTurnRequest): PreparedConversationContext {
   const durableSummary = incomingSummary(input);
   const relevantMemories = input.memoryContext?.relevantMemories ?? [];
+  const semanticReferents = input.memoryContext?.semanticReferents ?? [];
   return {
     recentMessages: input.history,
     ...(durableSummary ? { durableSummary } : {}),
     relevantMemories,
+    semanticReferents,
     audit: {
       recentMessageCount: input.history.length,
       storedMessageCount: 0,
       ...(durableSummary
         ? { summaryId: durableSummary.summaryId, summaryRevision: durableSummary.revision }
         : {}),
-      selectedMemoryIds: relevantMemories.map((memory) => memory.memoryId),
-      retrievalMethod: relevantMemories.length ? "SERVER_SELECTED" : "NONE",
+      selectedMemoryIds: [
+        ...relevantMemories.map((memory) => memory.memoryId),
+        ...semanticReferents.map((referent) => referent.referentId),
+      ],
+      retrievalMethod: relevantMemories.length || semanticReferents.length ? "SERVER_SELECTED" : "NONE",
     },
   };
 }
@@ -465,20 +472,25 @@ export class MastraConversationMemory {
       state.memorySnippets,
       olderMessages,
     );
-    const hasServer = serverMemories.length > 0;
+    const semanticReferents = input.memoryContext?.semanticReferents ?? [];
+    const hasServer = serverMemories.length > 0 || semanticReferents.length > 0;
     const hasLexical = relevantMemories.some((memory) =>
       memory.kind === "CONVERSATION_EXCERPT" || !serverMemories.some((item) => item.memoryId === memory.memoryId));
     return {
       recentMessages,
       ...(durableSummary ? { durableSummary } : {}),
       relevantMemories,
+      semanticReferents,
       audit: {
         recentMessageCount: recentMessages.length,
         storedMessageCount: recalled.total,
         ...(durableSummary
           ? { summaryId: durableSummary.summaryId, summaryRevision: durableSummary.revision }
           : {}),
-        selectedMemoryIds: relevantMemories.map((memory) => memory.memoryId),
+        selectedMemoryIds: [
+          ...relevantMemories.map((memory) => memory.memoryId),
+          ...semanticReferents.map((referent) => referent.referentId),
+        ],
         retrievalMethod: hasServer && hasLexical
           ? "SERVER_AND_LEXICAL_V1"
           : hasServer

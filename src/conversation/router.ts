@@ -36,7 +36,44 @@ const GREETING_PATTERN = /^(?:你(?:好|好呀|好啊)|您好|嗨|哈(?:喽|啰|
 const THANKS_PATTERN = /^(?:谢谢|多谢|感谢(?:你)?|thanks|thank\s+you)[\s!！,.，。?？~～]*$/iu;
 const GOODBYE_PATTERN = /^(?:再见|拜拜|回头见|bye|goodbye|see\s+you)[\s!！,.，。?？~～]*$/iu;
 const PERSONAL_PREFERENCE_PATTERN = /(?:我(?:很)?(?:喜欢|偏好|习惯)|我的(?:名字|称呼|昵称|偏好|喜好|习惯)|(?:以后)?(?:叫|称呼)我(?:为|做)?|i\s+(?:like|prefer)|my\s+(?:name|nickname|preference)|call\s+me)/iu;
-const ROBOT_REQUEST_CUE_PATTERN = /(?:机器人|向前|后退|转身|旋转|移动|导航|走(?:到|去|两|几|\d)|抓取|拿起|放下|打开|关闭|观察|robot|walk|move|turn|rotate|navigate|grab|pick\s+up|put\s+down)/iu;
+const ROBOT_REQUEST_CUE_PATTERN = /(?:机器人|向前|后退|转身|旋转|移动|导航|前往|进入|进去|去(?:那里|那边|这里|这边|会议室|开放办公区|独立办公室|茶水间|储物间|走廊|open\s+office|meeting\s+room)|走(?:到|去|进|两|几|\d)|抓取|拿起|放下|打开|关闭|观察|robot|walk|move|turn|rotate|navigate|enter|approach|grab|pick\s+up|put\s+down)/iu;
+
+// The classifier may choose only one top-level intent.  A motion request that
+// also asks to observe must never be downgraded to the read-only current-frame
+// route merely because words such as "看" or "观察" are prominent.  This is a
+// one-way authority guard: it can require Mission review, but can never turn a
+// harmless observation into direct execution.
+const PHYSICAL_ACTION_CUE_PATTERNS = [
+  /(?:请|让|叫|使)?(?:机器人)?\s*(?:向前|后退|左转|右转|转身|旋转|移动|导航|前往|进入|进去|走进|走到|走去|驶入|回到|返回到|靠近|到达)/u,
+  /(?:走出|离开|出去|退出)(?:当前|这个|这间|开放|会议|独立|办公室|房间|区域|open|office|room)?/iu,
+  /(?:去|走到|移动到).{0,30}(?:旁边|前面|跟前|附近|边上)(?:站着|站住|停下|停住)?/u,
+  /(?:寻找|找到|搜索|搜寻|环顾|巡视|转一圈|全面观察).{0,40}(?:电脑|椅子|架子|桌子|物体|目标|办公室|房间|区域|computer|chair|shelf|rack|desk|object|office|room)/iu,
+  /(?:观察|查看|看看).{0,30}(?:并|来|以便)?(?:寻找|找到|搜索|搜寻)/u,
+  /(?:^|[\s，,。；;！!？?])(?:请\s*)?(?:去)(?=\s*(?:那里|那边|这里|这边|会议室|开放办公区|独立办公室|茶水间|储物间|走廊|前台|接待区|open[\s_-]*office|meeting[\s_-]*room|focus[\s_-]*office|pantry|storage|corridor|reception))/iu,
+  /\b(?:go|walk|move|navigate|enter|approach|return)\b/iu,
+];
+const EXPLICIT_STATIONARY_OBSERVATION_PATTERN = /(?:(?:只|仅)(?:观察|查看|看).{0,16}(?:当前|现在|眼前)(?:画面|视野|环境)?|(?:当前|现在|眼前)(?:画面|视野|环境).{0,20}(?:不要|不再|无需|不用|禁止).{0,6}(?:移动|导航|转动|旋转)|原地(?:观察|查看|看)|保持静止|(?:observe|inspect|look).{0,32}(?:current\s+(?:view|scene)|in\s+place|without\s+moving|do\s+not\s+move))/iu;
+
+function requiresPhysicalAction(text: string): boolean {
+  const normalized = text.trim();
+  return normalized.length > 0
+    && !EXPLICIT_STATIONARY_OBSERVATION_PATTERN.test(normalized)
+    && PHYSICAL_ACTION_CUE_PATTERNS.some((pattern) => pattern.test(normalized));
+}
+
+function enforcePhysicalIntent(
+  input: ConversationTurnRequest,
+  output: ConversationRouterModelOutput,
+): ConversationRouterModelOutput {
+  if (!requiresPhysicalAction(input.text) || output.intent === "ROBOT_ACTION") {
+    return output;
+  }
+  return {
+    intent: "ROBOT_ACTION",
+    assistantMessage: output.assistantMessage,
+    clarification: output.clarification,
+  };
+}
 
 function isChineseLocale(locale: string): boolean {
   return locale.toLowerCase().startsWith("zh");
@@ -253,6 +290,7 @@ const ROUTER_INSTRUCTIONS = [
   "GENERAL_QA is a knowledge, explanation, or calculation request that does not require a robot or current sensor data.",
   "ROBOT_OBSERVE uses current robot sensors but must not translate, rotate, change pose, or perform another physical action.",
   "ROBOT_ACTION is any requested physical robot action, including walking, base rotation, navigation, manipulation, or a sequence containing one.",
+  "Active visual search such as finding/searching for an object in a room is ROBOT_ACTION because it may rotate or move between reviewed observation points.",
   "SCENE_TEACH teaches, names, corrects, or asks to remember a place/object in the current environment.",
   "A request to remember the user's name, preferred form of address, likes, dislikes, habits, or other personal preferences is SOCIAL_CHAT, never SCENE_TEACH, and does not require a robot.",
   "ADMIN_DEV is developer/admin configuration, diagnostics, protocol, interface, or system-maintenance work; never pretend to have changed the system.",
@@ -278,6 +316,7 @@ function contextPrompt(input: ConversationTurnRequest, context: PreparedConversa
       durableSummary: context.durableSummary ?? null,
       recentMessages: context.recentMessages,
       relevantMemories: context.relevantMemories,
+      semanticReferents: context.semanticReferents,
       currentUserText: input.text,
     }),
     "</UNTRUSTED_CONVERSATIONAL_CONTEXT>",
@@ -352,7 +391,10 @@ export class ConversationRouter {
       if (value.error) throw value.error;
       return value;
     }, signal);
-    const modelOutput = conversationRouterModelOutputSchema.parse(output.object);
+    const modelOutput = enforcePhysicalIntent(
+      input,
+      conversationRouterModelOutputSchema.parse(output.object),
+    );
     const response = buildResponse(input, modelOutput);
     await this.recordTurn(input, response, context);
     return response;
@@ -363,4 +405,5 @@ export const conversationRouterInternals = {
   arithmeticExpression,
   contextPrompt,
   evaluateArithmetic,
+  requiresPhysicalAction,
 };

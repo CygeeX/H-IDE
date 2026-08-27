@@ -43,7 +43,8 @@ const AUTHORITY_BOUNDARY = [
   "Qwen/VLM records are hypotheses only. Only geometry, Robot Agent, scene, operator, or verifier records marked as facts may satisfy a physical precondition.",
   "PCD/scene records are static priors. They cannot prove current occupancy, reachability, or dynamic safety.",
   "If the objective explicitly says observe only, do not move, or do not rotate, never add a navigation skill—not even as a placeholder or non-executing semantic node.",
-  "For target grounding use a vision intent such as task=describe_and_ground and target_description=<semantic target>; for an unrestricted scene summary use task=scene_description.",
+  "For target grounding use a vision intent such as task=describe_and_ground and targetDescription=<semantic target>; for an unrestricted scene summary use task=scene_description.",
+  "Never emit target_region, target_description, or entry_pose. For a published place use the exact typed h-ide.place-intent/1 shape from the supplied world records, including locationId, anchorRole, targetRecordId, candidateTargetRecordIds, and an explicit completion predicate.",
   "Use explicit preconditionIds and postconditionIds so H-IDE can observe, execute, verify, and replan continuously.",
 ].join("\n");
 

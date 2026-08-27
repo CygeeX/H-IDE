@@ -66,6 +66,53 @@ export const conversationMemorySnippetSchema = z
   })
   .strict();
 
+export const semanticReferentSchema = z
+  .object({
+    schemaVersion: z.literal("h-ide.semantic-referent/1"),
+    referentId: z.string().trim().min(1).max(200),
+    sourceTaskId: z.string().trim().min(1).max(200),
+    sourceMissionId: z.string().trim().min(1).max(200).nullable().optional(),
+    analysisId: z.string().trim().min(1).max(200),
+    hypothesisId: z.string().trim().min(1).max(200),
+    label: z.string().trim().min(1).max(200),
+    aliases: z.array(z.string().trim().min(1).max(200)).max(30).default([]),
+    regionId: z.string().trim().min(1).max(200).nullable().optional(),
+    pixelBox: z.tuple([
+      z.number().int(),
+      z.number().int(),
+      z.number().int(),
+      z.number().int(),
+    ]).nullable().optional(),
+    confidence: z.number().finite().min(0).max(1).nullable().optional(),
+    evidence: z.array(z.object({
+      kind: z.string().trim().min(1).max(80),
+      sha256: z.string().regex(/^[0-9a-f]{64}$/),
+      mediaType: z.string().trim().min(1).max(120),
+    }).strict()).max(20).default([]),
+    capturedAt: z.string().datetime({ offset: true }),
+    robotBootId: z.string().trim().min(1).max(200),
+    localizationEpochId: z.string().trim().min(1).max(200),
+    observationSessionId: z.string().trim().min(1).max(200).nullable().optional(),
+    sceneRef: z.object({
+      sceneId: z.string().trim().min(1).max(200),
+      revision: z.union([
+        z.string().trim().min(1).max(200),
+        z.number().int().nonnegative(),
+      ]),
+    }).strict().nullable().optional(),
+    authority: z.literal("SEMANTIC_ONLY"),
+    executionEligible: z.literal(false),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (new Set(value.aliases.map((item) => item.toLocaleLowerCase())).size !== value.aliases.length) {
+      context.addIssue({ code: "custom", path: ["aliases"], message: "semantic referent aliases must be unique" });
+    }
+    if (value.pixelBox && (value.pixelBox[0] >= value.pixelBox[2] || value.pixelBox[1] >= value.pixelBox[3])) {
+      context.addIssue({ code: "custom", path: ["pixelBox"], message: "semantic referent pixelBox is invalid" });
+    }
+  });
+
 export const conversationMemoryContextSchema = z
   .object({
     schemaVersion: z.literal("h-ide.conversation-memory-context/1"),
@@ -76,6 +123,7 @@ export const conversationMemoryContextSchema = z
     revision: z.number().int().nonnegative(),
     durableSummary: conversationDurableSummarySchema.nullable().optional(),
     relevantMemories: z.array(conversationMemorySnippetSchema).max(8).default([]),
+    semanticReferents: z.array(semanticReferentSchema).max(20).default([]),
   })
   .strict()
   .superRefine((value, context) => {
@@ -183,6 +231,7 @@ export type ConversationIntent = z.infer<typeof conversationIntentSchema>;
 export type ConversationHistoryMessage = z.infer<typeof conversationHistoryMessageSchema>;
 export type ConversationDurableSummary = z.infer<typeof conversationDurableSummarySchema>;
 export type ConversationMemorySnippet = z.infer<typeof conversationMemorySnippetSchema>;
+export type SemanticReferent = z.infer<typeof semanticReferentSchema>;
 export type ConversationMemoryContext = z.infer<typeof conversationMemoryContextSchema>;
 export type ConversationTurnRequest = z.infer<typeof conversationTurnRequestSchema>;
 export type ConversationRouterModelOutput = z.infer<typeof conversationRouterModelOutputSchema>;

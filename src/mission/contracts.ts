@@ -122,7 +122,10 @@ export const missionEnvelopeSchema = z.object({
   maximumDurationSeconds: z.number().int().positive().max(7_200).default(600),
   maximumAutoRevisions: z.number().int().min(0).max(20).default(3),
   maximumStageAttempts: z.number().int().min(1).max(10).default(3),
-  maximumScanYawRad: z.number().finite().positive().max(2 * Math.PI).default(2 * Math.PI),
+  // Cumulative Mission budget. Individual rotate/scan actions remain bounded
+  // by their capability schema and the downstream policy gate, while a
+  // multi-station inspection may legitimately consume many full scans.
+  maximumScanYawRad: z.number().finite().positive().max(40 * Math.PI).default(2 * Math.PI),
   modelPins: z.array(modelPinSchema).min(2).max(16),
   expiresAt: isoDateTime,
 }).strict().superRefine((value, context) => {
@@ -171,6 +174,45 @@ function rejectExecutableIntent(value: unknown, path = "intent") {
   }
 }
 
+export const placeTargetSchema = z.object({
+  schemaVersion: z.literal("h-ide.place-target/1"),
+  locationId: id,
+  locationName: id,
+  anchorRole: z.enum(["entry", "interior", "observation_vantage"]),
+  stationId: id,
+  targetRecordId: id,
+  candidateTargetRecordIds: z.array(id).min(1).max(20),
+}).strict().superRefine((value, context) => {
+  if (new Set(value.candidateTargetRecordIds).size !== value.candidateTargetRecordIds.length) {
+    context.addIssue({ code: "custom", path: ["candidateTargetRecordIds"], message: "place candidates must be unique" });
+  }
+  if (value.candidateTargetRecordIds[0] !== value.targetRecordId) {
+    context.addIssue({ code: "custom", path: ["targetRecordId"], message: "selected place target must be the first candidate" });
+  }
+});
+
+export const placeCompletionSchema = z.object({
+  schemaVersion: z.literal("h-ide.place-completion/1"),
+  predicate: z.enum(["at_anchor", "inside_region"]),
+  regionId: id,
+  minimumClearanceM: z.number().finite().min(0).max(2),
+  maximumAnchorDistanceM: z.number().finite().positive().max(2),
+}).strict();
+
+export const placeNavigationIntentSchema = z.object({
+  schemaVersion: z.literal("h-ide.place-intent/1"),
+  task: z.enum(["navigate_to_place", "verify_inside_region"]),
+  place: placeTargetSchema,
+  completion: placeCompletionSchema,
+}).strict().superRefine((value, context) => {
+  if (value.place.locationId !== value.completion.regionId) {
+    context.addIssue({ code: "custom", path: ["completion", "regionId"], message: "place completion region mismatch" });
+  }
+  if (value.completion.predicate === "inside_region" && value.place.anchorRole === "entry") {
+    context.addIssue({ code: "custom", path: ["place", "anchorRole"], message: "inside completion requires an interior anchor" });
+  }
+});
+
 export const missionNodeSchema = z.object({
   nodeId: id,
   skillId: id,
@@ -186,6 +228,19 @@ export const missionNodeSchema = z.object({
     rejectExecutableIntent(value.intent);
   } catch (error) {
     context.addIssue({ code: "custom", path: ["intent"], message: error instanceof Error ? error.message : String(error) });
+  }
+  if (value.skillId === "navigation.navigate_to_pose") {
+    for (const retired of ["target_region", "target_description", "entry_pose"] as const) {
+      if (retired in value.intent) {
+        context.addIssue({ code: "custom", path: ["intent", retired], message: `${retired} is retired; use a typed place target or targetRecordId` });
+      }
+    }
+  }
+  if ("place" in value.intent || value.intent.schemaVersion === "h-ide.place-intent/1") {
+    const typed = placeNavigationIntentSchema.safeParse(value.intent);
+    if (!typed.success) {
+      context.addIssue({ code: "custom", path: ["intent"], message: `invalid typed place intent: ${typed.error.issues[0]?.message ?? "unknown error"}` });
+    }
   }
   for (const field of ["dependsOn", "preconditionIds", "postconditionIds"] as const) {
     if (new Set(value[field]).size !== value[field].length) {
