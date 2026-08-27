@@ -5,7 +5,7 @@ release:
   branch: main
   tag: integration/office-v2-e2e-20260827
   status: frozen-integration
-  root_commit: recorded-by-release-tag
+  root_commit: c8914c0e100440d2af0ff489810c4dd8799d8ae8
   validation_contract: L0-L1-L2
 
 # These are the source commits that were imported into the monorepo. The
