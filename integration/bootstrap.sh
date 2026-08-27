@@ -132,6 +132,7 @@ fi
 mkdir -p "$(dirname -- "${g1_target}")"
 g1_target="$(cd -- "$(dirname -- "${g1_target}")" && pwd -P)/$(basename -- "${g1_target}")"
 g1_component_path="${COMPONENTS}/h-ide-mujoco-sonic/models/unitree-g1-mujoco"
+mkdir -p "$(dirname -- "${g1_component_path}")"
 
 configured_groot_root="$(env_value HIDE_GROOT_ROOT)"
 groot_target="${HIDE_GROOT_ROOT:-${configured_groot_root:-${EXTERNAL_ROOT}/GR00T-WholeBodyControl}}"
