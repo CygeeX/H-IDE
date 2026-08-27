@@ -1,0 +1,70 @@
+# Local secrets and operator configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.secret
+
+# Local environments, package managers and build output
+.venv/
+venv/
+env/
+node_modules/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+.mastra/
+dist/
+build/
+install/
+target/
+
+# Runtime state and potentially identifying evidence
+data/
+var/
+logs/
+log/
+runs/
+recordings/
+captures/
+evidence/
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+*.log
+*.crash
+*.core
+*.mp4
+*.mcap
+*.bag
+
+# Model and accelerator artifacts; obtain through the locked fetch workflow
+*.onnx
+*.engine
+*.plan
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+models/**/.cache/
+hf_cache/
+.huggingface/
+
+# Local Git internals accidentally copied into vendor trees
+**/.git/
+**/.gitmodules.local
+
+# Editor/OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp

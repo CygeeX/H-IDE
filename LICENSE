@@ -1,0 +1,14 @@
+Skillstore Internal Collaboration License
+=========================================
+
+Copyright (c) 2026 the Skillstore project contributors.
+
+Unless a component directory or its accompanying third-party notice states a
+different license, the first-party code in this repository is provided only
+for internal development, testing, and operation by the Skillstore project
+team. It may not be redistributed, sublicensed, sold, or exposed as a public
+service without written authorization from the project owner.
+
+This notice does not replace or alter the licenses of vendored or referenced
+third-party components. The applicable component-level LICENSE and
+THIRD_PARTY_NOTICES files take precedence for those components.
