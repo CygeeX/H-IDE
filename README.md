@@ -56,6 +56,7 @@ helper 提供，不能写进 URL 或脚本。
 
 - [快速开始与账号初始化](docs/quickstart/README.md)
 - [组件与调用链](docs/architecture/README.md)
+- [Scene Explorer Agent 设计与接入规范](docs/architecture/scene-explorer-agent.md)
 - [各组件开发说明](docs/components/README.md)
 - [运行、停止、复位和监控](docs/operations/README.md)
 - [从干净克隆复刻](docs/reproduction/README.md)

@@ -81,3 +81,7 @@ DAAAM 只作为异步 post-Mission importer。它可以帮助“上次某区域�
 - DAAAM：空间-语义记忆的异步导入思想，仅取其 observation-only 部分。
 
 详细的接口字段和源码入口请先看各组件 README，再看 `integration/integration.lock.yaml`。
+
+下一阶段的地图自动探索、跨视角理解和标注模块见
+[`scene-explorer-agent.md`](scene-explorer-agent.md)。该设计明确移除 PCD/Potree，
+并把 PLY/3DGS 渲染、覆盖分析和人工发布放在独立的 observation-only sidecar。
