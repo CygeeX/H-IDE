@@ -107,6 +107,9 @@ share one boot/session identity.
 - Live open-corridor A/B runs: approximately `1.99 m` and `1.98 m` traversed
   as one continuous forward action, with terminal `IDLE/GRANTED` and no Plant
   or SONIC fault.
+- Live full-straight run: a `3.95 m` clear segment completed as one
+  `DriveOnHeading` action and returned `SUCCEEDED`; the final pose remained
+  upright inside the relaxed arrival envelope.
 - Offline full-straight planner proof: a clear 3 m corridor is partitioned into
   one segment and passes production verification with the full-mode segment
   bound.
