@@ -15,11 +15,11 @@ normal stop boundary at a turn.
 ## Full straight mode
 
 `full_straight_drive` is a separate, more aggressive profile for a verified
-straight segment.  It asks the static planner to use a map-bounded `20 m`
-maximum segment (the diagonal of the 16 m x 12 m Office V2 map), so an open
-3–8 m chord can be sent as one `DriveOnHeading` action.  The action contract
-itself has no 2 m limit; the 20 m value is only a finite runtime/watchdog
-bound.
+straight segment.  It asks the static planner to use a map-bounded `4 m`
+maximum segment, so an open 3–4 m chord can be sent as one
+`DriveOnHeading` action.  The action contract
+itself has no 2 m limit; the runtime currently caps one action at `4.0 m` so
+the conservative progress timeout remains within Nav2's 120-second bound.
 
 Full mode is admitted only when the selected segment remains collision-free at
 an additional `0.60 m` occupancy inflation contour.  The single-action bound

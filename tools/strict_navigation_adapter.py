@@ -501,7 +501,11 @@ class StrictNavigationExecutor:
                 **self._plan_kwargs(full_straight=False),
             )
             if recovery.get("disposition") == "send_action":
-                self._execute_resolved(recovery, cancelled=cancelled)
+                self._execute_resolved(
+                    recovery,
+                    cancelled=cancelled,
+                    drive_chunk_m=MAX_RUNTIME_DRIVE_CHUNK_M,
+                )
                 completed += 1
             elif recovery.get("disposition") != "not_required":
                 raise runner.StrictMotionRunnerError(
