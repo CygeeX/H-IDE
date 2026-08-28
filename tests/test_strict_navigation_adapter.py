@@ -294,12 +294,50 @@ def test_continuous_drive_handoff_skips_only_intermediate_idle_wait() -> None:
     assert result.final_pose.x == pytest.approx(1.0)
     assert backend.sent == [
         ("Spin", 0.2),
-        ("DriveOnHeading", 0.5),
-        ("DriveOnHeading", 0.5),
+        ("DriveOnHeading", 1.0),
     ]
-    # The first Spin and the final Drive retain the ordinary balanced-IDLE
-    # gate; only the handoff between the two same-direction drive chunks is
-    # allowed to proceed without the blocking evidence wait.
+    # The opt-in profile takes the whole one-metre reviewed segment in one
+    # official action.  The Spin and terminal Drive retain the ordinary
+    # balanced-IDLE gate.
+    assert backend.health_calls == 2
+
+
+def test_continuous_drive_handoff_only_skips_an_intermediate_chunk() -> None:
+    backend = FakeBackend()
+
+    class ThreeMetrePlanner(FakePlanner):
+        def resolve_live_primitive(self, plan, index, navfn_path, pose, **kwargs):
+            if index == 0:
+                return super().resolve_live_primitive(
+                    plan, index, navfn_path, pose, **kwargs
+                )
+            remaining = max(0.0, 3.0 - float(pose["x"]))
+            if remaining <= runner.DETOUR_ENDPOINT_TOLERANCE_M:
+                return {"disposition": "skip_within_endpoint_tolerance"}
+            return {
+                "disposition": "send_action",
+                "action_type": "nav2_msgs/action/DriveOnHeading",
+                "action_goal": {
+                    "target": {"x": remaining, "y": 0.0, "z": 0.0},
+                    "speed_mps": runner.OFFICIAL_DRIVE_SPEED_MPS,
+                },
+                "fresh_distance_to_endpoint_m": remaining,
+            }
+
+    result = executor(
+        backend,
+        ThreeMetrePlanner(),
+        continuous_drive_handoff=True,
+    ).navigate(runner.PlanarPose(3.0, 0.0, 0.2))
+
+    assert result.final_pose.x == pytest.approx(3.0)
+    assert backend.sent == [
+        ("Spin", 0.2),
+        ("DriveOnHeading", 2.0),
+        ("DriveOnHeading", 1.0),
+    ]
+    # Spin + terminal Drive only.  The first 2 m action is handed directly to
+    # the next same-direction chunk without a blocking learned-IDLE wait.
     assert backend.health_calls == 2
 
 

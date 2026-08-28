@@ -35,10 +35,16 @@ IDLE_SETTLE_TIMEOUT_S = 20.0
 POLL_PERIOD_S = 0.02
 MAX_PRODUCT_REPLANS = 2
 # DriveOnHeading is distance-controlled, not an endpoint-tracking controller.
-# Re-sample map odometry and heading at least every half metre so small learned
-# gait yaw errors cannot accumulate across a two-metre static-plan segment and
-# put the next NavFn start inside an inflated doorway cell.
+# The frozen integration profile deliberately caps each runtime checkpoint at
+# 0.50 m: it re-samples map odometry and heading often enough that small learned
+# gait yaw errors cannot accumulate across a two-metre static-plan segment.
+#
+# The opt-in continuous-handoff profile uses the static planner's reviewed
+# maximum (2 m).  This is the important part of the experiment: a long, open
+# straight segment is one official DriveOnHeading action instead of four short
+# actions, so Nav2 does not request a stop/re-arm boundary every half metre.
 MAX_RUNTIME_DRIVE_CHUNK_M = 0.50
+CONTINUOUS_RUNTIME_DRIVE_CHUNK_M = 2.0
 MAX_RUNTIME_DRIVE_ACTIONS_PER_SEGMENT = 8
 
 
@@ -115,6 +121,11 @@ class StrictNavigationExecutor:
         if not isinstance(continuous_drive_handoff, bool):
             raise ValueError("continuous_drive_handoff must be a boolean")
         self.continuous_drive_handoff = continuous_drive_handoff
+        self.runtime_drive_chunk_m = (
+            CONTINUOUS_RUNTIME_DRIVE_CHUNK_M
+            if continuous_drive_handoff
+            else MAX_RUNTIME_DRIVE_CHUNK_M
+        )
 
     @staticmethod
     def _plan_kwargs() -> dict[str, Any]:
@@ -197,7 +208,7 @@ class StrictNavigationExecutor:
                 target.get("x"), "DriveOnHeading distance"
             )
             distance = math.copysign(
-                min(abs(resolved_distance), MAX_RUNTIME_DRIVE_CHUNK_M),
+                min(abs(resolved_distance), self.runtime_drive_chunk_m),
                 resolved_distance,
             )
             timeout_s = runner.translation_action_timeout_s(abs(distance))
@@ -508,17 +519,40 @@ class StrictNavigationExecutor:
                             self.continuous_drive_handoff
                             and action_type == "nav2_msgs/action/DriveOnHeading"
                             and distance is not None
-                            and distance
-                            > MAX_RUNTIME_DRIVE_CHUNK_M
-                            + runner.DETOUR_ENDPOINT_TOLERANCE_M
+                            and isinstance(
+                                resolved.get("action_goal"), Mapping
+                            )
                         ):
-                            # The action still publishes a zero at its own
-                            # endpoint, but the next same-heading chunk is
-                            # admitted immediately. If the fresh resolver asks
-                            # for a Spin, a skip, or a replan, the pending
-                            # handoff is flushed through the normal balanced
-                            # IDLE gate before that different transition.
-                            wait_for_idle = False
+                            resolved_goal = self._mapping(
+                                resolved.get("action_goal"),
+                                "resolved action goal",
+                            )
+                            resolved_target = self._mapping(
+                                resolved_goal.get("target"),
+                                "resolved DriveOnHeading target",
+                            )
+                            command_distance = abs(
+                                self._finite(
+                                    resolved_target.get("x"),
+                                    "resolved DriveOnHeading command distance",
+                                )
+                            )
+                            admitted_distance = min(
+                                command_distance,
+                                self.runtime_drive_chunk_m,
+                            )
+                            if (
+                                distance
+                                > admitted_distance
+                                + runner.DETOUR_ENDPOINT_TOLERANCE_M
+                            ):
+                                # The action still publishes a zero at its own
+                                # endpoint, but the next same-heading chunk is
+                                # admitted immediately. If the fresh resolver
+                                # asks for a Spin, a skip, or a replan, the
+                                # pending handoff is flushed through the normal
+                                # balanced-IDLE gate before that transition.
+                                wait_for_idle = False
                         kind = self._execute_resolved(
                             resolved,
                             cancelled=cancelled,
