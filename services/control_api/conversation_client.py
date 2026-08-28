@@ -81,13 +81,21 @@ class MastraConversationClient:
             # strict schema and returns 422 for the new memoryContext field.
             # Retry once with the server-generated digest-checked summary in
             # the legacy field; never fall back for other status codes.
+            response_text = response.text.casefold()
             rejects_memory_context = (
                 response.status_code == 422
-                and "memorycontext" in response.text.casefold()
+                and "memorycontext" in response_text
             )
-            if rejects_memory_context and request.memoryContext is not None:
+            rejects_skill_context = (
+                response.status_code == 422
+                and "skillid" in response_text
+            )
+            if (rejects_memory_context or rejects_skill_context) and (
+                request.memoryContext is not None or request.skillId is not None
+            ):
                 legacy_payload = dict(payload)
                 legacy_payload.pop("memoryContext", None)
+                legacy_payload.pop("skillId", None)
                 durable = request.memoryContext.durableSummary
                 if durable is not None:
                     legacy_payload["summary"] = durable.text

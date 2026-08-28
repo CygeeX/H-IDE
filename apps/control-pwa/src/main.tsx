@@ -3,6 +3,8 @@ import { createRoot } from "react-dom/client";
 import type {
   ApiError,
   AssistantConversation,
+  AssistantConversationBulkDeleteResult,
+  AssistantConversationPage,
   AssistantDraft,
   AssistantMessage,
   AuthPrincipal,
@@ -44,15 +46,50 @@ import {
   currentMissionOfficeReport,
   MissionOfficeReportCard,
 } from "./mission-office-report";
+import {
+  browserSpeakChinese,
+  LEADER_SKILLS,
+  RobotAvatar3D,
+  RobotPicker,
+  SkillModeBanner,
+  SkillSelection,
+  type LeaderSkillDefinition,
+  type LeaderSkillId,
+  type RobotDisplayOption,
+} from "./leader-demo";
+import {
+  buildConversationTimeline,
+  mergeConversationMessages,
+} from "./conversation-timeline";
+import { missionUserProgress } from "./mission-progress";
 import "./app.css";
 import "./chat-shell.css";
 
 type ConnectionState = "connecting" | "live" | "offline";
 type VoiceCaptureMode = "streaming" | "offline_wav";
+type ConversationLifecycleView = "active" | "archived" | "deleted";
 interface VoiceUiState {
   phase: StreamingSpeechPhase;
   partial: string;
   metrics: StreamingSpeechMetrics;
+}
+
+interface AssistantRetryRequest {
+  text: string;
+  modality: "text" | "voice";
+  transcriptionId: string | null;
+  route: "conversation" | "mission";
+  candidateSelection?: {
+    candidateId: string;
+    selectionSourceAnalysisId: string;
+  } | null;
+}
+
+interface AssistantClientIssue {
+  occurredAt: string;
+  operation: string;
+  detail: string;
+  taskId?: string;
 }
 type AppRoute =
   | { kind: "chat"; shell: "user" | "developer"; conversationId?: string }
@@ -167,6 +204,59 @@ async function apiFetchBlob(path: string): Promise<Blob> {
   const blob = await response.blob();
   if (blob.size > 8 * 1024 * 1024) throw new Error("视觉证据超过 8 MiB 安全上限");
   return blob;
+}
+
+function isAssistantConversationPage(value: unknown): value is AssistantConversationPage {
+  if (!value || typeof value !== "object") return false;
+  const page = value as Partial<AssistantConversationPage>;
+  return Array.isArray(page.items)
+    && (page.nextCursor === null || typeof page.nextCursor === "string");
+}
+
+async function fetchAssistantConversationPage({
+  lifecycle = "active",
+  query = "",
+  cursor = null,
+  limit = 30,
+}: {
+  lifecycle?: ConversationLifecycleView;
+  query?: string;
+  cursor?: string | null;
+  limit?: number;
+} = {}): Promise<AssistantConversationPage> {
+  const parameters = new URLSearchParams({ lifecycle, limit: String(limit) });
+  if (query.trim()) parameters.set("q", query.trim());
+  if (cursor) parameters.set("cursor", cursor);
+  try {
+    const page = await apiFetch<unknown>(
+      `/api/v2/assistant/conversations?${parameters.toString()}`,
+    );
+    if (isAssistantConversationPage(page)) return page;
+  } catch (reason) {
+    if (!(reason instanceof ApiFailure) || reason.status !== 404) throw reason;
+  }
+
+  // Compatibility for a rolling deployment where the new PWA reaches an old
+  // Control API. V1 is unpaged, so the fallback is intentionally finite and
+  // disappears once every workstation exposes the V2 cursor contract.
+  const legacyQuery = lifecycle === "active"
+    ? ""
+    : lifecycle === "archived"
+      ? "?includeArchived=true"
+      : "?includeArchived=true&includeDeleted=true";
+  const legacy = await apiFetch<AssistantConversation[]>(
+    `/api/v1/assistant/conversations${legacyQuery}`,
+  );
+  const normalizedQuery = query.trim().toLocaleLowerCase();
+  const filtered = (Array.isArray(legacy) ? legacy : []).filter((conversation) => {
+    if (lifecycle === "active" && (conversation.archived || conversation.deleted)) return false;
+    if (lifecycle === "archived" && (!conversation.archived || conversation.deleted)) return false;
+    if (lifecycle === "deleted" && !conversation.deleted) return false;
+    if (!normalizedQuery) return true;
+    const firstUserMessage = conversation.messages?.find((message) => message.role === "user")?.content ?? "";
+    return `${conversation.title ?? ""}\n${firstUserMessage}`.toLocaleLowerCase().includes(normalizedQuery);
+  });
+  return { items: filtered.slice(0, limit), nextCursor: null };
 }
 
 async function fetchSpeechReply(text: string, signal: AbortSignal): Promise<Response> {
@@ -305,6 +395,36 @@ function friendlyError(error: unknown): string {
   return "请求失败，请检查工作站连接";
 }
 
+function assistantUserFacingError(error: unknown): string {
+  if (error instanceof ApiFailure) {
+    if (error.status === 401 || error.status === 403) return "会话权限已失效，请重新登录后重试";
+    if (error.status === 409) return "当前任务状态已变化，请刷新后重试";
+    if (error.status === 429) return "服务暂时繁忙，请稍后重试";
+    if (error.status >= 500) return "服务暂时不可用，请稍后重试";
+  }
+  return "暂时无法完成，请重试";
+}
+
+function conversationHasActiveWork(status: string | undefined): boolean {
+  return new Set([
+    "planning",
+    "queued",
+    "running",
+    "review",
+    "approved",
+    "ready",
+    "observing",
+    "dispatching",
+    "executing",
+    "verifying",
+    "needs_input",
+    "awaiting_review",
+    "suspended",
+    "awaiting_user",
+    "teaching",
+  ]).has(status ?? "");
+}
+
 function isDraftExpired(draft: AssistantDraft | null, now = Date.now()): boolean {
   if (!draft) return false;
   if (draft.status === "expired") return true;
@@ -437,7 +557,7 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (session: AuthSessio
   };
 
   return <main className="auth-shell">
-    <section className="auth-intro"><span className="auth-logo"><Icon name="logo" /></span><p className="eyebrow">H-IDE ASSISTANT</p><h1>让人与机器人自然协作</h1><p>聊天、视觉观察与机器人任务都在同一个连续会话里；真正的行动始终受权限与安全边界约束。</p></section>
+    <section className="auth-intro"><span className="auth-logo"><img src="/assets/leader-demo/brand/h-ide-logo.png" alt="H-IDE" /></span><p className="eyebrow">H-IDE ASSISTANT</p><h1>让人与机器人自然协作</h1><p>聊天、视觉观察与机器人任务都在同一个连续会话里；真正的行动始终受权限与安全边界约束。</p><RobotAvatar3D speech="你好，我是 H-IDE。准备好开始今天的协作了吗？" /></section>
     <section className="auth-card" aria-label={mode === "login" ? "登录 H-IDE" : "注册 H-IDE"}>
       <div className="auth-tabs"><button className={mode === "login" ? "active" : ""} type="button" onClick={() => setMode("login")}>登录</button><button className={mode === "register" ? "active" : ""} type="button" onClick={() => setMode("register")}>注册</button></div>
       <form onSubmit={submit}>
@@ -501,6 +621,16 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
   const developerMode = canDevelop && route.shell === "developer";
   const [robots, setRobots] = useState<RobotState[]>([]);
   const [selectedRobotId, setSelectedRobotId] = useState("");
+  const [selectedDisplayRobotId, setSelectedDisplayRobotId] = useState<RobotDisplayOption["id"]>(() => {
+    try {
+      const value = window.localStorage.getItem("h-ide-leader-demo-robot");
+      return value === "agibot" || value === "deeprobotics" || value === "unitree" ? value : "unitree";
+    } catch {
+      return "unitree";
+    }
+  });
+  const [selectedSkill, setSelectedSkill] = useState<LeaderSkillId | null>(null);
+  const [skillGreeting, setSkillGreeting] = useState("");
   const [capabilities, setCapabilities] = useState<CapabilitySnapshot | null>(null);
   const [events, setEvents] = useState<ControlEvent[]>([]);
   const [mappings, setMappings] = useState<MappingSnapshot[]>([]);
@@ -511,10 +641,15 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
   const [lastReceipt, setLastReceipt] = useState<CommandReceipt | null>(null);
   const [lastCommandId, setLastCommandId] = useState<string | null>(null);
   const [assistantConversations, setAssistantConversations] = useState<AssistantConversation[]>([]);
+  const [assistantConversationsLoaded, setAssistantConversationsLoaded] = useState(false);
   const [assistantConversation, setAssistantConversation] = useState<AssistantConversation | null>(null);
   const [assistantText, setAssistantText] = useState("");
   const [assistantTurn, setAssistantTurn] = useState<AssistantTurn | null>(null);
   const [assistantBusy, setAssistantBusy] = useState(false);
+  const [assistantThinking, setAssistantThinking] = useState(false);
+  const [assistantInlineError, setAssistantInlineError] = useState("");
+  const [assistantRetryRequest, setAssistantRetryRequest] = useState<AssistantRetryRequest | null>(null);
+  const [assistantClientIssue, setAssistantClientIssue] = useState<AssistantClientIssue | null>(null);
   const [transcriptionId, setTranscriptionId] = useState<string | null>(null);
   const [recording, setRecording] = useState(false);
   const [voiceBusy, setVoiceBusy] = useState(false);
@@ -548,6 +683,12 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
   const [toolMenuOpen, setToolMenuOpen] = useState(false);
   const [controlPanelOpen, setControlPanelOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [historyLifecycle, setHistoryLifecycle] = useState<ConversationLifecycleView>("active");
+  const [historyConversations, setHistoryConversations] = useState<AssistantConversation[]>([]);
+  const [historyNextCursor, setHistoryNextCursor] = useState<string | null>(null);
+  const [historySearch, setHistorySearch] = useState("");
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [deletedConversationUndo, setDeletedConversationUndo] = useState<AssistantConversation | null>(null);
   const [advancedMode, setAdvancedMode] = useState(() => {
     try {
       return window.localStorage.getItem("h-ide-advanced-mode") === "true";
@@ -574,8 +715,11 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
   const speechPlayerRef = useRef<StreamingPcmPlayer | null>(null);
   const voiceReplyEnabledRef = useRef(voiceReplyEnabled);
   voiceReplyEnabledRef.current = voiceReplyEnabled;
+  const selectedSkillRef = useRef<LeaderSkillId | null>(selectedSkill);
+  selectedSkillRef.current = selectedSkill;
   const finalTranscriptRef = useRef(new Set<string>());
   const pendingMissionInterventionRef = useRef(new Map<string, string>());
+  const deletedConversationUndoTimerRef = useRef<number | undefined>(undefined);
   const restoredConversationRef = useRef(false);
   const restoredMissionRef = useRef(false);
   const assistantConversationRef = useRef<AssistantConversation | null>(assistantConversation);
@@ -613,6 +757,9 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
   const applyConversationDetail = useCallback((detail: AssistantConversation) => {
     setSelectedRobotId(detail.robotId);
     setAssistantConversation(detail);
+    setMissionDraft(null);
+    setMissionRecord(null);
+    setMissionMessages([]);
     const latestTurn = detail.turns?.at(-1) ?? null;
     const drafts = [...(detail.drafts ?? [])].reverse();
     const latestDraft = drafts.find((item) => item.status === "draft") ?? drafts[0] ?? null;
@@ -632,9 +779,45 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
   }, []);
 
   const loadConversationSummaries = useCallback(async () => {
-    const conversations = await apiFetch<AssistantConversation[]>("/api/v1/assistant/conversations");
-    setAssistantConversations(conversations);
-    return conversations;
+    try {
+      const page = await fetchAssistantConversationPage({ limit: 30 });
+      setAssistantConversations(page.items);
+      return page.items;
+    } finally {
+      setAssistantConversationsLoaded(true);
+    }
+  }, []);
+
+  const loadConversationHistory = useCallback(async (
+    lifecycle: ConversationLifecycleView,
+    query: string,
+    cursor: string | null = null,
+    append = false,
+  ) => {
+    setHistoryLoading(true);
+    try {
+      const page = await fetchAssistantConversationPage({
+        lifecycle,
+        query,
+        cursor,
+        limit: 30,
+      });
+      setHistoryConversations((current) => append
+        ? [
+          ...current,
+          ...page.items.filter((item) => !current.some(
+            (existing) => existing.conversationId === item.conversationId,
+          )),
+        ]
+        : page.items);
+      setHistoryNextCursor(page.nextCursor);
+      if (lifecycle === "active" && !query.trim() && !cursor) {
+        setAssistantConversations(page.items);
+      }
+      return page;
+    } finally {
+      setHistoryLoading(false);
+    }
   }, []);
 
   const loadMissionHistory = useCallback(async () => {
@@ -659,6 +842,43 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
     const latestDraft = drafts.find((item) => item.status === "draft") ?? drafts[0] ?? null;
     if (latestDraft && isVisualMissionPlan(latestDraft.plan) && latestDraft.status !== "draft") {
       await loadVisualMission(latestDraft.plan.mission.missionId).catch(() => setVisualMission(null));
+    }
+    const latestMissionId = detail.activeMissionId ?? detail.missionIds?.at(-1) ?? null;
+    const latestMissionDraftId = [...(detail.missionLinks ?? [])].reverse().find(
+      (item) => item.draftStatus === "draft",
+    )?.missionDraftId
+      ?? detail.missionDraftIds?.at(-1)
+      ?? detail.turns?.map((item) => item.result?.missionDraftId).filter(
+        (item): item is string => typeof item === "string" && Boolean(item),
+      ).at(-1)
+      ?? null;
+    if (latestMissionId) {
+      try {
+        const mission = await apiFetch<MissionRecordV2>(
+          `/api/v2/missions/${encodeURIComponent(latestMissionId)}`,
+        );
+        setMissionRecord(mission);
+        setMissionHistory((current) => [
+          mission,
+          ...current.filter((item) => item.missionId !== mission.missionId),
+        ]);
+      } catch (reason) {
+        if (!(reason instanceof ApiFailure) || reason.status !== 404) throw reason;
+      }
+    }
+    if (latestMissionDraftId && latestMissionDraftId !== latestMissionId) {
+      try {
+        const missionDraftRecord = await apiFetch<MissionDraftRecordV2>(
+          `/api/v2/missions/drafts/${encodeURIComponent(latestMissionDraftId)}`,
+        );
+        setMissionDraft(missionDraftRecord);
+        setMissionDraftHistory((current) => [
+          missionDraftRecord,
+          ...current.filter((item) => item.draftId !== missionDraftRecord.draftId),
+        ]);
+      } catch (reason) {
+        if (!(reason instanceof ApiFailure) || reason.status !== 404) throw reason;
+      }
     }
     return detail;
   }, [applyConversationDetail, loadVisualMission]);
@@ -709,7 +929,7 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
           )
           || missionDraftHistory.some((item) => item.status === "draft")
         ) return;
-        const active = conversations.find((item) => ["planning", "review", "running"].includes(item.status));
+        const active = conversations.find((item) => conversationHasActiveWork(item.status));
         if (active) navigate(chatPath(initialRoute.shell, active.conversationId), { replace: true });
       })
       .catch((reason) => {
@@ -725,7 +945,13 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
   ]);
 
   useEffect(() => {
-    if (!missionHistoryLoaded || restoredMissionRef.current) return;
+    if (!historyOpen) return;
+    void loadConversationHistory(historyLifecycle, historySearch)
+      .catch((reason) => setError(friendlyError(reason)));
+  }, [historyLifecycle, historyOpen, historySearch, loadConversationHistory]);
+
+  useEffect(() => {
+    if (!missionHistoryLoaded || !assistantConversationsLoaded || restoredMissionRef.current) return;
     restoredMissionRef.current = true;
     const initialRoute = parseAppRoute(window.location.pathname);
     if (initialRoute.kind !== "chat" || initialRoute.conversationId) return;
@@ -733,15 +959,28 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
       (item) => !["completed", "failed", "cancelled"].includes(item.snapshot.status),
     );
     const activeDraft = missionDraftHistory.find((item) => item.status === "draft");
-    const identifier = activeMission?.missionId ?? activeDraft?.draftId;
+    const linkedConversation = activeMission
+      ? assistantConversations.find((item) => (
+        item.activeMissionId === activeMission.missionId
+        || item.missionIds?.includes(activeMission.missionId)
+      ))
+      : activeDraft
+        ? assistantConversations.find((item) => item.missionDraftIds?.includes(activeDraft.draftId))
+        : null;
+    const identifier = linkedConversation?.conversationId
+      ?? activeMission?.missionId
+      ?? activeDraft?.draftId;
     if (identifier) navigate(chatPath(initialRoute.shell, identifier), { replace: true });
-  }, [missionDraftHistory, missionHistory, missionHistoryLoaded, navigate]);
+  }, [assistantConversations, assistantConversationsLoaded, missionDraftHistory, missionHistory, missionHistoryLoaded, navigate]);
 
   useEffect(() => {
     if (route.kind !== "chat") return;
     if (!route.conversationId) {
       setAssistantConversation(null);
       setAssistantTurn(null);
+      setAssistantThinking(false);
+      setAssistantInlineError("");
+      setAssistantRetryRequest(null);
       setDraft(null);
       setVisualMission(null);
       setMissionDraft(null);
@@ -810,6 +1049,9 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
     streamingSpeechRef.current = null;
     void speechPlayerRef.current?.close();
     speechPlayerRef.current = null;
+    if (deletedConversationUndoTimerRef.current !== undefined) {
+      window.clearTimeout(deletedConversationUndoTimerRef.current);
+    }
   }, []);
 
   useEffect(() => {
@@ -828,6 +1070,31 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
       // Local preferences are optional in private browsing.
     }
   }, [voiceReplyEnabled]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem("h-ide-leader-demo-robot", selectedDisplayRobotId);
+    } catch {
+      // Local preferences are optional in private browsing.
+    }
+  }, [selectedDisplayRobotId]);
+
+  const selectLeaderSkill = useCallback((skill: LeaderSkillDefinition) => {
+    setSelectedSkill(skill.id);
+    setSkillGreeting(skill.prompt);
+    setAssistantInlineError("");
+    if (skill.id === "assistant.voice") {
+      // The leader-demo voice path uses the browser's zh-CN SpeechSynthesis
+      // contract, so it is available even when the optional streaming TTS
+      // service is not configured.
+      setVoiceReplyEnabled(true);
+    }
+  }, []);
+
+  const clearLeaderSkill = useCallback(() => {
+    setSelectedSkill(null);
+    setSkillGreeting("");
+  }, []);
 
   useEffect(() => {
     let disposed = false;
@@ -944,15 +1211,10 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
     if (detail?.conversationId && detail.robotId === robotId && selectedRobotRef.current === robotId) {
       setAssistantConversation((current) => {
         if (current?.conversationId !== detail.conversationId) return detail;
-        const messages = [...(detail.messages ?? [])];
-        for (const local of current.messages ?? []) {
-          const persisted = messages.some((message) =>
-            message.role === local.role
-            && message.content === local.content
-            && (message.taskId === local.taskId || !message.taskId || !local.taskId));
-          if (!persisted) messages.push(local);
-        }
-        messages.sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+        const messages = mergeConversationMessages(
+          detail.messages ?? [],
+          current.messages ?? [],
+        );
         return { ...detail, messages };
       });
       setAssistantTurn(detail.turns?.at(-1) ?? null);
@@ -990,9 +1252,19 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
         } else if (turn.status === "needs_input") {
           setNotice(turn.result?.assistantMessage ?? "调度 Agent 需要补充信息");
         } else if (turn.status === "cannot_plan") {
-          setError(turn.result?.assistantMessage ?? "当前能力不足，无法规划任务");
+          setNotice(turn.result?.assistantMessage ?? "当前能力不足，无法规划任务");
         } else if (["failed", "unknown"].includes(turn.status)) {
-          setError(turn.error ?? "Agent 规划失败");
+          const detail = turn.error ?? "Agent 规划失败";
+          setAssistantInlineError(
+            turn.failure?.userMessage
+              ?? "本轮没有完成，机器人没有移动；可以安全重试。",
+          );
+          setAssistantClientIssue({
+            occurredAt: new Date().toISOString(),
+            operation: "assistant.turn",
+            detail,
+            taskId: turn.taskId,
+          });
         }
         try {
           await refreshConversation(turn.conversationId, robotId);
@@ -1009,7 +1281,15 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
 
   const speakAssistantReply = useCallback((text: string | undefined) => {
     const reply = text?.trim();
-    if (!reply || !voiceReplyEnabledRef.current) return;
+    if (!reply) return;
+    if (selectedSkillRef.current === "assistant.voice") {
+      // Keep the demo path local and deterministic: browser SpeechSynthesis
+      // speaks the same text rendered in the transcript. It does not require
+      // a cloud TTS credential and never changes robot-control authority.
+      browserSpeakChinese(reply);
+      return;
+    }
+    if (!voiceReplyEnabledRef.current) return;
     const player = speechPlayerRef.current ?? new StreamingPcmPlayer();
     speechPlayerRef.current = player;
     void player.speak(reply, fetchSpeechReply, {
@@ -1021,6 +1301,21 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
     });
   }, []);
 
+  const triggerLeaderWave = useCallback(async (robotId: string) => {
+    if (selectedSkillRef.current !== "assistant.voice") return;
+    try {
+      await apiFetch<{ status: string }>("/api/v1/leader-demo/gestures/wave", {
+        method: "POST",
+        body: JSON.stringify({ robotId }),
+      });
+      setNotice("语音助手已回答，机器人正在挥手");
+    } catch {
+      // Speech remains a successful assistant interaction when the optional
+      // local MuJoCo gesture channel is not running.
+      setNotice("语音助手已回答（仿真挥手通道未连接）");
+    }
+  }, []);
+
   const sendAssistantMessage = useCallback(async (
     rawText: string,
     modality: "text" | "voice" = "text",
@@ -1028,11 +1323,24 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
   ) => {
     const text = rawText.trim();
     if (!text || assistantBusy) return;
+    const retirePreviousMissionUi = Boolean(
+      (missionDraft && missionDraft.status !== "draft")
+      || (
+        missionRecord
+        && ["completed", "failed", "cancelled"].includes(
+          missionRecord.snapshot.status,
+        )
+      ),
+    );
     if (connection !== "live") {
-      setError("工作站当前离线。任务不会排队发送，请恢复连接后重新提交。");
+      setAssistantInlineError("工作站当前离线，请恢复连接后重试");
+      setAssistantRetryRequest({ text, modality, transcriptionId: sourceTranscriptionId, route: "conversation" });
       return;
     }
     setAssistantBusy(true);
+    setAssistantThinking(true);
+    setAssistantInlineError("");
+    setAssistantRetryRequest({ text, modality, transcriptionId: sourceTranscriptionId, route: "conversation" });
     setError("");
     try {
       const robotId = selectedRobotId;
@@ -1040,7 +1348,12 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
       if (selectedRobotRef.current !== robotId) {
         throw new Error("机器人选择已变化，请重新提交任务");
       }
-      const accepted = await apiFetch<{ taskId: string; conversationId: string; status: string }>(
+      const accepted = await apiFetch<{
+        taskId: string;
+        conversationId: string;
+        status: string;
+        userMessage?: AssistantMessage;
+      }>(
         `/api/v1/assistant/conversations/${encodeURIComponent(conversation.conversationId)}/messages`,
         {
           method: "POST",
@@ -1048,6 +1361,7 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
             text,
             modality,
             transcriptionId: sourceTranscriptionId,
+            skillId: selectedSkillRef.current,
           }),
         },
       );
@@ -1058,14 +1372,25 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
         conversationId: accepted.conversationId,
         status: accepted.status,
       });
+      // Mission cards are projections of one planning turn, not permanent
+      // conversation chrome. Once the next turn is durably accepted, retire
+      // terminal artifacts from the previous turn so a rejected/completed
+      // plan cannot be mistaken for the response currently being prepared.
+      // The durable draft, Mission, messages and evidence remain available in
+      // conversation history and are not deleted here.
+      if (retirePreviousMissionUi) {
+        setMissionDraft(null);
+        setMissionRecord(null);
+        setMissionMessages([]);
+      }
       setDraft(null);
       setReviewFeedback("");
       setAssistantConversation((current) => current ? {
         ...current,
         status: "planning",
-        messages: [
-          ...(current.messages ?? []),
-          {
+        messages: mergeConversationMessages(
+          current.messages ?? [],
+          [accepted.userMessage ?? {
             messageId: makeId("message-local"),
             taskId: accepted.taskId,
             role: "user",
@@ -1073,20 +1398,33 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
             modality,
             transcriptionId: sourceTranscriptionId,
             createdAt: new Date().toISOString(),
-          },
-        ],
+          }],
+        ),
       } : current);
       setAssistantConversations((current) => current.map((item) => item.conversationId === conversation.conversationId
         ? { ...item, status: "planning", updatedAt: new Date().toISOString() }
         : item));
       const terminal = await monitorAssistantTurn(accepted.taskId, conversation.robotId);
       speakAssistantReply(terminal.result?.assistantMessage);
+      if (terminal.status === "completed" && terminal.result?.assistantMessage) {
+        void triggerLeaderWave(conversation.robotId);
+      }
+      if (!["failed", "unknown"].includes(terminal.status)) {
+        setAssistantRetryRequest(null);
+      }
     } catch (reason) {
-      setError(friendlyError(reason));
+      setAssistantInlineError(assistantUserFacingError(reason));
+      setAssistantClientIssue({
+        occurredAt: new Date().toISOString(),
+        operation: "assistant.submit",
+        detail: friendlyError(reason),
+        taskId: assistantTurn?.taskId,
+      });
     } finally {
+      setAssistantThinking(false);
       setAssistantBusy(false);
     }
-  }, [assistantBusy, connection, ensureAssistantConversation, monitorAssistantTurn, selectedRobotId, speakAssistantReply]);
+  }, [assistantBusy, assistantTurn?.taskId, connection, ensureAssistantConversation, missionDraft, missionRecord, monitorAssistantTurn, selectedRobotId, speakAssistantReply, triggerLeaderWave]);
 
   const advanceMission = useCallback(async (missionId: string) => {
     const advanced = await apiFetch<MissionAdvanceResultV2>(
@@ -1130,6 +1468,7 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
       candidateId: string;
       selectionSourceAnalysisId: string;
     } | null = null,
+    retrying = false,
   ) => {
     const text = rawText.trim();
     if (!text || assistantBusy) return;
@@ -1145,10 +1484,14 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
       return;
     }
     if (connection !== "live") {
-      setError("工作站当前离线。任务不会排队发送，请恢复连接后重新提交。");
+      setAssistantInlineError("工作站当前离线，请恢复连接后重试");
+      setAssistantRetryRequest({ text, modality, transcriptionId: sourceTranscriptionId, route: "mission", candidateSelection });
       return;
     }
     setAssistantBusy(true);
+    setAssistantThinking(true);
+    setAssistantInlineError("");
+    setAssistantRetryRequest({ text, modality, transcriptionId: sourceTranscriptionId, route: "mission", candidateSelection });
     setError("");
     setAssistantText("");
     setTranscriptionId(null);
@@ -1180,7 +1523,7 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
       fingerprint: interventionFingerprint,
       interventionId,
     });
-    setMissionMessages((current) => [...current, userMessage]);
+    if (!retrying) setMissionMessages((current) => [...current, userMessage]);
     try {
       const response = await apiFetch<{
         decision: { kind?: string; reason?: string };
@@ -1221,9 +1564,16 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
         },
       ]);
       speakAssistantReply(reply);
+      setAssistantRetryRequest(null);
     } catch (reason) {
-      setError(friendlyError(reason));
+      setAssistantInlineError(assistantUserFacingError(reason));
+      setAssistantClientIssue({
+        occurredAt: new Date().toISOString(),
+        operation: "mission.message",
+        detail: friendlyError(reason),
+      });
     } finally {
+      setAssistantThinking(false);
       setAssistantBusy(false);
     }
   }, [assistantBusy, connection, missionRecord, principal.userId, sendAssistantMessage, speakAssistantReply]);
@@ -1236,6 +1586,27 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
     }
     void sendAssistantMessage(assistantText, "text", null);
   }, [assistantText, missionRecord?.snapshot.status, sendAssistantMessage, sendMissionMessage]);
+
+  const retryAssistantRequest = useCallback(() => {
+    if (!assistantRetryRequest || assistantBusy) return;
+    setAssistantInlineError("");
+    const request = assistantRetryRequest;
+    if (request.route === "mission") {
+      void sendMissionMessage(
+        request.text,
+        request.modality,
+        request.transcriptionId,
+        request.candidateSelection ?? null,
+        true,
+      );
+    } else {
+      void sendAssistantMessage(
+        request.text,
+        request.modality,
+        request.transcriptionId,
+      );
+    }
+  }, [assistantBusy, assistantRetryRequest, sendAssistantMessage, sendMissionMessage]);
 
   const confirmMissionDraft = useCallback(() => {
     if (!missionDraft || missionDraft.status !== "draft") return;
@@ -1450,10 +1821,14 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
           { method: "POST" },
         );
         setAssistantTurn(turn);
+        setAssistantThinking(false);
+        setAssistantInlineError("");
+        setAssistantRetryRequest(null);
         setNotice("规划已取消；人工控制仍可继续使用");
       } catch (reason) {
         setError(friendlyError(reason));
       } finally {
+        setAssistantThinking(false);
         setAssistantBusy(false);
       }
     })();
@@ -1876,6 +2251,9 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
     if (robotId !== selectedRobotId) setSelectedRobotId(robotId);
     setAssistantConversation(null);
     setAssistantTurn(null);
+    setAssistantThinking(false);
+    setAssistantInlineError("");
+    setAssistantRetryRequest(null);
     setDraft(null);
     setMissionDraft(null);
     setMissionRecord(null);
@@ -1883,6 +2261,8 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
     setAssistantText("");
     setTranscriptionId(null);
     setReviewFeedback("");
+    setSelectedSkill(null);
+    setSkillGreeting("");
     setError("");
     navigate(chatPath(route.shell));
   }, [navigate, route.shell, selectedRobotId]);
@@ -1917,6 +2297,9 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
       setAssistantConversations((current) => current.map((item) => (
         item.conversationId === updated.conversationId ? { ...item, ...updated } : item
       )));
+      setHistoryConversations((current) => current.map((item) => (
+        item.conversationId === updated.conversationId ? { ...item, ...updated } : item
+      )));
       setAssistantConversation((current) => current?.conversationId === updated.conversationId
         ? { ...current, ...updated }
         : current);
@@ -1928,8 +2311,22 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
     setAssistantConversations((current) => current.filter(
       (item) => item.conversationId !== conversationId,
     ));
+    setHistoryConversations((current) => current.filter(
+      (item) => item.conversationId !== conversationId,
+    ));
     if (route.kind === "chat" && route.conversationId === conversationId) startNewTask();
   }, [route, startNewTask]);
+
+  const offerConversationUndo = useCallback((conversation: AssistantConversation) => {
+    if (deletedConversationUndoTimerRef.current !== undefined) {
+      window.clearTimeout(deletedConversationUndoTimerRef.current);
+    }
+    setDeletedConversationUndo(conversation);
+    deletedConversationUndoTimerRef.current = window.setTimeout(() => {
+      deletedConversationUndoTimerRef.current = undefined;
+      setDeletedConversationUndo(null);
+    }, 10_000);
+  }, []);
 
   const archiveConversation = useCallback((conversation: AssistantConversation) => {
     void runRequest(async () => {
@@ -1943,64 +2340,118 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
   }, [hideConversationAfterLifecycleChange, runRequest]);
 
   const deleteConversation = useCallback((conversation: AssistantConversation) => {
-    if (!window.confirm("将这个会话移入可恢复的删除状态？消息、任务和视觉凭证都会保留。")) return;
     void runRequest(async () => {
+      if (
+        conversation.activeMissionId
+        || conversation.lifecycleBlockedReason === "active_mission"
+      ) {
+        throw new Error("机器人任务仍在执行，请先在会话中取消 Mission 并等待终止回执");
+      }
+      if (
+        conversation.lifecycleBlockedReason === "active_turn"
+        || ["planning", "queued", "running"].includes(conversation.status)
+      ) {
+        if (!window.confirm("当前消息仍在处理中。取消本次处理并将会话移入回收站？")) return;
+        const detail = assistantConversation?.conversationId === conversation.conversationId
+          ? assistantConversation
+          : await apiFetch<AssistantConversation>(
+            `/api/v1/assistant/conversations/${encodeURIComponent(conversation.conversationId)}`,
+          );
+        const activeTurn = detail.turns?.find((item) => ["queued", "running"].includes(item.status));
+        if (activeTurn) {
+          await apiFetch<AssistantTurn>(
+            `/api/v1/assistant/turns/${encodeURIComponent(activeTurn.taskId)}/cancel`,
+            { method: "POST" },
+          );
+        }
+      } else if (!window.confirm("将这个会话移入回收站？消息、任务和视觉凭证都会保留。")) {
+        return;
+      }
       await apiFetch<AssistantConversation>(
         `/api/v1/assistant/conversations/${encodeURIComponent(conversation.conversationId)}`,
         { method: "DELETE" },
       );
       hideConversationAfterLifecycleChange(conversation.conversationId);
-      setNotice("会话已移除；这是可恢复的软删除，关联记录未被清除");
+      offerConversationUndo(conversation);
+      setNotice("会话已移入回收站");
     });
-  }, [hideConversationAfterLifecycleChange, runRequest]);
+  }, [assistantConversation, hideConversationAfterLifecycleChange, offerConversationUndo, runRequest]);
 
-  const missionConversationEntries = useMemo<AssistantConversation[]>(() => {
-    const records = missionHistory.map((item) => ({
-      conversationId: item.missionId,
-      robotId: item.robotId,
+  const restoreConversation = useCallback((conversation: AssistantConversation) => {
+    void runRequest(async () => {
+      const restored = await apiFetch<AssistantConversation>(
+        `/api/v1/assistant/conversations/${encodeURIComponent(conversation.conversationId)}`,
+        { method: "PATCH", body: JSON.stringify({ deleted: false, archived: false }) },
+      );
+      setAssistantConversations((current) => [
+        restored,
+        ...current.filter((item) => item.conversationId !== restored.conversationId),
+      ]);
+      setHistoryConversations((current) => historyLifecycle === "active" && !historySearch
+        ? [
+          restored,
+          ...current.filter((item) => item.conversationId !== restored.conversationId),
+        ]
+        : current.filter((item) => item.conversationId !== restored.conversationId));
+      setDeletedConversationUndo(null);
+      if (deletedConversationUndoTimerRef.current !== undefined) {
+        window.clearTimeout(deletedConversationUndoTimerRef.current);
+        deletedConversationUndoTimerRef.current = undefined;
+      }
+      setNotice("会话已恢复");
+    });
+  }, [historyLifecycle, historySearch, runRequest]);
+
+  const bulkDeleteConversations = useCallback((conversations: AssistantConversation[]) => {
+    const conversationIds = conversations.map((item) => item.conversationId);
+    if (!conversationIds.length) return;
+    if (!window.confirm(`将选中的 ${conversationIds.length} 个已结束会话移入回收站？`)) return;
+    void runRequest(async () => {
+      const result = await apiFetch<AssistantConversationBulkDeleteResult>(
+        "/api/v2/assistant/conversations/bulk-delete",
+        { method: "POST", body: JSON.stringify({ conversationIds }) },
+      );
+      const deleted = new Set(result.deletedConversationIds);
+      setAssistantConversations((current) => current.filter(
+        (item) => !deleted.has(item.conversationId),
+      ));
+      setHistoryConversations((current) => current.filter(
+        (item) => !deleted.has(item.conversationId),
+      ));
+      if (route.kind === "chat" && route.conversationId && deleted.has(route.conversationId)) {
+        startNewTask();
+      }
+      setNotice(result.skipped.length
+        ? `已清理 ${deleted.size} 个会话；${result.skipped.length} 个活动会话已跳过`
+        : `已清理 ${deleted.size} 个会话`);
+    });
+  }, [route, runRequest, startNewTask]);
+
+  const currentMissionEntry = useMemo<AssistantConversation | null>(() => {
+    const current = missionRecord ?? missionDraft;
+    if (!current) return null;
+    const plan = current.plan;
+    const conversationId = "missionId" in current ? current.missionId : current.draftId;
+    const status = "snapshot" in current ? current.snapshot.status : current.status;
+    const updatedAt = "snapshot" in current
+      ? current.snapshot.updatedAt
+      : current.updatedAt ?? plan.createdAt;
+    return {
+      conversationId,
+      robotId: current.robotId,
       requestedBy: "operator",
       locale: "zh-CN",
-      status: item.snapshot.status,
-      createdAt: item.plan.createdAt,
-      updatedAt: item.snapshot.updatedAt,
-      messages: [{
-        messageId: `mission-tab-${item.missionId}`,
-        role: "user" as const,
-        content: item.plan.objective,
-        modality: "text" as const,
-        createdAt: item.plan.createdAt,
-      }],
-    }));
-    const missionIds = new Set(records.map((item) => item.conversationId));
-    const drafts = missionDraftHistory
-      .filter((item) => !missionIds.has(item.draftId))
-      .map((item) => ({
-        conversationId: item.draftId,
-        robotId: item.robotId,
-        requestedBy: "operator",
-        locale: "zh-CN",
-        status: item.status,
-        createdAt: item.plan.createdAt,
-        updatedAt: item.updatedAt ?? item.plan.createdAt,
-        messages: [{
-          messageId: `mission-draft-tab-${item.draftId}`,
-          role: "user" as const,
-          content: item.plan.objective,
-          modality: "text" as const,
-          createdAt: item.plan.createdAt,
-        }],
-      }));
-    return [...records, ...drafts];
-  }, [missionDraftHistory, missionHistory]);
-  const allConversationEntries = useMemo(() => [
-    ...missionConversationEntries,
-    ...assistantConversations.filter((item) => !missionConversationEntries.some(
-      (mission) => mission.conversationId === item.conversationId,
-    )),
-  ], [assistantConversations, missionConversationEntries]);
-  const currentConversationEntry = missionConversationEntries.find(
-    (item) => item.conversationId === (missionRecord?.missionId ?? missionDraft?.draftId),
-  ) ?? assistantConversation;
+      title: plan.objective,
+      status,
+      createdAt: plan.createdAt,
+      updatedAt,
+    };
+  }, [missionDraft, missionRecord]);
+  // The product history has one row per Assistant conversation. A current
+  // legacy/orphan Mission may still occupy the active tab for safe recovery,
+  // but it never becomes a duplicate history row.
+  const allConversationEntries = assistantConversations;
+  const currentConversationEntry = assistantConversation ?? currentMissionEntry;
   const conversationPath = chatPath(
     route.shell,
     missionRecord?.missionId ?? missionDraft?.draftId ?? assistantConversation?.conversationId,
@@ -2049,9 +2500,11 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
         robots={robots}
         robot={selectedRobot}
         selectedRobotId={selectedRobotId}
+        selectedDisplayId={selectedDisplayRobotId}
         connection={connection}
         taskStatus={activeTaskStatus}
         onRobotChange={selectRobotForNewTask}
+        onDisplayChange={setSelectedDisplayRobotId}
         onStop={() => submitCommand("stop", {})}
         stopDisabled={!selectedRobot || connection !== "live" || busy || !capabilities?.capabilities.includes("stop")}
       /> : null}
@@ -2075,7 +2528,13 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
         visualMission={visualMission}
         missionDraft={missionDraft}
         mission={missionRecord}
+        selectedSkill={selectedSkill}
+        skillGreeting={skillGreeting}
+        selectedDisplayId={selectedDisplayRobotId}
         busy={assistantBusy}
+        thinking={assistantThinking}
+        inlineError={assistantInlineError}
+        canCancelThinking={Boolean(assistantTurn && ["queued", "running"].includes(assistantTurn.status))}
         voiceBusy={voiceBusy}
         recording={recording}
         voiceUi={voiceUi}
@@ -2086,6 +2545,7 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
         onVoice={toggleVoiceRecording}
         onToggleVoiceReplies={toggleVoiceReplies}
         onCancelPlanning={cancelAssistantTurn}
+        onRetry={retryAssistantRequest}
         onConfirm={confirmDraft}
         onConfirmMission={confirmMissionDraft}
         onRejectMission={rejectMissionDraft}
@@ -2108,6 +2568,9 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
         onCancelVisualMission={cancelVisualMission}
         onLoadVisualEvidence={loadVisualEvidence}
         onPrompt={setAssistantText}
+        onSelectSkill={selectLeaderSkill}
+        onClearSkill={clearLeaderSkill}
+        onDisplayRobotChange={setSelectedDisplayRobotId}
         developerMode={developerMode}
         onRobotChange={selectRobotForNewTask}
       /> : null}
@@ -2168,7 +2631,7 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
         subtitle="只读检查 H-IDE、Agent、Vision、Robot Agent、Nav2 与仿真执行链"
         onBack={() => navigate(conversationPath)}
       >
-        <DeveloperDiagnostics apiFetch={apiFetch} robotId={selectedRobotId || undefined} />
+        <DeveloperDiagnostics apiFetch={apiFetch} robotId={selectedRobotId || undefined} clientIssue={assistantClientIssue} />
       </WorkspacePage> : null}
 
       {toolMenuOpen && (developerMode || canUseSceneMemory) ? <ToolMenu
@@ -2205,23 +2668,37 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
         />
       </SidePanel> : null}
 
-      {historyOpen ? <SidePanel title="任务历史" subtitle={`${allConversationEntries.length} 个会话`} onClose={() => setHistoryOpen(false)} side="left">
+      {historyOpen ? <SidePanel title="任务历史" subtitle={`${historyConversations.length} 个会话${historyNextCursor ? " · 还有更多" : ""}`} onClose={() => setHistoryOpen(false)} side="left">
         <HistoryPanel
-          conversations={allConversationEntries}
+          conversations={historyConversations}
           currentId={currentConversationEntry?.conversationId}
           onOpen={openConversation}
           onNew={() => { setHistoryOpen(false); startNewTask(); }}
-          canManage={(conversation) => assistantConversations.some(
-            (item) => item.conversationId === conversation.conversationId,
-          )}
           onRename={renameConversation}
           onArchive={archiveConversation}
           onDelete={deleteConversation}
+          onRestore={restoreConversation}
+          onBulkDelete={bulkDeleteConversations}
+          lifecycle={historyLifecycle}
+          onLifecycleChange={setHistoryLifecycle}
+          search={historySearch}
+          onSearch={setHistorySearch}
+          loading={historyLoading}
+          hasMore={Boolean(historyNextCursor)}
+          onLoadMore={() => {
+            if (!historyNextCursor) return;
+            void loadConversationHistory(
+              historyLifecycle,
+              historySearch,
+              historyNextCursor,
+              true,
+            ).catch((reason) => setError(friendlyError(reason)));
+          }}
           developerMode={developerMode}
         />
       </SidePanel> : null}
 
-      {notice ? <div className="app-toast" role="status"><Icon name="check" /><span>{notice}</span><button type="button" onClick={() => setNotice("")} aria-label="关闭提示"><Icon name="close" /></button></div> : null}
+      {notice ? <div className="app-toast" role="status"><Icon name="check" /><span>{notice}</span>{deletedConversationUndo && notice === "会话已移入回收站" ? <button className="toast-action" type="button" onClick={() => restoreConversation(deletedConversationUndo)}>撤销</button> : null}<button type="button" onClick={() => { setNotice(""); setDeletedConversationUndo(null); }} aria-label="关闭提示"><Icon name="close" /></button></div> : null}
     </div>
   );
 }
@@ -2302,7 +2779,7 @@ function AppTitlebar({
     .filter((item, index, list) => list.findIndex((candidate) => candidate.conversationId === item.conversationId) === index)
     .slice(0, 5);
   return <header className="app-titlebar">
-    <button className="brand-button" type="button" onClick={onNew} aria-label="H-IDE 新任务"><Icon name="logo" /><span>H-IDE</span></button>
+    <button className="brand-button" type="button" onClick={onNew} aria-label="H-IDE 新任务"><img className="brand-logo-image" src="/assets/leader-demo/brand/h-ide-logo.png" alt="" /><span>H-IDE</span></button>
     <nav className="mission-tabs" aria-label="活动任务">
       {tabs.map((conversation) => <button
         key={conversation.conversationId}
@@ -2342,26 +2819,28 @@ function StatusBar({
   robots,
   robot,
   selectedRobotId,
+  selectedDisplayId,
   connection,
   taskStatus,
   onRobotChange,
+  onDisplayChange,
   onStop,
   stopDisabled,
 }: {
   robots: RobotState[];
   robot: RobotState | null;
   selectedRobotId: string;
+  selectedDisplayId: RobotDisplayOption["id"];
   connection: ConnectionState;
   taskStatus: string;
   onRobotChange: (robotId: string) => void;
+  onDisplayChange: (displayId: RobotDisplayOption["id"]) => void;
   onStop: () => void;
   stopDisabled: boolean;
 }) {
   const pose = poseFreshness(robot);
   return <div className="global-statusbar" aria-label="当前控制上下文">
-    <label className="status-selector"><Icon name="robot" /><select value={selectedRobotId} onChange={(event) => onRobotChange(event.target.value)} aria-label="当前机器人">
-      {robots.length ? robots.map((item) => <option key={item.robotId} value={item.robotId}>{item.name ?? item.robotId}</option>) : <option value={selectedRobotId}>{selectedRobotId}</option>}
-    </select><span className={`context-dot ${robot?.connected ? "live" : "offline"}`} /></label>
+    <RobotPicker robots={robots} selectedRobotId={selectedRobotId} selectedDisplayId={selectedDisplayId} onRobotChange={onRobotChange} onDisplayChange={onDisplayChange} compact />
     <span className={`status-context connection-${connection}`}><span className="context-dot" />{connection === "live" ? "工作站在线" : connection === "connecting" ? "正在连接" : "工作站离线"}</span>
     <span className={`status-context ${pose.stale ? "stale" : "ready"}`}><Icon name="activity" />{pose.label}</span>
     <span className="status-context task-context">任务 <StatusPill value={taskStatus} /></span>
@@ -2429,17 +2908,115 @@ function SidePanel({ title, subtitle, onClose, side = "right", children }: { tit
   </aside></div>;
 }
 
-function HistoryPanel({ conversations, currentId, onOpen, onNew, onRename, onArchive, onDelete, developerMode, canManage }: { conversations: AssistantConversation[]; currentId?: string; onOpen: (conversationId: string) => void; onNew: () => void; onRename: (conversation: AssistantConversation) => void; onArchive: (conversation: AssistantConversation) => void; onDelete: (conversation: AssistantConversation) => void; developerMode: boolean; canManage: (conversation: AssistantConversation) => boolean }) {
-  return <div className="history-panel"><button className="new-history-task" type="button" onClick={onNew}><Icon name="plus" />开始新任务</button>
-    <p className="history-contract-note">归档和删除不会清除消息、任务或视觉凭证；当前列表默认只显示活跃会话。</p>
-    <div className="history-list">
-      {conversations.length ? conversations.map((conversation) => <div className={`history-row ${conversation.conversationId === currentId ? "active" : ""}`} key={conversation.conversationId}>
-        <button className="history-open" type="button" onClick={() => onOpen(conversation.conversationId)}>
-          <span className={`history-state tab-${conversation.status}`}><Icon name="spark" /></span><span><strong>{conversationLabel(conversation, conversation.conversationId === currentId ? conversation : null)}</strong><small>{developerMode ? `${conversation.robotId} · ` : ""}{formatDateTime(conversation.updatedAt ?? conversation.createdAt)}</small></span><StatusPill value={conversation.status} />
-        </button>
-        <div className="history-lifecycle" aria-label="会话管理"><button type="button" disabled={!canManage(conversation)} onClick={() => onRename(conversation)}>重命名</button><button type="button" disabled={!canManage(conversation)} onClick={() => onArchive(conversation)}>归档</button><button type="button" disabled={!canManage(conversation)} onClick={() => onDelete(conversation)}>删除</button></div>
-      </div>) : <EmptyState>还没有任务会话。发送第一条消息后，会话会保存在这里。</EmptyState>}
+const BULK_DELETABLE_CONVERSATION_STATUSES = new Set([
+  "idle",
+  "completed",
+  "failed",
+  "cancelled",
+  "rejected",
+  "cannot_plan",
+  "expired",
+]);
+
+function HistoryPanel({
+  conversations,
+  currentId,
+  onOpen,
+  onNew,
+  onRename,
+  onArchive,
+  onDelete,
+  onRestore,
+  onBulkDelete,
+  lifecycle,
+  onLifecycleChange,
+  search,
+  onSearch,
+  loading,
+  hasMore,
+  onLoadMore,
+  developerMode,
+}: {
+  conversations: AssistantConversation[];
+  currentId?: string;
+  onOpen: (conversationId: string) => void;
+  onNew: () => void;
+  onRename: (conversation: AssistantConversation) => void;
+  onArchive: (conversation: AssistantConversation) => void;
+  onDelete: (conversation: AssistantConversation) => void;
+  onRestore: (conversation: AssistantConversation) => void;
+  onBulkDelete: (conversations: AssistantConversation[]) => void;
+  lifecycle: ConversationLifecycleView;
+  onLifecycleChange: (lifecycle: ConversationLifecycleView) => void;
+  search: string;
+  onSearch: (value: string) => void;
+  loading: boolean;
+  hasMore: boolean;
+  onLoadMore: () => void;
+  developerMode: boolean;
+}) {
+  const [searchDraft, setSearchDraft] = useState(search);
+  const [managing, setManaging] = useState(false);
+  const [selected, setSelected] = useState<Set<string>>(() => new Set());
+  useEffect(() => setSearchDraft(search), [search]);
+  useEffect(() => {
+    setManaging(false);
+    setSelected(new Set());
+  }, [lifecycle]);
+  const deletable = conversations.filter((conversation) => (
+    conversation.lifecycleMutable !== false
+    && BULK_DELETABLE_CONVERSATION_STATUSES.has(conversation.status)
+  ));
+  const selectedConversations = conversations.filter((conversation) => selected.has(conversation.conversationId));
+  const toggleSelected = (conversationId: string) => {
+    setSelected((current) => {
+      const next = new Set(current);
+      if (next.has(conversationId)) next.delete(conversationId);
+      else next.add(conversationId);
+      return next;
+    });
+  };
+  return <div className="history-panel">
+    <button className="new-history-task" type="button" onClick={onNew}><Icon name="plus" />开始新任务</button>
+    <div className="history-view-tabs" role="tablist" aria-label="历史记录分类">
+      {(["active", "archived", "deleted"] as const).map((value) => <button
+        className={lifecycle === value ? "active" : ""}
+        type="button"
+        role="tab"
+        aria-selected={lifecycle === value}
+        onClick={() => onLifecycleChange(value)}
+        key={value}
+      >{value === "active" ? "会话" : value === "archived" ? "归档" : "回收站"}</button>)}
     </div>
+    <form className="history-search" onSubmit={(event) => { event.preventDefault(); onSearch(searchDraft.trim()); }}>
+      <input aria-label="搜索会话标题" value={searchDraft} onChange={(event) => setSearchDraft(event.target.value)} maxLength={120} placeholder="搜索标题或消息…" />
+      <button type="submit">搜索</button>
+      {search ? <button type="button" onClick={() => { setSearchDraft(""); onSearch(""); }}>清除</button> : null}
+    </form>
+    <p className="history-contract-note">{lifecycle === "deleted"
+      ? "回收站记录不会参与普通会话列表；恢复后消息、任务和视觉凭证仍保持关联。"
+      : lifecycle === "archived"
+        ? "归档会话保留完整上下文，可随时恢复到普通会话列表。"
+        : "每行代表一条完整会话；Mission、草案和视觉凭证不再重复占用历史列表。"}</p>
+    {lifecycle === "active" ? <div className="history-manage-bar">
+      <button type="button" onClick={() => { setManaging((value) => !value); setSelected(new Set()); }}>{managing ? "完成" : "管理历史"}</button>
+      {managing ? <><button type="button" onClick={() => setSelected(new Set(deletable.map((item) => item.conversationId)))}>选择所有已结束</button><button className="history-delete-selected" type="button" disabled={!selectedConversations.length} onClick={() => onBulkDelete(selectedConversations)}>删除所选 ({selectedConversations.length})</button></> : null}
+    </div> : null}
+    <div className="history-list" aria-busy={loading}>
+      {conversations.length ? conversations.map((conversation) => {
+        const bulkEligible = conversation.lifecycleMutable !== false
+          && BULK_DELETABLE_CONVERSATION_STATUSES.has(conversation.status);
+        return <div className={`history-row ${conversation.conversationId === currentId ? "active" : ""}`} key={conversation.conversationId}>
+          {managing ? <label className="history-select"><input type="checkbox" checked={selected.has(conversation.conversationId)} disabled={!bulkEligible} onChange={() => toggleSelected(conversation.conversationId)} /><span /></label> : null}
+          <button className="history-open" type="button" onClick={() => lifecycle === "active" ? onOpen(conversation.conversationId) : onRestore(conversation)}>
+            <span className={`history-state tab-${conversation.status}`}><Icon name="spark" /></span><span><strong>{conversationLabel(conversation, conversation.conversationId === currentId ? conversation : null)}</strong><small>{developerMode ? `${conversation.robotId} · ` : ""}{formatDateTime(conversation.updatedAt ?? conversation.createdAt)}</small></span><StatusPill value={conversation.status} />
+          </button>
+          {!managing ? <details className="history-actions"><summary role="button" aria-label={`管理会话：${conversationLabel(conversation, null)}`}>•••</summary><div>{lifecycle === "active" ? <><button type="button" onClick={() => onRename(conversation)}>重命名</button><button type="button" onClick={() => onArchive(conversation)}>归档</button><button className="danger" type="button" onClick={() => onDelete(conversation)}>删除</button></> : <button type="button" onClick={() => onRestore(conversation)}>恢复会话</button>}</div></details> : null}
+        </div>;
+      }) : !loading ? <EmptyState>{search ? "没有匹配的会话。" : lifecycle === "deleted" ? "回收站为空。" : lifecycle === "archived" ? "还没有归档会话。" : "还没有任务会话。发送第一条消息后，会话会保存在这里。"}</EmptyState> : null}
+      {loading ? <div className="history-loading" role="status"><span className="planning-pulse" />正在读取会话…</div> : null}
+    </div>
+    {hasMore ? <button className="history-load-more" type="button" onClick={onLoadMore} disabled={loading}>加载更多</button> : null}
   </div>;
 }
 
@@ -2538,6 +3115,22 @@ function ConversationVisualEvidence({ turn, developerMode }: { turn: AssistantTu
   </section>;
 }
 
+function ThinkingIndicator({ canCancel, onCancel }: { canCancel: boolean; onCancel: () => void }) {
+  return <div className="thinking-indicator" role="status" aria-live="polite" aria-label="H-IDE 正在思考">
+    <span className="thinking-orbit" aria-hidden="true"><Icon name="spark" /><i /></span>
+    <span>Thinking…</span>
+    {canCancel ? <button type="button" onClick={onCancel}>取消</button> : null}
+  </div>;
+}
+
+function AssistantInlineFailure({ message, onRetry }: { message: string; onRetry: () => void }) {
+  return <div className="assistant-inline-failure" role="alert">
+    <Icon name="warning" />
+    <span>{message}</span>
+    <button type="button" onClick={onRetry}>重试</button>
+  </div>;
+}
+
 function ChatWorkspace({
   conversation,
   missionMessages,
@@ -2554,7 +3147,13 @@ function ChatWorkspace({
   visualMission,
   missionDraft,
   mission,
+  selectedSkill,
+  skillGreeting,
+  selectedDisplayId,
   busy,
+  thinking,
+  inlineError,
+  canCancelThinking,
   voiceBusy,
   recording,
   voiceUi,
@@ -2565,6 +3164,7 @@ function ChatWorkspace({
   onVoice,
   onToggleVoiceReplies,
   onCancelPlanning,
+  onRetry,
   onConfirm,
   onConfirmMission,
   onRejectMission,
@@ -2580,6 +3180,9 @@ function ChatWorkspace({
   onCancelVisualMission,
   onLoadVisualEvidence,
   onPrompt,
+  onSelectSkill,
+  onClearSkill,
+  onDisplayRobotChange,
   developerMode,
   onRobotChange,
 }: {
@@ -2598,7 +3201,13 @@ function ChatWorkspace({
   visualMission: VisualMissionRecord | null;
   missionDraft: MissionDraftRecordV2 | null;
   mission: MissionRecordV2 | null;
+  selectedSkill: LeaderSkillId | null;
+  skillGreeting: string;
+  selectedDisplayId: RobotDisplayOption["id"];
   busy: boolean;
+  thinking: boolean;
+  inlineError: string;
+  canCancelThinking: boolean;
   voiceBusy: boolean;
   recording: boolean;
   voiceUi: VoiceUiState;
@@ -2609,6 +3218,7 @@ function ChatWorkspace({
   onVoice: () => void;
   onToggleVoiceReplies: () => void;
   onCancelPlanning: () => void;
+  onRetry: () => void;
   onConfirm: () => void;
   onConfirmMission: () => void;
   onRejectMission: () => void;
@@ -2628,92 +3238,159 @@ function ChatWorkspace({
   onCancelVisualMission: () => void;
   onLoadVisualEvidence: (missionId: string, sha256: string) => Promise<string>;
   onPrompt: (prompt: string) => void;
+  onSelectSkill: (skill: LeaderSkillDefinition) => void;
+  onClearSkill: () => void;
+  onDisplayRobotChange: (displayId: RobotDisplayOption["id"]) => void;
   developerMode: boolean;
   onRobotChange: (robotId: string) => void;
 }) {
   const timelineRef = useRef<HTMLDivElement | null>(null);
-  const messages = missionMessages.length ? missionMessages : conversation?.messages ?? [];
-  const activeTurn = Boolean(turn && ["queued", "running"].includes(turn.status));
-  const evidenceTurns = [...(conversation?.turns ?? []), ...(turn ? [turn] : [])]
-    .filter((item, index, items) => items.findIndex((candidate) => candidate.taskId === item.taskId) === index)
-    .filter((item) => Boolean(item.result?.evidence?.length || item.result?.visualResult));
-  const empty = !messages.length && !turn && !draft && !missionDraft && !mission;
+  const missionLink = (conversation?.missionLinks ?? []).find((item) => (
+    mission && item.missionId === mission.missionId
+  )) ?? null;
+  const missionDraftLink = (conversation?.missionLinks ?? []).find((item) => (
+    missionDraft && item.missionDraftId === missionDraft.draftId
+  )) ?? null;
+  const missionTaskId = missionLink?.taskId
+    ?? (turn && turn.result?.missionDraftId === mission?.missionId ? turn.taskId : null);
+  const missionDraftTaskId = missionDraftLink?.taskId
+    ?? (turn && turn.result?.missionDraftId === missionDraft?.draftId ? turn.taskId : null);
+  const legacyTaskId = draft?.taskId ?? null;
+  const activityTaskId = turn?.taskId
+    ?? missionTaskId
+    ?? missionDraftTaskId
+    ?? legacyTaskId;
+  const localMessages = missionMessages.map((message) => ({
+    ...message,
+    taskId: message.taskId ?? missionTaskId,
+    turnSequence: message.turnSequence ?? missionLink?.turnSequence ?? null,
+  }));
+  const timeline = buildConversationTimeline(conversation, turn, localMessages);
+  const messages = timeline.flatMap((item) => item.messages);
+  const missionAttached = missionTaskId !== null
+    && timeline.some((item) => item.taskId === missionTaskId);
+  const missionDraftAttached = missionDraftTaskId !== null
+    && timeline.some((item) => item.taskId === missionDraftTaskId);
+  const legacyAttached = legacyTaskId !== null
+    && timeline.some((item) => item.taskId === legacyTaskId);
+  const empty = !timeline.length && !draft && !missionDraft && !mission;
   useEffect(() => {
     const element = timelineRef.current;
     if (!element) return;
     if (typeof element.scrollTo === "function") element.scrollTo({ top: element.scrollHeight, behavior: "smooth" });
     else element.scrollTop = element.scrollHeight;
-  }, [busy, draft?.draftId, messages.length, mission?.snapshot.lastSequence, missionDraft?.draftId, turn?.status]);
+  }, [busy, draft?.draftId, inlineError, messages.length, mission?.snapshot.lastSequence, missionDraft?.draftId, thinking, turn?.status]);
   const suggestions = ["你好，介绍一下你自己", "机器人现在状态怎么样？", "只观察当前画面，告诉我看到了什么", "去会议桌旁边"];
+  const activeSkill = LEADER_SKILLS.find((item) => item.id === selectedSkill) ?? null;
+  const latestAssistantSpeech = [...messages]
+    .reverse()
+    .find((message) => message.role === "assistant")?.content
+    ?? skillGreeting
+    ?? "你好，我是 H-IDE。";
+  const activeMissionBlocksDraft = Boolean(
+    mission
+    && !["completed", "failed", "cancelled"].includes(mission.snapshot.status),
+  );
+  const renderMissionDraft = () => missionDraft ? <MissionPlanCard
+      draft={missionDraft}
+      robot={robot}
+      busy={busy}
+      feedback={feedback}
+      setFeedback={setFeedback}
+      onConfirm={onConfirmMission}
+      onReject={onRejectMission}
+      developerMode={developerMode}
+      blockedByMissionId={activeMissionBlocksDraft ? mission?.missionId ?? null : null}
+    /> : null;
+  const renderMission = () => mission ? <MissionExecutionCard
+      mission={mission}
+      busy={busy}
+      onContinue={onContinueMission}
+      onCancel={onCancelMission}
+      onApproveRevision={onApproveMissionRevision}
+      onSelectCandidate={onSelectMissionCandidate}
+      developerMode={developerMode}
+    /> : null;
+  const renderLegacyArtifacts = () => !missionDraft && !mission ? <>
+    {draft && isVisualMissionPlan(draft.plan) ? <VisualMissionCard
+      draft={draft}
+      robot={robot}
+      mission={visualMission}
+      busy={busy}
+      expired={isDraftExpired(draft)}
+      reviewable={isDraftReviewableForRobot(draft, robot?.robotId ?? "", busy)}
+      expiry={formatDraftExpiry(draft.plan.expiresAt, Date.now())}
+      onConfirm={onConfirm}
+      onRun={onRunVisualMission}
+      onSelectCandidate={onSelectVisualCandidate}
+      onCancel={onCancelVisualMission}
+      feedback={feedback}
+      setFeedback={setFeedback}
+      onReject={onReject}
+      onRevise={onRevise}
+      onLoadEvidence={onLoadVisualEvidence}
+      onReplan={onReplan}
+    /> : draft ? <PlanDraftCard
+      draft={draft}
+      robot={robot}
+      activeSceneContext={activeSceneContext}
+      busy={busy}
+      feedback={feedback}
+      setFeedback={setFeedback}
+      onConfirm={onConfirm}
+      onReject={onReject}
+      onRevise={onRevise}
+      onReplan={onReplan}
+      developerMode={developerMode}
+    /> : null}
+    {draft?.status === "confirmed" && lastReceipt && !isVisualMissionPlan(draft.plan) ? <ExecutionCard receipt={lastReceipt} /> : null}
+  </> : null;
   return <main className="chat-workspace">
+    <aside className="leader-avatar-rail" aria-label="H-IDE 机器人助手">
+      <RobotAvatar3D compact speech={selectedSkill ? latestAssistantSpeech : undefined} />
+    </aside>
     <div className="chat-timeline" ref={timelineRef} aria-live="polite">
       <div className="chat-thread">
-        {empty ? <section className="chat-empty-state"><span className="empty-logo"><Icon name="logo" /></span><h1>今天想和机器人做什么？</h1><p>可以聊天、提问、观察环境，也可以下达行动任务。只有机器人行动会形成需要审核的计划。</p><div className="suggestion-grid">{suggestions.map((prompt) => <button key={prompt} type="button" onClick={() => onPrompt(prompt)}>{prompt}<Icon name="chevron" /></button>)}</div></section> : null}
-        {messages.map((message) => <article className={`chat-message message-${message.role}`} key={message.messageId}>
-          <div className="message-author">{message.role === "user" ? "你" : message.role === "assistant" ? <><span className="agent-avatar"><Icon name="spark" /></span>H-IDE</> : "系统"}<time>{formatTime(message.createdAt)}</time></div>
-          <div className="message-body">{message.content}</div>
-          {message.modality === "voice" ? <span className="message-modality"><Icon name="mic" />语音转写</span> : null}
-        </article>)}
-        {turn && !missionDraft && !mission && (["queued", "running"].includes(turn.status) || turn.result?.intent === "ROBOT_ACTION") ? <PlanningActivityCard turn={turn} draft={draft} developerMode={developerMode} /> : null}
-        {turn?.result?.assistantMessage && !messages.some((message) => message.taskId === turn.taskId && message.role === "assistant") ? <article className="chat-message message-assistant"><div className="message-author"><span className="agent-avatar"><Icon name="spark" /></span>H-IDE</div><div className="message-body">{turn.result.assistantMessage}</div></article> : null}
-        {evidenceTurns.map((item) => <ConversationVisualEvidence key={item.taskId} turn={item} developerMode={developerMode} />)}
-        {missionDraft && !mission ? <MissionPlanCard
-          draft={missionDraft}
-          robot={robot}
-          busy={busy}
-          feedback={feedback}
-          setFeedback={setFeedback}
-          onConfirm={onConfirmMission}
-          onReject={onRejectMission}
-          developerMode={developerMode}
-        /> : null}
-        {mission ? <MissionExecutionCard
-          mission={mission}
-          busy={busy}
-          onContinue={onContinueMission}
-          onCancel={onCancelMission}
-          onApproveRevision={onApproveMissionRevision}
-          onSelectCandidate={onSelectMissionCandidate}
-          developerMode={developerMode}
-        /> : null}
-        {!missionDraft && !mission && draft && isVisualMissionPlan(draft.plan) ? <VisualMissionCard
-          draft={draft}
-          robot={robot}
-          mission={visualMission}
-          busy={busy}
-          expired={isDraftExpired(draft)}
-          reviewable={isDraftReviewableForRobot(draft, robot?.robotId ?? "", busy)}
-          expiry={formatDraftExpiry(draft.plan.expiresAt, Date.now())}
-          onConfirm={onConfirm}
-          onRun={onRunVisualMission}
-          onSelectCandidate={onSelectVisualCandidate}
-          onCancel={onCancelVisualMission}
-          feedback={feedback}
-          setFeedback={setFeedback}
-          onReject={onReject}
-          onRevise={onRevise}
-          onLoadEvidence={onLoadVisualEvidence}
-          onReplan={onReplan}
-        /> : !missionDraft && !mission && draft ? <PlanDraftCard
-          draft={draft}
-          robot={robot}
-          activeSceneContext={activeSceneContext}
-          busy={busy}
-          feedback={feedback}
-          setFeedback={setFeedback}
-          onConfirm={onConfirm}
-          onReject={onReject}
-          onRevise={onRevise}
-          onReplan={onReplan}
-          developerMode={developerMode}
-        /> : null}
-        {!mission && draft?.status === "confirmed" && lastReceipt && !isVisualMissionPlan(draft.plan) ? <ExecutionCard receipt={lastReceipt} /> : null}
+        {empty ? <section className="chat-empty-state">
+          <span className="empty-logo"><img src="/assets/leader-demo/brand/h-ide-logo.png" alt="H-IDE" /></span>
+          <h1>今天想和我做什么？</h1>
+          <span className="sr-only">今天想和机器人做什么？</span>
+          <p>先选择一个 Skill，再用中文告诉我目标。巡检会进入办公室并汇总信息；语音助手会直接用声音回应。</p>
+          <SkillSelection selected={selectedSkill} onSelect={onSelectSkill} />
+          <div className="suggestion-grid">{suggestions.map((prompt) => <button key={prompt} type="button" onClick={() => onPrompt(prompt)}>{prompt}<Icon name="chevron" /></button>)}</div>
+        </section> : null}
+        {activeSkill ? <div className="leader-session-context"><SkillModeBanner skill={activeSkill} onClear={onClearSkill} />{skillGreeting ? <article className="leader-skill-greeting"><div className="message-author"><span className="agent-avatar"><Icon name="spark" /></span>H-IDE</div><div className="message-body">{skillGreeting}</div></article> : null}</div> : null}
+        {timeline.map((item) => <section
+          className="conversation-turn"
+          data-task-id={item.taskId ?? undefined}
+          data-turn-sequence={item.turnSequence ?? undefined}
+          key={item.key}
+        >
+          {item.messages.map((message) => <article className={`chat-message message-${message.role}`} key={message.messageId}>
+            <div className="message-author">{message.role === "user" ? "你" : message.role === "assistant" ? <><span className="agent-avatar"><Icon name="spark" /></span>H-IDE</> : "系统"}<time>{formatTime(message.createdAt)}</time></div>
+            <div className="message-body">{message.content}</div>
+            {message.modality === "voice" ? <span className="message-modality"><Icon name="mic" />语音转写</span> : null}
+          </article>)}
+          {(activityTaskId !== null
+            ? item.taskId === activityTaskId
+            : item.key === "turn:legacy-orphans") && !thinking && inlineError
+            ? <AssistantInlineFailure message={inlineError} onRetry={onRetry} />
+            : null}
+          {item.turn?.result?.assistantMessage && !item.messages.some((message) => message.role === "assistant") ? <article className="chat-message message-assistant"><div className="message-author"><span className="agent-avatar"><Icon name="spark" /></span>H-IDE</div><div className="message-body">{item.turn.result.assistantMessage}</div></article> : null}
+          {item.turn && Boolean(item.turn.result?.evidence?.length || item.turn.result?.visualResult) ? <ConversationVisualEvidence turn={item.turn} developerMode={developerMode} /> : null}
+          {missionTaskId !== null && item.taskId === missionTaskId ? renderMission() : null}
+          {missionDraftTaskId !== null && item.taskId === missionDraftTaskId ? renderMissionDraft() : null}
+          {legacyTaskId !== null && item.taskId === legacyTaskId ? renderLegacyArtifacts() : null}
+        </section>)}
+        {thinking ? <section className="conversation-turn transient-thinking-turn"><ThinkingIndicator canCancel={canCancelThinking} onCancel={onCancelPlanning} /></section> : null}
+        {!missionAttached ? renderMission() : null}
+        {!missionDraftAttached ? renderMissionDraft() : null}
+        {!legacyAttached ? renderLegacyArtifacts() : null}
       </div>
     </div>
     <div className="composer-region">
-      {activeTurn ? <div className="active-task-dock"><span className="planning-pulse" /><span>H-IDE 正在理解并回复</span><button type="button" onClick={onCancelPlanning}>取消</button></div> : busy ? <div className="active-task-dock"><span className="planning-pulse" /><span>正在准备或推进机器人任务</span></div> : null}
       <form className="chat-composer" onSubmit={onSubmit}>
-        <div className="composer-contexts">{developerMode ? <span><Icon name="robot" />{robot?.name ?? robot?.robotId ?? "未选择机器人"}</span> : <label className="user-robot-picker"><Icon name="robot" /><select aria-label="对话机器人" value={robot?.robotId ?? ""} onChange={(event) => onRobotChange(event.target.value)}>{robots.map((item, index) => <option key={item.robotId} value={item.robotId}>{item.name ?? `机器人 ${index + 1}`}</option>)}</select></label>}{developerMode ? <span className={`composer-health ${robot?.connected ? "connected" : "offline"}`}>{robot?.connected ? "代理在线" : "代理离线"}</span> : null}<button className={voiceReplyEnabled ? "attached" : ""} type="button" onClick={onToggleVoiceReplies} aria-label={voiceReplyEnabled ? "关闭语音回复" : "开启语音回复"}><Icon name="volume" />{voiceReplyEnabled ? "语音回复开" : "语音回复关"}</button>{developerMode ? <span>{voiceCaptureMode === "streaming" ? "流式 ASR" : "离线 WAV 降级"}</span> : null}</div>
+        <div className="composer-contexts"><RobotPicker robots={robots} selectedRobotId={robot?.robotId ?? ""} selectedDisplayId={selectedDisplayId} onRobotChange={onRobotChange} onDisplayChange={onDisplayRobotChange} />{developerMode ? <span className={`composer-health ${robot?.connected ? "connected" : "offline"}`}>{robot?.connected ? "代理在线" : "代理离线"}</span> : null}<button className={voiceReplyEnabled ? "attached" : ""} type="button" onClick={onToggleVoiceReplies} aria-label={voiceReplyEnabled ? "关闭语音回复" : "开启语音回复"}><Icon name="volume" />{voiceReplyEnabled ? "语音回复开" : "语音回复关"}</button>{developerMode ? <span>{voiceCaptureMode === "streaming" ? "流式 ASR" : "离线 WAV 降级"}</span> : null}</div>
         <textarea id="assistant-task" aria-label="任务描述" value={text} onChange={(event) => setText(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} rows={1} maxLength={4000} placeholder={connection === "live" ? "描述任务，或点击麦克风说话…" : "工作站离线，任务草稿不会发送"} disabled={connection !== "live"} />
         {voiceUi.partial ? <div className="voice-live-transcript" role="status" aria-live="polite"><span className="voice-wave" /> <b>{voiceUi.phase === "finalizing" ? "已识别" : "正在听"}</b><span>{voiceUi.partial}</span></div> : null}
         <div className="composer-actions"><div><button className={`composer-icon-button voice-button ${recording ? "recording" : ""}`} type="button" onClick={onVoice} disabled={voiceBusy || busy || connection !== "live"} aria-label={recording ? "停止录音并发送" : "开始语音输入"}><Icon name="mic" /></button><span className="composer-hint">{recording ? (voiceCaptureMode === "streaming" ? "流式聆听中，再次点击结束" : "离线录音中，再次点击批量转写") : voiceBusy ? "正在识别并发送…" : "Enter 发送 · Shift+Enter 换行"}</span></div><button className="send-button" type="submit" disabled={busy || !text.trim() || connection !== "live"} aria-label="发送给 H-IDE"><Icon name="send" /></button></div>
@@ -2724,7 +3401,7 @@ function ChatWorkspace({
   </main>;
 }
 
-function MissionPlanCard({ draft, robot, busy, feedback, setFeedback, onConfirm, onReject, developerMode }: {
+function MissionPlanCard({ draft, robot, busy, feedback, setFeedback, onConfirm, onReject, developerMode, blockedByMissionId = null }: {
   draft: MissionDraftRecordV2;
   robot: RobotState | null;
   busy: boolean;
@@ -2733,14 +3410,59 @@ function MissionPlanCard({ draft, robot, busy, feedback, setFeedback, onConfirm,
   onConfirm: () => void;
   onReject: () => void;
   developerMode: boolean;
+  blockedByMissionId?: string | null;
 }) {
   const plan = draft.plan;
-  const reviewable = draft.status === "draft" && !busy && plan.robotId === robot?.robotId;
+  const reviewable = draft.status === "draft"
+    && !busy
+    && blockedByMissionId === null
+    && plan.robotId === robot?.robotId;
+  const typedPlaces = plan.nodes.flatMap((node) => {
+    const intent = node.intent && typeof node.intent === "object"
+      ? node.intent as Record<string, unknown>
+      : null;
+    const place = intent?.place && typeof intent.place === "object"
+      ? intent.place as Record<string, unknown>
+      : null;
+    const completion = intent?.completion && typeof intent.completion === "object"
+      ? intent.completion as Record<string, unknown>
+      : null;
+    return place && typeof place.locationId === "string"
+      ? [{ node, place, completion }]
+      : [];
+  });
+  const finalPlace = [...typedPlaces].reverse().find(({ place }) => (
+    place.anchorRole === "interior" || place.anchorRole === "observation_vantage"
+  )) ?? typedPlaces.at(-1);
+  const finalPlaceName = typeof finalPlace?.place.locationName === "string"
+    ? finalPlace.place.locationName
+    : null;
+  const finalAnchorRole = finalPlace?.place.anchorRole === "observation_vantage"
+    ? "内部观察点"
+    : finalPlace?.place.anchorRole === "interior"
+      ? "内部站立点"
+      : finalPlace?.place.anchorRole === "entry"
+        ? "入口点"
+        : null;
+  const candidateCount = Array.isArray(finalPlace?.place.candidateTargetRecordIds)
+    ? finalPlace.place.candidateTargetRecordIds.length
+    : 0;
+  const completionLabel = finalPlace?.completion?.predicate === "inside_region"
+    ? "机器人进入目标区域并靠近选定内部点"
+    : finalPlace?.completion?.predicate === "at_anchor"
+      ? "机器人到达选定入口点"
+      : null;
   return <section className="plan-draft-card mission-v2-card" aria-label="Mission V2 计划审核">
     <header>
       <div><span className="card-kicker"><Icon name="spark" />MISSION V2 · SUPERVISOR–WORKER</span><h2>{plan.objective}</h2></div>
       <StatusPill value={draft.status} />
     </header>
+    {finalPlaceName ? <div className="place-plan-summary" aria-label="地点任务完成条件">
+      <span><small>目标地点</small><strong>{finalPlaceName}</strong></span>
+      <span><small>目标角色</small><strong>{finalAnchorRole ?? "已审核地点"}</strong></span>
+      <span><small>备用点</small><strong>{Math.max(0, candidateCount - 1)} 个</strong></span>
+      <span><small>完成条件</small><strong>{completionLabel ?? "完成全部审核步骤"}</strong></span>
+    </div> : null}
     {developerMode ? <div className="plan-context-grid">
       <span><small>目标机器人</small><strong>{plan.robotId}</strong></span>
       <span><small>风险上限</small><strong>{plan.envelope.maximumRiskLevel}</strong></span>
@@ -2748,6 +3470,7 @@ function MissionPlanCard({ draft, robot, busy, feedback, setFeedback, onConfirm,
       <span><small>审核有效期</small><strong>{formatDraftExpiry(plan.expiresAt, Date.now())}</strong></span>
     </div> : <p className="user-plan-summary">我会按下面的顺序完成任务。执行中如果环境发生变化，我会停下并告诉你。</p>}
     <p className="card-warning"><Icon name="warning" />请确认周围环境安全，并留意机器人移动。</p>
+    {blockedByMissionId ? <p className="mission-queue-notice"><Icon name="activity" />当前机器人仍在执行上一项 Mission；这份计划已排在对应对话轮次下方，待上一任务结束后即可审核。</p> : null}
     <ol className="plan-step-list">
       {plan.nodes.map((node, index) => <li key={node.nodeId}>
         <span>{index + 1}</span>
@@ -2762,6 +3485,7 @@ function MissionPlanCard({ draft, robot, busy, feedback, setFeedback, onConfirm,
         <section><strong>固定身份</strong><p>boot: {plan.envelope.robotBootId}<br />epoch: {plan.envelope.localizationEpochId}</p></section>
         <section><strong>自动修订</strong><p>最多 {plan.envelope.maximumAutoRevisions} 次；超出授权边界必须重新审核。</p></section>
         <section><strong>场景先验</strong><p>{plan.envelope.sceneRefs.length ? plan.envelope.sceneRefs.map((item) => `${item.sceneId}@${item.revision}`).join("、") : "未附加场景先验"}</p></section>
+        {finalPlace ? <section><strong>强类型地点绑定</strong><p>{String(finalPlace.place.locationId)} · {String(finalPlace.place.anchorRole)}<br />{String(finalPlace.place.targetRecordId)}</p></section> : null}
       </div>
     </details> : null}
     {draft.status === "draft" ? <div className="plan-review-controls">
@@ -2797,8 +3521,9 @@ function MissionExecutionCard({ mission, busy, onContinue, onCancel, onApproveRe
   const visualResult = latestMissionVisualResult(mission);
   const currentVisualAmbiguity = currentMissionVisualAmbiguity(mission);
   const officeReport = currentMissionOfficeReport(mission);
+  const userProgress = missionUserProgress(mission);
   const presentedVisualResult = status === "needs_input"
-    ? currentVisualAmbiguity
+    ? currentVisualAmbiguity ?? visualResult
     : visualResult;
   const observationOnly = !mission.activeRevision.nodes.some((node) =>
     ["navigation.navigate_to_pose", "navigation.rotate"].includes(node.skillId));
@@ -2823,7 +3548,14 @@ function MissionExecutionCard({ mission, busy, onContinue, onCancel, onApproveRe
       <span><small>活动修订</small><strong>r{mission.activeRevision.sequence}</strong></span>
       <span><small>视觉假设</small><strong>{hypotheses}</strong></span>
       <span><small>可信空间事实</small><strong>{facts}</strong></span>
-    </div> : <p className="user-mission-status">{status === "completed" ? "任务已经完成。" : status === "failed" ? "任务没有完成，我已停止执行。" : status === "needs_input" ? "我需要你再补充一点信息。" : "机器人正在按计划执行，我会持续汇报进展。"}</p>}
+    </div> : <p className="user-mission-status">{status === "completed" ? "任务已经完成。" : status === "failed" ? "任务没有完成，我已停止执行。" : status === "cancelled" ? "任务已取消。" : status === "needs_input" ? "任务已停止推进，需要补充目标信息。" : status === "suspended" ? "任务已暂停，场景、定位或授权状态需要重新确认。" : status === "awaiting_review" ? "任务修订正在等待你的审核。" : status === "ready" ? "下一节点的目标已经解析，正在继续执行。" : "机器人正在按计划执行，我会持续汇报进展。"}</p>}
+    {userProgress.length ? <section className="mission-user-progress" aria-label="机器人执行进度">
+      <strong>实时进度</strong>
+      <ol>{userProgress.map((item) => <li className={`progress-${item.state}`} key={item.sequence}>
+        <span />
+        <p>{item.text}</p>
+      </li>)}</ol>
+    </section> : null}
     {presentedVisualResult ? <MissionVisualSummary
       result={presentedVisualResult}
       observationOnly={observationOnly}
@@ -2850,8 +3582,10 @@ function MissionExecutionCard({ mission, busy, onContinue, onCancel, onApproveRe
       result={currentVisualAmbiguity}
       busy={busy}
       onSelect={onSelectCandidate}
+      missionId={mission.missionId}
+      onLoadEvidence={loadMissionVisualEvidence}
     /> : null}
-    {status === "needs_input" ? <p className="mission-input-hint">也可以在下方用文字或语音说“选择第一个候选”。候选会先重新观察验证，不会绕过运动授权。</p> : null}
+    {status === "needs_input" ? <p className="mission-input-hint">{currentVisualAmbiguity ? "可以在下方用文字或语音选择一个视觉候选；系统会先重新观察验证，不会直接移动。" : "请根据上方的具体阻塞原因补充地点信息，或取消后重新规划；系统不会退化到入口或任意可信点。"}</p> : null}
     {status === "awaiting_review" ? <div className="mission-revision-review"><p><strong>修订需要审核</strong><span>{Array.isArray(pendingRevision?.changeSummary) ? pendingRevision.changeSummary.join("；") : "持续规划改变了任务步骤或授权范围。"}</span></p><button type="button" onClick={onApproveRevision} disabled={busy}>审核修订并继续</button></div> : null}
     {!['completed', 'failed', 'cancelled'].includes(status) ? <div className="mission-runtime-actions">
       <button className="mission-cancel-button" type="button" onClick={onCancel} disabled={busy}>取消 Mission</button>
@@ -2867,18 +3601,6 @@ function MissionExecutionCard({ mission, busy, onContinue, onCancel, onApproveRe
     onLoadEvidence={loadMissionVisualEvidence}
   /> : null}
   </>;
-}
-
-function PlanningActivityCard({ turn, draft, developerMode }: { turn: AssistantTurn; draft: AssistantDraft | null; developerMode: boolean }) {
-  const active = ["queued", "running"].includes(turn.status);
-  const contributions = draft?.review?.contributions ?? [];
-  return <details className={`planning-activity planning-${turn.status}`} open={active || undefined}>
-    <summary><span className="agent-avatar"><Icon name="spark" /></span><span><strong>{active ? "正在理解你的消息" : turn.status === "draft_ready" ? "行动方案已准备好" : "处理完成"}</strong><small>{active ? "H-IDE 正在判断是直接回答，还是准备机器人任务" : statusLabel(turn.status)}</small></span><StatusPill value={turn.status} /><Icon name="chevron" /></summary>
-    {developerMode ? <div className="planning-details"><div className="planning-stage-list"><span className="done"><i />理解任务</span><span className={turn.status === "queued" ? "active" : "done"}><i />路由意图</span><span className={active ? "active" : draft ? "done" : ""}><i />准备响应</span></div>
-      {contributions.length ? <div className="worker-list">{contributions.map((worker) => <div key={worker.agentId}><span><Icon name="spark" /></span><p><strong>{worker.agentId}</strong><small>{worker.summary}</small></p></div>)}</div> : <p className="planning-placeholder">行动任务的专属 Agent 贡献会在计划完成后显示。</p>}
-      {turn.error ? <p className="planning-error">{turn.error}</p> : null}
-    </div> : null}
-  </details>;
 }
 
 function HoldConfirmButton({ disabled, onConfirm }: { disabled: boolean; onConfirm: () => void }) {

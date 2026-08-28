@@ -12,6 +12,7 @@ from services.control_api.office_inspection import (
     MISSION_REPORT_SKILL,
     OFFICE_INSPECTION_SKILL,
     catalog,
+    build_location_report,
     build_report,
     compile_plan,
     envelope_defaults,
@@ -81,6 +82,8 @@ def test_exact_pwa_intent_selects_the_long_office_envelope() -> None:
     objective = "走遍所有办公室，并把所有办公室里面的信息和路上的信息都给我"
 
     assert is_full_office_inspection(objective) is True
+    assert is_full_office_inspection("巡检全部办公室，把看到的信息汇总给我") is True
+    assert is_full_office_inspection("遍历每个办公室并告诉我看到了什么") is True
     assert is_full_office_inspection("观察当前房间") is False
     assert envelope_defaults(objective) == {
         "maximumGoalDistanceM": 20.0,
@@ -249,6 +252,96 @@ def test_report_is_evidence_bound_and_marks_missing_stations() -> None:
         "mediaType": "image/jpeg",
     }
     assert "看到清晰门牌" in report["narrativeZhCN"]
+
+
+def _location_report_mission(*, captured_before_arrival: bool = False) -> dict:
+    station = station_index()["meeting_south"]
+    verified_at = utc_now()
+    captured_at = verified_at + timedelta(
+        seconds=-1 if captured_before_arrival else 1
+    )
+    headings = [
+        {
+            "headingRad": heading,
+            "visualResult": {
+                "schemaVersion": "h-ide.visual-result/2",
+                "status": "succeeded",
+                "mode": "scene_description",
+                "analysisId": f"analysis-meeting-{index}",
+                "observationSummary": f"会议室方向 {index} 可见桌椅和显示设备",
+                "source": {"capturedAt": captured_at.isoformat()},
+                "evidence": [
+                    {"sha256": f"{index:x}" * 64, "mediaType": "image/jpeg"}
+                ],
+            },
+        }
+        for index, heading in enumerate(station["scanHeadingsRad"], start=1)
+    ]
+    return {
+        "missionId": "mission-meeting-observe",
+        "skillExecutions": [
+            {
+                "request": {
+                    "skillId": "scene.verify_inside_region",
+                },
+                "result": {
+                    "status": "succeeded",
+                    "result": {
+                        "insideRegionResult": {
+                            "schemaVersion": "h-ide.inside-region/1",
+                            "verified": True,
+                            "regionId": "meeting_room",
+                            "stationId": "meeting_south",
+                            "verifiedAt": verified_at.isoformat(),
+                        }
+                    },
+                },
+            },
+            {
+                "request": {
+                    "skillId": OFFICE_INSPECTION_SKILL,
+                    "input": {"stationId": "meeting_south"},
+                },
+                "result": {
+                    "status": "succeeded",
+                    "result": {
+                        "inspectionResult": {
+                            "schemaVersion": "h-ide.office-inspection/1",
+                            "stationId": "meeting_south",
+                            "regionId": "meeting_room",
+                            "headings": headings,
+                        }
+                    },
+                },
+            },
+        ],
+    }
+
+
+def test_location_report_requires_inside_verification_and_post_arrival_frames() -> None:
+    report = build_location_report(
+        _location_report_mission(),
+        region_id="meeting_room",
+        station_id="meeting_south",
+    )
+
+    assert report["reportScope"] == "current_location"
+    assert report["locationId"] == "meeting_room"
+    assert report["status"] == "completed"
+    assert report["fullChainAccepted"] is True
+    assert report["missingStations"] == []
+    assert len(report["regions"]) == 1
+    assert len(report["regions"][0]["summaries"]) == 4
+    assert "会议室观察报告" in report["narrativeZhCN"]
+
+
+def test_location_report_rejects_pre_arrival_visual_frames() -> None:
+    with pytest.raises(ValueError, match="pre-arrival"):
+        build_location_report(
+            _location_report_mission(captured_before_arrival=True),
+            region_id="meeting_room",
+            station_id="meeting_south",
+        )
 
 
 def test_report_accepts_only_complete_catalog_bound_station_scans() -> None:

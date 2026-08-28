@@ -110,10 +110,14 @@ from .conversation_client import (
 from .office_inspection import (
     MISSION_REPORT_SKILL,
     OFFICE_INSPECTION_SKILL,
+    build_location_report as build_office_location_report,
     build_report as build_office_inspection_report,
     is_full_office_inspection,
 )
+from .object_search_report import build_object_search_report
+from .office_semantic_navigation import SCENE_VERIFY_INSIDE_SKILL
 from .conversation_gateway import ConversationGateway
+from .leader_demo import LeaderDemoGestureUnavailable, trigger_wave
 from .developer_diagnostics import (
     DeveloperDiagnosticsService,
     create_developer_diagnostics_router,
@@ -2633,6 +2637,9 @@ def create_app(
             raise ValueError("Mission workstation skill request has expired")
         if skill.skillId == "vision.observe":
             return dispatch_visual_workstation_skill(skill)
+        if skill.skillId == SCENE_VERIFY_INSIDE_SKILL:
+            refresh_robot_agent_snapshot(skill.robotId)
+            return mission_service.verify_inside_region(skill)
         if skill.skillId == OFFICE_INSPECTION_SKILL:
             return _start_office_inspection(skill)
         if skill.skillId == MISSION_REPORT_SKILL:
@@ -2670,12 +2677,35 @@ def create_app(
                             "Office report source Mission identity is incompatible"
                         )
                     source_missions.append(source)
-            return {
-                "mode": "office_mission_report",
-                "missionReport": build_office_inspection_report(
+            report_scope = skill.input.get("reportScope")
+            if report_scope == "current_location":
+                report = build_office_location_report(
+                    mission,
+                    region_id=str(skill.input.get("regionId") or ""),
+                    station_id=str(skill.input.get("stationId") or ""),
+                )
+            elif report_scope == "all_office_regions_and_corridor":
+                report = build_office_inspection_report(
                     mission,
                     source_missions=source_missions,
-                ),
+                )
+            elif report_scope == "object_search":
+                report = build_object_search_report(
+                    mission,
+                    target_description=str(
+                        skill.input.get("targetDescription") or ""
+                    ),
+                    region_id=(
+                        str(skill.input["regionId"])
+                        if isinstance(skill.input.get("regionId"), str)
+                        else None
+                    ),
+                )
+            else:
+                raise ValueError("Office report scope is invalid")
+            return {
+                "mode": "office_mission_report",
+                "missionReport": report,
             }
         raise ValueError(f"unsupported workstation skill: {skill.skillId}")
 
@@ -3476,6 +3506,52 @@ def create_app(
             refresh_robot_agent_snapshot(simulation_robot_id)
         return context.store.list_robots()
 
+    @app.post(
+        "/api/v1/leader-demo/gestures/wave",
+        dependencies=[Depends(require_assistant)],
+    )
+    def leader_demo_wave(
+        body: dict[str, Any],
+        principal: Principal = Depends(require_assistant),
+        context: _ControlContext = Depends(get_context),
+    ):
+        """Trigger the bounded simulation-only wave used by the voice Skill."""
+
+        if set(body) != {"robotId"}:
+            raise HTTPException(status_code=422, detail="leader-demo wave accepts only robotId")
+        robot_id = body.get("robotId")
+        if not isinstance(robot_id, str) or not robot_id.strip():
+            raise HTTPException(status_code=422, detail="robotId is required")
+        expected_robot_id = os.getenv("SIMULATION_ROBOT_AGENT_ID", "g1-sim").strip()
+        try:
+            result = trigger_wave(
+                robot_id=robot_id,
+                expected_robot_id=expected_robot_id,
+            )
+        except LeaderDemoGestureUnavailable as exc:
+            # A missing optional gesture channel must not turn a successful
+            # voice reply into a failed conversation turn.
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        context.store.record_event(
+            {
+                "eventType": "leader_demo.gesture_requested",
+                "gesture": "wave",
+                "robotId": robot_id,
+                "requestedBy": principal.user_id,
+                "backend": "sonic_simulation_arbiter",
+                "requestId": result.get("request_id"),
+            }
+        )
+        return {
+            "status": "accepted",
+            "gesture": "wave",
+            "robotId": robot_id,
+            "requestId": result.get("request_id"),
+            "backend": "sonic_simulation_arbiter",
+        }
+
     @app.get("/api/v1/robots/{robot_id}/capabilities", dependencies=[Depends(require_robots_read)])
     def get_capabilities(robot_id: str, context: _ControlContext = Depends(get_context)):
         refresh_robot_agent_snapshot(robot_id)
@@ -3503,6 +3579,74 @@ def create_app(
                 str(conversation["conversationId"]),
             )
         ]
+
+    @app.get(
+        "/api/v2/assistant/conversations",
+        dependencies=[Depends(require_assistant)],
+    )
+    def list_assistant_conversations_v2(
+        lifecycle: str = "active",
+        q: str | None = None,
+        cursor: str | None = None,
+        limit: int = 30,
+        principal: Principal = Depends(require_assistant),
+        service: AssistantService = Depends(get_assistant_service),
+    ):
+        try:
+            return service.list_conversation_page(
+                lifecycle=lifecycle,
+                query=q,
+                cursor=cursor,
+                limit=limit,
+                visible=lambda conversation_id: assistant_resource_visible(
+                    principal,
+                    "assistant_conversation",
+                    conversation_id,
+                ),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post(
+        "/api/v2/assistant/conversations/bulk-delete",
+        dependencies=[Depends(require_assistant)],
+    )
+    def bulk_delete_assistant_conversations(
+        body: dict[str, Any],
+        request: Request,
+        principal: Principal = Depends(require_assistant),
+        service: AssistantService = Depends(get_assistant_service),
+    ):
+        raw_ids = body.get("conversationIds")
+        if not isinstance(raw_ids, list):
+            raise HTTPException(
+                status_code=422,
+                detail="conversationIds must be a list",
+            )
+        normalized_ids: list[str] = []
+        for value in raw_ids:
+            if not isinstance(value, str) or not value or value != value.strip():
+                raise HTTPException(
+                    status_code=422,
+                    detail="conversationIds contains an invalid identifier",
+                )
+            if value not in normalized_ids:
+                normalized_ids.append(value)
+        if not 1 <= len(normalized_ids) <= 100:
+            raise HTTPException(
+                status_code=422,
+                detail="conversationIds must contain between 1 and 100 entries",
+            )
+        for conversation_id in normalized_ids:
+            require_conversation_resource(
+                request,
+                principal,
+                conversation_id,
+            )
+        try:
+            return service.delete_conversations(normalized_ids)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post(
         "/api/v1/assistant/conversations",

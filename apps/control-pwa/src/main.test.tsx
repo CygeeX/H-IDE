@@ -572,6 +572,14 @@ describe("control console", () => {
   });
 
   beforeEach(() => {
+    Object.defineProperty(URL, "createObjectURL", {
+      configurable: true,
+      value: vi.fn(() => "blob:visual-evidence"),
+    });
+    Object.defineProperty(URL, "revokeObjectURL", {
+      configurable: true,
+      value: vi.fn(),
+    });
     draftExpiresAt = "2099-01-01T00:00:00Z";
     confirmConflict = false;
     window.history.replaceState({}, "", "/developer");
@@ -754,6 +762,8 @@ describe("control console", () => {
 
   afterEach(() => {
     cleanup();
+    Reflect.deleteProperty(URL, "createObjectURL");
+    Reflect.deleteProperty(URL, "revokeObjectURL");
     vi.unstubAllGlobals();
   });
 
@@ -811,6 +821,130 @@ describe("control console", () => {
     expect((await screen.findAllByText("会议区巡检")).length).toBeGreaterThan(0);
     expect(screen.getByRole("button", { name: "归档" })).not.toBeDisabled();
     expect(screen.getByRole("button", { name: "删除" })).not.toBeDisabled();
+  });
+
+  it("shows one themed Thinking indicator without the former planning card or dock", async () => {
+    const fallback = vi.mocked(fetch).getMockImplementation();
+    let resolveTurn: ((value: Response) => void) | undefined;
+    const pendingTurn = new Promise<Response>((resolve) => { resolveTurn = resolve; });
+    vi.mocked(fetch).mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/assistant/conversations/conversation-ui/messages")) {
+        return Promise.resolve(response({
+          taskId: "task-thinking",
+          conversationId: "conversation-ui",
+          status: "queued",
+        }, { status: 202 }));
+      }
+      if (url.includes("/assistant/turns/task-thinking")) return pendingTurn;
+      if (url.endsWith("/assistant/conversations/conversation-ui")) {
+        return Promise.resolve(response({
+          conversationId: "conversation-ui",
+          robotId: "robot-1",
+          requestedBy: "operator",
+          locale: "zh-CN",
+          status: "idle",
+          messages: [{
+            messageId: "message-thinking-assistant",
+            taskId: "task-thinking",
+            role: "assistant",
+            content: "已经理解你的问题。",
+            modality: "text",
+            createdAt: "2026-08-20T00:00:01Z",
+          }],
+          turns: [],
+          drafts: [],
+        }));
+      }
+      return fallback!(input, init) as Promise<Response>;
+    });
+
+    render(<App />);
+    const input = await screen.findByLabelText("任务描述");
+    fireEvent.change(input, { target: { value: "介绍一下当前系统" } });
+    fireEvent.submit(input.closest("form")!);
+
+    expect(await screen.findByRole("status", { name: "H-IDE 正在思考" })).toHaveTextContent("Thinking…");
+    expect(screen.getAllByText("Thinking…")).toHaveLength(1);
+    expect(screen.queryByText("正在理解你的消息")).not.toBeInTheDocument();
+    expect(screen.queryByText("H-IDE 正在理解并回复")).not.toBeInTheDocument();
+
+    resolveTurn!(response({
+      taskId: "task-thinking",
+      conversationId: "conversation-ui",
+      status: "completed",
+      result: {
+        schemaVersion: "h-ide.assistant-result/2",
+        intent: "GENERAL_QA",
+        route: "reply",
+        routeStatus: "completed",
+        assistantMessage: "已经理解你的问题。",
+      },
+    }));
+    await waitFor(() => expect(screen.queryByRole("status", { name: "H-IDE 正在思考" })).not.toBeInTheDocument());
+    expect(await screen.findByText("已经理解你的问题。")).toBeInTheDocument();
+  });
+
+  it("keeps Mission children in one history row and supports delete with undo", async () => {
+    const fallback = vi.mocked(fetch).getMockImplementation();
+    const conversation = {
+      conversationId: "conversation-history-ui",
+      robotId: "robot-1",
+      requestedBy: "developer-ui",
+      locale: "zh-CN",
+      title: "办公室完整巡检",
+      status: "completed",
+      archived: false,
+      deleted: false,
+      missionDraftIds: ["mission-ui"],
+      missionIds: ["mission-ui"],
+      activeMissionId: null,
+      lifecycleMutable: true,
+      lifecycleBlockedReason: null,
+      createdAt: "2026-08-20T00:00:00Z",
+      updatedAt: "2026-08-20T00:10:00Z",
+    };
+    vi.mocked(fetch).mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/api/v2/assistant/conversations?") && !init?.method) {
+        return Promise.resolve(response({ items: [conversation], nextCursor: null }));
+      }
+      if (url.endsWith("/api/v2/missions") && !init?.method) {
+        return Promise.resolve(response([missionRecordFixture("completed")]));
+      }
+      if (url.endsWith("/assistant/conversations/conversation-history-ui") && init?.method === "DELETE") {
+        return Promise.resolve(response({ ...conversation, deleted: true }));
+      }
+      if (url.endsWith("/assistant/conversations/conversation-history-ui") && init?.method === "PATCH") {
+        return Promise.resolve(response({ ...conversation, deleted: false, archived: false }));
+      }
+      return fallback!(input, init) as Promise<Response>;
+    });
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    render(<App />);
+    await screen.findAllByText("robot-1");
+    fireEvent.click(screen.getByRole("button", { name: "任务历史" }));
+    expect(await screen.findByText("办公室完整巡检")).toBeInTheDocument();
+    expect(Array.from(document.querySelectorAll(".history-open strong")).filter(
+      (element) => element.textContent === "办公室完整巡检",
+    )).toHaveLength(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "管理会话：办公室完整巡检" }));
+    fireEvent.click(screen.getByRole("button", { name: "删除" }));
+    expect(await screen.findByText("会话已移入回收站")).toBeInTheDocument();
+    await waitFor(() => expect(vi.mocked(fetch).mock.calls.some(([input, init]) => (
+      String(input).endsWith("/assistant/conversations/conversation-history-ui")
+      && init?.method === "DELETE"
+    ))).toBe(true));
+
+    fireEvent.click(screen.getByRole("button", { name: "撤销" }));
+    await waitFor(() => expect(vi.mocked(fetch).mock.calls.some(([input, init]) => (
+      String(input).endsWith("/assistant/conversations/conversation-history-ui")
+      && init?.method === "PATCH"
+      && init.body === JSON.stringify({ deleted: false, archived: false })
+    ))).toBe(true));
+    expect(await screen.findByText("会话已恢复")).toBeInTheDocument();
   });
 
   it("waits for robot discovery before requesting robot-scoped endpoints", async () => {
@@ -885,6 +1019,90 @@ describe("control console", () => {
     expect(vi.mocked(fetch).mock.calls.some(([input]) => String(input).endsWith("/api/v2/missions/mission-ui/advance"))).toBe(true);
   });
 
+  it("shows the typed place role and semantic completion before approval", async () => {
+    const fallback = vi.mocked(fetch).getMockImplementation();
+    const typedDraft = missionDraftFixture("去会议室里观察，看到了什么告诉我");
+    typedDraft.plan.nodes = [
+      {
+        ...typedDraft.plan.nodes[1],
+        nodeId: "place-nav-entry",
+        purpose: "前往会议室入口",
+        dependsOn: [],
+        intent: {
+          schemaVersion: "h-ide.place-intent/1",
+          task: "navigate_to_place",
+          place: {
+            schemaVersion: "h-ide.place-target/1",
+            locationId: "meeting_room",
+            locationName: "会议室",
+            anchorRole: "entry",
+            stationId: "meeting_entry",
+            targetRecordId: "world-mission-ui-scene-target-meeting_entry",
+            candidateTargetRecordIds: ["world-mission-ui-scene-target-meeting_entry"],
+          },
+          completion: {
+            schemaVersion: "h-ide.place-completion/1",
+            predicate: "at_anchor",
+            regionId: "meeting_room",
+            minimumClearanceM: 0,
+            maximumAnchorDistanceM: 0.25,
+          },
+        },
+      },
+      {
+        ...typedDraft.plan.nodes[1],
+        nodeId: "place-nav-interior",
+        purpose: "进入会议室内部",
+        dependsOn: ["place-nav-entry"],
+        intent: {
+          schemaVersion: "h-ide.place-intent/1",
+          task: "navigate_to_place",
+          place: {
+            schemaVersion: "h-ide.place-target/1",
+            locationId: "meeting_room",
+            locationName: "会议室",
+            anchorRole: "observation_vantage",
+            stationId: "meeting_south",
+            targetRecordId: "world-mission-ui-scene-target-meeting_south",
+            candidateTargetRecordIds: [
+              "world-mission-ui-scene-target-meeting_south",
+              "world-mission-ui-scene-target-meeting_north",
+            ],
+          },
+          completion: {
+            schemaVersion: "h-ide.place-completion/1",
+            predicate: "inside_region",
+            regionId: "meeting_room",
+            minimumClearanceM: 0.25,
+            maximumAnchorDistanceM: 0.25,
+          },
+        },
+      },
+    ];
+    vi.mocked(fetch).mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/api/v2/missions/drafts/mission-ui") && !init?.method) {
+        return Promise.resolve(response(typedDraft));
+      }
+      return fallback!(input, init) as Promise<Response>;
+    });
+
+    render(<App />);
+    await screen.findAllByText("robot-1");
+    fireEvent.change(screen.getByLabelText("任务描述"), {
+      target: { value: "去会议室里观察，看到了什么告诉我" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "发送给 H-IDE" }));
+
+    const summary = await screen.findByLabelText("地点任务完成条件");
+    expect(summary).toHaveTextContent("会议室");
+    expect(summary).toHaveTextContent("内部观察点");
+    expect(summary).toHaveTextContent("备用点1 个");
+    expect(summary).toHaveTextContent("机器人进入目标区域");
+    expect(screen.getByText("前往会议室入口")).toBeInTheDocument();
+    expect(screen.getByText("进入会议室内部")).toBeInTheDocument();
+  });
+
   it("rejects a Mission draft without dispatching any command", async () => {
     render(<App />);
     await screen.findAllByText("robot-1");
@@ -897,6 +1115,91 @@ describe("control console", () => {
     await waitFor(() => expect(vi.mocked(fetch).mock.calls.some(([input]) => String(input).endsWith("/api/v2/missions/drafts/mission-ui/reject"))).toBe(true));
     expect(screen.queryByRole("button", { name: "按住确认并执行" })).not.toBeInTheDocument();
     expect(vi.mocked(fetch).mock.calls.some(([input]) => String(input).endsWith("/api/v1/commands"))).toBe(false);
+  });
+
+  it("retires a rejected Mission card when the next conversation turn starts", async () => {
+    const fallback = vi.mocked(fetch).getMockImplementation();
+    let submittedTurns = 0;
+    let finishSecondTurn: ((response: Response) => void) | undefined;
+    const secondTurn = new Promise<Response>((resolve) => {
+      finishSecondTurn = resolve;
+    });
+    vi.mocked(fetch).mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/assistant/conversations/conversation-ui/messages")) {
+        submittedTurns += 1;
+        return fallback!(input, init) as Promise<Response>;
+      }
+      if (url.includes("/assistant/turns/task-ui") && submittedTurns >= 2) {
+        return secondTurn;
+      }
+      if (url.endsWith("/api/v2/missions/drafts/mission-next") && !init?.method) {
+        const nextDraft = missionDraftFixture("前往会议室");
+        return Promise.resolve(response({
+          ...nextDraft,
+          draftId: "mission-next",
+          plan: { ...nextDraft.plan, planId: "mission-next" },
+        }));
+      }
+      if (url.endsWith("/assistant/conversations/conversation-ui") && !init?.method) {
+        return Promise.resolve(response({
+          conversationId: "conversation-ui",
+          robotId: "robot-1",
+          requestedBy: "operator",
+          locale: "zh-CN",
+          status: submittedTurns >= 2 ? "idle" : "review",
+          messages: [],
+          turns: [],
+          drafts: [],
+        }));
+      }
+      return fallback!(input, init) as Promise<Response>;
+    });
+
+    render(<App />);
+    await screen.findAllByText("robot-1");
+    fireEvent.change(screen.getByLabelText("任务描述"), {
+      target: { value: "向前移动" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "发送给 H-IDE" }));
+    await screen.findByRole("region", { name: "Mission V2 计划审核" });
+
+    fireEvent.click(screen.getByRole("button", { name: "拒绝" }));
+    await waitFor(() => expect(screen.queryByRole("button", {
+      name: "按住确认并执行",
+    })).not.toBeInTheDocument());
+    expect(screen.getByRole("region", { name: "Mission V2 计划审核" })).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("任务描述"), {
+      target: { value: "前往会议室" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "发送给 H-IDE" }));
+
+    expect(await screen.findByRole("status", {
+      name: "H-IDE 正在思考",
+    })).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByRole("region", {
+      name: "Mission V2 计划审核",
+    })).not.toBeInTheDocument());
+
+    finishSecondTurn!(response({
+      taskId: "task-ui",
+      conversationId: "conversation-ui",
+      status: "completed",
+      result: {
+        schemaVersion: "h-ide.assistant-result/2",
+        intent: "ROBOT_ACTION",
+        route: "mission_review",
+        routeStatus: "review",
+        assistantMessage: "新的行动方案已生成。",
+        missionDraftId: "mission-next",
+      },
+    }));
+    const nextPlan = await screen.findByRole("region", {
+      name: "Mission V2 计划审核",
+    });
+    expect(nextPlan).toHaveTextContent("前往会议室");
+    expect(nextPlan).not.toHaveTextContent("向前移动");
   });
 
   it("routes through ConversationGateway before loading a Mission V2 draft", async () => {
@@ -1134,6 +1437,12 @@ describe("control console", () => {
       if (url.endsWith("/api/v2/missions/drafts") && !init?.method) {
         return Promise.resolve(response([]));
       }
+      if (url.includes("/api/v2/missions/mission-ui/visual-evidence/")) {
+        return Promise.resolve(new Response(new Blob(["jpeg"], { type: "image/jpeg" }), {
+          status: 200,
+          headers: { "content-type": "image/jpeg" },
+        }));
+      }
       if (url.endsWith("/api/v2/missions/mission-ui/messages") && init?.method === "POST") {
         const body = typeof init.body === "string" ? JSON.parse(init.body) : {};
         messageBodies.push(body);
@@ -1175,8 +1484,11 @@ describe("control console", () => {
     window.sessionStorage.setItem(otherMissionStorageKey, otherMissionValue);
 
     const firstRender = render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: /左侧银白色机器人/ }));
-    expect(await screen.findByText("temporary candidate retry failure")).toBeInTheDocument();
+    const firstCandidate = await screen.findByRole("button", { name: /左侧银白色机器人/ });
+    await waitFor(() => expect(firstCandidate).not.toBeDisabled());
+    fireEvent.click(firstCandidate);
+    expect(await screen.findByText("服务暂时不可用，请稍后重试")).toBeInTheDocument();
+    expect(screen.queryByText("temporary candidate retry failure")).not.toBeInTheDocument();
     expect(messageBodies).toHaveLength(1);
     const firstInterventionId = messageBodies[0].interventionId;
     expect(firstInterventionId).toEqual(expect.stringMatching(/^intervention-/));
@@ -1186,7 +1498,9 @@ describe("control console", () => {
 
     firstRender.unmount();
     const secondRender = render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: /左侧银白色机器人/ }));
+    const secondCandidate = await screen.findByRole("button", { name: /左侧银白色机器人/ });
+    await waitFor(() => expect(secondCandidate).not.toBeDisabled());
+    fireEvent.click(secondCandidate);
     await waitFor(() => expect(messageBodies).toHaveLength(2));
 
     expect(messageBodies[1]).toMatchObject({
