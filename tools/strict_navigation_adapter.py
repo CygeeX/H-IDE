@@ -94,6 +94,7 @@ class StrictNavigationExecutor:
         sleep: Callable[[float], None] = time.sleep,
         command_timeout_s: float = DEFAULT_COMMAND_TIMEOUT_S,
         live_clearance_radius_m: float | None = None,
+        continuous_drive_handoff: bool = False,
     ) -> None:
         timeout = float(command_timeout_s)
         if not math.isfinite(timeout) or timeout <= 0.0:
@@ -111,6 +112,9 @@ class StrictNavigationExecutor:
         self.sleep = sleep
         self.command_timeout_s = timeout
         self.live_clearance_radius_m = clearance
+        if not isinstance(continuous_drive_handoff, bool):
+            raise ValueError("continuous_drive_handoff must be a boolean")
+        self.continuous_drive_handoff = continuous_drive_handoff
 
     @staticmethod
     def _plan_kwargs() -> dict[str, Any]:
@@ -183,6 +187,7 @@ class StrictNavigationExecutor:
         resolved: Mapping[str, Any],
         *,
         cancelled: Callable[[], bool],
+        wait_for_idle: bool = True,
     ) -> str:
         action_type = resolved.get("action_type")
         goal = self._mapping(resolved.get("action_goal"), "resolved action goal")
@@ -226,7 +231,8 @@ class StrictNavigationExecutor:
             )
         finally:
             self.backend.stop_relay()
-        self._wait_balanced_idle(cancelled=cancelled)
+        if wait_for_idle:
+            self._wait_balanced_idle(cancelled=cancelled)
         return kind
 
     def _cleanup(self) -> None:
@@ -307,6 +313,7 @@ class StrictNavigationExecutor:
         started = self.clock()
         completed = 0
         final_plan_hash = ""
+        pending_drive_handoff = False
         try:
             self.backend.wait_ready(timeout_s=10.0)
             recovery_pose = self.backend.wait_fresh_map_pose()
@@ -340,6 +347,9 @@ class StrictNavigationExecutor:
                     )
                     <= runner.DETOUR_COMPLETED_ENDPOINT_TOLERANCE_M
                 ):
+                    if pending_drive_handoff:
+                        self._wait_balanced_idle(cancelled=cancelled)
+                        pending_drive_handoff = False
                     return NavigationResult(
                         final_pose=fresh_before_plan.pose,
                         plan_sha256=self._terminal_path_sha256(navfn_path, goal),
@@ -420,8 +430,14 @@ class StrictNavigationExecutor:
                             "skip_within_endpoint_tolerance",
                             "skip_within_heading_tolerance",
                         }:
+                            if pending_drive_handoff:
+                                self._wait_balanced_idle(cancelled=cancelled)
+                                pending_drive_handoff = False
                             break
                         if disposition == "realign_spin_required":
+                            if pending_drive_handoff:
+                                self._wait_balanced_idle(cancelled=cancelled)
+                                pending_drive_handoff = False
                             if realignments >= runner.MAX_DRIVE_REALIGNMENT_SPINS:
                                 raise runner.StrictMotionRunnerError(
                                     "DriveOnHeading exceeded bounded realignment"
@@ -487,17 +503,44 @@ class StrictNavigationExecutor:
                                 raise runner.StrictMotionRunnerError(
                                     "DriveOnHeading exceeded bounded progress actions"
                                 )
-                        kind = self._execute_resolved(resolved, cancelled=cancelled)
+                        wait_for_idle = True
+                        if (
+                            self.continuous_drive_handoff
+                            and action_type == "nav2_msgs/action/DriveOnHeading"
+                            and distance is not None
+                            and distance
+                            > MAX_RUNTIME_DRIVE_CHUNK_M
+                            + runner.DETOUR_ENDPOINT_TOLERANCE_M
+                        ):
+                            # The action still publishes a zero at its own
+                            # endpoint, but the next same-heading chunk is
+                            # admitted immediately. If the fresh resolver asks
+                            # for a Spin, a skip, or a replan, the pending
+                            # handoff is flushed through the normal balanced
+                            # IDLE gate before that different transition.
+                            wait_for_idle = False
+                        kind = self._execute_resolved(
+                            resolved,
+                            cancelled=cancelled,
+                            wait_for_idle=wait_for_idle,
+                        )
                         completed += 1
+                        pending_drive_handoff = not wait_for_idle
                         if kind == "DriveOnHeading":
                             drive_actions += 1
                             previous_distance = distance
                             continue
                         break
                     if replan_required:
+                        if pending_drive_handoff:
+                            self._wait_balanced_idle(cancelled=cancelled)
+                            pending_drive_handoff = False
                         break
                 if replan_required:
                     continue
+                if pending_drive_handoff:
+                    self._wait_balanced_idle(cancelled=cancelled)
+                    pending_drive_handoff = False
                 final = self.backend.wait_fresh_map_pose().pose
                 return NavigationResult(
                     final_pose=final,
@@ -746,6 +789,14 @@ def _parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_COMMAND_TIMEOUT_S,
     )
+    parser.add_argument(
+        "--continuous-drive-handoff",
+        action="store_true",
+        help=(
+            "skip the balanced-IDLE evidence wait between contiguous "
+            "DriveOnHeading chunks; final/direction-change stops remain gated"
+        ),
+    )
     return parser
 
 
@@ -761,6 +812,7 @@ def main() -> int:
             backend,
             static_planner,
             command_timeout_s=args.command_timeout_seconds,
+            continuous_drive_handoff=args.continuous_drive_handoff,
         )
         server = StrictNavigationActionServer(backend, executor)
         try:

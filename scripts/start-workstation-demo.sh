@@ -20,6 +20,7 @@ HIDE_DEMO_SYSTEMD_PREFIX="h-ide-mujoco-demo"
 HIDE_DOCKER_OBSERVATION_BIND_REQUEST="${HIDE_DOCKER_OBSERVATION_BIND_HOST:-auto}"
 HIDE_DEMO_REBUILD=false
 HIDE_DEMO_MOTION_CORE=false
+HIDE_DEMO_CONTINUOUS_DRIVE_HANDOFF="${HIDE_CONTINUOUS_DRIVE_HANDOFF:-0}"
 HIDE_MUJOCO_ONSCREEN_VIEWER=0
 # Reversible simulation experiment: keep the learned SONIC whole-body policy
 # in control through automatic gait/navigation/health observations. Explicit
@@ -30,6 +31,11 @@ HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT="${HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_F
 if [[ "${HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT}" != "0" \
   && "${HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT}" != "1" ]]; then
   printf '%s\n' 'HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT must be exactly 0 or 1' >&2
+  exit 2
+fi
+if [[ "${HIDE_DEMO_CONTINUOUS_DRIVE_HANDOFF}" != "0" \
+  && "${HIDE_DEMO_CONTINUOUS_DRIVE_HANDOFF}" != "1" ]]; then
+  printf '%s\n' 'HIDE_CONTINUOUS_DRIVE_HANDOFF must be exactly 0 or 1' >&2
   exit 2
 fi
 
@@ -44,8 +50,11 @@ for argument in "$@"; do
     --motion-core)
       HIDE_DEMO_MOTION_CORE=true
       ;;
+    --continuous-drive-handoff)
+      HIDE_DEMO_CONTINUOUS_DRIVE_HANDOFF=1
+      ;;
     *)
-      printf 'usage: %s [--rebuild] [--viewer] [--motion-core]\n' "$0" >&2
+      printf 'usage: %s [--rebuild] [--viewer] [--motion-core] [--continuous-drive-handoff]\n' "$0" >&2
       exit 2
       ;;
   esac
@@ -69,6 +78,7 @@ export HIDE_DEMO_H_IDE_ROOT HIDE_DEMO_SIM_ROOT HIDE_DEMO_ROBOT_ROOT HIDE_DEMO_VI
 export HIDE_DEMO_CONFIG HIDE_DEMO_ROBOT_CONFIG HIDE_DEMO_OBSERVATION_CONFIG
 export HIDE_DEMO_CYCLONE DISPLAY="${DISPLAY:-:0}"
 export HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT
+export HIDE_DEMO_CONTINUOUS_DRIVE_HANDOFF
 HIDE_DEMO_XAUTHORITY="${XAUTHORITY:-${XDG_RUNTIME_DIR}/gdm/Xauthority}"
 if [[ "${HIDE_MUJOCO_ONSCREEN_VIEWER}" == "1" ]]; then
   HIDE_DEMO_XAUTHORITY_RESOLVED="$(
@@ -372,6 +382,7 @@ start_process() {
     --setenv="HIDE_DEMO_GATEWAY_TOKEN=${HIDE_DEMO_GATEWAY_TOKEN}" \
     --setenv="HIDE_DOCKER_OBSERVATION_BIND_HOST=${HIDE_DOCKER_OBSERVATION_BIND_HOST}" \
     --setenv="HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT=${HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT}" \
+    --setenv="HIDE_DEMO_CONTINUOUS_DRIVE_HANDOFF=${HIDE_DEMO_CONTINUOUS_DRIVE_HANDOFF}" \
     /bin/bash -lc "${command}" >/dev/null
 
   for _ in {1..30}; do
@@ -1092,11 +1103,19 @@ fi
 # motion owner that passed motion-core acceptance.  Start this adapter after
 # Nav2 lifecycle activation and before any component capable of acquiring a
 # RobotAgent lease.  NavigateToPose / FollowPath output remains quarantined.
+# In continuous handoff mode only the blocking balanced-IDLE wait between
+# contiguous DriveOnHeading chunks is skipped. The runner still publishes the
+# endpoint zero, revalidates fresh odometry/clearance, and gates final or
+# direction-changing stops.
+strict_navigation_command='source /opt/ros/jazzy/setup.bash; source "$HIDE_DEMO_ROBOT_ROOT/tools/activate-local-nav2-jazzy.bash"; export ROS_DOMAIN_ID=232 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp CYCLONEDDS_URI="$HIDE_DEMO_CYCLONE"; export PYTHONPATH="$HIDE_DEMO_SIM_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"; exec /usr/bin/python3 -u "$HIDE_DEMO_SIM_ROOT/tools/strict_navigation_adapter.py" --command-timeout-seconds 2400'
+if [[ "${HIDE_DEMO_CONTINUOUS_DRIVE_HANDOFF}" == "1" ]]; then
+  strict_navigation_command+=' --continuous-drive-handoff'
+fi
 start_process \
   strict-navigation-adapter \
   'tools/strict_navigation_adapter.py' \
   "${HIDE_DEMO_SIM_ROOT}" \
-  'source /opt/ros/jazzy/setup.bash; source "$HIDE_DEMO_ROBOT_ROOT/tools/activate-local-nav2-jazzy.bash"; export ROS_DOMAIN_ID=232 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp CYCLONEDDS_URI="$HIDE_DEMO_CYCLONE"; export PYTHONPATH="$HIDE_DEMO_SIM_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"; exec /usr/bin/python3 -u "$HIDE_DEMO_SIM_ROOT/tools/strict_navigation_adapter.py" --command-timeout-seconds 2400'
+  "${strict_navigation_command}"
 
 if ! wait_for_strict_navigation_adapter 30; then
   exit 1

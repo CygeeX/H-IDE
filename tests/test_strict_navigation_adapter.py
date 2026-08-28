@@ -24,6 +24,7 @@ class FakeBackend:
         self.sent: list[tuple[str, float]] = []
         self.cancel_calls = 0
         self.stop_calls = 0
+        self.health_calls = 0
 
     def wait_ready(self, *, timeout_s: float = 10.0) -> None:
         assert timeout_s > 0.0
@@ -78,6 +79,7 @@ class FakeBackend:
         self.stop_calls += 1
 
     def bridge_health(self):
+        self.health_calls += 1
         return {"healthy": True, "gaitState": "idle", "fault": None}
 
     def raise_if_faulted(self):
@@ -206,11 +208,17 @@ class FinalHeadingPlanner(FakePlanner):
         }
 
 
-def executor(backend: FakeBackend, planner: FakePlanner):
+def executor(
+    backend: FakeBackend,
+    planner: FakePlanner,
+    *,
+    continuous_drive_handoff: bool = False,
+):
     return adapter.StrictNavigationExecutor(
         backend,
         planner,
         sleep=lambda _seconds: None,
+        continuous_drive_handoff=continuous_drive_handoff,
     )
 
 
@@ -271,6 +279,28 @@ def test_navigate_realigns_long_drive_at_half_metre_boundaries() -> None:
         ("DriveOnHeading", 0.5),
         ("DriveOnHeading", 0.5),
     ]
+
+
+def test_continuous_drive_handoff_skips_only_intermediate_idle_wait() -> None:
+    backend = FakeBackend()
+    planner = FakePlanner()
+
+    result = executor(
+        backend,
+        planner,
+        continuous_drive_handoff=True,
+    ).navigate(runner.PlanarPose(1.0, 0.0, 0.2))
+
+    assert result.final_pose.x == pytest.approx(1.0)
+    assert backend.sent == [
+        ("Spin", 0.2),
+        ("DriveOnHeading", 0.5),
+        ("DriveOnHeading", 0.5),
+    ]
+    # The first Spin and the final Drive retain the ordinary balanced-IDLE
+    # gate; only the handoff between the two same-direction drive chunks is
+    # allowed to proceed without the blocking evidence wait.
+    assert backend.health_calls == 2
 
 
 def test_fresh_geometry_failure_replans_at_most_twice() -> None:
