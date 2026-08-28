@@ -385,6 +385,7 @@ def test_full_straight_drive_sends_the_whole_verified_segment_once() -> None:
         ("Spin", 0.2),
         ("DriveOnHeading", 3.0),
     ]
+    assert result.completed_primitives == 2
     assert planner.max_segment_values == [4.0]
     assert backend.health_calls == 2
 
