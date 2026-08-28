@@ -341,6 +341,44 @@ def test_continuous_drive_handoff_only_skips_an_intermediate_chunk() -> None:
     assert backend.health_calls == 2
 
 
+@pytest.mark.parametrize("clear", [True, False])
+def test_continuous_profile_uses_extra_map_clearance_gate(clear: bool) -> None:
+    class FakeMap:
+        @classmethod
+        def load(cls, _yaml_path, _image_path):
+            return cls()
+
+        def inflated_blocked_cells(self, _radius):
+            return frozenset()
+
+        def segment_is_clear(self, _start, _end, _blocked):
+            return clear
+
+    class ProductionLikePlanner(FakePlanner):
+        StaticMap = FakeMap
+
+    backend = FakeBackend()
+    planner = ProductionLikePlanner()
+    subject = executor(backend, planner, continuous_drive_handoff=True)
+    plan = {
+        "segments": [
+            {
+                "id": "segment-000",
+                "start_map": {"x": 0.0, "y": 0.0},
+                "end_map": {"x": 1.8, "y": 0.0},
+                "heading_map_yaw_rad": 0.0,
+            }
+        ]
+    }
+
+    allowed = subject._continuous_segment_allowed(
+        plan,
+        {"segment_id": "segment-000"},
+    )
+
+    assert allowed is clear
+
+
 def test_fresh_geometry_failure_replans_at_most_twice() -> None:
     backend = FakeBackend()
     planner = FakePlanner(fail_first_resolve=True)

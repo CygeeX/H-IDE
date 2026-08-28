@@ -50,7 +50,6 @@ CONTINUOUS_RUNTIME_DRIVE_CHUNK_M = 2.0
 # 0.50 m contour keeps the optimization away from door jambs, walls, and the
 # column detour where learned yaw/cross-track error needs frequent checkpoints.
 CONTINUOUS_RUNTIME_CLEARANCE_RADIUS_M = 0.50
-CONTINUOUS_HEADING_VARIATION_RAD = 0.15
 MAX_RUNTIME_DRIVE_ACTIONS_PER_SEGMENT = 8
 
 
@@ -154,21 +153,18 @@ class StrictNavigationExecutor:
             raise runner.StrictMotionRunnerError(f"{field} must be an object")
         return value
 
-    @staticmethod
-    def _wrapped_delta(current: float, previous: float) -> float:
-        return math.atan2(
-            math.sin(current - previous),
-            math.cos(current - previous),
-        )
-
-    def _continuous_plan_allowed(self, plan: Mapping[str, Any]) -> bool:
-        """Allow long chunks only on a straight, generously clear plan.
+    def _continuous_segment_allowed(
+        self,
+        plan: Mapping[str, Any],
+        primitive: Mapping[str, Any],
+    ) -> bool:
+        """Allow a long chunk only on one generously clear segment.
 
         The frozen profile deliberately revalidates every half metre.  The
         continuous profile is an optimization for open straight travel, not a
         blanket relaxation for turns or obstacle corridors.  The static
         planner is kept authoritative: if its map implementation is present,
-        every reviewed segment must also be clear at a larger 0.50 m contour.
+        the selected segment must also be clear at a larger 0.50 m contour.
         Small fake planners used by unit tests do not expose ``StaticMap`` and
         retain the old test-only behavior.
         """
@@ -178,32 +174,25 @@ class StrictNavigationExecutor:
         raw_segments = plan.get("segments")
         if not isinstance(raw_segments, list) or not raw_segments:
             return not hasattr(self.static_planner, "StaticMap")
-        segments: list[Mapping[str, Any]] = []
-        headings: list[float] = []
+        segment_id = primitive.get("segment_id")
+        selected: Mapping[str, Any] | None = None
         for index, raw in enumerate(raw_segments):
             if not isinstance(raw, Mapping):
                 return False
-            try:
-                start = self._mapping(raw.get("start_map"), f"segment {index} start")
-                end = self._mapping(raw.get("end_map"), f"segment {index} end")
-                heading = self._finite(
-                    raw.get("heading_map_yaw_rad"),
-                    f"segment {index} heading",
-                )
-                self._finite(start.get("x"), f"segment {index} start x")
-                self._finite(start.get("y"), f"segment {index} start y")
-                self._finite(end.get("x"), f"segment {index} end x")
-                self._finite(end.get("y"), f"segment {index} end y")
-            except runner.StrictMotionRunnerError:
-                return False
-            segments.append(raw)
-            headings.append(heading)
-        reference_heading = headings[0]
-        if any(
-            abs(self._wrapped_delta(heading, reference_heading))
-            > CONTINUOUS_HEADING_VARIATION_RAD
-            for heading in headings[1:]
-        ):
+            if segment_id is None or raw.get("id") == segment_id:
+                selected = raw
+                break
+        if selected is None:
+            return False
+        try:
+            start = self._mapping(selected.get("start_map"), "segment start")
+            end = self._mapping(selected.get("end_map"), "segment end")
+            self._finite(selected.get("heading_map_yaw_rad"), "segment heading")
+            self._finite(start.get("x"), "segment start x")
+            self._finite(start.get("y"), "segment start y")
+            self._finite(end.get("x"), "segment end x")
+            self._finite(end.get("y"), "segment end y")
+        except runner.StrictMotionRunnerError:
             return False
 
         # Production plans expose the map raster.  Do not silently enable the
@@ -220,17 +209,18 @@ class StrictNavigationExecutor:
                 self._continuous_blocked = self._continuous_map.inflated_blocked_cells(
                     CONTINUOUS_RUNTIME_CLEARANCE_RADIUS_M
                 )
-            for index, segment in enumerate(segments):
-                start = self._mapping(segment.get("start_map"), f"segment {index} start")
-                end = self._mapping(segment.get("end_map"), f"segment {index} end")
-                if not self._continuous_map.segment_is_clear(
-                    (self._finite(start.get("x"), f"segment {index} start x"),
-                     self._finite(start.get("y"), f"segment {index} start y")),
-                    (self._finite(end.get("x"), f"segment {index} end x"),
-                     self._finite(end.get("y"), f"segment {index} end y")),
-                    self._continuous_blocked,
-                ):
-                    return False
+            if not self._continuous_map.segment_is_clear(
+                (
+                    self._finite(start.get("x"), "segment start x"),
+                    self._finite(start.get("y"), "segment start y"),
+                ),
+                (
+                    self._finite(end.get("x"), "segment end x"),
+                    self._finite(end.get("y"), "segment end y"),
+                ),
+                self._continuous_blocked,
+            ):
+                return False
         except Exception:
             return False
         return True
@@ -491,12 +481,6 @@ class StrictNavigationExecutor:
                     raise runner.StrictMotionRunnerError(
                         "static primitive plan is empty"
                     )
-                continuous_plan_handoff = self._continuous_plan_allowed(verified)
-                plan_drive_chunk_m = (
-                    CONTINUOUS_RUNTIME_DRIVE_CHUNK_M
-                    if continuous_plan_handoff
-                    else MAX_RUNTIME_DRIVE_CHUNK_M
-                )
                 final_plan_hash = str(verified.get("plan_sha256", ""))
                 if not final_plan_hash:
                     raise runner.StrictMotionRunnerError(
@@ -508,6 +492,15 @@ class StrictNavigationExecutor:
                         raise runner.StrictMotionRunnerError(
                             "static primitive entry is invalid"
                         )
+                    continuous_plan_handoff = self._continuous_segment_allowed(
+                        verified,
+                        primitive,
+                    )
+                    plan_drive_chunk_m = (
+                        CONTINUOUS_RUNTIME_DRIVE_CHUNK_M
+                        if continuous_plan_handoff
+                        else MAX_RUNTIME_DRIVE_CHUNK_M
+                    )
                     realignments = 0
                     drive_actions = 0
                     previous_distance: float | None = None
