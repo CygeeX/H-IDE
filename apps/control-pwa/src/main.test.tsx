@@ -780,6 +780,20 @@ describe("control console", () => {
     expect(screen.queryByText("cmd_vel")).not.toBeInTheDocument();
   });
 
+  it("keeps the robot picker above Skill selection and out of the composer", async () => {
+    render(<App />);
+    await screen.findAllByText("robot-1");
+    const selector = document.querySelector(".leader-skill-robot-selector");
+    const skills = screen.getByRole("region", { name: "选择 Skill" });
+    expect(selector).toBeInTheDocument();
+    expect(skills.previousElementSibling).toBe(selector);
+    expect(document.querySelector(".composer-contexts .leader-robot-picker")).not.toBeInTheDocument();
+    expect(document.querySelector(".global-statusbar .leader-robot-picker")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "选择机器人" }));
+    expect(screen.getByRole("dialog", { name: "选择机器人" })).toBeInTheDocument();
+  });
+
   it("uses the durable conversation lifecycle API for history management", async () => {
     const fallback = vi.mocked(fetch).getMockImplementation();
     const conversation = {
@@ -925,7 +939,7 @@ describe("control console", () => {
     render(<App />);
     await screen.findAllByText("robot-1");
     fireEvent.click(screen.getByRole("button", { name: "任务历史" }));
-    expect(await screen.findByText("办公室完整巡检")).toBeInTheDocument();
+    expect((await screen.findAllByText("办公室完整巡检")).length).toBeGreaterThan(0);
     expect(Array.from(document.querySelectorAll(".history-open strong")).filter(
       (element) => element.textContent === "办公室完整巡检",
     )).toHaveLength(1);

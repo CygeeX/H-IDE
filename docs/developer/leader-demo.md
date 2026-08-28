@@ -19,25 +19,16 @@
 | 组件 | 位置 | 责任 |
 | --- | --- | --- |
 | Skill 卡片/模式上下文 | `apps/control-pwa/src/leader-demo.tsx` | 白名单 Skill、欢迎语、模式提示 |
-| 3D 头像 | `leader-demo.tsx` 的 `RobotAvatar3D` | Three.js + GLTFLoader、鼠标跟随、DOM 对话气泡 |
+| 助手头像 | `leader-demo.tsx` 的 `RobotAvatar` | 纯 CSS 光环/面板动效、DOM 对话气泡；不加载 GLB |
 | 机器人选择器 | `leader-demo.tsx` 的 `RobotPicker` | 三家公司展示卡；只有 Unitree 保持实际控制绑定 |
 | 会话接入 | `apps/control-pwa/src/main.tsx` | Skill 状态、`skillId` advisory 字段、语音朗读与挥手触发 |
-| 主题 | `apps/control-pwa/src/chat-shell.css` | 登录页/会话页 3D 展示、卡片和气泡样式 |
+| 主题 | `apps/control-pwa/src/chat-shell.css` | 登录页/会话页 CSS 头像、卡片和气泡样式 |
 
 ### 2.1 资源
 
-资源位于 `apps/control-pwa/public/assets/leader-demo/`。原始文件的 SHA-256、来源
-类型和控制后端映射记录在 `asset-manifest.json`。头像 GLB 的 SHA-256 为：
-
-```text
-1ea6fee4a1907f966f40969b929d85a2ea4acda92ef6e3e68bcd1f4b5a281e33
-```
-
-GLB 没有动画、骨骼或相机，只用于视觉展示。它的来源许可尚未完成外部核验；
-公开发布前必须完成授权，或将该二进制放入内部 artifact 并由部署环境提供。
-
-PWA 依赖固定版本 `three@0.185.1` 与 `@types/three@0.185.4`。服务 worker 使用
-带 hash 的 GLB URL（`?v=...`），避免旧缓存遮蔽新模型。
+资源位于 `apps/control-pwa/public/assets/leader-demo/`。品牌和机器人选择卡仍
+使用本地 PNG；助手头像由 CSS 绘制，不再依赖 GLB、Three.js、GLTFLoader 或
+WebGL 初始化。
 
 ## 3. Skill 请求契约
 
@@ -156,8 +147,8 @@ HIDE_LEADER_DEMO_GESTURES_ENABLED=true \
 
 ## 7. 故障定位
 
-- 页面只有文字头像：检查浏览器 WebGL、`/assets/leader-demo/models/h-ide-head.glb`
-  静态托管和网络面板；PWA 测试环境会有意显示 fallback。
+- 页面头像异常：检查 `leader-demo.tsx` 与 `chat-shell.css` 的 CSS 动效；当前头像
+  不依赖 WebGL、GLB 或模型静态托管。
 - 语音正常但没有挥手：检查 Control API 容器的三个 gesture 环境变量、
   `host.docker.internal:8798/healthz` 连通性，以及 SONIC telemetry 的
   `gesture_state`。

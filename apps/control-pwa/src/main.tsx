@@ -49,7 +49,7 @@ import {
 import {
   browserSpeakChinese,
   LEADER_SKILLS,
-  RobotAvatar3D,
+  RobotAvatar,
   RobotPicker,
   SkillModeBanner,
   SkillSelection,
@@ -557,7 +557,7 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (session: AuthSessio
   };
 
   return <main className="auth-shell">
-    <section className="auth-intro"><span className="auth-logo"><img src="/assets/leader-demo/brand/h-ide-logo.png" alt="H-IDE" /></span><p className="eyebrow">H-IDE ASSISTANT</p><h1>让人与机器人自然协作</h1><p>聊天、视觉观察与机器人任务都在同一个连续会话里；真正的行动始终受权限与安全边界约束。</p><RobotAvatar3D speech="你好，我是 H-IDE。准备好开始今天的协作了吗？" /></section>
+    <section className="auth-intro"><span className="auth-logo"><img src="/assets/leader-demo/brand/h-ide-logo.png" alt="H-IDE" /></span><p className="eyebrow">H-IDE ASSISTANT</p><h1>让人与机器人自然协作</h1><p>聊天、视觉观察与机器人任务都在同一个连续会话里；真正的行动始终受权限与安全边界约束。</p><RobotAvatar speech="你好，我是 H-IDE。准备好开始今天的协作了吗？" /></section>
     <section className="auth-card" aria-label={mode === "login" ? "登录 H-IDE" : "注册 H-IDE"}>
       <div className="auth-tabs"><button className={mode === "login" ? "active" : ""} type="button" onClick={() => setMode("login")}>登录</button><button className={mode === "register" ? "active" : ""} type="button" onClick={() => setMode("register")}>注册</button></div>
       <form onSubmit={submit}>
@@ -2497,14 +2497,9 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
         onLogout={onLogout}
       />
       {developerMode ? <StatusBar
-        robots={robots}
         robot={selectedRobot}
-        selectedRobotId={selectedRobotId}
-        selectedDisplayId={selectedDisplayRobotId}
         connection={connection}
         taskStatus={activeTaskStatus}
-        onRobotChange={selectRobotForNewTask}
-        onDisplayChange={setSelectedDisplayRobotId}
         onStop={() => submitCommand("stop", {})}
         stopDisabled={!selectedRobot || connection !== "live" || busy || !capabilities?.capabilities.includes("stop")}
       /> : null}
@@ -2517,6 +2512,7 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
         missionMessages={missionMessages}
         robots={robots}
         robot={selectedRobot}
+        selectedRobotId={selectedRobotId}
         turn={assistantTurn}
         draft={draft}
         text={assistantText}
@@ -2816,31 +2812,20 @@ function poseFreshness(robot: RobotState | null): { label: string; stale: boolea
 }
 
 function StatusBar({
-  robots,
   robot,
-  selectedRobotId,
-  selectedDisplayId,
   connection,
   taskStatus,
-  onRobotChange,
-  onDisplayChange,
   onStop,
   stopDisabled,
 }: {
-  robots: RobotState[];
   robot: RobotState | null;
-  selectedRobotId: string;
-  selectedDisplayId: RobotDisplayOption["id"];
   connection: ConnectionState;
   taskStatus: string;
-  onRobotChange: (robotId: string) => void;
-  onDisplayChange: (displayId: RobotDisplayOption["id"]) => void;
   onStop: () => void;
   stopDisabled: boolean;
 }) {
   const pose = poseFreshness(robot);
   return <div className="global-statusbar" aria-label="当前控制上下文">
-    <RobotPicker robots={robots} selectedRobotId={selectedRobotId} selectedDisplayId={selectedDisplayId} onRobotChange={onRobotChange} onDisplayChange={onDisplayChange} compact />
     <span className={`status-context connection-${connection}`}><span className="context-dot" />{connection === "live" ? "工作站在线" : connection === "connecting" ? "正在连接" : "工作站离线"}</span>
     <span className={`status-context ${pose.stale ? "stale" : "ready"}`}><Icon name="activity" />{pose.label}</span>
     <span className="status-context task-context">任务 <StatusPill value={taskStatus} /></span>
@@ -3136,6 +3121,7 @@ function ChatWorkspace({
   missionMessages,
   robots,
   robot,
+  selectedRobotId,
   turn,
   draft,
   text,
@@ -3190,6 +3176,7 @@ function ChatWorkspace({
   missionMessages: AssistantMessage[];
   robots: RobotState[];
   robot: RobotState | null;
+  selectedRobotId: string;
   turn: AssistantTurn | null;
   draft: AssistantDraft | null;
   text: string;
@@ -3345,9 +3332,22 @@ function ChatWorkspace({
     /> : null}
     {draft?.status === "confirmed" && lastReceipt && !isVisualMissionPlan(draft.plan) ? <ExecutionCard receipt={lastReceipt} /> : null}
   </> : null;
+  const renderLeaderRobotPicker = () => (
+    <div className="leader-skill-robot-selector">
+      <span className="leader-skill-robot-label">当前演示机器人</span>
+      <RobotPicker
+        robots={robots}
+        selectedRobotId={selectedRobotId}
+        selectedDisplayId={selectedDisplayId}
+        onRobotChange={onRobotChange}
+        onDisplayChange={onDisplayRobotChange}
+        compact={developerMode}
+      />
+    </div>
+  );
   return <main className="chat-workspace">
     <aside className="leader-avatar-rail" aria-label="H-IDE 机器人助手">
-      <RobotAvatar3D compact speech={selectedSkill ? latestAssistantSpeech : undefined} />
+      <RobotAvatar compact speech={selectedSkill ? latestAssistantSpeech : undefined} />
     </aside>
     <div className="chat-timeline" ref={timelineRef} aria-live="polite">
       <div className="chat-thread">
@@ -3356,10 +3356,11 @@ function ChatWorkspace({
           <h1>今天想和我做什么？</h1>
           <span className="sr-only">今天想和机器人做什么？</span>
           <p>先选择一个 Skill，再用中文告诉我目标。巡检会进入办公室并汇总信息；语音助手会直接用声音回应。</p>
+          {renderLeaderRobotPicker()}
           <SkillSelection selected={selectedSkill} onSelect={onSelectSkill} />
           <div className="suggestion-grid">{suggestions.map((prompt) => <button key={prompt} type="button" onClick={() => onPrompt(prompt)}>{prompt}<Icon name="chevron" /></button>)}</div>
         </section> : null}
-        {activeSkill ? <div className="leader-session-context"><SkillModeBanner skill={activeSkill} onClear={onClearSkill} />{skillGreeting ? <article className="leader-skill-greeting"><div className="message-author"><span className="agent-avatar"><Icon name="spark" /></span>H-IDE</div><div className="message-body">{skillGreeting}</div></article> : null}</div> : null}
+        {activeSkill ? <div className="leader-session-context">{empty ? null : renderLeaderRobotPicker()}<SkillModeBanner skill={activeSkill} onClear={onClearSkill} />{skillGreeting ? <article className="leader-skill-greeting"><div className="message-author"><span className="agent-avatar"><Icon name="spark" /></span>H-IDE</div><div className="message-body">{skillGreeting}</div></article> : null}</div> : null}
         {timeline.map((item) => <section
           className="conversation-turn"
           data-task-id={item.taskId ?? undefined}
@@ -3390,7 +3391,7 @@ function ChatWorkspace({
     </div>
     <div className="composer-region">
       <form className="chat-composer" onSubmit={onSubmit}>
-        <div className="composer-contexts"><RobotPicker robots={robots} selectedRobotId={robot?.robotId ?? ""} selectedDisplayId={selectedDisplayId} onRobotChange={onRobotChange} onDisplayChange={onDisplayRobotChange} />{developerMode ? <span className={`composer-health ${robot?.connected ? "connected" : "offline"}`}>{robot?.connected ? "代理在线" : "代理离线"}</span> : null}<button className={voiceReplyEnabled ? "attached" : ""} type="button" onClick={onToggleVoiceReplies} aria-label={voiceReplyEnabled ? "关闭语音回复" : "开启语音回复"}><Icon name="volume" />{voiceReplyEnabled ? "语音回复开" : "语音回复关"}</button>{developerMode ? <span>{voiceCaptureMode === "streaming" ? "流式 ASR" : "离线 WAV 降级"}</span> : null}</div>
+        <div className="composer-contexts">{developerMode ? <span className={`composer-health ${robot?.connected ? "connected" : "offline"}`}>{robot?.connected ? "代理在线" : "代理离线"}</span> : null}<button className={voiceReplyEnabled ? "attached" : ""} type="button" onClick={onToggleVoiceReplies} aria-label={voiceReplyEnabled ? "关闭语音回复" : "开启语音回复"}><Icon name="volume" />{voiceReplyEnabled ? "语音回复开" : "语音回复关"}</button>{developerMode ? <span>{voiceCaptureMode === "streaming" ? "流式 ASR" : "离线 WAV 降级"}</span> : null}</div>
         <textarea id="assistant-task" aria-label="任务描述" value={text} onChange={(event) => setText(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} rows={1} maxLength={4000} placeholder={connection === "live" ? "描述任务，或点击麦克风说话…" : "工作站离线，任务草稿不会发送"} disabled={connection !== "live"} />
         {voiceUi.partial ? <div className="voice-live-transcript" role="status" aria-live="polite"><span className="voice-wave" /> <b>{voiceUi.phase === "finalizing" ? "已识别" : "正在听"}</b><span>{voiceUi.partial}</span></div> : null}
         <div className="composer-actions"><div><button className={`composer-icon-button voice-button ${recording ? "recording" : ""}`} type="button" onClick={onVoice} disabled={voiceBusy || busy || connection !== "live"} aria-label={recording ? "停止录音并发送" : "开始语音输入"}><Icon name="mic" /></button><span className="composer-hint">{recording ? (voiceCaptureMode === "streaming" ? "流式聆听中，再次点击结束" : "离线录音中，再次点击批量转写") : voiceBusy ? "正在识别并发送…" : "Enter 发送 · Shift+Enter 换行"}</span></div><button className="send-button" type="submit" disabled={busy || !text.trim() || connection !== "live"} aria-label="发送给 H-IDE"><Icon name="send" /></button></div>

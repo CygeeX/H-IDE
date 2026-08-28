@@ -32,14 +32,6 @@
       "source": "operator-provided:unitree_matte_head_web.png",
       "license": "operator-provided-local-asset",
       "controlBackend": "unitree-g1-sim"
-    },
-    {
-      "id": "avatar.h-ide-head",
-      "path": "/assets/leader-demo/models/h-ide-head.glb",
-      "sha256": "1ea6fee4a1907f966f40969b929d85a2ea4acda92ef6e3e68bcd1f4b5a281e33",
-      "source": "operator-provided:tmp7220h_2s.glb",
-      "license": "unknown-local-provenance",
-      "notes": "Static display mesh; no animation, skin, camera, or control semantics. Keep private until provenance is cleared."
     }
   ]
 }

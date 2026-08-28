@@ -1,6 +1,4 @@
-import { useEffect, useRef, useState } from "react";
-import * as THREE from "three";
-import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
+import { useEffect, useState } from "react";
 import type { RobotState } from "./contracts";
 
 /** The two operator-facing entry points used by the leader demonstration. */
@@ -144,6 +142,14 @@ export function RobotPicker({
   const [open, setOpen] = useState(false);
   const selected = ROBOT_DISPLAY_OPTIONS.find((item) => item.id === selectedDisplayId) ?? ROBOT_DISPLAY_OPTIONS[0];
   const boundRobot = robots.find((item) => item.robotId === selectedRobotId);
+  useEffect(() => {
+    if (!open) return undefined;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [open]);
   const choose = (option: RobotDisplayOption) => {
     onDisplayChange(option.id);
     // Only Unitree is wired to the live/simulation backend in this demo.
@@ -173,6 +179,7 @@ export function RobotPicker({
         onClick={() => setOpen((value) => !value)}
         aria-expanded={open}
         aria-haspopup="dialog"
+        aria-controls="leader-robot-options"
         aria-label="选择机器人"
       >
         <img src={selected.image} alt="" />
@@ -181,10 +188,10 @@ export function RobotPicker({
         <i aria-hidden="true">⌄</i>
       </button>
       {open ? (
-        <>
+        <div className="leader-picker-modal-layer">
           <button className="leader-picker-scrim" type="button" onClick={() => setOpen(false)} aria-label="关闭机器人选择" />
-          <div className="leader-robot-options" role="dialog" aria-label="机器人型号选择">
-            <header><strong>选择机器人</strong><small>当前演示只调用宇树 G1 控制链路</small></header>
+          <div className="leader-robot-options" id="leader-robot-options" role="dialog" aria-modal="true" aria-labelledby="leader-robot-options-title">
+            <header><span><strong id="leader-robot-options-title">选择机器人</strong><small>当前演示只调用宇树 G1 控制链路</small></span><button className="leader-robot-options-close" type="button" onClick={() => setOpen(false)} aria-label="关闭机器人选择">×</button></header>
             <div className="leader-robot-option-grid">
               {ROBOT_DISPLAY_OPTIONS.map((option) => (
                 <button
@@ -200,7 +207,7 @@ export function RobotPicker({
               ))}
             </div>
           </div>
-        </>
+        </div>
       ) : null}
     </div>
   );
@@ -220,146 +227,30 @@ export function browserSpeakChinese(text: string): boolean {
   return true;
 }
 
-interface RobotAvatar3DProps {
+interface RobotAvatarProps {
   speech?: string;
   compact?: boolean;
   className?: string;
 }
 
-/** Lightweight Three.js wrapper used by both login and conversation shells. */
-export function RobotAvatar3D({ speech, compact = false, className = "" }: RobotAvatar3DProps) {
-  const hostRef = useRef<HTMLDivElement | null>(null);
-  const modelRef = useRef<THREE.Object3D | null>(null);
-  const pointerRef = useRef({ x: 0, y: 0 });
-  const targetRef = useRef({ x: 0, y: 0 });
-  const [loadError, setLoadError] = useState(false);
-  useEffect(() => {
-    const host = hostRef.current;
-    if (!host) return undefined;
-    let disposed = false;
-    if (typeof navigator !== "undefined" && /jsdom/i.test(navigator.userAgent)) {
-      setLoadError(true);
-      return undefined;
-    }
-    const scene = new THREE.Scene();
-    const camera = new THREE.PerspectiveCamera(28, 1, 0.01, 100);
-    camera.position.set(0, 0.05, compact ? 3.25 : 3.1);
-    let renderer: THREE.WebGLRenderer;
-    try {
-      renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true, powerPreference: "high-performance" });
-    } catch {
-      // Headless test runners and browsers without WebGL still receive the
-      // semantic avatar/speech shell; a real browser uses the full GLB path.
-      setLoadError(true);
-      return undefined;
-    }
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
-    renderer.setClearColor(0x000000, 0);
-    renderer.outputColorSpace = THREE.SRGBColorSpace;
-    renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    renderer.toneMappingExposure = 1.15;
-    host.appendChild(renderer.domElement);
-    const ambient = new THREE.HemisphereLight(0xf5ecff, 0x3c2b56, 2.4);
-    scene.add(ambient);
-    const key = new THREE.DirectionalLight(0xffffff, 3.1);
-    key.position.set(2.4, 3.2, 4.5);
-    scene.add(key);
-    const rim = new THREE.PointLight(0x8bdcff, 2.2, 8);
-    rim.position.set(-2, 1, 2);
-    scene.add(rim);
-    const ring = new THREE.Mesh(
-      new THREE.TorusGeometry(compact ? 0.7 : 0.82, 0.012, 8, 96),
-      new THREE.MeshBasicMaterial({ color: 0xa394ff, transparent: true, opacity: 0.45 }),
-    );
-    ring.rotation.x = Math.PI / 2;
-    ring.position.y = -0.54;
-    scene.add(ring);
-    const loader = new GLTFLoader();
-    loader.load(
-      "/assets/leader-demo/models/h-ide-head.glb?v=1ea6fee4",
-      (gltf) => {
-        if (disposed) return;
-        const model = gltf.scene;
-        const bounds = new THREE.Box3().setFromObject(model);
-        const size = bounds.getSize(new THREE.Vector3());
-        const center = bounds.getCenter(new THREE.Vector3());
-        const scale = 1.35 / Math.max(size.x, size.y, size.z, 0.01);
-        model.scale.setScalar(scale);
-        model.position.set(-center.x * scale, -center.y * scale - 0.28, -center.z * scale);
-        model.traverse((object) => {
-          if (object instanceof THREE.Mesh) {
-            object.castShadow = false;
-            object.receiveShadow = false;
-            const material = object.material;
-            if (Array.isArray(material)) material.forEach((item) => { item.needsUpdate = true; });
-            else if (material) material.needsUpdate = true;
-          }
-        });
-        modelRef.current = model;
-        scene.add(model);
-      },
-      undefined,
-      () => { if (!disposed) setLoadError(true); },
-    );
-    const resize = () => {
-      const width = Math.max(1, host.clientWidth);
-      const height = Math.max(1, host.clientHeight);
-      camera.aspect = width / height;
-      camera.updateProjectionMatrix();
-      renderer.setSize(width, height, false);
-    };
-    const onPointerMove = (event: PointerEvent) => {
-      const bounds = host.getBoundingClientRect();
-      if (!bounds.width || !bounds.height) return;
-      pointerRef.current.x = Math.max(-1, Math.min(1, ((event.clientX - bounds.left) / bounds.width) * 2 - 1));
-      pointerRef.current.y = Math.max(-1, Math.min(1, ((event.clientY - bounds.top) / bounds.height) * 2 - 1));
-      targetRef.current.x = pointerRef.current.y * 0.18;
-      targetRef.current.y = pointerRef.current.x * 0.35;
-    };
-    const onPointerLeave = () => { targetRef.current.x = 0; targetRef.current.y = 0; };
-    host.addEventListener("pointermove", onPointerMove);
-    host.addEventListener("pointerleave", onPointerLeave);
-    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(resize);
-    observer?.observe(host);
-    resize();
-    let frame = 0;
-    const animate = () => {
-      if (disposed) return;
-      frame = window.requestAnimationFrame(animate);
-      const model = modelRef.current;
-      if (model) {
-        model.rotation.x += (targetRef.current.x - model.rotation.x) * 0.08;
-        model.rotation.y += (targetRef.current.y - model.rotation.y) * 0.08;
-      }
-      ring.rotation.z += 0.004;
-      renderer.render(scene, camera);
-    };
-    animate();
-    return () => {
-      disposed = true;
-      window.cancelAnimationFrame(frame);
-      observer?.disconnect();
-      host.removeEventListener("pointermove", onPointerMove);
-      host.removeEventListener("pointerleave", onPointerLeave);
-      modelRef.current = null;
-      scene.traverse((object) => {
-        if (object instanceof THREE.Mesh) {
-          object.geometry.dispose();
-          const material = object.material;
-          if (Array.isArray(material)) material.forEach((item) => item.dispose());
-          else material?.dispose();
-        }
-      });
-      renderer.dispose();
-      renderer.domElement.remove();
-    };
-  }, [compact]);
+/** CSS-only assistant avatar. It avoids a heavyweight/low-quality GLB while
+ * preserving the themed motion and speech bubble used by the demo shell. */
+export function RobotAvatar({ speech, compact = false, className = "" }: RobotAvatarProps) {
   return (
-    <div className={`robot-avatar-3d ${compact ? "compact" : ""} ${loadError ? "load-error" : ""} ${className}`}>
-      <div className="robot-avatar-3d-canvas" ref={hostRef} aria-label="H-IDE 机器人 3D 头像" />
-      <div className="robot-avatar-3d-glow" aria-hidden="true" />
+    <div className={`robot-avatar ${compact ? "compact" : ""} ${className}`}>
+      <div className="robot-avatar-orbit" aria-hidden="true">
+        <span className="robot-avatar-ring ring-a" />
+        <span className="robot-avatar-ring ring-b" />
+        <div className="robot-avatar-face" aria-label="H-IDE 机器人头像">
+          <div className="robot-avatar-visor"><i /><i /><b /></div>
+          <span className="robot-avatar-mark"><img src="/assets/leader-demo/brand/h-ide-logo.png" alt="" /></span>
+        </div>
+      </div>
       {speech ? <div className="robot-speech-bubble" role="status">{speech}</div> : null}
-      {loadError ? <span className="robot-avatar-3d-fallback" aria-hidden="true">H</span> : null}
     </div>
   );
 }
+
+// Kept as a source-compatible alias for integrations that imported the old
+// name; it no longer loads or renders a GLB.
+export const RobotAvatar3D = RobotAvatar;

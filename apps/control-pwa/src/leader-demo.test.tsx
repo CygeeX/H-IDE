@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   LEADER_SKILLS,
   ROBOT_DISPLAY_OPTIONS,
+  RobotAvatar,
   RobotPicker,
   SkillSelection,
   browserSpeakChinese,
@@ -29,9 +30,10 @@ describe("leader demo entry points", () => {
         selectedDisplayId="unitree"
         onRobotChange={onRobotChange}
         onDisplayChange={onDisplayChange}
-      />,
+    />,
     );
     fireEvent.click(screen.getByRole("button", { name: "选择机器人" }));
+    expect(screen.getByRole("dialog", { name: "选择机器人" })).toHaveAttribute("aria-modal", "true");
     expect(screen.getByText(/智元 AgiBot/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /智元 AgiBot/ }));
     expect(onDisplayChange).toHaveBeenCalledWith("agibot");
@@ -41,6 +43,13 @@ describe("leader demo entry points", () => {
       "agibot",
       "deeprobotics",
     ]);
+  });
+
+  it("uses the CSS avatar without a GLB canvas", () => {
+    render(<RobotAvatar speech="你好" />);
+    expect(screen.getByLabelText("H-IDE 机器人头像")).toBeInTheDocument();
+    expect(screen.queryByRole("img", { name: /GLB/i })).not.toBeInTheDocument();
+    expect(document.querySelector("canvas")).not.toBeInTheDocument();
   });
 
   it("does not throw when browser speech synthesis is unavailable", () => {

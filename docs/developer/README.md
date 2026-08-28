@@ -13,9 +13,9 @@
 目标仍由 Office V2 场景目录解析，行动仍经过 Mission V2 审核与 Robot Agent →
 Nav2 → SONIC → MuJoCo 链路。
 
-`leader-demo` 的 GLB 是会话/登录页的静态展示头像，不是地图模型、3DGS 输入或
-运动控制模型。地图审计/PLY/3DGS 设计应使用独立的 scene-explorer worker，不能
-把头像 GLB 当作场景事实。
+`leader-demo` 的助手头像是会话/登录页的纯 CSS 展示组件，不是地图模型、3DGS 输入
+或运动控制模型。地图审计/PLY/3DGS 设计应使用独立的 scene-explorer worker，不能
+把演示头像当作场景事实。
 
 ## 分支与回退
 
