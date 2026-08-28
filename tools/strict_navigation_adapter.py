@@ -325,6 +325,7 @@ class StrictNavigationExecutor:
         completed = 0
         final_plan_hash = ""
         pending_drive_handoff = False
+        pending_drive_direction: int | None = None
         try:
             self.backend.wait_ready(timeout_s=10.0)
             recovery_pose = self.backend.wait_fresh_map_pose()
@@ -361,6 +362,7 @@ class StrictNavigationExecutor:
                     if pending_drive_handoff:
                         self._wait_balanced_idle(cancelled=cancelled)
                         pending_drive_handoff = False
+                        pending_drive_direction = None
                     return NavigationResult(
                         final_pose=fresh_before_plan.pose,
                         plan_sha256=self._terminal_path_sha256(navfn_path, goal),
@@ -444,11 +446,13 @@ class StrictNavigationExecutor:
                             if pending_drive_handoff:
                                 self._wait_balanced_idle(cancelled=cancelled)
                                 pending_drive_handoff = False
+                                pending_drive_direction = None
                             break
                         if disposition == "realign_spin_required":
                             if pending_drive_handoff:
                                 self._wait_balanced_idle(cancelled=cancelled)
                                 pending_drive_handoff = False
+                                pending_drive_direction = None
                             if realignments >= runner.MAX_DRIVE_REALIGNMENT_SPINS:
                                 raise runner.StrictMotionRunnerError(
                                     "DriveOnHeading exceeded bounded realignment"
@@ -483,6 +487,37 @@ class StrictNavigationExecutor:
                                 "static primitive could not be executed"
                             )
                         action_type = resolved.get("action_type")
+                        drive_direction: int | None = None
+                        if action_type == "nav2_msgs/action/DriveOnHeading":
+                            raw_goal = self._mapping(
+                                resolved.get("action_goal"),
+                                "resolved action goal",
+                            )
+                            raw_target = self._mapping(
+                                raw_goal.get("target"),
+                                "resolved DriveOnHeading target",
+                            )
+                            raw_distance = self._finite(
+                                raw_target.get("x"),
+                                "resolved DriveOnHeading command distance",
+                            )
+                            if abs(raw_distance) <= 1e-9:
+                                raise runner.StrictMotionRunnerError(
+                                    "resolved DriveOnHeading command distance is zero"
+                                )
+                            drive_direction = 1 if raw_distance > 0.0 else -1
+                        # A pending no-wait handoff is valid only for another
+                        # DriveOnHeading in the same signed direction. Flush it
+                        # before a Spin, a reverse/recovery drive, or any other
+                        # transition so the learned policy gets its ordinary
+                        # balanced-IDLE boundary.
+                        if pending_drive_handoff and (
+                            action_type != "nav2_msgs/action/DriveOnHeading"
+                            or drive_direction != pending_drive_direction
+                        ):
+                            self._wait_balanced_idle(cancelled=cancelled)
+                            pending_drive_handoff = False
+                            pending_drive_direction = None
                         distance = None
                         if action_type == "nav2_msgs/action/DriveOnHeading":
                             distance = self._finite(
@@ -559,7 +594,12 @@ class StrictNavigationExecutor:
                             wait_for_idle=wait_for_idle,
                         )
                         completed += 1
-                        pending_drive_handoff = not wait_for_idle
+                        pending_drive_handoff = (
+                            kind == "DriveOnHeading" and not wait_for_idle
+                        )
+                        pending_drive_direction = (
+                            drive_direction if pending_drive_handoff else None
+                        )
                         if kind == "DriveOnHeading":
                             drive_actions += 1
                             previous_distance = distance
@@ -569,12 +609,14 @@ class StrictNavigationExecutor:
                         if pending_drive_handoff:
                             self._wait_balanced_idle(cancelled=cancelled)
                             pending_drive_handoff = False
+                            pending_drive_direction = None
                         break
                 if replan_required:
                     continue
                 if pending_drive_handoff:
                     self._wait_balanced_idle(cancelled=cancelled)
                     pending_drive_handoff = False
+                    pending_drive_direction = None
                 final = self.backend.wait_fresh_map_pose().pose
                 return NavigationResult(
                     final_pose=final,
@@ -696,6 +738,8 @@ class StrictNavigationActionServer:
                 "schemaVersion": ADAPTER_SCHEMA,
                 "healthy": healthy,
                 "active": active,
+                "continuousDriveHandoff": self.executor.continuous_drive_handoff,
+                "runtimeDriveChunkM": self.executor.runtime_drive_chunk_m,
                 "bridge": bridge,
                 "error": detail,
             },
