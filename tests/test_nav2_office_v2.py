@@ -132,8 +132,7 @@ def test_both_nav2_costmaps_use_the_office_v2_static_geometry() -> None:
         assert costmap["footprint_padding"] == navigation["footprint_padding_m"]
 
 
-def test_evaluation_only_grid_proves_static_column_requires_a_forward_detour(
-) -> None:
+def test_evaluation_only_grid_keeps_the_central_corridor_open_for_the_demo() -> None:
     """Prove map feasibility without exposing privileged coordinates at runtime."""
     generated = ROOT / "scenes" / "office_v2" / "generated"
     evaluation = json.loads(
@@ -148,11 +147,7 @@ def test_evaluation_only_grid_proves_static_column_requires_a_forward_detour(
     params = _nav2_params()
     global_costmap = params["global_costmap"]["global_costmap"]["ros__parameters"]
 
-    case = next(
-        item
-        for item in evaluation["semantic_tests"]
-        if item["id"] == "nav_avoid_corridor_column"
-    )
+    case = next(item for item in evaluation["semantic_tests"] if item["id"] == "nav_central_corridor")
     start_pose = next(item for item in evaluation["spawns"] if item["default"])[
         "pose"
     ]
@@ -197,14 +192,11 @@ def test_evaluation_only_grid_proves_static_column_requires_a_forward_detour(
     assert start not in blocked
     assert goal not in blocked
 
-    # The approved endpoints share a row, and the static column blocks that
-    # straight chord. A collision-free grid route must therefore turn around
-    # fixed geometry instead of succeeding as a straight/no-op command.
+    # The former decorative central column is intentionally gone. The direct
+    # corridor chord should therefore remain free so the full-straight demo
+    # can traverse it without a synthetic detour.
     start_column, goal_column = sorted((start[1], goal[1]))
-    assert any(
-        (start[0], column) in blocked
-        for column in range(start_column, goal_column + 1)
-    )
+    assert not any((start[0], column) in blocked for column in range(start_column, goal_column + 1))
 
     frontier: list[tuple[float, tuple[int, int]]] = [(0.0, start)]
     costs = {start: 0.0}
@@ -228,7 +220,7 @@ def test_evaluation_only_grid_proves_static_column_requires_a_forward_detour(
             heappush(frontier, (cost + heuristic, candidate))
 
     assert goal in costs
-    assert costs[goal] > math.hypot(goal[0] - start[0], goal[1] - start[1])
+    assert costs[goal] == pytest.approx(math.hypot(goal[0] - start[0], goal[1] - start[1]))
 
     # Reconstruct the accepted route and re-check every swept grid edge. This
     # keeps a later search refactor from accidentally bypassing the no-corner-

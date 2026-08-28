@@ -10,7 +10,7 @@
   "map": {
     "frameId": "map",
     "heightCells": 240,
-    "imageSha256": "47b2ddd54d9f0aa2a220d5b79afcee367cbaa7a57068e4809189f24ab207360d",
+    "imageSha256": "c76ec21602efe452ea42695ec29f00f16ff11b4fbdc49182a93652ff32fc5a57",
     "origin": [
       -8.0,
       -6.0,
@@ -18,7 +18,7 @@
     ],
     "resolution": 0.05,
     "widthCells": 320,
-    "yamlSha256": "50b8a333887413053c6ddd3d6888819fc6c78093969948d980a1346a540ff71f"
+    "yamlSha256": "2601597bc5557849e715565a3040f5cb5c5b5f9d227ac83d54bf37ad2faaa5e6"
   },
   "regions": [
     {
@@ -620,6 +620,6 @@
     "corridor_east"
   ],
   "sceneId": "office_v2",
-  "sceneSourceSha256": "7c30b7c4bb3e8136659688c80b8bef97724aae79aa7fd0f82deb96b227ca98ff",
+  "sceneSourceSha256": "0b3368f15295bf14ad163c13ed58f458aa8812bb391c7cf070bb007931ffa0ec",
   "schemaVersion": "h-ide.office-inspection/1"
 }

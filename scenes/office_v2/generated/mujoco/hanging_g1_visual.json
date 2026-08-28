@@ -1,0 +1,2242 @@
+{
+  "actuators": "none",
+  "collision": "none",
+  "groundOffset": 0.7574907452582463,
+  "meshes": [
+    {
+      "meshFile": "models/unitree-g1-mujoco/assets/meshes/head_link.STL",
+      "meshName": "head_link",
+      "position": [
+        0.0036874423118083127,
+        2.4814250502793286e-05,
+        0.4291317963124549
+      ],
+      "quaternion": [
+        0.999740185018941,
+        1.3327356330234592e-05,
+        0.022793843601353406,
+        5.453945449828206e-05
+      ],
+      "rgba": [
+        0.20000000298023224,
+        0.20000000298023224,
+        0.20000000298023224,
+        1.0
+      ]
+    },
+    {
+      "meshFile": "models/unitree-g1-mujoco/assets/meshes/left_ankle_pitch_link.STL",
+      "meshName": "left_ankle_pitch_link",
+      "position": [
+        -0.005577546921953935,
+        0.11856533230678462,
+        -0.7127383420556977
+      ],
+      "quaternion": [
+        0.6772829454573986,
+        0.20319402499224912,
+        0.20319402499224912,
+        0.6772829454573991
+      ],
+      "rgba": [
+        0.699999988079071,
+        0.699999988079071,
+        0.699999988079071,
+        1.0
+      ]
+    },
+    {
+      "meshFile": "models/unitree-g1-mujoco/assets/meshes/left_ankle_roll_link.STL",
+      "meshName": "left_ankle_roll_link",
+      "position": [
+        0.02513100259443461,
+        0.11857996826310042,
+        -0.7356452005362082
+      ],
+      "quaternion": [
+        -0.0005743608797698458,
+        0.7332491624383676,
+        -0.000725693656329533,
+        0.6799594173638109
+      ],
+      "rgba": [
+        0.20000000298023224,
+        0.20000000298023224,
+        0.20000000298023224,
+        1.0
+      ]
+    },
+    {
+      "meshFile": "models/unitree-g1-mujoco/assets/meshes/left_elbow_link.STL",
+      "meshName": "left_elbow_link",
+      "position": [
+        0.007326879956403246,
+        0.20073773511800133,
+        0.06927163400923386
+      ],
+      "quaternion": [
+        0.2503384653080752,
+        0.7516247714528755,
+        0.5790646432311056,
+        0.1925486813386298
+      ],
+      "rgba": [
+        0.699999988079071,
+        0.699999988079071,
+        0.699999988079071,
+        1.0
+      ]
+    },
+    {
+      "meshFile": "models/unitree-g1-mujoco/assets/meshes/left_hip_pitch_link.STL",
+      "meshName": "left_hip_pitch_link",
+      "position": [
+        0.007247210025931103,
+        0.11156295469219488,
+        -0.12799259966234178
+      ],
+      "quaternion": [
+        0.9271562082975823,
+        0.3015716807877915,
+        -0.1913852549109718,
+        0.11317053929684691
+      ],
+      "rgba": [
+        0.20000000298023224,
+        0.20000000298023224,
+        0.20000000298023224,
+        1.0
+      ]
+    },
+    {
+      "meshFile": "models/unitree-g1-mujoco/assets/meshes/left_hip_roll_link.STL",
+      "meshName": "left_hip_roll_link",
+      "position": [
+        0.0725622883353185,
+        0.11608838049323612,
+        -0.1748473148939902
+      ],
+      "quaternion": [
+        0.9977331920707226,
+        -0.002058956689712302,
+        -0.06683484074921009,
+        -0.007572463254725273
+      ],
+      "rgba": [
+        0.699999988079071,
+        0.699999988079071,
+        0.699999988079071,
+        1.0
+      ]
+    },
+    {
+      "meshFile": "models/unitree-g1-mujoco/assets/meshes/left_hip_yaw_link.STL",
+      "meshName": "left_hip_yaw_link",
+      "position": [
+        0.10573556474575188,
+        0.11329448762850797,
+        -0.3259289163705646
+      ],
+      "quaternion": [
+        0.6899732743640792,
+        -0.022713530012048327,
+        0.007054910326334238,
+        0.723443988473186
+      ],
+      "rgba": [
+        0.699999988079071,
+        0.699999988079071,
+        0.699999988079071,
+        1.0
+      ]
+    },
+    {
+      "meshFile": "models/unitree-g1-mujoco/assets/meshes/left_knee_link.STL",
+      "meshName": "left_knee_link",
+      "position": [
+        0.07193805632523921,
+        0.12133034078452902,
+        -0.5423537251002193
+      ],
+      "quaternion": [
+        0.7412185786679529,
+        0.10196170047439307,
+        0.1635944602768678,
+        0.6429896444271492
+      ],
+      "rgba": [
+        0.699999988079071,
+        0.699999988079071,
+        0.699999988079071,
+        1.0
+      ]
+    },
+    {
+      "meshFile": "models/unitree-g1-mujoco/assets/meshes/left_rubber_hand.STL",
+      "meshName": "left_rubber_hand",
+      "position": [
+        0.1735533089814451,
+        0.22683179629818875,
+        -0.0973326517811901
+      ],
+      "quaternion": [
+        0.2610527604383143,
+        0.7284881016710879,
+        0.5871695200532093,
+        0.23746262171482369
+      ],
+      "rgba": [
+        0.699999988079071,
+        0.699999988079071,
+        0.699999988079071,
+        1.0
+      ]
+    },
+    {
+      "meshFile": "models/unitree-g1-mujoco/assets/meshes/left_shoulder_pitch_link.STL",
+      "meshName": "left_shoulder_pitch_link",
+      "position": [
+        -0.0017950372863873075,
+        0.13582972929723372,
+        0.29291468670527043
+      ],
+      "quaternion": [
+        0.6677021674943562,
+        0.36971399619848616,
+        -0.21912312260118266,
+        0.6078407963272892
+      ],
+      "rgba": [
+        0.699999988079071,
+        0.699999988079071,
+        0.699999988079071,
+        1.0
+      ]
+    },
+    {
+      "meshFile": "models/unitree-g1-mujoco/assets/meshes/left_shoulder_roll_link.STL",
+      "meshName": "left_shoulder_roll_link",
+      "position": [
+        -0.010266099300408858,
+        0.15532547736355706,
+        0.2547305543302557
+      ],
+      "quaternion": [
+        0.6869030666153361,
+        0.16910290460924446,
+        -0.026823041871587888,
+        0.7062923680402621
+      ],
+      "rgba": [
+        0.699999988079071,
+        0.699999988079071,
+        0.699999988079071,
+        1.0
+      ]
+    },
+    {
+      "meshFile": "models/unitree-g1-mujoco/assets/meshes/left_shoulder_yaw_link.STL",
+      "meshName": "left_shoulder_yaw_link",
+      "position": [
+        -0.024878349911848334,
+        0.1721864880093129,
+        0.14260055573234476
+      ],
+      "quaternion": [
+        0.6564512385808835,
+        0.01224149690279798,
+        -0.054417810668434166,
+        0.7523035417976301
+      ],
+      "rgba": [
+        0.699999988079071,
+        0.699999988079071,
+        0.699999988079071,
+        1.0
+      ]
+    },
+    {
+      "meshFile": "models/unitree-g1-mujoco/assets/meshes/left_wrist_pitch_link.STL",
+      "meshName": "left_wrist_pitch_link",
+      "position": [
+        0.08090032805258228,
+        0.21049012969610986,
+        -0.008754821313776362
+      ],
+      "quaternion": [
+        -0.234034830921566,
+        0.8488855950552131,
+        -0.3665933964200733,
+        0.30038346513160386
+      ],
+      "rgba": [
+        0.699999988079071,
+        0.699999988079071,
+        0.699999988079071,
+        1.0
+      ]
+    },
+    {
+      "meshFile": "models/unitree-g1-mujoco/assets/meshes/left_wrist_roll_link.STL",
+      "meshName": "left_wrist_roll_link",
+      "position": [
+        0.051749056832626365,
+        0.20440746423842174,
+        0.021355143503562712
+      ],
+      "quaternion": [
+        0.595260112945449,
+        0.7100405761383556,
+        -0.2907513021725249,
+        0.23868694656027614
+      ],
+      "rgba": [
+        0.699999988079071,
+        0.699999988079071,
+        0.699999988079071,
+        1.0
+      ]
+    },
+    {
+      "meshFile": "models/unitree-g1-mujoco/assets/meshes/left_wrist_yaw_link.STL",
+      "meshName": "left_wrist_yaw_link",
+      "position": [
+        0.1116733960601074,
+        0.21854344914881405,
+        -0.03867432704353635
+      ],
+      "quaternion": [
+        0.5862895678484387,
+        0.3350075208942035,
+        0.1789112262294668,
+        0.7155594152168507
+      ],
+      "rgba": [
+        0.699999988079071,
+        0.699999988079071,
+        0.699999988079071,
+        1.0
+      ]
+    },
+    {
+      "meshFile": "models/unitree-g1-mujoco/assets/meshes/logo_link.STL",
+      "meshName": "logo_link",
+      "position": [
+        -0.0009444083063188096,
+        0.0011127782956188072,
+        0.2714603991787473
+      ],
+      "quaternion": [
+        0.024694524690064744,
+        0.7080436764686437,
+        -0.024486631443821485,
+        0.7053118016477796
+      ],
+      "rgba": [
+        0.20000000298023224,
+        0.20000000298023224,
+        0.20000000298023224,
+        1.0
+      ]
+    },
+    {
+      "meshFile": "models/unitree-g1-mujoco/assets/meshes/pelvis.STL",
+      "meshName": "pelvis",
+      "position": [
+        -1.9529809540945105e-07,
+        -9.171826830955297e-07,
+        -0.07637656182566166
+      ],
+      "quaternion": [
+        0.9999999967943373,
+        7.995180754249253e-05,
+        -3.4881146178201784e-10,
+        4.362771416749531e-06
+      ],
+      "rgba": [
+        0.20000000298023224,
+        0.20000000298023224,
+        0.20000000298023224,
+        1.0
+      ]
+    },
+    {
+      "meshFile": "models/unitree-g1-mujoco/assets/meshes/pelvis_contour_link.STL",
+      "meshName": "pelvis_contour_link",
+      "position": [
+        0.0006870395627471365,
+        2.401819341082137e-05,
+        -0.07859361570716927
+      ],
+      "quaternion": [
+        0.5061214278235927,
+        0.493518210275343,
+        0.4946116461202721,
+        0.5056087380046239
+      ],
+      "rgba": [
+        0.699999988079071,
+        0.699999988079071,
+        0.699999988079071,
+        1.0
+      ]
+    },
+    {
+      "meshFile": "models/unitree-g1-mujoco/assets/meshes/right_ankle_pitch_link.STL",
+      "meshName": "right_ankle_pitch_link",
+      "position": [
+        -0.005577946410968612,
+        -0.11856553273354097,
+        -0.7127378617745544
+      ],
+      "quaternion": [
+        0.6772936435178962,
+        0.20315836298378961,
+        0.20315836298378961,
+        0.6772936435178967
+      ],
+      "rgba": [
+        0.699999988079071,
+        0.699999988079071,
+        0.699999988079071,
+        1.0
+      ]
+    },
+    {
+      "meshFile": "models/unitree-g1-mujoco/assets/meshes/right_ankle_roll_link.STL",
+      "meshName": "right_ankle_roll_link",
+      "position": [
+        0.02513612751100853,
+        -0.118579119443176,
+        -0.7356453954866516
+      ],
+      "quaternion": [
+        0.0005447117908057154,
+        0.7332505115353342,
+        0.0007172148160736737,
+        0.6799579959270627
+      ],
+      "rgba": [
+        0.20000000298023224,
+        0.20000000298023224,
+        0.20000000298023224,
+        1.0
+      ]
+    },
+    {
+      "meshFile": "models/unitree-g1-mujoco/assets/meshes/right_elbow_link.STL",
+      "meshName": "right_elbow_link",
+      "position": [
+        0.007327875740318235,
+        -0.20072611690217668,
+        0.06927203006878524
+      ],
+      "quaternion": [
+        0.1925692834723326,
+        0.5790370026548944,
+        0.7516481577025323,
+        0.25031633514770907
+      ],
+      "rgba": [
+        0.699999988079071,
+        0.699999988079071,
+        0.699999988079071,
+        1.0
+      ]
+    },
+    {
+      "meshFile": "models/unitree-g1-mujoco/assets/meshes/right_hip_pitch_link.STL",
+      "meshName": "right_hip_pitch_link",
+      "position": [
+        0.007247443739712582,
+        -0.11156205033357466,
+        -0.127993036984265
+      ],
+      "quaternion": [
+        0.9271454980268783,
+        -0.3015873603831834,
+        -0.19139461828777515,
+        -0.11320066093478605
+      ],
+      "rgba": [
+        0.20000000298023224,
+        0.20000000298023224,
+        0.20000000298023224,
+        1.0
+      ]
+    },
+    {
+      "meshFile": "models/unitree-g1-mujoco/assets/meshes/right_hip_roll_link.STL",
+      "meshName": "right_hip_roll_link",
+      "position": [
+        0.07256177435547548,
+        -0.116090302815209,
+        -0.17484671271665586
+      ],
+      "quaternion": [
+        0.997734755970655,
+        0.0020747163295881865,
+        -0.06683331940031198,
+        0.007372902974085845
+      ],
+      "rgba": [
+        0.699999988079071,
+        0.699999988079071,
+        0.699999988079071,
+        1.0
+      ]
+    },
+    {
+      "meshFile": "models/unitree-g1-mujoco/assets/meshes/right_hip_yaw_link.STL",
+      "meshName": "right_hip_yaw_link",
+      "position": [
+        0.10573449064535863,
+        -0.11329327745867503,
+        -0.32592992300631446
+      ],
+      "quaternion": [
+        0.7234809126000039,
+        0.007051710110513922,
+        -0.022710957171437098,
+        0.6899346743803656
+      ],
+      "rgba": [
+        0.699999988079071,
+        0.699999988079071,
+        0.699999988079071,
+        1.0
+      ]
+    },
+    {
+      "meshFile": "models/unitree-g1-mujoco/assets/meshes/right_knee_link.STL",
+      "meshName": "right_knee_link",
+      "position": [
+        0.07193757484329888,
+        -0.12132931855718722,
+        -0.5423562438072852
+      ],
+      "quaternion": [
+        0.6429465149134792,
+        0.1635925017449897,
+        0.1019581109352723,
+        0.7412569162901205
+      ],
+      "rgba": [
+        0.699999988079071,
+        0.699999988079071,
+        0.699999988079071,
+        1.0
+      ]
+    },
+    {
+      "meshFile": "models/unitree-g1-mujoco/assets/meshes/right_rubber_hand.STL",
+      "meshName": "right_rubber_hand",
+      "position": [
+        0.17355160545406906,
+        -0.22682204887312338,
+        -0.09733103698307521
+      ],
+      "quaternion": [
+        0.23746223818639342,
+        0.5871797069429687,
+        0.7284805717660657,
+        0.2610512090553624
+      ],
+      "rgba": [
+        0.699999988079071,
+        0.699999988079071,
+        0.699999988079071,
+        1.0
+      ]
+    },
+    {
+      "meshFile": "models/unitree-g1-mujoco/assets/meshes/right_shoulder_pitch_link.STL",
+      "meshName": "right_shoulder_pitch_link",
+      "position": [
+        -0.001793945436554411,
+        -0.13582081309242378,
+        0.2929148162062808
+      ],
+      "quaternion": [
+        0.6076953588919978,
+        -0.21896013133468048,
+        0.36983685502965297,
+        0.6678199699985039
+      ],
+      "rgba": [
+        0.699999988079071,
+        0.699999988079071,
+        0.699999988079071,
+        1.0
+      ]
+    },
+    {
+      "meshFile": "models/unitree-g1-mujoco/assets/meshes/right_shoulder_roll_link.STL",
+      "meshName": "right_shoulder_roll_link",
+      "position": [
+        -0.010266181477997096,
+        -0.15531506558574432,
+        0.25473075285629043
+      ],
+      "quaternion": [
+        0.7063285834436007,
+        -0.026839212281109658,
+        0.16908976473785595,
+        0.6868684301637283
+      ],
+      "rgba": [
+        0.699999988079071,
+        0.699999988079071,
+        0.699999988079071,
+        1.0
+      ]
+    },
+    {
+      "meshFile": "models/unitree-g1-mujoco/assets/meshes/right_shoulder_yaw_link.STL",
+      "meshName": "right_shoulder_yaw_link",
+      "position": [
+        -0.024878458526431443,
+        -0.1721755131856207,
+        0.14260022637035152
+      ],
+      "quaternion": [
+        0.7522621379306735,
+        -0.054453838012824725,
+        0.012243029837047852,
+        0.6564956691266562
+      ],
+      "rgba": [
+        0.699999988079071,
+        0.699999988079071,
+        0.699999988079071,
+        1.0
+      ]
+    },
+    {
+      "meshFile": "models/unitree-g1-mujoco/assets/meshes/right_wrist_pitch_link.STL",
+      "meshName": "right_wrist_pitch_link",
+      "position": [
+        0.0809002306993605,
+        -0.2104801959327556,
+        -0.008754451365117544
+      ],
+      "quaternion": [
+        0.23747299765534732,
+        0.8446192913238503,
+        0.376320332977698,
+        0.29767068229125065
+      ],
+      "rgba": [
+        0.699999988079071,
+        0.699999988079071,
+        0.699999988079071,
+        1.0
+      ]
+    },
+    {
+      "meshFile": "models/unitree-g1-mujoco/assets/meshes/right_wrist_roll_link.STL",
+      "meshName": "right_wrist_roll_link",
+      "position": [
+        0.0517487951161806,
+        -0.20439747817655748,
+        0.021354947583142825
+      ],
+      "quaternion": [
+        0.7100217771992395,
+        0.5952692229569461,
+        -0.23871391930882657,
+        0.29075641494434645
+      ],
+      "rgba": [
+        0.699999988079071,
+        0.699999988079071,
+        0.699999988079071,
+        1.0
+      ]
+    },
+    {
+      "meshFile": "models/unitree-g1-mujoco/assets/meshes/right_wrist_yaw_link.STL",
+      "meshName": "right_wrist_yaw_link",
+      "position": [
+        0.11167396943887913,
+        -0.2185327753392577,
+        -0.03867224508850953
+      ],
+      "quaternion": [
+        0.7155626467531735,
+        0.1788338562212239,
+        0.3349250762462419,
+        0.5863563283039502
+      ],
+      "rgba": [
+        0.699999988079071,
+        0.699999988079071,
+        0.699999988079071,
+        1.0
+      ]
+    },
+    {
+      "meshFile": "models/unitree-g1-mujoco/assets/meshes/torso_link.STL",
+      "meshName": "torso_link",
+      "position": [
+        0.0009202739907605449,
+        0.002122432415161523,
+        0.19180783433329696
+      ],
+      "quaternion": [
+        0.999985629175475,
+        0.0020443376354646195,
+        0.004474637869814798,
+        0.002130667054164369
+      ],
+      "rgba": [
+        0.699999988079071,
+        0.699999988079071,
+        0.699999988079071,
+        1.0
+      ]
+    },
+    {
+      "meshFile": "models/unitree-g1-mujoco/assets/meshes/waist_roll_link.STL",
+      "meshName": "waist_roll_link",
+      "position": [
+        -0.003963947893810264,
+        -5.375318902658795e-07,
+        0.04250033597817415
+      ],
+      "quaternion": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rgba": [
+        0.699999988079071,
+        0.699999988079071,
+        0.699999988079071,
+        1.0
+      ]
+    },
+    {
+      "meshFile": "models/unitree-g1-mujoco/assets/meshes/waist_support_link.STL",
+      "meshName": "waist_support_link",
+      "position": [
+        -0.0007369290355372709,
+        8.064506001391946e-05,
+        0.03157567985967269
+      ],
+      "quaternion": [
+        0.5001044652835217,
+        0.4993865614802032,
+        -0.5006463243822027,
+        0.4998618248066725
+      ],
+      "rgba": [
+        0.699999988079071,
+        0.699999988079071,
+        0.699999988079071,
+        1.0
+      ]
+    },
+    {
+      "meshFile": "models/unitree-g1-mujoco/assets/meshes/waist_yaw_link.STL",
+      "meshName": "waist_yaw_link",
+      "position": [
+        0.004643086659573277,
+        3.9417883471413433e-07,
+        0.01792136969091207
+      ],
+      "quaternion": [
+        -7.817973835472232e-05,
+        0.6437496649306503,
+        6.673285458658201e-05,
+        0.7652361454716667
+      ],
+      "rgba": [
+        0.699999988079071,
+        0.699999988079071,
+        0.699999988079071,
+        1.0
+      ]
+    }
+  ],
+  "pose": "unitree_g1_29dof_nominal_standing_v1",
+  "scale": 0.78,
+  "schemaVersion": "h-ide.hanging-g1-visual/2",
+  "sourceModel": "models/unitree-g1-mujoco/assets/g1_29dof_no_hand.xml",
+  "sourceModelSha256": "fdb850e065979896253daeba903ca00bad6dbf739d948b77f161f39557e0d3f8",
+  "staticBody": {
+    "children": [
+      {
+        "children": [
+          {
+            "children": [
+              {
+                "children": [
+                  {
+                    "children": [
+                      {
+                        "children": [
+                          {
+                            "children": [],
+                            "geoms": [
+                              {
+                                "mesh": "left_ankle_roll_link",
+                                "position": [
+                                  0.0,
+                                  0.0,
+                                  0.0
+                                ],
+                                "quaternion": [
+                                  1.0,
+                                  0.0,
+                                  0.0,
+                                  0.0
+                                ],
+                                "rgba": [
+                                  0.2,
+                                  0.2,
+                                  0.2,
+                                  1.0
+                                ],
+                                "type": "mesh"
+                              },
+                              {
+                                "position": [
+                                  0.035,
+                                  0.0,
+                                  -0.03
+                                ],
+                                "quaternion": [
+                                  1.0,
+                                  0.0,
+                                  0.0,
+                                  0.0
+                                ],
+                                "rgba": [
+                                  0.2,
+                                  0.2,
+                                  0.2,
+                                  0.4
+                                ],
+                                "size": [
+                                  0.085,
+                                  0.03,
+                                  0.005
+                                ],
+                                "type": "box"
+                              }
+                            ],
+                            "name": "left_ankle_roll_link",
+                            "position": [
+                              0.0,
+                              0.0,
+                              -0.017558
+                            ],
+                            "quaternion": [
+                              1.0,
+                              0.0,
+                              0.0,
+                              0.0
+                            ]
+                          }
+                        ],
+                        "geoms": [
+                          {
+                            "mesh": "left_ankle_pitch_link",
+                            "position": [
+                              0.0,
+                              0.0,
+                              0.0
+                            ],
+                            "quaternion": [
+                              1.0,
+                              0.0,
+                              0.0,
+                              0.0
+                            ],
+                            "rgba": [
+                              0.7,
+                              0.7,
+                              0.7,
+                              1.0
+                            ],
+                            "type": "mesh"
+                          }
+                        ],
+                        "name": "left_ankle_pitch_link",
+                        "position": [
+                          0.0,
+                          -9.4445e-05,
+                          -0.30001
+                        ],
+                        "quaternion": [
+                          0.9835740417047399,
+                          0.0,
+                          -0.180505137003362,
+                          0.0
+                        ]
+                      }
+                    ],
+                    "geoms": [
+                      {
+                        "mesh": "left_knee_link",
+                        "position": [
+                          0.0,
+                          0.0,
+                          0.0
+                        ],
+                        "quaternion": [
+                          1.0,
+                          0.0,
+                          0.0,
+                          0.0
+                        ],
+                        "rgba": [
+                          0.7,
+                          0.7,
+                          0.7,
+                          1.0
+                        ],
+                        "type": "mesh"
+                      }
+                    ],
+                    "name": "left_knee_link",
+                    "position": [
+                      -0.078273,
+                      0.0021489,
+                      -0.17734
+                    ],
+                    "quaternion": [
+                      0.9122920751390907,
+                      0.0,
+                      0.40954019294620103,
+                      0.0
+                    ]
+                  }
+                ],
+                "geoms": [
+                  {
+                    "mesh": "left_hip_yaw_link",
+                    "position": [
+                      0.0,
+                      0.0,
+                      0.0
+                    ],
+                    "quaternion": [
+                      1.0,
+                      0.0,
+                      0.0,
+                      0.0
+                    ],
+                    "rgba": [
+                      0.7,
+                      0.7,
+                      0.7,
+                      1.0
+                    ],
+                    "type": "mesh"
+                  }
+                ],
+                "name": "left_hip_yaw_link",
+                "position": [
+                  0.025001,
+                  0.0,
+                  -0.12412
+                ],
+                "quaternion": [
+                  1.0,
+                  0.0,
+                  0.0,
+                  0.0
+                ]
+              }
+            ],
+            "geoms": [
+              {
+                "mesh": "left_hip_roll_link",
+                "position": [
+                  0.0,
+                  0.0,
+                  0.0
+                ],
+                "quaternion": [
+                  1.0,
+                  0.0,
+                  0.0,
+                  0.0
+                ],
+                "rgba": [
+                  0.7,
+                  0.7,
+                  0.7,
+                  1.0
+                ],
+                "type": "mesh"
+              }
+            ],
+            "name": "left_hip_roll_link",
+            "position": [
+              0.0,
+              0.052,
+              -0.030465
+            ],
+            "quaternion": [
+              0.996178685660368,
+              0.0,
+              -0.08733857244071258,
+              0.0
+            ]
+          }
+        ],
+        "geoms": [
+          {
+            "mesh": "left_hip_pitch_link",
+            "position": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "quaternion": [
+              1.0,
+              0.0,
+              0.0,
+              0.0
+            ],
+            "rgba": [
+              0.2,
+              0.2,
+              0.2,
+              1.0
+            ],
+            "type": "mesh"
+          }
+        ],
+        "name": "left_hip_pitch_link",
+        "position": [
+          0.0,
+          0.064452,
+          -0.1027
+        ],
+        "quaternion": [
+          0.9878566566949545,
+          0.0,
+          -0.15536803346720587,
+          0.0
+        ]
+      },
+      {
+        "children": [
+          {
+            "children": [
+              {
+                "children": [
+                  {
+                    "children": [
+                      {
+                        "children": [
+                          {
+                            "children": [],
+                            "geoms": [
+                              {
+                                "mesh": "right_ankle_roll_link",
+                                "position": [
+                                  0.0,
+                                  0.0,
+                                  0.0
+                                ],
+                                "quaternion": [
+                                  1.0,
+                                  0.0,
+                                  0.0,
+                                  0.0
+                                ],
+                                "rgba": [
+                                  0.2,
+                                  0.2,
+                                  0.2,
+                                  1.0
+                                ],
+                                "type": "mesh"
+                              },
+                              {
+                                "position": [
+                                  0.035,
+                                  0.0,
+                                  -0.03
+                                ],
+                                "quaternion": [
+                                  1.0,
+                                  0.0,
+                                  0.0,
+                                  0.0
+                                ],
+                                "rgba": [
+                                  0.2,
+                                  0.2,
+                                  0.2,
+                                  0.4
+                                ],
+                                "size": [
+                                  0.085,
+                                  0.03,
+                                  0.005
+                                ],
+                                "type": "box"
+                              }
+                            ],
+                            "name": "right_ankle_roll_link",
+                            "position": [
+                              0.0,
+                              0.0,
+                              -0.017558
+                            ],
+                            "quaternion": [
+                              1.0,
+                              0.0,
+                              0.0,
+                              0.0
+                            ]
+                          }
+                        ],
+                        "geoms": [
+                          {
+                            "mesh": "right_ankle_pitch_link",
+                            "position": [
+                              0.0,
+                              0.0,
+                              0.0
+                            ],
+                            "quaternion": [
+                              1.0,
+                              0.0,
+                              0.0,
+                              0.0
+                            ],
+                            "rgba": [
+                              0.7,
+                              0.7,
+                              0.7,
+                              1.0
+                            ],
+                            "type": "mesh"
+                          }
+                        ],
+                        "name": "right_ankle_pitch_link",
+                        "position": [
+                          0.0,
+                          9.4445e-05,
+                          -0.30001
+                        ],
+                        "quaternion": [
+                          0.9835740417047399,
+                          0.0,
+                          -0.180505137003362,
+                          0.0
+                        ]
+                      }
+                    ],
+                    "geoms": [
+                      {
+                        "mesh": "right_knee_link",
+                        "position": [
+                          0.0,
+                          0.0,
+                          0.0
+                        ],
+                        "quaternion": [
+                          1.0,
+                          0.0,
+                          0.0,
+                          0.0
+                        ],
+                        "rgba": [
+                          0.7,
+                          0.7,
+                          0.7,
+                          1.0
+                        ],
+                        "type": "mesh"
+                      }
+                    ],
+                    "name": "right_knee_link",
+                    "position": [
+                      -0.078273,
+                      -0.0021489,
+                      -0.17734
+                    ],
+                    "quaternion": [
+                      0.9122920751390907,
+                      0.0,
+                      0.40954019294620103,
+                      0.0
+                    ]
+                  }
+                ],
+                "geoms": [
+                  {
+                    "mesh": "right_hip_yaw_link",
+                    "position": [
+                      0.0,
+                      0.0,
+                      0.0
+                    ],
+                    "quaternion": [
+                      1.0,
+                      0.0,
+                      0.0,
+                      0.0
+                    ],
+                    "rgba": [
+                      0.7,
+                      0.7,
+                      0.7,
+                      1.0
+                    ],
+                    "type": "mesh"
+                  }
+                ],
+                "name": "right_hip_yaw_link",
+                "position": [
+                  0.025001,
+                  0.0,
+                  -0.12412
+                ],
+                "quaternion": [
+                  1.0,
+                  0.0,
+                  0.0,
+                  0.0
+                ]
+              }
+            ],
+            "geoms": [
+              {
+                "mesh": "right_hip_roll_link",
+                "position": [
+                  0.0,
+                  0.0,
+                  0.0
+                ],
+                "quaternion": [
+                  1.0,
+                  0.0,
+                  0.0,
+                  0.0
+                ],
+                "rgba": [
+                  0.7,
+                  0.7,
+                  0.7,
+                  1.0
+                ],
+                "type": "mesh"
+              }
+            ],
+            "name": "right_hip_roll_link",
+            "position": [
+              0.0,
+              -0.052,
+              -0.030465
+            ],
+            "quaternion": [
+              0.996178685660368,
+              0.0,
+              -0.08733857244071258,
+              0.0
+            ]
+          }
+        ],
+        "geoms": [
+          {
+            "mesh": "right_hip_pitch_link",
+            "position": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "quaternion": [
+              1.0,
+              0.0,
+              0.0,
+              0.0
+            ],
+            "rgba": [
+              0.2,
+              0.2,
+              0.2,
+              1.0
+            ],
+            "type": "mesh"
+          }
+        ],
+        "name": "right_hip_pitch_link",
+        "position": [
+          0.0,
+          -0.064452,
+          -0.1027
+        ],
+        "quaternion": [
+          0.9878566566949545,
+          0.0,
+          -0.15536803346720587,
+          0.0
+        ]
+      },
+      {
+        "children": [
+          {
+            "children": [
+              {
+                "children": [
+                  {
+                    "children": [
+                      {
+                        "children": [
+                          {
+                            "children": [
+                              {
+                                "children": [
+                                  {
+                                    "children": [
+                                      {
+                                        "children": [
+                                          {
+                                            "children": [
+                                              {
+                                                "children": [],
+                                                "geoms": [
+                                                  {
+                                                    "mesh": "left_rubber_hand",
+                                                    "position": [
+                                                      0.0415,
+                                                      0.003,
+                                                      0.0
+                                                    ],
+                                                    "quaternion": [
+                                                      1.0,
+                                                      0.0,
+                                                      0.0,
+                                                      0.0
+                                                    ],
+                                                    "rgba": [
+                                                      0.7,
+                                                      0.7,
+                                                      0.7,
+                                                      1.0
+                                                    ],
+                                                    "type": "mesh"
+                                                  }
+                                                ],
+                                                "name": "left_rubber_hand",
+                                                "position": [
+                                                  0.0,
+                                                  0.0,
+                                                  0.0
+                                                ],
+                                                "quaternion": [
+                                                  1.0,
+                                                  0.0,
+                                                  0.0,
+                                                  0.0
+                                                ]
+                                              }
+                                            ],
+                                            "geoms": [
+                                              {
+                                                "mesh": "left_wrist_yaw_link",
+                                                "position": [
+                                                  0.0,
+                                                  0.0,
+                                                  0.0
+                                                ],
+                                                "quaternion": [
+                                                  1.0,
+                                                  0.0,
+                                                  0.0,
+                                                  0.0
+                                                ],
+                                                "rgba": [
+                                                  0.7,
+                                                  0.7,
+                                                  0.7,
+                                                  1.0
+                                                ],
+                                                "type": "mesh"
+                                              }
+                                            ],
+                                            "name": "left_wrist_yaw_link",
+                                            "position": [
+                                              0.046,
+                                              0.0,
+                                              0.0
+                                            ],
+                                            "quaternion": [
+                                              1.0,
+                                              0.0,
+                                              0.0,
+                                              0.0
+                                            ]
+                                          }
+                                        ],
+                                        "geoms": [
+                                          {
+                                            "mesh": "left_wrist_pitch_link",
+                                            "position": [
+                                              0.0,
+                                              0.0,
+                                              0.0
+                                            ],
+                                            "quaternion": [
+                                              1.0,
+                                              0.0,
+                                              0.0,
+                                              0.0
+                                            ],
+                                            "rgba": [
+                                              0.7,
+                                              0.7,
+                                              0.7,
+                                              1.0
+                                            ],
+                                            "type": "mesh"
+                                          }
+                                        ],
+                                        "name": "left_wrist_pitch_link",
+                                        "position": [
+                                          0.038,
+                                          0.0,
+                                          0.0
+                                        ],
+                                        "quaternion": [
+                                          1.0,
+                                          0.0,
+                                          0.0,
+                                          0.0
+                                        ]
+                                      }
+                                    ],
+                                    "geoms": [
+                                      {
+                                        "mesh": "left_wrist_roll_link",
+                                        "position": [
+                                          0.0,
+                                          0.0,
+                                          0.0
+                                        ],
+                                        "quaternion": [
+                                          1.0,
+                                          0.0,
+                                          0.0,
+                                          0.0
+                                        ],
+                                        "rgba": [
+                                          0.7,
+                                          0.7,
+                                          0.7,
+                                          1.0
+                                        ],
+                                        "type": "mesh"
+                                      }
+                                    ],
+                                    "name": "left_wrist_roll_link",
+                                    "position": [
+                                      0.1,
+                                      0.00188791,
+                                      -0.01
+                                    ],
+                                    "quaternion": [
+                                      1.0,
+                                      0.0,
+                                      0.0,
+                                      0.0
+                                    ]
+                                  }
+                                ],
+                                "geoms": [
+                                  {
+                                    "mesh": "left_elbow_link",
+                                    "position": [
+                                      0.0,
+                                      0.0,
+                                      0.0
+                                    ],
+                                    "quaternion": [
+                                      1.0,
+                                      0.0,
+                                      0.0,
+                                      0.0
+                                    ],
+                                    "rgba": [
+                                      0.7,
+                                      0.7,
+                                      0.7,
+                                      1.0
+                                    ],
+                                    "type": "mesh"
+                                  }
+                                ],
+                                "name": "left_elbow_link",
+                                "position": [
+                                  0.015783,
+                                  0.0,
+                                  -0.080518
+                                ],
+                                "quaternion": [
+                                  0.955336489125606,
+                                  0.0,
+                                  0.29552020666133955,
+                                  0.0
+                                ]
+                              }
+                            ],
+                            "geoms": [
+                              {
+                                "mesh": "left_shoulder_yaw_link",
+                                "position": [
+                                  0.0,
+                                  0.0,
+                                  0.0
+                                ],
+                                "quaternion": [
+                                  1.0,
+                                  0.0,
+                                  0.0,
+                                  0.0
+                                ],
+                                "rgba": [
+                                  0.7,
+                                  0.7,
+                                  0.7,
+                                  1.0
+                                ],
+                                "type": "mesh"
+                              }
+                            ],
+                            "name": "left_shoulder_yaw_link",
+                            "position": [
+                              0.0,
+                              0.00624,
+                              -0.1032
+                            ],
+                            "quaternion": [
+                              1.0,
+                              0.0,
+                              0.0,
+                              0.0
+                            ]
+                          }
+                        ],
+                        "geoms": [
+                          {
+                            "mesh": "left_shoulder_roll_link",
+                            "position": [
+                              0.0,
+                              0.0,
+                              0.0
+                            ],
+                            "quaternion": [
+                              1.0,
+                              0.0,
+                              0.0,
+                              0.0
+                            ],
+                            "rgba": [
+                              0.7,
+                              0.7,
+                              0.7,
+                              1.0
+                            ],
+                            "type": "mesh"
+                          },
+                          {
+                            "position": [
+                              -0.004,
+                              0.006,
+                              -0.053
+                            ],
+                            "quaternion": [
+                              1.0,
+                              0.0,
+                              0.0,
+                              0.0
+                            ],
+                            "rgba": [
+                              0.7,
+                              0.7,
+                              0.7,
+                              1.0
+                            ],
+                            "size": [
+                              0.03,
+                              0.015
+                            ],
+                            "type": "cylinder"
+                          }
+                        ],
+                        "name": "left_shoulder_roll_link",
+                        "position": [
+                          0.0,
+                          0.038,
+                          -0.013831
+                        ],
+                        "quaternion": [
+                          0.9992150221254243,
+                          -0.03961489062066998,
+                          0.0,
+                          0.0
+                        ]
+                      }
+                    ],
+                    "geoms": [
+                      {
+                        "mesh": "left_shoulder_pitch_link",
+                        "position": [
+                          0.0,
+                          0.0,
+                          0.0
+                        ],
+                        "quaternion": [
+                          1.0,
+                          0.0,
+                          0.0,
+                          0.0
+                        ],
+                        "rgba": [
+                          0.7,
+                          0.7,
+                          0.7,
+                          1.0
+                        ],
+                        "type": "mesh"
+                      },
+                      {
+                        "position": [
+                          0.0,
+                          0.04,
+                          -0.01
+                        ],
+                        "quaternion": [
+                          0.7071067811865475,
+                          0.0,
+                          0.7071067811865475,
+                          0.0
+                        ],
+                        "rgba": [
+                          0.7,
+                          0.7,
+                          0.7,
+                          1.0
+                        ],
+                        "size": [
+                          0.03,
+                          0.025
+                        ],
+                        "type": "cylinder"
+                      }
+                    ],
+                    "name": "left_shoulder_pitch_link",
+                    "position": [
+                      0.0039563,
+                      0.10022,
+                      0.23778
+                    ],
+                    "quaternion": [
+                      0.9853155587312084,
+                      0.13851544657999235,
+                      0.09887525533913812,
+                      0.01379871959901998
+                    ]
+                  },
+                  {
+                    "children": [
+                      {
+                        "children": [
+                          {
+                            "children": [
+                              {
+                                "children": [
+                                  {
+                                    "children": [
+                                      {
+                                        "children": [
+                                          {
+                                            "children": [
+                                              {
+                                                "children": [],
+                                                "geoms": [
+                                                  {
+                                                    "mesh": "right_rubber_hand",
+                                                    "position": [
+                                                      0.0415,
+                                                      -0.003,
+                                                      0.0
+                                                    ],
+                                                    "quaternion": [
+                                                      1.0,
+                                                      0.0,
+                                                      0.0,
+                                                      0.0
+                                                    ],
+                                                    "rgba": [
+                                                      0.7,
+                                                      0.7,
+                                                      0.7,
+                                                      1.0
+                                                    ],
+                                                    "type": "mesh"
+                                                  }
+                                                ],
+                                                "name": "right_rubber_hand",
+                                                "position": [
+                                                  0.0,
+                                                  0.0,
+                                                  0.0
+                                                ],
+                                                "quaternion": [
+                                                  1.0,
+                                                  0.0,
+                                                  0.0,
+                                                  0.0
+                                                ]
+                                              }
+                                            ],
+                                            "geoms": [
+                                              {
+                                                "mesh": "right_wrist_yaw_link",
+                                                "position": [
+                                                  0.0,
+                                                  0.0,
+                                                  0.0
+                                                ],
+                                                "quaternion": [
+                                                  1.0,
+                                                  0.0,
+                                                  0.0,
+                                                  0.0
+                                                ],
+                                                "rgba": [
+                                                  0.7,
+                                                  0.7,
+                                                  0.7,
+                                                  1.0
+                                                ],
+                                                "type": "mesh"
+                                              }
+                                            ],
+                                            "name": "right_wrist_yaw_link",
+                                            "position": [
+                                              0.046,
+                                              0.0,
+                                              0.0
+                                            ],
+                                            "quaternion": [
+                                              1.0,
+                                              0.0,
+                                              0.0,
+                                              0.0
+                                            ]
+                                          }
+                                        ],
+                                        "geoms": [
+                                          {
+                                            "mesh": "right_wrist_pitch_link",
+                                            "position": [
+                                              0.0,
+                                              0.0,
+                                              0.0
+                                            ],
+                                            "quaternion": [
+                                              1.0,
+                                              0.0,
+                                              0.0,
+                                              0.0
+                                            ],
+                                            "rgba": [
+                                              0.7,
+                                              0.7,
+                                              0.7,
+                                              1.0
+                                            ],
+                                            "type": "mesh"
+                                          }
+                                        ],
+                                        "name": "right_wrist_pitch_link",
+                                        "position": [
+                                          0.038,
+                                          0.0,
+                                          0.0
+                                        ],
+                                        "quaternion": [
+                                          1.0,
+                                          0.0,
+                                          0.0,
+                                          0.0
+                                        ]
+                                      }
+                                    ],
+                                    "geoms": [
+                                      {
+                                        "mesh": "right_wrist_roll_link",
+                                        "position": [
+                                          0.0,
+                                          0.0,
+                                          0.0
+                                        ],
+                                        "quaternion": [
+                                          1.0,
+                                          0.0,
+                                          0.0,
+                                          0.0
+                                        ],
+                                        "rgba": [
+                                          0.7,
+                                          0.7,
+                                          0.7,
+                                          1.0
+                                        ],
+                                        "type": "mesh"
+                                      }
+                                    ],
+                                    "name": "right_wrist_roll_link",
+                                    "position": [
+                                      0.1,
+                                      -0.00188791,
+                                      -0.01
+                                    ],
+                                    "quaternion": [
+                                      1.0,
+                                      0.0,
+                                      0.0,
+                                      0.0
+                                    ]
+                                  }
+                                ],
+                                "geoms": [
+                                  {
+                                    "mesh": "right_elbow_link",
+                                    "position": [
+                                      0.0,
+                                      0.0,
+                                      0.0
+                                    ],
+                                    "quaternion": [
+                                      1.0,
+                                      0.0,
+                                      0.0,
+                                      0.0
+                                    ],
+                                    "rgba": [
+                                      0.7,
+                                      0.7,
+                                      0.7,
+                                      1.0
+                                    ],
+                                    "type": "mesh"
+                                  }
+                                ],
+                                "name": "right_elbow_link",
+                                "position": [
+                                  0.015783,
+                                  0.0,
+                                  -0.080518
+                                ],
+                                "quaternion": [
+                                  0.955336489125606,
+                                  0.0,
+                                  0.29552020666133955,
+                                  0.0
+                                ]
+                              }
+                            ],
+                            "geoms": [
+                              {
+                                "mesh": "right_shoulder_yaw_link",
+                                "position": [
+                                  0.0,
+                                  0.0,
+                                  0.0
+                                ],
+                                "quaternion": [
+                                  1.0,
+                                  0.0,
+                                  0.0,
+                                  0.0
+                                ],
+                                "rgba": [
+                                  0.7,
+                                  0.7,
+                                  0.7,
+                                  1.0
+                                ],
+                                "type": "mesh"
+                              }
+                            ],
+                            "name": "right_shoulder_yaw_link",
+                            "position": [
+                              0.0,
+                              -0.00624,
+                              -0.1032
+                            ],
+                            "quaternion": [
+                              1.0,
+                              0.0,
+                              0.0,
+                              0.0
+                            ]
+                          }
+                        ],
+                        "geoms": [
+                          {
+                            "mesh": "right_shoulder_roll_link",
+                            "position": [
+                              0.0,
+                              0.0,
+                              0.0
+                            ],
+                            "quaternion": [
+                              1.0,
+                              0.0,
+                              0.0,
+                              0.0
+                            ],
+                            "rgba": [
+                              0.7,
+                              0.7,
+                              0.7,
+                              1.0
+                            ],
+                            "type": "mesh"
+                          },
+                          {
+                            "position": [
+                              -0.004,
+                              -0.006,
+                              -0.053
+                            ],
+                            "quaternion": [
+                              1.0,
+                              0.0,
+                              0.0,
+                              0.0
+                            ],
+                            "rgba": [
+                              0.7,
+                              0.7,
+                              0.7,
+                              1.0
+                            ],
+                            "size": [
+                              0.03,
+                              0.015
+                            ],
+                            "type": "cylinder"
+                          }
+                        ],
+                        "name": "right_shoulder_roll_link",
+                        "position": [
+                          0.0,
+                          -0.038,
+                          -0.013831
+                        ],
+                        "quaternion": [
+                          0.9992150221254243,
+                          0.03961489062066998,
+                          0.0,
+                          0.0
+                        ]
+                      }
+                    ],
+                    "geoms": [
+                      {
+                        "mesh": "right_shoulder_pitch_link",
+                        "position": [
+                          0.0,
+                          0.0,
+                          0.0
+                        ],
+                        "quaternion": [
+                          1.0,
+                          0.0,
+                          0.0,
+                          0.0
+                        ],
+                        "rgba": [
+                          0.7,
+                          0.7,
+                          0.7,
+                          1.0
+                        ],
+                        "type": "mesh"
+                      },
+                      {
+                        "position": [
+                          0.0,
+                          -0.04,
+                          -0.01
+                        ],
+                        "quaternion": [
+                          0.7071067811865475,
+                          0.0,
+                          0.7071067811865475,
+                          0.0
+                        ],
+                        "rgba": [
+                          0.7,
+                          0.7,
+                          0.7,
+                          1.0
+                        ],
+                        "size": [
+                          0.03,
+                          0.025
+                        ],
+                        "type": "cylinder"
+                      }
+                    ],
+                    "name": "right_shoulder_pitch_link",
+                    "position": [
+                      0.0039563,
+                      -0.10021,
+                      0.23778
+                    ],
+                    "quaternion": [
+                      0.9853155587312084,
+                      -0.13851544657999235,
+                      0.09887525533913812,
+                      -0.01379871959901998
+                    ]
+                  }
+                ],
+                "geoms": [
+                  {
+                    "mesh": "torso_link",
+                    "position": [
+                      0.0,
+                      0.0,
+                      0.0
+                    ],
+                    "quaternion": [
+                      1.0,
+                      0.0,
+                      0.0,
+                      0.0
+                    ],
+                    "rgba": [
+                      0.7,
+                      0.7,
+                      0.7,
+                      1.0
+                    ],
+                    "type": "mesh"
+                  },
+                  {
+                    "mesh": "logo_link",
+                    "position": [
+                      0.0039635,
+                      0.0,
+                      -0.054
+                    ],
+                    "quaternion": [
+                      1.0,
+                      0.0,
+                      0.0,
+                      0.0
+                    ],
+                    "rgba": [
+                      0.2,
+                      0.2,
+                      0.2,
+                      1.0
+                    ],
+                    "type": "mesh"
+                  },
+                  {
+                    "mesh": "head_link",
+                    "position": [
+                      0.0039635,
+                      0.0,
+                      -0.054
+                    ],
+                    "quaternion": [
+                      1.0,
+                      0.0,
+                      0.0,
+                      0.0
+                    ],
+                    "rgba": [
+                      0.2,
+                      0.2,
+                      0.2,
+                      1.0
+                    ],
+                    "type": "mesh"
+                  },
+                  {
+                    "mesh": "waist_support_link",
+                    "position": [
+                      0.0039635,
+                      0.0,
+                      -0.054
+                    ],
+                    "quaternion": [
+                      1.0,
+                      0.0,
+                      0.0,
+                      0.0
+                    ],
+                    "rgba": [
+                      0.7,
+                      0.7,
+                      0.7,
+                      1.0
+                    ],
+                    "type": "mesh"
+                  }
+                ],
+                "name": "torso_link",
+                "position": [
+                  0.0,
+                  0.0,
+                  0.019
+                ],
+                "quaternion": [
+                  1.0,
+                  0.0,
+                  0.0,
+                  0.0
+                ]
+              }
+            ],
+            "geoms": [
+              {
+                "mesh": "waist_roll_link",
+                "position": [
+                  0.0,
+                  0.0,
+                  0.0
+                ],
+                "quaternion": [
+                  1.0,
+                  0.0,
+                  0.0,
+                  0.0
+                ],
+                "rgba": [
+                  0.7,
+                  0.7,
+                  0.7,
+                  1.0
+                ],
+                "type": "mesh"
+              }
+            ],
+            "name": "waist_roll_link",
+            "position": [
+              -0.0039635,
+              0.0,
+              0.035
+            ],
+            "quaternion": [
+              1.0,
+              0.0,
+              0.0,
+              0.0
+            ]
+          }
+        ],
+        "geoms": [
+          {
+            "mesh": "waist_yaw_link",
+            "position": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "quaternion": [
+              1.0,
+              0.0,
+              0.0,
+              0.0
+            ],
+            "rgba": [
+              0.7,
+              0.7,
+              0.7,
+              1.0
+            ],
+            "type": "mesh"
+          }
+        ],
+        "name": "waist_yaw_link",
+        "position": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "quaternion": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      }
+    ],
+    "geoms": [
+      {
+        "mesh": "pelvis",
+        "position": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "quaternion": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "rgba": [
+          0.2,
+          0.2,
+          0.2,
+          1.0
+        ],
+        "type": "mesh"
+      },
+      {
+        "mesh": "pelvis_contour_link",
+        "position": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "quaternion": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "rgba": [
+          0.7,
+          0.7,
+          0.7,
+          1.0
+        ],
+        "type": "mesh"
+      }
+    ],
+    "name": "pelvis",
+    "position": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "quaternion": [
+      1.0,
+      0.0,
+      0.0,
+      0.0
+    ]
+  }
+}

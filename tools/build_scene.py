@@ -40,6 +40,7 @@ BUILD_VERSION = "office-v2-generator/4"
 SCHEMA_VERSION = "h-ide.office-scene/4"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SCENE = REPO_ROOT / "scenes" / "office_v2" / "scene.yaml"
+HANGING_G1_MANIFEST = REPO_ROOT / "scenes" / "office_v2" / "hanging_g1_visual.json"
 SUPPORTED_TEMPLATES = {
     "column",
     "meeting_table",
@@ -231,6 +232,20 @@ def _validate_scene(scene: Mapping[str, Any]) -> None:
             raise SceneBuildError(f"invalid material ID: {material_id}")
         if "texture" in material and material["texture"] not in texture_ids:
             raise SceneBuildError(f"material {material_id} references an unknown texture")
+        builtin_texture = material.get("texture_builtin")
+        if builtin_texture is not None:
+            if not isinstance(builtin_texture, Mapping):
+                raise SceneBuildError(f"materials.{material_id}.texture_builtin must be an object")
+            if not isinstance(builtin_texture.get("builtin"), str) or not builtin_texture["builtin"].strip():
+                raise SceneBuildError(f"materials.{material_id}.texture_builtin.builtin is invalid")
+            for color_name in ("rgb1", "rgb2"):
+                color = _numbers(builtin_texture.get(color_name), 3, f"materials.{material_id}.texture_builtin.{color_name}")
+                if any(channel < 0 or channel > 1 for channel in color):
+                    raise SceneBuildError(f"materials.{material_id}.texture_builtin.{color_name} must be normalized")
+            for size_name in ("width", "height"):
+                size_value = builtin_texture.get(size_name)
+                if isinstance(size_value, bool) or not isinstance(size_value, int) or size_value <= 0:
+                    raise SceneBuildError(f"materials.{material_id}.texture_builtin.{size_name} must be a positive integer")
         rgba = _numbers(material["rgba"], 4, f"materials.{material_id}.rgba")
         if any(channel < 0 or channel > 1 for channel in rgba):
             raise SceneBuildError(f"materials.{material_id}.rgba must be normalized")
@@ -347,7 +362,7 @@ def _validate_scene(scene: Mapping[str, Any]) -> None:
 
     for item in scene["visual_decor"]:
         kind = item.get("kind")
-        if kind not in {"floor_zone", "doorway_frame", "ceiling_panel"}:
+        if kind not in {"floor_zone", "doorway_frame", "ceiling_panel", "display_robot", "hanging_robot"}:
             raise SceneBuildError(f"unsupported visual_decor kind: {kind}")
         _numbers(item["pose"], 4, f"visual_decor.{item['id']}.pose")
         dimensions = _numbers(
@@ -371,6 +386,118 @@ def _validate_scene(scene: Mapping[str, Any]) -> None:
                 raise SceneBuildError(
                     f"visual_decor {item['id']} opening is too narrow for its frame"
                 )
+        # A display robot pose is a floor anchor.  Zero is intentional: the
+        # builder adds the measured root-to-feet offset from the G1 manifest.
+        if kind in {"display_robot", "hanging_robot"} and float(item["pose"][2]) < 0:
+            raise SceneBuildError(
+                f"visual_decor {item['id']} display_robot floor anchor must be non-negative"
+            )
+
+    if any(item.get("kind") in {"display_robot", "hanging_robot"} for item in scene["visual_decor"]):
+        if not HANGING_G1_MANIFEST.is_file():
+            raise SceneBuildError(
+                f"hanging G1 visual manifest is missing: {HANGING_G1_MANIFEST}"
+            )
+        try:
+            hanging = json.loads(HANGING_G1_MANIFEST.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SceneBuildError("hanging G1 visual manifest is invalid") from exc
+        if not isinstance(hanging, Mapping) or hanging.get("schemaVersion") != "h-ide.hanging-g1-visual/2":
+            raise SceneBuildError("hanging G1 visual manifest schema is unsupported")
+        source_model = Path(str(hanging.get("sourceModel", "")))
+        if source_model.is_absolute() or not source_model.parts or not (REPO_ROOT / source_model).is_file():
+            raise SceneBuildError("hanging G1 visual source model is unavailable")
+        source_sha = str(hanging.get("sourceModelSha256", ""))
+        if not SHA256_PATTERN.fullmatch(source_sha) or _sha256_path((REPO_ROOT / source_model).resolve()) != source_sha:
+            raise SceneBuildError("hanging G1 visual source model hash changed")
+        try:
+            scale = float(hanging.get("scale", 0.0))
+        except (TypeError, ValueError):
+            scale = 0.0
+        if not math.isfinite(scale) or scale <= 0 or scale > 2:
+            raise SceneBuildError("hanging G1 visual scale is invalid")
+        try:
+            ground_offset = float(hanging.get("groundOffset", 0.0))
+        except (TypeError, ValueError):
+            ground_offset = 0.0
+        if not math.isfinite(ground_offset) or ground_offset <= 0:
+            raise SceneBuildError("hanging G1 visual groundOffset is invalid")
+        meshes = hanging.get("meshes")
+        if not isinstance(meshes, list) or not meshes:
+            raise SceneBuildError("hanging G1 visual manifest has no meshes")
+        mesh_names: set[str] = set()
+        for mesh in meshes:
+            if not isinstance(mesh, Mapping):
+                raise SceneBuildError("hanging G1 visual mesh entry is invalid")
+            name = str(mesh.get("meshName", ""))
+            relative = Path(str(mesh.get("meshFile", "")))
+            if not name or name in mesh_names or relative.is_absolute() or relative.parts[:3] != ("models", "unitree-g1-mujoco", "assets"):
+                raise SceneBuildError("hanging G1 visual mesh identity/path is invalid")
+            source_path = (REPO_ROOT / relative).resolve()
+            try:
+                source_path.relative_to(REPO_ROOT / "models" / "unitree-g1-mujoco" / "assets")
+            except ValueError as exc:
+                raise SceneBuildError("hanging G1 visual mesh path escapes the model asset boundary") from exc
+            if not source_path.is_file():
+                raise SceneBuildError(f"hanging G1 visual mesh is missing: {relative}")
+            position = _numbers(mesh.get("position"), 3, f"hanging_g1.{name}.position")
+            quaternion = _numbers(mesh.get("quaternion"), 4, f"hanging_g1.{name}.quaternion")
+            rgba = _numbers(mesh.get("rgba"), 4, f"hanging_g1.{name}.rgba")
+            if any(channel < 0 or channel > 1 for channel in rgba):
+                raise SceneBuildError(f"hanging_g1.{name}.rgba must be normalized")
+            norm = math.sqrt(sum(value * value for value in quaternion))
+            if not 0.999 <= norm <= 1.001:
+                raise SceneBuildError(f"hanging_g1.{name}.quaternion must be normalized")
+            mesh_names.add(name)
+
+        static_body = hanging.get("staticBody")
+        if not isinstance(static_body, Mapping):
+            raise SceneBuildError("hanging G1 visual staticBody is missing")
+        body_names: set[str] = set()
+
+        def validate_static_body(body: Mapping[str, Any], field: str) -> None:
+            name = body.get("name")
+            if not isinstance(name, str) or not name or name in body_names:
+                raise SceneBuildError(f"{field}.name is invalid or duplicated")
+            body_names.add(name)
+            _numbers(body.get("position"), 3, f"{field}.position")
+            quaternion = _numbers(body.get("quaternion"), 4, f"{field}.quaternion")
+            norm = math.sqrt(sum(value * value for value in quaternion))
+            if not 0.999 <= norm <= 1.001:
+                raise SceneBuildError(f"{field}.quaternion must be normalized")
+            geoms = body.get("geoms")
+            if not isinstance(geoms, list):
+                raise SceneBuildError(f"{field}.geoms must be a list")
+            for index, geom in enumerate(geoms):
+                geom_field = f"{field}.geoms[{index}]"
+                if not isinstance(geom, Mapping):
+                    raise SceneBuildError(f"{geom_field} must be an object")
+                geom_type = geom.get("type")
+                if geom_type not in {"mesh", "box", "cylinder", "capsule", "sphere", "ellipsoid"}:
+                    raise SceneBuildError(f"{geom_field}.type is unsupported")
+                _numbers(geom.get("position"), 3, f"{geom_field}.position")
+                geom_quaternion = _numbers(geom.get("quaternion"), 4, f"{geom_field}.quaternion")
+                geom_norm = math.sqrt(sum(value * value for value in geom_quaternion))
+                if not 0.999 <= geom_norm <= 1.001:
+                    raise SceneBuildError(f"{geom_field}.quaternion must be normalized")
+                rgba = _numbers(geom.get("rgba"), 4, f"{geom_field}.rgba")
+                if any(channel < 0 or channel > 1 for channel in rgba):
+                    raise SceneBuildError(f"{geom_field}.rgba must be normalized")
+                if geom_type == "mesh":
+                    mesh_name = geom.get("mesh")
+                    if not isinstance(mesh_name, str) or mesh_name not in mesh_names:
+                        raise SceneBuildError(f"{geom_field}.mesh is unknown")
+                elif not isinstance(geom.get("size"), list) or not geom.get("size"):
+                    raise SceneBuildError(f"{geom_field}.size is required")
+            children = body.get("children")
+            if not isinstance(children, list):
+                raise SceneBuildError(f"{field}.children must be a list")
+            for index, child in enumerate(children):
+                if not isinstance(child, Mapping):
+                    raise SceneBuildError(f"{field}.children[{index}] must be an object")
+                validate_static_body(child, f"{field}.children[{index}]")
+
+        validate_static_body(static_body, "hanging_g1.staticBody")
 
     object_ids = {entry["id"] for entry in scene["objects"]}
     for item in scene["objects"]:
@@ -591,6 +718,11 @@ class MjcfBuilder:
         self.lines: list[str] = []
         self.object_mappings: list[dict[str, Any]] = []
         self.decor_visual_names: list[str] = []
+        self.hanging_g1_manifest: Mapping[str, Any] | None = None
+        if any(item.get("kind") in {"display_robot", "hanging_robot"} for item in scene["visual_decor"]):
+            self.hanging_g1_manifest = json.loads(
+                HANGING_G1_MANIFEST.read_text(encoding="utf-8")
+            )
 
     def add(self, indent: int, text: str) -> None:
         self.lines.append("  " * indent + text)
@@ -794,6 +926,87 @@ class MjcfBuilder:
             raise SceneBuildError(f"unsupported template: {template}")
         return names
 
+    def _add_hanging_g1(self, prefix: str, item: Mapping[str, Any]) -> None:
+        """Emit a complete, joint-free static copy of the official G1 pose.
+
+        The manifest stores the source body's hierarchy with nominal joint
+        rotations already composed into each body quaternion.  Keeping that
+        hierarchy lets MuJoCo apply every mesh's authored compiler offset
+        exactly once; a flat list of compiled world meshes is what caused the
+        old display copies to look disassembled.
+        """
+
+        manifest = self.hanging_g1_manifest
+        if not isinstance(manifest, Mapping):
+            raise SceneBuildError("hanging G1 visual manifest is not loaded")
+        static_body = manifest.get("staticBody")
+        if not isinstance(static_body, Mapping):
+            raise SceneBuildError("hanging G1 visual staticBody is not loaded")
+        x, y, z, yaw = [float(axis) for axis in item["pose"]]
+        scale = float(manifest["scale"])
+        ground_offset = float(manifest["groundOffset"])
+
+        def emit_body(
+            node: Mapping[str, Any],
+            *,
+            depth: int,
+            path: str,
+            root: bool = False,
+        ) -> None:
+            source_name = str(node["name"])
+            body_name = f"{prefix}_g1_static" if root else f"{prefix}_g1_{path}_{source_name}"
+            if root:
+                # ``pose.z`` is a floor anchor.  The measured source
+                # root-to-feet offset keeps the lowest sole vertex at z=0.
+                body_attributes: dict[str, Any] = {
+                    "name": body_name,
+                    "pos": _vec([x, y, z + ground_offset * scale]),
+                    "euler": f"0 0 {_fmt(yaw)}",
+                }
+            else:
+                body_attributes = {
+                    "name": body_name,
+                    "pos": _vec(float(value) * scale for value in node["position"]),
+                    "quat": _vec(node["quaternion"]),
+                }
+            self.add(depth, f"<body {_xml_attrs(body_attributes)}>")
+
+            for index, geom in enumerate(node.get("geoms", []), start=1):
+                if not isinstance(geom, Mapping):
+                    raise SceneBuildError("hanging G1 static body has an invalid geom")
+                geom_type = str(geom["type"])
+                geom_name = f"{body_name}_visual_{index:02d}"
+                attributes: dict[str, Any] = {
+                    "name": geom_name,
+                    "type": geom_type,
+                    "pos": _vec(float(value) * scale for value in geom["position"]),
+                    "quat": _vec(geom["quaternion"]),
+                    "contype": "0",
+                    "conaffinity": "0",
+                    "group": "2",
+                    "rgba": _vec(geom["rgba"]),
+                }
+                if geom_type == "mesh":
+                    attributes["mesh"] = f"office_v2_hanging_g1_{geom['mesh']}"
+                if "size" in geom:
+                    attributes["size"] = _vec(float(value) * scale for value in geom["size"])
+                if "fromto" in geom:
+                    attributes["fromto"] = _vec(float(value) * scale for value in geom["fromto"])
+                self.add(depth + 1, f"<geom {_xml_attrs(attributes)}/>")
+                self.decor_visual_names.append(geom_name)
+
+            for child_index, child in enumerate(node.get("children", []), start=1):
+                if not isinstance(child, Mapping):
+                    raise SceneBuildError("hanging G1 static body has an invalid child")
+                emit_body(
+                    child,
+                    depth=depth + 1,
+                    path=f"{path}_{child_index:02d}" if path else f"{child_index:02d}",
+                )
+            self.add(depth, "</body>")
+
+        emit_body(static_body, depth=2, path="root", root=True)
+
     def build(self) -> tuple[str, list[dict[str, Any]]]:
         self.add(0, "<mujocoinclude>")
         self.add(1, f"<!-- Generated by {BUILD_VERSION}; source sha256: {self.source_sha}. -->")
@@ -809,6 +1022,17 @@ class MjcfBuilder:
         for texture in self.scene["textures"]:
             texture_id = texture["id"]
             self.add(2, f'<texture name="office_v2_{texture_id}" type="2d" file="textures/{texture_id}.png"/>')
+        for material_id, material in self.scene["materials"].items():
+            builtin = material.get("texture_builtin")
+            if not isinstance(builtin, Mapping):
+                continue
+            self.add(
+                2,
+                f'<texture name="office_v2_builtin_{material_id}" type="2d" '
+                f'builtin="{builtin["builtin"]}" rgb1="{_vec(builtin["rgb1"])}" '
+                f'rgb2="{_vec(builtin["rgb2"])}" width="{int(builtin["width"])}" '
+                f'height="{int(builtin["height"])}"/>',
+            )
         template_meshes = self.scene["template_meshes"]
         for index, item in enumerate(self.scene["objects"], start=1):
             template = item["visual"]["template"]
@@ -836,12 +1060,29 @@ class MjcfBuilder:
                     '3 2 6 3 6 7 0 3 7 0 7 4 1 5 6 1 6 2" '
                     f'scale="{_vec([width, depth * 0.30, height])}"/>',
                 )
+        if self.hanging_g1_manifest is not None:
+            hanging_scale = float(self.hanging_g1_manifest["scale"])
+            for mesh in self.hanging_g1_manifest["meshes"]:
+                mesh_name = str(mesh["meshName"])
+                mesh_file = str(mesh["meshFile"])
+                self.add(
+                    2,
+                    f'<mesh name="office_v2_hanging_g1_{mesh_name}" '
+                    f'file="../../../../{mesh_file}" '
+                    f'scale="{_vec([hanging_scale, hanging_scale, hanging_scale])}"/>',
+                )
         for material_id, material in self.scene["materials"].items():
             attributes: dict[str, Any] = {"name": f"office_v2_mat_{material_id}", "rgba": _vec(material["rgba"])}
             if "texture" in material:
                 attributes.update(
                     texture=f"office_v2_{material['texture']}",
                     texuniform="true" if material.get("texuniform", True) else "false",
+                    texrepeat=_vec(material.get("repeat", [1, 1])),
+                )
+            elif "texture_builtin" in material:
+                attributes.update(
+                    texture=f"office_v2_builtin_{material_id}",
+                    texuniform="true",
                     texrepeat=_vec(material.get("repeat", [1, 1])),
                 )
             for field in ("reflectance", "emission", "shininess", "specular"):
@@ -870,6 +1111,8 @@ class MjcfBuilder:
                 suffix: str,
                 local_pos: Sequence[float],
                 dimensions: Sequence[float],
+                mat: str | None = None,
+                local_euler: Sequence[float] | None = None,
             ) -> None:
                 local_x, local_y, local_z = [float(axis) for axis in local_pos]
                 world_x = x + math.cos(yaw) * local_x - math.sin(yaw) * local_y
@@ -881,13 +1124,42 @@ class MjcfBuilder:
                     geom_type="box",
                     pos=[world_x, world_y, z + local_z],
                     size=[float(axis) / 2 for axis in dimensions],
-                    material=material,
-                    euler=[0, 0, yaw],
+                    material=material if mat is None else mat,
+                    euler=(
+                        [0, 0, yaw]
+                        if local_euler is None
+                        else [float(local_euler[0]), float(local_euler[1]), yaw + float(local_euler[2])]
+                    ),
+                )
+                self.decor_visual_names.append(name)
+
+            def decor_cylinder(
+                suffix: str,
+                local_pos: Sequence[float],
+                radius: float,
+                cylinder_height: float,
+                mat: str,
+                euler: Sequence[float] | None = None,
+            ) -> None:
+                local_x, local_y, local_z = [float(axis) for axis in local_pos]
+                world_x = x + math.cos(yaw) * local_x - math.sin(yaw) * local_y
+                world_y = y + math.sin(yaw) * local_x + math.cos(yaw) * local_y
+                name = f"{prefix}_{suffix}"
+                self.geom(
+                    2,
+                    name,
+                    geom_type="cylinder",
+                    pos=[world_x, world_y, z + local_z],
+                    size=[float(radius), float(cylinder_height) / 2],
+                    material=mat,
+                    euler=None if euler is None else [0, 0, yaw + float(euler[2])],
                 )
                 self.decor_visual_names.append(name)
 
             if kind in {"floor_zone", "ceiling_panel"}:
                 decor_box("visual_01", [0, 0, height / 2], [width, depth, height])
+            elif kind in {"display_robot", "hanging_robot"}:
+                self._add_hanging_g1(prefix, item)
             else:
                 frame_width = float(item["frame_width"])
                 opening_width = width
@@ -1110,6 +1382,13 @@ def _output_inventory(
                 paths.generated / "mujoco" / "meshes" / f"{mesh['id']}.obj",
             )
         )
+    if any(item.get("kind") in {"display_robot", "hanging_robot"} for item in scene["visual_decor"]):
+        inventory.append(
+            (
+                "scenes/office_v2/generated/mujoco/hanging_g1_visual.json",
+                paths.generated / "mujoco" / "hanging_g1_visual.json",
+            )
+        )
     for asset in scene["provenance"]["third_party_assets"]:
         inventory.append(
             (str(asset["license_path"]), (REPO_ROOT / str(asset["license_path"])).resolve())
@@ -1120,6 +1399,9 @@ def _output_inventory(
 def build_scene(paths: BuildPaths | None = None) -> dict[str, str]:
     paths = paths or BuildPaths.defaults()
     scene, source_sha = load_scene(paths.scene)
+    hanging_manifest_output = paths.generated / "mujoco" / "hanging_g1_visual.json"
+    if HANGING_G1_MANIFEST.is_file():
+        _atomic_write(hanging_manifest_output, HANGING_G1_MANIFEST.read_bytes())
     texture_hashes: dict[str, str] = {}
     for texture in scene["textures"]:
         texture_id = texture["id"]
@@ -1343,6 +1625,28 @@ def build_scene(paths: BuildPaths | None = None) -> dict[str, str]:
     collision_contract_sha256 = _sha256_bytes(
         json.dumps(map_geometry, sort_keys=True, separators=(",", ":")).encode("utf-8")
     )
+    render_asset_entries = [
+        {
+            "path": f"mujoco/textures/{texture['id']}.png",
+            "sha256": texture_hashes[texture["id"]],
+        }
+        for texture in scene["textures"]
+    ] + [
+        {
+            "path": f"mujoco/meshes/{mesh['id']}.obj",
+            "sha256": mesh_hashes[mesh["id"]],
+        }
+        for mesh in scene["mesh_assets"]
+    ]
+    if any(item.get("kind") in {"display_robot", "hanging_robot"} for item in scene["visual_decor"]):
+        hanging_payload = json.loads(hanging_manifest_output.read_text(encoding="utf-8"))
+        render_asset_entries.append(
+            {
+                "path": "mujoco/hanging_g1_visual.json",
+                "sha256": _sha256_path(hanging_manifest_output),
+                "source_model_sha256": str(hanging_payload.get("sourceModelSha256", "")),
+            }
+        )
     runtime_manifest = {
         "schema_version": "h-ide.office-v2-runtime/1",
         "scene_id": scene["scene_id"],
@@ -1359,20 +1663,7 @@ def build_scene(paths: BuildPaths | None = None) -> dict[str, str]:
                 "path": "mujoco/office_v2.include.xml",
                 "sha256": _sha256_path(include_path),
             },
-            "render_assets": [
-                {
-                    "path": f"mujoco/textures/{texture['id']}.png",
-                    "sha256": texture_hashes[texture["id"]],
-                }
-                for texture in scene["textures"]
-            ]
-            + [
-                {
-                    "path": f"mujoco/meshes/{mesh['id']}.obj",
-                    "sha256": mesh_hashes[mesh["id"]],
-                }
-                for mesh in scene["mesh_assets"]
-            ],
+            "render_assets": render_asset_entries,
         },
         "map": {
             "frame_id": map_spec["frame_id"],

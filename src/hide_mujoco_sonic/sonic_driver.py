@@ -31,6 +31,7 @@ from .arm_limiter_evidence import (
     source_bundle_sha256,
 )
 from .config import SimConfig
+from .gesture import GestureError, GestureWaveController
 from .motion_fault import (
     SONIC_HEALTH_SCHEMA_VERSION,
     validate_sonic_health_request,
@@ -558,6 +559,10 @@ class SonicDriver:
         self._last_published_targets: tuple[float, ...] | None = None
         self._safe_hold_targets: tuple[float, ...] | None = None
         self._support_lock = threading.RLock()
+        # Voice-assistant gestures share SONIC's actuator boundary. The
+        # controller only stores a bounded trajectory; every actual LowCmd
+        # remains serialized through _publish/_publish_position_hold.
+        self._gesture = GestureWaveController(clock=self._wall_clock)
         self._normal_stop = NormalStopState()
         self._normal_stop_bridge_boot_id: UUID | None = None
         self._normal_stop_seen_bridge_boot_ids: set[UUID] = set()
@@ -1370,6 +1375,10 @@ class SonicDriver:
                     "terminal SONIC hold has no executed actuator boundary"
                 )
             selected = self._safe_hold_targets or targets
+            if getattr(self, "_gesture", None) is not None and self._gesture.snapshot().state == "running":
+                selected = self._sample_gesture_targets_locked(
+                    tuple(float(value) for value in selected)
+                )
             for index in range(29):
                 motor = self._msg.motor_cmd[index]
                 motor.mode = 1
@@ -4796,6 +4805,82 @@ class SonicDriver:
     def _angular_delta(value: float, previous: float) -> float:
         return (float(value) - float(previous) + math.pi) % (2.0 * math.pi) - math.pi
 
+    def _gesture_ready_locked(self) -> bool:
+        """Return whether the sole SONIC owner may run a demo gesture."""
+
+        controller = getattr(self, "_controller", None)
+        mode = getattr(getattr(controller, "ms", None), "mode", 0)
+        has_movement = bool(getattr(getattr(controller, "ms", None), "has_movement", False))
+        mode_is_idle = mode == 0 or str(mode).upper() == "IDLE"
+        return bool(
+            not self._fault_latched.is_set()
+            and not self._stop.is_set()
+            and not self._navigation_task_active
+            and not self._normal_stop_fences_motion_locked()
+            and not self._process_stop_fences_motion_locked()
+            and not self._plant_support_stop_pending
+            and not self._plant_support_safety_latched
+            and self._plant_support_mode in {"idle", "startup", None}
+            and mode_is_idle
+            and not has_movement
+        )
+
+    def _update_gesture_telemetry(self, snapshot=None) -> None:
+        gesture = getattr(self, "_gesture", None)
+        if gesture is None:
+            return
+        value = snapshot or gesture.snapshot()
+        self._update_telemetry_hot(
+            gesture_state=value.state,
+            gesture_name=value.gesture,
+            gesture_request_id=value.request_id,
+            gesture_progress=value.progress,
+            gesture_last_error=value.last_error,
+        )
+
+    def _sample_gesture_targets_locked(
+        self,
+        targets: tuple[float, ...],
+        *,
+        now: float | None = None,
+    ) -> tuple[float, ...]:
+        """Overlay a gesture only while the same SONIC boundary is held."""
+
+        gesture = getattr(self, "_gesture", None)
+        if gesture is None:
+            return targets
+        if not self._gesture_ready_locked():
+            if gesture.snapshot().state == "running":
+                self._update_gesture_telemetry(
+                    gesture.cancel("gesture interrupted by a motion or stop boundary")
+                )
+            return targets
+        sampled, snapshot = gesture.sample(targets, now=now)
+        self._update_gesture_telemetry(snapshot)
+        return sampled
+
+    def _handle_gesture_request(self, payload: Mapping[str, Any]) -> dict[str, object]:
+        expected = {"type", "request_id", "gesture", "duration_s", "simulation_only"}
+        if set(payload) != expected:
+            raise ValueError("gesture_wave request fields do not match v1")
+        if self.config.robot_profile != "unitree_g1_29dof":
+            raise ValueError("gesture_wave is only implemented for the G1 simulation profile")
+        with self._support_lock:
+            ready = self._gesture_ready_locked()
+            try:
+                response = self._gesture.request_wave(
+                    request_id=payload.get("request_id"),
+                    gesture=payload.get("gesture"),
+                    duration_s=payload.get("duration_s"),
+                    simulation_only=payload.get("simulation_only"),
+                    ready=ready,
+                )
+            except GestureError as exc:
+                self._update_gesture_telemetry()
+                raise
+        self._update_gesture_telemetry()
+        return response
+
     def _action_targets(self, action: dict[str, Any], lowstate) -> tuple[float, ...]:
         return tuple(
             float(action.get(f"{self._joint_name(index)}.q", lowstate.motor_state[index].q))
@@ -4921,6 +5006,10 @@ class SonicDriver:
                 )
             else:
                 published_targets = raw_targets
+            if getattr(self, "_gesture", None) is not None and self._gesture.snapshot().state == "running":
+                published_targets = self._sample_gesture_targets_locked(
+                    tuple(float(value) for value in published_targets)
+                )
             for index in range(29):
                 motor = self._msg.motor_cmd[index]
                 motor.mode = 1
@@ -7130,6 +7219,8 @@ class SonicDriver:
         return response
 
     def accept_json(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        if payload.get("type") == "gesture_wave":
+            return self._handle_gesture_request(payload)
         if (
             isinstance(payload.get("type"), str)
             and str(payload["type"]).startswith("arm_limiter_evidence_")

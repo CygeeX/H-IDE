@@ -135,6 +135,7 @@ done
 HIDE_DEMO_COUPLED_UNIT_SUFFIXES=(
   mujoco-plant
   sonic-driver
+  leader-demo-gesture-proxy
   ros-cmd-vel-bridge
   ros-observation-bridge
   ros-safe-stop
@@ -269,6 +270,17 @@ export HIDE_DOCKER_OBSERVATION_BIND_HOST
 # constrained proxy below is the only Docker-visible route, so Compose must
 # never point control-api directly at the loopback-only 8796 endpoint.
 export SIMULATION_ROBOT_AGENT_DIAGNOSTICS_URL="http://host.docker.internal:8797"
+# Resolve the gesture-proxy token before Compose creates the containers.  The
+# proxy unit and Control API therefore receive the same value even when an
+# operator overrides it in the H-IDE .env file.
+HIDE_DEMO_GESTURE_PROXY_TOKEN="${HIDE_LEADER_DEMO_GESTURE_PROXY_TOKEN:-}"
+if [[ -z "${HIDE_DEMO_GESTURE_PROXY_TOKEN}" ]]; then
+  HIDE_DEMO_GESTURE_PROXY_TOKEN="$(sed -n 's/^HIDE_LEADER_DEMO_GESTURE_PROXY_TOKEN=//p' "${HIDE_DEMO_H_IDE_ROOT}/.env" | tail -n 1)"
+fi
+if [[ -z "${HIDE_DEMO_GESTURE_PROXY_TOKEN}" ]]; then
+  HIDE_DEMO_GESTURE_PROXY_TOKEN="dev-leader-demo-gesture-token"
+fi
+export HIDE_DEMO_GESTURE_PROXY_TOKEN HIDE_LEADER_DEMO_GESTURE_PROXY_TOKEN="${HIDE_DEMO_GESTURE_PROXY_TOKEN}"
 
 # Runtime evidence contains process/session identities and must not be writable
 # by another account.  Older launchers created this directory using the user's
@@ -320,6 +332,12 @@ env_value() {
 
 HIDE_DEMO_GATEWAY_TOKEN="$(env_value SIMULATION_ROBOT_AGENT_GATEWAY_TOKEN dev-sim-gateway-token)"
 export HIDE_DEMO_GATEWAY_TOKEN
+HIDE_DEMO_GESTURE_PROXY_TOKEN="$(env_value HIDE_LEADER_DEMO_GESTURE_PROXY_TOKEN dev-leader-demo-gesture-token)"
+if [[ -z "${HIDE_DEMO_GESTURE_PROXY_TOKEN}" ]]; then
+  printf '%s\n' 'leader-demo gesture proxy token must not be empty' >&2
+  exit 2
+fi
+export HIDE_DEMO_GESTURE_PROXY_TOKEN
 
 start_process() {
   local name="$1"
@@ -390,6 +408,8 @@ start_process() {
     --setenv="HIDE_DEMO_OBSERVATION_CONFIG=${HIDE_DEMO_OBSERVATION_CONFIG}" \
     --setenv="HIDE_DEMO_CYCLONE=${HIDE_DEMO_CYCLONE}" \
     --setenv="HIDE_DEMO_GATEWAY_TOKEN=${HIDE_DEMO_GATEWAY_TOKEN}" \
+    --setenv="HIDE_DEMO_GESTURE_PROXY_TOKEN=${HIDE_DEMO_GESTURE_PROXY_TOKEN}" \
+    --setenv="HIDE_LEADER_DEMO_GESTURE_PROXY_TOKEN=${HIDE_DEMO_GESTURE_PROXY_TOKEN}" \
     --setenv="HIDE_DOCKER_OBSERVATION_BIND_HOST=${HIDE_DOCKER_OBSERVATION_BIND_HOST}" \
     --setenv="HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT=${HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT}" \
     --setenv="HIDE_DEMO_CONTINUOUS_DRIVE_HANDOFF=${HIDE_DEMO_CONTINUOUS_DRIVE_HANDOFF}" \
@@ -1035,6 +1055,20 @@ start_process \
 # IDLE consumer has sustained the authoritative 50 Hz simulation cadence, and
 # the driver explicitly opens its motion gate.
 wait_for_sonic_motion_ready 120
+
+# Keep the raw SONIC command socket host-loopback-only.  Control API reaches
+# this fixed, allow-listed proxy through Docker's validated bridge address; the
+# proxy accepts only the g1-sim wave payload and forwards no generic command.
+start_process \
+  leader-demo-gesture-proxy \
+  '-m hide_mujoco_sonic.leader_demo_gesture_proxy' \
+  "${HIDE_DEMO_SIM_ROOT}" \
+  'exec "$HIDE_DEMO_SIM_ROOT/.venv/bin/python" -u -m hide_mujoco_sonic.leader_demo_gesture_proxy --bind-host "$HIDE_DOCKER_OBSERVATION_BIND_HOST"'
+wait_for_http \
+  'Leader-demo gesture proxy' \
+  "http://${HIDE_DOCKER_OBSERVATION_BIND_HOST}:8798/healthz" \
+  30
+
 trigger_native_viewer
 wait_for_native_viewer
 if [[ "${HIDE_MUJOCO_ONSCREEN_VIEWER}" == "1" ]]; then

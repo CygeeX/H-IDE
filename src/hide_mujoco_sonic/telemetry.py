@@ -83,6 +83,11 @@ class TelemetryState:
     sonic_reference_actuator_authority: bool = False
     sonic_reference_authority_dds_target_sequence: int | None = None
     sonic_execution_feedback_pending: bool = False
+    gesture_state: str = "idle"
+    gesture_name: str | None = None
+    gesture_request_id: str | None = None
+    gesture_progress: float = 0.0
+    gesture_last_error: str | None = None
     last_cmd_vx: float = 0.0
     last_cmd_vy: float = 0.0
     last_cmd_wz: float = 0.0

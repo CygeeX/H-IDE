@@ -211,15 +211,6 @@
     },
     {
       "center": [
-        0.0,
-        0.0
-      ],
-      "radius": 0.29,
-      "shape": "circle",
-      "source_id": "corridor_column"
-    },
-    {
-      "center": [
         0.7,
         3.72
       ],
@@ -468,50 +459,6 @@
   "objects": [
     {
       "collision": {
-        "height": 2.7,
-        "nav_obstacle": true,
-        "radius": 0.29,
-        "shape": "circle"
-      },
-      "dimensions": [
-        0.58,
-        0.58,
-        2.7
-      ],
-      "id": "corridor_column",
-      "mjcf": {
-        "collision_geoms": [
-          "office_fixture_001_collision_01"
-        ],
-        "mjcf_body": "office_fixture_001",
-        "source_group": "objects",
-        "source_id": "corridor_column",
-        "visual_geoms": [
-          "office_fixture_001_visual_01",
-          "office_fixture_001_visual_02"
-        ]
-      },
-      "pose": [
-        0.0,
-        0.0,
-        0.0,
-        0.0
-      ],
-      "room": "corridor",
-      "semantic": {
-        "aliases": [
-          "柱子",
-          "column"
-        ],
-        "class": "structural_column",
-        "labels": [
-          "走廊立柱",
-          "corridor column"
-        ]
-      }
-    },
-    {
-      "collision": {
         "height": 0.76,
         "nav_obstacle": true,
         "shape": "box",
@@ -528,19 +475,19 @@
       "id": "meeting_table",
       "mjcf": {
         "collision_geoms": [
-          "office_fixture_002_collision_01"
+          "office_fixture_001_collision_01"
         ],
-        "mjcf_body": "office_fixture_002",
+        "mjcf_body": "office_fixture_001",
         "source_group": "objects",
         "source_id": "meeting_table",
         "visual_geoms": [
-          "office_fixture_002_visual_01",
-          "office_fixture_002_visual_02",
-          "office_fixture_002_visual_03",
-          "office_fixture_002_visual_04",
-          "office_fixture_002_visual_05",
-          "office_fixture_002_visual_06",
-          "office_fixture_002_visual_07"
+          "office_fixture_001_visual_01",
+          "office_fixture_001_visual_02",
+          "office_fixture_001_visual_03",
+          "office_fixture_001_visual_04",
+          "office_fixture_001_visual_05",
+          "office_fixture_001_visual_06",
+          "office_fixture_001_visual_07"
         ]
       },
       "pose": [
@@ -577,13 +524,13 @@
       "id": "meeting_chair_north_01",
       "mjcf": {
         "collision_geoms": [
-          "office_fixture_003_collision_01"
+          "office_fixture_002_collision_01"
         ],
-        "mjcf_body": "office_fixture_003",
+        "mjcf_body": "office_fixture_002",
         "source_group": "objects",
         "source_id": "meeting_chair_north_01",
         "visual_geoms": [
-          "office_fixture_003_visual_01"
+          "office_fixture_002_visual_01"
         ]
       },
       "pose": [
@@ -620,13 +567,13 @@
       "id": "meeting_chair_north_02",
       "mjcf": {
         "collision_geoms": [
-          "office_fixture_004_collision_01"
+          "office_fixture_003_collision_01"
         ],
-        "mjcf_body": "office_fixture_004",
+        "mjcf_body": "office_fixture_003",
         "source_group": "objects",
         "source_id": "meeting_chair_north_02",
         "visual_geoms": [
-          "office_fixture_004_visual_01"
+          "office_fixture_003_visual_01"
         ]
       },
       "pose": [
@@ -663,13 +610,13 @@
       "id": "meeting_chair_south_01",
       "mjcf": {
         "collision_geoms": [
-          "office_fixture_005_collision_01"
+          "office_fixture_004_collision_01"
         ],
-        "mjcf_body": "office_fixture_005",
+        "mjcf_body": "office_fixture_004",
         "source_group": "objects",
         "source_id": "meeting_chair_south_01",
         "visual_geoms": [
-          "office_fixture_005_visual_01"
+          "office_fixture_004_visual_01"
         ]
       },
       "pose": [
@@ -706,13 +653,13 @@
       "id": "meeting_chair_south_02",
       "mjcf": {
         "collision_geoms": [
-          "office_fixture_006_collision_01"
+          "office_fixture_005_collision_01"
         ],
-        "mjcf_body": "office_fixture_006",
+        "mjcf_body": "office_fixture_005",
         "source_group": "objects",
         "source_id": "meeting_chair_south_02",
         "visual_geoms": [
-          "office_fixture_006_visual_01"
+          "office_fixture_005_visual_01"
         ]
       },
       "pose": [
@@ -747,12 +694,12 @@
       "id": "meeting_display",
       "mjcf": {
         "collision_geoms": [],
-        "mjcf_body": "office_fixture_007",
+        "mjcf_body": "office_fixture_006",
         "source_group": "objects",
         "source_id": "meeting_display",
         "visual_geoms": [
-          "office_fixture_007_visual_01",
-          "office_fixture_007_visual_02"
+          "office_fixture_006_visual_01",
+          "office_fixture_006_visual_02"
         ]
       },
       "pose": [
@@ -788,12 +735,12 @@
       "id": "meeting_sign",
       "mjcf": {
         "collision_geoms": [],
-        "mjcf_body": "office_fixture_008",
+        "mjcf_body": "office_fixture_007",
         "source_group": "objects",
         "source_id": "meeting_sign",
         "visual_geoms": [
-          "office_fixture_008_visual_01",
-          "office_fixture_008_visual_02"
+          "office_fixture_007_visual_01",
+          "office_fixture_007_visual_02"
         ]
       },
       "pose": [
@@ -827,13 +774,13 @@
       "id": "meeting_coffee_cup",
       "mjcf": {
         "collision_geoms": [],
-        "mjcf_body": "office_fixture_009",
+        "mjcf_body": "office_fixture_008",
         "source_group": "objects",
         "source_id": "meeting_coffee_cup",
         "visual_geoms": [
-          "office_fixture_009_visual_01",
-          "office_fixture_009_visual_02",
-          "office_fixture_009_visual_03"
+          "office_fixture_008_visual_01",
+          "office_fixture_008_visual_02",
+          "office_fixture_008_visual_03"
         ]
       },
       "pose": [
@@ -869,11 +816,11 @@
       "id": "meeting_laptop",
       "mjcf": {
         "collision_geoms": [],
-        "mjcf_body": "office_fixture_010",
+        "mjcf_body": "office_fixture_009",
         "source_group": "objects",
         "source_id": "meeting_laptop",
         "visual_geoms": [
-          "office_fixture_010_visual_01"
+          "office_fixture_009_visual_01"
         ]
       },
       "pose": [
@@ -913,17 +860,17 @@
       "id": "pantry_counter",
       "mjcf": {
         "collision_geoms": [
-          "office_fixture_011_collision_01"
+          "office_fixture_010_collision_01"
         ],
-        "mjcf_body": "office_fixture_011",
+        "mjcf_body": "office_fixture_010",
         "source_group": "objects",
         "source_id": "pantry_counter",
         "visual_geoms": [
-          "office_fixture_011_visual_01",
-          "office_fixture_011_visual_02",
-          "office_fixture_011_visual_03",
-          "office_fixture_011_visual_04",
-          "office_fixture_011_visual_05"
+          "office_fixture_010_visual_01",
+          "office_fixture_010_visual_02",
+          "office_fixture_010_visual_03",
+          "office_fixture_010_visual_04",
+          "office_fixture_010_visual_05"
         ]
       },
       "pose": [
@@ -963,17 +910,17 @@
       "id": "water_dispenser",
       "mjcf": {
         "collision_geoms": [
-          "office_fixture_012_collision_01"
+          "office_fixture_011_collision_01"
         ],
-        "mjcf_body": "office_fixture_012",
+        "mjcf_body": "office_fixture_011",
         "source_group": "objects",
         "source_id": "water_dispenser",
         "visual_geoms": [
-          "office_fixture_012_visual_01",
-          "office_fixture_012_visual_02",
-          "office_fixture_012_visual_03",
-          "office_fixture_012_visual_04",
-          "office_fixture_012_visual_05"
+          "office_fixture_011_visual_01",
+          "office_fixture_011_visual_02",
+          "office_fixture_011_visual_03",
+          "office_fixture_011_visual_04",
+          "office_fixture_011_visual_05"
         ]
       },
       "pose": [
@@ -1008,11 +955,11 @@
       "id": "coffee_machine",
       "mjcf": {
         "collision_geoms": [],
-        "mjcf_body": "office_fixture_013",
+        "mjcf_body": "office_fixture_012",
         "source_group": "objects",
         "source_id": "coffee_machine",
         "visual_geoms": [
-          "office_fixture_013_visual_01"
+          "office_fixture_012_visual_01"
         ]
       },
       "pose": [
@@ -1047,13 +994,13 @@
       "id": "pantry_cup",
       "mjcf": {
         "collision_geoms": [],
-        "mjcf_body": "office_fixture_014",
+        "mjcf_body": "office_fixture_013",
         "source_group": "objects",
         "source_id": "pantry_cup",
         "visual_geoms": [
-          "office_fixture_014_visual_01",
-          "office_fixture_014_visual_02",
-          "office_fixture_014_visual_03"
+          "office_fixture_013_visual_01",
+          "office_fixture_013_visual_02",
+          "office_fixture_013_visual_03"
         ]
       },
       "pose": [
@@ -1094,13 +1041,13 @@
       "id": "pantry_fridge",
       "mjcf": {
         "collision_geoms": [
-          "office_fixture_015_collision_01"
+          "office_fixture_014_collision_01"
         ],
-        "mjcf_body": "office_fixture_015",
+        "mjcf_body": "office_fixture_014",
         "source_group": "objects",
         "source_id": "pantry_fridge",
         "visual_geoms": [
-          "office_fixture_015_visual_01"
+          "office_fixture_014_visual_01"
         ]
       },
       "pose": [
@@ -1135,12 +1082,12 @@
       "id": "pantry_sign",
       "mjcf": {
         "collision_geoms": [],
-        "mjcf_body": "office_fixture_016",
+        "mjcf_body": "office_fixture_015",
         "source_group": "objects",
         "source_id": "pantry_sign",
         "visual_geoms": [
-          "office_fixture_016_visual_01",
-          "office_fixture_016_visual_02"
+          "office_fixture_015_visual_01",
+          "office_fixture_015_visual_02"
         ]
       },
       "pose": [
@@ -1179,23 +1126,23 @@
       "id": "open_office_desk_01",
       "mjcf": {
         "collision_geoms": [
-          "office_fixture_017_collision_01"
+          "office_fixture_016_collision_01"
         ],
-        "mjcf_body": "office_fixture_017",
+        "mjcf_body": "office_fixture_016",
         "source_group": "objects",
         "source_id": "open_office_desk_01",
         "visual_geoms": [
-          "office_fixture_017_visual_01",
-          "office_fixture_017_visual_02",
-          "office_fixture_017_visual_03",
-          "office_fixture_017_visual_04",
-          "office_fixture_017_visual_05",
-          "office_fixture_017_visual_06",
-          "office_fixture_017_visual_07",
-          "office_fixture_017_visual_08",
-          "office_fixture_017_visual_09",
-          "office_fixture_017_visual_10",
-          "office_fixture_017_visual_11"
+          "office_fixture_016_visual_01",
+          "office_fixture_016_visual_02",
+          "office_fixture_016_visual_03",
+          "office_fixture_016_visual_04",
+          "office_fixture_016_visual_05",
+          "office_fixture_016_visual_06",
+          "office_fixture_016_visual_07",
+          "office_fixture_016_visual_08",
+          "office_fixture_016_visual_09",
+          "office_fixture_016_visual_10",
+          "office_fixture_016_visual_11"
         ]
       },
       "pose": [
@@ -1235,23 +1182,23 @@
       "id": "open_office_desk_02",
       "mjcf": {
         "collision_geoms": [
-          "office_fixture_018_collision_01"
+          "office_fixture_017_collision_01"
         ],
-        "mjcf_body": "office_fixture_018",
+        "mjcf_body": "office_fixture_017",
         "source_group": "objects",
         "source_id": "open_office_desk_02",
         "visual_geoms": [
-          "office_fixture_018_visual_01",
-          "office_fixture_018_visual_02",
-          "office_fixture_018_visual_03",
-          "office_fixture_018_visual_04",
-          "office_fixture_018_visual_05",
-          "office_fixture_018_visual_06",
-          "office_fixture_018_visual_07",
-          "office_fixture_018_visual_08",
-          "office_fixture_018_visual_09",
-          "office_fixture_018_visual_10",
-          "office_fixture_018_visual_11"
+          "office_fixture_017_visual_01",
+          "office_fixture_017_visual_02",
+          "office_fixture_017_visual_03",
+          "office_fixture_017_visual_04",
+          "office_fixture_017_visual_05",
+          "office_fixture_017_visual_06",
+          "office_fixture_017_visual_07",
+          "office_fixture_017_visual_08",
+          "office_fixture_017_visual_09",
+          "office_fixture_017_visual_10",
+          "office_fixture_017_visual_11"
         ]
       },
       "pose": [
@@ -1286,11 +1233,11 @@
       "id": "open_office_laptop",
       "mjcf": {
         "collision_geoms": [],
-        "mjcf_body": "office_fixture_019",
+        "mjcf_body": "office_fixture_018",
         "source_group": "objects",
         "source_id": "open_office_laptop",
         "visual_geoms": [
-          "office_fixture_019_visual_01"
+          "office_fixture_018_visual_01"
         ]
       },
       "pose": [
@@ -1327,13 +1274,13 @@
       "id": "open_office_chair_01",
       "mjcf": {
         "collision_geoms": [
-          "office_fixture_020_collision_01"
+          "office_fixture_019_collision_01"
         ],
-        "mjcf_body": "office_fixture_020",
+        "mjcf_body": "office_fixture_019",
         "source_group": "objects",
         "source_id": "open_office_chair_01",
         "visual_geoms": [
-          "office_fixture_020_visual_01"
+          "office_fixture_019_visual_01"
         ]
       },
       "pose": [
@@ -1370,13 +1317,13 @@
       "id": "open_office_chair_02",
       "mjcf": {
         "collision_geoms": [
-          "office_fixture_021_collision_01"
+          "office_fixture_020_collision_01"
         ],
-        "mjcf_body": "office_fixture_021",
+        "mjcf_body": "office_fixture_020",
         "source_group": "objects",
         "source_id": "open_office_chair_02",
         "visual_geoms": [
-          "office_fixture_021_visual_01"
+          "office_fixture_020_visual_01"
         ]
       },
       "pose": [
@@ -1416,13 +1363,13 @@
       "id": "open_office_cabinet",
       "mjcf": {
         "collision_geoms": [
-          "office_fixture_022_collision_01"
+          "office_fixture_021_collision_01"
         ],
-        "mjcf_body": "office_fixture_022",
+        "mjcf_body": "office_fixture_021",
         "source_group": "objects",
         "source_id": "open_office_cabinet",
         "visual_geoms": [
-          "office_fixture_022_visual_01"
+          "office_fixture_021_visual_01"
         ]
       },
       "pose": [
@@ -1459,13 +1406,13 @@
       "id": "open_office_plant",
       "mjcf": {
         "collision_geoms": [
-          "office_fixture_023_collision_01"
+          "office_fixture_022_collision_01"
         ],
-        "mjcf_body": "office_fixture_023",
+        "mjcf_body": "office_fixture_022",
         "source_group": "objects",
         "source_id": "open_office_plant",
         "visual_geoms": [
-          "office_fixture_023_visual_01"
+          "office_fixture_022_visual_01"
         ]
       },
       "pose": [
@@ -1500,12 +1447,12 @@
       "id": "open_office_sign",
       "mjcf": {
         "collision_geoms": [],
-        "mjcf_body": "office_fixture_024",
+        "mjcf_body": "office_fixture_023",
         "source_group": "objects",
         "source_id": "open_office_sign",
         "visual_geoms": [
-          "office_fixture_024_visual_01",
-          "office_fixture_024_visual_02"
+          "office_fixture_023_visual_01",
+          "office_fixture_023_visual_02"
         ]
       },
       "pose": [
@@ -1544,18 +1491,18 @@
       "id": "reception_desk",
       "mjcf": {
         "collision_geoms": [
-          "office_fixture_025_collision_01"
+          "office_fixture_024_collision_01"
         ],
-        "mjcf_body": "office_fixture_025",
+        "mjcf_body": "office_fixture_024",
         "source_group": "objects",
         "source_id": "reception_desk",
         "visual_geoms": [
-          "office_fixture_025_visual_01",
-          "office_fixture_025_visual_02",
-          "office_fixture_025_visual_03",
-          "office_fixture_025_visual_04",
-          "office_fixture_025_visual_05",
-          "office_fixture_025_visual_06"
+          "office_fixture_024_visual_01",
+          "office_fixture_024_visual_02",
+          "office_fixture_024_visual_03",
+          "office_fixture_024_visual_04",
+          "office_fixture_024_visual_05",
+          "office_fixture_024_visual_06"
         ]
       },
       "pose": [
@@ -1595,13 +1542,13 @@
       "id": "reception_sofa",
       "mjcf": {
         "collision_geoms": [
-          "office_fixture_026_collision_01"
+          "office_fixture_025_collision_01"
         ],
-        "mjcf_body": "office_fixture_026",
+        "mjcf_body": "office_fixture_025",
         "source_group": "objects",
         "source_id": "reception_sofa",
         "visual_geoms": [
-          "office_fixture_026_visual_01"
+          "office_fixture_025_visual_01"
         ]
       },
       "pose": [
@@ -1636,12 +1583,12 @@
       "id": "reception_sign",
       "mjcf": {
         "collision_geoms": [],
-        "mjcf_body": "office_fixture_027",
+        "mjcf_body": "office_fixture_026",
         "source_group": "objects",
         "source_id": "reception_sign",
         "visual_geoms": [
-          "office_fixture_027_visual_01",
-          "office_fixture_027_visual_02"
+          "office_fixture_026_visual_01",
+          "office_fixture_026_visual_02"
         ]
       },
       "pose": [
@@ -1680,23 +1627,23 @@
       "id": "focus_desk",
       "mjcf": {
         "collision_geoms": [
-          "office_fixture_028_collision_01"
+          "office_fixture_027_collision_01"
         ],
-        "mjcf_body": "office_fixture_028",
+        "mjcf_body": "office_fixture_027",
         "source_group": "objects",
         "source_id": "focus_desk",
         "visual_geoms": [
-          "office_fixture_028_visual_01",
-          "office_fixture_028_visual_02",
-          "office_fixture_028_visual_03",
-          "office_fixture_028_visual_04",
-          "office_fixture_028_visual_05",
-          "office_fixture_028_visual_06",
-          "office_fixture_028_visual_07",
-          "office_fixture_028_visual_08",
-          "office_fixture_028_visual_09",
-          "office_fixture_028_visual_10",
-          "office_fixture_028_visual_11"
+          "office_fixture_027_visual_01",
+          "office_fixture_027_visual_02",
+          "office_fixture_027_visual_03",
+          "office_fixture_027_visual_04",
+          "office_fixture_027_visual_05",
+          "office_fixture_027_visual_06",
+          "office_fixture_027_visual_07",
+          "office_fixture_027_visual_08",
+          "office_fixture_027_visual_09",
+          "office_fixture_027_visual_10",
+          "office_fixture_027_visual_11"
         ]
       },
       "pose": [
@@ -1731,11 +1678,11 @@
       "id": "focus_laptop",
       "mjcf": {
         "collision_geoms": [],
-        "mjcf_body": "office_fixture_029",
+        "mjcf_body": "office_fixture_028",
         "source_group": "objects",
         "source_id": "focus_laptop",
         "visual_geoms": [
-          "office_fixture_029_visual_01"
+          "office_fixture_028_visual_01"
         ]
       },
       "pose": [
@@ -1772,13 +1719,13 @@
       "id": "focus_chair",
       "mjcf": {
         "collision_geoms": [
-          "office_fixture_030_collision_01"
+          "office_fixture_029_collision_01"
         ],
-        "mjcf_body": "office_fixture_030",
+        "mjcf_body": "office_fixture_029",
         "source_group": "objects",
         "source_id": "focus_chair",
         "visual_geoms": [
-          "office_fixture_030_visual_01"
+          "office_fixture_029_visual_01"
         ]
       },
       "pose": [
@@ -1813,16 +1760,16 @@
       "id": "focus_whiteboard",
       "mjcf": {
         "collision_geoms": [],
-        "mjcf_body": "office_fixture_031",
+        "mjcf_body": "office_fixture_030",
         "source_group": "objects",
         "source_id": "focus_whiteboard",
         "visual_geoms": [
-          "office_fixture_031_visual_01",
-          "office_fixture_031_visual_02",
-          "office_fixture_031_visual_03",
-          "office_fixture_031_visual_04",
-          "office_fixture_031_visual_05",
-          "office_fixture_031_visual_06"
+          "office_fixture_030_visual_01",
+          "office_fixture_030_visual_02",
+          "office_fixture_030_visual_03",
+          "office_fixture_030_visual_04",
+          "office_fixture_030_visual_05",
+          "office_fixture_030_visual_06"
         ]
       },
       "pose": [
@@ -1857,12 +1804,12 @@
       "id": "focus_office_sign",
       "mjcf": {
         "collision_geoms": [],
-        "mjcf_body": "office_fixture_032",
+        "mjcf_body": "office_fixture_031",
         "source_group": "objects",
         "source_id": "focus_office_sign",
         "visual_geoms": [
-          "office_fixture_032_visual_01",
-          "office_fixture_032_visual_02"
+          "office_fixture_031_visual_01",
+          "office_fixture_031_visual_02"
         ]
       },
       "pose": [
@@ -1901,13 +1848,13 @@
       "id": "storage_cabinet_01",
       "mjcf": {
         "collision_geoms": [
-          "office_fixture_033_collision_01"
+          "office_fixture_032_collision_01"
         ],
-        "mjcf_body": "office_fixture_033",
+        "mjcf_body": "office_fixture_032",
         "source_group": "objects",
         "source_id": "storage_cabinet_01",
         "visual_geoms": [
-          "office_fixture_033_visual_01"
+          "office_fixture_032_visual_01"
         ]
       },
       "pose": [
@@ -1947,13 +1894,13 @@
       "id": "storage_cabinet_02",
       "mjcf": {
         "collision_geoms": [
-          "office_fixture_034_collision_01"
+          "office_fixture_033_collision_01"
         ],
-        "mjcf_body": "office_fixture_034",
+        "mjcf_body": "office_fixture_033",
         "source_group": "objects",
         "source_id": "storage_cabinet_02",
         "visual_geoms": [
-          "office_fixture_034_visual_01"
+          "office_fixture_033_visual_01"
         ]
       },
       "pose": [
@@ -1988,11 +1935,11 @@
       "id": "storage_box_01",
       "mjcf": {
         "collision_geoms": [],
-        "mjcf_body": "office_fixture_035",
+        "mjcf_body": "office_fixture_034",
         "source_group": "objects",
         "source_id": "storage_box_01",
         "visual_geoms": [
-          "office_fixture_035_visual_01"
+          "office_fixture_034_visual_01"
         ]
       },
       "pose": [
@@ -2027,11 +1974,11 @@
       "id": "storage_box_02",
       "mjcf": {
         "collision_geoms": [],
-        "mjcf_body": "office_fixture_036",
+        "mjcf_body": "office_fixture_035",
         "source_group": "objects",
         "source_id": "storage_box_02",
         "visual_geoms": [
-          "office_fixture_036_visual_01"
+          "office_fixture_035_visual_01"
         ]
       },
       "pose": [
@@ -2066,12 +2013,12 @@
       "id": "storage_sign",
       "mjcf": {
         "collision_geoms": [],
-        "mjcf_body": "office_fixture_037",
+        "mjcf_body": "office_fixture_036",
         "source_group": "objects",
         "source_id": "storage_sign",
         "visual_geoms": [
-          "office_fixture_037_visual_01",
-          "office_fixture_037_visual_02"
+          "office_fixture_036_visual_01",
+          "office_fixture_036_visual_02"
         ]
       },
       "pose": [
@@ -2107,13 +2054,13 @@
       "id": "corridor_plant",
       "mjcf": {
         "collision_geoms": [
-          "office_fixture_038_collision_01"
+          "office_fixture_037_collision_01"
         ],
-        "mjcf_body": "office_fixture_038",
+        "mjcf_body": "office_fixture_037",
         "source_group": "objects",
         "source_id": "corridor_plant",
         "visual_geoms": [
-          "office_fixture_038_visual_01"
+          "office_fixture_037_visual_01"
         ]
       },
       "pose": [
@@ -2150,13 +2097,13 @@
       "id": "corridor_waste_bin",
       "mjcf": {
         "collision_geoms": [
-          "office_fixture_039_collision_01"
+          "office_fixture_038_collision_01"
         ],
-        "mjcf_body": "office_fixture_039",
+        "mjcf_body": "office_fixture_038",
         "source_group": "objects",
         "source_id": "corridor_waste_bin",
         "visual_geoms": [
-          "office_fixture_039_visual_01"
+          "office_fixture_038_visual_01"
         ]
       },
       "pose": [
@@ -2177,10 +2124,172 @@
           "waste bin"
         ]
       }
+    },
+    {
+      "collision": {
+        "nav_obstacle": false,
+        "shape": "none"
+      },
+      "dimensions": [
+        1.35,
+        0.07,
+        0.62
+      ],
+      "id": "corridor_notice_board",
+      "mjcf": {
+        "collision_geoms": [],
+        "mjcf_body": "office_fixture_039",
+        "source_group": "objects",
+        "source_id": "corridor_notice_board",
+        "visual_geoms": [
+          "office_fixture_039_visual_01",
+          "office_fixture_039_visual_02"
+        ]
+      },
+      "pose": [
+        2.65,
+        1.24,
+        1.55,
+        0.0
+      ],
+      "room": "corridor",
+      "semantic": {
+        "aliases": [
+          "公告板",
+          "notice board"
+        ],
+        "class": "wayfinding_board",
+        "labels": [
+          "巡检公告板",
+          "inspection notice board"
+        ]
+      }
+    },
+    {
+      "collision": {
+        "nav_obstacle": false,
+        "shape": "none"
+      },
+      "dimensions": [
+        1.18,
+        0.08,
+        0.86
+      ],
+      "id": "open_office_whiteboard",
+      "mjcf": {
+        "collision_geoms": [],
+        "mjcf_body": "office_fixture_040",
+        "source_group": "objects",
+        "source_id": "open_office_whiteboard",
+        "visual_geoms": [
+          "office_fixture_040_visual_01",
+          "office_fixture_040_visual_02",
+          "office_fixture_040_visual_03",
+          "office_fixture_040_visual_04",
+          "office_fixture_040_visual_05",
+          "office_fixture_040_visual_06"
+        ]
+      },
+      "pose": [
+        -6.95,
+        5.42,
+        1.04,
+        3.14159
+      ],
+      "room": "open_office",
+      "semantic": {
+        "aliases": [
+          "白板",
+          "board"
+        ],
+        "class": "whiteboard",
+        "labels": [
+          "开放办公区白板",
+          "open-office whiteboard"
+        ]
+      }
+    },
+    {
+      "collision": {
+        "nav_obstacle": false,
+        "shape": "none"
+      },
+      "dimensions": [
+        0.46,
+        0.38,
+        0.32
+      ],
+      "id": "pantry_snack_box",
+      "mjcf": {
+        "collision_geoms": [],
+        "mjcf_body": "office_fixture_041",
+        "source_group": "objects",
+        "source_id": "pantry_snack_box",
+        "visual_geoms": [
+          "office_fixture_041_visual_01"
+        ]
+      },
+      "pose": [
+        6.42,
+        3.02,
+        0.98,
+        0.0
+      ],
+      "room": "pantry",
+      "semantic": {
+        "aliases": [
+          "纸箱",
+          "箱子"
+        ],
+        "class": "parcel_box",
+        "labels": [
+          "茶水间纸箱",
+          "pantry parcel box"
+        ]
+      }
+    },
+    {
+      "collision": {
+        "nav_obstacle": false,
+        "shape": "none"
+      },
+      "dimensions": [
+        0.56,
+        0.56,
+        1.18
+      ],
+      "id": "reception_plant",
+      "mjcf": {
+        "collision_geoms": [],
+        "mjcf_body": "office_fixture_042",
+        "source_group": "objects",
+        "source_id": "reception_plant",
+        "visual_geoms": [
+          "office_fixture_042_visual_01"
+        ]
+      },
+      "pose": [
+        -7.12,
+        -4.75,
+        0.0,
+        0.0
+      ],
+      "room": "reception",
+      "semantic": {
+        "aliases": [
+          "植物",
+          "绿植"
+        ],
+        "class": "potted_plant",
+        "labels": [
+          "前台绿植",
+          "reception plant"
+        ]
+      }
     }
   ],
   "scene_id": "office_v2",
-  "scene_source_sha256": "7c30b7c4bb3e8136659688c80b8bef97724aae79aa7fd0f82deb96b227ca98ff",
+  "scene_source_sha256": "0b3368f15295bf14ad163c13ed58f458aa8812bb391c7cf070bb007931ffa0ec",
   "schema_version": "h-ide.office-v2-evaluation/1",
   "semantic_tests": [
     {
@@ -2230,10 +2339,10 @@
         "target_corridor_east"
       ],
       "expected_object_ids": [
-        "corridor_column"
+        "corridor_notice_board"
       ],
-      "id": "nav_avoid_corridor_column",
-      "prompt": "从西侧起点前往走廊东端，避开固定立柱。"
+      "id": "nav_central_corridor",
+      "prompt": "从西侧起点沿中央走廊前往东端，识别沿途公告板。"
     }
   ],
   "spawns": [

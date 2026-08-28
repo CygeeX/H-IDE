@@ -55,6 +55,26 @@ excluded from the Nav2 Docker context and are never exposed by the plant,
 H-IDE or Vision runtime. Nav2 receives only the generated occupancy map and a
 non-semantic integrity manifest.
 
+### Leader-demo showroom robots
+
+The leader-demo scene removes the old central corridor cylinder and visible
+ceiling panels, then uses MuJoCo's checker floor material. Three
+`display_robot_*` entries place complete, realistic G1 copies on the floor in
+room corners. The generator expands the source body's hierarchy and nominal
+joint pose recorded in `scenes/office_v2/hanging_g1_visual.json`; it measures a
+root-to-feet anchor so the soles touch the grid, and emits no joints,
+actuators, or collision bits for these copies. They are display-only, while
+the single dynamic G1 body remains the sole SONIC/Nav2-controlled robot. The
+manifest name is retained for compatibility with existing runtime asset
+paths. Re-run `python tools/build_scene.py` after changing either the scene
+manifest or the pinned G1 visual extraction.
+
+The optional voice-assistant wave uses the host-side
+`leader-demo-gesture-proxy` on the Docker bridge (`8798`). Control API can
+submit only the authenticated `g1-sim` wave payload; the proxy performs the
+private hop to SONIC's loopback command socket. The raw SONIC command port is
+never exposed to the container or the browser.
+
 ## Safety and isolation
 
 * Use `ROS_DOMAIN_ID=232` for every simulation process.  The real Robot Agent

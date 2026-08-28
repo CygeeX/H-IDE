@@ -145,7 +145,7 @@ def _assert_primitive_plan(module, navfn_path, plan) -> None:
         navfn_path["poses"]
     )
     assert plan["map_provenance"]["scene_source_sha256"] == (
-        "7c30b7c4bb3e8136659688c80b8bef97724aae79aa7fd0f82deb96b227ca98ff"
+        "0b3368f15295bf14ad163c13ed58f458aa8812bb391c7cf070bb007931ffa0ec"
     )
     assert all(
         len(plan["map_provenance"][name]) == 64
@@ -667,7 +667,7 @@ def test_live_revalidation_uses_physical_envelope_after_a_successful_action(
     start = (current["x"], current["y"])
     end = (endpoint["x"], endpoint["y"])
 
-    assert not static_map.segment_is_clear(
+    assert static_map.segment_is_clear(
         start,
         end,
         static_map.inflated_blocked_cells(CLEARANCE_RADIUS),
