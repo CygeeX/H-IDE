@@ -58,6 +58,10 @@ CONTINUOUS_RUNTIME_CLEARANCE_RADIUS_M = 0.50
 # partitioned into a small number of these long segments.
 FULL_STRAIGHT_RUNTIME_DRIVE_CHUNK_M = 4.0
 FULL_STRAIGHT_RUNTIME_CLEARANCE_RADIUS_M = 0.60
+FULL_STRAIGHT_TERMINAL_POSITION_TOLERANCE_M = (
+    runner.DETOUR_COMPLETED_ENDPOINT_TOLERANCE_M
+)
+FULL_STRAIGHT_TERMINAL_YAW_TOLERANCE_RAD = 0.35
 MAX_RUNTIME_DRIVE_ACTIONS_PER_SEGMENT = 8
 
 
@@ -457,6 +461,48 @@ class StrictNavigationExecutor:
         )
 
     @staticmethod
+    def _angle_delta(current: float, target: float) -> float:
+        return math.atan2(
+            math.sin(current - target),
+            math.cos(current - target),
+        )
+
+    def _full_straight_terminal_result(
+        self,
+        goal: runner.PlanarPose,
+        pose: runner.PlanarPose,
+        *,
+        plan_sha256: str,
+        plan_attempt: int,
+        completed_primitives: int,
+    ) -> NavigationResult | None:
+        """Accept a completed long straight drive without a risky micro-turn.
+
+        A long learned drive can stop a few decimetres past the exact NavFn
+        endpoint while remaining inside the reviewed physical arrival envelope.
+        Replanning that tiny residual often creates a spurious path tangent and
+        asks SONIC for a large corrective Spin.  Full mode accepts that physical
+        endpoint only after a verified plan/action and only when the requested
+        final yaw is already within the normal 0.35 rad arrival tolerance.
+        """
+
+        if not self.full_straight_drive or not plan_sha256:
+            return None
+        distance = math.hypot(goal.x - pose.x, goal.y - pose.y)
+        heading_error = abs(self._angle_delta(pose.yaw, goal.yaw))
+        if (
+            distance > FULL_STRAIGHT_TERMINAL_POSITION_TOLERANCE_M
+            or heading_error > FULL_STRAIGHT_TERMINAL_YAW_TOLERANCE_RAD
+        ):
+            return None
+        return NavigationResult(
+            final_pose=pose,
+            plan_sha256=plan_sha256,
+            completed_primitives=completed_primitives,
+            plan_attempts=plan_attempt,
+        )
+
+    @staticmethod
     def _terminal_path_sha256(
         navfn_path: Mapping[str, Any], goal: runner.PlanarPose
     ) -> str:
@@ -605,6 +651,19 @@ class StrictNavigationExecutor:
                     while True:
                         self._cancelled(cancelled)
                         fresh = self.backend.wait_fresh_map_pose()
+                        terminal = self._full_straight_terminal_result(
+                            goal,
+                            fresh.pose,
+                            plan_sha256=final_plan_hash,
+                            plan_attempt=plan_attempt,
+                            completed_primitives=completed,
+                        )
+                        if terminal is not None:
+                            if pending_drive_handoff:
+                                self._wait_balanced_idle(cancelled=cancelled)
+                                pending_drive_handoff = False
+                                pending_drive_direction = None
+                            return terminal
                         if feedback is not None:
                             feedback(
                                 NavigationProgress(
