@@ -1103,10 +1103,11 @@ fi
 # motion owner that passed motion-core acceptance.  Start this adapter after
 # Nav2 lifecycle activation and before any component capable of acquiring a
 # RobotAgent lease.  NavigateToPose / FollowPath output remains quarantined.
-# In continuous handoff mode only the blocking balanced-IDLE wait between
-# contiguous DriveOnHeading chunks is skipped. The runner still publishes the
+# In continuous handoff mode open DriveOnHeading checkpoints may use the
+# reviewed 2 m planner limit and skip the blocking balanced-IDLE wait only
+# when another same-direction chunk remains. The runner still publishes the
 # endpoint zero, revalidates fresh odometry/clearance, and gates final or
-# direction-changing stops.
+# direction-changing stops. The default remains the frozen 0.50 m profile.
 strict_navigation_command='source /opt/ros/jazzy/setup.bash; source "$HIDE_DEMO_ROBOT_ROOT/tools/activate-local-nav2-jazzy.bash"; export ROS_DOMAIN_ID=232 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp CYCLONEDDS_URI="$HIDE_DEMO_CYCLONE"; export PYTHONPATH="$HIDE_DEMO_SIM_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"; exec /usr/bin/python3 -u "$HIDE_DEMO_SIM_ROOT/tools/strict_navigation_adapter.py" --command-timeout-seconds 2400'
 if [[ "${HIDE_DEMO_CONTINUOUS_DRIVE_HANDOFF}" == "1" ]]; then
   strict_navigation_command+=' --continuous-drive-handoff'
