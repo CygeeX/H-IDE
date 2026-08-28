@@ -21,9 +21,12 @@ stale or cancelled.
 
 * `vendor/lerobot` is pinned to `f5fdcb61cda272b866ca81f72ce6f1f76b87fad9`.
   The source is Apache-2.0.
-* `models/unitree-g1-mujoco` is the public `lerobot/unitree-g1-mujoco`
-  repository. Its simulator bridge and no-hand G1 asset match NVIDIA's current
-  SONIC MuJoCo deployment model, including the full-sole collision boxes.
+* `models/unitree-g1-mujoco` is the pinned local simulator model tree. It is
+  based on `lerobot/unitree-g1-mujoco`; this checkout contains the reviewed
+  H-IDE simulator patches and must be present at gitlink revision
+  `4a164cf08d4e14b100f7dccc711bc62a7c838f6f`. Its no-hand G1 asset matches
+  NVIDIA's current SONIC MuJoCo deployment model, including the full-sole
+  collision boxes.
 * SONIC ONNX weights are downloaded at runtime from `nvidia/GEAR-SONIC` and
   must not be committed or baked into an image.  The weights are covered by
   NVIDIA's Open Model License, which is separate from the LeRobot license.
@@ -32,6 +35,15 @@ The first install can download several gigabytes of PyTorch/CUDA wheels and
 about 865 MB of SONIC weights.  Set `SONIC_FORCE_CPU=1` when checking the
 contracts on a host without a compatible CUDA runtime.  CPU mode is suitable
 for contract tests, not for a smooth 50 Hz demonstration.
+
+When cloning a fresh workstation, obtain the model tree from the project's
+approved internal mirror (the parent repository stores it as a gitlink), then
+verify the revision before building:
+
+```sh
+git -C models/unitree-g1-mujoco rev-parse HEAD
+# expected: 4a164cf08d4e14b100f7dccc711bc62a7c838f6f
+```
 
 ## Office V2 scene contract
 
