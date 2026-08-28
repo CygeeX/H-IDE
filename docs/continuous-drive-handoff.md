@@ -22,11 +22,14 @@ itself has no 2 m limit; the 20 m value is only a finite runtime/watchdog
 bound.
 
 Full mode is admitted only when the selected segment remains collision-free at
-an additional `0.60 m` occupancy inflation contour.  If that proof fails, or
-if the wider plan cannot be built/verified, execution automatically falls back
-to the 2 m continuous profile and then to the frozen 0.50 m profile.  Turns,
-doorways, walls, columns, reverse/recovery actions, and final heading checks
-remain segmented.
+an additional `0.60 m` occupancy inflation contour.  The single-action bound
+is `4.0 m`, because the current conservative progress watchdog would otherwise
+produce a `time_allowance` over Nav2's 120-second contract.  Longer clear
+paths are divided into a small number of 4 m actions.  If the wider plan
+cannot be built/verified, execution automatically falls back to the 2 m
+continuous profile and then to the frozen 0.50 m profile.  Turns, doorways,
+walls, columns, reverse/recovery actions, and final heading checks remain
+segmented.
 
 ## Behaviour
 
@@ -105,7 +108,8 @@ share one boot/session identity.
   as one continuous forward action, with terminal `IDLE/GRANTED` and no Plant
   or SONIC fault.
 - Offline full-straight planner proof: a clear 3 m corridor is partitioned into
-  one segment and passes production verification with `max_segment_m=20.0`.
+  one segment and passes production verification with the full-mode segment
+  bound.
 - A multi-segment column route retained short checkpoints near the obstacle;
   its independent endpoint/heading convergence issue is not hidden by this
   optimization and remains a separate navigation task.

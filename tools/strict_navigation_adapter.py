@@ -50,11 +50,13 @@ CONTINUOUS_RUNTIME_DRIVE_CHUNK_M = 2.0
 # 0.50 m contour keeps the optimization away from door jambs, walls, and the
 # column detour where learned yaw/cross-track error needs frequent checkpoints.
 CONTINUOUS_RUNTIME_CLEARANCE_RADIUS_M = 0.50
-# Full straight mode raises the planner's segment bound to the map's maximum
-# useful span.  This is not an unbounded command: the static planner still
-# proves the entire chord against the occupancy raster, and the runtime action
-# timeout remains finite.  A 20 m diagonal covers the 16 m x 12 m Office V2 map.
-FULL_STRAIGHT_RUNTIME_DRIVE_CHUNK_M = 20.0
+# Full straight mode raises the planner's segment bound to the largest single
+# DriveOnHeading action that still fits Nav2's 120 s time_allowance contract
+# when the runner retains its conservative 0.04 m/s progress floor.  Four
+# metres yields a 110 s allowance (including the 10 s startup/stop margin),
+# leaving headroom for transport and executor jitter. Longer clear paths are
+# partitioned into a small number of these long segments.
+FULL_STRAIGHT_RUNTIME_DRIVE_CHUNK_M = 4.0
 FULL_STRAIGHT_RUNTIME_CLEARANCE_RADIUS_M = 0.60
 MAX_RUNTIME_DRIVE_ACTIONS_PER_SEGMENT = 8
 

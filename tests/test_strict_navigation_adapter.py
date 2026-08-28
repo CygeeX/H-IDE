@@ -385,7 +385,7 @@ def test_full_straight_drive_sends_the_whole_verified_segment_once() -> None:
         ("Spin", 0.2),
         ("DriveOnHeading", 3.0),
     ]
-    assert planner.max_segment_values == [20.0]
+    assert planner.max_segment_values == [4.0]
     assert backend.health_calls == 2
 
 
@@ -412,7 +412,7 @@ def test_full_straight_drive_falls_back_to_reviewed_planner_bound() -> None:
     assert verified is plan
     assert full_active is False
     assert "max_segment_m" not in kwargs
-    assert planner.max_segment_values == [20.0, None]
+    assert planner.max_segment_values == [4.0, None]
 
 
 @pytest.mark.parametrize("clear", [True, False])
