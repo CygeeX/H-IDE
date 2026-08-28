@@ -45,6 +45,12 @@ MAX_PRODUCT_REPLANS = 2
 # actions, so Nav2 does not request a stop/re-arm boundary every half metre.
 MAX_RUNTIME_DRIVE_CHUNK_M = 0.50
 CONTINUOUS_RUNTIME_DRIVE_CHUNK_M = 2.0
+# Extra map clearance required before a plan is allowed to use the long
+# continuous profile.  The reviewed planner clearance is 0.42 m; requiring a
+# 0.50 m contour keeps the optimization away from door jambs, walls, and the
+# column detour where learned yaw/cross-track error needs frequent checkpoints.
+CONTINUOUS_RUNTIME_CLEARANCE_RADIUS_M = 0.50
+CONTINUOUS_HEADING_VARIATION_RAD = 0.15
 MAX_RUNTIME_DRIVE_ACTIONS_PER_SEGMENT = 8
 
 
@@ -126,6 +132,8 @@ class StrictNavigationExecutor:
             if continuous_drive_handoff
             else MAX_RUNTIME_DRIVE_CHUNK_M
         )
+        self._continuous_map = None
+        self._continuous_blocked = None
 
     @staticmethod
     def _plan_kwargs() -> dict[str, Any]:
@@ -145,6 +153,87 @@ class StrictNavigationExecutor:
         if not isinstance(value, Mapping):
             raise runner.StrictMotionRunnerError(f"{field} must be an object")
         return value
+
+    @staticmethod
+    def _wrapped_delta(current: float, previous: float) -> float:
+        return math.atan2(
+            math.sin(current - previous),
+            math.cos(current - previous),
+        )
+
+    def _continuous_plan_allowed(self, plan: Mapping[str, Any]) -> bool:
+        """Allow long chunks only on a straight, generously clear plan.
+
+        The frozen profile deliberately revalidates every half metre.  The
+        continuous profile is an optimization for open straight travel, not a
+        blanket relaxation for turns or obstacle corridors.  The static
+        planner is kept authoritative: if its map implementation is present,
+        every reviewed segment must also be clear at a larger 0.50 m contour.
+        Small fake planners used by unit tests do not expose ``StaticMap`` and
+        retain the old test-only behavior.
+        """
+
+        if not self.continuous_drive_handoff:
+            return False
+        raw_segments = plan.get("segments")
+        if not isinstance(raw_segments, list) or not raw_segments:
+            return not hasattr(self.static_planner, "StaticMap")
+        segments: list[Mapping[str, Any]] = []
+        headings: list[float] = []
+        for index, raw in enumerate(raw_segments):
+            if not isinstance(raw, Mapping):
+                return False
+            try:
+                start = self._mapping(raw.get("start_map"), f"segment {index} start")
+                end = self._mapping(raw.get("end_map"), f"segment {index} end")
+                heading = self._finite(
+                    raw.get("heading_map_yaw_rad"),
+                    f"segment {index} heading",
+                )
+                self._finite(start.get("x"), f"segment {index} start x")
+                self._finite(start.get("y"), f"segment {index} start y")
+                self._finite(end.get("x"), f"segment {index} end x")
+                self._finite(end.get("y"), f"segment {index} end y")
+            except runner.StrictMotionRunnerError:
+                return False
+            segments.append(raw)
+            headings.append(heading)
+        reference_heading = headings[0]
+        if any(
+            abs(self._wrapped_delta(heading, reference_heading))
+            > CONTINUOUS_HEADING_VARIATION_RAD
+            for heading in headings[1:]
+        ):
+            return False
+
+        # Production plans expose the map raster.  Do not silently enable the
+        # long profile if the larger-contour proof cannot be computed.
+        map_type = getattr(self.static_planner, "StaticMap", None)
+        if map_type is None:
+            return True
+        try:
+            if self._continuous_map is None or self._continuous_blocked is None:
+                kwargs = self._plan_kwargs()
+                self._continuous_map = map_type.load(
+                    kwargs["map_yaml_path"], kwargs["map_image_path"]
+                )
+                self._continuous_blocked = self._continuous_map.inflated_blocked_cells(
+                    CONTINUOUS_RUNTIME_CLEARANCE_RADIUS_M
+                )
+            for index, segment in enumerate(segments):
+                start = self._mapping(segment.get("start_map"), f"segment {index} start")
+                end = self._mapping(segment.get("end_map"), f"segment {index} end")
+                if not self._continuous_map.segment_is_clear(
+                    (self._finite(start.get("x"), f"segment {index} start x"),
+                     self._finite(start.get("y"), f"segment {index} start y")),
+                    (self._finite(end.get("x"), f"segment {index} end x"),
+                     self._finite(end.get("y"), f"segment {index} end y")),
+                    self._continuous_blocked,
+                ):
+                    return False
+        except Exception:
+            return False
+        return True
 
     def _cancelled(self, cancelled: Callable[[], bool]) -> None:
         if cancelled():
@@ -199,7 +288,18 @@ class StrictNavigationExecutor:
         *,
         cancelled: Callable[[], bool],
         wait_for_idle: bool = True,
+        drive_chunk_m: float | None = None,
     ) -> str:
+        if drive_chunk_m is None:
+            drive_chunk_m = self.runtime_drive_chunk_m
+        if (
+            isinstance(drive_chunk_m, bool)
+            or not isinstance(drive_chunk_m, (int, float))
+            or not math.isfinite(float(drive_chunk_m))
+            or float(drive_chunk_m) <= 0.0
+        ):
+            raise ValueError("drive chunk limit must be finite and positive")
+        drive_chunk_m = float(drive_chunk_m)
         action_type = resolved.get("action_type")
         goal = self._mapping(resolved.get("action_goal"), "resolved action goal")
         if action_type == "nav2_msgs/action/DriveOnHeading":
@@ -208,7 +308,7 @@ class StrictNavigationExecutor:
                 target.get("x"), "DriveOnHeading distance"
             )
             distance = math.copysign(
-                min(abs(resolved_distance), self.runtime_drive_chunk_m),
+                min(abs(resolved_distance), drive_chunk_m),
                 resolved_distance,
             )
             timeout_s = runner.translation_action_timeout_s(abs(distance))
@@ -391,6 +491,12 @@ class StrictNavigationExecutor:
                     raise runner.StrictMotionRunnerError(
                         "static primitive plan is empty"
                     )
+                continuous_plan_handoff = self._continuous_plan_allowed(verified)
+                plan_drive_chunk_m = (
+                    CONTINUOUS_RUNTIME_DRIVE_CHUNK_M
+                    if continuous_plan_handoff
+                    else MAX_RUNTIME_DRIVE_CHUNK_M
+                )
                 final_plan_hash = str(verified.get("plan_sha256", ""))
                 if not final_plan_hash:
                     raise runner.StrictMotionRunnerError(
@@ -551,7 +657,7 @@ class StrictNavigationExecutor:
                                 )
                         wait_for_idle = True
                         if (
-                            self.continuous_drive_handoff
+                            continuous_plan_handoff
                             and action_type == "nav2_msgs/action/DriveOnHeading"
                             and distance is not None
                             and isinstance(
@@ -574,7 +680,7 @@ class StrictNavigationExecutor:
                             )
                             admitted_distance = min(
                                 command_distance,
-                                self.runtime_drive_chunk_m,
+                                plan_drive_chunk_m,
                             )
                             if (
                                 distance
@@ -592,6 +698,7 @@ class StrictNavigationExecutor:
                             resolved,
                             cancelled=cancelled,
                             wait_for_idle=wait_for_idle,
+                            drive_chunk_m=plan_drive_chunk_m,
                         )
                         completed += 1
                         pending_drive_handoff = (
