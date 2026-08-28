@@ -50,6 +50,12 @@ CONTINUOUS_RUNTIME_DRIVE_CHUNK_M = 2.0
 # 0.50 m contour keeps the optimization away from door jambs, walls, and the
 # column detour where learned yaw/cross-track error needs frequent checkpoints.
 CONTINUOUS_RUNTIME_CLEARANCE_RADIUS_M = 0.50
+# Full straight mode raises the planner's segment bound to the map's maximum
+# useful span.  This is not an unbounded command: the static planner still
+# proves the entire chord against the occupancy raster, and the runtime action
+# timeout remains finite.  A 20 m diagonal covers the 16 m x 12 m Office V2 map.
+FULL_STRAIGHT_RUNTIME_DRIVE_CHUNK_M = 20.0
+FULL_STRAIGHT_RUNTIME_CLEARANCE_RADIUS_M = 0.60
 MAX_RUNTIME_DRIVE_ACTIONS_PER_SEGMENT = 8
 
 
@@ -106,6 +112,7 @@ class StrictNavigationExecutor:
         command_timeout_s: float = DEFAULT_COMMAND_TIMEOUT_S,
         live_clearance_radius_m: float | None = None,
         continuous_drive_handoff: bool = False,
+        full_straight_drive: bool = False,
     ) -> None:
         timeout = float(command_timeout_s)
         if not math.isfinite(timeout) or timeout <= 0.0:
@@ -125,18 +132,27 @@ class StrictNavigationExecutor:
         self.live_clearance_radius_m = clearance
         if not isinstance(continuous_drive_handoff, bool):
             raise ValueError("continuous_drive_handoff must be a boolean")
+        if not isinstance(full_straight_drive, bool):
+            raise ValueError("full_straight_drive must be a boolean")
         self.continuous_drive_handoff = continuous_drive_handoff
+        self.full_straight_drive = full_straight_drive
         self.runtime_drive_chunk_m = (
-            CONTINUOUS_RUNTIME_DRIVE_CHUNK_M
+            FULL_STRAIGHT_RUNTIME_DRIVE_CHUNK_M
+            if full_straight_drive
+            else CONTINUOUS_RUNTIME_DRIVE_CHUNK_M
             if continuous_drive_handoff
             else MAX_RUNTIME_DRIVE_CHUNK_M
         )
         self._continuous_map = None
-        self._continuous_blocked = None
+        self._continuous_blocked: dict[float, Any] = {}
 
-    @staticmethod
-    def _plan_kwargs() -> dict[str, Any]:
-        return runner.StrictMotionCaseExecutor._static_plan_kwargs()
+    def _plan_kwargs(self, *, full_straight: bool | None = None) -> dict[str, Any]:
+        kwargs = runner.StrictMotionCaseExecutor._static_plan_kwargs()
+        if full_straight is None:
+            full_straight = self.full_straight_drive
+        if full_straight:
+            kwargs["max_segment_m"] = FULL_STRAIGHT_RUNTIME_DRIVE_CHUNK_M
+        return kwargs
 
     @staticmethod
     def _finite(value: object, field: str) -> float:
@@ -157,6 +173,8 @@ class StrictNavigationExecutor:
         self,
         plan: Mapping[str, Any],
         primitive: Mapping[str, Any],
+        *,
+        full_straight: bool = False,
     ) -> bool:
         """Allow a long chunk only on one generously clear segment.
 
@@ -164,12 +182,13 @@ class StrictNavigationExecutor:
         continuous profile is an optimization for open straight travel, not a
         blanket relaxation for turns or obstacle corridors.  The static
         planner is kept authoritative: if its map implementation is present,
-        the selected segment must also be clear at a larger 0.50 m contour.
+        the selected segment must also be clear at a larger contour (0.50 m for
+        the 2 m profile, 0.60 m for full-straight mode).
         Small fake planners used by unit tests do not expose ``StaticMap`` and
         retain the old test-only behavior.
         """
 
-        if not self.continuous_drive_handoff:
+        if not (self.continuous_drive_handoff or self.full_straight_drive):
             return False
         raw_segments = plan.get("segments")
         if not isinstance(raw_segments, list) or not raw_segments:
@@ -201,14 +220,22 @@ class StrictNavigationExecutor:
         if map_type is None:
             return True
         try:
-            if self._continuous_map is None or self._continuous_blocked is None:
+            if self._continuous_map is None:
                 kwargs = self._plan_kwargs()
                 self._continuous_map = map_type.load(
                     kwargs["map_yaml_path"], kwargs["map_image_path"]
                 )
-                self._continuous_blocked = self._continuous_map.inflated_blocked_cells(
-                    CONTINUOUS_RUNTIME_CLEARANCE_RADIUS_M
+            clearance_radius = (
+                FULL_STRAIGHT_RUNTIME_CLEARANCE_RADIUS_M
+                if full_straight
+                else CONTINUOUS_RUNTIME_CLEARANCE_RADIUS_M
+            )
+            blocked = self._continuous_blocked.get(clearance_radius)
+            if blocked is None:
+                blocked = self._continuous_map.inflated_blocked_cells(
+                    clearance_radius
                 )
+                self._continuous_blocked[clearance_radius] = blocked
             if not self._continuous_map.segment_is_clear(
                 (
                     self._finite(start.get("x"), "segment start x"),
@@ -218,12 +245,56 @@ class StrictNavigationExecutor:
                     self._finite(end.get("x"), "segment end x"),
                     self._finite(end.get("y"), "segment end y"),
                 ),
-                self._continuous_blocked,
+                blocked,
             ):
                 return False
         except Exception:
             return False
         return True
+
+    def _build_verified_plan(
+        self,
+        navfn_path: Mapping[str, Any],
+    ) -> tuple[Any, Mapping[str, Any], bool, dict[str, Any]]:
+        """Build a plan, falling back to the reviewed 2 m partition if needed.
+
+        ``full_straight_drive`` changes only the planner's maximum segment
+        length.  A failure to construct or verify that wider plan must not turn
+        a valid ordinary navigation request into an error; retry the same
+        NavFn path with the frozen planner bound and let the existing 2 m/0.5 m
+        runtime profiles take over.
+        """
+
+        requested_full = self.full_straight_drive
+        plan_kwargs = self._plan_kwargs(full_straight=requested_full)
+        try:
+            plan = self.static_planner.build_primitive_plan(
+                navfn_path,
+                **plan_kwargs,
+            )
+            verified = self.static_planner.verify_primitive_plan(
+                plan,
+                navfn_path,
+                **plan_kwargs,
+            )
+            return plan, verified, requested_full, plan_kwargs
+        except Exception as full_error:
+            if not requested_full:
+                raise
+            fallback_kwargs = self._plan_kwargs(full_straight=False)
+            try:
+                plan = self.static_planner.build_primitive_plan(
+                    navfn_path,
+                    **fallback_kwargs,
+                )
+                verified = self.static_planner.verify_primitive_plan(
+                    plan,
+                    navfn_path,
+                    **fallback_kwargs,
+                )
+            except Exception as fallback_error:
+                raise fallback_error from full_error
+            return plan, verified, False, fallback_kwargs
 
     def _cancelled(self, cancelled: Callable[[], bool]) -> None:
         if cancelled():
@@ -425,7 +496,7 @@ class StrictNavigationExecutor:
                     "y": recovery_pose.pose.y,
                     "yaw": recovery_pose.pose.yaw,
                 },
-                **self._plan_kwargs(),
+                **self._plan_kwargs(full_straight=False),
             )
             if recovery.get("disposition") == "send_action":
                 self._execute_resolved(recovery, cancelled=cancelled)
@@ -460,9 +531,12 @@ class StrictNavigationExecutor:
                         plan_attempts=plan_attempt,
                     )
                 try:
-                    plan = self.static_planner.build_primitive_plan(
-                        navfn_path, **self._plan_kwargs()
-                    )
+                    (
+                        plan,
+                        verified,
+                        full_plan_active,
+                        plan_kwargs,
+                    ) = self._build_verified_plan(navfn_path)
                 except Exception:
                     terminal = self._finish_relaxed_terminal_pose(
                         goal,
@@ -473,9 +547,6 @@ class StrictNavigationExecutor:
                     if terminal is not None:
                         return terminal
                     raise
-                verified = self.static_planner.verify_primitive_plan(
-                    plan, navfn_path, **self._plan_kwargs()
-                )
                 primitives = verified.get("primitives")
                 if not isinstance(primitives, list) or not primitives:
                     raise runner.StrictMotionRunnerError(
@@ -492,13 +563,34 @@ class StrictNavigationExecutor:
                         raise runner.StrictMotionRunnerError(
                             "static primitive entry is invalid"
                         )
-                    continuous_plan_handoff = self._continuous_segment_allowed(
-                        verified,
-                        primitive,
+                    full_segment_handoff = (
+                        full_plan_active
+                        and self._continuous_segment_allowed(
+                            verified,
+                            primitive,
+                            full_straight=True,
+                        )
+                    )
+                    continuous_segment_handoff = (
+                        (
+                            self.continuous_drive_handoff
+                            or self.full_straight_drive
+                            or full_plan_active
+                        )
+                        and self._continuous_segment_allowed(
+                            verified,
+                            primitive,
+                            full_straight=False,
+                        )
+                    )
+                    segment_handoff_enabled = (
+                        full_segment_handoff or continuous_segment_handoff
                     )
                     plan_drive_chunk_m = (
-                        CONTINUOUS_RUNTIME_DRIVE_CHUNK_M
-                        if continuous_plan_handoff
+                        FULL_STRAIGHT_RUNTIME_DRIVE_CHUNK_M
+                        if full_segment_handoff
+                        else CONTINUOUS_RUNTIME_DRIVE_CHUNK_M
+                        if continuous_segment_handoff
                         else MAX_RUNTIME_DRIVE_CHUNK_M
                     )
                     realignments = 0
@@ -530,7 +622,7 @@ class StrictNavigationExecutor:
                                 live_execution_clearance_radius_m=(
                                     self.live_clearance_radius_m
                                 ),
-                                **self._plan_kwargs(),
+                                **plan_kwargs,
                             )
                         except Exception:
                             if plan_attempt <= MAX_PRODUCT_REPLANS:
@@ -571,7 +663,7 @@ class StrictNavigationExecutor:
                                 live_execution_clearance_radius_m=(
                                     self.live_clearance_radius_m
                                 ),
-                                **self._plan_kwargs(),
+                                **plan_kwargs,
                             )
                             if resolved.get("disposition") != "send_action":
                                 raise runner.StrictMotionRunnerError(
@@ -650,7 +742,7 @@ class StrictNavigationExecutor:
                                 )
                         wait_for_idle = True
                         if (
-                            continuous_plan_handoff
+                            segment_handoff_enabled
                             and action_type == "nav2_msgs/action/DriveOnHeading"
                             and distance is not None
                             and isinstance(
@@ -839,6 +931,7 @@ class StrictNavigationActionServer:
                 "healthy": healthy,
                 "active": active,
                 "continuousDriveHandoff": self.executor.continuous_drive_handoff,
+                "fullStraightDrive": self.executor.full_straight_drive,
                 "runtimeDriveChunkM": self.executor.runtime_drive_chunk_m,
                 "bridge": bridge,
                 "error": detail,
@@ -975,6 +1068,14 @@ def _parser() -> argparse.ArgumentParser:
             "DriveOnHeading chunks; final/direction-change stops remain gated"
         ),
     )
+    parser.add_argument(
+        "--full-straight-drive",
+        action="store_true",
+        help=(
+            "allow one full map-verified straight segment (with automatic "
+            "fallback to the 2 m/0.5 m profiles); implies continuous handoff"
+        ),
+    )
     return parser
 
 
@@ -991,6 +1092,7 @@ def main() -> int:
             static_planner,
             command_timeout_s=args.command_timeout_seconds,
             continuous_drive_handoff=args.continuous_drive_handoff,
+            full_straight_drive=args.full_straight_drive,
         )
         server = StrictNavigationActionServer(backend, executor)
         try:

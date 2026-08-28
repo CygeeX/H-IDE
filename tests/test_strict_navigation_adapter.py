@@ -213,12 +213,14 @@ def executor(
     planner: FakePlanner,
     *,
     continuous_drive_handoff: bool = False,
+    full_straight_drive: bool = False,
 ):
     return adapter.StrictNavigationExecutor(
         backend,
         planner,
         sleep=lambda _seconds: None,
         continuous_drive_handoff=continuous_drive_handoff,
+        full_straight_drive=full_straight_drive,
     )
 
 
@@ -339,6 +341,78 @@ def test_continuous_drive_handoff_only_skips_an_intermediate_chunk() -> None:
     # Spin + terminal Drive only.  The first 2 m action is handed directly to
     # the next same-direction chunk without a blocking learned-IDLE wait.
     assert backend.health_calls == 2
+
+
+def test_full_straight_drive_sends_the_whole_verified_segment_once() -> None:
+    backend = FakeBackend()
+
+    class ThreeMetrePlanner(FakePlanner):
+        def __init__(self):
+            super().__init__()
+            self.max_segment_values: list[float | None] = []
+
+        def build_primitive_plan(self, navfn_path, **kwargs):
+            self.max_segment_values.append(kwargs.get("max_segment_m"))
+            return super().build_primitive_plan(navfn_path, **kwargs)
+
+        def resolve_live_primitive(self, plan, index, navfn_path, pose, **kwargs):
+            if index == 0:
+                return super().resolve_live_primitive(
+                    plan, index, navfn_path, pose, **kwargs
+                )
+            remaining = max(0.0, 3.0 - float(pose["x"]))
+            if remaining <= runner.DETOUR_ENDPOINT_TOLERANCE_M:
+                return {"disposition": "skip_within_endpoint_tolerance"}
+            return {
+                "disposition": "send_action",
+                "action_type": "nav2_msgs/action/DriveOnHeading",
+                "action_goal": {
+                    "target": {"x": remaining, "y": 0.0, "z": 0.0},
+                    "speed_mps": runner.OFFICIAL_DRIVE_SPEED_MPS,
+                },
+                "fresh_distance_to_endpoint_m": remaining,
+            }
+
+    planner = ThreeMetrePlanner()
+    result = executor(
+        backend,
+        planner,
+        full_straight_drive=True,
+    ).navigate(runner.PlanarPose(3.0, 0.0, 0.2))
+
+    assert result.final_pose.x == pytest.approx(3.0)
+    assert backend.sent == [
+        ("Spin", 0.2),
+        ("DriveOnHeading", 3.0),
+    ]
+    assert planner.max_segment_values == [20.0]
+    assert backend.health_calls == 2
+
+
+def test_full_straight_drive_falls_back_to_reviewed_planner_bound() -> None:
+    class RejectFullPlanner(FakePlanner):
+        def __init__(self):
+            super().__init__()
+            self.max_segment_values: list[float | None] = []
+
+        def build_primitive_plan(self, navfn_path, **kwargs):
+            value = kwargs.get("max_segment_m")
+            self.max_segment_values.append(value)
+            if value == adapter.FULL_STRAIGHT_RUNTIME_DRIVE_CHUNK_M:
+                raise ValueError("full chord is not partitionable")
+            return super().build_primitive_plan(navfn_path, **kwargs)
+
+    planner = RejectFullPlanner()
+    subject = executor(FakeBackend(), planner, full_straight_drive=True)
+    plan, verified, full_active, kwargs = subject._build_verified_plan(
+        {"frame_id": "map", "poses": [{"x": 0.0, "y": 0.0, "yaw": 0.0}, {"x": 1.0, "y": 0.0, "yaw": 0.0}]}
+    )
+
+    assert isinstance(plan, dict)
+    assert verified is plan
+    assert full_active is False
+    assert "max_segment_m" not in kwargs
+    assert planner.max_segment_values == [20.0, None]
 
 
 @pytest.mark.parametrize("clear", [True, False])

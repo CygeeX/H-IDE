@@ -1,4 +1,4 @@
-# Continuous Drive Handoff
+# Continuous Drive Handoff and Full Straight Drive
 
 ## Purpose
 
@@ -11,6 +11,22 @@ boundary is correct for safety, but it made an open straight corridor look like
 This document describes the opt-in continuous profile.  It does not remove
 fault handling, cancellation, endpoint checks, fresh localization, or the
 normal stop boundary at a turn.
+
+## Full straight mode
+
+`full_straight_drive` is a separate, more aggressive profile for a verified
+straight segment.  It asks the static planner to use a map-bounded `20 m`
+maximum segment (the diagonal of the 16 m x 12 m Office V2 map), so an open
+3–8 m chord can be sent as one `DriveOnHeading` action.  The action contract
+itself has no 2 m limit; the 20 m value is only a finite runtime/watchdog
+bound.
+
+Full mode is admitted only when the selected segment remains collision-free at
+an additional `0.60 m` occupancy inflation contour.  If that proof fails, or
+if the wider plan cannot be built/verified, execution automatically falls back
+to the 2 m continuous profile and then to the frozen 0.50 m profile.  Turns,
+doorways, walls, columns, reverse/recovery actions, and final heading checks
+remain segmented.
 
 ## Behaviour
 
@@ -39,6 +55,16 @@ From the simulator repository:
 ./scripts/start-workstation-demo.sh --viewer --continuous-drive-handoff
 ```
 
+To enable the independent full straight profile:
+
+```bash
+./scripts/start-workstation-demo.sh --viewer --full-straight-drive
+```
+
+Full mode implies the continuous handoff behavior for any segment that does
+not qualify for the full-length contour.  The equivalent environment switch
+is `HIDE_FULL_STRAIGHT_DRIVE=1`.
+
 The launcher's default remains the frozen profile.  The equivalent environment
 switch is:
 
@@ -51,6 +77,7 @@ The strict adapter health service exposes the active choice:
 ```text
 /h_ide/strict_navigation/health
 continuousDriveHandoff: true
+fullStraightDrive: false
 runtimeDriveChunkM: 2.0
 ```
 
@@ -63,19 +90,22 @@ git switch feat/assistant-v2
 ./scripts/start-workstation-demo.sh --viewer
 ```
 
-Omitting `--continuous-drive-handoff` also disables the profile when running
-the experiment branch.  Restart the complete coupled simulation chain after a
+Omitting both profile flags disables the optimization when running the
+experiment branch.  Restart the complete coupled simulation chain after a
 branch or profile change so Plant, SONIC, ROS bridges, Nav2, and the adapter
 share one boot/session identity.
 
 ## Verification record
 
-- Adapter regression tests: `18 passed`.
+- Adapter regression tests: `20 passed` (including full-straight and fallback
+  cases).
 - Formal launch checks: `bash -n scripts/start-workstation-demo.sh` and Python
   byte-compilation pass.
 - Live open-corridor A/B runs: approximately `1.99 m` and `1.98 m` traversed
   as one continuous forward action, with terminal `IDLE/GRANTED` and no Plant
   or SONIC fault.
+- Offline full-straight planner proof: a clear 3 m corridor is partitioned into
+  one segment and passes production verification with `max_segment_m=20.0`.
 - A multi-segment column route retained short checkpoints near the obstacle;
   its independent endpoint/heading convergence issue is not hidden by this
   optimization and remains a separate navigation task.
