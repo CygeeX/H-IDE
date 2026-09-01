@@ -57,6 +57,7 @@ evidence/
 *.safetensors
 *.bin
 models/**/.cache/
+components/h-ide-mujoco-sonic/models/unitree-g1-mujoco
 hf_cache/
 .huggingface/
 

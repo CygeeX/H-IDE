@@ -17,6 +17,7 @@ GROOT_URL="https://github.com/NVlabs/GR00T-WholeBodyControl.git"
 GROOT_REVISION="c374bae5b9039cd0ee71377e654d11ce1bc69e1d"
 SONIC_REPO="nvidia/GEAR-SONIC"
 SONIC_REVISION="9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2"
+HUGGINGFACE_HUB_VERSION="1.29.0"
 
 FETCH_SONIC=false
 FETCH_G1=false
@@ -228,14 +229,55 @@ if [[ "${FETCH_SONIC}" == true ]]; then
   configured_sonic_cache="$(env_value SONIC_HF_CACHE)"
   sonic_cache="${SONIC_HF_CACHE:-${configured_sonic_cache:-${XDG_CACHE_HOME:-${HOME}/.cache}/huggingface/hub}}"
   mkdir -p "${sonic_cache}"
-  python3 - "${sonic_cache}" "${SONIC_REPO}" "${SONIC_REVISION}" <<'PY'
+  bootstrap_tools="${EXTERNAL_ROOT}/bootstrap-tools"
+  bootstrap_python="${bootstrap_tools}/bin/python"
+  if [[ ! -x "${bootstrap_python}" ]]; then
+    python3 -m venv "${bootstrap_tools}"
+  fi
+  if ! "${bootstrap_python}" - "${HUGGINGFACE_HUB_VERSION}" <<'PY'
+import importlib.metadata
+import sys
+
+expected = sys.argv[1]
+try:
+    actual = importlib.metadata.version("huggingface-hub")
+except importlib.metadata.PackageNotFoundError:
+    raise SystemExit(1)
+raise SystemExit(0 if actual == expected else 1)
+PY
+  then
+    "${bootstrap_python}" -m pip install --disable-pip-version-check \
+      "huggingface-hub==${HUGGINGFACE_HUB_VERSION}"
+  fi
+  "${bootstrap_python}" - \
+    "${sonic_cache}" "${SONIC_REPO}" "${SONIC_REVISION}" \
+    "${COMPONENTS}/h-ide-mujoco-sonic/config/sonic-models.lock.json" <<'PY'
+import json
+from pathlib import Path
 import sys
 try:
     from huggingface_hub import snapshot_download
 except Exception as exc:
     raise SystemExit(f"huggingface_hub is required for --fetch-sonic-model: {exc}")
-cache, repo, revision = sys.argv[1:]
-snapshot_download(repo_id=repo, revision=revision, cache_dir=cache)
+cache, repo, revision, lock_path = sys.argv[1:]
+lock = json.loads(Path(lock_path).read_text(encoding="utf-8"))
+profile = lock["profiles"]["sonic-python-experimental"]
+marker = f"/snapshots/{revision}/"
+patterns = sorted(
+    {
+        entry["path"].split(marker, 1)[1]
+        for entry in profile["files"]
+        if marker in entry.get("path", "")
+    }
+)
+if not patterns:
+    raise SystemExit("SONIC runtime lock contains no model files to fetch")
+snapshot_download(
+    repo_id=repo,
+    revision=revision,
+    cache_dir=cache,
+    allow_patterns=patterns,
+)
 PY
 fi
 

@@ -143,8 +143,7 @@ run_pytest_if_ready "${ROOT}/components/h-ide-vision" \
 run_pytest_if_ready "${ROOT}/components/robotagent" \
   tests/test_config.py tests/test_capabilities_v2.py tests/test_protocol_families.py
 run_pytest_if_ready "${ROOT}/components/h-ide-mujoco-sonic" \
-  tests/test_model_lock.py tests/test_nav2_config.py tests/test_office_v2_scene.py \
-  tests/test_reset_policy.py
+  tests/test_model_lock.py tests/test_nav2_config.py tests/test_reset_policy.py
 
 if command -v npm >/dev/null 2>&1 && [[ -d "${ROOT}/components/h-ide-agent/node_modules" ]]; then
   (cd "${ROOT}/components/h-ide-agent" && npm test)
@@ -158,6 +157,11 @@ if [[ "${LEVEL}" == L1 ]]; then
   printf '%s\n' 'acceptance L1: OK'
   exit 0
 fi
+
+# This suite loads the operator-fetched G1 display mesh. L2 preflight has
+# already verified that the licensed external asset and its manifest exist.
+run_pytest_if_ready "${ROOT}/components/h-ide-mujoco-sonic" \
+  tests/test_office_v2_scene.py
 
 command -v curl >/dev/null 2>&1 || { printf '%s\n' 'missing command: curl' >&2; exit 1; }
 printf '%s\n' 'Acceptance: live service health (read-only; no motion command is sent)'

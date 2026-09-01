@@ -397,10 +397,13 @@ if [[ "${LEVEL}" != L0 ]]; then
       -f "${COMPONENTS}/h-ide/infra/docker-compose.simulation.yml" \
       config --quiet || fail 'Docker Compose configuration is invalid'
   fi
-  if [[ -x "${sim}/.venv/bin/python" ]]; then
+  if [[ -x "${sim}/.venv/bin/python" ]] && \
+     [[ -f "${sim}/models/unitree-g1-mujoco/assets/meshes/head_link.STL" ]]; then
     (cd "${sim}" && .venv/bin/python tools/build_scene.py --check) \
       || fail 'Office V2 generated scene artifacts do not match scene.yaml'
-  else
+  elif [[ -x "${sim}/.venv/bin/python" && "${LEVEL}" == L1 ]]; then
+    warn 'G1 model is absent; asset-bound scene regeneration is deferred to L2'
+  elif [[ ! -x "${sim}/.venv/bin/python" ]]; then
     warn 'MuJoCo Python environment is absent; scene check deferred'
   fi
 fi
