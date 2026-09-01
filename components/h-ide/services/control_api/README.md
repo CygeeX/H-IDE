@@ -2,22 +2,41 @@
 
 `services.control_api.main:create_app` builds an isolated FastAPI control
 plane, and the module-level `services.control_api.main:app` is the single
-process entry point used by Docker/systemd. Every route requires
-`Authorization: Bearer <token>`; the websocket
-also accepts the token as `?token=` for browser clients.
+process entry point used by Docker/systemd. Browser and PWA users authenticate
+through `POST /api/v1/auth/login`. A successful login sets an opaque,
+server-side `hide_session` cookie and a double-submit `hide_csrf` cookie;
+state-changing REST requests must also send the matching `x-csrf-token`
+header. Cookie-authenticated WebSockets carry the CSRF value in their initial
+protocol message where required. Credentials are never accepted in a URL or
+query string.
 
 Interactive OpenAPI, Swagger, and ReDoc endpoints are disabled by default
 (`/openapi.json`, `/docs`, and `/redoc` return 404) so robot capability
 metadata is not exposed anonymously. If a deployment publishes a schema it
 must put it behind the same authentication boundary. A built PWA bundle, when
 present under `apps/control-pwa/dist`, is mounted as public static assets; it
-contains no command authority without the authenticated API token.
+contains no command authority without an authenticated, scoped user session.
 
-The default development token is `dev-token`.  Deployments should pass
-`auth_token=` or set `CONTROL_API_TOKEN`. When `create_app()` is called without
-an explicit `db_path`, it reads `CONTROL_DB_PATH` (falling back to `:memory:`),
-so service restarts retain commands, mappings and audits when a file path is
-configured.
+`auth_token=` / `CONTROL_API_TOKEN` is retained only as a legacy DEVELOPER
+Bearer identity for loopback tests and explicitly authorized internal
+compatibility tooling. It is not the PWA login credential, must never be
+embedded through a `VITE_*` variable, and must not be sent in a browser URL.
+New user-facing integrations use cookie sessions and CSRF; service-to-service
+calls use their own distinct internal Bearer credentials, such as
+`MASTRA_INTERNAL_TOKEN`, `SCENE_API_INTERNAL_TOKEN`, Vision tokens, and Robot
+Agent gateway tokens. When `create_app()` is called without an explicit
+`db_path`, it reads `CONTROL_DB_PATH` (falling back to `:memory:`), so service
+restarts retain commands, mappings and audits when a file path is configured.
+
+The browser authentication lifecycle is:
+
+- `POST /api/v1/auth/register`: create an ordinary user when registration is enabled;
+- `POST /api/v1/auth/login`: set `hide_session` / `hide_csrf` and return the CSRF value;
+- `GET /api/v1/auth/me`: resolve the current session principal;
+- `POST /api/v1/auth/logout`: revoke the server-side session and clear both cookies.
+
+The first administrator is created with the offline `h-ide-admin-bootstrap`
+command, not with a deployment-wide browser token.
 
 ## Routes
 

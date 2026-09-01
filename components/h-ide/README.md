@@ -61,10 +61,11 @@ python3.12 -m venv .venv
 .venv/bin/pip install -e '.[test]'
 ```
 
-启动 API（开发默认使用内存库）：
+启动 API。`CONTROL_API_TOKEN` 这里只保留给回环测试和内部兼容工具的 legacy
+DEVELOPER 身份，不是浏览器登录凭据：
 
 ```bash
-CONTROL_API_TOKEN=dev-token \
+export CONTROL_API_TOKEN="$(openssl rand -hex 32)"
 CONTROL_DB_PATH=./data/control.db \
 .venv/bin/uvicorn services.control_api.main:app --host 127.0.0.1 --port 8080
 ```
@@ -81,9 +82,11 @@ npm run dev
 `VITE_DEV_PROXY_TARGET`（默认 `http://127.0.0.1:8080`），因此 5173 页面无需
 CORS 配置。若开发时 Control API 和 Scene API 分别运行（例如 18080/8090），再设置
 服务端专用的 `HIDE_DEV_SCENE_API_TARGET` 和 `HIDE_DEV_SCENE_API_TOKEN`；Vite 会按
-与 Caddy 相同的路径规则分流，浏览器仍只持有 Control API token。完整 PCD 功能需要
-可用的 Scene API/Worker；只启动 Control API 时其余控制界面仍可使用。也可以设置 `VITE_CONTROL_API_URL` 和
-`VITE_CONTROL_API_TOKEN`。生产构建完成后，如果
+与 Caddy 相同的路径规则分流。浏览器通过 `/api/v1/auth/login` 获得同源的
+`hide_session`/`hide_csrf` Cookie；PWA 不接收 `CONTROL_API_TOKEN`、Scene token 或
+其他服务 Bearer。完整 PCD 功能需要可用的 Scene API/Worker；只启动 Control API 时
+其余控制界面仍可使用。若设置 `VITE_CONTROL_API_URL`，目标仍必须满足部署的同源 Cookie、
+CSRF 和安全上下文策略；不存在受支持的 `VITE_CONTROL_API_TOKEN` 产品路径。生产构建完成后，如果
 `apps/control-pwa/dist` 存在，控制 API 会挂载静态 bundle。
 
 当前 Supervisor–Worker、MissionEnvelope、视觉事实、语音审核与外部技能接入见
@@ -96,14 +99,23 @@ CORS 配置。若开发时 Control API 和 Scene API 分别运行（例如 18080
 
 ## API 快速示例
 
-所有 REST 请求都需要 `Authorization: Bearer $CONTROL_API_TOKEN`；事件 WebSocket
-可使用 `?token=...&after=<eventId>`。交互式 OpenAPI、Swagger 和 ReDoc 默认关闭。
+PWA 主路径使用服务端 Session Cookie。`POST /api/v1/auth/login` 设置 HttpOnly
+`hide_session` 和 double-submit `hide_csrf` Cookie，并在响应中返回相同的
+`csrfToken`。GET/HEAD 读取携带 Session Cookie；POST/PUT/PATCH/DELETE 还必须携带
+`x-csrf-token`。Cookie、Bearer 和供应商 token 均不得放入 URL/query string。
+
+下面假定操作者已经通过登录接口安全生成权限为 `0600` 的 curl cookie jar，并将登录
+响应中的 CSRF 值保存在当前私有终端。不要把密码、Cookie 或 CSRF 值提交到 Git：
 
 ```bash
-curl -H 'Authorization: Bearer dev-token' http://127.0.0.1:8080/api/v1/robots
+COOKIE_JAR=/secure/local/h-ide-cookie-jar
+CSRF_TOKEN='value-returned-by-auth-login'
+
+curl --cookie "$COOKIE_JAR" http://127.0.0.1:8080/api/v1/robots
 
 curl -X POST http://127.0.0.1:8080/api/v1/commands \
-  -H 'Authorization: Bearer dev-token' \
+  --cookie "$COOKIE_JAR" \
+  -H "x-csrf-token: $CSRF_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"robotId":"robot-1","commandKey":"move.forward",
        "commandVersion":"1","transport":"fake",
@@ -156,11 +168,13 @@ npm run build
   `CONTROL_API_PORT` 的同源网关访问；Scene API 的 `SCENE_API_PORT` 只绑定回环，
   供可选的 host-network ROS 2 profile 使用。
 - systemd：安装 [`infra/systemd/robot-action-console.service`](infra/systemd/robot-action-console.service)
-  并在 EnvironmentFile 中设置 token、数据库路径和适配器端点。
+  并在 EnvironmentFile 中设置彼此独立的内部服务 token、数据库路径和适配器端点。
 - ROS 2：仅在确实需要访问主机 DDS 图时启用 compose 的 `ros2-host` profile；浏览器
   不接触 ROS 话题、DDS、ZMQ 或机器人端口。
 
-生产环境至少应使用 HTTPS/WireGuard、长随机 Bearer token、控制库与场景库备份。
+生产环境至少应使用 HTTPS/WireGuard、服务端 Session Cookie、CSRF、独立且最小权限的
+内部服务凭据，以及控制库与场景库备份。Legacy `CONTROL_API_TOKEN` 只能限制在回环/内部
+兼容用途，不能重新成为 PWA 的共享登录秘密。
 手机安装 PWA、浏览器录音以及浏览器端 PCD 校验依赖安全上下文，因此 LAN 真机
 演示也应提供受信任的 HTTPS。部署前请按安全文档验证断网、重启、租约过期和
 物理急停流程。
