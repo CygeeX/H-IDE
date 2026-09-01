@@ -1,16 +1,16 @@
 # Skillstore · H-IDE Office V2 端到端联调发行仓库
 
 Skillstore 把 H-IDE PWA、Conversation/Mission V2、视觉解析、Robot Agent、Nav2、
-SONIC 和 MuJoCo Office V2 的候选源码、跨组件锁、启动脚本与验收入口冻结在同一个
+SONIC 和 MuJoCo Office V2 的冻结源码、跨组件锁、启动脚本与验收入口保存在同一个
 Git 版本中。它是可复刻的联调发行仓库，不是模型权重、机器人资产或运行数据库的
 分发仓库。
 
 | 发行属性 | 当前值 |
 | --- | --- |
-| Release candidate | `skillstore-office-v2-e2e-20260901-r1` |
+| Frozen demo release | `skillstore-office-v2-e2e-20260901-r1` |
 | 审计分支 | `release/office-v2-e2e-20260901` |
 | 目标标签 | `integration/office-v2-e2e-20260901-r1` |
-| 状态 | Candidate；完成 clean-clone 与 L0/L1/L2/L3 门禁后才创建标签并更新 `main` |
+| 状态 | L0/L1/L2 已通过；仓库所有者接受已记录的 L3 仿真超时问题后冻结，非生产安全认证 |
 
 真实 API key、内部令牌、账号数据库、日志、视觉证据、模型权重和本机缓存不得提交
 到 Git。公开读取仓库不等于取得外部模型、网格或品牌资产的独立再分发权。
@@ -113,7 +113,7 @@ legacy loopback/internal compatibility，不能注入前端或出现在浏览器
 
 ## 文档索引
 
-- [2026-09-01 R1 候选发布说明](docs/releases/skillstore-office-v2-e2e-20260901-r1.md)
+- [2026-09-01 R1 冻结 Demo 发布说明](docs/releases/skillstore-office-v2-e2e-20260901-r1.md)
 - [快速开始与管理员初始化](docs/quickstart/README.md)
 - [当前组件和源码入口](docs/components/README.md)
 - [当前运行、监控、复位与演示](docs/operations/README.md)

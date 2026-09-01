@@ -1,6 +1,6 @@
 # 秘密、许可证与供应链边界
 
-本页区分当前 release candidate 的实际安全措施与商业化 Proposed 架构。仿真中的放宽
+本页区分当前 frozen demo release 的实际安全措施与商业化 Proposed 架构。仿真中的放宽
 profile 不能复制到真机；Cloud/Edge mTLS、签名 MissionBundle、离线 Entitlement 等目标
 设计尚未成为当前代码的完整实现。
 
@@ -66,7 +66,7 @@ protection、gitleaks/trufflehog 全历史扫描或人工许可证评审。
 
 ## 5. Git 历史与当前树不是同一件事
 
-本候选的 L0 门禁检查当前 Git 树。仓库此前通过 subtree 保留 LeRobot 上游历史，历史对象
+本发行版的 L0 门禁检查当前 Git 树。仓库此前通过 subtree 保留 LeRobot 上游历史，历史对象
 中可能仍出现已从当前树删除的测试模型、视频、bag 或 dataset 路径。因此：
 
 1. “当前发行树不包含权重”不能写成“完整历史从未包含二进制”；
@@ -92,7 +92,7 @@ Proposed 的 Cognition Broker 可以在 Local、Site Brain 与 Cloud 模型之�
 
 ## 7. 仿真与真机隔离
 
-- 当前 release 是 MuJoCo Office V2 仿真候选，不是 G1 真机安全认证。
+- 当前 release 是带已知问题的 MuJoCo Office V2 冻结 Demo，不是 G1 真机安全认证。
 - 仿真 collision/retry/failure profile 用于验证 Agent 编排，不能导出为 pilot/production
   配置。
 - 真机必须重新验证硬件急停、速度、碰撞、停止距离、人员进入、网络、定位、平衡连续性

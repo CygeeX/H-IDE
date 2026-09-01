@@ -3,8 +3,8 @@
 | 属性 | 值 |
 | --- | --- |
 | Release ID | `skillstore-office-v2-e2e-20260901-r1` |
-| 目标 tag | `integration/office-v2-e2e-20260901-r1` |
-| 发布状态 | Release candidate；L0–L3 和远端审计完成后创建不可变 tag |
+| 不可变 tag | `integration/office-v2-e2e-20260901-r1` |
+| 发布状态 | Frozen demo with known issue；L3 非完整通过，不属于生产安全认证 |
 | 上一稳定 tag / 回退点 | `integration/office-v2-e2e-20260827-r3` |
 
 ## 1. 组件来源
@@ -45,6 +45,14 @@ Release Manifest，并由 L0 重新计算；不能只凭 source commit 推断发
 
 ### 已完成
 
+- Gitea 完整历史 clean clone 的 L0、L1 通过，审计 SHA 为
+  `6988e1dfe83fd637921ba040b7f03020665edf2d`；
+- 本地同一候选 L2 readiness 通过且没有发送运动：Plant/SONIC/Robot Agent/observation/
+  Scene identity 匹配，Nav2 active，strict adapter idle/healthy，full-straight 4 m profile 生效；
+- 双房巡检曾完成并生成报告；同会话电脑/椅子问答与命令级挥手回落通过；
+- 严格复核没有把 L3 写成通过：完成报告仍有两个 open-office heading gap，冷启动第二轮
+  触发 `SIM-PLANNER-REFERENCE-DEADLINE-001`。
+
 H-IDE Agent：
 
 ```bash
@@ -70,13 +78,12 @@ source install/setup.bash
 
 - `63 passed in 7.53s`。
 
-### 正式发布前仍需
+### 冻结决定与未通过项
 
-- clean clone L0、L1；
-- 目标工作站 L2 readiness；
-- [L3-01 至 L3-05](../acceptance/README.md) 的 Mission/Evidence 记录；
-- 更新后的 integration lock、SBOM、模型和场景 digest；
-- 远端审计分支验证并将 `main` fast-forward 到同一 root commit。
+仓库所有者明确要求保留当前本地行为并继续发布，因此本版允许在 L3 未完整通过的情况下
+进入 `main` 和不可变 tag。该决定只冻结可复刻 Demo，不豁免已知问题，也不表示真机、
+生产安全或未知场地能力通过。[L3-01 至 L3-05](../acceptance/README.md) 仍是后续修复版必须
+重新满足的完整合同。
 
 ## 4. 已知问题和边界
 

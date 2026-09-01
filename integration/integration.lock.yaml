@@ -5,8 +5,10 @@ release:
   branch: release/office-v2-e2e-20260901
   target_branch: main
   tag: integration/office-v2-e2e-20260901-r1
-  status: release-candidate
+  status: frozen-demo-with-known-issue
   root_commit: recorded-by-release-tag
+  validated_candidate_commit: 6988e1dfe83fd637921ba040b7f03020665edf2d
+  validation_recorded_at: "2026-09-01T14:03:23+08:00"
   validation_contract: L0-L1-L2-L3
   release_manifest: manifests/release/skillstore-office-v2-e2e-20260901-r1.json
   source_sbom: manifests/sbom/skillstore-office-v2-e2e-20260901-r1.spdx.json
@@ -147,6 +149,11 @@ acceptance:
   l2: live service health plus ROS, GPU, model and external-asset readiness
   l3: operator-authorized real Mission execution and structured evidence capture
   motion_policy: L0-L2 never send motion; L3 requires explicit execute-motion and operator approval
+  results:
+    l0: passed-local-and-gitea-clean-clone
+    l1: passed-local-and-gitea-clean-clone
+    l2: passed-local-final-candidate-no-motion
+    l3: owner-accepted-with-known-issue-not-full-pass
 
 secrets:
   file: .env

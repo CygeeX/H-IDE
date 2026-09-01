@@ -12,7 +12,7 @@
     "creators": [
       "Organization: H-IDE"
     ],
-    "comment": "Source-component SBOM for the release candidate. Runtime-resolved Python, Node, ROS, container-image, driver and model dependencies require separate generated SBOMs before a production release."
+    "comment": "Source-component SBOM for the frozen demo release with a documented known issue. Runtime-resolved Python, Node, ROS, container-image, driver and model dependencies require separate generated SBOMs before a production release."
   },
   "packages": [
     {

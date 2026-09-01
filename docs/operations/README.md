@@ -1,6 +1,6 @@
 # Office V2 联调运维手册
 
-本文适用于 release candidate `skillstore-office-v2-e2e-20260901-r1`。命令从仓库根
+本文适用于 frozen demo release `skillstore-office-v2-e2e-20260901-r1`。命令从仓库根
 目录运行，并使用 `ROOT="$(pwd -P)"` 派生本机路径。
 
 ## 1. 启动 profile
@@ -201,9 +201,9 @@ ROOT="$(pwd -P)"
 
 ## 8. 回退
 
-候选通过后，`integration/office-v2-e2e-20260901-r1` 是本版本的不可变回退入口。回退前
+冻结后，`integration/office-v2-e2e-20260901-r1` 是本版本的不可变回退入口。回退前
 停止完整链路，在干净 worktree 检出标签，重新 bootstrap/preflight，再冷启动；不要把旧
 `.env`、数据库或运行缓存提交到回退分支。
 
-目标云—站点—边缘架构仍是 Proposed，不改变本候选当前的同机运维事实。参见
+目标云—站点—边缘架构仍是 Proposed，不改变本冻结 Demo 当前的同机运维事实。参见
 [平台架构](../../components/h-ide/docs/platform-architecture/README.md)。

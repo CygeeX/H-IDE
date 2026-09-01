@@ -2,7 +2,7 @@
   "schemaVersion": "skillstore.release-manifest/1",
   "release": {
     "id": "skillstore-office-v2-e2e-20260901-r1",
-    "status": "release-candidate",
+    "status": "frozen-demo-with-known-issue",
     "branch": "release/office-v2-e2e-20260901",
     "targetBranch": "main",
     "tag": "integration/office-v2-e2e-20260901-r1",
@@ -112,10 +112,41 @@
   ],
   "validation": {
     "contract": "L0-L1-L2-L3",
-    "L0": "pending-on-release-commit",
-    "L1": "pending-on-release-commit",
-    "L2": "pending-on-release-host",
-    "L3": "pending-explicit-operator-mission",
+    "candidateCommit": "6988e1dfe83fd637921ba040b7f03020665edf2d",
+    "recordedAt": "2026-09-01T14:03:23+08:00",
+    "L0": {
+      "status": "passed",
+      "localCandidate": true,
+      "giteaFullHistoryCleanClone": true,
+      "knownHistoryWarningAccepted": true
+    },
+    "L1": {
+      "status": "passed",
+      "localCandidate": true,
+      "giteaCleanClone": true,
+      "agentTests": "114/114",
+      "pwaTests": "146/146",
+      "productionBuilds": "passed"
+    },
+    "L2": {
+      "status": "passed-local-final-candidate",
+      "motionIssued": false,
+      "fullStraightDrive": true,
+      "runtimeDriveChunkM": 4.0,
+      "identityAndSceneBinding": "matched"
+    },
+    "L3": {
+      "status": "owner-accepted-with-known-issue-not-full-pass",
+      "fullContractPassed": false,
+      "completedMissionId": "mission-2c47f39465d5473387c304dca7fd3431",
+      "completedMissionRawSha256": "4656497ad1ae9c63beb4b32b07d195799f185d78c891ac149913b24f2bd81887",
+      "strictReevaluation": "rejected: completed_with_gaps with two open-office heading gaps",
+      "memoryQuestions": "computer and chair room recall passed in the same conversation",
+      "voiceAndGesture": "assistant reply and command-level wave return to completed IDLE passed",
+      "coldRestartMissionId": "mission-ca907266bd3d4735a2a1cf6d8af2f095",
+      "coldRestartResult": "not completed: accepted known issue SIM-PLANNER-REFERENCE-DEADLINE-001",
+      "releaseDecision": "repository owner requested preserving current local behavior and proceeding"
+    },
     "l3ResultSchema": "manifests/release/l3-mission-result.schema.json"
   },
   "repositoryRiskInventory": {

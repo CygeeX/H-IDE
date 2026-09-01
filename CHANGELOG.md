@@ -3,10 +3,10 @@
 本文件记录 Skillstore 集成发行版的用户可见变化。组件内部提交历史仍保留，但只有通过
 跨组件门禁并创建不可变 integration tag 的版本才是可复刻 Release。
 
-## `skillstore-office-v2-e2e-20260901-r1` — Release candidate
+## `skillstore-office-v2-e2e-20260901-r1` — Frozen demo with known issue
 
-目标标签：`integration/office-v2-e2e-20260901-r1`。标签在 clean-clone、L0/L1/L2/L3 和
-显式端到端行为验收完成后创建。
+标签：`integration/office-v2-e2e-20260901-r1`。L0/L1/L2 已通过；L3 没有完整通过，仓库
+所有者明确接受已记录的仿真 planner-reference terminal fault 后冻结本 Demo。
 
 ### Added
 
@@ -53,18 +53,20 @@
 - FARM 未进入运行链；DAAAM 仅为默认关闭的 Mission 后异步 importer，不能提供实时对象
   姿态。
 - Field Executive、Cognition Broker、World Model、Semantic Scene Compiler 和新场景
-  onboarding 是 Proposed，不是本候选的已实现能力。
+  onboarding 是 Proposed，不是本发行版的已实现能力。
 - 仿真挥手不是 Unitree 真机动作能力；三家公司卡片中非 Unitree 选项仅用于展示。
 - 云模型可受供应商欠费、限流、区域和同名模型更新影响。
 - G1 网格、SONIC/GR00T 权重和 SAM2 checkpoint 必须由操作者按条款外置获取。
 
 ### Verification snapshot
 
-- H-IDE PWA 定向回归：7 个 test files、112 项测试通过。
-- H-IDE PWA 全量回归：17 个 test files、146 项测试通过。
-- PWA `tsc --noEmit && vite build` 通过。
-- 最终 Release 仍需记录 clean-clone L0/L1、L2 readiness、双 Skill 行为验收、镜像 digest、
-  SBOM 和许可证/秘密扫描结果；本节不把候选测试误写成最终发布批准。
+- Gitea 完整历史 clean clone：L0、L1 通过；工作树与远端审计分支 SHA 一致。
+- H-IDE Agent：16 个 test file、114 项测试、typecheck 与 production build 通过。
+- H-IDE PWA：17 个 test file、146 项测试及 `tsc --noEmit && vite build` 通过。
+- 本地最终候选 L2：Plant/SONIC/Robot Agent/observation/Scene identity 一致，Nav2 active，
+  strict adapter idle/healthy，`fullStraightDrive=true`；L2 未发送运动。
+- L3：历史问答和命令级挥手回落通过；第一轮报告有两个 heading gap，冷启动第二轮触发
+  已接受的 Plant 退出问题，因此明确记录为“非完整通过”，不冒充生产批准。
 
 ## `skillstore-office-v2-e2e-20260827-r3`
 

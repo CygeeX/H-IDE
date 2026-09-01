@@ -6,7 +6,7 @@
 目标标签 `integration/office-v2-e2e-20260901-r1` 只有在 clean-clone 和 L0–L3 发布门禁通过后
 才创建；标签发布前，审计人员使用 `release/office-v2-e2e-20260901` 分支。
 
-## 1. 本候选提供什么
+## 1. 本冻结 Demo 提供什么
 
 当前链路为：
 
@@ -22,7 +22,7 @@ PWA → Control API / Conversation V2 / Mission V2
 2. `assistant.voice`：普通问答和巡检历史问答，浏览器中文语音朗读；仿真可选挥手。
 
 `H-IDE Field Executive`、`Cognition Broker`、FARM/DAAAM Shadow Provider、统一 World
-Model 和 Semantic Scene Compiler 属于 Proposed 架构，不在本候选的运行声明内。参见
+Model 和 Semantic Scene Compiler 属于 Proposed 架构，不在本冻结 Demo 的运行声明内。参见
 [平台架构说明](../../components/h-ide/docs/platform-architecture/README.md)。
 
 ## 2. 主机前置条件
@@ -180,7 +180,7 @@ SKILLSTORE_ACCEPT_G1_MODEL_TERMS=1 \
 - G1 网格、GR00T/SONIC 源和 SONIC 权重按 manifest 固定 revision，由操作者获取。
 - G1 网格再分发状态未确认，不随公开 Git 仓库分发。
 - SAM2 checkpoint 必须使用上述 `sam2.1_hiera_tiny.pt` 官方文件，L2 会再次核验 SHA-256。
-- DAAAM 研究环境、数据集和权重不随本候选分发，也不是默认启动依赖。
+- DAAAM 研究环境、数据集和权重不随本发行版分发，也不是默认启动依赖。
 
 具体来源见 `manifests/vendor/`、`integration/integration.lock.yaml` 和
 [安全文档](../security/README.md)。
