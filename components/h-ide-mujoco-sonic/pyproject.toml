@@ -19,6 +19,9 @@ runtime = [
   "onnxruntime>=1.16,<2",
   "onnx>=1.16,<2",
   "pyzmq>=26,<28",
+  "cyclonedds==11.0.1",
+  "loguru>=0.7,<1",
+  "pygame>=2.6,<3",
 ]
 ros = ["rclpy>=4,<5"]
 test = [
