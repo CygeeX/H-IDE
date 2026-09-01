@@ -109,7 +109,11 @@ function validateNodesAgainstCapabilities(
     if (capability.riskLevel !== node.riskLevel) {
       throw new Error(`mission risk does not match capability manifest: ${node.skillId}`);
     }
-    if (capability.kind === "motion" && capability.executor !== "nav2") {
+    const baseMotionOwnedByNav2 = (
+      capability.executor === "nav2"
+      || capability.baseMotionOwner === "nav2"
+    );
+    if (capability.kind === "motion" && !baseMotionOwnedByNav2) {
       throw new Error(`mission base motion capability is not owned by Nav2: ${node.skillId}`);
     }
   }

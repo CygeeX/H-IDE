@@ -141,6 +141,24 @@ function revision(overrides: Record<string, unknown> = {}) {
 }
 
 describe("Mission V2 planning", () => {
+  it("accepts the reviewed cumulative scan budget for a multi-room inspection", () => {
+    expect(missionBriefSchema.parse({
+      ...brief(),
+      envelope: {
+        ...envelope(),
+        maximumScanYawRad: 40 * Math.PI,
+      },
+    }).envelope.maximumScanYawRad).toBe(40 * Math.PI);
+
+    expect(() => missionBriefSchema.parse({
+      ...brief(),
+      envelope: {
+        ...envelope(),
+        maximumScanYawRad: 40 * Math.PI + 0.001,
+      },
+    })).toThrow(z.ZodError);
+  });
+
   it("keeps planner intent semantic and rejects every physical-motion bypass", () => {
     for (const intent of [
       { goalPose: { x: 1, y: 2, yaw: 0 } },
@@ -150,6 +168,57 @@ describe("Mission V2 planning", () => {
     ]) {
       expect(() => missionNodeSchema.parse({ ...nodes()[0], intent })).toThrow(/executable|geometry/i);
     }
+  });
+
+  it("accepts typed place navigation and rejects retired free-form place fields", () => {
+    const typed = missionNodeSchema.safeParse({
+      nodeId: "navigate-meeting-interior",
+      skillId: "navigation.navigate_to_pose",
+      skillVersion: "2",
+      purpose: "进入会议室内部",
+      intent: {
+        schemaVersion: "h-ide.place-intent/1",
+        task: "navigate_to_place",
+        place: {
+          schemaVersion: "h-ide.place-target/1",
+          locationId: "meeting_room",
+          locationName: "会议室",
+          anchorRole: "interior",
+          stationId: "meeting_south",
+          targetRecordId: "world-mission-1-scene-target-meeting_south",
+          candidateTargetRecordIds: [
+            "world-mission-1-scene-target-meeting_south",
+            "world-mission-1-scene-target-meeting_north",
+          ],
+        },
+        completion: {
+          schemaVersion: "h-ide.place-completion/1",
+          predicate: "inside_region",
+          regionId: "meeting_room",
+          minimumClearanceM: 0.25,
+          maximumAnchorDistanceM: 0.25,
+        },
+      },
+      dependsOn: [],
+      preconditionIds: [],
+      postconditionIds: [],
+      riskLevel: "medium",
+    });
+    expect(typed.success).toBe(true);
+
+    const legacy = missionNodeSchema.safeParse({
+      nodeId: "legacy-place",
+      skillId: "navigation.navigate_to_pose",
+      skillVersion: "2",
+      purpose: "旧地点导航",
+      intent: { target_region: "meeting_room" },
+      dependsOn: [],
+      preconditionIds: [],
+      postconditionIds: [],
+      riskLevel: "medium",
+    });
+    expect(legacy.success).toBe(false);
+    expect(legacy.error?.issues.some((issue) => issue.message.includes("retired"))).toBe(true);
   });
 
   it("creates a reviewable DAG using only envelope skills", async () => {
@@ -170,6 +239,92 @@ describe("Mission V2 planning", () => {
       "navigation.navigate_to_pose",
     ]);
     expect(JSON.stringify(draft.nodes)).not.toMatch(/goalPose|cmd_vel|waypoints|rosAction/iu);
+  });
+
+  it("accepts a workstation scan composite only when Nav2 ownership is explicit", async () => {
+    const scanCapability = {
+      skillId: "inspection.scan_station",
+      skillVersion: "1.0.0",
+      description: "Orchestrate reviewed Nav2 rotations and RGB-D captures",
+      kind: "motion" as const,
+      riskLevel: "medium" as const,
+      executor: "behavior_tree" as const,
+      executorProfile: "office_v2.station_scan.v1",
+      baseMotionOwner: "nav2" as const,
+      requiredSensorIds: ["head_rgbd"],
+    };
+    const scanNode: MissionNode = {
+      nodeId: "scan-open-office",
+      skillId: scanCapability.skillId,
+      skillVersion: scanCapability.skillVersion,
+      purpose: "在开放办公区内部多方向观察",
+      intent: {
+        stationId: "open_office_west",
+        regionId: "open_office",
+        scanPurpose: "location_observation",
+      },
+      dependsOn: [],
+      preconditionIds: [],
+      postconditionIds: [],
+      riskLevel: "medium",
+    };
+    const scanBrief = missionBriefSchema.parse({
+      ...brief(),
+      envelope: {
+        ...envelope(),
+        allowedSkillIds: [
+          ...envelope().allowedSkillIds,
+          scanCapability.skillId,
+        ],
+      },
+      capabilities: [...capabilities(), scanCapability],
+    });
+    const acceptedRuntime = {
+      draftMission: vi.fn().mockResolvedValue({
+        objective: scanBrief.objective,
+        nodes: [scanNode],
+        assumptions: [],
+        warnings: [],
+      }),
+      replanMission: vi.fn(),
+    };
+
+    const draft = await new MissionEngine(acceptedRuntime).createDraft(
+      scanBrief,
+      new AbortController().signal,
+    );
+    expect(draft.nodes[0]?.skillId).toBe("inspection.scan_station");
+
+    const unownedBrief = {
+      ...scanBrief,
+      capabilities: scanBrief.capabilities.map((capability) => (
+        capability.skillId === scanCapability.skillId
+          ? {
+              skillId: capability.skillId,
+              skillVersion: capability.skillVersion,
+              description: capability.description,
+              kind: capability.kind,
+              riskLevel: capability.riskLevel,
+              executor: capability.executor,
+              executorProfile: capability.executorProfile,
+              requiredSensorIds: capability.requiredSensorIds,
+            }
+          : capability
+      )),
+    };
+    const rejectedRuntime = {
+      draftMission: vi.fn().mockResolvedValue({
+        objective: scanBrief.objective,
+        nodes: [scanNode],
+        assumptions: [],
+        warnings: [],
+      }),
+      replanMission: vi.fn(),
+    };
+    await expect(new MissionEngine(rejectedRuntime).createDraft(
+      unownedBrief,
+      new AbortController().signal,
+    )).rejects.toThrow(/not owned by Nav2/iu);
   });
 
   it("rejects approval placeholders disguised as executable skills", async () => {
