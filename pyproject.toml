@@ -21,7 +21,11 @@ runtime = [
   "pyzmq>=26,<28",
 ]
 ros = ["rclpy>=4,<5"]
-test = ["pytest>=8,<9"]
+test = [
+  "pytest>=8,<9",
+  "jsonschema>=4,<5",
+  "scipy>=1.14,<2",
+]
 
 [project.scripts]
 hide-mujoco-sonic = "hide_mujoco_sonic.cli:main"
@@ -31,4 +35,3 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-
