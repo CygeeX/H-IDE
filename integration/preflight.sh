@@ -258,7 +258,13 @@ if [[ -e "${ENV_FILE}" || -L "${ENV_FILE}" ]]; then
     done
     for key in DEEPSEEK_API_KEY DASHSCOPE_API_KEY; do
       value="$(sed -n "s/^${key}=//p" "${ENV_FILE}" | tail -n 1)"
-      [[ -n "${value}" ]] || warn "${key} is empty; model-backed L2 tasks will be unavailable"
+      if [[ -z "${value}" ]]; then
+        if [[ "${LEVEL}" == L2 ]]; then
+          fail "${key} is empty; the model-backed L2 product path cannot be reproduced"
+        else
+          warn "${key} is empty; model-backed L2 tasks will be unavailable"
+        fi
+      fi
     done
   fi
 elif [[ "${LEVEL}" == L0 ]]; then
@@ -310,6 +316,7 @@ paths = [
     root / "manifests/vendor/g1-model.json",
     root / "manifests/vendor/groot-wbc.json",
     root / "manifests/vendor/lerobot.json",
+    root / "manifests/vendor/sam2-checkpoint.json",
     root / "manifests/vendor/unitree-sdk2-python.json",
     root / "components/h-ide-mujoco-sonic/config/sonic-models.lock.json",
 ]
@@ -391,6 +398,16 @@ if (
 vision_lock = root / vision_runtime["lockFile"]
 if hashlib.sha256(vision_lock.read_bytes()).hexdigest() != vision_runtime["lockFileSha256"]:
     raise SystemExit("Vision GPU lock SHA-256 does not match its runtime manifest")
+sam2_manifest = json.loads(
+    (root / "manifests/vendor/sam2-checkpoint.json").read_text(encoding="utf-8")
+)
+if (
+    sam2_manifest.get("schema_version") != "skillstore.external-model/1"
+    or sam2_manifest.get("sha256")
+    != "7402e0d864fa82708a20fbd15bc84245c2f26dff0eb43a4b5b93452deb34be69"
+    or sam2_manifest.get("redistribution") != "operator_fetch"
+):
+    raise SystemExit("unexpected SAM2 checkpoint provenance contract")
 lock = json.loads(paths[-1].read_text(encoding="utf-8"))
 if lock.get("schema_version") != "h-ide.sonic-model-lock/1":
     raise SystemExit("unexpected SONIC lock schema")

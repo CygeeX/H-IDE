@@ -14,6 +14,15 @@
     "missionStatus",
     "navigationSucceeded",
     "inspectionSucceeded",
+    "officeSequenceValidated",
+    "allRequiredNodesSucceeded",
+    "allRequiredHeadingsObserved",
+    "reportFullChainAccepted",
+    "regionIds",
+    "stationIds",
+    "headingGapCount",
+    "reportEvidenceCount",
+    "scanEvidenceCount",
     "resultAccepted",
     "rawMissionSha256",
     "rawMissionPath"
@@ -50,6 +59,40 @@
     "inspectionSucceeded": {
       "type": "boolean"
     },
+    "officeSequenceValidated": {
+      "type": "boolean"
+    },
+    "allRequiredNodesSucceeded": {
+      "type": "boolean"
+    },
+    "allRequiredHeadingsObserved": {
+      "type": "boolean"
+    },
+    "reportFullChainAccepted": {
+      "type": "boolean"
+    },
+    "regionIds": {
+      "type": "array",
+      "items": {"type": "string"},
+      "maxItems": 2
+    },
+    "stationIds": {
+      "type": "array",
+      "items": {"type": "string"},
+      "maxItems": 2
+    },
+    "headingGapCount": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "reportEvidenceCount": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "scanEvidenceCount": {
+      "type": "integer",
+      "minimum": 0
+    },
     "resultAccepted": {
       "type": "boolean"
     },
@@ -73,5 +116,43 @@
       "type": "string",
       "minLength": 1
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"resultAccepted": {"const": true}},
+        "required": ["resultAccepted"]
+      },
+      "then": {
+        "properties": {
+          "missionStatus": {"const": "completed"},
+          "navigationSucceeded": {"const": true},
+          "inspectionSucceeded": {"const": true},
+          "officeSequenceValidated": {"const": true},
+          "allRequiredNodesSucceeded": {"const": true},
+          "allRequiredHeadingsObserved": {"const": true},
+          "reportFullChainAccepted": {"const": true},
+          "regionIds": {
+            "prefixItems": [
+              {"const": "open_office"},
+              {"const": "meeting_room"}
+            ],
+            "minItems": 2,
+            "maxItems": 2
+          },
+          "stationIds": {
+            "prefixItems": [
+              {"const": "open_office_west"},
+              {"const": "meeting_south"}
+            ],
+            "minItems": 2,
+            "maxItems": 2
+          },
+          "headingGapCount": {"const": 0},
+          "reportEvidenceCount": {"type": "integer", "minimum": 1},
+          "scanEvidenceCount": {"type": "integer", "minimum": 8}
+        }
+      }
+    }
+  ]
 }

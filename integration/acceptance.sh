@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
+ENV_FILE="${SKILLSTORE_ENV_FILE:-${ROOT}/.env}"
 RELEASE_ID=skillstore-office-v2-e2e-20260901-r1
 LEVEL=L0
 EXECUTE_MOTION=false
@@ -117,6 +118,7 @@ for path in [
     root / "manifests/vendor/g1-model.json",
     root / "manifests/vendor/groot-wbc.json",
     root / "manifests/vendor/lerobot.json",
+    root / "manifests/vendor/sam2-checkpoint.json",
     root / "manifests/vendor/unitree-sdk2-python.json",
 ]:
     json.loads(path.read_text(encoding="utf-8"))
@@ -153,11 +155,17 @@ run_pytest_if_ready "${ROOT}/components/robotagent" \
 run_pytest_if_ready "${ROOT}/components/h-ide-mujoco-sonic" \
   tests/test_model_lock.py tests/test_nav2_config.py tests/test_reset_policy.py
 
-if command -v npm >/dev/null 2>&1 && [[ -d "${ROOT}/components/h-ide-agent/node_modules" ]]; then
+if command -v npm >/dev/null 2>&1 \
+  && [[ -d "${ROOT}/components/h-ide-agent/node_modules" ]] \
+  && [[ -d "${ROOT}/components/h-ide/apps/control-pwa/node_modules" ]]; then
   (cd "${ROOT}/components/h-ide-agent" && npm test)
   (cd "${ROOT}/components/h-ide-agent" && npm run typecheck)
+  (cd "${ROOT}/components/h-ide-agent" && npm run build)
+  (cd "${ROOT}/components/h-ide/apps/control-pwa" && npm test -- --run)
+  (cd "${ROOT}/components/h-ide/apps/control-pwa" && npm run build)
 else
-  printf '%s\n' 'missing h-ide-agent/node_modules; run npm ci before L1 acceptance' >&2
+  printf '%s\n' \
+    'missing npm or Agent/PWA node_modules; run integration/setup-environments.sh before L1 acceptance' >&2
   exit 1
 fi
 
@@ -173,13 +181,203 @@ run_pytest_if_ready "${ROOT}/components/h-ide-mujoco-sonic" \
 
 command -v curl >/dev/null 2>&1 || { printf '%s\n' 'missing command: curl' >&2; exit 1; }
 printf '%s\n' 'Acceptance: live service health (read-only; no motion command is sent)'
-curl --noproxy '*' -fsS --max-time 5 http://127.0.0.1:8794/healthz >/dev/null
-curl --noproxy '*' -fsS --max-time 5 http://127.0.0.1:8792/healthz >/dev/null
-curl --noproxy '*' -fsS --max-time 5 http://127.0.0.1:8092/healthz >/dev/null
+[[ -f "${ENV_FILE}" && ! -L "${ENV_FILE}" ]] || {
+  printf '%s\n' 'L2 requires the regular Skillstore environment file' >&2
+  exit 1
+}
+
+env_value() {
+  local key="$1"
+  sed -n "s/^${key}=//p" "${ENV_FILE}" | tail -n 1
+}
+
+control_token="$(env_value CONTROL_API_TOKEN)"
+gateway_token="$(env_value SIMULATION_ROBOT_AGENT_GATEWAY_TOKEN)"
+scene_internal_token="$(env_value SCENE_API_INTERNAL_TOKEN)"
+[[ -n "${control_token}" && -n "${gateway_token}" && -n "${scene_internal_token}" ]] || {
+  printf '%s\n' 'L2 requires Control, Robot Agent gateway and Scene internal credentials' >&2
+  exit 1
+}
+
+compose_services="$({
+  docker compose \
+    --project-name "${SKILLSTORE_COMPOSE_PROJECT:-skillstore-e2e}" \
+    --env-file "${ENV_FILE}" \
+    -f "${ROOT}/components/h-ide/infra/docker-compose.yml" \
+    -f "${ROOT}/components/h-ide/infra/docker-compose.simulation.yml" \
+    ps --services --filter status=running
+} | sort)"
+expected_services="$({
+  docker compose \
+    --project-name "${SKILLSTORE_COMPOSE_PROJECT:-skillstore-e2e}" \
+    --env-file "${ENV_FILE}" \
+    -f "${ROOT}/components/h-ide/infra/docker-compose.yml" \
+    -f "${ROOT}/components/h-ide/infra/docker-compose.simulation.yml" \
+    config --services
+} | sort)"
+[[ "${compose_services}" == "${expected_services}" ]] || {
+  printf '%s\n' 'L2 Compose service set is not completely running' >&2
+  exit 1
+}
+
+plant_health="$(curl --noproxy '*' -fsS --max-time 5 http://127.0.0.1:8794/healthz)"
+sonic_health="$(curl --noproxy '*' -fsS --max-time 5 http://127.0.0.1:8792/telemetry)"
+vision_health="$(curl --noproxy '*' -fsS --max-time 5 http://127.0.0.1:8092/healthz)"
+robot_diagnostics="$(curl --noproxy '*' -fsS --max-time 5 http://127.0.0.1:8796/v1/diagnostics)"
+gateway_discovery="$(curl --noproxy '*' -fsS --max-time 5 \
+  -H "Authorization: Bearer ${gateway_token}" \
+  'http://127.0.0.1:8094/internal/v1/discover?robotId=g1-sim')"
+control_robots="$(curl --noproxy '*' -fsS --max-time 5 \
+  -H "Authorization: Bearer ${control_token}" \
+  http://127.0.0.1:8080/api/v1/robots)"
+scene_context="$(curl --noproxy '*' -fsS --max-time 5 \
+  -H "Authorization: Bearer ${scene_internal_token}" \
+  http://127.0.0.1:8090/internal/v1/robots/g1-sim/scene-context)"
+
+python3 - "${plant_health}" "${sonic_health}" "${vision_health}" \
+  "${robot_diagnostics}" "${gateway_discovery}" "${control_robots}" \
+  "${scene_context}" <<'PY'
+import json
+import sys
+
+plant, sonic, vision, diagnostics, discovery, robots, scene = map(json.loads, sys.argv[1:])
+if plant.get("status") != "running":
+    raise SystemExit("MuJoCo Plant is not running")
+if not all(isinstance(plant.get(key), str) and plant[key] for key in (
+    "producerBootId", "sessionId", "localizationEpochId"
+)):
+    raise SystemExit("MuJoCo Plant identity is incomplete")
+support = plant.get("support") if isinstance(plant.get("support"), dict) else {}
+if support.get("fault") is not None or support.get("motionFault") is not None:
+    raise SystemExit("MuJoCo Plant retains a physics or motion fault")
+if sonic.get("status") != "running" or sonic.get("gesture_state") == "running":
+    raise SystemExit("SONIC is not in a read-only-ready state")
+if sonic.get("navigation_task_active") is not False:
+    raise SystemExit("SONIC still owns an active navigation task")
+capabilities = vision.get("capabilities") if isinstance(vision.get("capabilities"), dict) else {}
+vlm = capabilities.get("vlm") if isinstance(capabilities.get("vlm"), dict) else {}
+segmenter = capabilities.get("segmentation") if isinstance(capabilities.get("segmentation"), dict) else {}
+if (
+    vision.get("status") != "ok"
+    or vision.get("releaseState") != "pure_vlm_product_profile"
+    or vlm.get("provider") != "qwen"
+    or vlm.get("model") != "qwen3-vl-plus"
+    or vlm.get("available") is not True
+    or segmenter.get("provider") != "sam2"
+    or segmenter.get("available") is not True
+):
+    raise SystemExit("Vision is not the frozen Qwen + SAM2 product profile")
+if diagnostics.get("ready") is not True or not diagnostics.get("robotBootId"):
+    raise SystemExit("Robot Agent diagnostics are not ready")
+if diagnostics.get("commandReadiness", {}).get("ready") is not True:
+    raise SystemExit("Robot Agent command boundary is not ready")
+result = discovery.get("result") if isinstance(discovery.get("result"), dict) else {}
+observation = result.get("observation") if isinstance(result.get("observation"), dict) else {}
+if (
+    discovery.get("status") != "available"
+    or result.get("available") is not True
+    or result.get("robotId") != "g1-sim"
+    or result.get("robotBootId") != diagnostics.get("robotBootId")
+    or observation.get("status") != "USABLE"
+    or not observation.get("sessionId")
+    or not observation.get("localizationEpochId")
+    or observation.get("localizationEpochId") != plant.get("localizationEpochId")
+):
+    raise SystemExit("Robot Agent gateway discovery/observation identity is not ready")
+robot = next((item for item in robots if item.get("robotId") == "g1-sim"), None)
+details = robot.get("details") if isinstance(robot, dict) and isinstance(robot.get("details"), dict) else {}
+manifest = details.get("capabilityManifest") if isinstance(details.get("capabilityManifest"), dict) else {}
+skill_ids = {
+    item.get("skillId")
+    for item in manifest.get("capabilities", [])
+    if isinstance(item, dict)
+}
+if (
+    not isinstance(robot, dict)
+    or robot.get("status") != "online"
+    or robot.get("connected") is not True
+    or details.get("robotBootId") != diagnostics.get("robotBootId")
+    or details.get("observationSessionId") != observation.get("sessionId")
+    or details.get("localizationEpochId") != observation.get("localizationEpochId")
+    or not {"navigation.navigate_to_pose", "navigation.rotate"}.issubset(skill_ids)
+):
+    raise SystemExit("Control API robot projection does not match Robot Agent identity")
+scene_ref = scene.get("sceneRef") if isinstance(scene.get("sceneRef"), dict) else {}
+annotations = scene.get("annotations") if isinstance(scene.get("annotations"), list) else []
+location_ids = {item.get("locationId") for item in annotations if isinstance(item, dict)}
+required = {
+    "corridor", "corridor_west", "corridor_center", "corridor_east",
+    "reception", "reception_entry", "reception_main",
+    "open_office", "open_office_entry", "open_office_west", "open_office_east",
+    "meeting_room", "meeting_entry", "meeting_south", "meeting_north",
+    "focus_office", "focus_entry", "focus_main", "focus_east_wall",
+    "pantry", "pantry_entry", "pantry_west", "pantry_center",
+    "storage", "storage_entry", "storage_main", "storage_deep",
+}
+if (
+    not scene_ref.get("sceneId")
+    or not isinstance(scene_ref.get("revision"), int)
+    or location_ids != required
+):
+    raise SystemExit("Office V2 published Scene binding is incomplete")
+print(
+    "Live identities: Plant/SONIC, Robot Agent, observation session, Control API "
+    "and Office V2 Scene binding agree"
+)
+PY
+
 # Control API serves the built PWA at root and currently has no generic
 # /readyz route. Compose already gates its Postgres/Redis dependencies; a 200
 # root response proves the same process and gateway path used by operators.
 curl --noproxy '*' -fsS --max-time 5 http://127.0.0.1:8080/ >/dev/null
+
+ros_runtime() (
+  set +u
+  # shellcheck disable=SC1091
+  source /opt/ros/jazzy/setup.bash
+  # shellcheck disable=SC1091
+  source "${ROOT}/components/robotagent/tools/activate-local-nav2-jazzy.bash"
+  set -u
+  export ROS_DOMAIN_ID=232
+  export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+  export CYCLONEDDS_URI='<CycloneDDS><Domain><General><Interfaces><NetworkInterface name="lo"/></Interfaces><AllowMulticast>true</AllowMulticast></General></Domain></CycloneDDS>'
+  exec "$@"
+)
+for node in map_server planner_server controller_server behavior_server bt_navigator waypoint_follower; do
+  lifecycle="$(ros_runtime timeout 8 ros2 lifecycle get "/${node}")"
+  [[ "${lifecycle}" == *'active [3]'* ]] || {
+    printf 'Nav2 lifecycle node is not active: %s\n' "${node}" >&2
+    exit 1
+  }
+done
+strict_health="$(ros_runtime timeout 10 ros2 service call \
+  /h_ide/strict_navigation/health std_srvs/srv/Trigger '{}')"
+python3 - "${strict_health}" <<'PY'
+import ast
+import json
+import re
+import sys
+
+match = re.search(r"success=(True|False), message=(?P<message>.+)\)\s*$", sys.argv[1], re.DOTALL)
+if match is None or match.group(1) != "True":
+    raise SystemExit("strict navigation health service did not succeed")
+payload = json.loads(ast.literal_eval(match.group("message")))
+bridge = payload.get("bridge") if isinstance(payload.get("bridge"), dict) else {}
+if (
+    payload.get("healthy") is not True
+    or payload.get("active") is not False
+    or bridge.get("healthy") is not True
+    or bridge.get("fault") is not None
+    or bridge.get("sonicStatus") != "ready"
+):
+    raise SystemExit("strict navigation adapter/ROS bridge is not idle and healthy")
+print(
+    "Strict adapter: healthy, idle, "
+    f"fullStraightDrive={payload.get('fullStraightDrive')}, "
+    f"continuousDriveHandoff={payload.get('continuousDriveHandoff')}, "
+    f"runtimeDriveChunkM={payload.get('runtimeDriveChunkM')}"
+)
+PY
 
 if [[ "${LEVEL}" == L2 ]]; then
   printf '%s\n' 'acceptance L2: OK (runtime health only; no Mission or motion was executed)'
@@ -259,7 +457,9 @@ python3 - \
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 from pathlib import Path
+import re
 import sys
 
 raw_path = Path(sys.argv[1])
@@ -296,6 +496,210 @@ inspection_succeeded = any(
     skill_id == "inspection.scan_station" and status == "succeeded"
     for skill_id, status in identities
 )
+expected_nodes = [
+    ("office-sequence-01-nav-01-open_office_entry", "navigation.navigate_to_pose"),
+    ("office-sequence-01-nav-02-open_office_west", "navigation.navigate_to_pose"),
+    ("office-sequence-01-verify-open_office", "scene.verify_inside_region"),
+    ("office-sequence-01-scan-open_office_west", "inspection.scan_station"),
+    ("office-sequence-02-nav-01-meeting_entry", "navigation.navigate_to_pose"),
+    ("office-sequence-02-nav-02-meeting_south", "navigation.navigate_to_pose"),
+    ("office-sequence-02-verify-meeting_room", "scene.verify_inside_region"),
+    ("office-sequence-02-scan-meeting_south", "inspection.scan_station"),
+    ("office-sequence-final-report", "mission.report"),
+]
+expected_contracts = {
+    "office-sequence-01-nav-01-open_office_entry": {
+        "dependsOn": [], "locationId": "open_office", "stationId": "open_office_entry", "anchorRole": "entry",
+    },
+    "office-sequence-01-nav-02-open_office_west": {
+        "dependsOn": ["office-sequence-01-nav-01-open_office_entry"], "locationId": "open_office", "stationId": "open_office_west", "anchorRole": "observation_vantage",
+    },
+    "office-sequence-01-verify-open_office": {
+        "dependsOn": ["office-sequence-01-nav-02-open_office_west"], "locationId": "open_office", "stationId": "open_office_west", "anchorRole": "observation_vantage",
+    },
+    "office-sequence-01-scan-open_office_west": {
+        "dependsOn": ["office-sequence-01-verify-open_office"], "regionId": "open_office", "stationId": "open_office_west",
+    },
+    "office-sequence-02-nav-01-meeting_entry": {
+        "dependsOn": ["office-sequence-01-scan-open_office_west"], "locationId": "meeting_room", "stationId": "meeting_entry", "anchorRole": "entry",
+    },
+    "office-sequence-02-nav-02-meeting_south": {
+        "dependsOn": ["office-sequence-02-nav-01-meeting_entry"], "locationId": "meeting_room", "stationId": "meeting_south", "anchorRole": "observation_vantage",
+    },
+    "office-sequence-02-verify-meeting_room": {
+        "dependsOn": ["office-sequence-02-nav-02-meeting_south"], "locationId": "meeting_room", "stationId": "meeting_south", "anchorRole": "observation_vantage",
+    },
+    "office-sequence-02-scan-meeting_south": {
+        "dependsOn": ["office-sequence-02-verify-meeting_room"], "regionId": "meeting_room", "stationId": "meeting_south",
+    },
+    "office-sequence-final-report": {
+        "dependsOn": ["office-sequence-02-scan-meeting_south"], "reportScope": "selected_locations",
+    },
+}
+plan = mission.get("plan") if isinstance(mission.get("plan"), dict) else {}
+plan_nodes = plan.get("nodes") if isinstance(plan.get("nodes"), list) else []
+actual_nodes = [
+    (str(item.get("nodeId") or ""), str(item.get("skillId") or ""))
+    for item in plan_nodes
+    if isinstance(item, dict)
+]
+node_by_id = {
+    str(item.get("nodeId") or ""): item
+    for item in plan_nodes
+    if isinstance(item, dict)
+}
+
+def node_contract_matches(node_id, skill_id):
+    node = node_by_id.get(node_id)
+    expected = expected_contracts[node_id]
+    if not isinstance(node, dict) or node.get("dependsOn") != expected["dependsOn"]:
+        return False
+    intent = node.get("intent") if isinstance(node.get("intent"), dict) else {}
+    if skill_id in {"navigation.navigate_to_pose", "scene.verify_inside_region"}:
+        place = intent.get("place") if isinstance(intent.get("place"), dict) else {}
+        return all(place.get(key) == expected[key] for key in ("locationId", "stationId", "anchorRole"))
+    if skill_id == "inspection.scan_station":
+        return (
+            intent.get("regionId") == expected["regionId"]
+            and intent.get("stationId") == expected["stationId"]
+            and intent.get("requiresInsideVerification") is True
+        )
+    if skill_id == "mission.report":
+        return (
+            intent.get("reportScope") == "selected_locations"
+            and intent.get("regionIds") == ["open_office", "meeting_room"]
+            and intent.get("stationIds") == ["open_office_west", "meeting_south"]
+            and intent.get("locale") == "zh-CN"
+        )
+    return False
+
+active_revision = mission.get("activeRevision") if isinstance(mission.get("activeRevision"), dict) else {}
+revisions = mission.get("revisions") if isinstance(mission.get("revisions"), list) else []
+active_revision_nodes = active_revision.get("nodes") if isinstance(active_revision.get("nodes"), list) else []
+revision_stable = bool(
+    len(revisions) == 1
+    and active_revision.get("sequence") == 1
+    and active_revision.get("revisionId") == mission.get("activeRevisionId")
+    and active_revision_nodes == plan_nodes
+)
+office_sequence_validated = bool(
+    plan.get("objective") == "今天巡检开放办公室和会议室"
+    and actual_nodes == expected_nodes
+    and all(node_contract_matches(node_id, skill_id) for node_id, skill_id in expected_nodes)
+    and revision_stable
+)
+node_states = mission.get("nodeStates") if isinstance(mission.get("nodeStates"), list) else []
+state_by_node = {
+    str(item.get("nodeId") or ""): str(item.get("status") or "")
+    for item in node_states
+    if isinstance(item, dict)
+}
+all_required_nodes_succeeded = all(
+    state_by_node.get(node_id) == "succeeded" for node_id, _skill_id in expected_nodes
+)
+
+def execution_for(node_id, skill_id):
+    for item in reversed(executions):
+        if not isinstance(item, dict) or item.get("nodeId") != node_id:
+            continue
+        request = item.get("request") if isinstance(item.get("request"), dict) else {}
+        result = item.get("result") if isinstance(item.get("result"), dict) else {}
+        if (
+            request.get("skillId") == skill_id
+            and item.get("status") == "succeeded"
+            and result.get("status") == "succeeded"
+        ):
+            return item
+    return None
+
+scan_complete = True
+scan_evidence_count = 0
+seen_scan_evidence = set()
+expected_scans = {
+    "office-sequence-01-scan-open_office_west": ("open_office_west", "open_office"),
+    "office-sequence-02-scan-meeting_south": ("meeting_south", "meeting_room"),
+}
+expected_heading_radians = {1: 0.0, 2: math.pi / 2.0, 3: math.pi, 4: -math.pi / 2.0}
+for node_id, (station_id, region_id) in expected_scans.items():
+    execution = execution_for(node_id, "inspection.scan_station")
+    outer_result = execution.get("result") if isinstance(execution, dict) else {}
+    result = outer_result.get("result") if isinstance(outer_result, dict) else {}
+    inspection = result.get("inspectionResult") if isinstance(result, dict) else {}
+    headings = inspection.get("headings") if isinstance(inspection, dict) else None
+    heading_gaps = inspection.get("headingGaps", []) if isinstance(inspection, dict) else None
+    headings_by_index = {
+        item.get("headingIndex"): item
+        for item in headings
+        if isinstance(item, dict) and isinstance(item.get("headingIndex"), int) and not isinstance(item.get("headingIndex"), bool)
+    } if isinstance(headings, list) else {}
+    valid_headings = [
+        item for index, expected_heading in expected_heading_radians.items()
+        for item in [headings_by_index.get(index)]
+        if isinstance(item, dict)
+        and isinstance(item.get("headingRad"), (int, float))
+        and not isinstance(item.get("headingRad"), bool)
+        and math.isclose(float(item["headingRad"]), expected_heading, abs_tol=1e-9)
+        and item.get("status") == "observed"
+        and isinstance(item.get("visualResult"), dict)
+        and item["visualResult"].get("status") == "succeeded"
+        and item["visualResult"].get("missionId") == mission_id
+        and item["visualResult"].get("revisionId") == mission.get("activeRevisionId")
+        and str(item["visualResult"].get("nodeId") or "").startswith(node_id + "-view-")
+        and isinstance(item["visualResult"].get("evidence"), list)
+        and bool(item["visualResult"]["evidence"])
+    ]
+    evidence_hashes = [
+        evidence.get("sha256")
+        for item in valid_headings
+        for evidence in item["visualResult"]["evidence"]
+        if isinstance(evidence, dict)
+    ]
+    evidence_valid = bool(
+        evidence_hashes
+        and all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) for value in evidence_hashes)
+        and len(evidence_hashes) == len(set(evidence_hashes))
+        and not (set(evidence_hashes) & seen_scan_evidence)
+    )
+    seen_scan_evidence.update(value for value in evidence_hashes if isinstance(value, str))
+    scan_evidence_count += len(evidence_hashes)
+    if (
+        inspection.get("stationId") != station_id
+        or inspection.get("regionId") != region_id
+        or not isinstance(headings, list)
+        or len(headings) != 4
+        or set(headings_by_index) != set(expected_heading_radians)
+        or len(valid_headings) != 4
+        or not isinstance(heading_gaps, list)
+        or heading_gaps
+        or not evidence_valid
+    ):
+        scan_complete = False
+
+report_execution = execution_for("office-sequence-final-report", "mission.report")
+outer_report = report_execution.get("result") if isinstance(report_execution, dict) else {}
+report_result = outer_report.get("result") if isinstance(outer_report, dict) else {}
+report = report_result.get("missionReport") if isinstance(report_result, dict) else {}
+expected_regions = ["open_office", "meeting_room"]
+expected_stations = ["open_office_west", "meeting_south"]
+report_evidence = report.get("evidence") if isinstance(report, dict) else []
+report_heading_gaps = report.get("headingGaps") if isinstance(report, dict) else None
+report_missing_stations = report.get("missingStations") if isinstance(report, dict) else None
+report_full_chain_accepted = bool(
+    isinstance(report, dict)
+    and report.get("reportScope") == "selected_locations"
+    and report.get("status") == "completed"
+    and report.get("fullChainAccepted") is True
+    and report.get("regionIds") == expected_regions
+    and report.get("stationIds") == expected_stations
+    and isinstance(report_heading_gaps, list)
+    and not report_heading_gaps
+    and isinstance(report_missing_stations, list)
+    and not report_missing_stations
+    and isinstance(report_evidence, list)
+    and bool(report_evidence)
+    and "开放办公区" in str(report.get("narrativeZhCN") or "")
+    and "会议室" in str(report.get("narrativeZhCN") or "")
+)
 events = mission.get("events") if isinstance(mission.get("events"), list) else []
 world_records = (
     mission.get("worldRecords") if isinstance(mission.get("worldRecords"), list) else []
@@ -305,6 +709,10 @@ accepted = (
     and navigation_succeeded
     and inspection_succeeded
     and bool(world_records)
+    and office_sequence_validated
+    and all_required_nodes_succeeded
+    and scan_complete
+    and report_full_chain_accepted
 )
 summary = {
     "schemaVersion": "skillstore.l3-mission-result/1",
@@ -316,6 +724,15 @@ summary = {
     "missionStatus": mission_status,
     "navigationSucceeded": navigation_succeeded,
     "inspectionSucceeded": inspection_succeeded,
+    "officeSequenceValidated": office_sequence_validated,
+    "allRequiredNodesSucceeded": all_required_nodes_succeeded,
+    "allRequiredHeadingsObserved": scan_complete,
+    "reportFullChainAccepted": report_full_chain_accepted,
+    "regionIds": expected_regions if report_full_chain_accepted else [],
+    "stationIds": expected_stations if report_full_chain_accepted else [],
+    "headingGapCount": len(report_heading_gaps) if isinstance(report_heading_gaps, list) else 0,
+    "reportEvidenceCount": len(report_evidence) if isinstance(report_evidence, list) else 0,
+    "scanEvidenceCount": scan_evidence_count,
     "resultAccepted": accepted,
     "eventCount": len(events),
     "worldRecordCount": len(world_records),
@@ -329,13 +746,31 @@ summary_path.write_text(
 )
 if not accepted:
     raise SystemExit(
-        "L3 rejected: expected completed Mission with succeeded navigation, "
-        "succeeded inspection and at least one durable world record"
+        "L3 rejected: expected the exact reviewed two-room DAG, every required "
+        "node and four-heading scan to succeed, a gap-free full-chain selected-"
+        "locations report, and at least one durable world record"
     )
 PY
 mv -- "${summary_pending}" "${summary_result}"
+schema_validation_status=0
+"${ROOT}/components/h-ide/.venv/bin/python" - \
+  "${ROOT}/manifests/release/l3-mission-result.schema.json" \
+  "${summary_result}" <<'PY' || schema_validation_status=$?
+import json
+from pathlib import Path
+import sys
+
+from jsonschema import Draft202012Validator
+
+schema = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+result = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+errors = sorted(Draft202012Validator(schema).iter_errors(result), key=lambda item: list(item.path))
+if errors:
+    detail = "; ".join(error.message for error in errors[:5])
+    raise SystemExit(f"L3 structured result does not match its release schema: {detail}")
+PY
 trap - EXIT
-if (( mission_validation_status != 0 )); then
+if (( mission_validation_status != 0 || schema_validation_status != 0 )); then
   printf 'acceptance L3: FAILED; structured result: %s\n' "${summary_result}" >&2
   exit 1
 fi

@@ -124,7 +124,10 @@ L3-01 完成后，在同一会话切换“语音助手 Skill”，依次输入�
 只向 `g1-sim` 请求一次 simulation-only wave。挥手只在 stationary/IDLE 接受，由 SONIC
 唯一 50 Hz LowCmd owner 叠加；默认 2.4 秒后 envelope 回到零、目标恢复到 SONIC 基础
 姿态，telemetry 为 `completed`。若期间开始导航或停止流程，gesture 必须取消并回到底层
-目标，不能挂住右臂或影响下一 Mission。该结果只证明仿真动作，不代表真机动作 ID 已接入。
+目标，不能挂住右臂或影响下一 Mission。这里的 telemetry 只证明命令级 gesture overlay
+已经结束并把目标交还基础控制器，不等价于实测关节角已经收敛到基础姿态；若要声明关节
+物理回落，还必须另存 MuJoCo/关节状态的实测角度、容差和稳定时长。该结果只证明仿真动作，
+不代表真机动作 ID 已接入。
 
 ### L3-04：`full_straight_drive`
 
@@ -151,9 +154,14 @@ Office V2 的正式复位是进程级冷启动，不是在运行中改 `qpos`：
 ./integration/start-e2e.sh --viewer --full-straight-drive
 ```
 
-确认新 Plant boot、Robot Agent boot/session 和 Localization Epoch 后，新建会话并再次执行
-L3-01。第二次 Mission 必须使用新身份和新 Evidence；旧 Mission 不能继续、未知物理动作
-不能重放，报告结果仍满足同一验收条件。
+确认 Plant、SONIC、ROS bridge 和 observation gateway 的进程/session/control generation
+均已更新。Linux 机器人计算域没有重启时，`robotBootId` 应在同一次 OS boot 内保持一致；
+不能为了满足测试而伪造新的 Robot Boot。`localizationEpochId` 只有在地图切换、重新定位或
+定位状态明确重置时才更新；单纯重启上述进程并继续使用同一地图/定位时，它应保持一致。
+
+无论某个身份按契约更新还是保持一致，都必须新建会话并再次执行 L3-01：第二次 Mission
+使用新的 Mission/request、进程 session/control generation 和新鲜 Evidence；旧 Mission
+不得续跑，未知物理动作不得重放，旧 Evidence 不得冒充本轮观察，报告仍满足同一验收条件。
 
 ### 可选基础运动回归
 
