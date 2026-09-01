@@ -4,6 +4,10 @@
 
 
 需要从跨仓库、端到端视角理解当前 PWA、Mission、Vision、Robot Agent、Nav2、SONIC、MuJoCo、DAAAM 与开源依赖时，请从 [H-IDE 联调开发者手册](docs/developer/README.md) 开始。
+
+商业化云—站点—边缘—机器人架构、PRO 6000 本地验证方案、硬件档位和地图硬编码迁移
+路线见 [H-IDE 平台架构文档集](docs/platform-architecture/README.md)。
+
 Robot Action Console 是工作站上的机器人行动控制平面。它不是机器人侧
 Robot Agent，也不是 Agent 依赖框架；它把手动控制、已确认的 Agent 计划和
 接口映射管理统一收敛到一个可审计的 `ActionRuntime`。
