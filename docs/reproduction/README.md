@@ -1,48 +1,80 @@
-# 从干净克隆复刻联调
+# 从干净克隆复刻 Office V2 联调
 
-本文把“代码可克隆”和“联调可复现”分开验证。仅在 README 中列出缺失依赖并不
-足够；冻结版通过相对路径、机器可读 manifest、哈希验证和分级验收把这些依赖变成
-显式输入。
+本文区分“能够 clone”与“能够复现端到端行为”。目标版本为
+`skillstore-office-v2-e2e-20260901-r1`，目标不可变标签为
+`integration/office-v2-e2e-20260901-r1`。
 
-## 1. 验证克隆身份
+## 1. 建立真正干净的工作区
+
+发布后：
 
 ```bash
-git clone http://192.168.50.189:37085/zhongwenjun/skillstore.git
-cd skillstore
+git clone http://192.168.50.189:37085/zhongwenjun/skillstore.git skillstore-clean
+cd skillstore-clean
+git checkout --detach integration/office-v2-e2e-20260901-r1
+ROOT="$(pwd -P)"
 git status --short
-git tag --verify integration/office-v2-e2e-20260827-r3 2>/dev/null || \
-  git show --no-patch integration/office-v2-e2e-20260827-r3
+git show --no-patch --decorate HEAD
 ./integration/acceptance.sh --level L0
 ```
 
-预期：工作树为空、无 gitlink/submodule、L0 通过。`third_party/lerobot` 和
-`unitree_sdk2_python` 应为普通可读源码；G1 网格和权重应仍为空/外置。
+发布审计时改为检出 `release/office-v2-e2e-20260901`。候选必须满足：
 
-## 2. 创建各组件隔离环境
+- 工作树为空；
+- 当前树无 gitlink/submodule、`.env`、数据库、日志、Evidence、模型或权重；
+- 不依赖仓库外的 sibling project、旧 `.venv`、旧 `node_modules` 或 ROS build；
+- 关键 runtime selector 不含开发者绝对路径；
+- L0 通过。
 
-不同组件的 Python 版本不同，不能共用一个 `.venv`：
+匿名 clone 不需要 token。因为仓库地址是内网 HTTP，写权限凭据只允许通过本机
+credential helper/askpass 使用，不能拼进 URL。
+
+## 2. 记录主机 manifest
+
+复现报告至少记录以下只读输出，不把主机序列号、用户名或凭据提交到公开仓库：
 
 ```bash
-# H-IDE / Mission / Scene（Python 3.12）
-python3.12 -m venv components/h-ide/.venv
-components/h-ide/.venv/bin/pip install -e 'components/h-ide[test,daaam]'
-
-# MuJoCo / SONIC（Python 3.12）
-python3.12 -m venv components/h-ide-mujoco-sonic/.venv
-components/h-ide-mujoco-sonic/.venv/bin/pip install \
-  -e 'components/h-ide-mujoco-sonic[runtime,test]'
-
-# Vision（项目锁固定 Python 3.11）
-(cd components/h-ide-vision && uv sync --locked --extra dev)
-
-# Robot Agent
-(cd components/robotagent && uv sync --locked --group dev)
-
-# Planning Agent
-(cd components/h-ide-agent && npm ci)
+uname -a
+lsb_release -ds
+nvidia-smi
+docker version
+docker compose version
+bash -lc 'source /opt/ros/jazzy/setup.bash && ros2 doctor --report'
+node --version
+npm --version
+python3.12 --version
+python3.11 --version
+uv --version
 ```
 
-Robot Agent 的 ROS 2 interfaces/overlay 仍需按其 README 构建，并使以下文件存在：
+“PRO 6000”必须记录准确产品代际、显存、driver 和 CUDA；不能用计划采购型号代替实际
+验收主机。
+
+## 3. 创建隔离依赖环境
+
+```bash
+./integration/provision-ros-prefixes.sh
+
+python3.12 -m venv "$ROOT/components/h-ide/.venv"
+"$ROOT/components/h-ide/.venv/bin/pip" install \
+  -e "$ROOT/components/h-ide[test,daaam]"
+
+python3.12 -m venv "$ROOT/components/h-ide-mujoco-sonic/.venv"
+"$ROOT/components/h-ide-mujoco-sonic/.venv/bin/pip" install \
+  -e "$ROOT/components/h-ide-mujoco-sonic[runtime,test]"
+
+(cd "$ROOT/components/h-ide-vision" && uv sync --locked --extra dev)
+
+(cd "$ROOT/components/robotagent" && \
+  uv venv --python /usr/bin/python3.12 --system-site-packages .venv && \
+  uv sync --python .venv/bin/python --all-groups && \
+  bash -lc 'source /opt/ros/jazzy/setup.bash && /usr/bin/python3 /usr/bin/colcon build --symlink-install')
+
+(cd "$ROOT/components/h-ide-agent" && npm ci)
+(cd "$ROOT/components/h-ide/apps/control-pwa" && npm ci)
+```
+
+预期存在：
 
 ```text
 components/robotagent/install/setup.bash
@@ -50,64 +82,121 @@ components/robotagent/tools/activate-local-nav2-jazzy.bash
 components/robotagent/tools/activate-local-realsense-jazzy.bash
 ```
 
-## 3. 创建秘密和本机依赖
+两个 activation script 还要求 operator-local prefix：
 
-```bash
-./integration/bootstrap.sh --install-agent
-chmod 600 .env
+```text
+components/robotagent/.local/ros-jazzy-nav2/root/opt/ros/jazzy
+components/robotagent/.local/ros-jazzy-realsense/root/opt/ros/jazzy
 ```
 
-填写 DeepSeek、DashScope、SAM2 路径。内部 token 由 bootstrap 随机生成；同一个
-`.env` 通过相对 symlink 给 H-IDE/Compose/host launcher 使用，避免多份 token 漂移。
+这些 prefix 由 `integration/provision-ros-prefixes.sh` 根据
+`manifests/ros/jazzy-user-prefix-amd64.json` 从零生成：脚本固定 package version、核对 deb
+SHA-256，并在无 sudo 情况下解包。禁止复制原工作站 `.local` 或注释掉 launcher 的
+activation gate。
 
-获取外部资产：
+不同 Python minor 版本不能共用 `.venv`。不得把生成的环境、ROS `build/install/log`、
+PWA `dist` 或 `node_modules` 提交到发行仓库。
+
+## 4. 创建秘密与获取外部资产
+
+```bash
+./integration/bootstrap.sh --install-agent --provision-ros-prefixes
+chmod 600 "$ROOT/.env"
+```
+
+填写 DeepSeek、DashScope、SAM2 checkpoint 和本地演示选项。内部 service token 由
+bootstrap 随机生成；不要复制原开发者 `.env` 或数据库。
 
 ```bash
 ./integration/bootstrap.sh --fetch-groot-source
-SKILLSTORE_ACCEPT_G1_MODEL_TERMS=1 ./integration/bootstrap.sh --fetch-g1-model
+SKILLSTORE_ACCEPT_G1_MODEL_TERMS=1 \
+  ./integration/bootstrap.sh --fetch-g1-model
 ./integration/bootstrap.sh --fetch-sonic-model
 ```
 
-脚本会检出 manifest 中的完整 Git SHA，并对 G1 应用已记录 SHA-256 的 Office
-overlay patch。它不会下载任意 `main` 最新版。
+脚本必须检出 manifest 中的完整 revision 并验证哈希，不允许下载浮动 `main`。G1 网格、
+SONIC/GR00T 权重、SAM2 checkpoint 与 DAAAM 研究资产不进入 Git。
 
-## 4. 主机 ROS/Nav2 依赖
+当前模型与外部资产边界：
 
-完整 L2 以 Ubuntu 24.04 + ROS 2 Jazzy 为基线。至少需要：
+| 类别 | Current 依赖 | 复现方式 |
+| --- | --- | --- |
+| 文本 | DeepSeek `deepseek/deepseek-v4-flash` | 操作者提供 API 凭据 |
+| 视觉语义 | Qwen `qwen3-vl-plus` | 操作者提供 DashScope 凭据 |
+| 分割 | SAM2 锁定 checkpoint | 外置文件 + SHA-256 |
+| 运动 | GEAR-SONIC 锁定 bundle | operator-fetch + model lock |
+| G1 场景模型 | Unitree G1 MuJoCo checkout + reviewed overlay | 接受上游条款后 operator-fetch |
+| DAAAM | 默认关闭的异步 importer | 完整 research stack 不在复现主路径 |
 
-- `ros-jazzy-ros-base`、Nav2、`rmw-cyclonedds-cpp`、TF2 和常用 message/action。
-- 能运行 host-network 容器的 Docker Engine/Compose v2。
-- 当前用户可用的 `systemctl --user`；桌面模式有 X11 session。
-- NVIDIA driver/CUDA 与项目依赖兼容，`nvidia-smi` 正常。
-
-具体 ROS package 以 `components/h-ide-mujoco-sonic/docker/nav2/Dockerfile` 和
-Robot Agent 的 activation scripts 为准。L1 可以在没有 GPU/ROS 的构建机运行，
-但不能据此宣称运动链复现成功。
-
-## 5. 从静态到动态验收
+## 5. 静态和组件门禁
 
 ```bash
 ./integration/preflight.sh --level L0
 ./integration/preflight.sh --level L1
 ./integration/acceptance.sh --level L1
+
+(cd "$ROOT/components/h-ide/apps/control-pwa" && npm test && npm run build)
+(cd "$ROOT/components/h-ide-agent" && npm test && npm run typecheck && npm run build)
+```
+
+L1 必须从这个 clean clone 的环境运行。使用另一份源目录中已经构建的镜像、测试缓存或
+生成场景，不能作为复现证据。
+
+## 6. 启动、管理员初始化和 L2 readiness
+
+```bash
 ./integration/preflight.sh --level L2
-./integration/start-e2e.sh --viewer
+./integration/start-e2e.sh --rebuild --viewer --full-straight-drive
 ./integration/acceptance.sh --level L2
 ```
 
-需要实际运动时，按 `docs/acceptance/README.md` 逐个运行有名称的 case。通用脚本
-不会自动猜路线，也不会因“这是仿真”而绕过 Mission/Robot Agent 权限边界。
+如果需要首个 ADMIN，在服务已创建 schema 后停止 Control API，并通过一次性 CLI 初始化：
 
-## 6. 可复现性仍有哪些边界
+```bash
+COMPOSE=(docker compose --project-name skillstore-e2e \
+  --env-file "$ROOT/.env" \
+  -f "$ROOT/components/h-ide/infra/docker-compose.yml" \
+  -f "$ROOT/components/h-ide/infra/docker-compose.simulation.yml")
 
-- API 服务端模型可能由供应商更新、限流或欠费；仓库固定请求模型 ID和参数，
-  但不能冻结第三方在线服务的运行状态。
-- GPU driver、CUDA、ROS deb 和 Docker base image 由主机/镜像源提供；正式发布应
-  额外记录 SBOM 和镜像 registry digest。
-- G1 网格和 SONIC 权重受各自条款约束，不能通过公开 Git 镜像分发。
-- PWA 账号、会话历史、Mission 数据库和视觉证据属于运行状态，必须由 bootstrap/
-  管理命令重新创建，不能从开发者数据库复制。
+"${COMPOSE[@]}" stop control-api
+"${COMPOSE[@]}" run --rm --no-deps control-api \
+  h-ide-admin-bootstrap \
+  --database /data/control.db \
+  --username administrator \
+  --display-name "Administrator" \
+  --site-id default
+"${COMPOSE[@]}" up -d control-api gateway
+```
 
-这些边界会影响复现，因此不能只写一句“请自行安装”。本发行版对它们提供锁定
-revision、哈希、明确安装命令和 fail-fast 检查；只有供应商账户/硬件环境需要
-开发者自己提供。
+密码通过交互式隐藏输入提供；数据库、密码和审计运行状态都不属于发行源码。
+
+## 7. 有行为的端到端验收
+
+通用 L2 health 不会自动改变机器人状态。要证明当前候选的联调效果，操作者必须显式执行
+并保存 Mission ID、Robot Agent 回执、Plant/SONIC session、最终 pose 和 EvidenceRef：
+
+1. 单房间：`今天巡检开放办公室`。
+2. 双房间：`今天巡检开放办公室和会议室`。
+3. 确认每个房间都有进入、内部停稳、多方向观察和报告节点。
+4. 同一会话切换语音助手，询问：`刚刚有看到电脑吗？`。
+5. 确认历史回答与上轮报告一致，浏览器语音可用，空闲机器人挥手后恢复正常姿态。
+6. 确认 full-straight 只在经地图证明的直线段生效，转向/终点仍正确停稳。
+7. 冷启动复位后至少再运行一次，排除旧数据库、旧 Mission 或缓存造成的假成功。
+
+当前场景没有走廊中央圆柱，不使用旧的柱子绕行用例。不得用直接 Nav2 action、人工移动
+`qpos` 或预填运行数据库替代 PWA 端到端验收。
+
+## 8. 可复现边界
+
+- 供应商可能更新同一云模型 ID、限流、欠费或改变服务可用区；代码无法冻结其在线状态。
+- GPU driver、CUDA、ROS deb 和基础容器镜像来自外部供应链；正式 Release 应附镜像 digest、
+  主机 manifest、SBOM 与漏洞/许可证报告。
+- G1 网格和模型权重受独立条款约束，不能因源码仓库公开就重新分发。
+- PWA 账户、会话、Mission 数据库、视觉 Evidence 和运行日志必须在新环境重新创建。
+- 当前 Office V2 场景目录与可信站点仍是固定 Demo 回退基线；FARM/DAAAM、World Model、
+  Semantic Scene Compiler 和第二场景无硬编码 onboarding 属于 Proposed 里程碑。
+- 旧 LeRobot subtree 历史可能包含上游测试二进制路径；当前树门禁不等于完整历史审计，
+  正式公开发布前仍要执行 full-history secret/license scan。
+
+只有完成本页的 clean clone、依赖、L0/L1、L2 readiness 和 L3 显式行为验收，才能声称另一名
+开发者复现了联调；仅成功启动 PWA 或 MuJoCo viewer 不够。

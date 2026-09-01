@@ -1,112 +1,169 @@
-# 快速开始：复现冻结版端到端联调
+# 快速开始：Office V2 端到端联调
 
-本文是新开发者从零开始复刻当前 H-IDE Office V2 联调的唯一推荐入口。
-命令均以仓库根目录为当前目录，不依赖 `/home/phi` 或其他开发者的本机路径。
+本文面向第一次复刻 `skillstore-office-v2-e2e-20260901-r1` 的开发者。所有命令均从
+仓库根目录执行，并通过 `ROOT="$(pwd -P)"` 派生路径，不依赖任何原开发者目录。
 
-## 1. 你将得到什么
+目标标签 `integration/office-v2-e2e-20260901-r1` 只有在 clean-clone 和 L0–L3 发布门禁通过后
+才创建；标签发布前，审计人员使用 `release/office-v2-e2e-20260901` 分支。
 
-冻结版链路如下：
+## 1. 本候选提供什么
+
+当前链路为：
 
 ```text
-PWA → H-IDE Control API/Mission V2 → h-ide-agent（只规划）
-                                      ↘ h-ide-vision（Qwen + SAM2）
-                         → Robot Agent → Nav2 → ROS 2 bridge
-                         → SONIC → MuJoCo Plant（Office V2）
+PWA → Control API / Conversation V2 / Mission V2
+    → h-ide-agent → h-ide-vision
+    → Robot Agent → Nav2 → SONIC → MuJoCo Office V2
 ```
 
-LLM 只负责语言意图和计划草案；它没有运动权限。运动命令必须经过 Mission
-审核/授权、Robot Agent 能力边界和 Nav2/SONIC 执行链。DAAAM 默认不启动，
-只在 Mission 完成后提供区域级语义先验。
+可演示两项 Current Skill：
+
+1. `inspection.office`：中文单房间/多房间巡检，进入房间后多方向观察并按房间报告。
+2. `assistant.voice`：普通问答和巡检历史问答，浏览器中文语音朗读；仿真可选挥手。
+
+`H-IDE Field Executive`、`Cognition Broker`、FARM/DAAAM Shadow Provider、统一 World
+Model 和 Semantic Scene Compiler 属于 Proposed 架构，不在本候选的运行声明内。参见
+[平台架构说明](../../components/h-ide/docs/platform-architecture/README.md)。
 
 ## 2. 主机前置条件
 
-- Ubuntu 24.04（Ubuntu 22.04 只支持容器/协议级验证，不宣称完整复现）。
-- Python 3.12：`h-ide`、`h-ide-agent` 的相关服务、MuJoCo/SONIC。
-- Python 3.11：`h-ide-vision`（项目声明 `<3.12`）。
-- Python 3.10 或更高：`robotagent`。
-- Node.js `>=22.13.0`、npm、Docker Engine + Compose v2。
-- ROS 2 Jazzy、`rmw_cyclonedds_cpp`、Nav2；L2 需要 NVIDIA 驱动/CUDA、
-  `nvidia-smi`、`git-lfs` 和 systemd user manager。
-- 只有选择 `--viewer` 时才需要可用的 X11 `DISPLAY`/`XAUTHORITY`。
+- Ubuntu 24.04；Ubuntu 22.04 仅用于容器或协议级验证。
+- Python 3.12：H-IDE、MuJoCo/SONIC、Robot Agent Jazzy 环境。
+- Python 3.11：`h-ide-vision`。
+- Node.js `>=22.13.0`、npm、`uv`、Docker Engine 与 Compose v2。
+- ROS 2 Jazzy、Nav2、TF2、`rmw_cyclonedds_cpp`、colcon。
+- NVIDIA 驱动/CUDA、`nvidia-smi`、`git-lfs`；完整 L2 还需要与锁文件相符的模型。
+- 可用的 `systemctl --user`；仅 `--viewer` 需要 X11 `DISPLAY`/`XAUTHORITY`。
 
-## 3. 克隆和本地配置
+不要仅凭“有 NVIDIA GPU”宣称复现成功。验收记录应保存 GPU SKU、显存、driver、CUDA、
+ROS、Docker、Node 与 Python 版本；目标 PRO 6000 也必须记录准确 SKU。
+
+## 3. 克隆并固定版本
+
+发布后推荐：
 
 ```bash
 git clone http://192.168.50.189:37085/zhongwenjun/skillstore.git
 cd skillstore
-git checkout main
-./integration/bootstrap.sh
+git checkout --detach integration/office-v2-e2e-20260901-r1
+ROOT="$(pwd -P)"
+git status --short
 ```
 
-`bootstrap.sh` 会创建权限为 `0600` 的根目录 `.env`，生成空缺的内部随机令牌，
-并建立 `components/h-ide/.env → ../../.env` 相对链接。它不会覆盖已有凭据，
-不会把密钥写入 Git，也不会静默下载大型模型。
+发布审计阶段改为：
 
-编辑 `.env`，至少填写：
+```bash
+git checkout release/office-v2-e2e-20260901
+ROOT="$(pwd -P)"
+```
+
+预期工作树为空。公开仓库匿名 clone 不需要凭据；内网 HTTP 不加密，写权限凭据不得
+写入 remote URL 或 shell history。
+
+## 4. 创建隔离环境
+
+`bootstrap.sh` 默认只创建本地 `.env`、内部随机令牌和外部资产链接。它不会替你创建
+全部 Python/ROS 环境，因此首次复刻还需执行：
+
+```bash
+./integration/bootstrap.sh --install-agent --provision-ros-prefixes
+
+python3.12 -m venv components/h-ide/.venv
+components/h-ide/.venv/bin/pip install -e 'components/h-ide[test,daaam]'
+
+python3.12 -m venv components/h-ide-mujoco-sonic/.venv
+components/h-ide-mujoco-sonic/.venv/bin/pip install \
+  -e 'components/h-ide-mujoco-sonic[runtime,test]'
+
+(cd components/h-ide-vision && uv sync --locked --extra dev)
+
+(cd components/robotagent && \
+  uv venv --python /usr/bin/python3.12 --system-site-packages .venv && \
+  uv sync --python .venv/bin/python --all-groups && \
+  bash -lc 'source /opt/ros/jazzy/setup.bash && /usr/bin/python3 /usr/bin/colcon build --symlink-install')
+
+(cd components/h-ide/apps/control-pwa && npm ci)
+```
+
+launcher 要求以下两个 operator-local ROS prefix：
+
+```text
+components/robotagent/.local/ros-jazzy-nav2/root/opt/ros/jazzy
+components/robotagent/.local/ros-jazzy-realsense/root/opt/ros/jazzy
+```
+
+它们不在 Git 中，也不能从另一名开发者的工作区复制。`bootstrap` 的
+`--provision-ros-prefixes` 会读取
+`manifests/ros/jazzy-user-prefix-amd64.json`，下载精确 ROS deb、核对 SHA-256，并在无 sudo
+情况下解包到上述目录。也可以单独运行：
+
+```bash
+./integration/provision-ros-prefixes.sh
+```
+
+L2 preflight 会验证两个 prefix 的 manifest 和必需 ROS package；不得注释掉 activation
+script 绕过门禁。
+
+如果某一步失败，不要借用仓库外的 `.venv`、`node_modules` 或 ROS `install` 目录。完整
+clean-clone 过程见[复刻文档](../reproduction/README.md)。
+
+## 5. 配置供应商凭据与演示选项
+
+根目录 `.env` 必须是当前用户拥有的普通文件且权限为 `0600`：
+
+```bash
+chmod 600 "$ROOT/.env"
+```
+
+至少配置：
 
 ```dotenv
-DEEPSEEK_API_KEY=<文本规划凭据>
-DASHSCOPE_API_KEY=<Qwen/SAM2 服务凭据>
-HIDE_VISION_SAM2_CHECKPOINT=/absolute/path/to/sam2.1_hiera_tiny.pt
+DEEPSEEK_API_KEY=<operator-provided>
+DASHSCOPE_API_KEY=<operator-provided>
+HIDE_VISION_SAM2_CHECKPOINT=<absolute-operator-cache-path>
 ```
 
-当前冻结版文本模型固定为 `deepseek/deepseek-v4-flash`，视觉模型固定为
-`qwen3-vl-plus`；不要把供应商凭据放在 URL、Compose 文件或提交信息中。
+当前文本 profile 为 DeepSeek `deepseek/deepseek-v4-flash`，视觉 profile 为
+`qwen3-vl-plus` + SAM2。云模型可能欠费、限流或由供应商更新；固定 model ID 不等于
+冻结外部服务本身。
 
-## 4. 获取许可受限的外部资产
+要展示仿真挥手，还需在 `.env` 中启用并设置一个本地随机代理令牌；不要复制文档中的
+固定示例或把真实值提交到 Git：
 
-源码和权重分开处理：
+```dotenv
+HIDE_LEADER_DEMO_GESTURES_ENABLED=true
+HIDE_LEADER_DEMO_GESTURE_PROXY_TOKEN=<operator-generated-random-secret>
+```
+
+## 6. 获取外部资产
 
 ```bash
-# NVIDIA GR00T/SONIC 部署源码（官方 profile 的来源证明）
 ./integration/bootstrap.sh --fetch-groot-source
-
-# G1 MuJoCo 网格和 XML；先阅读 manifests/vendor/g1-model.json 的条款
 SKILLSTORE_ACCEPT_G1_MODEL_TERMS=1 \
   ./integration/bootstrap.sh --fetch-g1-model
-
-# 约 865 MB 的 GEAR-SONIC ONNX bundle
 ./integration/bootstrap.sh --fetch-sonic-model
-
-# 可选：安装规划 Agent 的 Node 依赖
-./integration/bootstrap.sh --install-agent
 ```
 
-默认下载位置是 `${XDG_CACHE_HOME:-$HOME/.cache}/skillstore`。可在 `.env` 中用
-`SKILLSTORE_EXTERNAL_ROOT`、`HIDE_G1_MODEL_ROOT`、`SONIC_HF_CACHE` 改变位置。
-G1 网格没有在仓库中再分发；SONIC 权重也不进 Git。每个来源、提交、哈希和
-许可证状态见 `manifests/vendor/` 与 `integration/integration.lock.yaml`。
+- G1 网格、GR00T/SONIC 源和 SONIC 权重按 manifest 固定 revision，由操作者获取。
+- G1 网格再分发状态未确认，不随公开 Git 仓库分发。
+- SAM2 checkpoint 由操作者单独取得，L2 会核验 SHA-256。
+- DAAAM 研究环境、数据集和权重不随本候选分发，也不是默认启动依赖。
 
-SAM2 checkpoint 需要由操作者单独取得；L2 会核验其 SHA-256。当前冻结哈希为：
-`7402e0d864fa82708a20fbd15bc84245c2f26dff0eb43a4b5b93452deb34be69`。
+具体来源见 `manifests/vendor/`、`integration/integration.lock.yaml` 和
+[安全文档](../security/README.md)。
 
-## 5. 分级预检
+## 7. 分级预检与启动
 
 ```bash
-./integration/preflight.sh --level L0   # 不需要模型、ROS 或 Docker
-./integration/preflight.sh --level L1   # 需要 Docker/场景构建环境
-./integration/preflight.sh --level L2   # 完整主机、外部资产、GPU/ROS
+./integration/preflight.sh --level L0
+./integration/preflight.sh --level L1
+./integration/preflight.sh --level L2
+./integration/start-e2e.sh --viewer --full-straight-drive
 ```
 
-预检失败时先修复报告中的第一项，不要用 `--force` 绕过。L0/L1/L2 的定义和
-验收证据见 [`../acceptance/README.md`](../acceptance/README.md)。
-
-## 6. 启动完整联调
-
-```bash
-./integration/start-e2e.sh --viewer
-```
-
-无图形环境使用：
-
-```bash
-./integration/start-e2e.sh
-```
-
-启动器按以下顺序等待就绪：Compose 控制面 → Qwen/SAM2 → Office V2 场景校验
-→ MuJoCo Plant → SONIC 50 Hz motion gate → ROS ingress → map→base_link TF
-→ Nav2 lifecycle → strict navigation adapter → Robot Agent/observation gateway。
-它不会因为某个旧服务“看起来还活着”就复用半条链路。
+`--full-straight-drive` 只合并地图证明安全的直线段，单动作当前最多 4 m；转向、门口、
+终点、取消和故障仍进入正常边界，不满足条件时自动回退到较短 profile。省略该参数即可
+使用默认冻结 profile。
 
 启动后：
 
@@ -114,25 +171,50 @@ SAM2 checkpoint 需要由操作者单独取得；L2 会核验其 SHA-256。当�
 - 仿真观测：`http://127.0.0.1:8080/simulation`
 - 状态汇总：`./components/h-ide-mujoco-sonic/scripts/workstation-demo-status.sh`
 
-## 7. 停止与重新开始
+## 8. 初始化首个管理员
+
+普通用户可以在 PWA 注册；需要管理员/开发者功能时，首个管理员必须通过离线 CLI 创建，
+不能把密码放进 `.env`、命令参数或仓库。先让 Control API 创建数据库 schema，再停止它：
+
+```bash
+COMPOSE=(docker compose --project-name skillstore-e2e \
+  --env-file "$ROOT/.env" \
+  -f "$ROOT/components/h-ide/infra/docker-compose.yml" \
+  -f "$ROOT/components/h-ide/infra/docker-compose.simulation.yml")
+
+"${COMPOSE[@]}" stop control-api
+"${COMPOSE[@]}" run --rm --no-deps control-api \
+  h-ide-admin-bootstrap \
+  --database /data/control.db \
+  --username administrator \
+  --display-name "Administrator" \
+  --site-id default
+"${COMPOSE[@]}" up -d control-api gateway
+```
+
+CLI 会通过隐藏输入读取并确认密码。它只允许在 `users` 表为空时成功一次；详细失败关闭
+规则见
+[`offline-admin-bootstrap.md`](../../components/h-ide/docs/operations/offline-admin-bootstrap.md)。
+
+## 9. 推荐演示顺序
+
+1. 点击“新任务”，在 Skill 上方选择“宇树 Unitree”，确认后端为 `g1-sim`。
+2. 选择“巡检 Skill”，输入：`今天巡检开放办公室和会议室`。
+3. 审核并执行 Mission；确认机器人依次进入两个房间，停稳、多方向观察，最后输出
+   Office V2 定向巡检报告。
+4. 切换“语音助手 Skill”，输入：`刚刚有看到电脑吗？`。
+5. 确认回答引用上一轮报告中的房间和证据，并由浏览器朗读；机器人空闲时完成一次挥手
+   并放下手臂。
+
+不要用直接调用 Nav2 action 代替该验收，否则会跳过自然语言、Mission 审核、会话记忆、
+视觉证据和 Robot Agent 权限边界。
+
+## 10. 停止和复位
 
 ```bash
 ./integration/stop-e2e.sh
-./integration/start-e2e.sh --viewer
+./integration/start-e2e.sh --viewer --full-straight-drive
 ```
 
-停止脚本只停止带有 `skillstore-e2e` 项目名的 Compose 服务和冻结脚本创建的
-systemd user 单元；不会删除数据库卷、日志、模型或外部 checkout。需要查看
-失败原因时，先看 `XDG_RUNTIME_DIR/h-ide-mujoco-demo-$(id -u)/*.log`，再看
-`docker compose ... logs`。
-
-## 8. 最小 PWA 验收顺序
-
-1. 登录并确认机器人状态为 `g1-sim`、场景为已发布的 Office V2。
-2. 先发送纯观察请求，确认视觉凭证和对象事实来自 Qwen/SAM2。
-3. 发送一个短距离 `走到开放办公室门口`，审核 Mission 草案后执行。
-4. 再执行原地转向、横移和静态柱子绕行；每一步等待终态对账。
-5. 最后执行办公室巡检，确认 PWA 收到所有房间/路上观察信息及 Mission 终态。
-
-不要用“直接调用 Nav2 action”替代 PWA 验收；那会跳过本项目要验证的授权、
-视觉 grounding、流式状态和 Robot Agent 边界。
+Office V2 的完整复位策略是冷启动整条运动链；不要在 Plant 运行时直接修改 `qpos` 或
+单独重启 SONIC。更多监控和故障定位见[运维手册](../operations/README.md)。

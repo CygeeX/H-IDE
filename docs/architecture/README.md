@@ -1,87 +1,128 @@
-# 架构与信任边界
+# 架构、调用链与信任边界
 
-## 1. 端到端职责
+| 属性 | 值 |
+| --- | --- |
+| 发布基线 | `skillstore-office-v2-e2e-20260901-r1` |
+| 当前已实现 | Office V2 上的 PWA → Mission V2 → Robot Agent → Nav2 → SONIC → MuJoCo 巡检与证据报告 |
+| 当前未实现 | Field Executive、Cognition Broker、FARM/DAAAM Shadow Provider、Canonical World Model、Semantic Scene Compiler |
+| 详细设计 | [H-IDE 云—站点—边缘—机器人平台架构](../../components/h-ide/docs/platform-architecture/README.md) |
 
-| 层 | 组件 | 允许做的事 | 明确不能做的事 |
-| --- | --- | --- | --- |
-| 交互 | `components/h-ide` PWA/Control API | 会话、Mission 草案、授权、事件流、场景绑定 | 直接发布 ROS/运动命令 |
-| 规划 | `components/h-ide-agent` | 意图分类、Worker 编排、生成 `PlanProposal` | 访问机器人执行工具、发坐标或越过人工审核 |
-| 视觉 | `components/h-ide-vision` | Qwen 语义识别、SAM2 分割、RGB-D/TF 几何候选 | 路径规划、速度控制、机器人凭据 |
-| 机器人边界 | `components/robotagent` | 能力、租约、观察快照、命令回执、取消 | 让未授权计划直接执行 |
-| 导航 | Nav2/strict adapter | map 坐标路径、旋转/行走原语、可达性 | 取代 Mission 授权或 SONIC 控制回路 |
-| 运动 | `h-ide-mujoco-sonic` | MuJoCo Plant、SONIC、ROS bridge、遥测 | 让 LLM 直接控制关节 |
-| 记忆（可选） | DAAAM | Mission 后的区域/语义先验 | 实时定位、障碍事实、运动授权 |
+本文只描述这个发行版真实存在的能力。目标架构已经完成职责设计，但不能因此把
+Proposed 组件写成 Current 功能。
 
-## 2. 一次行动的时序
+## 1. 当前真实调用链
+
+### 1.1 已知 Office V2 巡检
 
 ```text
-用户文本
-  │
-  ├─普通问答/观察 ───────────────► 事实或回复，不创建运动 Mission
-  │
-  └─行动意图
-       │
-       ▼
-  h-ide-agent：Supervisor → Worker → Structuring
-       │ 只返回 PlanProposal（含语义地点/视觉目标，不含自造坐标）
-       ▼
-  H-IDE：SceneContext + 能力 + 当前 pose/epoch 复核
-       │
-       ▼
-  PWA：用户确认 draft
-       │
-       ▼
-  Mission V2：授权、幂等 dispatch、进度/事件流、终态对账
-       │
-       ▼
-  Robot Agent → strict Nav2 adapter → ROS primitive
-       │                                  (Spin/DriveOnHeading/pose)
-       ▼
-  SONIC 50 Hz → MuJoCo Plant → odom/TF/RGB-D/telemetry
+PWA
+  → H-IDE Control API / Conversation Gateway
+  → Office V2 巡检意图确定性匹配
+  → Scene API 已发布 SceneRef + Mission 局部 WorldRecord
+  → Office Python Compiler
+       navigation → inside-region verification → multi-heading scan → report
+  → PWA 人工审核
+  → Control API 内的 MissionRuntime / 当前 workstation 执行权威
+  → Robot Agent Gateway
+  → g1-sim Robot Agent
+  → Nav2 NavigateToPose / Spin / DriveOnHeading
+  → strict navigation adapter
+  → cmd_vel bridge → SONIC 50 Hz LowCmd → MuJoCo G1
+  → RGB-D + capture-time TF + localization epoch
+  → Observation Gateway → H-IDE Vision
+  → Qwen/SAM2/几何 Evidence → Mission report → PWA
 ```
 
-任何一层失败都必须保留可诊断的状态；不能把“进程存活”误报为“运动完成”。
-取消和安全停机路径独立于 LLM、Vision 和场景 Worker。
+“今天巡检开放办公室和会议室”这类已知场景任务，优先由
+`components/h-ide/services/control_api/office_semantic_navigation.py` 编译完整 DAG，
+不会让 LLM 逐步决定坐标或路线。`components/h-ide-agent` 仍负责会话分类、未命中
+确定性编译器时的高层语义 Mission 草案以及受约束的重规划；它没有 Robot Agent、
+ROS、Nav2 或 SONIC 执行工具。
 
-## 3. 坐标与可信事实
+### 1.2 普通观察、对象接近和开放式行动
 
-1. Office V2 `scene.yaml` 生成 MuJoCo XML、Nav2 PGM/YAML 和 Scene API catalog；
-   `tools/build_scene.py --check` 保证它们来自同一个场景源哈希。
-2. 房间/门/静态站点是已发布 SceneMemory 的可信语义事实，不由模型临时发明。
-3. “走到当前画面中的架子前”先由 Qwen 抽取对象语义，再由 SAM2 + RGB-D +
-   capture-time TF 计算候选；候选必须带 `visualResolutionId`、传感器、定位 epoch、
-   新鲜度和几何置信信息。
-4. H-IDE 在草案生成和确认两个时点重新校验场景 revision、机器人 pose 和
-   localization epoch。视觉候选是待验证假设，不是地图坐标的替代品。
+- 只观察当前画面时，Control API 创建只读视觉请求，不生成底盘运动。
+- “走到这个架子前面”先由 Qwen 提出对象语义和像素候选，再由 SAM2、同步深度与
+  capture-time TF 产生短 TTL 的几何接近候选；历史 centroid 不能直接进入 Nav2。
+- 未被 Office 确定性编译器覆盖的行动可由 Mission Architect 生成高层语义 DAG，
+  但 `h-ide.mission/2` 合同拒绝模型提供 Pose、Waypoint、速度、`cmd_vel` 和 ROS 字段。
 
-## 4. 模型与可执行 profile
+## 2. 当前组件职责
 
-`config/sonic-models.lock.json` 将 SONIC 权重、控制器源文件、观察契约和 runtime
-profile 绑定。当前可执行的是 `sonic-python-experimental`（默认 SONIC revision
-和 vendored LeRobot snapshot）；官方 C++ profile 只有完整 bundle provenance，
-没有宣称已接入 H-IDE 运动执行。启动前 verifier fail-closed，任何大小、哈希、
-来源或配置 selector 漂移都会拒绝 motion-capable 进程。
+| 层 | 当前组件 | 当前责任 | 明确不能做的事 |
+| --- | --- | --- | --- |
+| 交互/控制面 | `components/h-ide` PWA、Control API | 会话、审核、Mission ledger、Scene binding、当前执行推进 | 让浏览器或模型直接控制 ROS/关节 |
+| Mission 规划 | `components/h-ide-agent` | 会话分类、高层语义 DAG、重规划建议 | 输出可执行坐标或访问机器人命令端口 |
+| 实时视觉 | `components/h-ide-vision` | Qwen 语义、SAM2 Mask、RGB-D/TF 几何、Evidence | 路径规划、长期世界事实发布、运动授权 |
+| 机器人协议 | `components/robotagent` | 能力清单、租约、幂等命令账本、精确取消、ROS Action 映射 | 接受未授权或未知命令 |
+| 导航 | Nav2 + strict adapter | 地图路径、旋转/直行原语、实时执行状态 | 代替 Mission 审核或 SONIC 全身控制 |
+| 运控/物理 | `components/h-ide-mujoco-sonic` | SONIC、DDS、MuJoCo Plant、桥和遥测 | 读取自然语言或让 LLM 写 LowCmd |
+| 异步记忆 | DAAAM importer | Mission 后、区域级、`observation_only` 语义先验 | 从零建图、发布 Anchor、实时控制 |
 
-## 5. DAAAM 的正确位置
+## 3. Current / Proposed 矩阵
 
-DAAAM 只作为异步 post-Mission importer。它可以帮助“上次某区域常见什么”这类
-语义先验，但不能回答“机器人此刻在哪里”“前方是否可通行”，也不能改变 Nav2
-路径、SONIC 速度或安全停机。完整 research weights/datasets 不在本仓库。
+| 能力 | Current（本发行版） | Proposed（后续路线） |
+| --- | --- | --- |
+| 云端高层规划 | `h-ide-agent` 作为 planning-only Agent | 产品角色固定为 `H-IDE Mission Architect` |
+| 物理 Mission 执行权 | Control API/MissionRuntime 与 workstation composite executor | 独立 `H-IDE Field Executive`，成为唯一上游执行权威 |
+| 模型升级调用 | Control API/Agent/Vision 的固定调用关系 | Field 侧 `H-IDE Cognition Broker` 按 Local → Site → Cloud 升级；模型仍无运动权 |
+| 世界状态 | Mission 局部 `WorldRecord`、Scene v1 annotation | Provider-neutral Canonical World Model + `WorldDelta` |
+| 场景发布 | 人工 annotation，`draft → published` | Compiler proposal，`draft → proposed → reviewed → published` |
+| 新场地记忆 | 不支持从零自动建立 | FARM/DAAAM Shadow → Admission → Semantic Scene Compiler |
+| DAAAM | post-Mission importer，依赖已有 Scene/region | 独立 v2 Shadow Provider，不依赖 Office Polygon |
+| FARM | 运行集成为 0 | 独立 Shadow Provider；原生 pickle 不作为产品协议 |
+| Scene Explorer | 只有设计文档 | PLY/3DGS 异步质量审计与标注候选 Worker |
+| 云边部署 | 当前工作站进程/Compose 耦合部署 | PRO 6000 上以 cloud/site/edge 独立网络、身份和存储模拟正式边界 |
+| 断云自治 | 当前未形成正式产品合同 | 签名 `MissionBundle`、Edge ledger/event spool、重连不重放物理动作 |
 
-## 6. 参考的开源思想
+Field Executive 应当具有调用云端模型的能力，但调用必须经过 Cognition Broker。
+云模型返回带证据的候选或推理结果；Field Executive 再执行本地 Schema、授权、
+Scene、几何、Localization Epoch 和实时健康校验。模型调用能力不等于运动权限。
 
-- NVIDIA GEAR-SONIC/GR00T：50 Hz whole-body policy、官方 observation contract
-  和模型/控制器成套锁定。
-- Nav2：生命周期管理、规划器/控制器分层、NavigateToPose/Spin 等 action 语义；
-  本项目用 strict adapter 把它约束到已验收的底盘原语。
-- LeRobot：机器人/策略模块化和 SONIC Python 控制器实现；当前 snapshot 作为
-  普通 monorepo 文件并用内容哈希锁定。
-- ROS 2/CycloneDDS：仿真 ROS domain 232 与 Unitree domain 230 隔离，避免接触
-  live domain 231。
-- DAAAM：空间-语义记忆的异步导入思想，仅取其 observation-only 部分。
+## 4. Office V2 硬编码和执行栈限制
 
-详细的接口字段和源码入口请先看各组件 README，再看 `integration/integration.lock.yaml`。
+当前可信坐标的源头是
+`components/h-ide-mujoco-sonic/scenes/office_v2/scene.yaml`：其中包含房间 Polygon、
+入口、站点 Pose、扫描方向和固定全场路线。`tools/build_scene.py` 生成 MuJoCo、Nav2
+地图和 `inspection_catalog.json`，启动器再将产品包交给
+`components/h-ide/services/scene_api/office_v2_bootstrap.py` 发布。
 
-下一阶段的地图自动探索、跨视角理解和标注模块见
-[`scene-explorer-agent.md`](scene-explorer-agent.md)。该设计明确移除 PCD/Potree，
-并把 PLY/3DGS 渲染、覆盖分析和人工发布放在独立的 observation-only sidecar。
+这条链可审计且比让 LLM 猜坐标可靠，但仍是场地硬编码。换场地时，开发者必须改
+场景源并重新生成产品包，因而不能作为真机商业化 onboarding 方案。
+
+执行栈也绑定 Office V2：
+
+- `src/hide_mujoco_sonic/scene_runtime.py` 校验固定 scene ID；
+- `docker/nav2/static_primitive_planner.py` 校验 Office runtime manifest；
+- `docker/nav2/nav2_sim_launch.py` 与 `nav2_params.yaml` 固定 Office map；
+- `tools/strict_motion_runner.py`、`verify_office_v2_bundle.py` 和启动器固定 Office 路径。
+
+因此，仅把坐标从 Python 移到数据库不算解决。必须同时实现记忆/几何融合、可审核
+SceneRevision、通用 map artifact 加载、SceneRef/map digest/runtime digest/
+Localization Epoch 一致绑定及 Last-Known-Good 回退。
+
+## 5. 不变的执行边界
+
+- Nav2 始终是路径和底盘导航 owner；SONIC 是全身运控，不接收地图目标。
+- Qwen、SAM2、FARM、DAAAM 和 Scene Explorer 都不能直接发布运动命令。
+- 每个物理 Mission 仍需可审核草案、授权、幂等 request、终态回执和证据。
+- 仿真中的宽松 Safety Profile 不得直接继承到真机。
+- 停止、取消、急停和受支持的返航不能被商业授权锁定。
+
+## 6. 继续阅读
+
+- [PRO 6000 Demo 架构迁移路线](platform-roadmap.md)
+- [完整平台架构文档索引](../../components/h-ide/docs/platform-architecture/README.md)
+- [当前现状与缺口](../../components/h-ide/docs/platform-architecture/demo/01-current-state-and-gap.md)
+- [Semantic Scene Compiler](../../components/h-ide/docs/platform-architecture/demo/03-semantic-scene-compiler.md)
+- [详细实施与验收](../../components/h-ide/docs/platform-architecture/demo/04-implementation-roadmap-and-acceptance.md)
+- [Scene Explorer 设计](scene-explorer-agent.md)
+
+## 7. 参考的工程思想
+
+- NVIDIA GEAR-SONIC/GR00T：50 Hz whole-body policy、模型和 observation contract 锁定；
+- Nav2：生命周期、规划/控制分层和 Action 语义；
+- ROS 2/CycloneDDS：仿真、真机和 Unitree DDS domain 隔离；
+- DAAAM/FARM：posed RGB-D 上的时空/对象记忆候选；
+- Isaac Mission Dispatch：完整 Mission 下发、机器人侧执行客户端和异步状态回传；
+- Sedna/Greengrass/IoT Edge：边缘先处理、困难样本升级、离线缓存与 store-and-forward。

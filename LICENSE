@@ -1,14 +1,42 @@
-Skillstore Internal Collaboration License
-=========================================
+H-IDE Source-Available Evaluation License 1.0
+================================================
 
-Copyright (c) 2026 the Skillstore project contributors.
+Copyright (c) 2026 the H-IDE project contributors.
 
-Unless a component directory or its accompanying third-party notice states a
-different license, the first-party code in this repository is provided only
-for internal development, testing, and operation by the Skillstore project
-team. It may not be redistributed, sublicensed, sold, or exposed as a public
-service without written authorization from the project owner.
+Permission is granted, without fee, to view, clone, copy, modify, and run the
+first-party H-IDE source code in this repository solely for:
 
-This notice does not replace or alter the licenses of vendored or referenced
-third-party components. The applicable component-level LICENSE and
-THIRD_PARTY_NOTICES files take precedence for those components.
+1. evaluation and demonstration;
+2. non-production research and testing; and
+3. internal development by the recipient or its organization.
+
+You may redistribute source-code modifications for those same purposes if you
+retain this license, identify the modifications, and preserve all copyright,
+attribution, third-party, model, data, and asset notices.
+
+Without a separate written commercial license from the project owner, you may
+not:
+
+1. use the first-party H-IDE code in production or a safety-critical system;
+2. sell, rent, sublicense, or commercially distribute the code or a product
+   substantially based on it;
+3. offer it as a paid or public hosted service;
+4. use project or third-party names, logos, or trademarks to imply endorsement;
+5. remove or bypass entitlement, audit, safety, attribution, or license checks;
+   or
+6. grant broader rights than you received under this license.
+
+This license applies only to first-party H-IDE material that does not carry a
+different license. Components, vendored source, patches, models, weights,
+meshes, datasets, images, and other third-party material remain governed by
+their own notices and terms. A public Git repository does not grant rights to
+material that is excluded from this license or fetched separately.
+
+THE SOFTWARE AND DOCUMENTATION ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+KIND, EXPRESS OR IMPLIED, INCLUDING MERCHANTABILITY, FITNESS FOR A PARTICULAR
+PURPOSE, TITLE, AND NON-INFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM THE
+SOFTWARE OR ITS USE.
+
+Production, commercial, redistribution, or OEM rights require a separate
+written agreement with the project owner.
