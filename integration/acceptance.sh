@@ -10,6 +10,7 @@ MISSION_ID=""
 OPERATOR_APPROVAL=""
 RESULT_DIR="${SKILLSTORE_ACCEPTANCE_RESULT_DIR:-${ROOT}/var/acceptance/${RELEASE_ID}}"
 CONTROL_API_BASE_URL="${SKILLSTORE_CONTROL_API_BASE_URL:-http://127.0.0.1:8080}"
+COOKIE_JAR="${SKILLSTORE_L3_COOKIE_JAR:-}"
 
 usage() {
   cat <<'EOF'
@@ -19,6 +20,7 @@ usage: integration/acceptance.sh [options]
   --execute-motion                 required for L3; invalid for L0-L2
   --mission-id ID                  existing operator-reviewed PWA Mission
   --operator-approval TEXT         must equal AUTHORIZE_L3:<mission-id>
+  --cookie-jar PATH                mode-0600 PWA session cookie jar
   --result-dir PATH                ignored runtime evidence destination
 
 L0 checks repository hygiene, release manifests, shell syntax and selectors.
@@ -29,9 +31,8 @@ L3 records one real PWA Mission after an explicit flag, exact approval phrase
    approves a draft, starts a Mission or sends a motion command automatically.
 
 For L3, create and approve an inspection Mission in the PWA, execute it to a
-terminal state, then provide a short-lived PWA bearer token through the hidden
-prompt or SKILLSTORE_L3_BEARER_TOKEN. Evidence is written mode 0600 beneath
-var/ by default and must not be committed.
+terminal state, then provide a mode-0600 curl cookie jar for the same PWA user.
+Evidence is written mode 0600 beneath var/ by default and must not be committed.
 EOF
 }
 
@@ -54,6 +55,11 @@ while [[ $# -gt 0 ]]; do
     --operator-approval)
       [[ $# -ge 2 ]] || { usage >&2; exit 2; }
       OPERATOR_APPROVAL="$2"
+      shift 2
+      ;;
+    --cookie-jar)
+      [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+      COOKIE_JAR="$2"
       shift 2
       ;;
     --result-dir)
@@ -81,8 +87,8 @@ if [[ "${LEVEL}" != L3 && "${EXECUTE_MOTION}" == true ]]; then
   printf '%s\n' '--execute-motion is valid only with --level L3' >&2
   exit 2
 fi
-if [[ "${LEVEL}" != L3 && ( -n "${MISSION_ID}" || -n "${OPERATOR_APPROVAL}" ) ]]; then
-  printf '%s\n' '--mission-id and --operator-approval are valid only for L3' >&2
+if [[ "${LEVEL}" != L3 && ( -n "${MISSION_ID}" || -n "${OPERATOR_APPROVAL}" || -n "${COOKIE_JAR}" ) ]]; then
+  printf '%s\n' '--mission-id, --operator-approval and --cookie-jar are valid only for L3' >&2
   exit 2
 fi
 
@@ -200,7 +206,7 @@ expected_approval="AUTHORIZE_L3:${MISSION_ID}"
   exit 2
 }
 [[ "${CONTROL_API_BASE_URL}" =~ ^http://(127\.0\.0\.1|localhost):[0-9]{1,5}$ ]] || {
-  printf '%s\n' 'L3 bearer tokens may only be sent to an explicit loopback host and numeric port' >&2
+  printf '%s\n' 'L3 session cookies may only be sent to an explicit loopback host and numeric port' >&2
   exit 2
 }
 
@@ -212,13 +218,19 @@ IFS= read -r typed_mission_id
   exit 2
 }
 
-bearer_token="${SKILLSTORE_L3_BEARER_TOKEN:-}"
-if [[ -z "${bearer_token}" ]]; then
-  printf '%s' 'PWA bearer token (hidden, never persisted in the result): ' >&2
-  IFS= read -r -s bearer_token
-  printf '\n' >&2
+if [[ -z "${COOKIE_JAR}" ]]; then
+  printf '%s' 'PWA curl cookie-jar path: ' >&2
+  IFS= read -r COOKIE_JAR
 fi
-[[ -n "${bearer_token}" ]] || { printf '%s\n' 'a short-lived PWA bearer token is required' >&2; exit 2; }
+[[ -f "${COOKIE_JAR}" && ! -L "${COOKIE_JAR}" ]] || {
+  printf '%s\n' 'L3 requires a regular, non-symlink PWA cookie jar' >&2
+  exit 2
+}
+cookie_mode="$(stat -c '%a' "${COOKIE_JAR}" 2>/dev/null || printf unknown)"
+[[ "${cookie_mode}" == 600 ]] || {
+  printf 'L3 cookie jar must have mode 0600 (got %s)\n' "${cookie_mode}" >&2
+  exit 2
+}
 
 umask 077
 mkdir -p -- "${RESULT_DIR}"
@@ -228,19 +240,15 @@ raw_pending="${base}.mission.json.pending"
 raw_result="${base}.mission.json"
 summary_pending="${base}.acceptance.json.pending"
 summary_result="${base}.acceptance.json"
-header_pending="${base}.headers.pending"
 cleanup_pending() {
-  rm -f -- "${raw_pending}" "${summary_pending}" "${header_pending}"
+  rm -f -- "${raw_pending}" "${summary_pending}"
 }
 trap cleanup_pending EXIT
 
-printf 'Authorization: Bearer %s\n' "${bearer_token}" >"${header_pending}"
-unset bearer_token
 curl --noproxy '*' -fsS --max-time 15 \
-  -H "@${header_pending}" \
+  --cookie "${COOKIE_JAR}" \
   "${CONTROL_API_BASE_URL}/api/v2/missions/${MISSION_ID}" \
   -o "${raw_pending}"
-rm -f -- "${header_pending}"
 mv -- "${raw_pending}" "${raw_result}"
 
 repository_commit="$(git -C "${ROOT}" rev-parse HEAD)"
