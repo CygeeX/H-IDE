@@ -40,6 +40,16 @@ ROS、Docker、Node 与 Python 版本；目标 PRO 6000 也必须记录准确 SK
 
 ## 3. 克隆并固定版本
 
+工作站 topology 使用固定 Compose/container/systemd 名称。在开始另一份 clone 前，必须先从
+当前活动 clone 停止服务：
+
+```bash
+./integration/stop-e2e.sh
+```
+
+两个 clone 不能并行运行本 profile。发布和 clean-clone 审计禁止 shallow/partial clone；
+不要使用 `--depth`、`--shallow-*` 或 `--filter`。
+
 发布后推荐：
 
 ```bash
@@ -48,6 +58,7 @@ cd skillstore
 git checkout --detach integration/office-v2-e2e-20260901-r1
 ROOT="$(pwd -P)"
 git status --short
+test "$(git rev-parse --is-shallow-repository)" = false
 ```
 
 发布审计阶段改为：
@@ -69,6 +80,20 @@ ROOT="$(pwd -P)"
 ./integration/bootstrap.sh --provision-ros-prefixes
 ./integration/setup-environments.sh
 ```
+
+普通开发者默认使用自己账号下的持久缓存。只有发布 clean audit 才在上述两条命令之前
+创建并导出一次性隔离根，并在整个审计 shell 中保持该值：
+
+```bash
+audit_external_root="$(mktemp -d)"
+chmod 700 "$audit_external_root"
+export SKILLSTORE_EXTERNAL_ROOT="$audit_external_root"
+```
+
+该值不应复制进 Git。全新 external root 是 release clean audit 的硬性要求，但普通开发者
+无需每次重新下载缓存；两者仍不得跨 clone 并行使用同一固定运行 topology。当前 SONIC lock 的路径
+契约仍使用 Hugging Face 默认 cache；该 cache 可以复用，但启动前会逐文件校验大小与
+SHA-256，`SONIC_HF_CACHE` 在本发行版必须留空。
 
 仿真环境严格安装 `torch 2.11.0+cu128`、`torchvision 0.26.0+cu128` 和
 `cyclonedds 11.0.1`；Unitree 上游旧 CycloneDDS 要求的兼容覆盖及原因记录在
@@ -113,8 +138,12 @@ HIDE_VISION_SAM2_CHECKPOINT=<absolute-operator-cache-path>
 ```
 
 当前文本 profile 为 DeepSeek `deepseek/deepseek-v4-flash`，视觉 profile 为
-`qwen3-vl-plus` + SAM2。云模型可能欠费、限流或由供应商更新；固定 model ID 不等于
+`qwen3-vl-plus` + `sam2.1_hiera_tiny.pt`。云模型可能欠费、限流或由供应商更新；固定 model ID 不等于
 冻结外部服务本身。
+
+PWA/浏览器使用同源 server-side `hide_session` Cookie 与 double-submit CSRF；写请求
+携带 `x-csrf-token`。`CONTROL_API_TOKEN` 由 bootstrap 生成，但只保留给 legacy
+loopback/internal compatibility，不能通过 `VITE_*`、URL 或页面脚本交给浏览器。
 
 要展示仿真挥手，还需在 `.env` 中启用并设置一个本地随机代理令牌；不要复制文档中的
 固定示例或把真实值提交到 Git：
@@ -126,6 +155,21 @@ HIDE_LEADER_DEMO_GESTURE_PROXY_TOKEN=<operator-generated-random-secret>
 
 ## 6. 获取外部资产
 
+使用仓库内的 operator-fetch 脚本安装本发行固定的 SAM 2.1 Hiera Tiny checkpoint：
+
+```bash
+sam2_dir="${SKILLSTORE_EXTERNAL_ROOT:-${XDG_CACHE_HOME:-${HOME}/.cache}/skillstore}/sam2"
+install -d -m 700 "$sam2_dir"
+./integration/fetch-sam2-checkpoint.sh \
+  --target "$sam2_dir/sam2.1_hiera_tiny.pt" \
+  --env-file "$ROOT/.env"
+```
+
+脚本从 `manifests/vendor/sam2-checkpoint.json` 读取官方 URL、固定文件名、byte size 和
+SHA-256，在同目录私有临时文件中完成 HTTPS 下载和校验，再进行原子 no-clobber 安装；
+已有正确文件只验证复用。它只安全更新 `.env` 中的 checkpoint 路径，不会 source 或导出
+其中的其他秘密。Checkpoint 保持 operator-fetch，不提交 Git。
+
 ```bash
 ./integration/bootstrap.sh --fetch-groot-source
 SKILLSTORE_ACCEPT_G1_MODEL_TERMS=1 \
@@ -135,7 +179,7 @@ SKILLSTORE_ACCEPT_G1_MODEL_TERMS=1 \
 
 - G1 网格、GR00T/SONIC 源和 SONIC 权重按 manifest 固定 revision，由操作者获取。
 - G1 网格再分发状态未确认，不随公开 Git 仓库分发。
-- SAM2 checkpoint 由操作者单独取得，L2 会核验 SHA-256。
+- SAM2 checkpoint 必须使用上述 `sam2.1_hiera_tiny.pt` 官方文件，L2 会再次核验 SHA-256。
 - DAAAM 研究环境、数据集和权重不随本候选分发，也不是默认启动依赖。
 
 具体来源见 `manifests/vendor/`、`integration/integration.lock.yaml` 和
@@ -147,8 +191,12 @@ SKILLSTORE_ACCEPT_G1_MODEL_TERMS=1 \
 ./integration/preflight.sh --level L0
 ./integration/preflight.sh --level L1
 ./integration/preflight.sh --level L2
-./integration/start-e2e.sh --viewer --full-straight-drive
+./integration/stop-e2e.sh
+./integration/start-e2e.sh --rebuild --viewer --full-straight-drive
 ```
+
+clean audit 必须传 `--rebuild`，并在启动前再次执行 `stop-e2e.sh`，防止固定名称的旧容器或
+systemd unit 被误当成当前 clone 的服务。
 
 `--full-straight-drive` 只合并地图证明安全的直线段，单动作当前最多 4 m；转向、门口、
 终点、取消和故障仍进入正常边界，不满足条件时自动回退到较短 profile。省略该参数即可

@@ -1,0 +1,22 @@
+{
+  "schema_version": "skillstore.external-model/1",
+  "component": "sam2-segmentation-checkpoint",
+  "model_name": "SAM 2.1 Hiera Tiny",
+  "model_config": "configs/sam2.1/sam2.1_hiera_t.yaml",
+  "filename": "sam2.1_hiera_tiny.pt",
+  "source_project": "facebookresearch/sam2",
+  "source_project_url": "https://github.com/facebookresearch/sam2",
+  "upstream_revision": "2b90b9f5ceec907a1c18123530e92e794ad901a4",
+  "source_download_script": "https://github.com/facebookresearch/sam2/blob/2b90b9f5ceec907a1c18123530e92e794ad901a4/checkpoints/download_ckpts.sh",
+  "source_url": "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt",
+  "sha256": "7402e0d864fa82708a20fbd15bc84245c2f26dff0eb43a4b5b93452deb34be69",
+  "byte_size": 156008466,
+  "license": "Apache-2.0",
+  "license_scope": "model_checkpoint",
+  "license_url": "https://github.com/facebookresearch/sam2/blob/2b90b9f5ceec907a1c18123530e92e794ad901a4/LICENSE",
+  "license_note": "The official SAM 2 README states that SAM 2 model checkpoints are licensed under Apache-2.0.",
+  "redistribution": "operator_fetch",
+  "credential_env": "HIDE_VISION_SAM2_CHECKPOINT",
+  "recommended_install_target": "${SKILLSTORE_EXTERNAL_ROOT}/sam2/sam2.1_hiera_tiny.pt",
+  "notes": "The checkpoint remains outside Git. Download the exact official file, verify byte size and SHA-256, then set HIDE_VISION_SAM2_CHECKPOINT to its absolute local path."
+}

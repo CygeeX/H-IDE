@@ -56,7 +56,8 @@ Site 与 Edge 故障域。目标架构、当前缺口和实施门禁见
 
 ## 快速入口
 
-发布标签创建后，复刻者应检出精确标签，而不是浮动的 `main`：
+发布标签创建后，复刻者应做完整历史 clone 并检出精确标签，而不是浮动的 `main`。禁止
+使用 `--depth`、`--shallow-*` 或 `--filter`；发布审计需要检查全部可达 Git 对象：
 
 ```bash
 git clone http://192.168.50.189:37085/zhongwenjun/skillstore.git
@@ -67,15 +68,23 @@ ROOT="$(pwd -P)"
 ./integration/setup-environments.sh
 ```
 
-随后按[快速开始](docs/quickstart/README.md)配置隔离环境、供应商凭据和外部资产，运行：
+clean audit 必须先停止其他 clone 的固定工作站 topology，并在本 clone 配置全新的
+`SKILLSTORE_EXTERNAL_ROOT`。随后按[快速开始](docs/quickstart/README.md)配置隔离环境、
+供应商凭据和外部资产，强制重建并运行：
 
 ```bash
 ./integration/preflight.sh --level L0
-./integration/start-e2e.sh --viewer --full-straight-drive
+./integration/stop-e2e.sh
+./integration/start-e2e.sh --rebuild --viewer --full-straight-drive
 ```
+
+`skillstore-e2e`、`h-ide-mujoco-demo-*` 和 `h-ide-nav2-sim` 是固定 topology 名称，
+因此同一工作站不能从两个 clone 并行启动本 profile。
 
 当前 Git HTTP 地址只允许在受控内网使用。匿名 clone 不需要 token；写入凭据必须由
 credential helper/askpass 提供，不能出现在 URL、命令、文档或提交信息中。
+PWA 用户通过同源 server-side Session Cookie + CSRF 登录；`CONTROL_API_TOKEN` 只用于
+legacy loopback/internal compatibility，不能注入前端或出现在浏览器 URL。
 
 ## 仓库结构
 
@@ -89,7 +98,7 @@ credential helper/askpass 提供，不能出现在 URL、命令、文档或提�
 | `optional/DAAAM` | 可选 DAAAM provenance 和异步导入边界 |
 | `third_party` | 经记录的源码快照和补丁；不包含受限 G1 网格/模型权重 |
 | `integration` | 统一 bootstrap、preflight、启动、停止、验收和跨组件锁 |
-| `manifests` | 当前纳入 Git 的外部来源与资产 manifest |
+| `manifests` | 当前纳入 Git 的外部来源与资产 manifest（含 SAM2 checkpoint provenance） |
 | `docs` | 快速开始、组件、运维、复刻、安全与验收文档 |
 
 ## 执行与事实边界
@@ -109,7 +118,7 @@ credential helper/askpass 提供，不能出现在 URL、命令、文档或提�
 - [当前组件和源码入口](docs/components/README.md)
 - [当前运行、监控、复位与演示](docs/operations/README.md)
 - [从干净克隆复刻](docs/reproduction/README.md)
-- [L0/L1/L2 验收](docs/acceptance/README.md)
+- [L0/L1/L2/L3 验收](docs/acceptance/README.md)
 - [秘密、许可证与供应链](docs/security/README.md)
 - [架构与信任边界](docs/architecture/README.md)
 - [商业化与 PRO 6000 Demo 目标架构](components/h-ide/docs/platform-architecture/README.md)

@@ -6,6 +6,17 @@
 
 ## 1. 建立真正干净的工作区
 
+本 profile 固定使用 `skillstore-e2e` Compose project、`h-ide-mujoco-demo-*` systemd
+units、`h-ide-nav2-sim` container、端口和 ROS domain。两个 clone 不能并行运行。先从当前
+活动 clone 停止旧 topology：
+
+```bash
+./integration/stop-e2e.sh
+```
+
+发布审计必须获取完整 Git 历史。禁止 `--depth`、`--shallow-*`、`--filter` 或其他
+shallow/partial clone 选项，否则历史 blob/secret/license 风险清单不完整。
+
 发布后：
 
 ```bash
@@ -15,6 +26,7 @@ git checkout --detach integration/office-v2-e2e-20260901-r1
 ROOT="$(pwd -P)"
 git status --short
 git show --no-patch --decorate HEAD
+test "$(git rev-parse --is-shallow-repository)" = false
 ./integration/acceptance.sh --level L0
 ```
 
@@ -23,6 +35,7 @@ git show --no-patch --decorate HEAD
 - 工作树为空；
 - 当前树无 gitlink/submodule、`.env`、数据库、日志、Evidence、模型或权重；
 - 不依赖仓库外的 sibling project、旧 `.venv`、旧 `node_modules` 或 ROS build；
+- 不复用另一个 clone 的 `SKILLSTORE_EXTERNAL_ROOT`、模型 cache、数据库或 Evidence；
 - 关键 runtime selector 不含开发者绝对路径；
 - L0 通过。
 
@@ -53,9 +66,20 @@ uv --version
 ## 3. 创建隔离依赖环境
 
 ```bash
-./integration/provision-ros-prefixes.sh
+audit_external_root="$(mktemp -d)"
+chmod 700 "$audit_external_root"
+export SKILLSTORE_EXTERNAL_ROOT="$audit_external_root"
+
+./integration/bootstrap.sh --provision-ros-prefixes
+
 ./integration/setup-environments.sh
 ```
+
+在整个 clean-audit shell 中保持上述环境变量；不要把临时目录写进 Git。G1、GR00T 和
+SAM2 必须位于上述新 external root。SONIC 模型的当前 lock 仍使用 Hugging
+Face 默认 cache；可以复用该只读下载缓存，但 L2 会对运行所需文件逐个核验大小与 SHA-256。
+本发行版不支持自定义 `SONIC_HF_CACHE`，该项必须留空，避免“下载到新目录、运行仍读取默认
+目录”的伪复现。
 
 安装脚本从 `manifests/python/simulation-runtime.json` 固定 PyTorch CUDA 12.8、
 TorchVision、CycloneDDS、LeRobot 与 Unitree bridge 组合；它不会使用 sibling repo、系统中
@@ -87,13 +111,28 @@ PWA `dist` 或 `node_modules` 提交到发行仓库。
 ## 4. 创建秘密与获取外部资产
 
 ```bash
-./integration/bootstrap.sh --provision-ros-prefixes
-./integration/setup-environments.sh
 chmod 600 "$ROOT/.env"
 ```
 
 填写 DeepSeek、DashScope、SAM2 checkpoint 和本地演示选项。内部 service token 由
-bootstrap 随机生成；不要复制原开发者 `.env` 或数据库。
+bootstrap 随机生成；不要复制原开发者 `.env` 或数据库。PWA 用户使用同源 server-side
+Session Cookie + CSRF；`CONTROL_API_TOKEN` 只是 legacy loopback/internal compatibility，
+不能进入浏览器、`VITE_*` 或 URL。
+
+使用仓库内的 operator-fetch 脚本取得固定 SAM 2.1 Hiera Tiny checkpoint：
+
+```bash
+sam2_dir="${audit_external_root:?}/sam2"
+install -d -m 700 "$sam2_dir"
+./integration/fetch-sam2-checkpoint.sh \
+  --target "$sam2_dir/sam2.1_hiera_tiny.pt" \
+  --env-file "$ROOT/.env"
+```
+
+脚本只读取 `manifests/vendor/sam2-checkpoint.json` 中的官方 URL、文件名、byte size 与
+SHA-256；它在私有同目录临时文件中校验后原子 no-clobber 安装，已有正确文件可幂等复用。
+可选 `.env` 更新不会 source、导出或回显其中的任何秘密。该 checkpoint 是
+operator-fetch 资产，不进入 Git。
 
 ```bash
 ./integration/bootstrap.sh --fetch-groot-source
@@ -111,7 +150,7 @@ SONIC/GR00T 权重、SAM2 checkpoint 与 DAAAM 研究资产不进入 Git。
 | --- | --- | --- |
 | 文本 | DeepSeek `deepseek/deepseek-v4-flash` | 操作者提供 API 凭据 |
 | 视觉语义 | Qwen `qwen3-vl-plus` | 操作者提供 DashScope 凭据 |
-| 分割 | SAM2 锁定 checkpoint | 外置文件 + SHA-256 |
+| 分割 | SAM2 `sam2.1_hiera_tiny.pt` | Meta 官方 operator-fetch + byte size/SHA-256 |
 | 运动 | GEAR-SONIC 锁定 bundle | operator-fetch + model lock |
 | G1 场景模型 | Unitree G1 MuJoCo checkout + reviewed overlay | 接受上游条款后 operator-fetch |
 | DAAAM | 默认关闭的异步 importer | 完整 research stack 不在复现主路径 |
@@ -134,9 +173,13 @@ L1 必须从这个 clean clone 的环境运行。使用另一份源目录中已�
 
 ```bash
 ./integration/preflight.sh --level L2
+./integration/stop-e2e.sh
 ./integration/start-e2e.sh --rebuild --viewer --full-straight-drive
 ./integration/acceptance.sh --level L2
 ```
+
+clean audit 必须使用 `--rebuild`。启动前的第二次 `stop-e2e.sh` 是防御性清理，确保固定
+Compose/container/systemd 名称不再指向之前 clone 的进程；不能通过“窗口已经存在”跳过。
 
 如果需要首个 ADMIN，在服务已创建 schema 后停止 Control API，并通过一次性 CLI 初始化：
 

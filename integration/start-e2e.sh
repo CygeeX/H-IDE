@@ -11,7 +11,17 @@ ENV_FILE="${SKILLSTORE_ENV_FILE:-${ROOT}/.env}"
 if [[ "${1:-}" == "--help" ]]; then
   cat <<'EOF'
 usage: integration/start-e2e.sh [--rebuild] [--viewer] [--motion-core]
-  Start the frozen Office V2 H-IDE/Mission/Vision/Robot Agent/Nav2/SONIC chain.
+                                [--continuous-drive-handoff|--full-straight-drive]
+
+Start the frozen Office V2 H-IDE/Mission/Vision/Robot Agent/Nav2/SONIC chain.
+Use --rebuild for every clean-clone release audit.
+
+This workstation profile intentionally uses fixed topology identities:
+  Compose project: skillstore-e2e
+  systemd units:   h-ide-mujoco-demo-*.service
+  Nav2 container:  h-ide-nav2-sim
+It cannot run concurrently from two clones. Stop the active clone with
+integration/stop-e2e.sh before starting another clone.
 EOF
   exit 0
 fi
