@@ -1,0 +1,143 @@
+{
+  "spdxVersion": "SPDX-2.3",
+  "dataLicense": "CC0-1.0",
+  "SPDXID": "SPDXRef-DOCUMENT",
+  "name": "skillstore-office-v2-e2e-20260901-r1-source-components",
+  "documentNamespace": "https://h-ide.local/spdx/skillstore-office-v2-e2e-20260901-r1/source-components",
+  "documentDescribes": [
+    "SPDXRef-Package-skillstore"
+  ],
+  "creationInfo": {
+    "created": "2026-09-01T02:52:47Z",
+    "creators": [
+      "Organization: H-IDE"
+    ],
+    "comment": "Source-component SBOM for the release candidate. Runtime-resolved Python, Node, ROS, container-image, driver and model dependencies require separate generated SBOMs before a production release."
+  },
+  "packages": [
+    {
+      "name": "skillstore",
+      "SPDXID": "SPDXRef-Package-skillstore",
+      "versionInfo": "skillstore-office-v2-e2e-20260901-r1",
+      "downloadLocation": "http://192.168.50.189:37085/zhongwenjun/skillstore.git",
+      "filesAnalyzed": false,
+      "licenseConcluded": "LicenseRef-H-IDE-Source-Available-Evaluation-1.0",
+      "licenseDeclared": "LicenseRef-H-IDE-Source-Available-Evaluation-1.0",
+      "copyrightText": "Copyright (c) 2026 the H-IDE project contributors"
+    },
+    {
+      "name": "h-ide",
+      "SPDXID": "SPDXRef-Package-h-ide",
+      "versionInfo": "da1b83ab9793301250c6830ca23562f4a1f0b8d5",
+      "downloadLocation": "NOASSERTION",
+      "filesAnalyzed": false,
+      "licenseConcluded": "LicenseRef-H-IDE-Source-Available-Evaluation-1.0",
+      "licenseDeclared": "LicenseRef-H-IDE-Source-Available-Evaluation-1.0",
+      "copyrightText": "NOASSERTION"
+    },
+    {
+      "name": "h-ide-agent",
+      "SPDXID": "SPDXRef-Package-h-ide-agent",
+      "versionInfo": "09c727678f249c11efadac48f727f7c8d103a22e",
+      "downloadLocation": "NOASSERTION",
+      "filesAnalyzed": false,
+      "licenseConcluded": "LicenseRef-H-IDE-Source-Available-Evaluation-1.0",
+      "licenseDeclared": "LicenseRef-H-IDE-Source-Available-Evaluation-1.0",
+      "copyrightText": "NOASSERTION"
+    },
+    {
+      "name": "h-ide-vision",
+      "SPDXID": "SPDXRef-Package-h-ide-vision",
+      "versionInfo": "072a49f9741bed54805656c0358dde54fc998a0f",
+      "downloadLocation": "NOASSERTION",
+      "filesAnalyzed": false,
+      "licenseConcluded": "LicenseRef-H-IDE-Source-Available-Evaluation-1.0",
+      "licenseDeclared": "LicenseRef-H-IDE-Source-Available-Evaluation-1.0",
+      "copyrightText": "NOASSERTION"
+    },
+    {
+      "name": "robotagent",
+      "SPDXID": "SPDXRef-Package-robotagent",
+      "versionInfo": "f544f40c9c4ea7e1b6a35105918d12aa3a24900a",
+      "downloadLocation": "NOASSERTION",
+      "filesAnalyzed": false,
+      "licenseConcluded": "Apache-2.0",
+      "licenseDeclared": "Apache-2.0",
+      "copyrightText": "Copyright 2026 Phibotics"
+    },
+    {
+      "name": "h-ide-mujoco-sonic",
+      "SPDXID": "SPDXRef-Package-h-ide-mujoco-sonic",
+      "versionInfo": "6c888673aaab2aa387b1dd02e2beac5a3dd4989a",
+      "downloadLocation": "NOASSERTION",
+      "filesAnalyzed": false,
+      "licenseConcluded": "LicenseRef-H-IDE-Source-Available-Evaluation-1.0",
+      "licenseDeclared": "LicenseRef-H-IDE-Source-Available-Evaluation-1.0",
+      "copyrightText": "NOASSERTION"
+    },
+    {
+      "name": "lerobot-source-snapshot",
+      "SPDXID": "SPDXRef-Package-lerobot",
+      "versionInfo": "56b4087c40d7ee8e78e3485f78fe21e88679355b",
+      "downloadLocation": "https://github.com/huggingface/lerobot.git",
+      "filesAnalyzed": false,
+      "licenseConcluded": "Apache-2.0",
+      "licenseDeclared": "Apache-2.0",
+      "copyrightText": "Copyright 2024 The Hugging Face team"
+    },
+    {
+      "name": "unitree-sdk2-python-source-snapshot",
+      "SPDXID": "SPDXRef-Package-unitree-sdk2-python",
+      "versionInfo": "65691c8a8bc53b98d3976dba4dbf9d5d20b2e7f5",
+      "downloadLocation": "https://github.com/unitreerobotics/unitree_sdk2_python.git",
+      "filesAnalyzed": false,
+      "licenseConcluded": "BSD-3-Clause",
+      "licenseDeclared": "BSD-3-Clause",
+      "copyrightText": "Copyright (c) 2016-2024 HangZhou YuShu TECHNOLOGY CO.,LTD."
+    }
+  ],
+  "relationships": [
+    {
+      "spdxElementId": "SPDXRef-Package-skillstore",
+      "relationshipType": "CONTAINS",
+      "relatedSpdxElement": "SPDXRef-Package-h-ide"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-skillstore",
+      "relationshipType": "CONTAINS",
+      "relatedSpdxElement": "SPDXRef-Package-h-ide-agent"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-skillstore",
+      "relationshipType": "CONTAINS",
+      "relatedSpdxElement": "SPDXRef-Package-h-ide-vision"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-skillstore",
+      "relationshipType": "CONTAINS",
+      "relatedSpdxElement": "SPDXRef-Package-robotagent"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-skillstore",
+      "relationshipType": "CONTAINS",
+      "relatedSpdxElement": "SPDXRef-Package-h-ide-mujoco-sonic"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-skillstore",
+      "relationshipType": "CONTAINS",
+      "relatedSpdxElement": "SPDXRef-Package-lerobot"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-skillstore",
+      "relationshipType": "CONTAINS",
+      "relatedSpdxElement": "SPDXRef-Package-unitree-sdk2-python"
+    }
+  ],
+  "hasExtractedLicensingInfos": [
+    {
+      "licenseId": "LicenseRef-H-IDE-Source-Available-Evaluation-1.0",
+      "extractedText": "First-party H-IDE source is available for evaluation, demonstration, non-production research and internal development. Production, commercial, paid hosted service and OEM rights require a separate written agreement. See the repository LICENSE for the complete controlling text.",
+      "name": "H-IDE Source-Available Evaluation License 1.0"
+    }
+  ]
+}

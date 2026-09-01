@@ -1,0 +1,113 @@
+{
+  "schemaVersion": "skillstore.release-manifest/1",
+  "release": {
+    "id": "skillstore-office-v2-e2e-20260901-r1",
+    "status": "release-candidate",
+    "branch": "release/office-v2-e2e-20260901",
+    "targetBranch": "main",
+    "tag": "integration/office-v2-e2e-20260901-r1",
+    "rootCommit": "recorded-by-release-tag",
+    "createdAt": "2026-09-01T10:52:47+08:00"
+  },
+  "components": [
+    {
+      "id": "h-ide",
+      "path": "components/h-ide",
+      "sourceCommit": "da1b83ab9793301250c6830ca23562f4a1f0b8d5",
+      "distributionTree": "5e996d229b07543e73e6ad8c8e0ffd05289ad377",
+      "runtimeDefault": true
+    },
+    {
+      "id": "h-ide-agent",
+      "path": "components/h-ide-agent",
+      "sourceCommit": "09c727678f249c11efadac48f727f7c8d103a22e",
+      "distributionTree": "4bc00322d1815ab8f316a286ead48ff1b1b0d6aa",
+      "runtimeDefault": true
+    },
+    {
+      "id": "h-ide-vision",
+      "path": "components/h-ide-vision",
+      "sourceCommit": "072a49f9741bed54805656c0358dde54fc998a0f",
+      "distributionTree": "e235567979ec707290423f0f064b95913b916e6b",
+      "runtimeDefault": true
+    },
+    {
+      "id": "robotagent",
+      "path": "components/robotagent",
+      "sourceCommit": "f544f40c9c4ea7e1b6a35105918d12aa3a24900a",
+      "distributionTree": "e125316ce8b8ca51df5fbb8176263a608837f1a8",
+      "runtimeDefault": true
+    },
+    {
+      "id": "h-ide-mujoco-sonic",
+      "path": "components/h-ide-mujoco-sonic",
+      "sourceCommit": "6c888673aaab2aa387b1dd02e2beac5a3dd4989a",
+      "distributionTree": "651d9c5179b2edf43eb3736303a150439c329353",
+      "runtimeDefault": true
+    }
+  ],
+  "optionalProviders": [
+    {
+      "id": "daaam",
+      "metadataPath": "optional/DAAAM",
+      "upstreamCommit": "ebd6e3b89763849eb7bce7f75e8d08550ea7344a",
+      "upstreamLicense": "BSD-3-Clause",
+      "status": "optional-post-mission-observation-only",
+      "runtimeDefault": false,
+      "sourceDistributed": false,
+      "dependencyLicenseReviewRequired": true
+    },
+    {
+      "id": "farm",
+      "upstreamRepository": "https://github.com/GoldenGait/FARM-Project.git",
+      "upstreamCommit": "2fcaf8602e741341a70ca980133f7ff05cfc83a2",
+      "upstreamLicense": "AGPL-3.0",
+      "status": "proposed-shadow-provider",
+      "runtimeDefault": false,
+      "sourceDistributed": false,
+      "commercialLegalReviewRequired": true
+    }
+  ],
+  "architectureStatus": {
+    "implementedDemo": "single-workstation Office V2 compiled scene with the current H-IDE Mission V2, Robot Agent, Nav2, SONIC and MuJoCo execution chain",
+    "proposedNotImplemented": [
+      "H-IDE Mission Architect and H-IDE Field Executive deployment split",
+      "H-IDE Cognition Broker local-site-cloud model escalation",
+      "Semantic Scene Compiler generated SceneRevision publication",
+      "FARM and DAAAM MemoryProvider shadow benchmark",
+      "replacement of Office V2 hard-coded trusted coordinates"
+    ]
+  },
+  "validation": {
+    "contract": "L0-L1-L2-L3",
+    "L0": "pending-on-release-commit",
+    "L1": "pending-on-release-commit",
+    "L2": "pending-on-release-host",
+    "L3": "pending-explicit-operator-mission",
+    "l3ResultSchema": "manifests/release/l3-mission-result.schema.json"
+  },
+  "repositoryRiskInventory": {
+    "currentTreePolicy": "forbid committed credentials, databases, runtime evidence, model weights and files at or above 10 MiB",
+    "historyScan": {
+      "status": "known-risk-recorded",
+      "largeBlobThresholdBytes": 10485760,
+      "largeBlobCount": 11,
+      "largeBlobTotalBytes": 293243104,
+      "largestBlobBytes": 46089944,
+      "largestBlobExample": "removed LeRobot test data under tests/data",
+      "historicalArtifactLikePathCount": 501,
+      "impact": "removed third-party test artifacts remain retrievable from Git history and increase clone size",
+      "remediation": "perform a separately reviewed history rewrite only if immutable old release references may be replaced"
+    },
+    "secretScanStatement": "The bundled preflight uses conservative path, size and high-confidence content heuristics. It is not complete secret clearance and does not replace server-side push protection or a dedicated scanner.",
+    "publicAssetReview": "Repository-owner-provided demo PNGs are distributed only under the adjacent LicenseRef-HIDE-Demo-Asset notice and exact digest manifest; company names on display cards imply no endorsement or affiliation."
+  },
+  "artifacts": {
+    "integrationLock": "integration/integration.lock.yaml",
+    "sourceComponentSbom": "manifests/sbom/skillstore-office-v2-e2e-20260901-r1.spdx.json",
+    "rosUserPrefixManifest": "manifests/ros/jazzy-user-prefix-amd64.json",
+    "rosUserPrefixProvisioner": "integration/provision-ros-prefixes.sh",
+    "runtimeWeightsAndModelsDistributed": false,
+    "runtimeEvidenceTrackedByGit": false
+  }
+}

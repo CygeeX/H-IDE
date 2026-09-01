@@ -1,12 +1,15 @@
 schema_version: skillstore.integration-lock/1
 
 release:
-  id: skillstore-office-v2-e2e-20260827
-  branch: main
-  tag: integration/office-v2-e2e-20260827-r3
-  status: frozen-integration
+  id: skillstore-office-v2-e2e-20260901-r1
+  branch: release/office-v2-e2e-20260901
+  target_branch: main
+  tag: integration/office-v2-e2e-20260901-r1
+  status: release-candidate
   root_commit: recorded-by-release-tag
-  validation_contract: L0-L1-L2
+  validation_contract: L0-L1-L2-L3
+  release_manifest: manifests/release/skillstore-office-v2-e2e-20260901-r1.json
+  source_sbom: manifests/sbom/skillstore-office-v2-e2e-20260901-r1.spdx.json
 
 # These are the source commits that were imported into the monorepo. The
 # subtree history remains available in Git; this table makes the intended
@@ -14,29 +17,46 @@ release:
 components:
   - id: h-ide
     path: components/h-ide
-    source_commit: 4f0d535b779f6099907c92d0ec5f3e154d5a4505
+    source_commit: da1b83ab9793301250c6830ca23562f4a1f0b8d5
+    distribution_tree: 5e996d229b07543e73e6ad8c8e0ffd05289ad377
     role: control-api-pwa-scene-api-mission-v2
   - id: h-ide-agent
     path: components/h-ide-agent
-    source_commit: 941760317774ecb1dff3e52f3e0a2dbfb23909bd
-    role: assistant-v2-planning-only
+    source_commit: 09c727678f249c11efadac48f727f7c8d103a22e
+    distribution_tree: 4bc00322d1815ab8f316a286ead48ff1b1b0d6aa
+    role: mission-architect-planning-only
   - id: h-ide-vision
     path: components/h-ide-vision
     source_commit: 072a49f9741bed54805656c0358dde54fc998a0f
+    distribution_tree: e235567979ec707290423f0f064b95913b916e6b
     role: qwen-sam2-visual-grounding
   - id: robotagent
     path: components/robotagent
-    source_commit: 624dd747a8227daa68ace4b4d17d8a8fc01f5e57
+    source_commit: f544f40c9c4ea7e1b6a35105918d12aa3a24900a
+    distribution_tree: e125316ce8b8ca51df5fbb8176263a608837f1a8
     role: robot-agent-observation-and-command-boundary
   - id: h-ide-mujoco-sonic
     path: components/h-ide-mujoco-sonic
-    source_commit: d8ee5bdcb713380b0830bc89d77b43b67b777f37
+    source_commit: 6c888673aaab2aa387b1dd02e2beac5a3dd4989a
+    distribution_tree: 651d9c5179b2edf43eb3736303a150439c329353
     role: mujoco-office-v2-sonic-nav2-adapter
   - id: daaam
     path: optional/DAAAM
     source_commit: ebd6e3b89763849eb7bce7f75e8d08550ea7344a
     role: optional-post-mission-semantic-memory
     runtime_default: false
+
+# FARM is evaluated behind the proposed MemoryProvider boundary only.  No FARM
+# source, model, dataset or runtime is distributed or started by this release.
+proposed_providers:
+  - id: farm
+    upstream_repository: https://github.com/GoldenGait/FARM-Project.git
+    upstream_revision: 2fcaf8602e741341a70ca980133f7ff05cfc83a2
+    license: AGPL-3.0
+    integration_status: proposed-shadow-provider
+    distributed: false
+    runtime_default: false
+    commercial_legal_review_required: true
 
 protocols:
   mission_api: v2
@@ -85,6 +105,8 @@ external_sources:
 runtime:
   primary_os: Ubuntu 24.04
   ros_distribution: jazzy
+  ros_user_prefix_manifest: manifests/ros/jazzy-user-prefix-amd64.json
+  ros_user_prefix_provisioner: integration/provision-ros-prefixes.sh
   python:
     h_ide: "3.12"
     mujoco_sonic: "3.12"
@@ -100,8 +122,9 @@ runtime:
 acceptance:
   l0: repository hygiene, manifests, paths, shell and JSON syntax
   l1: deterministic component tests, Compose config and Office V2 scene check
-  l2: live health, ROS/GPU/assets, then explicit operator-reviewed motion cases
-  motion_policy: no motion command is sent by a generic health check
+  l2: live service health plus ROS, GPU, model and external-asset readiness
+  l3: operator-authorized real Mission execution and structured evidence capture
+  motion_policy: L0-L2 never send motion; L3 requires explicit execute-motion and operator approval
 
 secrets:
   file: .env
@@ -113,3 +136,7 @@ secrets:
     - SQLite databases
     - model weights and checkpoints
     - runtime logs/evidence
+  scan_scope:
+    current_tree: filename, symlink, size and high-confidence content heuristics
+    git_history: filename and blob-size risk inventory
+  limitation: heuristic repository checks are not complete secret clearance

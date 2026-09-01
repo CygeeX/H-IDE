@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://h-ide.local/schemas/skillstore-l3-mission-result-v1.json",
+  "title": "Skillstore L3 Mission Acceptance Result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "releaseId",
+    "repositoryCommit",
+    "recordedAt",
+    "missionId",
+    "operatorAuthorized",
+    "missionStatus",
+    "navigationSucceeded",
+    "inspectionSucceeded",
+    "resultAccepted",
+    "rawMissionSha256",
+    "rawMissionPath"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "skillstore.l3-mission-result/1"
+    },
+    "releaseId": {
+      "const": "skillstore-office-v2-e2e-20260901-r1"
+    },
+    "repositoryCommit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "recordedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "missionId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "operatorAuthorized": {
+      "const": true
+    },
+    "missionStatus": {
+      "type": "string"
+    },
+    "navigationSucceeded": {
+      "type": "boolean"
+    },
+    "inspectionSucceeded": {
+      "type": "boolean"
+    },
+    "resultAccepted": {
+      "type": "boolean"
+    },
+    "eventCount": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "worldRecordCount": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "skillExecutionCount": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "rawMissionSha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "rawMissionPath": {
+      "type": "string",
+      "minLength": 1
+    }
+  }
+}
