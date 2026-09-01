@@ -1,0 +1,52 @@
+name: Skillstore L0 reproducibility
+
+# Deliberately no pull_request or pull_request_target trigger. Untrusted PR code
+# must never execute on the workstation/GPU runner or inherit its network and
+# credential context. Maintainers review the diff first, then push the exact
+# candidate commit to a protected release branch.
+on:
+  push:
+    branches:
+      - main
+      - "release/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: skillstore-l0-${{ gitea.ref }}
+  cancel-in-progress: true
+
+jobs:
+  repository-contract:
+    if: ${{ gitea.event_name == 'push' || gitea.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # L0 does not use Docker, ROS, GPU, model providers or repository secrets.
+      CUDA_VISIBLE_DEVICES: ""
+      NVIDIA_VISIBLE_DEVICES: "void"
+      DOCKER_HOST: "disabled://skillstore-l0"
+      SKILLSTORE_ENV_FILE: /nonexistent/skillstore-l0.env
+    steps:
+      - name: Check out the complete candidate history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Assert non-privileged L0 runner contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${{ gitea.event_name }}" != pull_request
+          test "${{ gitea.event_name }}" != pull_request_target
+          test ! -e .env
+          command -v git
+          command -v python3
+          command -v rg
+
+      - name: Run repository-only acceptance
+        shell: bash
+        run: ./integration/acceptance.sh --level L0

@@ -22,6 +22,7 @@ FETCH_SONIC=false
 FETCH_G1=false
 FETCH_GROOT=false
 INSTALL_AGENT=false
+PROVISION_ROS_PREFIXES=false
 
 usage() {
   cat <<'EOF'
@@ -33,6 +34,9 @@ Options:
                        reviewed Office overlay. Requires explicit terms acceptance.
   --fetch-groot-source Download the pinned NVIDIA GR00T/SONIC deployment source.
   --install-agent      Run npm ci for the vendored planning agent.
+  --provision-ros-prefixes
+                       Download, verify, and extract the frozen Nav2/RealSense
+                       ROS packages into RobotAgent's user-space prefixes.
   --help               Show this help.
 
 The default action only creates a local .env, component links, and reports
@@ -46,6 +50,7 @@ for argument in "$@"; do
     --fetch-g1-model) FETCH_G1=true ;;
     --fetch-groot-source) FETCH_GROOT=true ;;
     --install-agent) INSTALL_AGENT=true ;;
+    --provision-ros-prefixes) PROVISION_ROS_PREFIXES=true ;;
     --help) usage; exit 0 ;;
     *) usage >&2; exit 2 ;;
   esac
@@ -239,11 +244,21 @@ if [[ "${INSTALL_AGENT}" == true ]]; then
   (cd "${COMPONENTS}/h-ide-agent" && npm ci)
 fi
 
+if [[ "${PROVISION_ROS_PREFIXES}" == true ]]; then
+  "${SCRIPT_DIR}/provision-ros-prefixes.sh"
+fi
+
 printf '%s\n' 'Skillstore bootstrap checks:'
 printf '%s\n' "- environment: ${ENV_FILE} (0600)"
 printf '%s\n' "- external root: ${EXTERNAL_ROOT}"
 printf '%s\n' '- LeRobot: vendored in third_party/lerobot'
 printf '%s\n' '- Unitree SDK: vendored in third_party/unitree_sdk2_python'
+if [[ -d "${COMPONENTS}/robotagent/.local/ros-jazzy-nav2/root/opt/ros/jazzy/share/nav2_msgs" \
+   && -d "${COMPONENTS}/robotagent/.local/ros-jazzy-realsense/root/opt/ros/jazzy/share/realsense2_camera" ]]; then
+  printf '%s\n' '- ROS user prefixes: installed and manifest-locked'
+else
+  printf '%s\n' '- ROS user prefixes: missing (run with --provision-ros-prefixes before L2)'
+fi
 if [[ -e "${g1_component_path}" ]]; then
   printf '%s\n' "- G1 model: linked ${g1_component_path}"
 else
