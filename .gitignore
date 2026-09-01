@@ -13,4 +13,7 @@ dist/
 data/
 models/
 *.db
+*.sqlite3
+/.tmp-*
+/var/
 .DS_Store
