@@ -10,6 +10,7 @@ from robot_agent.arbitration import ResourceArbiter, ResourceClaimError
 from robot_agent.session import (
     ControlState,
     LeaseError,
+    RetryableControlArmError,
     SafeStopState,
     SessionController,
     SessionStateError,
@@ -152,6 +153,45 @@ async def test_disconnect_cannot_race_atomic_control_activation() -> None:
     assert controller.state is ControlState.SAFE_HOLD
     assert controller.session_id is None
     assert stop_reasons == []
+
+
+@pytest.mark.asyncio
+async def test_retryable_control_arm_failure_does_not_latch_session() -> None:
+    calls = 0
+
+    async def safe_stop(reason: str) -> None:
+        del reason
+
+    async def control_arm() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RetryableControlArmError("measured simulator base is settling")
+
+    controller = SessionController(
+        lease_timeout=timedelta(seconds=2),
+        safe_stop=safe_stop,
+    )
+    session_id = uuid4()
+    await controller.connected(session_id)
+
+    with pytest.raises(RetryableControlArmError, match="settling"):
+        await controller.acquire(
+            session_id,
+            operator_id="operator-7",
+            at=NOW,
+            before_activate=control_arm,
+        )
+
+    assert controller.snapshot.can_acquire is True
+    assert "safety fault is latched" not in controller.snapshot.reason
+    acquired = await controller.acquire(
+        session_id,
+        operator_id="operator-7",
+        at=NOW + timedelta(milliseconds=100),
+        before_activate=control_arm,
+    )
+    assert acquired.state is ControlState.ACTIVE
 
 
 @pytest.mark.asyncio
