@@ -38,7 +38,7 @@ def result(*, accepted: bool) -> dict[str, object]:
         "resultAccepted": accepted,
         "eventCount": 1,
         "worldRecordCount": 1 if accepted else 0,
-        "skillExecutionCount": 1,
+        "skillExecutionCount": 9 if accepted else 1,
         "rawMissionSha256": "b" * 64,
         "rawMissionPath": "var/acceptance/mission-test.json",
     }

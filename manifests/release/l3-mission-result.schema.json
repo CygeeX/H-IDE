@@ -24,6 +24,9 @@
     "reportEvidenceCount",
     "scanEvidenceCount",
     "resultAccepted",
+    "eventCount",
+    "worldRecordCount",
+    "skillExecutionCount",
     "rawMissionSha256",
     "rawMissionPath"
   ],
@@ -150,7 +153,10 @@
           },
           "headingGapCount": {"const": 0},
           "reportEvidenceCount": {"type": "integer", "minimum": 1},
-          "scanEvidenceCount": {"type": "integer", "minimum": 8}
+          "scanEvidenceCount": {"type": "integer", "minimum": 8},
+          "eventCount": {"type": "integer", "minimum": 1},
+          "worldRecordCount": {"type": "integer", "minimum": 1},
+          "skillExecutionCount": {"type": "integer", "minimum": 9}
         }
       }
     }

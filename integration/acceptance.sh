@@ -684,6 +684,21 @@ expected_stations = ["open_office_west", "meeting_south"]
 report_evidence = report.get("evidence") if isinstance(report, dict) else []
 report_heading_gaps = report.get("headingGaps") if isinstance(report, dict) else None
 report_missing_stations = report.get("missingStations") if isinstance(report, dict) else None
+report_evidence_hashes = [
+    item.get("sha256")
+    for item in report_evidence
+    if isinstance(item, dict)
+] if isinstance(report_evidence, list) else []
+report_evidence_valid = bool(
+    report_evidence_hashes
+    and len(report_evidence_hashes) == len(report_evidence)
+    and len(report_evidence_hashes) == len(set(report_evidence_hashes))
+    and all(
+        isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)
+        for value in report_evidence_hashes
+    )
+    and set(report_evidence_hashes).issubset(seen_scan_evidence)
+)
 report_full_chain_accepted = bool(
     isinstance(report, dict)
     and report.get("reportScope") == "selected_locations"
@@ -697,6 +712,7 @@ report_full_chain_accepted = bool(
     and not report_missing_stations
     and isinstance(report_evidence, list)
     and bool(report_evidence)
+    and report_evidence_valid
     and "开放办公区" in str(report.get("narrativeZhCN") or "")
     and "会议室" in str(report.get("narrativeZhCN") or "")
 )
