@@ -18,6 +18,8 @@ units=(
   ros-observation-bridge
   ros-cmd-vel-bridge
   first-person-viewer
+  leader-demo-gesture-proxy
+  h-ide-vision-qwen
   sonic-driver
   mujoco-plant
 )
