@@ -10,6 +10,13 @@ ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
 COMPONENTS="${ROOT}/components"
 PYTHON_RUNTIME_MANIFEST="${ROOT}/manifests/python/simulation-runtime.json"
 
+# First-time CUDA wheels are hundreds of megabytes and the upstream NVIDIA
+# endpoint can pause longer than pip's short default read timeout. Keep exact
+# versions/indexes unchanged while making transient transport stalls retryable.
+export PIP_DEFAULT_TIMEOUT="${PIP_DEFAULT_TIMEOUT:-180}"
+export PIP_RETRIES="${PIP_RETRIES:-10}"
+export UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT:-180}"
+
 for command_name in python3.12 uv npm; do
   command -v "${command_name}" >/dev/null 2>&1 || {
     printf 'missing required command: %s\n' "${command_name}" >&2
