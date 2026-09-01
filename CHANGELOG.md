@@ -45,6 +45,9 @@
 
 ### Current limitations
 
+- 纯转向 SONIC reference 被证据门拒绝后，严格的 1 秒 planner deadline 仍会升级为
+  terminal Plant fault，导致 MuJoCo 偶发退出；R1 按冻结决定保留这一当前本地行为，
+  发生后需完整冷启动，详见发布说明。
 - 当前可信房间、入口、观察站点和中文目录仍绑定 Office V2 发布 catalog；换场地尚不能
   自动从零生成可执行 SceneRevision。
 - FARM 未进入运行链；DAAAM 仅为默认关闭的 Mission 后异步 importer，不能提供实时对象

@@ -77,6 +77,28 @@ source install/setup.bash
 
 ## 4. 已知问题和边界
 
+### 仿真纯转向 planner reference 超时会终止 MuJoCo Plant
+
+冷启动后的第二轮双房间巡检在本地运行约 13 分钟后复现：SONIC 为一次纯转向生成的
+reference 只有约 `-0.0043 rad` root yaw，未满足有效转向证据，因此候选被正确拒绝；随后
+严格的 `1.000 s` MuJoCo-time reference deadline 被升级为 terminal Plant physics fault，
+MuJoCo Plant 以 `PlantPhysicsFault` 退出，当前 Mission 转入重新规划/审核而不能自然完成。
+
+这不是碰撞、数值发散、OOM、GPU Xid 或云 API 故障。第一轮同一双房间 Mission 能完成并
+生成报告，因此该问题是时序相关、非每次必现。按照本次冻结决定，R1 **保留当前本地行为，
+不包含 sim-only record/retry 修复**；正确配置的远端复刻应得到相同代码与策略，不能将其
+误写为已经解决。发生后执行完整冷启动恢复：
+
+```bash
+./integration/stop-e2e.sh
+./integration/start-e2e.sh --rebuild --viewer --full-straight-drive
+```
+
+诊断特征为 Plant 日志中的 `required SONIC planner reference timed out`。环境变量
+`HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT=1` 不能阻止这个 terminal Plant fault；它只影响
+上层自动撤权路径。后续若实现“仿真记录并重新请求、生产继续 fail-closed”，必须作为新
+release 单独评审和验收。
+
 ### Robot Agent 扩大测试集的顺序性 hang
 
 扩大执行：
