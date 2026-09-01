@@ -77,8 +77,11 @@ _CONTROL_RELEASE_CONFIRMATION_TIMEOUT_SECONDS = 5.0
 # fail-closed.
 _CONTROL_ACQUIRE_CONFIRMATION_TIMEOUT_SECONDS = 5.0
 _CONTROL_ACQUIRE_TRANSIENT_RETRY_SECONDS = 0.25
-_TRANSIENT_CONTROL_ARM_REASON = (
-    "control arm rejected while the measured base is moving"
+_TRANSIENT_CONTROL_ARM_REASONS = (
+    "control arm rejected while the measured base is moving",
+    "control arm rejected while a gait is active or stopping",
+    "control acquisition requires a confirmed settled safety hold or resident balanced policy idle",
+    "retained static generation",
 )
 
 
@@ -498,7 +501,10 @@ class RobotAgentInboundPeer:
                 if self._control_state == "ACTIVE":
                     break
                 reason = self._control_reason
-                if _TRANSIENT_CONTROL_ARM_REASON not in reason.casefold():
+                if not any(
+                    marker in reason.casefold()
+                    for marker in _TRANSIENT_CONTROL_ARM_REASONS
+                ):
                     raise RuntimeError(
                         f"Robot Agent control is not active: {reason}"
                     )

@@ -212,6 +212,32 @@ class MissionRuntime:
         }
 
     @staticmethod
+    def _node_execution_equivalent(
+        previous: MissionNode | None,
+        current: MissionNode,
+    ) -> bool:
+        """Compare executable meaning, not presentation-only wording.
+
+        A planner may improve ``purpose`` text or lower a risk label without
+        changing the exact skill, typed intent or dependency boundary that was
+        already executed.  Replaying that physical node loses path memory and
+        creates duplicate walking.  Preconditions, postconditions and
+        dependencies remain part of the execution identity and therefore must
+        still match exactly.
+        """
+
+        return bool(
+            previous is not None
+            and previous.nodeId == current.nodeId
+            and previous.skillId == current.skillId
+            and previous.skillVersion == current.skillVersion
+            and previous.intent == current.intent
+            and previous.dependsOn == current.dependsOn
+            and previous.preconditionIds == current.preconditionIds
+            and previous.postconditionIds == current.postconditionIds
+        )
+
+    @staticmethod
     def _budget_xy(value: Any, field: str) -> tuple[float, float]:
         if not isinstance(value, Mapping):
             raise MissionConflict(f"{field} must be an object")
@@ -1999,7 +2025,10 @@ class MissionRuntime:
             for node in value.nodes:
                 old = old_nodes.get(node.nodeId)
                 old_state = old_states.get(node.nodeId, {})
-                preserve = old == node and old_state.get("status") == "succeeded"
+                preserve = (
+                    self._node_execution_equivalent(old, node)
+                    and old_state.get("status") == "succeeded"
+                )
                 preserve_attempt = (
                     old is not None
                     and old.skillId == node.skillId
@@ -2142,7 +2171,10 @@ class MissionRuntime:
         for node in approved.nodes:
             old = old_nodes.get(node.nodeId)
             old_state = old_states.get(node.nodeId, {})
-            preserve = old == node and old_state.get("status") == "succeeded"
+            preserve = (
+                self._node_execution_equivalent(old, node)
+                and old_state.get("status") == "succeeded"
+            )
             preserve_attempt = (
                 old is not None
                 and old.skillId == node.skillId

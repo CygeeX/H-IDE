@@ -37,6 +37,10 @@ configured.
 - `GET /api/v1/robots` and
   `GET /api/v1/robots/{robotId}/capabilities` return the seeded fake robot
   and capability snapshots.
+- `POST /api/v1/leader-demo/gestures/wave` is a simulation-only voice-assistant
+  presentation hook. It accepts only the bound `g1-sim` ID and calls the
+  host-side allow-listed gesture proxy; the Control API container never has
+  access to SONIC's raw command socket.
 - `POST /api/v1/commands` accepts a manual command body.  `commandId`,
   `issuedAt`, `expiresAt`, `idempotencyKey`, `sessionId`, and `traceId` may be
   omitted; the server fills safe defaults.  The response is a camelCase

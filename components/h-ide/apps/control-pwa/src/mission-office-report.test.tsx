@@ -183,4 +183,25 @@ describe("Mission Office report", () => {
     expect(screen.getByText("目标区域观察完成")).toBeTruthy();
     expect(screen.queryByText("全部区域已完成")).toBeNull();
   });
+
+  it("parses a completed report limited to selected rooms", () => {
+    const invalid = parseMissionOfficeReport(rawReport({
+      reportScope: "selected_locations",
+      regionIds: ["meeting_room", "corridor"],
+      stationIds: ["meeting_south", "corridor_west"],
+      regions: [rawReport().regions[0]],
+      narrativeZhCN: "定向巡检报告\n- 会议室：看到电脑\n- 走廊：可通行",
+    }), "mission-office-1");
+    expect(invalid).toBeNull();
+
+    const valid = parseMissionOfficeReport(rawReport({
+      reportScope: "selected_locations",
+      regionIds: ["meeting_room", "corridor"],
+      stationIds: ["meeting_south", "corridor_west"],
+      narrativeZhCN: "定向巡检报告\n- 会议室：看到电脑\n- 走廊：可通行",
+    }), "mission-office-1");
+    expect(valid?.reportScope).toBe("selected_locations");
+    expect(valid?.regionIds).toEqual(["meeting_room", "corridor"]);
+    expect(valid?.stationIds).toEqual(["meeting_south", "corridor_west"]);
+  });
 });

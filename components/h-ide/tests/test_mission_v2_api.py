@@ -66,6 +66,22 @@ def test_rotation_intent_preserves_explicit_degrees_instead_of_using_direction_d
     ) == pytest.approx(-0.2)
 
 
+def test_workstation_scan_catalog_keeps_behavior_tree_execution_and_nav2_motion_ownership() -> None:
+    catalog = {
+        item["skillId"]: item
+        for item in MissionService._capability_catalog(
+            MissionService._workstation_descriptors()
+        )
+    }
+
+    scan = catalog["inspection.scan_station"]
+    assert scan["executor"] == "behavior_tree"
+    assert scan["executorProfile"] == "office_v2.station_scan.v1"
+    assert scan["baseMotionOwner"] == "nav2"
+    assert "baseMotionOwner" not in catalog["vision.observe"]
+    assert "baseMotionOwner" not in catalog["mission.report"]
+
+
 def test_rotation_budget_accumulates_all_previously_issued_turns() -> None:
     record = {
         "skillExecutions": [

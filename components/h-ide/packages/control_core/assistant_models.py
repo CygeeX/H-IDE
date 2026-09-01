@@ -244,6 +244,10 @@ class ConversationTurnRequest(AssistantContract):
     schemaVersion: Literal["h-ide.conversation-turn/2"] = "h-ide.conversation-turn/2"
     conversationId: str
     robotId: str | None = None
+    # UI-selected skill context is advisory routing metadata. It never carries
+    # coordinates or execution authority; H-IDE still derives Mission steps
+    # from the deterministic scene catalog and capability envelope.
+    skillId: Literal["inspection.office", "assistant.voice"] | None = None
     locale: str = Field(default="zh-CN", min_length=2, max_length=35)
     text: str = Field(min_length=1, max_length=8000)
     history: list[ConversationHistoryMessage] = Field(default_factory=list, max_length=20)

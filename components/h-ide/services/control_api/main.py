@@ -117,6 +117,7 @@ from .office_inspection import (
 from .object_search_report import build_object_search_report
 from .office_semantic_navigation import SCENE_VERIFY_INSIDE_SKILL
 from .conversation_gateway import ConversationGateway
+from .leader_demo import LeaderDemoGestureUnavailable, trigger_wave
 from .developer_diagnostics import (
     DeveloperDiagnosticsService,
     create_developer_diagnostics_router,
@@ -2101,6 +2102,7 @@ def create_app(
         *,
         heading_index: int,
         target_heading: float,
+        attempt: int = 1,
     ) -> SkillRequest | None:
         pose = mission_service._current_robot_pose(parent.robotId)
         delta = _wrapped_yaw_delta(float(target_heading), float(pose.yaw))
@@ -2110,7 +2112,12 @@ def create_app(
         expires_at = min(parent.expiresAt, issued_at + timedelta(seconds=180))
         if expires_at <= issued_at:
             raise ValueError("Office inspection rotation lifetime has expired")
-        request_id = f"{parent.requestId}-rotate-{heading_index:02d}"
+        if attempt < 1:
+            raise ValueError("Office inspection rotation attempt must be positive")
+        request_id = (
+            f"{parent.requestId}-rotate-{heading_index:02d}"
+            + ("" if attempt == 1 else f"-retry-{attempt}")
+        )
         mission = mission_service.runtime.get(parent.missionId)
         plan = mission.get("plan")
         envelope = plan.get("envelope") if isinstance(plan, Mapping) else None
@@ -2397,25 +2404,76 @@ def create_app(
                 state["failureStage"] = "rotation"
                 state["headingIndex"] = heading_index
                 state["scanSequence"] = scan_sequence
-                child = _inspection_child_rotation(
-                    parent,
-                    heading_index=heading_index,
-                    target_heading=heading,
-                )
+                child: SkillRequest | None = None
                 receipt: dict[str, Any] | None = None
-                if child is not None:
+                rotation_attempts = 0
+                rotation_gap: str | None = None
+                for rotation_attempt in range(1, 5):
+                    rotation_attempts = rotation_attempt
+                    child = _inspection_child_rotation(
+                        parent,
+                        heading_index=heading_index,
+                        target_heading=heading,
+                        attempt=rotation_attempt,
+                    )
+                    if child is None:
+                        rotation_gap = None
+                        break
                     delta = abs(float(child.input["targetYawRad"]))
+                    if cumulative_yaw + delta > maximum_yaw + 1e-6:
+                        rotation_gap = "yaw reservation exhausted"
+                        break
+                    try:
+                        receipt = _inspection_wait_for_rotation(parent, child, state)
+                    except _OfficeInspectionCancelled:
+                        raise
+                    except Exception as exc:
+                        rotation_gap = str(exc).strip() or type(exc).__name__
+                        if rotation_attempt < 4:
+                            if state["cancelEvent"].wait(0.5):
+                                raise _OfficeInspectionCancelled()
+                            continue
+                        break
                     cumulative_yaw += delta
-                    if cumulative_yaw > maximum_yaw + 1e-6:
-                        raise ValueError("Office inspection exceeded its yaw reservation")
-                    receipt = _inspection_wait_for_rotation(parent, child, state)
+                    rotation_gap = None
+                    break
+                if rotation_gap is not None:
+                    heading_results.append(
+                        {
+                            "headingIndex": heading_index,
+                            "headingRad": heading,
+                            "status": "missing",
+                            "missingReason": f"rotation: {rotation_gap}"[:512],
+                            "rotationAttempts": rotation_attempts,
+                            "rotationRequestId": (
+                                child.requestId if child is not None else None
+                            ),
+                            "rotationReceipt": receipt,
+                            "visualRequestId": None,
+                            "visualAttempts": 0,
+                            "visualResult": None,
+                        }
+                    )
+                    _inspection_progress(
+                        parent,
+                        sequence=scan_sequence,
+                        progress=scan_sequence / len(headings),
+                        phase="heading_gap",
+                        detail=(
+                            f"Heading {scan_sequence} of {len(headings)} was not "
+                            "confirmed after relaxed simulation retries"
+                        ),
+                    )
+                    state["failureStage"] = "heading_gap_recorded"
+                    continue
                 if state["cancelEvent"].wait(settle_seconds):
                     raise _OfficeInspectionCancelled()
                 state["failureStage"] = "visual_observation"
                 visual: dict[str, Any] | None = None
                 visual_request: SkillRequest | None = None
                 attempts = 0
-                for attempt in (1, 2):
+                visual_gap: str | None = None
+                for attempt in (1, 2, 3, 4):
                     attempts = attempt
                     visual_request = _inspection_visual_request(
                         parent,
@@ -2428,14 +2486,48 @@ def create_app(
                             visual_request,
                             dispatch_visual_workstation_skill(visual_request),
                         )
-                    except Exception:
-                        if attempt == 2:
-                            raise
-                        if state["cancelEvent"].wait(1.0):
+                    except Exception as exc:
+                        visual_gap = str(exc).strip() or type(exc).__name__
+                        if attempt == 4:
+                            break
+                        if state["cancelEvent"].wait(0.5):
                             raise _OfficeInspectionCancelled()
                         continue
+                    visual_gap = None
                     break
-                assert visual is not None and visual_request is not None
+                if visual is None or visual_request is None:
+                    heading_results.append(
+                        {
+                            "headingIndex": heading_index,
+                            "headingRad": heading,
+                            "status": "missing",
+                            "missingReason": f"visual: {visual_gap or 'unavailable'}"[:512],
+                            "rotationAttempts": rotation_attempts,
+                            "rotationRequestId": (
+                                child.requestId if child is not None else None
+                            ),
+                            "rotationReceipt": receipt,
+                            "visualRequestId": (
+                                visual_request.requestId
+                                if visual_request is not None
+                                else None
+                            ),
+                            "visualAttempts": attempts,
+                            "visualResult": None,
+                        }
+                    )
+                    _inspection_progress(
+                        parent,
+                        sequence=scan_sequence,
+                        progress=scan_sequence / len(headings),
+                        phase="heading_gap",
+                        detail=(
+                            f"Heading {scan_sequence} of {len(headings)} has no "
+                            "reliable visual result after relaxed simulation retries"
+                        ),
+                    )
+                    state["failureStage"] = "heading_gap_recorded"
+                    continue
                 for evidence in visual.get("evidence", []):
                     sha = evidence.get("sha256") if isinstance(evidence, Mapping) else None
                     if isinstance(sha, str) and sha not in evidence_ids:
@@ -2444,6 +2536,8 @@ def create_app(
                     {
                         "headingIndex": heading_index,
                         "headingRad": heading,
+                        "status": "observed",
+                        "rotationAttempts": rotation_attempts,
                         "rotationRequestId": child.requestId if child is not None else None,
                         "rotationReceipt": receipt,
                         "visualRequestId": visual_request.requestId,
@@ -2461,6 +2555,13 @@ def create_app(
                     ),
                 )
                 state["failureStage"] = "heading_complete"
+            if not any(
+                isinstance(item.get("visualResult"), Mapping)
+                for item in heading_results
+            ):
+                raise RuntimeError(
+                    "Office inspection produced no reliable visual evidence"
+                )
             if state["cancelEvent"].is_set() or not _inspection_parent_is_active(parent):
                 raise _OfficeInspectionCancelled()
             mission_service.runtime.record_result(
@@ -2687,6 +2788,20 @@ def create_app(
                 report = build_office_inspection_report(
                     mission,
                     source_missions=source_missions,
+                )
+            elif report_scope == "selected_locations":
+                raw_region_ids = skill.input.get("regionIds")
+                raw_station_ids = skill.input.get("stationIds")
+                if (
+                    not isinstance(raw_region_ids, list)
+                    or not isinstance(raw_station_ids, list)
+                ):
+                    raise ValueError("Office selected-location report bindings are invalid")
+                report = build_office_inspection_report(
+                    mission,
+                    source_missions=source_missions,
+                    region_ids=raw_region_ids,
+                    station_ids=raw_station_ids,
                 )
             elif report_scope == "object_search":
                 report = build_object_search_report(
@@ -3504,6 +3619,52 @@ def create_app(
         if simulation_gateway_driver is not None:
             refresh_robot_agent_snapshot(simulation_robot_id)
         return context.store.list_robots()
+
+    @app.post(
+        "/api/v1/leader-demo/gestures/wave",
+        dependencies=[Depends(require_assistant)],
+    )
+    def leader_demo_wave(
+        body: dict[str, Any],
+        principal: Principal = Depends(require_assistant),
+        context: _ControlContext = Depends(get_context),
+    ):
+        """Trigger the bounded simulation-only wave used by the voice Skill."""
+
+        if set(body) != {"robotId"}:
+            raise HTTPException(status_code=422, detail="leader-demo wave accepts only robotId")
+        robot_id = body.get("robotId")
+        if not isinstance(robot_id, str) or not robot_id.strip():
+            raise HTTPException(status_code=422, detail="robotId is required")
+        expected_robot_id = os.getenv("SIMULATION_ROBOT_AGENT_ID", "g1-sim").strip()
+        try:
+            result = trigger_wave(
+                robot_id=robot_id,
+                expected_robot_id=expected_robot_id,
+            )
+        except LeaderDemoGestureUnavailable as exc:
+            # A missing optional gesture channel must not turn a successful
+            # voice reply into a failed conversation turn.
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        context.store.record_event(
+            {
+                "eventType": "leader_demo.gesture_requested",
+                "gesture": "wave",
+                "robotId": robot_id,
+                "requestedBy": principal.user_id,
+                "backend": "sonic_simulation_arbiter",
+                "requestId": result.get("request_id"),
+            }
+        )
+        return {
+            "status": "accepted",
+            "gesture": "wave",
+            "robotId": robot_id,
+            "requestId": result.get("request_id"),
+            "backend": "sonic_simulation_arbiter",
+        }
 
     @app.get("/api/v1/robots/{robot_id}/capabilities", dependencies=[Depends(require_robots_read)])
     def get_capabilities(robot_id: str, context: _ControlContext = Depends(get_context)):

@@ -159,6 +159,81 @@ def test_four_original_phrases_compile_without_the_text_mission_planner() -> Non
             assert "target_region" not in str(plan)
 
 
+def test_two_ordered_inspection_phrases_compile_to_the_same_room_sequence() -> None:
+    scene = OfficePlaceSceneContext()
+    app = create_app(
+        auth_token=TOKEN,
+        mission_planning_client=UnavailableMissionPlanningClient(
+            "ordered Office V2 inspections must use the deterministic compiler"
+        ),
+        scene_context_client=scene,
+        mission_supervisor_interval=3600,
+    )
+    capabilities = CapabilitySnapshot.model_validate(
+        app.state.store.get_capabilities("robot-1")
+    )
+    app.state.store.upsert_capabilities(
+        capabilities.model_copy(
+            update={
+                "capabilities": [
+                    *capabilities.capabilities,
+                    "navigation.rotate",
+                ]
+            }
+        ),
+        "robot-1",
+    )
+    phrases = [
+        "今天巡检开放办公室和会议室",
+        "请依次进入开放办公区和会议室，分别在房间内部停稳后进行多方向观察，记录房间内及沿途看到的信息，最后按房间分别汇总",
+    ]
+
+    with TestClient(app) as client:
+        plans = []
+        for index, text in enumerate(phrases, start=1):
+            response = client.post(
+                "/api/v2/missions/drafts",
+                headers=headers(),
+                json={
+                    "requestId": f"request-office-sequence-{index}",
+                    "missionId": f"mission-office-sequence-{index}",
+                    "robotId": "robot-1",
+                    "objective": text,
+                    "sceneRefs": [scene.scene_ref.model_dump(mode="json")],
+                },
+            )
+            assert response.status_code == 201, response.text
+            plans.append(response.json()["plan"])
+
+        def signature(plan: dict) -> list[tuple[str, str | None, str | None, str | None]]:
+            return [
+                (
+                    node["skillId"],
+                    node["intent"].get("regionId"),
+                    node["intent"].get("stationId"),
+                    node["intent"].get("reportScope"),
+                )
+                for node in plan["nodes"]
+            ]
+
+        assert signature(plans[0]) == signature(plans[1])
+        assert signature(plans[0]) == [
+            ("navigation.navigate_to_pose", None, None, None),
+            ("navigation.navigate_to_pose", None, None, None),
+            ("scene.verify_inside_region", None, None, None),
+            ("inspection.scan_station", "open_office", "open_office_west", None),
+            ("navigation.navigate_to_pose", None, None, None),
+            ("navigation.navigate_to_pose", None, None, None),
+            ("scene.verify_inside_region", None, None, None),
+            ("inspection.scan_station", "meeting_room", "meeting_south", None),
+            ("mission.report", None, None, "selected_locations"),
+        ]
+        assert plans[0]["nodes"][-1]["intent"]["regionIds"] == [
+            "open_office",
+            "meeting_room",
+        ]
+
+
 def test_exit_object_approach_and_active_search_never_require_text_planner() -> None:
     scene = OfficePlaceSceneContext()
     app = create_app(

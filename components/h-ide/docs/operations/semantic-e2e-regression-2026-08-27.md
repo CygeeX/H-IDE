@@ -26,7 +26,7 @@ turn/Mission；对象指代必须使用坐标无关的 `SemanticReferent`，随�
 ## 本地静态回归命令
 
 ```bash
-cd $SKILLSTORE_ROOT/components/h-ide
+cd /home/phi/learn-projects/h-ide
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/pytest -q
 
 cd ../h-ide-agent
@@ -101,7 +101,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -q \
 
 回滚前停止完整仿真链路。当前对话开始前的源码/数据库/镜像基线保存在：
 
-`$SKILLSTORE_BACKUP_ROOT/semantic-agent-baseline-20260827-ysPZdt`
+`/home/phi/learn-projects/.h-ide-backups/semantic-agent-baseline-20260827-ysPZdt`
 
 该目录的 `MANIFEST.md` 记录了 Git bundle、数据库和镜像标签；不要删除或覆盖它。
 

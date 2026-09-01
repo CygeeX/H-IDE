@@ -64,7 +64,10 @@ from .office_inspection import (
 from .office_semantic_navigation import (
     SCENE_VERIFY_INSIDE_SKILL,
     compile_plan as compile_office_place_plan,
+    compile_inspection_sequence_plan,
+    current_office_region_id,
     envelope_defaults as office_place_envelope_defaults,
+    parse_office_inspection_sequence_request,
     parse_office_place_request,
     parse_place_navigation_intent,
 )
@@ -356,12 +359,27 @@ class MissionService:
                             "enum": [
                                 "all_office_regions_and_corridor",
                                 "current_location",
+                                "selected_locations",
                                 "object_search",
                             ]
                         },
                         "locale": {"const": "zh-CN"},
                         "regionId": {"type": "string", "minLength": 1},
+                        "regionIds": {
+                            "type": "array",
+                            "minItems": 2,
+                            "maxItems": 8,
+                            "uniqueItems": True,
+                            "items": {"type": "string", "minLength": 1},
+                        },
                         "stationId": {"type": "string", "minLength": 1},
+                        "stationIds": {
+                            "type": "array",
+                            "minItems": 2,
+                            "maxItems": 8,
+                            "uniqueItems": True,
+                            "items": {"type": "string", "minLength": 1},
+                        },
                         "targetDescription": {"type": "string", "minLength": 1},
                         "sourceMissionIds": {
                             "type": "array",
@@ -387,8 +405,14 @@ class MissionService:
 
     @staticmethod
     def _capability_catalog(descriptors) -> list[dict[str, Any]]:
-        return [
-            {
+        catalog: list[dict[str, Any]] = []
+        for item in descriptors:
+            workstation_composite = (
+                item.executor == "behavior_tree"
+                and item.metadata.get("authority") == "workstation"
+                and item.metadata.get("containsPhysicalChildren") is True
+            )
+            payload = {
                 "skillId": item.skillId,
                 "skillVersion": item.skillVersion,
                 "description": item.description,
@@ -398,8 +422,15 @@ class MissionService:
                 "executorProfile": item.executorProfile,
                 "requiredSensorIds": list(item.requiredSensorIds),
             }
-            for item in descriptors
-        ]
+            # Keep execution and physical authority separate. A workstation
+            # behavior tree may orchestrate a reviewed composite scan, but
+            # every base rotation/translation child remains Nav2-owned.
+            if item.kind is CapabilityKind.MOTION and (
+                item.executor == "nav2" or workstation_composite
+            ):
+                payload["baseMotionOwner"] = "nav2"
+            catalog.append(payload)
+        return catalog
 
     @staticmethod
     def _manifest_from_details(robot_id: str, details: Mapping[str, Any]) -> tuple[RobotProfile, CapabilityManifest] | None:
@@ -959,6 +990,17 @@ class MissionService:
             else {}
         )
         inspection_defaults = office_inspection_envelope_defaults(objective)
+        if body.get("skillId") == "inspection.office":
+            inspection_defaults = {
+                "maximumGoalDistanceM": 20.0,
+                "maximumCumulativeDistanceM": 80.0,
+                "maximumSpeedMps": 0.40,
+                "maximumDurationSeconds": 4_800,
+                "maximumAutoRevisions": 8,
+                "maximumStageAttempts": 8,
+                "maximumScanYawRad": 40.0 * math.pi,
+                **inspection_defaults,
+            }
         envelope_defaults = {
             **place_defaults,
             **object_defaults,
@@ -1059,7 +1101,50 @@ class MissionService:
         if actor is not None:
             self.policy.require_robot_access(robot_id, actor)
         brief = self.build_brief(body, actor=actor)
-        if is_full_office_inspection(brief.get("objective")):
+        robot_payload = self.store.get_robot(robot_id) or {}
+        raw_current_pose = robot_payload.get("pose")
+        current_pose = (
+            PoseMap.model_validate(raw_current_pose)
+            if isinstance(raw_current_pose, Mapping)
+            else None
+        )
+        inspection_mode = body.get("skillId") == "inspection.office"
+        current_region_id = current_office_region_id(current_pose)
+        if inspection_mode and current_region_id in {None, "corridor"}:
+            # Elliptical follow-ups such as "再观察一下" inherit only the last
+            # named room identity from the server-owned conversation history.
+            # The current Robot Agent pose still supplies all executable
+            # geometry, so remembered text can never become a coordinate.
+            for history_item in reversed(brief.get("history", [])):
+                if not isinstance(history_item, Mapping):
+                    continue
+                prior = parse_office_inspection_sequence_request(
+                    history_item.get("content")
+                )
+                if prior is not None:
+                    current_region_id = prior.places[-1].location_id
+                    break
+        sequence_request = parse_office_inspection_sequence_request(
+            brief.get("objective"),
+            default_location_id=current_region_id,
+            inspection_mode=inspection_mode,
+        )
+        if inspection_mode and sequence_request is None:
+            raise MissionServiceError(
+                "巡检 Skill 需要一个明确办公室，或可从当前房间/本会话上一次巡检恢复"
+            )
+        if sequence_request is not None:
+            try:
+                plan = compile_inspection_sequence_plan(
+                    sequence_request,
+                    brief,
+                    current_pose=current_pose,
+                )
+            except Exception as exc:
+                raise MissionServiceError(
+                    f"Office inspection sequence plan compilation failed: {exc}"
+                ) from exc
+        elif is_full_office_inspection(brief.get("objective")):
             try:
                 resume_from = body.get("resumeFromMissionId")
                 if resume_from is not None:
@@ -2827,6 +2912,56 @@ class MissionService:
                         "地点报告缺少经审核的区域或观察站绑定",
                     )
                 payload.update(regionId=region_id, stationId=station_id)
+            elif report_scope == "selected_locations":
+                raw_region_ids = node.intent.get("regionIds")
+                raw_station_ids = node.intent.get("stationIds")
+                if (
+                    not isinstance(raw_region_ids, list)
+                    or not isinstance(raw_station_ids, list)
+                    or not 1 <= len(raw_region_ids) <= 8
+                    or not 1 <= len(raw_station_ids) <= 8
+                    or any(
+                        not isinstance(item, str) or not item.strip()
+                        for item in [*raw_region_ids, *raw_station_ids]
+                    )
+                    or len(set(raw_region_ids)) != len(raw_region_ids)
+                    or len(set(raw_station_ids)) != len(raw_station_ids)
+                ):
+                    raise MissionInputRequired(
+                        "SELECTED_LOCATION_REPORT_BINDING_REQUIRED",
+                        "定向巡检报告缺少有效的区域或观察站绑定",
+                    )
+                region_ids = [str(item).strip() for item in raw_region_ids]
+                station_ids = [str(item).strip() for item in raw_station_ids]
+                region_catalog = {
+                    str(item.get("regionId")): item
+                    for item in office_inspection_catalog().get("regions", [])
+                    if isinstance(item, Mapping) and item.get("regionId")
+                }
+                stations = office_inspection_station_index()
+                if any(item not in region_catalog for item in region_ids):
+                    raise MissionInputRequired(
+                        "SELECTED_LOCATION_REPORT_BINDING_INVALID",
+                        "定向巡检报告包含未发布的区域",
+                    )
+                if any(
+                    item not in stations
+                    or stations[item].get("regionId") not in set(region_ids)
+                    for item in station_ids
+                ):
+                    raise MissionInputRequired(
+                        "SELECTED_LOCATION_REPORT_BINDING_INVALID",
+                        "定向巡检报告观察站不属于所选区域",
+                    )
+                if any(
+                    not any(stations[station_id].get("regionId") == region_id for station_id in station_ids)
+                    for region_id in region_ids
+                ):
+                    raise MissionInputRequired(
+                        "SELECTED_LOCATION_REPORT_BINDING_INVALID",
+                        "定向巡检报告必须覆盖每个所选区域",
+                    )
+                payload.update(regionIds=region_ids, stationIds=station_ids)
             elif report_scope == "object_search":
                 target_description = self._semantic_text(
                     dict(node.intent), "targetDescription"
@@ -3213,7 +3348,26 @@ class MissionService:
             and receipt.get("status") == "unknown"
             and error == "cancellation confirmation pending"
         )
-        if not (timed_out or aborted or cancellation_pending):
+        simulation_control_unavailable = (
+            plan.robotId == "g1-sim"
+            and result.get("status") == "failed"
+            and result.get("errorCode") == "ROBOT_AGENT_FAILED"
+            and receipt.get("status") == "failed"
+            and (
+                error.startswith(
+                    "robot agent control acquisition unavailable:"
+                )
+                or error.startswith(
+                    "robot agent gateway request failed:"
+                )
+            )
+        )
+        if not (
+            timed_out
+            or aborted
+            or cancellation_pending
+            or simulation_control_unavailable
+        ):
             return None
         return execution
 
@@ -5472,6 +5626,103 @@ class MissionService:
         payload.setdefault("missionId", mission_id)
         return self.runtime.intervene(MissionIntervention.model_validate(payload))
 
+    @staticmethod
+    def _stateful_inspection_retry_revision(
+        record: Mapping[str, Any],
+        active: PlanRevision,
+        *,
+        reason: str,
+    ) -> PlanRevision | None:
+        """Retry only the failed inspection node and preserve completed work.
+
+        ``inspection.scan_station`` already performs its own multi-heading
+        VisualTasks.  Letting a text planner rewrite this DAG introduced a
+        second ``vision.observe`` node, dropped required report nodes, and
+        changed otherwise successful node definitions so MissionRuntime could
+        no longer carry their succeeded state forward.  A typed inspection
+        therefore receives a deterministic retry revision: every successful
+        node remains byte-for-byte identical, while only the failed node gets a
+        new identity (and a fresh attempt budget).
+        """
+
+        skill_ids = [node.skillId for node in active.nodes]
+        if (
+            OFFICE_INSPECTION_SKILL not in skill_ids
+            or MISSION_REPORT_SKILL not in skill_ids
+            or "vision.observe" in skill_ids
+        ):
+            return None
+        states = {
+            str(item.get("nodeId")): item
+            for item in record.get("nodeStates", [])
+            if isinstance(item, Mapping)
+            and item.get("revisionId") == active.revisionId
+        }
+        snapshot = record.get("snapshot")
+        active_node_id = (
+            snapshot.get("activeNodeId") if isinstance(snapshot, Mapping) else None
+        )
+        failed_node = next(
+            (
+                node
+                for node in active.nodes
+                if node.nodeId == active_node_id
+                and states.get(node.nodeId, {}).get("status")
+                in {"failed", "timed_out", "unknown"}
+            ),
+            None,
+        )
+        if failed_node is None:
+            failed_node = next(
+                (
+                    node
+                    for node in active.nodes
+                    if states.get(node.nodeId, {}).get("status")
+                    in {"failed", "timed_out", "unknown"}
+                ),
+                None,
+            )
+        if failed_node is None:
+            return None
+
+        retry_id = f"{failed_node.nodeId}-retry-r{active.sequence + 1}"
+        nodes: list[MissionNode] = []
+        for node in active.nodes:
+            dependencies = [
+                retry_id if item == failed_node.nodeId else item
+                for item in node.dependsOn
+            ]
+            nodes.append(
+                node.model_copy(
+                    update={
+                        "nodeId": retry_id if node.nodeId == failed_node.nodeId else node.nodeId,
+                        "dependsOn": dependencies,
+                    }
+                )
+            )
+        return PlanRevision(
+            revisionId=f"revision-{record['missionId']}-inspection-retry-{active.sequence + 1}",
+            missionId=str(record["missionId"]),
+            sequence=active.sequence + 1,
+            parentRevisionId=active.revisionId,
+            objective=active.objective,
+            nodes=nodes,
+            reasonCode="inspection_stateful_retry",
+            reason=(
+                "Deterministic inspection retry preserves every succeeded node: "
+                + reason
+            )[:1_000],
+            changeSummary=[
+                f"Retry only {failed_node.nodeId} as {retry_id}",
+                "Preserve completed navigation, verification and scan nodes",
+                "Retain the mandatory final inspection report",
+            ],
+            disposition="human_required",
+            authorizationId=None,
+            createdBy="h-ide-inspection-compiler",
+            createdAt=utc_now(),
+        )
+
     def request_revision(self, mission_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
         with self._planned_response_lock(mission_id):
             record = self.runtime.get(mission_id)
@@ -5584,23 +5835,34 @@ class MissionService:
                 "autoRevisionCount": snapshot.autoRevisionCount,
             }
             request.pop("operation", None)
-            raw = self.planner.create_revision(request)
-            if not isinstance(raw, Mapping):
-                raise MissionServiceError(
-                    "Mission planner returned an invalid revision"
-                )
-            payload = raw.get("revision")
-            revision_payload = dict(payload) if isinstance(payload, Mapping) else dict(raw)
-            proposed_nodes = revision_payload.get("nodes")
-            has_physical = isinstance(proposed_nodes, list) and any(
-                isinstance(item, Mapping)
-                and item.get("skillId") in _BASE_NAVIGATION_SKILLS
-                for item in proposed_nodes
+            revision = self._stateful_inspection_retry_revision(
+                record,
+                active,
+                reason=trigger_detail,
             )
-            if has_physical or revision_payload.get("disposition") == "human_approved":
-                revision_payload["disposition"] = "human_required"
-                revision_payload["authorizationId"] = None
-            revision = PlanRevision.model_validate(revision_payload)
+            if revision is None:
+                raw = self.planner.create_revision(request)
+                if not isinstance(raw, Mapping):
+                    raise MissionServiceError(
+                        "Mission planner returned an invalid revision"
+                    )
+                payload = raw.get("revision")
+                revision_payload = (
+                    dict(payload) if isinstance(payload, Mapping) else dict(raw)
+                )
+                proposed_nodes = revision_payload.get("nodes")
+                has_physical = isinstance(proposed_nodes, list) and any(
+                    isinstance(item, Mapping)
+                    and item.get("skillId") in _BASE_NAVIGATION_SKILLS
+                    for item in proposed_nodes
+                )
+                if (
+                    has_physical
+                    or revision_payload.get("disposition") == "human_approved"
+                ):
+                    revision_payload["disposition"] = "human_required"
+                    revision_payload["authorizationId"] = None
+                revision = PlanRevision.model_validate(revision_payload)
             completed = self.runtime.finalize_planned_intervention(
                 intervention,
                 request_sha256=request_sha256,
@@ -5805,11 +6067,28 @@ class MissionService:
                 record,
                 canonical_event,
             )
-            raw = self.planner.evaluate_event(payload, context)
-            if not isinstance(raw, Mapping):
-                raise MissionServiceError(
-                    "Mission planner returned an invalid event decision"
-                )
+            active = PlanRevision.model_validate(record["activeRevision"])
+            deterministic_revision = self._stateful_inspection_retry_revision(
+                record,
+                active,
+                reason=str(
+                    canonical_event.get("payload", {}).get("detail")
+                    if isinstance(canonical_event.get("payload"), Mapping)
+                    else canonical_event.get("eventType")
+                ),
+            )
+            if deterministic_revision is not None:
+                raw: Mapping[str, Any] = {
+                    "kind": "replan",
+                    "reason": "Typed inspection retry retained completed Mission state",
+                    "revision": deterministic_revision.model_dump(mode="json"),
+                }
+            else:
+                raw = self.planner.evaluate_event(payload, context)
+                if not isinstance(raw, Mapping):
+                    raise MissionServiceError(
+                        "Mission planner returned an invalid event decision"
+                    )
             decision = self._normalize_event_decision(
                 raw,
                 force_human_review=force_human_review,

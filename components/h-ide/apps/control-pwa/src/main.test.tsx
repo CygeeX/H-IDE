@@ -5,6 +5,7 @@ import {
   App,
   isDraftExpired,
   isDraftReviewableForRobot,
+  preferredDemoRobotId,
   preferredRobotId,
   shouldReconcileMission,
 } from "./main";
@@ -564,6 +565,16 @@ describe("control console", () => {
     expect(preferredRobotId(robots, "g1-dev")).toBe("g1-dev");
   });
 
+  it("selects the connected simulation robot when a stale demo record is selected", () => {
+    const robots = [
+      { robotId: "g1-dev", status: "unknown", connected: false, safetyMode: "normal" },
+      { robotId: "g1-sim", status: "online", connected: true, safetyMode: "normal" },
+    ] as Parameters<typeof preferredDemoRobotId>[0];
+
+    expect(preferredDemoRobotId(robots, "g1-dev")).toBe("g1-sim");
+    expect(preferredDemoRobotId(robots, "g1-sim")).toBe("g1-sim");
+  });
+
   it("keeps reconciling a failed skill while the Mission enters planning", () => {
     expect(shouldReconcileMission("executing")).toBe(true);
     expect(shouldReconcileMission("planning")).toBe(true);
@@ -780,6 +791,20 @@ describe("control console", () => {
     expect(screen.queryByText("cmd_vel")).not.toBeInTheDocument();
   });
 
+  it("keeps the robot picker above Skill selection and out of the composer", async () => {
+    render(<App />);
+    await screen.findAllByText("robot-1");
+    const selector = document.querySelector(".leader-skill-robot-selector");
+    const skills = screen.getByRole("region", { name: "选择 Skill" });
+    expect(selector).toBeInTheDocument();
+    expect(skills.previousElementSibling).toBe(selector);
+    expect(document.querySelector(".composer-contexts .leader-robot-picker")).not.toBeInTheDocument();
+    expect(document.querySelector(".global-statusbar .leader-robot-picker")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "选择机器人" }));
+    expect(screen.getByRole("dialog", { name: "选择机器人" })).toBeInTheDocument();
+  });
+
   it("uses the durable conversation lifecycle API for history management", async () => {
     const fallback = vi.mocked(fetch).getMockImplementation();
     const conversation = {
@@ -861,6 +886,7 @@ describe("control console", () => {
 
     render(<App />);
     const input = await screen.findByLabelText("任务描述");
+    await screen.findByText("工作站在线");
     fireEvent.change(input, { target: { value: "介绍一下当前系统" } });
     fireEvent.submit(input.closest("form")!);
 
@@ -925,7 +951,7 @@ describe("control console", () => {
     render(<App />);
     await screen.findAllByText("robot-1");
     fireEvent.click(screen.getByRole("button", { name: "任务历史" }));
-    expect(await screen.findByText("办公室完整巡检")).toBeInTheDocument();
+    expect((await screen.findAllByText("办公室完整巡检")).length).toBeGreaterThan(0);
     expect(Array.from(document.querySelectorAll(".history-open strong")).filter(
       (element) => element.textContent === "办公室完整巡检",
     )).toHaveLength(1);

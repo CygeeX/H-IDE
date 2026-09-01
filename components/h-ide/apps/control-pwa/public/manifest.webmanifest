@@ -10,9 +10,9 @@
   "lang": "zh-CN",
   "icons": [
     {
-      "src": "/icons/h-ide.svg",
-      "sizes": "any",
-      "type": "image/svg+xml",
+      "src": "/assets/leader-demo/brand/h-ide-logo.png",
+      "sizes": "549x549",
+      "type": "image/png",
       "purpose": "any maskable"
     }
   ]

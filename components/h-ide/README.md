@@ -3,9 +3,11 @@
 当前主任务流为 [Mission V2 连续 Supervisor–Worker 架构](docs/architecture/mission-v2-continuous-supervisor-worker.md)。真实 Robot Agent / D435i / Mock Nav2 的整链步骤见 [Mission V2 联调与验收清单](docs/integration/mission-v2-real-validation.md)。
 
 
-需要从跨仓库、端到端视角理解当前 PWA、Mission、Vision、Robot Agent、Nav2、SONIC、MuJoCo、DAAAM 与开源依赖时，请从仓库根目录的
-[Skillstore 组件开发者索引](../../docs/components/README.md) 和
-[架构与信任边界](../../docs/architecture/README.md) 开始。
+需要从跨仓库、端到端视角理解当前 PWA、Mission、Vision、Robot Agent、Nav2、SONIC、MuJoCo、DAAAM 与开源依赖时，请从 [H-IDE 联调开发者手册](docs/developer/README.md) 开始。
+
+商业化云—站点—边缘—机器人架构、PRO 6000 本地验证方案、硬件档位和地图硬编码迁移
+路线见 [H-IDE 平台架构文档集](docs/platform-architecture/README.md)。
+
 Robot Action Console 是工作站上的机器人行动控制平面。它不是机器人侧
 Robot Agent，也不是 Agent 依赖框架；它把手动控制、已确认的 Agent 计划和
 接口映射管理统一收敛到一个可审计的 `ActionRuntime`。
@@ -88,8 +90,7 @@ CORS 配置。若开发时 Control API 和 Scene API 分别运行（例如 18080
 [`docs/architecture/mission-v2-continuous-supervisor-worker.md`](docs/architecture/mission-v2-continuous-supervisor-worker.md)。
 旧 V1 Assistant 的迁移背景仍记录在
 [`docs/architecture/assistant-supervisor-worker.md`](docs/architecture/assistant-supervisor-worker.md)。
-独立 Mastra 服务位于本发行仓库的 `../h-ide-agent`（即
-`components/h-ide-agent`）。PCD 场景的
+独立 Mastra 服务位于相邻的 `/home/phi/learn-projects/h-ide-agent`。PCD 场景的
 导入、标定、标注和空间规划闭环见
 [`docs/architecture/pcd-scene-spatial-agent.md`](docs/architecture/pcd-scene-spatial-agent.md)。
 

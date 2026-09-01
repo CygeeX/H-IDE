@@ -7,7 +7,13 @@ import pytest
 
 from packages.control_core.validation import utc_now
 from packages.control_core.capabilities import RiskLevel
-from packages.mission_core import MissionEnvelope, MissionNode, SkillRequest, WorldRecord
+from packages.mission_core import (
+    MissionEnvelope,
+    MissionNode,
+    PlanRevision,
+    SkillRequest,
+    WorldRecord,
+)
 from packages.scene_core import PoseMap
 from services.control_api.mission_service import MissionInputRequired, MissionService
 from services.control_api.office_inspection import (
@@ -19,8 +25,10 @@ from services.control_api.office_inspection import (
 from services.control_api.office_semantic_navigation import (
     PLACE_INSIDE_MAXIMUM_ANCHOR_DISTANCE_M,
     SCENE_VERIFY_INSIDE_SKILL,
+    compile_inspection_sequence_plan,
     compile_plan,
     envelope_defaults,
+    parse_office_inspection_sequence_request,
     parse_office_place_request,
     parse_place_navigation_intent,
 )
@@ -103,6 +111,200 @@ def test_explicit_current_frame_observation_never_selects_place_navigation() -> 
     assert parse_office_place_request(
         "只观察当前画面里有什么，不要移动"
     ) is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "请依次巡检开放办公区和会议室",
+        "请依次进入开放办公区和会议室，分别在房间内部停稳后进行多方向观察，记录房间内及沿途看到的信息，最后按房间分别汇总",
+    ],
+)
+def test_ordered_multi_room_inspection_phrases_share_one_typed_request(
+    text: str,
+) -> None:
+    request = parse_office_inspection_sequence_request(text)
+
+    assert request is not None
+    assert [item.location_id for item in request.places] == [
+        "open_office",
+        "meeting_room",
+    ]
+    assert all(item.task == "observe_report" for item in request.places)
+    # A multi-room request must never be downgraded to the first room by the
+    # single-place parser.
+    assert parse_office_place_request(text) is None
+
+
+def test_single_room_inspection_is_a_complete_typed_workflow() -> None:
+    text = "今天巡检会议室"
+    request = parse_office_inspection_sequence_request(text)
+
+    assert request is not None
+    assert [item.location_id for item in request.places] == ["meeting_room"]
+    assert parse_office_place_request(text) is None
+
+    plan = compile_inspection_sequence_plan(
+        request,
+        brief(text, "mission-single-room-inspection"),
+        current_pose=PoseMap(
+            frameId="map",
+            x=-6.45,
+            y=0.0,
+            z=0.78,
+            yaw=0.0,
+        ),
+    )
+    assert [node.skillId for node in plan.nodes] == [
+        "navigation.navigate_to_pose",
+        "navigation.navigate_to_pose",
+        SCENE_VERIFY_INSIDE_SKILL,
+        OFFICE_INSPECTION_SKILL,
+        MISSION_REPORT_SKILL,
+    ]
+    assert plan.nodes[-1].intent == {
+        "reportScope": "selected_locations",
+        "regionIds": ["meeting_room"],
+        "stationIds": ["meeting_south"],
+        "locale": "zh-CN",
+    }
+
+
+def test_repeat_inspection_at_current_station_does_not_walk_out_and_back() -> None:
+    text = "今天巡检会议室"
+    request = parse_office_inspection_sequence_request(text)
+    assert request is not None
+
+    plan = compile_inspection_sequence_plan(
+        request,
+        brief(text, "mission-repeat-room-inspection"),
+        current_pose=PoseMap(
+            frameId="map",
+            x=0.7,
+            y=2.18,
+            z=0.78,
+            yaw=math.pi / 2,
+        ),
+    )
+
+    assert [node.skillId for node in plan.nodes] == [
+        SCENE_VERIFY_INSIDE_SKILL,
+        OFFICE_INSPECTION_SKILL,
+        MISSION_REPORT_SKILL,
+    ]
+    assert plan.nodes[0].dependsOn == []
+    assert plan.nodes[1].dependsOn == [plan.nodes[0].nodeId]
+
+
+def test_inspection_retry_keeps_succeeded_path_and_retries_only_failed_scan() -> None:
+    text = "今天巡检会议室"
+    request = parse_office_inspection_sequence_request(text)
+    assert request is not None
+    plan = compile_inspection_sequence_plan(
+        request,
+        brief(text, "mission-stateful-inspection-retry"),
+        current_pose=PoseMap(
+            frameId="map",
+            x=-6.45,
+            y=0.0,
+            z=0.78,
+            yaw=0.0,
+        ),
+    )
+    active = PlanRevision(
+        revisionId="revision-stateful-inspection-1",
+        missionId=plan.planId,
+        sequence=1,
+        parentRevisionId=None,
+        objective=plan.objective,
+        nodes=plan.nodes,
+        reasonCode="initial",
+        reason="Initial reviewed inspection",
+        changeSummary=["Initial"],
+        disposition="human_approved",
+        authorizationId="auth-stateful-inspection-1",
+        createdBy="operator",
+        createdAt=utc_now(),
+    )
+    scan = next(node for node in active.nodes if node.skillId == OFFICE_INSPECTION_SKILL)
+    record = {
+        "missionId": plan.planId,
+        "snapshot": {"activeNodeId": scan.nodeId},
+        "nodeStates": [
+            {
+                "revisionId": active.revisionId,
+                "nodeId": node.nodeId,
+                "status": "failed" if node.nodeId == scan.nodeId else "succeeded",
+                "attempt": 3 if node.nodeId == scan.nodeId else 1,
+                "state": {},
+            }
+            for node in active.nodes
+        ],
+    }
+
+    revision = MissionService._stateful_inspection_retry_revision(
+        record,
+        active,
+        reason="temporary scan failure",
+    )
+
+    assert revision is not None
+    assert "vision.observe" not in [node.skillId for node in revision.nodes]
+    assert revision.nodes[-1].skillId == MISSION_REPORT_SKILL
+    retry = next(
+        node for node in revision.nodes if node.skillId == OFFICE_INSPECTION_SKILL
+    )
+    assert retry.nodeId == f"{scan.nodeId}-retry-r2"
+    assert revision.nodes[-1].dependsOn == [retry.nodeId]
+    for original, updated in zip(active.nodes, revision.nodes, strict=True):
+        if original.nodeId != scan.nodeId and original.skillId != MISSION_REPORT_SKILL:
+            assert updated == original
+
+
+def test_multi_room_inspection_compiles_entry_scan_verify_segments_and_one_report() -> None:
+    text = "请依次巡检开放办公区和会议室"
+    request = parse_office_inspection_sequence_request(text)
+    assert request is not None
+    plan = compile_inspection_sequence_plan(
+        request,
+        brief(text, "mission-office-sequence"),
+        current_pose=PoseMap(
+            frameId="map",
+            x=-6.45,
+            y=0.0,
+            z=0.78,
+            yaw=0.0,
+        ),
+    )
+
+    assert [node.skillId for node in plan.nodes] == [
+        "navigation.navigate_to_pose",
+        "navigation.navigate_to_pose",
+        SCENE_VERIFY_INSIDE_SKILL,
+        OFFICE_INSPECTION_SKILL,
+        "navigation.navigate_to_pose",
+        "navigation.navigate_to_pose",
+        SCENE_VERIFY_INSIDE_SKILL,
+        OFFICE_INSPECTION_SKILL,
+        MISSION_REPORT_SKILL,
+    ]
+    assert plan.nodes[4].dependsOn == [plan.nodes[3].nodeId]
+    assert plan.nodes[-1].intent == {
+        "reportScope": "selected_locations",
+        "regionIds": ["open_office", "meeting_room"],
+        "stationIds": ["open_office_west", "meeting_south"],
+        "locale": "zh-CN",
+    }
+    assert plan.nodes[-1].dependsOn == [plan.nodes[-2].nodeId]
+    assert envelope_defaults(text) == {
+        "maximumGoalDistanceM": 20.0,
+        "maximumCumulativeDistanceM": 80.0,
+        "maximumSpeedMps": 0.2,
+        "maximumDurationSeconds": 4800,
+        "maximumAutoRevisions": 8,
+        "maximumStageAttempts": 8,
+        "maximumScanYawRad": 4.0 * math.pi,
+    }
 
 
 def test_exit_open_office_compiles_portal_corridor_and_outside_verification() -> None:
@@ -326,8 +528,8 @@ def test_place_envelope_allows_cross_office_navigation_without_speed_guessing() 
         "maximumCumulativeDistanceM": 50.0,
         "maximumSpeedMps": 0.2,
         "maximumDurationSeconds": 2400,
-        "maximumAutoRevisions": 3,
-        "maximumStageAttempts": 3,
+        "maximumAutoRevisions": 8,
+        "maximumStageAttempts": 8,
         "maximumScanYawRad": 2.0 * math.pi,
     }
 
@@ -664,6 +866,17 @@ def test_single_reviewed_place_anchor_remains_retryable_after_one_abort() -> Non
     }
 
     assert MissionService._place_navigation_retry_execution(record) is not None
+
+    record["skillExecutions"][0]["result"]["result"]["commandReceipt"][
+        "error"
+    ] = (
+        "Robot Agent control acquisition unavailable: measured simulator "
+        "control boundary is settling"
+    )
+    assert MissionService._place_navigation_retry_execution(record) is not None
+
+    record["plan"]["robotId"] = "g1-real"
+    assert MissionService._place_navigation_retry_execution(record) is None
 
 
 def test_near_goal_nav_abort_is_accepted_only_with_fresh_scene_geometry() -> None:

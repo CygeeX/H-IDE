@@ -114,8 +114,22 @@ class OfficePlaceRequest:
     source_location_id: str | None = None
 
 
+@dataclass(frozen=True)
+class OfficeInspectionSequenceRequest:
+    """An ordered, bounded list of Office V2 rooms to inspect.
+
+    The request intentionally carries region identities only.  Stations and
+    all executable navigation inputs are resolved later from the immutable
+    Office V2 catalog by :func:`compile_inspection_sequence_plan`.
+    """
+
+    objective: str
+    places: tuple[OfficePlaceRequest, ...]
+
+
 _MOTION_PATTERN = re.compile(
-    r"(?:去往|前往|进入|进去|走进|走到|走去|移动到|导航到|驶入|回到|返回到|靠近|到达|去|"
+    r"(?:去往|前往|进入|进去|走进|走到|走去|移动到|导航到|驶入|回到|返回到|靠近|到达|"
+    r"巡检|巡查|检查|查看|观察|去|"
     r"\b(?:go|walk|move|navigate|enter|approach|return)\b)",
     re.IGNORECASE,
 )
@@ -132,6 +146,18 @@ _ENTRY_PATTERN = re.compile(r"(?:门口|入口|\b(?:door|doorway|entrance|entry)
 _STATIONARY_CURRENT_PATTERN = re.compile(
     r"(?:(?:只|仅)(?:观察|查看|看).{0,16}(?:当前|现在|眼前)|原地(?:观察|查看|看)|"
     r"(?:current\s+(?:view|scene)|without\s+moving|do\s+not\s+move))",
+    re.IGNORECASE,
+)
+_INSPECTION_ACTION_PATTERN = re.compile(
+    r"(?:巡检|巡查|检查|巡视|inspect(?:ion)?|patrol)",
+    re.IGNORECASE,
+)
+_SEQUENCE_MARKER_PATTERN = re.compile(
+    r"(?:依次|逐一|分别|按(?:房间|顺序)|先.{0,32}(?:再|然后|接着|随后))",
+    re.IGNORECASE,
+)
+_MULTI_REGION_CONNECTOR_PATTERN = re.compile(
+    r"(?:和|及|以及|、|,|，|然后|接着|随后)",
     re.IGNORECASE,
 )
 
@@ -168,6 +194,126 @@ def _region_aliases(region: Mapping[str, Any]) -> set[str]:
     return {normalized for item in values if (normalized := _normalize_label(item))}
 
 
+def _ordered_region_matches(
+    text: str,
+    source: Mapping[str, Any],
+) -> list[tuple[int, int, Mapping[str, Any]]]:
+    """Return non-overlapping catalog region mentions in user-specified order."""
+
+    normalized = _normalize_label(text)
+    candidates: list[tuple[int, int, str, Mapping[str, Any]]] = []
+    for region in source.get("regions", []):
+        if not isinstance(region, Mapping):
+            continue
+        region_id = str(region.get("regionId") or "").strip()
+        if not region_id:
+            continue
+        for alias in _region_aliases(region):
+            if not alias:
+                continue
+            offset = normalized.find(alias)
+            while offset >= 0:
+                # Sort longer aliases first at the same offset.  This keeps
+                # the supplemental generic alias "办公室" from shadowing
+                # "开放办公室" or "独立办公室".
+                candidates.append((offset, len(alias), region_id, region))
+                offset = normalized.find(alias, offset + 1)
+    candidates.sort(key=lambda item: (item[0], -item[1], item[2]))
+
+    accepted: list[tuple[int, int, Mapping[str, Any]]] = []
+    seen_regions: set[str] = set()
+    occupied: list[tuple[int, int]] = []
+    for offset, length, region_id, region in candidates:
+        if region_id in seen_regions:
+            continue
+        end = offset + length
+        if any(offset < right and end > left for left, right in occupied):
+            continue
+        accepted.append((offset, length, region))
+        seen_regions.add(region_id)
+        occupied.append((offset, end))
+    accepted.sort(key=lambda item: item[0])
+    return accepted
+
+
+def parse_office_inspection_sequence_request(
+    objective: object,
+    *,
+    inspection_catalog: Mapping[str, Any] | None = None,
+    default_location_id: str | None = None,
+    inspection_mode: bool = False,
+) -> OfficeInspectionSequenceRequest | None:
+    """Parse one or more requested rooms as a complete inspection workflow.
+
+    Both concise commands such as ``请依次巡检开放办公区和会议室`` and
+    explicit commands that spell out entering, settling, observing and
+    reporting resolve to the same typed request.  A single-room command with an
+    explicit inspection verb is intentionally included: ``巡检会议室`` means
+    navigate, verify, scan and report, never merely navigate.  When the user has
+    explicitly selected the inspection Skill, ``default_location_id`` may bind
+    an ellipsis such as ``再观察一下`` to the robot's freshly measured current
+    room; conversational memory never supplies coordinates.
+    """
+
+    if not isinstance(objective, str) or not objective.strip():
+        return None
+    text = objective.strip()
+    if _EXIT_PATTERN.search(text) or _STATIONARY_CURRENT_PATTERN.search(text):
+        return None
+    has_sequence = _SEQUENCE_MARKER_PATTERN.search(text) is not None
+    has_inspection = (
+        _INSPECTION_ACTION_PATTERN.search(text) is not None or inspection_mode
+    )
+    has_motion = _MOTION_PATTERN.search(text) is not None
+    has_observation = _OBSERVE_PATTERN.search(text) is not None
+    # The long form may use "依次进入 ... 观察 ... 汇总" instead of the word
+    # "巡检".  A short form without an order marker still needs an explicit
+    # inspection verb and a room connector.
+    if not has_motion or not (has_inspection or has_observation):
+        return None
+
+    source = office_catalog() if inspection_catalog is None else inspection_catalog
+    matches = _ordered_region_matches(text, source)
+    if not matches and inspection_mode and isinstance(default_location_id, str):
+        fallback = next(
+            (
+                region
+                for region in source.get("regions", [])
+                if isinstance(region, Mapping)
+                and str(region.get("regionId") or "").strip()
+                == default_location_id.strip()
+                and str(region.get("regionId") or "").strip() != "corridor"
+            ),
+            None,
+        )
+        if fallback is not None:
+            matches = [(0, 0, fallback)]
+    if len(matches) < 1 or len(matches) > 8:
+        return None
+    if len(matches) > 1 and not has_sequence and not (
+        has_inspection and _MULTI_REGION_CONNECTOR_PATTERN.search(text)
+    ):
+        return None
+    if len(matches) == 1 and not has_inspection:
+        return None
+    places: list[OfficePlaceRequest] = []
+    for _offset, _length, region in matches:
+        region_id = str(region.get("regionId") or "").strip()
+        region_name = str(region.get("name") or region_id).strip()
+        if not region_id or not region_name:
+            return None
+        places.append(
+            OfficePlaceRequest(
+                objective=text,
+                location_id=region_id,
+                location_name=region_name,
+                task="observe_report",
+                requested_role="observation_vantage",
+            )
+        )
+    return OfficeInspectionSequenceRequest(objective=text, places=tuple(places))
+
+
 def parse_office_place_request(
     objective: object,
     *,
@@ -176,6 +322,14 @@ def parse_office_place_request(
     if not isinstance(objective, str) or not objective.strip():
         return None
     text = objective.strip()
+    # Do not silently downgrade an ordered multi-room inspection to the first
+    # room mentioned in the sentence.  MissionService handles the sequence
+    # through its dedicated compiler below.
+    if parse_office_inspection_sequence_request(
+        text,
+        inspection_catalog=inspection_catalog,
+    ) is not None:
+        return None
     exiting = _EXIT_PATTERN.search(text) is not None
     if _STATIONARY_CURRENT_PATTERN.search(text) or (
         not exiting and not _MOTION_PATTERN.search(text)
@@ -252,6 +406,18 @@ def parse_office_place_request(
 
 
 def envelope_defaults(objective: object) -> dict[str, Any]:
+    sequence = parse_office_inspection_sequence_request(objective)
+    if sequence is not None:
+        room_count = len(sequence.places)
+        return {
+            "maximumGoalDistanceM": 20.0,
+            "maximumCumulativeDistanceM": 80.0,
+            "maximumSpeedMps": 0.20,
+            "maximumDurationSeconds": 4_800,
+            "maximumAutoRevisions": 8,
+            "maximumStageAttempts": 8,
+            "maximumScanYawRad": min(40.0 * math.pi, room_count * math.tau),
+        }
     if parse_office_place_request(objective) is None:
         return {}
     return {
@@ -259,10 +425,105 @@ def envelope_defaults(objective: object) -> dict[str, Any]:
         "maximumCumulativeDistanceM": 50.0,
         "maximumSpeedMps": 0.20,
         "maximumDurationSeconds": 2_400,
-        "maximumAutoRevisions": 3,
-        "maximumStageAttempts": 3,
+        "maximumAutoRevisions": 8,
+        "maximumStageAttempts": 8,
         "maximumScanYawRad": 2.0 * math.pi,
     }
+
+
+def _point_in_polygon(
+    x: float,
+    y: float,
+    polygon: list[Mapping[str, Any]],
+) -> bool:
+    """Return whether one current map pose lies inside a published region."""
+
+    if len(polygon) < 3:
+        return False
+    inside = False
+    previous = polygon[-1]
+    for current in polygon:
+        x1 = float(previous.get("x", 0.0))
+        y1 = float(previous.get("y", 0.0))
+        x2 = float(current.get("x", 0.0))
+        y2 = float(current.get("y", 0.0))
+        if (y1 > y) != (y2 > y):
+            crossing = (x2 - x1) * (y - y1) / (y2 - y1) + x1
+            if x < crossing:
+                inside = not inside
+        previous = current
+    return inside
+
+
+def _region_for_id(
+    source: Mapping[str, Any],
+    region_id: str,
+) -> Mapping[str, Any] | None:
+    return next(
+        (
+            region
+            for region in source.get("regions", [])
+            if isinstance(region, Mapping)
+            and str(region.get("regionId") or "").strip() == region_id
+        ),
+        None,
+    )
+
+
+def _pose_inside_region(
+    pose: PoseMap | None,
+    region_id: str,
+    source: Mapping[str, Any],
+) -> bool:
+    if pose is None or pose.frameId != "map":
+        return False
+    region = _region_for_id(source, region_id)
+    polygon = region.get("polygonXY") if isinstance(region, Mapping) else None
+    if not isinstance(polygon, list) or not all(
+        isinstance(item, Mapping) for item in polygon
+    ):
+        return False
+    return _point_in_polygon(pose.x, pose.y, polygon)
+
+
+def current_office_region_id(
+    pose: PoseMap | None,
+    *,
+    inspection_catalog: Mapping[str, Any] | None = None,
+) -> str | None:
+    """Resolve only the robot's fresh map pose to a published Office region."""
+
+    source = office_catalog() if inspection_catalog is None else inspection_catalog
+    if pose is None or pose.frameId != "map":
+        return None
+    for region in source.get("regions", []):
+        if not isinstance(region, Mapping):
+            continue
+        region_id = str(region.get("regionId") or "").strip()
+        if region_id and _pose_inside_region(pose, region_id, source):
+            return region_id
+    return None
+
+
+def _pose_near_station(
+    pose: PoseMap | None,
+    station: Mapping[str, Any],
+    *,
+    maximum_distance_m: float = PLACE_INSIDE_MAXIMUM_ANCHOR_DISTANCE_M,
+) -> bool:
+    if pose is None or pose.frameId != "map":
+        return False
+    target = station.get("pose")
+    if not isinstance(target, Mapping):
+        return False
+    try:
+        distance = math.hypot(
+            float(target["x"]) - pose.x,
+            float(target["y"]) - pose.y,
+        )
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
+    return math.isfinite(distance) and distance <= maximum_distance_m
 
 
 def _station_role(station: Mapping[str, Any]) -> str:
@@ -460,6 +721,12 @@ def compile_plan(
         )
         selected_station = interior_candidates[0]
 
+    if any(item not in world_ids for item in final_target.candidateTargetRecordIds):
+        raise ValueError(
+            "Office place target is not published in the bound Scene: "
+            f"{final_target.stationId}"
+        )
+
     for index, station in enumerate(targets, start=1):
         station_id = str(station["stationId"])
         is_final = station_id == str(selected_station["stationId"])
@@ -524,7 +791,7 @@ def compile_plan(
                     place=final_target,
                     completion=_completion(request, predicate="inside_region"),
                 ).model_dump(mode="json"),
-                dependsOn=[str(previous)],
+                dependsOn=[] if previous is None else [previous],
                 riskLevel=RiskLevel.LOW,
             )
         )
@@ -567,6 +834,226 @@ def compile_plan(
             )
         )
 
+    created = utc_now()
+    return MissionPlanDraft(
+        planId=mission_id,
+        robotId=str(brief["robotId"]),
+        objective=request.objective,
+        nodes=nodes,
+        envelope=envelope,
+        createdAt=created,
+        expiresAt=envelope.expiresAt,
+    )
+
+
+def _compile_observation_segment(
+    request: OfficePlaceRequest,
+    *,
+    source: Mapping[str, Any],
+    mission_id: str,
+    world_ids: set[str],
+    current_pose: PoseMap | None,
+    segment_index: int,
+    dependency: str | None,
+) -> tuple[list[MissionNode], str, str]:
+    """Compile one room's entry, interior verification and scan nodes."""
+
+    entry, interior_candidates = _ordered_stations(
+        request,
+        current_pose=current_pose,
+        inspection_catalog=source,
+    )
+    if not interior_candidates:
+        raise ValueError(
+            f"Office V2 location has no interior station: {request.location_id}"
+        )
+
+    selected_station = interior_candidates[0]
+    final_target = _place_target(
+        request,
+        mission_id=mission_id,
+        selected=selected_station,
+        candidates=interior_candidates,
+        role="observation_vantage",
+    )
+    current_inside = _pose_inside_region(
+        current_pose,
+        request.location_id,
+        source,
+    )
+    already_at_selected = current_inside and _pose_near_station(
+        current_pose,
+        selected_station,
+    )
+    targets = (
+        []
+        if already_at_selected
+        else [selected_station]
+        if current_inside
+        else ([entry] if entry is not None else []) + [selected_station]
+    )
+    if any(item not in world_ids for item in final_target.candidateTargetRecordIds):
+        raise ValueError(
+            "Office inspection target is not published in the bound Scene: "
+            f"{final_target.stationId}"
+        )
+    nodes: list[MissionNode] = []
+    previous = dependency
+    for target_index, station in enumerate(targets, start=1):
+        station_id = str(station["stationId"])
+        is_final = target_index == len(targets)
+        place = (
+            final_target
+            if is_final
+            else _place_target(
+                request,
+                mission_id=mission_id,
+                selected=station,
+                candidates=[station],
+                role="entry",
+            )
+        )
+        if any(item not in world_ids for item in place.candidateTargetRecordIds):
+            raise ValueError(
+                f"Office inspection target is not published in the bound Scene: {station_id}"
+            )
+        node_id = (
+            f"office-sequence-{segment_index:02d}-nav-"
+            f"{target_index:02d}-{station_id}"
+        )
+        nodes.append(
+            MissionNode(
+                nodeId=node_id,
+                skillId="navigation.navigate_to_pose",
+                skillVersion="2.0.0",
+                purpose=(
+                    f"进入{request.location_name}内部"
+                    if is_final
+                    else f"前往{request.location_name}入口"
+                ),
+                intent=PlaceNavigationIntent(
+                    task="navigate_to_place",
+                    place=place,
+                    completion=_completion(
+                        request,
+                        predicate="inside_region" if is_final else "at_anchor",
+                    ),
+                ).model_dump(mode="json"),
+                dependsOn=[] if previous is None else [previous],
+                riskLevel=RiskLevel.MEDIUM,
+            )
+        )
+        previous = node_id
+
+    verify_id = f"office-sequence-{segment_index:02d}-verify-{request.location_id}"
+    nodes.append(
+        MissionNode(
+            nodeId=verify_id,
+            skillId=SCENE_VERIFY_INSIDE_SKILL,
+            skillVersion="1.0.0",
+            purpose=f"确认机器人已完整进入{request.location_name}",
+            intent=PlaceNavigationIntent(
+                task="verify_inside_region",
+                place=final_target,
+                completion=_completion(request, predicate="inside_region"),
+            ).model_dump(mode="json"),
+            dependsOn=[] if previous is None else [previous],
+            riskLevel=RiskLevel.LOW,
+        )
+    )
+    scan_id = f"office-sequence-{segment_index:02d}-scan-{selected_station['stationId']}"
+    nodes.append(
+        MissionNode(
+            nodeId=scan_id,
+            skillId=OFFICE_INSPECTION_SKILL,
+            skillVersion="1.0.0",
+            purpose=f"在{request.location_name}内部停稳并多方向观察",
+            intent={
+                "stationId": str(selected_station["stationId"]),
+                "regionId": request.location_id,
+                "regionName": request.location_name,
+                "scanPurpose": "location_observation",
+                "requiresInsideVerification": True,
+            },
+            dependsOn=[verify_id],
+            riskLevel=RiskLevel.MEDIUM,
+        )
+    )
+    return nodes, scan_id, str(selected_station["stationId"])
+
+
+def compile_inspection_sequence_plan(
+    request: OfficeInspectionSequenceRequest,
+    brief: Mapping[str, Any],
+    *,
+    current_pose: PoseMap | None,
+    inspection_catalog: Mapping[str, Any] | None = None,
+) -> MissionPlanDraft:
+    """Compile one Mission that visits and observes each requested room."""
+
+    source = office_catalog() if inspection_catalog is None else dict(inspection_catalog)
+    if source.get("containsObjectAnswers") is not False:
+        raise ValueError("Office semantic catalog violates the product boundary")
+    if len(request.places) < 1 or len(request.places) > 8:
+        raise ValueError("Office inspection sequence must contain one to eight rooms")
+    location_ids = [item.location_id for item in request.places]
+    if len(location_ids) != len(set(location_ids)):
+        raise ValueError("Office inspection sequence contains duplicate rooms")
+
+    mission_id = str(brief["missionId"])
+    envelope = MissionEnvelope.model_validate(brief["envelope"])
+    required = {
+        "navigation.navigate_to_pose",
+        SCENE_VERIFY_INSIDE_SKILL,
+        OFFICE_INSPECTION_SKILL,
+        MISSION_REPORT_SKILL,
+    }
+    missing = required.difference(envelope.allowedSkillIds)
+    if missing:
+        raise ValueError(f"Office inspection capability is missing: {sorted(missing)[0]}")
+    allowed_regions = set(envelope.allowedRegionIds)
+    if allowed_regions and any(item not in allowed_regions for item in location_ids):
+        raise ValueError("Office inspection sequence contains a region outside the authorization envelope")
+
+    world_ids = {
+        str(item.get("recordId"))
+        for item in brief.get("worldRecords", [])
+        if isinstance(item, Mapping)
+    }
+    nodes: list[MissionNode] = []
+    previous: str | None = None
+    station_ids: list[str] = []
+    for index, place in enumerate(request.places, start=1):
+        segment, previous, station_id = _compile_observation_segment(
+            place,
+            source=source,
+            mission_id=mission_id,
+            world_ids=world_ids,
+            current_pose=current_pose if index == 1 else None,
+            segment_index=index,
+            dependency=previous,
+        )
+        nodes.extend(segment)
+        station_ids.append(station_id)
+
+    assert previous is not None
+    labels = "、".join(item.location_name for item in request.places)
+    nodes.append(
+        MissionNode(
+            nodeId="office-sequence-final-report",
+            skillId=MISSION_REPORT_SKILL,
+            skillVersion="1.0.0",
+            purpose=f"按房间汇总{labels}内及沿途观察信息",
+            intent={
+                "reportScope": "selected_locations",
+                "regionIds": location_ids,
+                "stationIds": station_ids,
+                "locale": str(brief.get("locale", "zh-CN")),
+            },
+            dependsOn=[previous],
+            riskLevel=RiskLevel.LOW,
+        )
+    )
     created = utc_now()
     return MissionPlanDraft(
         planId=mission_id,
@@ -716,6 +1203,7 @@ def parse_place_navigation_intent(value: Mapping[str, Any]) -> PlaceNavigationIn
 
 
 __all__ = [
+    "OfficeInspectionSequenceRequest",
     "OfficePlaceRequest",
     "PLACE_COMPLETION_SCHEMA_VERSION",
     "PLACE_INTENT_SCHEMA_VERSION",
@@ -727,7 +1215,10 @@ __all__ = [
     "PlaceTarget",
     "SCENE_VERIFY_INSIDE_SKILL",
     "compile_plan",
+    "compile_inspection_sequence_plan",
+    "current_office_region_id",
     "envelope_defaults",
+    "parse_office_inspection_sequence_request",
     "parse_office_place_request",
     "parse_place_navigation_intent",
 ]

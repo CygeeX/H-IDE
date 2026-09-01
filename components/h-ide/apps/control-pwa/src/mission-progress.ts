@@ -5,7 +5,6 @@ export interface MissionUserProgress {
   text: string;
   state: "active" | "done" | "blocked" | "info";
 }
-
 function payloadString(payload: Record<string, unknown>, key: string): string | null {
   const value = payload[key];
   return typeof value === "string" && value.trim() ? value.trim() : null;

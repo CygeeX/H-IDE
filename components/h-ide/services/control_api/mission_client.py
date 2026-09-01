@@ -19,6 +19,40 @@ class MissionPlanningUnavailable(RuntimeError):
     pass
 
 
+_MISSION_BRIEF_WIRE_FIELDS = frozenset(
+    {
+        "requestId",
+        "missionId",
+        "robotId",
+        "requestedBy",
+        "objective",
+        "locale",
+        "modality",
+        "contextVersion",
+        "envelope",
+        "capabilities",
+        "history",
+        "worldRecords",
+    }
+)
+
+
+def _mission_brief_wire_payload(brief: Mapping[str, Any]) -> dict[str, Any]:
+    """Project H-IDE bookkeeping out of the strict Agent Mission contract.
+
+    Conversation and semantic-referent IDs are used by H-IDE's deterministic
+    compilers, but are not part of the planning-agent MissionBrief schema.
+    Keeping this projection at the HTTP boundary prevents an internal
+    implementation detail from turning a valid fallback plan into a 422.
+    """
+
+    return {
+        key: brief[key]
+        for key in _MISSION_BRIEF_WIRE_FIELDS
+        if key in brief
+    }
+
+
 class UnavailableMissionPlanningClient:
     def __init__(self, reason: str = "Mission V2 planning service is not configured") -> None:
         self.reason = reason
@@ -112,7 +146,10 @@ class MastraMissionPlanningClient:
         return value
 
     def create_draft(self, brief: Mapping[str, Any]) -> Mapping[str, Any]:
-        return self._post("/internal/v2/mission-plans", brief)
+        return self._post(
+            "/internal/v2/mission-plans",
+            _mission_brief_wire_payload(brief),
+        )
 
     def create_revision(self, request: Mapping[str, Any]) -> Mapping[str, Any]:
         return self._post("/internal/v2/mission-revisions", request)

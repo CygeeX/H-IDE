@@ -142,7 +142,21 @@ class RobotAgentGatewayDriver:
                     robot_id=request.robotId,
                     wire_command_id=wire_command_id,
                 )
-            self._ensure_lease(request.robotId)
+            try:
+                self._ensure_lease(request.robotId)
+            except (RuntimeError, TimeoutError, ValueError) as exc:
+                # Control acquisition is an operational availability boundary,
+                # not an unhandled HTTP server failure.  Returning a typed
+                # adapter result lets Mission V2 retain the reviewed node and
+                # retry it without manufacturing a plan revision.
+                return AdapterResult(
+                    status="unavailable",
+                    error=f"Robot Agent control acquisition unavailable: {exc}",
+                    details={
+                        "protocolState": "UNAVAILABLE",
+                        "retryableControlAcquisition": True,
+                    },
+                )
             ttl_ms = max(
                 1,
                 int(

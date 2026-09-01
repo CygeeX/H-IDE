@@ -481,6 +481,7 @@ class AssistantService:
                 {
                     "conversationId": conversation_id,
                     "robotId": conversation.get("robotId"),
+                    "skillId": body.get("skillId"),
                     "locale": body.get("locale", conversation["locale"]),
                     "text": text,
                     "history": [],
@@ -658,6 +659,7 @@ class AssistantService:
                 {
                     "conversationId": conversation_id,
                     "robotId": conversation.get("robotId"),
+                    "skillId": raw_request.get("skillId"),
                     "locale": raw_request.get("locale", conversation["locale"]),
                     "text": raw_request.get("text"),
                     "history": list(prepared_memory.history),

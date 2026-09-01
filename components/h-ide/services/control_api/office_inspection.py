@@ -26,10 +26,32 @@ def is_full_office_inspection(objective: object) -> bool:
     if not isinstance(objective, str):
         return False
     normalized = re.sub(r"[\s，。！？、,.!?;；：:]+", "", objective).casefold()
-    return all(
+    # The leader-demo entry point accepts natural Chinese variants instead of
+    # requiring one literal sentence.  It still requires an explicit
+    # whole-office scope and a reporting/observation intent; a single-room
+    # request remains on the typed place compiler.
+    whole_scope = any(
         token in normalized
-        for token in ("走遍", "所有办公室", "信息", "路上")
+        for token in (
+            "走遍所有办公室",
+            "巡检所有办公室",
+            "巡查所有办公室",
+            "检查所有办公室",
+            "遍历所有办公室",
+            "全部办公室",
+            "所有办公室",
+            "每个办公室",
+            "各个办公室",
+        )
     )
+    inspection_intent = any(
+        token in normalized for token in ("巡检", "巡查", "检查", "走遍", "遍历")
+    )
+    report_intent = any(
+        token in normalized
+        for token in ("信息", "汇总", "报告", "告诉我", "看到", "观察")
+    )
+    return whole_scope and inspection_intent and report_intent
 
 
 def envelope_defaults(objective: object) -> dict[str, Any]:
@@ -42,8 +64,8 @@ def envelope_defaults(objective: object) -> dict[str, Any]:
         ),
         "maximumSpeedMps": 0.40,
         "maximumDurationSeconds": OFFICE_INSPECTION_MAXIMUM_DURATION_SECONDS,
-        "maximumAutoRevisions": 3,
-        "maximumStageAttempts": 3,
+        "maximumAutoRevisions": 8,
+        "maximumStageAttempts": 8,
         "maximumScanYawRad": OFFICE_INSPECTION_MAXIMUM_SCAN_YAW_RAD,
     }
 
@@ -223,11 +245,59 @@ def build_report(
     *,
     inspection_catalog: Mapping[str, Any] | None = None,
     source_missions: Sequence[Mapping[str, Any]] | None = None,
+    region_ids: Sequence[str] | None = None,
+    station_ids: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Aggregate only immutable scan outputs; never consult object truth."""
 
     source = catalog() if inspection_catalog is None else dict(inspection_catalog)
     stations = station_index(source)
+    selected_region_ids: list[str] | None = None
+    if region_ids is not None:
+        if isinstance(region_ids, (str, bytes)):
+            raise ValueError("report region_ids must be a sequence of region IDs")
+        selected_region_ids = [str(item).strip() for item in region_ids]
+        if (
+            not selected_region_ids
+            or any(not item for item in selected_region_ids)
+            or len(selected_region_ids) != len(set(selected_region_ids))
+        ):
+            raise ValueError("report region_ids are invalid")
+    selected_station_ids: list[str] | None = None
+    if station_ids is not None:
+        if isinstance(station_ids, (str, bytes)):
+            raise ValueError("report station_ids must be a sequence of station IDs")
+        selected_station_ids = [str(item).strip() for item in station_ids]
+        if (
+            not selected_station_ids
+            or any(not item for item in selected_station_ids)
+            or len(selected_station_ids) != len(set(selected_station_ids))
+            or any(item not in stations for item in selected_station_ids)
+        ):
+            raise ValueError("report station_ids are invalid")
+    region_by_id = {
+        str(item.get("regionId")): item
+        for item in source.get("regions", [])
+        if isinstance(item, Mapping) and item.get("regionId")
+    }
+    if selected_region_ids is not None:
+        if any(item not in region_by_id for item in selected_region_ids):
+            raise ValueError("report region_ids contain an unknown Office V2 region")
+    if selected_station_ids is not None:
+        if selected_region_ids is not None and any(
+            stations[item].get("regionId") not in set(selected_region_ids)
+            for item in selected_station_ids
+        ):
+            raise ValueError("report station_ids do not belong to the selected regions")
+        if selected_region_ids is None:
+            selected_region_ids = []
+            for station_id in selected_station_ids:
+                region_id = str(stations[station_id].get("regionId") or "")
+                if region_id and region_id not in selected_region_ids:
+                    selected_region_ids.append(region_id)
+    selected_station_set = (
+        set(selected_station_ids) if selected_station_ids is not None else None
+    )
     observations: dict[str, dict[str, Any]] = {}
     for mission_record in [*(source_missions or ()), mission]:
         for execution in mission_record.get("skillExecutions", []):
@@ -260,6 +330,8 @@ def build_report(
                 continue
             observed_headings: list[float] = []
             valid = True
+            reliable_visual_count = 0
+            heading_gaps: list[dict[str, Any]] = []
             for heading in raw_headings:
                 if not isinstance(heading, Mapping):
                     valid = False
@@ -270,7 +342,22 @@ def build_report(
                     isinstance(raw_yaw, bool)
                     or not isinstance(raw_yaw, (int, float))
                     or not math.isfinite(float(raw_yaw))
-                    or not isinstance(visual, Mapping)
+                ):
+                    valid = False
+                    break
+                observed_headings.append(float(raw_yaw))
+                if heading.get("status") == "missing" and visual is None:
+                    heading_gaps.append(
+                        {
+                            "headingRad": float(raw_yaw),
+                            "reason": str(
+                                heading.get("missingReason") or "未取得可靠观察"
+                            )[:512],
+                        }
+                    )
+                    continue
+                if (
+                    not isinstance(visual, Mapping)
                     or visual.get("schemaVersion") != "h-ide.visual-result/2"
                     or visual.get("status") != "succeeded"
                     or visual.get("mode") != "scene_description"
@@ -279,21 +366,44 @@ def build_report(
                 ):
                     valid = False
                     break
-                observed_headings.append(float(raw_yaw))
+                reliable_visual_count += 1
             if not valid or any(
                 abs(actual - float(expected)) > 1e-9
                 for actual, expected in zip(observed_headings, expected_headings, strict=True)
-            ):
+            ) or reliable_visual_count == 0:
                 continue
-            observations[station_id] = dict(scan)
+            observations[station_id] = {
+                **dict(scan),
+                "headingGaps": heading_gaps,
+            }
 
+    if selected_region_ids is None:
+        regions_to_report = [
+            item for item in source["regions"] if isinstance(item, Mapping)
+        ]
+    else:
+        regions_to_report = [region_by_id[item] for item in selected_region_ids]
     regions: list[dict[str, Any]] = []
     evidence: list[dict[str, Any]] = []
     missing_stations: list[str] = []
-    for region in source["regions"]:
+    heading_gaps: list[dict[str, Any]] = []
+    for region in regions_to_report:
         station_reports: list[dict[str, Any]] = []
         summaries: list[str] = []
-        for station in region["stations"]:
+        report_stations = [
+            station
+            for station in region["stations"]
+            if selected_station_set is None
+            or station.get("stationId") in selected_station_set
+        ]
+        if not report_stations:
+            # A selected region must have at least one selected station.  This
+            # is checked here as well as at the input boundary so the report
+            # cannot claim completion for an empty room selection.
+            raise ValueError(
+                f"report selection contains no station for region {region['regionId']}"
+            )
+        for station in report_stations:
             station_id = station["stationId"]
             scan = observations.get(station_id)
             if scan is None:
@@ -308,6 +418,15 @@ def build_report(
                     continue
                 visual = heading.get("visualResult")
                 if not isinstance(visual, Mapping):
+                    heading_gaps.append(
+                        {
+                            "stationId": station_id,
+                            "headingRad": heading.get("headingRad"),
+                            "reason": str(
+                                heading.get("missingReason") or "未取得可靠观察"
+                            )[:512],
+                        }
+                    )
                     continue
                 summary = str(visual.get("observationSummary") or "").strip()
                 if summary:
@@ -341,8 +460,13 @@ def build_report(
             station_reports.append(
                 {
                     "stationId": station_id,
-                    "status": "observed" if heading_reports else "missing",
+                    "status": (
+                        "observed_with_gaps"
+                        if scan.get("headingGaps")
+                        else "observed"
+                    ) if heading_reports else "missing",
                     "headings": heading_reports,
+                    "headingGaps": list(scan.get("headingGaps", [])),
                 }
             )
             if not heading_reports:
@@ -355,6 +479,8 @@ def build_report(
                 "status": (
                     "observed"
                     if all(item["status"] == "observed" for item in station_reports)
+                    else "observed_with_gaps"
+                    if all(item["status"] != "missing" for item in station_reports)
                     else "partial"
                 ),
                 "summaries": summaries,
@@ -362,8 +488,13 @@ def build_report(
             }
         )
     missing_stations = list(dict.fromkeys(missing_stations))
-    status = "completed" if not missing_stations else "completed_with_gaps"
-    lines = ["Office V2 巡检报告"]
+    status = (
+        "completed"
+        if not missing_stations and not heading_gaps
+        else "completed_with_gaps"
+    )
+    selected = selected_region_ids is not None or selected_station_ids is not None
+    lines = ["Office V2 定向巡检报告" if selected else "Office V2 巡检报告"]
     for region in regions:
         summaries = region["summaries"]
         lines.append(
@@ -372,15 +503,214 @@ def build_report(
         )
     if missing_stations:
         lines.append("- 信息缺口：" + "、".join(missing_stations))
-    return {
+    if heading_gaps:
+        lines.append(
+            "- 未确认方向："
+            + "、".join(
+                f"{item['stationId']}@{float(item['headingRad']):.2f}rad"
+                for item in heading_gaps
+                if isinstance(item.get("headingRad"), (int, float))
+            )
+        )
+    report: dict[str, Any] = {
         "schemaVersion": "h-ide.office-report/1",
         "missionId": mission.get("missionId") or mission.get("snapshot", {}).get("missionId"),
+        "reportScope": (
+            "selected_locations"
+            if selected
+            else "all_office_regions_and_corridor"
+        ),
         "status": status,
         "fullChainAccepted": status == "completed",
         "regions": regions,
         "missingStations": missing_stations,
+        "headingGaps": heading_gaps,
         "evidence": evidence,
         "narrativeZhCN": "\n".join(lines),
+    }
+    if selected_region_ids is not None:
+        report["regionIds"] = list(selected_region_ids)
+    if selected_station_ids is not None:
+        report["stationIds"] = list(selected_station_ids)
+    return report
+
+
+def build_location_report(
+    mission: Mapping[str, Any],
+    *,
+    region_id: str,
+    station_id: str,
+    inspection_catalog: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build one evidence-complete report from post-arrival fresh frames."""
+
+    source = catalog() if inspection_catalog is None else dict(inspection_catalog)
+    stations = station_index(source)
+    station = stations.get(station_id)
+    if station is None or station.get("regionId") != region_id:
+        raise ValueError("location report station is not bound to the requested region")
+    region = next(
+        (
+            item
+            for item in source.get("regions", [])
+            if isinstance(item, Mapping) and item.get("regionId") == region_id
+        ),
+        None,
+    )
+    if not isinstance(region, Mapping):
+        raise ValueError("location report region is not in the Office V2 catalog")
+
+    verified_at = None
+    for execution in mission.get("skillExecutions", []):
+        if not isinstance(execution, Mapping):
+            continue
+        request = execution.get("request")
+        terminal = execution.get("result")
+        if (
+            not isinstance(request, Mapping)
+            or request.get("skillId") != "scene.verify_inside_region"
+            or not isinstance(terminal, Mapping)
+            or terminal.get("status") != "succeeded"
+        ):
+            continue
+        result = terminal.get("result")
+        inside = (
+            result.get("insideRegionResult")
+            if isinstance(result, Mapping)
+            else None
+        )
+        if (
+            not isinstance(inside, Mapping)
+            or inside.get("schemaVersion") != "h-ide.inside-region/1"
+            or inside.get("verified") is not True
+            or inside.get("regionId") != region_id
+            or inside.get("stationId") != station_id
+        ):
+            continue
+        raw_verified_at = inside.get("verifiedAt")
+        if not isinstance(raw_verified_at, str):
+            continue
+        try:
+            candidate = datetime.fromisoformat(raw_verified_at.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if verified_at is None or candidate > verified_at:
+            verified_at = candidate
+    if verified_at is None:
+        raise ValueError("location report has no successful inside-region verification")
+
+    scan = None
+    for execution in mission.get("skillExecutions", []):
+        if not isinstance(execution, Mapping):
+            continue
+        request = execution.get("request")
+        terminal = execution.get("result")
+        if (
+            not isinstance(request, Mapping)
+            or request.get("skillId") != OFFICE_INSPECTION_SKILL
+            or request.get("input", {}).get("stationId") != station_id
+            or not isinstance(terminal, Mapping)
+            or terminal.get("status") != "succeeded"
+        ):
+            continue
+        result = terminal.get("result")
+        candidate_scan = (
+            result.get("inspectionResult")
+            if isinstance(result, Mapping)
+            else None
+        )
+        if isinstance(candidate_scan, Mapping):
+            scan = candidate_scan
+    if not isinstance(scan, Mapping):
+        raise ValueError("location report has no completed station observation")
+
+    expected_headings = station.get("scanHeadingsRad")
+    raw_headings = scan.get("headings")
+    if (
+        not isinstance(expected_headings, list)
+        or not expected_headings
+        or not isinstance(raw_headings, list)
+        or len(raw_headings) != len(expected_headings)
+    ):
+        raise ValueError("location report observation headings are incomplete")
+    summaries: list[str] = []
+    evidence: list[dict[str, Any]] = []
+    for expected_yaw, heading in zip(expected_headings, raw_headings, strict=True):
+        if not isinstance(heading, Mapping):
+            raise ValueError("location report heading is invalid")
+        raw_yaw = heading.get("headingRad")
+        visual = heading.get("visualResult")
+        if (
+            isinstance(raw_yaw, bool)
+            or not isinstance(raw_yaw, (int, float))
+            or abs(float(raw_yaw) - float(expected_yaw)) > 1e-9
+            or not isinstance(visual, Mapping)
+            or visual.get("schemaVersion") != "h-ide.visual-result/2"
+            or visual.get("status") != "succeeded"
+            or visual.get("mode") != "scene_description"
+        ):
+            raise ValueError("location report contains an invalid visual heading")
+        source_payload = visual.get("source")
+        captured_at = (
+            source_payload.get("capturedAt")
+            if isinstance(source_payload, Mapping)
+            else None
+        )
+        if not isinstance(captured_at, str):
+            raise ValueError("location report visual frame has no capture time")
+        try:
+            captured = datetime.fromisoformat(captured_at.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("location report visual capture time is invalid") from exc
+        if captured <= verified_at:
+            raise ValueError("location report attempted to reuse a pre-arrival frame")
+        summary = str(visual.get("observationSummary") or "").strip()
+        if not summary:
+            raise ValueError("location report visual heading has no observation summary")
+        summaries.append(summary)
+        analysis_id = visual.get("analysisId")
+        for item in visual.get("evidence", []):
+            if not isinstance(item, Mapping) or not isinstance(item.get("sha256"), str):
+                continue
+            evidence.append(
+                {
+                    "stationId": station_id,
+                    "analysisId": analysis_id,
+                    "sha256": item["sha256"],
+                    "mediaType": item.get("mediaType"),
+                    "capturedAt": captured_at,
+                }
+            )
+    name = str(region.get("name") or region_id)
+    return {
+        "schemaVersion": "h-ide.office-report/1",
+        "missionId": mission.get("missionId")
+        or mission.get("snapshot", {}).get("missionId"),
+        "reportScope": "current_location",
+        "locationId": region_id,
+        "stationId": station_id,
+        "insideVerifiedAt": verified_at.isoformat(),
+        "status": "completed",
+        "fullChainAccepted": True,
+        "regions": [
+            {
+                "regionId": region_id,
+                "name": name,
+                "kind": str(region.get("kind") or "room"),
+                "status": "observed",
+                "summaries": summaries,
+                "stations": [
+                    {
+                        "stationId": station_id,
+                        "status": "observed",
+                        "headings": list(raw_headings),
+                    }
+                ],
+            }
+        ],
+        "missingStations": [],
+        "evidence": evidence,
+        "narrativeZhCN": f"{name}观察报告\n- " + "；".join(summaries),
     }
 
 

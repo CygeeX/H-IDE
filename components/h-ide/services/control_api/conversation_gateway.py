@@ -15,10 +15,13 @@ from packages.control_core.assistant_models import (
 
 from .conversation_client import ConversationClient
 from .conversation_client import ConversationRoutingUnavailable
-from .mission_policy import PolicyActor
+from .mission_policy import MissionPolicyDenied, PolicyActor
 from .office_inspection import is_full_office_inspection
 from .object_semantic_navigation import parse_object_semantic_request
-from .office_semantic_navigation import parse_office_place_request
+from .office_semantic_navigation import (
+    parse_office_inspection_sequence_request,
+    parse_office_place_request,
+)
 
 
 MissionDraftCreator = Callable[[Mapping[str, Any]], Mapping[str, Any]]
@@ -114,7 +117,12 @@ class ConversationGateway:
         # adds no authority check and makes the fixed acceptance flow depend
         # on an unrelated model/network timeout.  The shortcut still creates
         # only a reviewable Mission draft; it cannot dispatch motion.
-        if is_full_office_inspection(request.text):
+        sequence_request = parse_office_inspection_sequence_request(request.text)
+        if (
+            is_full_office_inspection(request.text)
+            or sequence_request is not None
+            or request.skillId == "inspection.office"
+        ):
             if request.robotId is None:
                 return self._result(
                     task_id=task_id,
@@ -141,12 +149,17 @@ class ConversationGateway:
             if request.memoryContext is not None
             else []
         )
+        known_sequence = sequence_request
         known_place = parse_office_place_request(request.text)
         known_object = parse_object_semantic_request(
             request.text,
             semantic_referents=semantic_referents,
         )
-        known_physical_action = known_place is not None or known_object is not None
+        known_physical_action = (
+            known_sequence is not None
+            or known_place is not None
+            or known_object is not None
+        )
         try:
             routed = self.client.route_turn(request)
         except ConversationRoutingUnavailable:
@@ -358,6 +371,8 @@ class ConversationGateway:
             "modality": modality,
             "history": [dict(item) for item in mission_history],
         }
+        if request.skillId is not None:
+            brief["skillId"] = request.skillId
         creator_parameters = inspect.signature(
             self.mission_draft_creator
         ).parameters.values()
@@ -365,11 +380,29 @@ class ConversationGateway:
             item.name == "actor" or item.kind is inspect.Parameter.VAR_KEYWORD
             for item in creator_parameters
         )
-        draft = (
-            self.mission_draft_creator(brief, actor=mission_actor)
-            if mission_actor is not None and accepts_actor
-            else self.mission_draft_creator(brief)
-        )
+        try:
+            draft = (
+                self.mission_draft_creator(brief, actor=mission_actor)
+                if mission_actor is not None and accepts_actor
+                else self.mission_draft_creator(brief)
+            )
+        except MissionPolicyDenied as exc:
+            # A stale developer-only robot record must produce an actionable
+            # selection message, not the generic "service unavailable" turn
+            # failure. Physical execution remains blocked until a bound robot
+            # is selected; no fallback robot is silently substituted here.
+            if "immutable site/execution-target binding" in str(exc):
+                return self._result(
+                    task_id=task_id,
+                    request=request,
+                    intent=ConversationIntent.ROBOT_ACTION,
+                    route=ConversationRoute.MISSION_REVIEW,
+                    route_status="needs_robot",
+                    assistant_message=(
+                        "当前选择的机器人没有可执行场地绑定，请选择在线的仿真 G1 后重试。"
+                    ),
+                )
+            raise
         draft_id = draft.get("draftId")
         if not isinstance(draft_id, str) or not draft_id:
             raise ConversationGatewayError("Mission V2 returned no durable draftId")

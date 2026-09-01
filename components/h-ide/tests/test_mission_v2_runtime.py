@@ -1303,6 +1303,68 @@ def test_human_required_revision_is_not_active_until_separately_approved() -> No
     assert observe_state["attempt"] == 1
 
 
+def test_revision_preserves_succeeded_node_when_only_display_text_changes() -> None:
+    plan = _plan()
+    runtime = MissionRuntime(SQLiteStore(":memory:"))
+    record = runtime.approve(plan, approved_by="tester")
+    runtime.start(plan.planId)
+    observed = _issue_current(
+        runtime,
+        plan.planId,
+        "observe",
+        {"mode": "scene_description"},
+    )
+    runtime.record_result(
+        plan.planId,
+        SkillResult(
+            requestId=observed.requestId,
+            status="succeeded",
+            completedAt=utc_now(),
+            result={"visualResult": "recorded"},
+        ),
+    )
+    active = runtime.get(plan.planId)["activeRevision"]
+    proposed = PlanRevision(
+        revisionId="revision-presentation-only-2",
+        missionId=plan.planId,
+        sequence=2,
+        parentRevisionId=active["revisionId"],
+        objective=plan.objective,
+        nodes=[
+            plan.nodes[0].model_copy(
+                update={
+                    "purpose": "用更清晰的文案描述同一视觉观察",
+                    "riskLevel": RiskLevel.MEDIUM,
+                }
+            ),
+            plan.nodes[1],
+        ],
+        reasonCode="presentation_only",
+        reason="Improve operator-facing wording without changing execution",
+        changeSummary=["Update purpose text"],
+        disposition=ApprovalDisposition.HUMAN_REQUIRED,
+        authorizationId=None,
+        createdBy="h-ide-agent",
+        createdAt=utc_now(),
+    )
+    runtime.apply_revision(proposed)
+
+    approved = runtime.approve_pending_revision(
+        plan.planId,
+        proposed.revisionId,
+        approved_by="operator-1",
+    )
+    state = next(
+        item
+        for item in approved["nodeStates"]
+        if item["revisionId"] == approved["activeRevisionId"]
+        and item["nodeId"] == "observe"
+    )
+    assert state["status"] == "succeeded"
+    assert state["attempt"] == 1
+    assert state["state"]["resultStatus"] == "succeeded"
+
+
 def test_planner_cannot_activate_a_physical_policy_inherited_revision() -> None:
     runtime = MissionRuntime(SQLiteStore(":memory:"))
     record = runtime.approve(_plan(), approved_by="tester")

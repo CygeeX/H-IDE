@@ -96,6 +96,33 @@ class _ScriptedPeer:
         )
 
 
+class _ControlUnavailablePeer(_ScriptedPeer):
+    def acquire(self, robot_id: str) -> Mapping[str, Any]:
+        assert robot_id == "robot-1"
+        raise RuntimeError("measured simulator control boundary is settling")
+
+
+def test_control_acquisition_unavailability_is_a_typed_adapter_result() -> None:
+    peer = _ControlUnavailablePeer()
+    driver = RobotAgentGatewayDriver(peer)
+
+    result = driver.dispatch(
+        request("10101010-1010-4010-8010-101010101010"),
+        mapping(),
+    )
+
+    assert result.status == "unavailable"
+    assert result.error == (
+        "Robot Agent control acquisition unavailable: "
+        "measured simulator control boundary is settling"
+    )
+    assert result.details == {
+        "protocolState": "UNAVAILABLE",
+        "retryableControlAcquisition": True,
+    }
+    assert peer.statuses == {}
+
+
 def test_two_commands_release_only_after_last_terminal_and_cache_truth() -> None:
     peer = _ScriptedPeer()
     driver = RobotAgentGatewayDriver(peer)

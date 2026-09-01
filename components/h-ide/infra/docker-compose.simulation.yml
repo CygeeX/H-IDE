@@ -30,6 +30,12 @@ services:
       SIMULATION_ROBOT_AGENT_GATEWAY_URL: ${SIMULATION_ROBOT_AGENT_GATEWAY_URL:-http://host.docker.internal:8094}
       SIMULATION_ROBOT_AGENT_GATEWAY_TOKEN: ${SIMULATION_ROBOT_AGENT_GATEWAY_TOKEN:-dev-sim-gateway-token}
       SIMULATION_ROBOT_AGENT_ID: ${SIMULATION_ROBOT_AGENT_ID:-g1-sim}
+      HIDE_LEADER_DEMO_GESTURES_ENABLED: ${HIDE_LEADER_DEMO_GESTURES_ENABLED:-true}
+      # Control API reaches only the host-side, allow-listed gesture proxy.
+      # The proxy owns the private SONIC socket hop; the raw command port is
+      # intentionally absent from this container's environment.
+      HIDE_LEADER_DEMO_GESTURE_URL: ${HIDE_LEADER_DEMO_GESTURE_URL:-http://host.docker.internal:8798}
+      HIDE_LEADER_DEMO_GESTURE_PROXY_TOKEN: ${HIDE_LEADER_DEMO_GESTURE_PROXY_TOKEN:-dev-leader-demo-gesture-token}
       # The Robot Agent binds its privileged diagnostics service to host
       # loopback on 8796.  Docker reaches the read-only bridge published by
       # the workstation launcher on 8797; pointing the container at 8796

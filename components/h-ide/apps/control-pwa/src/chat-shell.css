@@ -1140,3 +1140,228 @@ body {
   .auth-intro { display: none; }
   .auth-card { padding: 21px; border-radius: 16px; }
 }
+
+/* Leader-demo presentation layer.  It is intentionally appended after the
+   product theme so the demo can be enabled without changing the existing
+   conversation/mission layout contracts. */
+.brand-logo-image {
+  width: 25px;
+  height: 25px;
+  object-fit: cover;
+  border-radius: 7px;
+  box-shadow: 0 3px 12px rgba(108, 78, 137, .16);
+}
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+.empty-logo img, .auth-logo img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: inherit;
+}
+.auth-logo img { padding: 5px; }
+
+.leader-avatar-rail {
+  position: absolute;
+  z-index: 3;
+  top: 18px;
+  right: clamp(12px, 3vw, 52px);
+  width: min(218px, 22vw);
+  pointer-events: none;
+}
+.leader-avatar-rail .robot-avatar { pointer-events: auto; }
+.robot-avatar {
+  position: relative;
+  width: 100%;
+  min-height: 170px;
+  display: grid;
+  place-items: center;
+  isolation: isolate;
+}
+.robot-avatar.compact { min-height: 150px; }
+.robot-avatar-orbit {
+  position: relative;
+  width: 164px;
+  height: 164px;
+  display: grid;
+  place-items: center;
+  animation: robot-avatar-float 5s ease-in-out infinite;
+}
+.robot-avatar.compact .robot-avatar-orbit { width: 132px; height: 132px; }
+.robot-avatar-ring {
+  position: absolute;
+  inset: 8px;
+  border: 1px solid rgba(143, 112, 177, .34);
+  border-radius: 50%;
+  transform: rotate(18deg) scaleX(.72);
+  animation: robot-avatar-orbit 8s linear infinite;
+}
+.robot-avatar-ring.ring-b { inset: 18px; border-color: rgba(75, 158, 179, .28); transform: rotate(-28deg) scaleY(.72); animation-duration: 6.5s; animation-direction: reverse; }
+.robot-avatar-face {
+  position: relative;
+  z-index: 2;
+  width: 106px;
+  height: 106px;
+  display: grid;
+  place-items: center;
+  border: 1px solid rgba(152, 126, 190, .55);
+  border-radius: 34px;
+  background: linear-gradient(145deg, #302741, #151821 68%, #202d3a);
+  box-shadow: 0 16px 34px rgba(62, 45, 82, .22), inset 0 0 24px rgba(146, 120, 188, .12);
+}
+.robot-avatar.compact .robot-avatar-face { width: 86px; height: 86px; border-radius: 28px; }
+.robot-avatar-visor { position: absolute; top: 29px; display: flex; align-items: center; gap: 18px; }
+.robot-avatar.compact .robot-avatar-visor { top: 24px; gap: 14px; }
+.robot-avatar-visor i { width: 10px; height: 25px; border-radius: 8px; background: #8ce8ff; box-shadow: 0 0 12px rgba(117, 220, 246, .86); animation: robot-avatar-blink 4.8s ease-in-out infinite; }
+.robot-avatar-visor i:nth-child(2) { animation-delay: .12s; }
+.robot-avatar-visor b { position: absolute; top: 37px; left: 50%; width: 13px; height: 4px; border-radius: 4px; background: #a7a9ff; transform: translateX(-50%); box-shadow: 0 0 8px rgba(167, 169, 255, .65); }
+.robot-avatar-mark { position: absolute; right: 9px; bottom: 8px; width: 20px; height: 20px; padding: 3px; display: grid; place-items: center; border-radius: 7px; background: rgba(255, 253, 249, .9); }
+.robot-avatar-mark img { width: 100%; height: 100%; object-fit: cover; border-radius: 4px; }
+.robot-avatar.compact .robot-avatar-mark { right: 7px; bottom: 7px; width: 17px; height: 17px; }
+.robot-avatar::after { content: ""; position: absolute; right: 18%; bottom: 4px; left: 18%; height: 30px; border-radius: 50%; background: radial-gradient(ellipse, rgba(146, 118, 188, .28), transparent 70%); filter: blur(5px); }
+.robot-speech-bubble {
+  position: absolute;
+  z-index: 4;
+  top: 10px;
+  right: calc(100% - 36px);
+  width: 210px;
+  padding: 10px 12px;
+  border: 1px solid rgba(159, 134, 191, .35);
+  border-radius: 13px 13px 4px 13px;
+  color: #51465e;
+  background: rgba(255, 253, 249, .95);
+  box-shadow: 0 12px 32px rgba(74, 54, 87, .14);
+  font-size: 10px;
+  line-height: 1.55;
+  pointer-events: none;
+  animation: speech-pop .28s ease-out;
+}
+.robot-speech-bubble::after {
+  content: "";
+  position: absolute;
+  right: -7px;
+  bottom: 9px;
+  width: 12px;
+  height: 12px;
+  border-top: 1px solid rgba(159, 134, 191, .35);
+  border-right: 1px solid rgba(159, 134, 191, .35);
+  background: rgba(255, 253, 249, .95);
+  transform: rotate(45deg);
+}
+.robot-avatar:not(.compact) .robot-speech-bubble { right: -8px; top: 6px; width: 230px; }
+@keyframes speech-pop { from { opacity: 0; transform: translateY(4px) scale(.98); } }
+@keyframes robot-avatar-float { 50% { transform: translateY(-5px); } }
+@keyframes robot-avatar-orbit { to { transform: rotate(378deg) scaleX(.72); } }
+@keyframes robot-avatar-blink { 0%, 93%, 100% { transform: scaleY(1); } 96% { transform: scaleY(.18); } }
+
+.leader-session-context { display: grid; gap: 11px; }
+.leader-skill-banner {
+  width: min(100%, 760px);
+  align-self: center;
+  min-height: 38px;
+  padding: 7px 9px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid rgba(154, 127, 189, .28);
+  border-radius: 9px;
+  background: rgba(255, 253, 249, .72);
+  box-shadow: 0 7px 22px rgba(77, 56, 88, .06);
+}
+.leader-skill-banner.accent-cyan { border-color: rgba(85, 163, 184, .3); }
+.leader-skill-banner-dot { width: 7px; height: 7px; flex: 0 0 auto; border-radius: 50%; background: #9273af; box-shadow: 0 0 0 4px rgba(146, 115, 175, .12); }
+.accent-cyan .leader-skill-banner-dot { background: #4b9eb3; box-shadow: 0 0 0 4px rgba(75, 158, 179, .12); }
+.leader-skill-banner > span:nth-child(2) { min-width: 0; display: grid; gap: 1px; }
+.leader-skill-banner b { color: #51445d; font-size: 10px; }
+.leader-skill-banner small { color: #958a9d; font: 8px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.leader-skill-banner button { margin-left: auto; padding: 4px 7px; border: 1px solid #dfd3e4; border-radius: 6px; color: #806a90; background: #fffdf9; font-size: 9px; }
+.leader-skill-banner button:hover { border-color: #bda7ca; background: #f6eff8; }
+.leader-skill-greeting { width: min(100%, 720px); align-self: center; display: grid; gap: 7px; }
+
+.leader-skill-robot-selector { width: min(680px, 100%); margin: 0 auto 13px; padding: 8px 10px; display: flex; align-items: center; justify-content: space-between; gap: 12px; border: 1px solid #e2d7e5; border-radius: 10px; background: rgba(255, 253, 249, .72); box-shadow: 0 5px 16px rgba(81, 62, 93, .04); }
+.leader-skill-robot-label { color: #817487; font-size: 10px; font-weight: 650; letter-spacing: .01em; }
+
+.leader-skill-selection { width: min(680px, 100%); margin: 0 auto 20px; text-align: left; }
+.leader-skill-heading { display: grid; gap: 5px; margin-bottom: 9px; }
+.leader-skill-kicker { color: #9273af; font: 8px ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .1em; }
+.leader-skill-heading strong { color: #51455e; font-size: 12px; }
+.leader-skill-heading small { color: #84798b; font-size: 10px; line-height: 1.5; }
+.leader-skill-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
+.leader-skill-card {
+  position: relative;
+  min-width: 0;
+  min-height: 108px;
+  padding: 13px 30px 12px 12px;
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  align-items: start;
+  gap: 9px;
+  border: 1px solid #e2d7e5;
+  border-radius: 11px;
+  color: #4d4357;
+  background: rgba(255, 253, 249, .86);
+  text-align: left;
+  box-shadow: 0 6px 18px rgba(81, 62, 93, .04);
+  transition: transform .18s, border-color .18s, box-shadow .18s;
+}
+.leader-skill-card:hover, .leader-skill-card.selected { transform: translateY(-2px); border-color: #aa8fc1; box-shadow: 0 11px 25px rgba(101, 73, 119, .12); }
+.leader-skill-card.accent-cyan:hover, .leader-skill-card.accent-cyan.selected { border-color: #78b7c4; }
+.leader-skill-icon { width: 34px; height: 34px; display: grid; place-items: center; border-radius: 10px; color: #8d6aae; background: #f0e8f5; font-size: 20px; }
+.accent-cyan .leader-skill-icon { color: #398ba0; background: #e7f3f6; }
+.leader-skill-copy { min-width: 0; display: grid; gap: 4px; }
+.leader-skill-copy small { color: #9c8ca6; font: 8px ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .06em; }
+.leader-skill-copy strong { color: #4e4258; font-size: 12px; }
+.leader-skill-copy > span { color: #817687; font-size: 10px; line-height: 1.45; }
+.leader-skill-arrow { position: absolute; right: 11px; bottom: 11px; color: #a18caf; font-size: 16px; }
+.leader-skill-card.accent-cyan .leader-skill-arrow { color: #559dae; }
+
+.leader-robot-picker { position: relative; z-index: 12; flex: 0 0 auto; }
+.leader-robot-trigger { height: 29px; max-width: 205px; padding: 3px 7px 3px 4px; display: inline-flex; align-items: center; gap: 6px; border: 1px solid #e0d4e4; border-radius: 8px; color: #51455d; background: #fffaf5; }
+.leader-robot-trigger:hover { border-color: #baa4c8; background: #fffdf9; }
+.leader-robot-trigger > img { width: 22px; height: 22px; object-fit: cover; border-radius: 6px; background: #f0e9f4; }
+.leader-robot-trigger > span { min-width: 0; display: grid; gap: 1px; text-align: left; }
+.leader-robot-trigger b { overflow: hidden; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.leader-robot-trigger small { overflow: hidden; color: #938697; font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
+.leader-robot-trigger i { margin-left: auto; color: #927da0; font-style: normal; font-size: 13px; }
+.leader-robot-picker.compact .leader-robot-trigger { max-width: 190px; }
+.leader-picker-modal-layer { position: fixed; z-index: 80; inset: 0; display: grid; place-items: center; padding: 20px; }
+.leader-picker-scrim { position: absolute; z-index: 0; inset: 0; padding: 0; border: 0; background: rgba(40, 30, 48, .38); backdrop-filter: blur(5px); }
+.leader-robot-options { position: relative; z-index: 1; width: min(560px, 100%); max-height: min(650px, calc(100dvh - 40px)); overflow: auto; padding: 15px; border: 1px solid #ded2e2; border-radius: 16px; background: #fffdf9; box-shadow: 0 24px 70px rgba(67, 47, 78, .28); }
+.leader-robot-options header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 1px 2px 12px; }
+.leader-robot-options header > span { display: grid; gap: 3px; }
+.leader-robot-options header strong { color: #4c4056; font-size: 11px; }
+.leader-robot-options header small { color: #918495; font-size: 9px; }
+.leader-robot-options-close { width: 27px; height: 27px; padding: 0; border: 1px solid #e2d7e5; border-radius: 7px; color: #85758d; background: #faf5fb; font-size: 18px; line-height: 1; }
+.leader-robot-options-close:hover { border-color: #bea7ca; background: #f2eaf5; }
+.leader-robot-option-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
+.leader-robot-option { min-width: 0; padding: 6px; display: grid; gap: 5px; border: 1px solid #e5dbe6; border-radius: 9px; color: #564a5f; background: #fbf7fb; text-align: left; }
+.leader-robot-option:hover, .leader-robot-option.selected { border-color: #b497c4; background: #f4edf7; }
+.leader-robot-option img { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 6px; background: #eee8f2; }
+.leader-robot-option span { min-width: 0; display: grid; gap: 2px; }
+.leader-robot-option b { overflow: hidden; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.leader-robot-option small { overflow: hidden; color: #948798; font-size: 8px; line-height: 1.3; text-overflow: ellipsis; white-space: nowrap; }
+.leader-robot-option em { width: max-content; padding: 2px 4px; border-radius: 4px; color: #5c987b; background: #eaf5ef; font-size: 7px; font-style: normal; }
+.leader-robot-option:not(.selected) em { color: #987d55; background: #faf1df; }
+
+@media (max-width: 900px) {
+  .leader-avatar-rail { display: none; }
+}
+@media (max-width: 640px) {
+  .leader-skill-grid { grid-template-columns: 1fr; }
+  .leader-skill-selection { margin-bottom: 14px; }
+  .leader-skill-robot-selector { align-items: flex-start; flex-direction: column; gap: 7px; }
+  .leader-robot-trigger { max-width: 100%; }
+  .leader-robot-option-grid { gap: 5px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .robot-avatar-orbit, .robot-avatar-ring, .robot-avatar-visor i { animation: none; }
+}

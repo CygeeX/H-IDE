@@ -10,9 +10,11 @@ export interface MissionOfficeReportRegion {
 export interface MissionOfficeReport {
   schemaVersion: "h-ide.office-report/1";
   missionId: string;
-  reportScope: "all_office_regions_and_corridor" | "current_location";
+  reportScope: "all_office_regions_and_corridor" | "current_location" | "selected_locations";
   locationId?: string;
   stationId?: string;
+  regionIds?: string[];
+  stationIds?: string[];
   status: "completed" | "completed_with_gaps";
   fullChainAccepted: boolean;
   regions: MissionOfficeReportRegion[];
@@ -53,9 +55,11 @@ export function parseMissionOfficeReport(
   if (typeof report.narrativeZhCN !== "string" || !report.narrativeZhCN.trim()) return null;
   const reportScope = report.reportScope === "current_location"
     ? "current_location"
-    : report.reportScope == null || report.reportScope === "all_office_regions_and_corridor"
-      ? "all_office_regions_and_corridor"
-      : null;
+    : report.reportScope === "selected_locations"
+      ? "selected_locations"
+      : report.reportScope == null || report.reportScope === "all_office_regions_and_corridor"
+        ? "all_office_regions_and_corridor"
+        : null;
   if (!reportScope) return null;
   if (!Array.isArray(report.regions) || report.regions.length === 0) return null;
   const regions: MissionOfficeReportRegion[] = [];
@@ -79,6 +83,22 @@ export function parseMissionOfficeReport(
       summaries,
     });
   }
+  const selectedRegionIds = reportScope === "selected_locations"
+    ? strings(report.regionIds)
+    : null;
+  const selectedStationIds = reportScope === "selected_locations"
+    ? strings(report.stationIds)
+    : null;
+  if (reportScope === "selected_locations" && (
+    !selectedRegionIds
+    || selectedRegionIds.length < 2
+    || selectedRegionIds.length !== regions.length
+    || new Set(selectedRegionIds).size !== selectedRegionIds.length
+    || regions.some((region) => !selectedRegionIds.includes(region.regionId))
+    || !selectedStationIds
+    || selectedStationIds.length < 2
+    || new Set(selectedStationIds).size !== selectedStationIds.length
+  )) return null;
   if (!Array.isArray(report.evidence)) return null;
   const locationId = typeof report.locationId === "string" && report.locationId.trim()
     ? report.locationId.trim()
@@ -107,6 +127,8 @@ export function parseMissionOfficeReport(
     reportScope,
     ...(locationId ? { locationId } : {}),
     ...(stationId ? { stationId } : {}),
+    ...(selectedRegionIds ? { regionIds: selectedRegionIds } : {}),
+    ...(selectedStationIds ? { stationIds: selectedStationIds } : {}),
     status: report.status,
     fullChainAccepted: report.fullChainAccepted,
     regions,
@@ -162,7 +184,7 @@ export function currentMissionOfficeReport(
 export function MissionOfficeReportCard({ report }: { report: MissionOfficeReport }) {
   return <section className="mission-office-report" aria-label="办公室巡检报告">
     <header>
-      <div><small>OFFICE V2 · 证据汇总</small><strong>{report.reportScope === "current_location" ? "目标区域观察完成" : report.fullChainAccepted ? "全部区域已完成" : "巡检完成但仍有信息缺口"}</strong></div>
+      <div><small>OFFICE V2 · 证据汇总</small><strong>{report.reportScope === "current_location" ? "目标区域观察完成" : report.reportScope === "selected_locations" ? "指定区域观察完成" : report.fullChainAccepted ? "全部区域已完成" : "巡检完成但仍有信息缺口"}</strong></div>
       <span>{report.evidenceCount} 份证据</span>
     </header>
     <pre>{report.narrativeZhCN}</pre>

@@ -1,0 +1,41 @@
+{
+  "schemaVersion": "h-ide.leader-demo-assets/1",
+  "purpose": "recorded-leader-demo",
+  "assets": [
+    {
+      "id": "brand.h-ide-logo",
+      "path": "/assets/leader-demo/brand/h-ide-logo.png",
+      "sha256": "50e4a0127325588c3abe3a9ce99670bc04f1216d2daa7d43bd476b2ab6a79df6",
+      "source": "operator-provided:logo-白底.png",
+      "license": "LicenseRef-HIDE-Demo-Asset",
+      "licenseFile": "/assets/leader-demo/ASSET_LICENSE.md"
+    },
+    {
+      "id": "robot.agibot",
+      "path": "/assets/leader-demo/robots/agibot.png",
+      "sha256": "f262f3c197dd6d48bdd7d477095e8c4b9cf7c1b14155eb5fc94ee7f525da34e6",
+      "source": "operator-provided:agibot_matte_head_web.png",
+      "license": "LicenseRef-HIDE-Demo-Asset",
+      "licenseFile": "/assets/leader-demo/ASSET_LICENSE.md",
+      "controlBackend": "display-only"
+    },
+    {
+      "id": "robot.deeprobotics",
+      "path": "/assets/leader-demo/robots/deeprobotics.png",
+      "sha256": "20bc26ca9d84e6d81972b43e6f0d56216cd347d61e0484185b610e7f99bfc59c",
+      "source": "operator-provided:deeprobotics_matte_head_web.png",
+      "license": "LicenseRef-HIDE-Demo-Asset",
+      "licenseFile": "/assets/leader-demo/ASSET_LICENSE.md",
+      "controlBackend": "display-only"
+    },
+    {
+      "id": "robot.unitree-g1",
+      "path": "/assets/leader-demo/robots/unitree-g1.png",
+      "sha256": "92e9270b452d78467817a8a6e6e5c05332ddb1cf265d787400711407554ca4e7",
+      "source": "operator-provided:unitree_matte_head_web.png",
+      "license": "LicenseRef-HIDE-Demo-Asset",
+      "licenseFile": "/assets/leader-demo/ASSET_LICENSE.md",
+      "controlBackend": "unitree-g1-sim"
+    }
+  ]
+}

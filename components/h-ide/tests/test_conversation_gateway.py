@@ -22,6 +22,7 @@ from services.control_api.conversation_client import (
 )
 from services.control_api.conversation_gateway import ConversationGateway
 from services.control_api.main import create_app
+from services.control_api.mission_policy import MissionPolicyDenied
 
 
 TOKEN = "conversation-v2-test-token"
@@ -213,6 +214,92 @@ def test_exact_office_inspection_bypasses_remote_conversation_router() -> None:
             "history": [],
         }
     ]
+
+
+def test_ordered_room_inspection_phrases_bypass_remote_router_and_share_intent() -> None:
+    briefs: list[dict[str, Any]] = []
+    gateway = ConversationGateway(
+        FailingConversationClient(),
+        mission_draft_creator=lambda brief: briefs.append(dict(brief))
+        or {"draftId": f"mission-office-sequence-{len(briefs)}"},
+    )
+    phrases = [
+        "今天巡检开放办公室和会议室",
+        "请依次进入开放办公区和会议室，分别在房间内部停稳后进行多方向观察，记录房间内及沿途看到的信息，最后按房间分别汇总",
+    ]
+
+    results = []
+    for index, text in enumerate(phrases, start=1):
+        results.append(
+            gateway.handle(
+                task_id=f"task-office-sequence-{index}",
+                request=ConversationTurnRequest(
+                    conversationId=f"conversation-office-sequence-{index}",
+                    robotId="g1-sim",
+                    locale="zh-CN",
+                    text=text,
+                ),
+                requested_by="operator-test",
+                modality="text",
+                mission_history=[],
+            )
+        )
+
+    assert all(item.intent is ConversationIntent.ROBOT_ACTION for item in results)
+    assert all(item.routeStatus == "review" for item in results)
+    assert [item["objective"] for item in briefs] == phrases
+
+
+def test_selected_inspection_skill_routes_single_room_without_remote_llm() -> None:
+    briefs: list[dict[str, Any]] = []
+    result = ConversationGateway(
+        FailingConversationClient(),
+        mission_draft_creator=lambda brief: briefs.append(dict(brief))
+        or {"draftId": "mission-inspection-skill-single-room"},
+    ).handle(
+        task_id="task-inspection-skill-single-room",
+        request=ConversationTurnRequest(
+            conversationId="conversation-inspection-skill-single-room",
+            robotId="g1-sim",
+            skillId="inspection.office",
+            locale="zh-CN",
+            text="今天巡检会议室",
+        ),
+        requested_by="operator-test",
+        modality="text",
+        mission_history=[],
+    )
+
+    assert result.routeStatus == "review"
+    assert result.missionDraftId == "mission-inspection-skill-single-room"
+    assert briefs[0]["skillId"] == "inspection.office"
+    assert briefs[0]["objective"] == "今天巡检会议室"
+
+
+def test_unbound_robot_returns_selection_guidance_instead_of_service_failure() -> None:
+    def reject(_brief):
+        raise MissionPolicyDenied("robot has no immutable site/execution-target binding")
+
+    gateway = ConversationGateway(
+        RoutedConversationClient(),
+        mission_draft_creator=reject,
+    )
+
+    result = gateway.handle(
+        task_id="task-unbound-robot",
+        request=ConversationTurnRequest(
+            conversationId="conversation-unbound-robot",
+            robotId="g1-dev",
+            locale="zh-CN",
+            text="今天巡检开放办公室和会议室",
+        ),
+        requested_by="operator-test",
+        modality="text",
+        mission_history=[],
+    )
+
+    assert result.routeStatus == "needs_robot"
+    assert "在线的仿真 G1" in result.assistantMessage
 
 
 def test_known_object_and_exit_actions_override_a_misclassified_router_result() -> None:
