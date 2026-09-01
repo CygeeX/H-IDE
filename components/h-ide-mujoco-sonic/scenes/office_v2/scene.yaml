@@ -85,8 +85,11 @@ navigation:
   # These values are also asserted against the Nav2 local/global costmap
   # configuration. They define the minimum full-body clearance required by
   # every generated navigation target.
-  robot_radius_m: 0.35
-  footprint_padding_m: 0.02
+  # Simulation-only integration profile: keep only a small centre-point buffer.
+  # MuJoCo contact evidence remains visible, but touching furniture must not
+  # abort an Office inspection or revoke SONIC authority.
+  robot_radius_m: 0.25
+  footprint_padding_m: 0.0
 
 # Product-safe semantic navigation and observation stations.  This catalog is
 # deliberately separate from evaluator-only object labels and target answers:
@@ -193,16 +196,16 @@ inspection_catalog:
     - corridor_east
 
 render:
-  floor_material: commercial_carpet
+  floor_material: mujoco_grid
   wall_height: 2.7
   ambient: [0.34, 0.33, 0.31]
   haze: [0.78, 0.80, 0.82, 1.0]
+  # Invisible studio point lights keep the authored rooms readable. They are
+  # illumination only; no hanging-light mesh/fixture is present in the scene.
   lights:
-    - {id: light_west, position: [-4.8, 0.0, 2.75], diffuse: [0.72, 0.70, 0.65]}
-    - {id: light_center, position: [0.0, 0.0, 2.75], diffuse: [0.78, 0.76, 0.70]}
-    - {id: light_east, position: [4.8, 0.0, 2.75], diffuse: [0.72, 0.70, 0.65]}
-    - {id: light_meeting, position: [0.7, 3.8, 2.65], diffuse: [0.62, 0.60, 0.56]}
-    - {id: light_pantry, position: [5.4, 4.2, 2.65], diffuse: [0.64, 0.63, 0.59]}
+    - {id: studio_west, position: [-5.4, 0.0, 2.62], diffuse: [0.82, 0.82, 0.82]}
+    - {id: studio_center, position: [0.0, 0.0, 2.62], diffuse: [0.90, 0.90, 0.90]}
+    - {id: studio_east, position: [5.4, 0.0, 2.62], diffuse: [0.82, 0.82, 0.82]}
   cameras:
     - {id: office_overview, position: [11.0, -14.0, 10.0], look_at: [0.0, 0.0, 0.7]}
     - {id: corridor_west, position: [-6.55, 0.0, 1.52], look_at: [4.8, 0.0, 1.15]}
@@ -250,6 +253,14 @@ template_meshes:
   waste_bin: mesh_09
 
 materials:
+  # MuJoCo's built-in checker texture keeps the floor visually neutral while
+  # retaining the same collision plane and map geometry.
+  mujoco_grid:
+    rgba: [0.72, 0.74, 0.78, 1.0]
+    texture_builtin: {builtin: checker, rgb1: [0.34, 0.36, 0.40], rgb2: [0.62, 0.64, 0.68], width: 512, height: 512}
+    repeat: [32, 24]
+    reflectance: 0.02
+    emission: 0.04
   commercial_carpet: {rgba: [0.62, 0.62, 0.59, 1.0], texture: tex_01, repeat: [16, 12], reflectance: 0.03}
   oak_veneer: {rgba: [0.72, 0.52, 0.31, 1.0], texture: tex_02, repeat: [2, 1], reflectance: 0.08}
   navy_fabric: {rgba: [0.18, 0.25, 0.34, 1.0], texture: tex_03, repeat: [2, 2], reflectance: 0.02}
@@ -307,37 +318,20 @@ structures:
 # Collision-free architectural dressing improves RGB-D/VLM readability while
 # preserving the original MuJoCo/Nav2 collision contract bit-for-bit.
 visual_decor:
-  - {id: floor_corridor, kind: floor_zone, pose: [0.0, 0.0, 0.001, 0.0], dimensions: [15.72, 2.56, 0.002], material: corridor_carpet}
-  - {id: floor_open_office, kind: floor_zone, pose: [-4.58, 3.64, 0.002, 0.0], dimensions: [6.60, 4.44, 0.002], material: open_office_carpet}
-  - {id: floor_meeting, kind: floor_zone, pose: [0.95, 3.64, 0.002, 0.0], dimensions: [4.18, 4.44, 0.002], material: meeting_carpet}
-  - {id: floor_pantry, kind: floor_zone, pose: [5.50, 3.64, 0.002, 0.0], dimensions: [4.66, 4.44, 0.002], material: pantry_floor}
-  - {id: floor_reception, kind: floor_zone, pose: [-5.15, -3.64, 0.002, 0.0], dimensions: [5.38, 4.44, 0.002], material: reception_carpet}
-  - {id: floor_focus, kind: floor_zone, pose: [0.50, -3.64, 0.002, 0.0], dimensions: [5.68, 4.44, 0.002], material: focus_carpet}
-  - {id: floor_storage, kind: floor_zone, pose: [5.67, -3.64, 0.002, 0.0], dimensions: [4.42, 4.44, 0.002], material: storage_floor}
   - {id: portal_open_office, kind: doorway_frame, pose: [-4.30, 1.35, 0.0, 0.0], dimensions: [1.40, 0.20, 2.24], frame_width: 0.10, material: accent_open}
   - {id: portal_meeting, kind: doorway_frame, pose: [-0.80, 1.35, 0.0, 0.0], dimensions: [1.40, 0.20, 2.24], frame_width: 0.10, material: accent_meeting}
   - {id: portal_pantry, kind: doorway_frame, pose: [4.40, 1.35, 0.0, 0.0], dimensions: [1.40, 0.20, 2.24], frame_width: 0.10, material: accent_pantry}
   - {id: portal_reception, kind: doorway_frame, pose: [-5.10, -1.35, 0.0, 0.0], dimensions: [1.40, 0.20, 2.24], frame_width: 0.10, material: accent_reception}
   - {id: portal_focus, kind: doorway_frame, pose: [1.20, -1.35, 0.0, 0.0], dimensions: [1.40, 0.20, 2.24], frame_width: 0.10, material: accent_focus}
   - {id: portal_storage, kind: doorway_frame, pose: [5.20, -1.35, 0.0, 0.0], dimensions: [1.40, 0.20, 2.24], frame_width: 0.10, material: accent_storage}
-  - {id: ceiling_west, kind: ceiling_panel, pose: [-4.7, 0.0, 2.55, 0.0], dimensions: [1.20, 0.32, 0.035], material: ceiling_light}
-  - {id: ceiling_center, kind: ceiling_panel, pose: [0.0, 0.0, 2.55, 0.0], dimensions: [1.20, 0.32, 0.035], material: ceiling_light}
-  - {id: ceiling_east, kind: ceiling_panel, pose: [4.7, 0.0, 2.55, 0.0], dimensions: [1.20, 0.32, 0.035], material: ceiling_light}
-  - {id: ceiling_open_office, kind: ceiling_panel, pose: [-4.6, 3.8, 2.55, 0.0], dimensions: [1.40, 0.55, 0.035], material: ceiling_light}
-  - {id: ceiling_meeting, kind: ceiling_panel, pose: [0.7, 3.8, 2.55, 0.0], dimensions: [1.40, 0.55, 0.035], material: ceiling_light}
-  - {id: ceiling_pantry, kind: ceiling_panel, pose: [5.3, 3.8, 2.55, 0.0], dimensions: [1.40, 0.55, 0.035], material: ceiling_light}
-  - {id: ceiling_reception, kind: ceiling_panel, pose: [-5.1, -3.8, 2.55, 0.0], dimensions: [1.40, 0.55, 0.035], material: ceiling_light}
-  - {id: ceiling_focus, kind: ceiling_panel, pose: [0.5, -3.8, 2.55, 0.0], dimensions: [1.40, 0.55, 0.035], material: ceiling_light}
-  - {id: ceiling_storage, kind: ceiling_panel, pose: [5.6, -3.8, 2.55, 0.0], dimensions: [1.40, 0.55, 0.035], material: ceiling_light}
+  # Floor anchors for static, realistic G1 display models.  The scene
+  # generator adds the measured root-to-feet offset; z=0 therefore means the
+  # soles touch the MuJoCo grid instead of floating above it.
+  - {id: display_robot_open_office, kind: display_robot, pose: [-6.72, 5.08, 0.0, 0.0], dimensions: [0.58, 0.46, 0.82], material: white_plastic}
+  - {id: display_robot_pantry, kind: display_robot, pose: [7.00, 4.90, 0.0, 3.14159], dimensions: [0.58, 0.46, 0.82], material: white_plastic}
+  - {id: display_robot_storage, kind: display_robot, pose: [6.82, -3.18, 0.0, 3.14159], dimensions: [0.58, 0.46, 0.82], material: white_plastic}
 
 objects:
-  - id: corridor_column
-    room: corridor
-    pose: [0.0, 0.0, 0.0, 0.0]
-    dimensions: [0.58, 0.58, 2.7]
-    visual: {template: column, material: brushed_metal}
-    collision: {shape: circle, radius: 0.29, height: 2.7, nav_obstacle: true}
-    semantic: {class: structural_column, labels: [走廊立柱, corridor column], aliases: [柱子, column]}
   - id: meeting_table
     room: meeting_room
     pose: [0.70, 3.72, 0.0, 0.0]
@@ -604,6 +598,34 @@ objects:
     visual: {template: waste_bin, material: brushed_metal}
     collision: {shape: circle, radius: 0.22, height: 0.62, nav_obstacle: true}
     semantic: {class: waste_bin, labels: [垃圾桶, waste bin], aliases: [垃圾箱, bin]}
+  - id: corridor_notice_board
+    room: corridor
+    pose: [2.65, 1.24, 1.55, 0.0]
+    dimensions: [1.35, 0.07, 0.62]
+    visual: {template: sign, material: sign_01}
+    collision: {shape: none, nav_obstacle: false}
+    semantic: {class: wayfinding_board, labels: [巡检公告板, inspection notice board], aliases: [公告板, notice board]}
+  - id: open_office_whiteboard
+    room: open_office
+    pose: [-6.95, 5.42, 1.04, 3.14159]
+    dimensions: [1.18, 0.08, 0.86]
+    visual: {template: whiteboard, material: white_plastic}
+    collision: {shape: none, nav_obstacle: false}
+    semantic: {class: whiteboard, labels: [开放办公区白板, open-office whiteboard], aliases: [白板, board]}
+  - id: pantry_snack_box
+    room: pantry
+    pose: [6.42, 3.02, 0.98, 0.0]
+    dimensions: [0.46, 0.38, 0.32]
+    visual: {template: imported_mesh, material: cardboard, mesh_asset: mesh_07}
+    collision: {shape: none, nav_obstacle: false}
+    semantic: {class: parcel_box, labels: [茶水间纸箱, pantry parcel box], aliases: [纸箱, 箱子]}
+  - id: reception_plant
+    room: reception
+    pose: [-7.12, -4.75, 0.0, 0.0]
+    dimensions: [0.56, 0.56, 1.18]
+    visual: {template: plant, material: plant_leaf}
+    collision: {shape: none, nav_obstacle: false}
+    semantic: {class: potted_plant, labels: [前台绿植, reception plant], aliases: [植物, 绿植]}
 
 spawns:
   - {id: robot_spawn_west, pose: [-6.45, 0.0, 0.0], clearance_radius: 0.55, default: true}
@@ -636,7 +658,7 @@ semantic_tests:
     prompt: 找到前台并停在接待人员一侧。
     expected_object_ids: [reception_desk, reception_sign]
     acceptable_target_ids: [target_reception]
-  - id: nav_avoid_corridor_column
-    prompt: 从西侧起点前往走廊东端，避开固定立柱。
-    expected_object_ids: [corridor_column]
+  - id: nav_central_corridor
+    prompt: 从西侧起点沿中央走廊前往东端，识别沿途公告板。
+    expected_object_ids: [corridor_notice_board]
     acceptable_target_ids: [target_corridor_east]

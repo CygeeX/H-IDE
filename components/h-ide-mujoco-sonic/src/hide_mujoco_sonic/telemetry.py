@@ -83,6 +83,11 @@ class TelemetryState:
     sonic_reference_actuator_authority: bool = False
     sonic_reference_authority_dds_target_sequence: int | None = None
     sonic_execution_feedback_pending: bool = False
+    gesture_state: str = "idle"
+    gesture_name: str | None = None
+    gesture_request_id: str | None = None
+    gesture_progress: float = 0.0
+    gesture_last_error: str | None = None
     last_cmd_vx: float = 0.0
     last_cmd_vy: float = 0.0
     last_cmd_wz: float = 0.0
@@ -91,6 +96,18 @@ class TelemetryState:
     control_tick_ms: int | None = None
     control_dt_s: float | None = None
     control_clock_status: str = "waiting"
+    # Forward simulation-clock gaps are diagnostic evidence only.  They do not
+    # revoke SONIC authority or stop the Plant; invalid/backwards clocks still
+    # use the existing fault path.
+    control_clock_stall_count: int = 0
+    control_clock_source_gap_count: int = 0
+    control_clock_interval_gap_count: int = 0
+    control_clock_last_stall_ms: int | None = None
+    control_clock_max_stall_ms: int = 0
+    control_clock_last_stall_kind: str | None = None
+    control_clock_last_stall_message: str | None = None
+    control_sample_overrun_count: int = 0
+    control_sample_overrun_last_tick_ms: int | None = None
     controller_warmup_complete: bool = False
     controller_warmup_wall_s: float | None = None
     controller_warmup_state_unchanged: bool = False

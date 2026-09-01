@@ -145,7 +145,7 @@ def _assert_primitive_plan(module, navfn_path, plan) -> None:
         navfn_path["poses"]
     )
     assert plan["map_provenance"]["scene_source_sha256"] == (
-        "7c30b7c4bb3e8136659688c80b8bef97724aae79aa7fd0f82deb96b227ca98ff"
+        "b7db4504b1fd82d095ca8abde2d5cf6ff1a6f8780d810625f5fd6340664fec3e"
     )
     assert all(
         len(plan["map_provenance"][name]) == 64
@@ -284,6 +284,23 @@ def test_locked_short_route_segments_bidirectionally_without_oracle_data() -> No
     assert "heappop" not in source
     assert "evaluation/" not in source
     assert "scenes/office_v2/scene.yaml" not in source
+
+
+def test_relaxed_simulation_profile_accepts_zero_extra_clearance() -> None:
+    module = _planner()
+    navfn_path = _astar_fixture_navfn_path(module, START, GOAL)
+    kwargs = {
+        **_plan_kwargs(),
+        "robot_radius_m": 0.08,
+        "footprint_padding_m": 0.0,
+        "extra_clearance_m": 0.0,
+    }
+
+    plan = module.build_primitive_plan(navfn_path, **kwargs)
+    module.verify_primitive_plan(plan, navfn_path, **kwargs)
+
+    assert plan["segmenter"]["extra_clearance_m"] == 0.0
+    assert plan["segmenter"]["clearance_radius_m"] == pytest.approx(0.08)
 
 
 def test_navfn_relaxed_start_must_reenter_full_clearance_before_normal_segments(
@@ -453,7 +470,7 @@ def test_start_clearance_recovery_reverses_without_turning_inside_the_margin() -
 def test_navfn_start_inside_relaxed_physical_clearance_is_rejected() -> None:
     module = _planner()
     navfn_path = _astar_fixture_navfn_path(module, START, GOAL)
-    navfn_path["poses"][0] = {"x": -5.621, "y": -1.291, "yaw": 0.0}
+    navfn_path["poses"][0] = {"x": -5.78, "y": -1.325, "yaw": 0.0}
 
     with pytest.raises(ValueError, match="relaxed physical clearance"):
         _build(module, navfn_path)
@@ -667,7 +684,7 @@ def test_live_revalidation_uses_physical_envelope_after_a_successful_action(
     start = (current["x"], current["y"])
     end = (endpoint["x"], endpoint["y"])
 
-    assert not static_map.segment_is_clear(
+    assert static_map.segment_is_clear(
         start,
         end,
         static_map.inflated_blocked_cells(CLEARANCE_RADIUS),

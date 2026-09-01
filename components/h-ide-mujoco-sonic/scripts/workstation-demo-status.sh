@@ -63,8 +63,12 @@ if [[ -n "${docker_diagnostics_host}" ]]; then
   http_status \
     'Docker diagnostics proxy' \
     "http://${docker_diagnostics_host}:8797/healthz"
+  http_status \
+    'Leader-demo gesture proxy' \
+    "http://${docker_diagnostics_host}:8798/healthz"
 else
   printf '%-28s unavailable (bridge unresolved)\n' 'Docker diagnostics proxy'
+  printf '%-28s unavailable (bridge unresolved)\n' 'Leader-demo gesture proxy'
 fi
 http_status 'g1-sim Robot Agent gateway' 'http://127.0.0.1:8094/internal/v1/discover?robotId=g1-sim' -H "Authorization: Bearer ${gateway_token}"
 

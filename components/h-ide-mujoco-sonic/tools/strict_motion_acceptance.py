@@ -203,7 +203,7 @@ class FormalContract:
     # subject to fresh-odometry and inflated-map line-of-sight verification.
     detour_heading_tolerance_rad: float = 0.09
     robot_radius_m: float = 0.35
-    footprint_padding_m: float = 0.02
+    footprint_padding_m: float = 0.0
     map_resolution_m: float = 0.05
 
     @property

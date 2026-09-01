@@ -19,12 +19,14 @@ stale or cancelled.
 
 ## What is vendored and what is downloaded
 
-* `vendor/lerobot` resolves to the monorepo's `third_party/lerobot` snapshot,
-  pinned to `56b4087c40d7ee8e78e3485f78fe21e88679355b`. The source is Apache-2.0.
-* `models/unitree-g1-mujoco` is an operator-created link to the pinned public
-  `lerobot/unitree-g1-mujoco` checkout plus the reviewed Office overlay. The
-  mesh license is not assumed; run `integration/bootstrap.sh --fetch-g1-model`
-  only after reviewing `manifests/vendor/g1-model.json`.
+* `vendor/lerobot` is pinned to `f5fdcb61cda272b866ca81f72ce6f1f76b87fad9`.
+  The source is Apache-2.0.
+* `models/unitree-g1-mujoco` is the pinned local simulator model tree. It is
+  based on `lerobot/unitree-g1-mujoco`; this checkout contains the reviewed
+  H-IDE simulator patches and must be present at gitlink revision
+  `4a164cf08d4e14b100f7dccc711bc62a7c838f6f`. Its no-hand G1 asset matches
+  NVIDIA's current SONIC MuJoCo deployment model, including the full-sole
+  collision boxes.
 * SONIC ONNX weights are downloaded at runtime from `nvidia/GEAR-SONIC` and
   must not be committed or baked into an image.  The weights are covered by
   NVIDIA's Open Model License, which is separate from the LeRobot license.
@@ -33,6 +35,15 @@ The first install can download several gigabytes of PyTorch/CUDA wheels and
 about 865 MB of SONIC weights.  Set `SONIC_FORCE_CPU=1` when checking the
 contracts on a host without a compatible CUDA runtime.  CPU mode is suitable
 for contract tests, not for a smooth 50 Hz demonstration.
+
+When cloning a fresh workstation, obtain the model tree from the project's
+approved internal mirror (the parent repository stores it as a gitlink), then
+verify the revision before building:
+
+```sh
+git -C models/unitree-g1-mujoco rev-parse HEAD
+# expected: 4a164cf08d4e14b100f7dccc711bc62a7c838f6f
+```
 
 ## Office V2 scene contract
 
@@ -55,6 +66,26 @@ Privileged labels, targets and complete object/spawn inventories exist only in
 excluded from the Nav2 Docker context and are never exposed by the plant,
 H-IDE or Vision runtime. Nav2 receives only the generated occupancy map and a
 non-semantic integrity manifest.
+
+### Leader-demo showroom robots
+
+The leader-demo scene removes the old central corridor cylinder and visible
+ceiling panels, then uses MuJoCo's checker floor material. Three
+`display_robot_*` entries place complete, realistic G1 copies on the floor in
+room corners. The generator expands the source body's hierarchy and nominal
+joint pose recorded in `scenes/office_v2/hanging_g1_visual.json`; it measures a
+root-to-feet anchor so the soles touch the grid, and emits no joints,
+actuators, or collision bits for these copies. They are display-only, while
+the single dynamic G1 body remains the sole SONIC/Nav2-controlled robot. The
+manifest name is retained for compatibility with existing runtime asset
+paths. Re-run `python tools/build_scene.py` after changing either the scene
+manifest or the pinned G1 visual extraction.
+
+The optional voice-assistant wave uses the host-side
+`leader-demo-gesture-proxy` on the Docker bridge (`8798`). Control API can
+submit only the authenticated `g1-sim` wave payload; the proxy performs the
+private hop to SONIC's loopback command socket. The raw SONIC command port is
+never exposed to the container or the browser.
 
 ## Safety and isolation
 
@@ -153,7 +184,7 @@ simulation Robot Agent Gateway, `g1-sim`, and its Observation Gateway. It is
 idempotent: already running components are reported and left alone.
 
 ```bash
-cd $SKILLSTORE_ROOT/components/h-ide-mujoco-sonic
+cd /home/phi/learn-projects/h-ide-mujoco-sonic
 scripts/start-workstation-demo.sh
 
 # Rebuild changed H-IDE container images first when source changed:
@@ -189,9 +220,9 @@ two passive viewers. It exits with the robot stationary and sends no motion.
 Run exactly one explicitly authorized case from a second terminal:
 
 ```bash
-cd $SKILLSTORE_ROOT/components/h-ide-mujoco-sonic
+cd /home/phi/learn-projects/h-ide-mujoco-sonic
 source /opt/ros/jazzy/setup.bash
-source $SKILLSTORE_ROOT/components/robotagent/tools/activate-local-nav2-jazzy.bash
+source /home/phi/learn-projects/robotagent/tools/activate-local-nav2-jazzy.bash
 export ROS_DOMAIN_ID=232
 export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 export CYCLONEDDS_URI='<CycloneDDS><Domain><General><Interfaces><NetworkInterface name="lo"/></Interfaces><AllowMulticast>true</AllowMulticast></General></Domain></CycloneDDS>'
@@ -218,7 +249,7 @@ RobotAgent full chain.
 ## Manual component start (for debugging)
 
 ```bash
-cd $SKILLSTORE_ROOT/components/h-ide-mujoco-sonic
+cd /home/phi/learn-projects/h-ide-mujoco-sonic
 source .venv/bin/activate
 
 # Validate imports, pins, model and safety configuration (no simulator start)
@@ -263,10 +294,14 @@ the `*_last_over_threshold_gap_s`,
 `*_over_threshold_gc_overlap_count`, and
 `*_over_threshold_non_gc_residual_count` suffixes. SONIC performs one full
 collection and freezes the warmed long-lived Python object graph before arming
-its strict control clock. It then disables process-global automatic cyclic GC
-so a request thread cannot stop the 50 Hz actuator owner; ordinary CPython
-reference counting remains active, and the applied/error state is explicit in
-telemetry. The
+its simulation-time 50 Hz control clock. A finite forward callback/control
+interval gap (including a gap greater than the nominal 20 ms period) is
+recorded in SONIC telemetry and consumed as one nominal 20 ms step; it no
+longer stops a healthy Plant. Duplicate/backwards ticks, invalid values and
+actual MuJoCo numerical faults remain fail-closed. SONIC then disables
+process-global automatic cyclic GC so a request thread cannot stop the 50 Hz
+actuator owner; ordinary CPython reference counting remains active, and the
+applied/error state is explicit in telemetry. The
 LowState-only hot update mutates scalar telemetry in place; the ordinary update
 API retains its isolated-snapshot return contract, and HTTP readers also
 receive isolated copies.
@@ -316,7 +351,7 @@ ten-minute pre-motion record without sending a control, Nav2, reset, stop, or
 rearm request:
 
 ```bash
-cd $SKILLSTORE_ROOT/components/h-ide-mujoco-sonic
+cd /home/phi/learn-projects/h-ide-mujoco-sonic
 .venv/bin/python tools/idle_soak_monitor.py \
   --output var/acceptance/$(date -u +%Y%m%dT%H%M%SZ)-safe-hold/idle-soak.jsonl
 ```

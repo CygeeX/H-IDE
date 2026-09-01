@@ -160,28 +160,17 @@ def test_paired_static_detour_routes_share_exact_terminal_poses() -> None:
     assert reverse["goal"] == forward["start"]
 
 
-def test_corridor_column_route_matches_the_generated_scene_evaluation() -> None:
-    route = runner.DETOUR_ROUTES["office_corridor_column_w_to_e"]
+def test_leader_demo_corridor_route_matches_the_generated_scene_evaluation() -> None:
+    route = runner.DETOUR_ROUTES["office_corridor_w_to_e"]
 
     assert route == {
         "start": (-6.45, 0.0, 0.0),
         "goal": (6.10, 0.0, 0.0),
     }
-    column = next(
-        obstacle
-        for obstacle in runner.OFFICE_DETOUR_OBSTACLES
-        if obstacle.get("center") == [0.0, 0.0]
-    )
-    assert column == {
-        "source": "pgm_occupied_component",
-        "shape": "circle",
-        "center": [0.0, 0.0],
-        "radius": 0.29,
-    }
-    # The canonical direct line passes through the column center; NavFn must
-    # produce a non-straight path for this route.
-    assert route["start"][1] == route["goal"][1] == column["center"][1]
-    assert route["start"][0] < column["center"][0] < route["goal"][0]
+    # The leader-demo scene intentionally removes the former central column;
+    # no obstacle component may remain at the corridor midpoint.
+    assert not any(obstacle.get("center") == [0.0, 0.0] for obstacle in runner.OFFICE_DETOUR_OBSTACLES)
+    assert route["start"][1] == route["goal"][1] == 0.0
 
 
 def test_east_corridor_to_focus_office_route_uses_generated_scene_targets() -> None:

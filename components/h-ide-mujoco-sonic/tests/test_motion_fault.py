@@ -979,6 +979,15 @@ def test_control_acquisition_requires_fresh_confirmed_safe_hold() -> None:
             sonic_control_step_stale_s=0.10,
         )
 
+    armed_static = parse_health()
+    assert armed_static.confirmed_armed_static_idle is True
+    require_fresh_motion_health(
+        armed_static,
+        plant_lowstate_stale_s=0.10,
+        sonic_control_step_stale_s=0.10,
+        allow_armed_static_idle=True,
+    )
+
 
 def test_terminal_and_boot_change_remain_immediate_in_safe_hold() -> None:
     terminal_gate = health_fault_gate()

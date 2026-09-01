@@ -233,6 +233,41 @@ def test_expired_pending_gate_does_not_issue_another_request() -> None:
     assert calls == []
 
 
+def test_retained_experiment_reopens_a_confirmed_gate_for_a_fresh_probe() -> None:
+    transport = SonicHealthTransportGate(
+        probe_period_s=0.025,
+        probe_timeout_s=0.040,
+    )
+    transport.observe_timeout(
+        request_id=REQUEST_ID,
+        probe_started_at_s=50.000,
+        probe_completed_at_s=50.040,
+    )
+    transport.observe_timeout(
+        request_id=NEXT_REQUEST_ID,
+        probe_started_at_s=50.045,
+        probe_completed_at_s=50.085,
+    )
+    assert transport.confirmed_cause is not None
+
+    reopened = transport.reopen_for_retained_experiment()
+    assert reopened.transition == "reopened"
+    assert reopened.confirmed_cause is None
+    assert reopened.pending is None
+    assert reopened.total_timeout_count == 2
+    assert reopened.confirmed_timeout_count == 1
+
+    fresh = _attempt_sonic_health_probe(
+        UUID("60000000-0000-4000-8000-000000000006"),
+        request_health=strict_health,
+        transport_gate=transport,
+        clock=SequenceClock(50.100, 50.105),
+    )
+    assert fresh.request_attempted is True
+    assert fresh.health is not None
+    assert fresh.transport.confirmed_cause is None
+
+
 @pytest.mark.parametrize(
     ("fenced", "state", "command", "expected"),
     [

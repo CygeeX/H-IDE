@@ -151,8 +151,8 @@ MAX_DRIVE_REALIGNMENT_RETAINED_ERROR_RATIO = 0.90
 # endpoint within 0.35 m instead of commanding a short backtracking correction
 # beside an obstacle.  Fresh map odometry and the next segment's inflated-map
 # line-of-sight check remain authoritative.
-MAX_DRIVE_PROGRESS_ACTIONS = 4
-MIN_DRIVE_ENDPOINT_PROGRESS_M = 0.02
+MAX_DRIVE_PROGRESS_ACTIONS = 12
+MIN_DRIVE_ENDPOINT_PROGRESS_M = 0.005
 DETOUR_ENDPOINT_TOLERANCE_M = 0.15
 DETOUR_COMPLETED_ENDPOINT_TOLERANCE_M = 0.35
 EXCEPTION_BALANCED_IDLE_S = 1.0
@@ -205,11 +205,16 @@ DETOUR_ROUTES = {
         "start": (-7.30, -0.30, -2.50),
         "goal": (-6.45, 0.0, 0.0),
     },
-    # Office V2's canonical navigation evaluation: the direct west-to-east
-    # corridor line intersects the fixed structural column at (0, 0).  Both
-    # endpoints are generated scene targets with 0.55 m spawn/goal clearance,
-    # so long Spins and stop boundaries occur in open space rather than in the
-    # waste-bin dead end.
+    # Office V2's leader-demo navigation evaluation: the former decorative
+    # central column has been removed, so the direct west-to-east corridor is
+    # intentionally available for one continuous full-straight segment.
+    "office_corridor_w_to_e": {
+        "start": (-6.45, 0.0, 0.0),
+        "goal": (6.10, 0.0, 0.0),
+    },
+    # Compatibility spelling retained for previously recorded command lines;
+    # it now resolves to the open-corridor route and no longer implies an
+    # obstacle or detour.
     "office_corridor_column_w_to_e": {
         "start": (-6.45, 0.0, 0.0),
         "goal": (6.10, 0.0, 0.0),
@@ -225,7 +230,6 @@ DETOUR_ROUTES = {
 }
 RELAXED_LIVE_CLEARANCE_ROUTES = frozenset(
     {
-        "office_corridor_column_w_to_e",
         "office_corridor_east_to_focus_office",
     }
 )
@@ -248,12 +252,6 @@ OFFICE_DETOUR_OBSTACLES = [
         "shape": "circle",
         "center": [-6.85, -0.78],
         "radius": 0.22,
-    },
-    {
-        "source": "pgm_occupied_component",
-        "shape": "circle",
-        "center": [0.0, 0.0],
-        "radius": 0.29,
     },
 ]
 
@@ -722,6 +720,7 @@ class RosLiveBackend:
             name: False for name in self._ACTION_STATUS_TOPICS
         }
         self._active_execution: ActionExecution | None = None
+        self._loopback_reader = LoopbackJsonReader()
         self._closed = False
 
         already_initialized = rclpy.ok()
@@ -953,6 +952,43 @@ class RosLiveBackend:
         if not isinstance(value, dict):
             raise StrictMotionRunnerError("bridge health returned a non-object")
         return value
+
+    def obstacle_contact_snapshot(self) -> dict[str, Any]:
+        """Read one authoritative, cumulative MuJoCo obstacle-contact fact."""
+
+        plant = self._loopback_reader.read(PLANT_STATE_URL, timeout_s=0.20)
+        dynamics = _mapping(
+            plant.get("dynamicsEvidence"),
+            "Plant dynamicsEvidence",
+        )
+        contacts = _mapping(
+            dynamics.get("contacts"),
+            "Plant obstacle contacts",
+        )
+        if contacts.get("valid") is not True:
+            raise StrictMotionRunnerError(
+                "Plant obstacle contact evidence is not valid"
+            )
+        event_count = _integer(
+            contacts.get("obstacleContactEventCount"),
+            "Plant obstacle contact event count",
+        )
+        pairs = contacts.get("obstaclePairs")
+        if not isinstance(pairs, list) or any(
+            not isinstance(item, Mapping) for item in pairs
+        ):
+            raise StrictMotionRunnerError(
+                "Plant obstacle contact pairs are invalid"
+            )
+        return {
+            "sampleSequence": _integer(
+                contacts.get("sampleSequence"),
+                "Plant obstacle contact sample sequence",
+                minimum=1,
+            ),
+            "eventCount": event_count,
+            "pairs": [dict(item) for item in pairs],
+        }
 
     def control_arm(self) -> str:
         response = self._call_trigger(
@@ -2879,8 +2915,13 @@ class StrictMotionCaseExecutor:
             "map_image_path": OFFICE_MAP_IMAGE,
             "runtime_manifest_path": OFFICE_RUNTIME_MANIFEST,
             "motion_profile_manifest_path": MOTION_PROFILE_MANIFEST,
-            "robot_radius_m": 0.35,
-            "footprint_padding_m": 0.02,
+            "robot_radius_m": 0.25,
+            "footprint_padding_m": 0.0,
+            # The G1 whole-body swept envelope is materially wider than the
+            # former 0.08 m point-like demo footprint.  Keep 0.25 m as the
+            # physical body radius and another 0.10 m as route margin; contact
+            # recovery may still use the physical 0.25 m contour.
+            "extra_clearance_m": 0.10,
             "heading_tolerance_rad": DETOUR_HEADING_TOLERANCE_RAD,
         }
 

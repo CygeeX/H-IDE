@@ -40,3 +40,11 @@ so visual refinement cannot silently change the reviewed navigation geometry
 or 50 Hz locomotion dynamics.  All six functional regions now have large,
 front-facing English doorway plaques and more recognizable furniture for the
 first-person VLM.
+
+The leader-demo decoration also includes three floor-anchored, visual-only
+copies of the official G1 model in room corners. Their pinned manifest
+(`hanging_g1_visual.json`, schema v2) retains the complete link hierarchy and
+bakes the nominal joint pose; it is separate from the dynamic G1 body and
+from Nav2 collision geometry. The `groundOffset` field is measured from the
+source mesh bounds so rebuilding the scene keeps every sole on the MuJoCo
+grid.

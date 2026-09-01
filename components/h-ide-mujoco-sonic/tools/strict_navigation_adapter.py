@@ -19,6 +19,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import threading
 import time
 from typing import Any, Protocol
@@ -33,17 +34,45 @@ ADAPTER_SCHEMA = "h-ide.strict-navigation-adapter/v1"
 DEFAULT_COMMAND_TIMEOUT_S = 2_400.0
 IDLE_SETTLE_TIMEOUT_S = 20.0
 POLL_PERIOD_S = 0.02
-MAX_PRODUCT_REPLANS = 2
+MAX_PRODUCT_REPLANS = 8
 # DriveOnHeading is distance-controlled, not an endpoint-tracking controller.
-# Re-sample map odometry and heading at least every half metre so small learned
-# gait yaw errors cannot accumulate across a two-metre static-plan segment and
-# put the next NavFn start inside an inflated doorway cell.
-MAX_RUNTIME_DRIVE_CHUNK_M = 0.50
+# The tight-space profile caps each runtime checkpoint at 1.0 m.  The restored
+# 0.30 m live clearance and contact-triggered replanning keep door/wall motion
+# bounded without returning to the visibly stop-start 0.50 m demo cadence.
+#
+# The opt-in continuous-handoff profile uses the static planner's reviewed
+# maximum (2 m) only on a 0.70 m-clear chord.  A long, open straight segment is
+# one official DriveOnHeading action instead of multiple tight-space actions.
+MAX_RUNTIME_DRIVE_CHUNK_M = 1.0
+CONTINUOUS_RUNTIME_DRIVE_CHUNK_M = 2.0
+# Extra map clearance required before a plan is allowed to use the long
+# continuous profile.  Requiring a 0.70 m contour excludes Office V2's 1.40 m
+# door openings after grid quantization, so those use the 1.0 m tight profile.
+CONTINUOUS_RUNTIME_CLEARANCE_RADIUS_M = 0.70
+# Full straight mode raises the planner's segment bound to the largest single
+# DriveOnHeading action that still fits Nav2's 120 s time_allowance contract
+# when the runner retains its conservative 0.04 m/s progress floor.  Four
+# metres yields a 110 s allowance (including the 10 s startup/stop margin),
+# leaving headroom for transport and executor jitter. Longer clear paths are
+# partitioned into a small number of these long segments.  A 0.90 m contour
+# reserves this mode for the corridor and similarly open room chords.
+FULL_STRAIGHT_RUNTIME_DRIVE_CHUNK_M = 4.0
+FULL_STRAIGHT_RUNTIME_CLEARANCE_RADIUS_M = 0.90
+FULL_STRAIGHT_TERMINAL_POSITION_TOLERANCE_M = (
+    runner.DETOUR_COMPLETED_ENDPOINT_TOLERANCE_M
+)
+FULL_STRAIGHT_TERMINAL_YAW_TOLERANCE_RAD = 0.35
 MAX_RUNTIME_DRIVE_ACTIONS_PER_SEGMENT = 8
+RELAXED_SIMULATION_RECOVERY_ENV = "HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT"
+LIVE_EXECUTION_CLEARANCE_RADIUS_M = 0.35
 
 
 class StrictNavigationCancelled(RuntimeError):
     """The owning RobotAgent action requested cancellation."""
+
+
+class StrictNavigationContact(RuntimeError):
+    """A new MuJoCo obstacle contact requires non-terminal replanning."""
 
 
 class StrictNavigationBackend(Protocol):
@@ -63,6 +92,7 @@ class StrictNavigationBackend(Protocol):
     def cancel_active(self, *, timeout_s: float = 2.0) -> bool: ...
     def stop_relay(self) -> None: ...
     def bridge_health(self) -> dict[str, Any]: ...
+    def obstacle_contact_snapshot(self) -> dict[str, Any]: ...
     def raise_if_faulted(self) -> None: ...
 
 
@@ -94,14 +124,15 @@ class StrictNavigationExecutor:
         sleep: Callable[[float], None] = time.sleep,
         command_timeout_s: float = DEFAULT_COMMAND_TIMEOUT_S,
         live_clearance_radius_m: float | None = None,
+        continuous_drive_handoff: bool = False,
+        full_straight_drive: bool = False,
+        relaxed_simulation_recovery: bool = False,
     ) -> None:
         timeout = float(command_timeout_s)
         if not math.isfinite(timeout) or timeout <= 0.0:
             raise ValueError("command timeout must be finite and positive")
         if live_clearance_radius_m is None:
-            live_clearance_radius_m = float(
-                static_planner.RELAXED_LIVE_EXECUTION_CLEARANCE_RADIUS_M
-            )
+            live_clearance_radius_m = LIVE_EXECUTION_CLEARANCE_RADIUS_M
         clearance = float(live_clearance_radius_m)
         if not math.isfinite(clearance) or clearance <= 0.0:
             raise ValueError("live clearance radius must be finite and positive")
@@ -111,10 +142,32 @@ class StrictNavigationExecutor:
         self.sleep = sleep
         self.command_timeout_s = timeout
         self.live_clearance_radius_m = clearance
+        if not isinstance(continuous_drive_handoff, bool):
+            raise ValueError("continuous_drive_handoff must be a boolean")
+        if not isinstance(full_straight_drive, bool):
+            raise ValueError("full_straight_drive must be a boolean")
+        if not isinstance(relaxed_simulation_recovery, bool):
+            raise ValueError("relaxed_simulation_recovery must be a boolean")
+        self.continuous_drive_handoff = continuous_drive_handoff
+        self.full_straight_drive = full_straight_drive
+        self.relaxed_simulation_recovery = relaxed_simulation_recovery
+        self.runtime_drive_chunk_m = (
+            FULL_STRAIGHT_RUNTIME_DRIVE_CHUNK_M
+            if full_straight_drive
+            else CONTINUOUS_RUNTIME_DRIVE_CHUNK_M
+            if continuous_drive_handoff
+            else MAX_RUNTIME_DRIVE_CHUNK_M
+        )
+        self._continuous_map = None
+        self._continuous_blocked: dict[float, Any] = {}
 
-    @staticmethod
-    def _plan_kwargs() -> dict[str, Any]:
-        return runner.StrictMotionCaseExecutor._static_plan_kwargs()
+    def _plan_kwargs(self, *, full_straight: bool | None = None) -> dict[str, Any]:
+        kwargs = runner.StrictMotionCaseExecutor._static_plan_kwargs()
+        if full_straight is None:
+            full_straight = self.full_straight_drive
+        if full_straight:
+            kwargs["max_segment_m"] = FULL_STRAIGHT_RUNTIME_DRIVE_CHUNK_M
+        return kwargs
 
     @staticmethod
     def _finite(value: object, field: str) -> float:
@@ -131,6 +184,133 @@ class StrictNavigationExecutor:
             raise runner.StrictMotionRunnerError(f"{field} must be an object")
         return value
 
+    def _continuous_segment_allowed(
+        self,
+        plan: Mapping[str, Any],
+        primitive: Mapping[str, Any],
+        *,
+        full_straight: bool = False,
+    ) -> bool:
+        """Allow a long chunk only on one generously clear segment.
+
+        The frozen profile deliberately revalidates every half metre.  The
+        continuous profile is an optimization for open straight travel, not a
+        blanket relaxation for turns or obstacle corridors.  The static
+        planner is kept authoritative: if its map implementation is present,
+        the selected segment must also be clear at a larger contour (0.50 m for
+        the 2 m profile, 0.60 m for full-straight mode).
+        Small fake planners used by unit tests do not expose ``StaticMap`` and
+        retain the old test-only behavior.
+        """
+
+        if not (self.continuous_drive_handoff or self.full_straight_drive):
+            return False
+        raw_segments = plan.get("segments")
+        if not isinstance(raw_segments, list) or not raw_segments:
+            return not hasattr(self.static_planner, "StaticMap")
+        segment_id = primitive.get("segment_id")
+        selected: Mapping[str, Any] | None = None
+        for index, raw in enumerate(raw_segments):
+            if not isinstance(raw, Mapping):
+                return False
+            if segment_id is None or raw.get("id") == segment_id:
+                selected = raw
+                break
+        if selected is None:
+            return False
+        try:
+            start = self._mapping(selected.get("start_map"), "segment start")
+            end = self._mapping(selected.get("end_map"), "segment end")
+            self._finite(selected.get("heading_map_yaw_rad"), "segment heading")
+            self._finite(start.get("x"), "segment start x")
+            self._finite(start.get("y"), "segment start y")
+            self._finite(end.get("x"), "segment end x")
+            self._finite(end.get("y"), "segment end y")
+        except runner.StrictMotionRunnerError:
+            return False
+
+        # Production plans expose the map raster.  Do not silently enable the
+        # long profile if the larger-contour proof cannot be computed.
+        map_type = getattr(self.static_planner, "StaticMap", None)
+        if map_type is None:
+            return True
+        try:
+            if self._continuous_map is None:
+                kwargs = self._plan_kwargs()
+                self._continuous_map = map_type.load(
+                    kwargs["map_yaml_path"], kwargs["map_image_path"]
+                )
+            clearance_radius = (
+                FULL_STRAIGHT_RUNTIME_CLEARANCE_RADIUS_M
+                if full_straight
+                else CONTINUOUS_RUNTIME_CLEARANCE_RADIUS_M
+            )
+            blocked = self._continuous_blocked.get(clearance_radius)
+            if blocked is None:
+                blocked = self._continuous_map.inflated_blocked_cells(
+                    clearance_radius
+                )
+                self._continuous_blocked[clearance_radius] = blocked
+            if not self._continuous_map.segment_is_clear(
+                (
+                    self._finite(start.get("x"), "segment start x"),
+                    self._finite(start.get("y"), "segment start y"),
+                ),
+                (
+                    self._finite(end.get("x"), "segment end x"),
+                    self._finite(end.get("y"), "segment end y"),
+                ),
+                blocked,
+            ):
+                return False
+        except Exception:
+            return False
+        return True
+
+    def _build_verified_plan(
+        self,
+        navfn_path: Mapping[str, Any],
+    ) -> tuple[Any, Mapping[str, Any], bool, dict[str, Any]]:
+        """Build a plan, falling back to the reviewed 2 m partition if needed.
+
+        ``full_straight_drive`` changes only the planner's maximum segment
+        length.  A failure to construct or verify that wider plan must not turn
+        a valid ordinary navigation request into an error; retry the same
+        NavFn path with the frozen planner bound and let the existing 2 m/0.5 m
+        runtime profiles take over.
+        """
+
+        requested_full = self.full_straight_drive
+        plan_kwargs = self._plan_kwargs(full_straight=requested_full)
+        try:
+            plan = self.static_planner.build_primitive_plan(
+                navfn_path,
+                **plan_kwargs,
+            )
+            verified = self.static_planner.verify_primitive_plan(
+                plan,
+                navfn_path,
+                **plan_kwargs,
+            )
+            return plan, verified, requested_full, plan_kwargs
+        except Exception as full_error:
+            if not requested_full:
+                raise
+            fallback_kwargs = self._plan_kwargs(full_straight=False)
+            try:
+                plan = self.static_planner.build_primitive_plan(
+                    navfn_path,
+                    **fallback_kwargs,
+                )
+                verified = self.static_planner.verify_primitive_plan(
+                    plan,
+                    navfn_path,
+                    **fallback_kwargs,
+                )
+            except Exception as fallback_error:
+                raise fallback_error from full_error
+            return plan, verified, False, fallback_kwargs
+
     def _cancelled(self, cancelled: Callable[[], bool]) -> None:
         if cancelled():
             raise StrictNavigationCancelled("strict navigation was cancelled")
@@ -141,16 +321,74 @@ class StrictNavigationExecutor:
         *,
         timeout_s: float,
         cancelled: Callable[[], bool],
+        contact_baseline: Mapping[str, Any],
+        allow_existing_contact: bool = False,
     ) -> None:
         deadline = self.clock() + min(float(timeout_s), self.command_timeout_s)
+        baseline_count = int(contact_baseline.get("eventCount", -1))
+        if baseline_count < 0:
+            raise runner.StrictMotionRunnerError(
+                "obstacle contact baseline is invalid"
+            )
+        next_contact_probe = self.clock()
+        baseline_pairs = {
+            (str(item.get("robotBody")), str(item.get("staticGeom")))
+            for item in contact_baseline.get("pairs", [])
+            if isinstance(item, Mapping)
+        }
+
+        def check_contact(*, cancel_active: bool, force: bool = False) -> None:
+            nonlocal next_contact_probe
+            now = self.clock()
+            if not force and now < next_contact_probe:
+                return
+            snapshot = self.backend.obstacle_contact_snapshot()
+            next_contact_probe = now + 0.10
+            current_count = int(snapshot.get("eventCount", -1))
+            pairs = snapshot.get("pairs")
+            if current_count < baseline_count or not isinstance(pairs, list):
+                raise runner.StrictMotionRunnerError(
+                    "obstacle contact evidence regressed or is invalid"
+                )
+            current_pairs = {
+                (str(item.get("robotBody")), str(item.get("staticGeom")))
+                for item in pairs
+                if isinstance(item, Mapping)
+            }
+            new_contact = current_count > baseline_count or bool(
+                current_pairs - baseline_pairs
+            )
+            if allow_existing_contact:
+                contact_requires_replan = new_contact
+            else:
+                contact_requires_replan = new_contact or bool(current_pairs)
+            if not contact_requires_replan:
+                return
+            if cancel_active:
+                try:
+                    self.backend.cancel_active(timeout_s=2.0)
+                except Exception:
+                    pass
+            pair_names = [
+                f"{item.get('robotBody')}->{item.get('staticGeom')}"
+                for item in pairs
+                if isinstance(item, Mapping)
+            ]
+            detail = ", ".join(pair_names[:4]) or "brief contact"
+            raise StrictNavigationContact(
+                f"MuJoCo obstacle contact observed ({detail}); replan required"
+            )
+
         while not self.backend.action_done(execution):
             self.backend.raise_if_faulted()
             self._cancelled(cancelled)
+            check_contact(cancel_active=True)
             if self.clock() >= deadline:
                 raise runner.StrictMotionRunnerError(
                     f"{execution.kind} exceeded its bounded action timeout"
                 )
             self.sleep(POLL_PERIOD_S)
+        check_contact(cancel_active=False, force=True)
         self.backend.finish_action(execution)
 
     def _wait_balanced_idle(self, *, cancelled: Callable[[], bool]) -> None:
@@ -183,7 +421,25 @@ class StrictNavigationExecutor:
         resolved: Mapping[str, Any],
         *,
         cancelled: Callable[[], bool],
+        wait_for_idle: bool = True,
+        drive_chunk_m: float | None = None,
+        allow_existing_contact: bool = False,
     ) -> str:
+        if drive_chunk_m is None:
+            drive_chunk_m = self.runtime_drive_chunk_m
+        if (
+            isinstance(drive_chunk_m, bool)
+            or not isinstance(drive_chunk_m, (int, float))
+            or not math.isfinite(float(drive_chunk_m))
+            or float(drive_chunk_m) <= 0.0
+        ):
+            raise ValueError("drive chunk limit must be finite and positive")
+        drive_chunk_m = float(drive_chunk_m)
+        contact_baseline = self.backend.obstacle_contact_snapshot()
+        if contact_baseline.get("pairs") and not allow_existing_contact:
+            raise StrictNavigationContact(
+                "MuJoCo obstacle contact is already active; recovery required"
+            )
         action_type = resolved.get("action_type")
         goal = self._mapping(resolved.get("action_goal"), "resolved action goal")
         if action_type == "nav2_msgs/action/DriveOnHeading":
@@ -192,7 +448,7 @@ class StrictNavigationExecutor:
                 target.get("x"), "DriveOnHeading distance"
             )
             distance = math.copysign(
-                min(abs(resolved_distance), MAX_RUNTIME_DRIVE_CHUNK_M),
+                min(abs(resolved_distance), drive_chunk_m),
                 resolved_distance,
             )
             timeout_s = runner.translation_action_timeout_s(abs(distance))
@@ -223,10 +479,13 @@ class StrictNavigationExecutor:
                 execution,
                 timeout_s=timeout_s,
                 cancelled=cancelled,
+                contact_baseline=contact_baseline,
+                allow_existing_contact=allow_existing_contact,
             )
         finally:
             self.backend.stop_relay()
-        self._wait_balanced_idle(cancelled=cancelled)
+        if wait_for_idle:
+            self._wait_balanced_idle(cancelled=cancelled)
         return kind
 
     def _cleanup(self) -> None:
@@ -277,6 +536,48 @@ class StrictNavigationExecutor:
         )
 
     @staticmethod
+    def _angle_delta(current: float, target: float) -> float:
+        return math.atan2(
+            math.sin(current - target),
+            math.cos(current - target),
+        )
+
+    def _full_straight_terminal_result(
+        self,
+        goal: runner.PlanarPose,
+        pose: runner.PlanarPose,
+        *,
+        plan_sha256: str,
+        plan_attempt: int,
+        completed_primitives: int,
+    ) -> NavigationResult | None:
+        """Accept a completed long straight drive without a risky micro-turn.
+
+        A long learned drive can stop a few decimetres past the exact NavFn
+        endpoint while remaining inside the reviewed physical arrival envelope.
+        Replanning that tiny residual often creates a spurious path tangent and
+        asks SONIC for a large corrective Spin.  Full mode accepts that physical
+        endpoint only after a verified plan/action and only when the requested
+        final yaw is already within the normal 0.35 rad arrival tolerance.
+        """
+
+        if not self.full_straight_drive or not plan_sha256:
+            return None
+        distance = math.hypot(goal.x - pose.x, goal.y - pose.y)
+        heading_error = abs(self._angle_delta(pose.yaw, goal.yaw))
+        if (
+            distance > FULL_STRAIGHT_TERMINAL_POSITION_TOLERANCE_M
+            or heading_error > FULL_STRAIGHT_TERMINAL_YAW_TOLERANCE_RAD
+        ):
+            return None
+        return NavigationResult(
+            final_pose=pose,
+            plan_sha256=plan_sha256,
+            completed_primitives=completed_primitives,
+            plan_attempts=plan_attempt,
+        )
+
+    @staticmethod
     def _terminal_path_sha256(
         navfn_path: Mapping[str, Any], goal: runner.PlanarPose
     ) -> str:
@@ -307,31 +608,62 @@ class StrictNavigationExecutor:
         started = self.clock()
         completed = 0
         final_plan_hash = ""
+        pending_drive_handoff = False
+        pending_drive_direction: int | None = None
         try:
             self.backend.wait_ready(timeout_s=10.0)
-            recovery_pose = self.backend.wait_fresh_map_pose()
-            recovery = self.static_planner.resolve_start_clearance_recovery(
-                {
-                    "x": recovery_pose.pose.x,
-                    "y": recovery_pose.pose.y,
-                    "yaw": recovery_pose.pose.yaw,
-                },
-                **self._plan_kwargs(),
-            )
-            if recovery.get("disposition") == "send_action":
-                self._execute_resolved(recovery, cancelled=cancelled)
-                completed += 1
-            elif recovery.get("disposition") != "not_required":
-                raise runner.StrictMotionRunnerError(
-                    "static start-clearance recovery returned an invalid disposition"
-                )
-            for plan_attempt in range(1, MAX_PRODUCT_REPLANS + 2):
+            plan_attempt = 0
+            while (
+                self.relaxed_simulation_recovery
+                or plan_attempt < MAX_PRODUCT_REPLANS + 1
+            ):
+                plan_attempt += 1
+                replan_required = False
                 self._cancelled(cancelled)
                 if self.clock() - started >= self.command_timeout_s:
                     raise runner.StrictMotionRunnerError(
                         "strict navigation exceeded its command timeout"
                     )
-                navfn_path = self.backend.compute_path(goal, timeout_s=10.0)
+                try:
+                    recovery_pose = self.backend.wait_fresh_map_pose()
+                    recovery = self.static_planner.resolve_start_clearance_recovery(
+                        {
+                            "x": recovery_pose.pose.x,
+                            "y": recovery_pose.pose.y,
+                            "yaw": recovery_pose.pose.yaw,
+                        },
+                        **self._plan_kwargs(full_straight=False),
+                    )
+                    if recovery.get("disposition") == "send_action":
+                        self._execute_resolved(
+                            recovery,
+                            cancelled=cancelled,
+                            drive_chunk_m=MAX_RUNTIME_DRIVE_CHUNK_M,
+                            allow_existing_contact=True,
+                        )
+                        completed += 1
+                    elif recovery.get("disposition") != "not_required":
+                        raise runner.StrictMotionRunnerError(
+                            "static start-clearance recovery returned an invalid disposition"
+                        )
+                except StrictNavigationCancelled:
+                    raise
+                except Exception:
+                    if not self.relaxed_simulation_recovery:
+                        raise
+                    self._cleanup()
+                    self.backend.raise_if_faulted()
+                    self.sleep(POLL_PERIOD_S)
+                    continue
+                try:
+                    navfn_path = self.backend.compute_path(goal, timeout_s=10.0)
+                except Exception:
+                    if not self.relaxed_simulation_recovery:
+                        raise
+                    self._cleanup()
+                    self.backend.raise_if_faulted()
+                    self.sleep(POLL_PERIOD_S)
+                    continue
                 fresh_before_plan = self.backend.wait_fresh_map_pose()
                 if (
                     math.hypot(
@@ -340,6 +672,10 @@ class StrictNavigationExecutor:
                     )
                     <= runner.DETOUR_COMPLETED_ENDPOINT_TOLERANCE_M
                 ):
+                    if pending_drive_handoff:
+                        self._wait_balanced_idle(cancelled=cancelled)
+                        pending_drive_handoff = False
+                        pending_drive_direction = None
                     return NavigationResult(
                         final_pose=fresh_before_plan.pose,
                         plan_sha256=self._terminal_path_sha256(navfn_path, goal),
@@ -347,9 +683,12 @@ class StrictNavigationExecutor:
                         plan_attempts=plan_attempt,
                     )
                 try:
-                    plan = self.static_planner.build_primitive_plan(
-                        navfn_path, **self._plan_kwargs()
-                    )
+                    (
+                        plan,
+                        verified,
+                        full_plan_active,
+                        plan_kwargs,
+                    ) = self._build_verified_plan(navfn_path)
                 except Exception:
                     terminal = self._finish_relaxed_terminal_pose(
                         goal,
@@ -359,10 +698,13 @@ class StrictNavigationExecutor:
                     )
                     if terminal is not None:
                         return terminal
-                    raise
-                verified = self.static_planner.verify_primitive_plan(
-                    plan, navfn_path, **self._plan_kwargs()
-                )
+                    if not self.relaxed_simulation_recovery:
+                        raise
+                    self._cleanup()
+                    self.backend.raise_if_faulted()
+                    replan_required = True
+                if replan_required:
+                    continue
                 primitives = verified.get("primitives")
                 if not isinstance(primitives, list) or not primitives:
                     raise runner.StrictMotionRunnerError(
@@ -379,12 +721,55 @@ class StrictNavigationExecutor:
                         raise runner.StrictMotionRunnerError(
                             "static primitive entry is invalid"
                         )
+                    full_segment_handoff = (
+                        full_plan_active
+                        and self._continuous_segment_allowed(
+                            verified,
+                            primitive,
+                            full_straight=True,
+                        )
+                    )
+                    continuous_segment_handoff = (
+                        (
+                            self.continuous_drive_handoff
+                            or self.full_straight_drive
+                            or full_plan_active
+                        )
+                        and self._continuous_segment_allowed(
+                            verified,
+                            primitive,
+                            full_straight=False,
+                        )
+                    )
+                    segment_handoff_enabled = (
+                        full_segment_handoff or continuous_segment_handoff
+                    )
+                    plan_drive_chunk_m = (
+                        FULL_STRAIGHT_RUNTIME_DRIVE_CHUNK_M
+                        if full_segment_handoff
+                        else CONTINUOUS_RUNTIME_DRIVE_CHUNK_M
+                        if continuous_segment_handoff
+                        else MAX_RUNTIME_DRIVE_CHUNK_M
+                    )
                     realignments = 0
                     drive_actions = 0
                     previous_distance: float | None = None
                     while True:
                         self._cancelled(cancelled)
                         fresh = self.backend.wait_fresh_map_pose()
+                        terminal = self._full_straight_terminal_result(
+                            goal,
+                            fresh.pose,
+                            plan_sha256=final_plan_hash,
+                            plan_attempt=plan_attempt,
+                            completed_primitives=completed,
+                        )
+                        if terminal is not None:
+                            if pending_drive_handoff:
+                                self._wait_balanced_idle(cancelled=cancelled)
+                                pending_drive_handoff = False
+                                pending_drive_direction = None
+                            return terminal
                         if feedback is not None:
                             feedback(
                                 NavigationProgress(
@@ -408,10 +793,13 @@ class StrictNavigationExecutor:
                                 live_execution_clearance_radius_m=(
                                     self.live_clearance_radius_m
                                 ),
-                                **self._plan_kwargs(),
+                                **plan_kwargs,
                             )
                         except Exception:
-                            if plan_attempt <= MAX_PRODUCT_REPLANS:
+                            if (
+                                self.relaxed_simulation_recovery
+                                or plan_attempt <= MAX_PRODUCT_REPLANS
+                            ):
                                 replan_required = True
                                 break
                             raise
@@ -420,12 +808,26 @@ class StrictNavigationExecutor:
                             "skip_within_endpoint_tolerance",
                             "skip_within_heading_tolerance",
                         }:
+                            if pending_drive_handoff:
+                                self._wait_balanced_idle(cancelled=cancelled)
+                                pending_drive_handoff = False
+                                pending_drive_direction = None
                             break
                         if disposition == "realign_spin_required":
+                            if pending_drive_handoff:
+                                self._wait_balanced_idle(cancelled=cancelled)
+                                pending_drive_handoff = False
+                                pending_drive_direction = None
                             if realignments >= runner.MAX_DRIVE_REALIGNMENT_SPINS:
-                                raise runner.StrictMotionRunnerError(
-                                    "DriveOnHeading exceeded bounded realignment"
-                                )
+                                # The humanoid may translate while stepping
+                                # through an otherwise successful Spin, which
+                                # changes the endpoint bearing and can consume
+                                # the local correction budget.  That is not a
+                                # terminal motion fault: discard the stale
+                                # segment geometry and ask NavFn for a fresh
+                                # path from measured map odometry.
+                                replan_required = True
+                                break
                             preceding = int(
                                 resolved.get("realignment_primitive_sequence", -1)
                             )
@@ -441,14 +843,27 @@ class StrictNavigationExecutor:
                                 live_execution_clearance_radius_m=(
                                     self.live_clearance_radius_m
                                 ),
-                                **self._plan_kwargs(),
+                                **plan_kwargs,
                             )
                             if resolved.get("disposition") != "send_action":
                                 raise runner.StrictMotionRunnerError(
                                     "realignment did not resolve to a Spin"
                                 )
                             realignments += 1
-                            self._execute_resolved(resolved, cancelled=cancelled)
+                            try:
+                                self._execute_resolved(
+                                    resolved,
+                                    cancelled=cancelled,
+                                )
+                            except StrictNavigationCancelled:
+                                raise
+                            except Exception:
+                                if not self.relaxed_simulation_recovery:
+                                    raise
+                                self._cleanup()
+                                self.backend.raise_if_faulted()
+                                replan_required = True
+                                break
                             completed += 1
                             continue
                         if disposition != "send_action":
@@ -456,6 +871,37 @@ class StrictNavigationExecutor:
                                 "static primitive could not be executed"
                             )
                         action_type = resolved.get("action_type")
+                        drive_direction: int | None = None
+                        if action_type == "nav2_msgs/action/DriveOnHeading":
+                            raw_goal = self._mapping(
+                                resolved.get("action_goal"),
+                                "resolved action goal",
+                            )
+                            raw_target = self._mapping(
+                                raw_goal.get("target"),
+                                "resolved DriveOnHeading target",
+                            )
+                            raw_distance = self._finite(
+                                raw_target.get("x"),
+                                "resolved DriveOnHeading command distance",
+                            )
+                            if abs(raw_distance) <= 1e-9:
+                                raise runner.StrictMotionRunnerError(
+                                    "resolved DriveOnHeading command distance is zero"
+                                )
+                            drive_direction = 1 if raw_distance > 0.0 else -1
+                        # A pending no-wait handoff is valid only for another
+                        # DriveOnHeading in the same signed direction. Flush it
+                        # before a Spin, a reverse/recovery drive, or any other
+                        # transition so the learned policy gets its ordinary
+                        # balanced-IDLE boundary.
+                        if pending_drive_handoff and (
+                            action_type != "nav2_msgs/action/DriveOnHeading"
+                            or drive_direction != pending_drive_direction
+                        ):
+                            self._wait_balanced_idle(cancelled=cancelled)
+                            pending_drive_handoff = False
+                            pending_drive_direction = None
                         distance = None
                         if action_type == "nav2_msgs/action/DriveOnHeading":
                             distance = self._finite(
@@ -477,27 +923,93 @@ class StrictNavigationExecutor:
                                     > previous_distance
                                     - runner.MIN_DRIVE_ENDPOINT_PROGRESS_M
                                 ):
-                                    raise runner.StrictMotionRunnerError(
-                                        "DriveOnHeading made no bounded endpoint progress"
-                                    )
+                                    replan_required = True
+                                    break
                             if (
                                 drive_actions
                                 >= MAX_RUNTIME_DRIVE_ACTIONS_PER_SEGMENT
                             ):
-                                raise runner.StrictMotionRunnerError(
-                                    "DriveOnHeading exceeded bounded progress actions"
+                                replan_required = True
+                                break
+                        wait_for_idle = True
+                        if (
+                            segment_handoff_enabled
+                            and action_type == "nav2_msgs/action/DriveOnHeading"
+                            and distance is not None
+                            and isinstance(
+                                resolved.get("action_goal"), Mapping
+                            )
+                        ):
+                            resolved_goal = self._mapping(
+                                resolved.get("action_goal"),
+                                "resolved action goal",
+                            )
+                            resolved_target = self._mapping(
+                                resolved_goal.get("target"),
+                                "resolved DriveOnHeading target",
+                            )
+                            command_distance = abs(
+                                self._finite(
+                                    resolved_target.get("x"),
+                                    "resolved DriveOnHeading command distance",
                                 )
-                        kind = self._execute_resolved(resolved, cancelled=cancelled)
+                            )
+                            admitted_distance = min(
+                                command_distance,
+                                plan_drive_chunk_m,
+                            )
+                            if (
+                                distance
+                                > admitted_distance
+                                + runner.DETOUR_ENDPOINT_TOLERANCE_M
+                            ):
+                                # The action still publishes a zero at its own
+                                # endpoint, but the next same-heading chunk is
+                                # admitted immediately. If the fresh resolver
+                                # asks for a Spin, a skip, or a replan, the
+                                # pending handoff is flushed through the normal
+                                # balanced-IDLE gate before that transition.
+                                wait_for_idle = False
+                        try:
+                            kind = self._execute_resolved(
+                                resolved,
+                                cancelled=cancelled,
+                                wait_for_idle=wait_for_idle,
+                                drive_chunk_m=plan_drive_chunk_m,
+                            )
+                        except StrictNavigationCancelled:
+                            raise
+                        except Exception:
+                            if not self.relaxed_simulation_recovery:
+                                raise
+                            self._cleanup()
+                            self.backend.raise_if_faulted()
+                            replan_required = True
+                            break
                         completed += 1
+                        pending_drive_handoff = (
+                            kind == "DriveOnHeading" and not wait_for_idle
+                        )
+                        pending_drive_direction = (
+                            drive_direction if pending_drive_handoff else None
+                        )
                         if kind == "DriveOnHeading":
                             drive_actions += 1
                             previous_distance = distance
                             continue
                         break
                     if replan_required:
+                        if pending_drive_handoff:
+                            self._wait_balanced_idle(cancelled=cancelled)
+                            pending_drive_handoff = False
+                            pending_drive_direction = None
                         break
                 if replan_required:
                     continue
+                if pending_drive_handoff:
+                    self._wait_balanced_idle(cancelled=cancelled)
+                    pending_drive_handoff = False
+                    pending_drive_direction = None
                 final = self.backend.wait_fresh_map_pose().pose
                 return NavigationResult(
                     final_pose=final,
@@ -523,6 +1035,7 @@ class StrictNavigationExecutor:
             raise ValueError("rotation target must be in [-2pi, 2pi] and non-zero")
         try:
             self.backend.wait_ready(timeout_s=10.0)
+            contact_baseline = self.backend.obstacle_contact_snapshot()
             mode = "turn_left" if target > 0.0 else "turn_right"
             self.backend.begin_relay(mode)
             timeout_s = (
@@ -535,6 +1048,7 @@ class StrictNavigationExecutor:
                     execution,
                     timeout_s=timeout_s,
                     cancelled=cancelled,
+                    contact_baseline=contact_baseline,
                 )
             finally:
                 self.backend.stop_relay()
@@ -619,6 +1133,12 @@ class StrictNavigationActionServer:
                 "schemaVersion": ADAPTER_SCHEMA,
                 "healthy": healthy,
                 "active": active,
+                "continuousDriveHandoff": self.executor.continuous_drive_handoff,
+                "fullStraightDrive": self.executor.full_straight_drive,
+                "relaxedSimulationRecovery": (
+                    self.executor.relaxed_simulation_recovery
+                ),
+                "runtimeDriveChunkM": self.executor.runtime_drive_chunk_m,
                 "bridge": bridge,
                 "error": detail,
             },
@@ -746,11 +1266,30 @@ def _parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_COMMAND_TIMEOUT_S,
     )
+    parser.add_argument(
+        "--continuous-drive-handoff",
+        action="store_true",
+        help=(
+            "skip the balanced-IDLE evidence wait between contiguous "
+            "DriveOnHeading chunks; final/direction-change stops remain gated"
+        ),
+    )
+    parser.add_argument(
+        "--full-straight-drive",
+        action="store_true",
+        help=(
+            "allow one full map-verified straight segment (with automatic "
+            "fallback to the 2 m/0.5 m profiles); implies continuous handoff"
+        ),
+    )
     return parser
 
 
 def main() -> int:
     args = _parser().parse_args()
+    relaxed_simulation_recovery = (
+        os.getenv(RELAXED_SIMULATION_RECOVERY_ENV, "0") == "1"
+    )
     static_planner = runner._load_file_module(
         "h_ide_static_primitive_planner_adapter",
         runner.STATIC_PLANNER_PATH,
@@ -761,6 +1300,9 @@ def main() -> int:
             backend,
             static_planner,
             command_timeout_s=args.command_timeout_seconds,
+            continuous_drive_handoff=args.continuous_drive_handoff,
+            full_straight_drive=args.full_straight_drive,
+            relaxed_simulation_recovery=relaxed_simulation_recovery,
         )
         server = StrictNavigationActionServer(backend, executor)
         try:

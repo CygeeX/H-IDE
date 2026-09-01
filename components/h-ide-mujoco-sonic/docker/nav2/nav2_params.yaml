@@ -124,13 +124,10 @@ local_costmap:
       width: 6
       height: 6
       resolution: 0.05
-      # G1's collision-observed navigation footprint is 0.25 m.  The product
-      # static-plan verifier still requires 0.42 m along normal path segments;
-      # this smaller Nav2 footprint exists so a collision-free pose reached
-      # after whole-body visual scanning can generate the bounded recovery
-      # prefix back into the fully reviewed clearance envelope.
+      # Match Nav2 collision checks to G1's collision-observed 0.25 m swept
+      # envelope.  The independent verifier adds another 0.10 m route margin.
       robot_radius: 0.25
-      footprint_padding: 0.02
+      footprint_padding: 0.0
       track_unknown_space: false
       always_send_full_costmap: true
       # This simulation deliberately has no live laser obstacle layer. The
@@ -156,11 +153,10 @@ global_costmap:
       global_frame: map
       robot_base_frame: base_link
       resolution: 0.05
-      # Keep the planner and behavior collision checks on the same physical
-      # footprint.  The independent static primitive verifier remains the
-      # authority for the stricter 0.42 m nominal route clearance.
+      # Keep planner and behavior collision checks on the same physical
+      # footprint; the independent verifier owns the 0.35 m route clearance.
       robot_radius: 0.25
-      footprint_padding: 0.02
+      footprint_padding: 0.0
       track_unknown_space: false
       always_send_full_costmap: true
       plugins: ["static_layer", "inflation_layer"]

@@ -11,7 +11,7 @@
       0.0
     ]
   },
-  "collision_contract_sha256": "cda5508f7404334e7fcd33f8921a8081b30d7c03b24abfeabebdfce7fab9c313",
+  "collision_contract_sha256": "a6cd8aad3e8d45a69fba204f80465dcdd02509f78711a234b63967d1f833985d",
   "content_class": "runtime_geometry",
   "default_spawn": {
     "clearance_radius_m": 0.55,
@@ -23,14 +23,14 @@
   "inspection_catalog": {
     "contains_object_answers": false,
     "path": "inspection_catalog.json",
-    "sha256": "86b0271bdc7a17b800abfa12f5120480a47fc2c87f41b78dbfe67f7f8cbd9cc7"
+    "sha256": "c1b309f31c9726989f7cad671fd1b304abb08b64fffb8565dd0fe3037f3cca4a"
   },
   "map": {
     "frame_id": "map",
     "height_cells": 240,
     "image": {
       "path": "nav2/office_v2.pgm",
-      "sha256": "47b2ddd54d9f0aa2a220d5b79afcee367cbaa7a57068e4809189f24ab207360d"
+      "sha256": "c76ec21602efe452ea42695ec29f00f16ff11b4fbdc49182a93652ff32fc5a57"
     },
     "origin": [
       -8.0,
@@ -45,13 +45,13 @@
     "width_cells": 320,
     "yaml": {
       "path": "nav2/office_v2.yaml",
-      "sha256": "50b8a333887413053c6ddd3d6888819fc6c78093969948d980a1346a540ff71f"
+      "sha256": "d5994271f5cbd42989c19cb9dafde95d22ffc8bd8b644428711810dd50cb8f62"
     }
   },
   "model": {
     "office_include": {
       "path": "mujoco/office_v2.include.xml",
-      "sha256": "a768e1a3098b69d2267008fa81a30c441cfb73a6d777b3ba3243d4a906031e47"
+      "sha256": "c453c5affaeff85faa51850ea0113e3293db38931b93bb76d0e20bfacffa461f"
     },
     "render_assets": [
       {
@@ -129,6 +129,11 @@
       {
         "path": "mujoco/meshes/mesh_09.obj",
         "sha256": "ff1cae31cea508dec27ab99cb5ca9d06afe50dee4a572cb9d2358125e6e2cac7"
+      },
+      {
+        "path": "mujoco/hanging_g1_visual.json",
+        "sha256": "48df49fe53baa2d4091b3339aa451970c2934cf02adf3054ab68c14cf2eda0ff",
+        "source_model_sha256": "fdb850e065979896253daeba903ca00bad6dbf739d948b77f161f39557e0d3f8"
       }
     ],
     "scene": {
@@ -138,6 +143,6 @@
   },
   "reset_policy": "explicit_process_restart",
   "scene_id": "office_v2",
-  "scene_source_sha256": "7c30b7c4bb3e8136659688c80b8bef97724aae79aa7fd0f82deb96b227ca98ff",
+  "scene_source_sha256": "b7db4504b1fd82d095ca8abde2d5cf6ff1a6f8780d810625f5fd6340664fec3e",
   "schema_version": "h-ide.office-v2-runtime/1"
 }

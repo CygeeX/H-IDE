@@ -24,6 +24,9 @@ class FakeBackend:
         self.sent: list[tuple[str, float]] = []
         self.cancel_calls = 0
         self.stop_calls = 0
+        self.health_calls = 0
+        self.contact_event_count = 0
+        self.contact_pairs: list[dict[str, object]] = []
 
     def wait_ready(self, *, timeout_s: float = 10.0) -> None:
         assert timeout_s > 0.0
@@ -78,7 +81,15 @@ class FakeBackend:
         self.stop_calls += 1
 
     def bridge_health(self):
+        self.health_calls += 1
         return {"healthy": True, "gaitState": "idle", "fault": None}
+
+    def obstacle_contact_snapshot(self):
+        return {
+            "sampleSequence": 1,
+            "eventCount": self.contact_event_count,
+            "pairs": list(self.contact_pairs),
+        }
 
     def raise_if_faulted(self):
         return None
@@ -161,6 +172,32 @@ class ResidualEndpointBackend(FakeBackend):
         )
 
 
+class OneContactBackend(FakeBackend):
+    """Inject one wall contact during the first drive, then recover."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.contact_injected = False
+
+    def action_done(self, execution):
+        if execution.kind == "DriveOnHeading" and not self.contact_injected:
+            self.contact_injected = True
+            self.contact_event_count += 1
+            self.contact_pairs = [
+                {
+                    "robotBody": "pelvis",
+                    "staticGeom": "south_corridor_02",
+                    "penetrationM": 0.001,
+                }
+            ]
+            return False
+        return True
+
+    def cancel_active(self, *, timeout_s=2.0):
+        self.contact_pairs = []
+        return super().cancel_active(timeout_s=timeout_s)
+
+
 class FinalHeadingPlanner(FakePlanner):
     def build_primitive_plan(self, navfn_path, **_kwargs):
         self.plan_number += 1
@@ -206,11 +243,44 @@ class FinalHeadingPlanner(FakePlanner):
         }
 
 
-def executor(backend: FakeBackend, planner: FakePlanner):
+class ReplanAfterRealignmentPlanner(FakePlanner):
+    def __init__(self, *, blocked_plans: int = 1) -> None:
+        super().__init__()
+        self.blocked_plans = blocked_plans
+
+    def resolve_live_primitive(self, plan, index, navfn_path, pose, **kwargs):
+        if self.plan_number <= self.blocked_plans and index == 1:
+            return {
+                "disposition": "realign_spin_required",
+                "fresh_distance_to_endpoint_m": 1.0,
+                "resolved_target_map_yaw_rad": 0.8,
+                "heading_error_rad": 0.2,
+                "realignment_primitive_sequence": 0,
+            }
+        return super().resolve_live_primitive(
+            plan,
+            index,
+            navfn_path,
+            pose,
+            **kwargs,
+        )
+
+
+def executor(
+    backend: FakeBackend,
+    planner: FakePlanner,
+    *,
+    continuous_drive_handoff: bool = False,
+    full_straight_drive: bool = False,
+    relaxed_simulation_recovery: bool = False,
+):
     return adapter.StrictNavigationExecutor(
         backend,
         planner,
         sleep=lambda _seconds: None,
+        continuous_drive_handoff=continuous_drive_handoff,
+        full_straight_drive=full_straight_drive,
+        relaxed_simulation_recovery=relaxed_simulation_recovery,
     )
 
 
@@ -225,19 +295,17 @@ def test_navigate_uses_only_spin_and_drive_then_returns_idle() -> None:
     )
 
     assert result.plan_sha256 == "plan-1"
-    assert result.completed_primitives == 3
+    assert result.completed_primitives == 2
     assert backend.compute_calls == 1
     assert backend.sent == [
         ("Spin", 0.2),
-        ("DriveOnHeading", 0.5),
-        ("DriveOnHeading", 0.5),
+        ("DriveOnHeading", 1.0),
     ]
     assert backend.started == [
         ("detour", "Spin", 1),
         ("detour", "DriveOnHeading", 1),
-        ("detour", "DriveOnHeading", 1),
     ]
-    assert backend.stop_calls == 3
+    assert backend.stop_calls == 2
     assert len(progress) >= 2
 
 
@@ -251,14 +319,13 @@ def test_navigate_closes_observed_residual_before_final_heading() -> None:
     assert result.final_pose.x == pytest.approx(1.0)
     assert backend.sent == [
         ("Spin", 0.2),
-        ("DriveOnHeading", 0.5),
-        ("DriveOnHeading", 0.5),
+        ("DriveOnHeading", 1.0),
         ("DriveOnHeading", pytest.approx(0.26)),
         ("Spin", 0.3),
     ]
 
 
-def test_navigate_realigns_long_drive_at_half_metre_boundaries() -> None:
+def test_tight_space_profile_allows_one_metre_drive_chunks() -> None:
     backend = FakeBackend()
 
     result = executor(backend, FakePlanner()).navigate(
@@ -268,9 +335,179 @@ def test_navigate_realigns_long_drive_at_half_metre_boundaries() -> None:
     assert result.final_pose.x == pytest.approx(1.0)
     assert backend.sent == [
         ("Spin", 0.2),
-        ("DriveOnHeading", 0.5),
-        ("DriveOnHeading", 0.5),
+        ("DriveOnHeading", 1.0),
     ]
+
+
+def test_continuous_drive_handoff_skips_only_intermediate_idle_wait() -> None:
+    backend = FakeBackend()
+    planner = FakePlanner()
+
+    result = executor(
+        backend,
+        planner,
+        continuous_drive_handoff=True,
+    ).navigate(runner.PlanarPose(1.0, 0.0, 0.2))
+
+    assert result.final_pose.x == pytest.approx(1.0)
+    assert backend.sent == [
+        ("Spin", 0.2),
+        ("DriveOnHeading", 1.0),
+    ]
+    # The opt-in profile takes the whole one-metre reviewed segment in one
+    # official action.  The Spin and terminal Drive retain the ordinary
+    # balanced-IDLE gate.
+    assert backend.health_calls == 2
+
+
+def test_continuous_drive_handoff_only_skips_an_intermediate_chunk() -> None:
+    backend = FakeBackend()
+
+    class ThreeMetrePlanner(FakePlanner):
+        def resolve_live_primitive(self, plan, index, navfn_path, pose, **kwargs):
+            if index == 0:
+                return super().resolve_live_primitive(
+                    plan, index, navfn_path, pose, **kwargs
+                )
+            remaining = max(0.0, 3.0 - float(pose["x"]))
+            if remaining <= runner.DETOUR_ENDPOINT_TOLERANCE_M:
+                return {"disposition": "skip_within_endpoint_tolerance"}
+            return {
+                "disposition": "send_action",
+                "action_type": "nav2_msgs/action/DriveOnHeading",
+                "action_goal": {
+                    "target": {"x": remaining, "y": 0.0, "z": 0.0},
+                    "speed_mps": runner.OFFICIAL_DRIVE_SPEED_MPS,
+                },
+                "fresh_distance_to_endpoint_m": remaining,
+            }
+
+    result = executor(
+        backend,
+        ThreeMetrePlanner(),
+        continuous_drive_handoff=True,
+    ).navigate(runner.PlanarPose(3.0, 0.0, 0.2))
+
+    assert result.final_pose.x == pytest.approx(3.0)
+    assert backend.sent == [
+        ("Spin", 0.2),
+        ("DriveOnHeading", 2.0),
+        ("DriveOnHeading", 1.0),
+    ]
+    # Spin + terminal Drive only.  The first 2 m action is handed directly to
+    # the next same-direction chunk without a blocking learned-IDLE wait.
+    assert backend.health_calls == 2
+
+
+def test_full_straight_drive_sends_the_whole_verified_segment_once() -> None:
+    backend = FakeBackend()
+
+    class ThreeMetrePlanner(FakePlanner):
+        def __init__(self):
+            super().__init__()
+            self.max_segment_values: list[float | None] = []
+
+        def build_primitive_plan(self, navfn_path, **kwargs):
+            self.max_segment_values.append(kwargs.get("max_segment_m"))
+            return super().build_primitive_plan(navfn_path, **kwargs)
+
+        def resolve_live_primitive(self, plan, index, navfn_path, pose, **kwargs):
+            if index == 0:
+                return super().resolve_live_primitive(
+                    plan, index, navfn_path, pose, **kwargs
+                )
+            remaining = max(0.0, 3.0 - float(pose["x"]))
+            if remaining <= runner.DETOUR_ENDPOINT_TOLERANCE_M:
+                return {"disposition": "skip_within_endpoint_tolerance"}
+            return {
+                "disposition": "send_action",
+                "action_type": "nav2_msgs/action/DriveOnHeading",
+                "action_goal": {
+                    "target": {"x": remaining, "y": 0.0, "z": 0.0},
+                    "speed_mps": runner.OFFICIAL_DRIVE_SPEED_MPS,
+                },
+                "fresh_distance_to_endpoint_m": remaining,
+            }
+
+    planner = ThreeMetrePlanner()
+    result = executor(
+        backend,
+        planner,
+        full_straight_drive=True,
+    ).navigate(runner.PlanarPose(3.0, 0.0, 0.2))
+
+    assert result.final_pose.x == pytest.approx(3.0)
+    assert backend.sent == [
+        ("Spin", 0.2),
+        ("DriveOnHeading", 3.0),
+    ]
+    assert result.completed_primitives == 2
+    assert planner.max_segment_values == [4.0]
+    assert backend.health_calls == 2
+
+
+def test_full_straight_drive_falls_back_to_reviewed_planner_bound() -> None:
+    class RejectFullPlanner(FakePlanner):
+        def __init__(self):
+            super().__init__()
+            self.max_segment_values: list[float | None] = []
+
+        def build_primitive_plan(self, navfn_path, **kwargs):
+            value = kwargs.get("max_segment_m")
+            self.max_segment_values.append(value)
+            if value == adapter.FULL_STRAIGHT_RUNTIME_DRIVE_CHUNK_M:
+                raise ValueError("full chord is not partitionable")
+            return super().build_primitive_plan(navfn_path, **kwargs)
+
+    planner = RejectFullPlanner()
+    subject = executor(FakeBackend(), planner, full_straight_drive=True)
+    plan, verified, full_active, kwargs = subject._build_verified_plan(
+        {"frame_id": "map", "poses": [{"x": 0.0, "y": 0.0, "yaw": 0.0}, {"x": 1.0, "y": 0.0, "yaw": 0.0}]}
+    )
+
+    assert isinstance(plan, dict)
+    assert verified is plan
+    assert full_active is False
+    assert "max_segment_m" not in kwargs
+    assert planner.max_segment_values == [4.0, None]
+
+
+@pytest.mark.parametrize("clear", [True, False])
+def test_continuous_profile_uses_extra_map_clearance_gate(clear: bool) -> None:
+    class FakeMap:
+        @classmethod
+        def load(cls, _yaml_path, _image_path):
+            return cls()
+
+        def inflated_blocked_cells(self, _radius):
+            return frozenset()
+
+        def segment_is_clear(self, _start, _end, _blocked):
+            return clear
+
+    class ProductionLikePlanner(FakePlanner):
+        StaticMap = FakeMap
+
+    backend = FakeBackend()
+    planner = ProductionLikePlanner()
+    subject = executor(backend, planner, continuous_drive_handoff=True)
+    plan = {
+        "segments": [
+            {
+                "id": "segment-000",
+                "start_map": {"x": 0.0, "y": 0.0},
+                "end_map": {"x": 1.8, "y": 0.0},
+                "heading_map_yaw_rad": 0.0,
+            }
+        ]
+    }
+
+    allowed = subject._continuous_segment_allowed(
+        plan,
+        {"segment_id": "segment-000"},
+    )
+
+    assert allowed is clear
 
 
 def test_fresh_geometry_failure_replans_at_most_twice() -> None:
@@ -284,6 +521,51 @@ def test_fresh_geometry_failure_replans_at_most_twice() -> None:
     assert result.plan_attempts == 2
     assert backend.compute_calls == 2
     assert result.plan_sha256 == "plan-2"
+
+
+def test_exhausted_local_realignments_replan_instead_of_aborting() -> None:
+    backend = FakeBackend()
+    planner = ReplanAfterRealignmentPlanner()
+
+    result = executor(backend, planner).navigate(
+        runner.PlanarPose(1.0, 0.0, 0.2)
+    )
+
+    assert result.plan_attempts == 2
+    assert backend.compute_calls == 2
+    assert result.plan_sha256 == "plan-2"
+
+
+def test_new_obstacle_contact_replans_without_failing_relaxed_navigation() -> None:
+    backend = OneContactBackend()
+
+    result = executor(
+        backend,
+        FakePlanner(),
+        relaxed_simulation_recovery=True,
+    ).navigate(runner.PlanarPose(1.0, 0.0, 0.2))
+
+    assert backend.contact_injected is True
+    assert backend.cancel_calls >= 1
+    assert backend.compute_calls == 2
+    assert result.plan_attempts == 2
+    assert result.final_pose.x == pytest.approx(1.0)
+
+
+def test_relaxed_simulation_has_no_fixed_replan_failure_limit() -> None:
+    backend = FakeBackend()
+    blocked_plans = adapter.MAX_PRODUCT_REPLANS + 2
+    planner = ReplanAfterRealignmentPlanner(blocked_plans=blocked_plans)
+
+    result = executor(
+        backend,
+        planner,
+        relaxed_simulation_recovery=True,
+    ).navigate(runner.PlanarPose(1.0, 0.0, 0.2))
+
+    assert result.plan_attempts == blocked_plans + 1
+    assert backend.compute_calls == blocked_plans + 1
+    assert result.plan_sha256 == f"plan-{blocked_plans + 1}"
 
 
 def test_replan_finishes_inside_endpoint_before_unpartitionable_micro_route() -> None:
@@ -348,12 +630,11 @@ def test_navigate_executes_forward_only_start_clearance_recovery_first() -> None
         runner.PlanarPose(1.0, 0.0, 0.0)
     )
 
-    assert result.completed_primitives == 4
+    assert result.completed_primitives == 3
     assert backend.sent == [
         ("DriveOnHeading", pytest.approx(0.30)),
         ("Spin", pytest.approx(0.20)),
-        ("DriveOnHeading", pytest.approx(0.50)),
-        ("DriveOnHeading", pytest.approx(0.20)),
+        ("DriveOnHeading", pytest.approx(0.70)),
     ]
 
 
@@ -373,7 +654,7 @@ def test_execute_resolved_preserves_bounded_reverse_drive_direction() -> None:
     )
 
     assert kind == "DriveOnHeading"
-    assert backend.sent == [("DriveOnHeading", pytest.approx(-0.50))]
+    assert backend.sent == [("DriveOnHeading", pytest.approx(-0.70))]
     assert backend.started == [("detour", "DriveOnHeading", -1)]
 
 
@@ -452,5 +733,5 @@ def test_rotate_uses_the_reviewed_spin_relay(target: float, mode: str) -> None:
 def test_adapter_import_has_no_ros_or_motion_side_effects() -> None:
     assert adapter.NAVIGATE_ACTION == "/h_ide/strict/navigate_to_pose"
     assert adapter.ROTATE_ACTION == "/h_ide/strict/spin"
-    assert adapter.MAX_PRODUCT_REPLANS == 2
+    assert adapter.MAX_PRODUCT_REPLANS == 8
     assert adapter.DEFAULT_COMMAND_TIMEOUT_S == 2_400.0

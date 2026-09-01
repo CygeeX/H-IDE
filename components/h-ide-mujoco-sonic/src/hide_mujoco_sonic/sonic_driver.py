@@ -31,6 +31,7 @@ from .arm_limiter_evidence import (
     source_bundle_sha256,
 )
 from .config import SimConfig
+from .gesture import GestureError, GestureWaveController
 from .motion_fault import (
     SONIC_HEALTH_SCHEMA_VERSION,
     validate_sonic_health_request,
@@ -467,11 +468,11 @@ class SonicDriver:
         self._control_clock_armed = False
         # Controller construction and the isolated first inference can starve
         # the Python DDS callback while MuJoCo continues publishing a held
-        # robot.  Track callback progress independently from the strict clock
+        # robot.  Track callback progress independently from the control clock
         # so startup can drain that cold-path backlog before choosing its
-        # baseline.  Once the first control-arm transaction commits,
-        # ``_runtime_clock_committed`` never becomes false again: identical
-        # gaps during or after motion remain terminal.
+        # baseline.  ``_runtime_clock_committed`` remains a provenance marker;
+        # later finite forward gaps are recorded and resynchronized, never
+        # terminalized.
         self._lowstate_sequence = 0
         self._runtime_clock_committed = False
         # ``_control_consumer_ready`` is only the callback/consumer handshake.
@@ -489,6 +490,12 @@ class SonicDriver:
         self._pending_control_sample: (
             tuple[Any, PlantControlStep, int] | None
         ) = None
+        # A late consumer must not turn a healthy simulator into a terminal
+        # fault.  Keep the latest sample and expose the number of replaced
+        # pending samples as diagnostics instead.
+        self._control_sample_overrun_count = 0
+        self._control_sample_overrun_last_tick_ms: int | None = None
+        self._control_clock_diagnostic_signature: tuple[int, int, int] | None = None
         self._wall_clock = time.monotonic
         self._control_clock_armed_at_wall_s: float | None = None
         self._last_lowstate_wall_s: float | None = None
@@ -558,6 +565,10 @@ class SonicDriver:
         self._last_published_targets: tuple[float, ...] | None = None
         self._safe_hold_targets: tuple[float, ...] | None = None
         self._support_lock = threading.RLock()
+        # Voice-assistant gestures share SONIC's actuator boundary. The
+        # controller only stores a bounded trajectory; every actual LowCmd
+        # remains serialized through _publish/_publish_position_hold.
+        self._gesture = GestureWaveController(clock=self._wall_clock)
         self._normal_stop = NormalStopState()
         self._normal_stop_bridge_boot_id: UUID | None = None
         self._normal_stop_seen_bridge_boot_ids: set[UUID] = set()
@@ -763,8 +774,10 @@ class SonicDriver:
                     # Before the first successful control-arm transaction no
                     # controller state, policy cursor, or actuator motion is
                     # authorized, so invalidate all pending credit and require
-                    # a fresh consecutive 50 Hz window.  The identical gap
-                    # after that authority boundary remains terminal.
+                    # a fresh consecutive simulation window.  The same gap
+                    # after that authority boundary is merely recorded by the
+                    # runtime control clock and does not stop the process.
+                    self._control_clock.note_source_gap(tick - previous_tick)
                     self._control_clock.rebase_stationary_qualification(tick)
                     self._pending_control_sample = None
                     self._startup_qualification_dropped_samples += 1
@@ -803,11 +816,38 @@ class SonicDriver:
                                 self._control_condition.notify_all()
                             else:
                                 pending_tick = self._pending_control_sample[1].tick_ms
-                                clock_fault = (
-                                    "MuJoCo control sample overrun: "
-                                    f"{pending_tick}ms was not consumed before "
-                                    f"{control_step.tick_ms}ms; catch-up is forbidden"
+                                # The producer/consumer boundary is latest-only:
+                                # a stale pending observation has no authority
+                                # once a newer simulation sample is available.
+                                # Replacing it preserves forward progress and
+                                # avoids converting ordinary inference/render
+                                # jitter into a process exit.
+                                self._control_sample_overrun_count = (
+                                    int(
+                                        getattr(
+                                            self,
+                                            "_control_sample_overrun_count",
+                                            0,
+                                        )
+                                    )
+                                    + 1
                                 )
+                                self._control_sample_overrun_last_tick_ms = (
+                                    pending_tick
+                                )
+                                logger.warning(
+                                    "SONIC control sample overrun: replacing "
+                                    "pending tick %sms with latest tick %sms; "
+                                    "continuing without catch-up",
+                                    pending_tick,
+                                    control_step.tick_ms,
+                                )
+                                self._pending_control_sample = (
+                                    message,
+                                    control_step,
+                                    self._startup_qualification_drop_generation,
+                                )
+                                self._control_condition.notify_all()
                         else:
                             self._pending_control_sample = (
                                 message,
@@ -830,14 +870,11 @@ class SonicDriver:
                 self._startup_qualification_consecutive_steps
             ),
         )
+        self._publish_control_clock_diagnostics()
         if clock_fault is not None:
-            # Any clock discontinuity invalidates policy history and actuator
-            # continuity.  Never rebuild history or replay missed policy ticks.
-            if clock_fault.startswith("MuJoCo control sample overrun:"):
-                logger.error(
-                    "capturing all SONIC thread stacks at control-sample overrun"
-                )
-                faulthandler.dump_traceback(all_threads=True)
+            # Only an invalid/backwards clock reaches this branch.  Forward
+            # gaps and pending-sample overruns are handled as latest-only
+            # diagnostics above and never revoke actuator authority.
             self._latch_terminal_fault(clock_fault)
 
     def _run_lowstate_reader(self) -> None:
@@ -925,10 +962,10 @@ class SonicDriver:
         remain held while those sessions load.  A long GIL/ORT scheduling
         pause can nevertheless leave ``_lowstate`` older than the first
         callback delivered after warm-up.  Arming against that stale sample
-        manufactures a multi-second source jump even though no motion was
-        possible.  Require a fresh, bounded-gap callback window while the
-        strict clock is still disarmed; no sample earns policy or startup
-        qualification credit here.
+        manufactures a multi-second source gap even though no motion was
+        possible.  Require a fresh callback window while the clock is still
+        disarmed; a large positive gap is recorded but does not invalidate the
+        window or terminate the process.
         """
 
         if not math.isfinite(float(timeout_s)) or float(timeout_s) <= 0.0:
@@ -952,7 +989,9 @@ class SonicDriver:
                         raise RuntimeError("post-warm LowState callback lost its sample")
                     tick = int(self._lowstate.tick)
                     gap = None if previous_tick is None else tick - previous_tick
-                    if gap is not None and 0 < gap <= self._control_clock.max_source_gap_ms:
+                    if gap is not None and gap > 0:
+                        if gap > self._control_clock.max_source_gap_ms:
+                            self._control_clock.note_source_gap(gap)
                         consecutive += 1
                     else:
                         consecutive = 1
@@ -1135,7 +1174,7 @@ class SonicDriver:
         )
 
     def _prepare_idle_startup(self) -> None:
-        """Hold the plant and warm inference before strict clock handoff."""
+        """Hold the plant and warm inference before control-clock handoff."""
 
         lowstate = self._wait_for_initial_lowstate()
         if self._fault_latched.is_set():
@@ -1370,6 +1409,10 @@ class SonicDriver:
                     "terminal SONIC hold has no executed actuator boundary"
                 )
             selected = self._safe_hold_targets or targets
+            if getattr(self, "_gesture", None) is not None and self._gesture.snapshot().state == "running":
+                selected = self._sample_gesture_targets_locked(
+                    tuple(float(value) for value in selected)
+                )
             for index in range(29):
                 motor = self._msg.motor_cmd[index]
                 motor.mode = 1
@@ -1617,6 +1660,31 @@ class SonicDriver:
         runtime_diagnostics = getattr(self, "_runtime_diagnostics", None)
         if runtime_diagnostics is not None:
             runtime_diagnostics.observe_control_publish(published_at)
+
+    def _publish_control_clock_diagnostics(self) -> None:
+        """Expose non-fatal clock jitter without changing motion state."""
+
+        clock = getattr(self, "_control_clock", None)
+        diagnostics = getattr(clock, "diagnostics", None)
+        if not callable(diagnostics):
+            return
+        values = diagnostics()
+        overrun_count = int(getattr(self, "_control_sample_overrun_count", 0))
+        signature = (
+            int(values.get("control_clock_stall_count", 0)),
+            int(values.get("control_clock_interval_gap_count", 0)),
+            overrun_count,
+        )
+        if signature == getattr(self, "_control_clock_diagnostic_signature", None):
+            return
+        self._control_clock_diagnostic_signature = signature
+        values.update(
+            control_sample_overrun_count=overrun_count,
+            control_sample_overrun_last_tick_ms=getattr(
+                self, "_control_sample_overrun_last_tick_ms", None
+            ),
+        )
+        self._update_telemetry_hot(**values)
 
     def _arm_control_stall_diagnostic(self) -> None:
         """Enable one pre-fault stack capture for the current motion task."""
@@ -4796,6 +4864,82 @@ class SonicDriver:
     def _angular_delta(value: float, previous: float) -> float:
         return (float(value) - float(previous) + math.pi) % (2.0 * math.pi) - math.pi
 
+    def _gesture_ready_locked(self) -> bool:
+        """Return whether the sole SONIC owner may run a demo gesture."""
+
+        controller = getattr(self, "_controller", None)
+        mode = getattr(getattr(controller, "ms", None), "mode", 0)
+        has_movement = bool(getattr(getattr(controller, "ms", None), "has_movement", False))
+        mode_is_idle = mode == 0 or str(mode).upper() == "IDLE"
+        return bool(
+            not self._fault_latched.is_set()
+            and not self._stop.is_set()
+            and not self._navigation_task_active
+            and not self._normal_stop_fences_motion_locked()
+            and not self._process_stop_fences_motion_locked()
+            and not self._plant_support_stop_pending
+            and not self._plant_support_safety_latched
+            and self._plant_support_mode in {"idle", "startup", None}
+            and mode_is_idle
+            and not has_movement
+        )
+
+    def _update_gesture_telemetry(self, snapshot=None) -> None:
+        gesture = getattr(self, "_gesture", None)
+        if gesture is None:
+            return
+        value = snapshot or gesture.snapshot()
+        self._update_telemetry_hot(
+            gesture_state=value.state,
+            gesture_name=value.gesture,
+            gesture_request_id=value.request_id,
+            gesture_progress=value.progress,
+            gesture_last_error=value.last_error,
+        )
+
+    def _sample_gesture_targets_locked(
+        self,
+        targets: tuple[float, ...],
+        *,
+        now: float | None = None,
+    ) -> tuple[float, ...]:
+        """Overlay a gesture only while the same SONIC boundary is held."""
+
+        gesture = getattr(self, "_gesture", None)
+        if gesture is None:
+            return targets
+        if not self._gesture_ready_locked():
+            if gesture.snapshot().state == "running":
+                self._update_gesture_telemetry(
+                    gesture.cancel("gesture interrupted by a motion or stop boundary")
+                )
+            return targets
+        sampled, snapshot = gesture.sample(targets, now=now)
+        self._update_gesture_telemetry(snapshot)
+        return sampled
+
+    def _handle_gesture_request(self, payload: Mapping[str, Any]) -> dict[str, object]:
+        expected = {"type", "request_id", "gesture", "duration_s", "simulation_only"}
+        if set(payload) != expected:
+            raise ValueError("gesture_wave request fields do not match v1")
+        if self.config.robot_profile != "unitree_g1_29dof":
+            raise ValueError("gesture_wave is only implemented for the G1 simulation profile")
+        with self._support_lock:
+            ready = self._gesture_ready_locked()
+            try:
+                response = self._gesture.request_wave(
+                    request_id=payload.get("request_id"),
+                    gesture=payload.get("gesture"),
+                    duration_s=payload.get("duration_s"),
+                    simulation_only=payload.get("simulation_only"),
+                    ready=ready,
+                )
+            except GestureError as exc:
+                self._update_gesture_telemetry()
+                raise
+        self._update_gesture_telemetry()
+        return response
+
     def _action_targets(self, action: dict[str, Any], lowstate) -> tuple[float, ...]:
         return tuple(
             float(action.get(f"{self._joint_name(index)}.q", lowstate.motor_state[index].q))
@@ -4921,6 +5065,10 @@ class SonicDriver:
                 )
             else:
                 published_targets = raw_targets
+            if getattr(self, "_gesture", None) is not None and self._gesture.snapshot().state == "running":
+                published_targets = self._sample_gesture_targets_locked(
+                    tuple(float(value) for value in published_targets)
+                )
             for index in range(29):
                 motor = self._msg.motor_cmd[index]
                 motor.mode = 1
@@ -7130,6 +7278,8 @@ class SonicDriver:
         return response
 
     def accept_json(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        if payload.get("type") == "gesture_wave":
+            return self._handle_gesture_request(payload)
         if (
             isinstance(payload.get("type"), str)
             and str(payload["type"]).startswith("arm_limiter_evidence_")

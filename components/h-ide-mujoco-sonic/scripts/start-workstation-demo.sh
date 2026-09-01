@@ -45,6 +45,8 @@ HIDE_DEMO_SYSTEMD_PREFIX="h-ide-mujoco-demo"
 HIDE_DOCKER_OBSERVATION_BIND_REQUEST="${HIDE_DOCKER_OBSERVATION_BIND_HOST:-auto}"
 HIDE_DEMO_REBUILD=false
 HIDE_DEMO_MOTION_CORE=false
+HIDE_DEMO_CONTINUOUS_DRIVE_HANDOFF="${HIDE_CONTINUOUS_DRIVE_HANDOFF:-0}"
+HIDE_DEMO_FULL_STRAIGHT_DRIVE="${HIDE_FULL_STRAIGHT_DRIVE:-0}"
 HIDE_MUJOCO_ONSCREEN_VIEWER=0
 # Reversible simulation experiment: keep the learned SONIC whole-body policy
 # in control through automatic gait/navigation/health observations. Explicit
@@ -55,6 +57,16 @@ HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT="${HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_F
 if [[ "${HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT}" != "0" \
   && "${HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT}" != "1" ]]; then
   printf '%s\n' 'HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT must be exactly 0 or 1' >&2
+  exit 2
+fi
+if [[ "${HIDE_DEMO_CONTINUOUS_DRIVE_HANDOFF}" != "0" \
+  && "${HIDE_DEMO_CONTINUOUS_DRIVE_HANDOFF}" != "1" ]]; then
+  printf '%s\n' 'HIDE_CONTINUOUS_DRIVE_HANDOFF must be exactly 0 or 1' >&2
+  exit 2
+fi
+if [[ "${HIDE_DEMO_FULL_STRAIGHT_DRIVE}" != "0" \
+  && "${HIDE_DEMO_FULL_STRAIGHT_DRIVE}" != "1" ]]; then
+  printf '%s\n' 'HIDE_FULL_STRAIGHT_DRIVE must be exactly 0 or 1' >&2
   exit 2
 fi
 
@@ -69,8 +81,14 @@ for argument in "$@"; do
     --motion-core)
       HIDE_DEMO_MOTION_CORE=true
       ;;
+    --continuous-drive-handoff)
+      HIDE_DEMO_CONTINUOUS_DRIVE_HANDOFF=1
+      ;;
+    --full-straight-drive)
+      HIDE_DEMO_FULL_STRAIGHT_DRIVE=1
+      ;;
     *)
-      printf 'usage: %s [--rebuild] [--viewer] [--motion-core]\n' "$0" >&2
+      printf 'usage: %s [--rebuild] [--viewer] [--motion-core] [--continuous-drive-handoff] [--full-straight-drive]\n' "$0" >&2
       exit 2
       ;;
   esac
@@ -94,6 +112,8 @@ export HIDE_DEMO_H_IDE_ROOT HIDE_DEMO_SIM_ROOT HIDE_DEMO_ROBOT_ROOT HIDE_DEMO_VI
 export HIDE_DEMO_CONFIG HIDE_DEMO_ROBOT_CONFIG HIDE_DEMO_OBSERVATION_CONFIG
 export HIDE_DEMO_CYCLONE DISPLAY="${DISPLAY:-:0}"
 export HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT
+export HIDE_DEMO_CONTINUOUS_DRIVE_HANDOFF
+export HIDE_DEMO_FULL_STRAIGHT_DRIVE
 HIDE_DEMO_XAUTHORITY="${XAUTHORITY:-${XDG_RUNTIME_DIR}/gdm/Xauthority}"
 if [[ "${HIDE_MUJOCO_ONSCREEN_VIEWER}" == "1" ]]; then
   HIDE_DEMO_XAUTHORITY_RESOLVED="$(
@@ -140,6 +160,7 @@ done
 HIDE_DEMO_COUPLED_UNIT_SUFFIXES=(
   mujoco-plant
   sonic-driver
+  leader-demo-gesture-proxy
   ros-cmd-vel-bridge
   ros-observation-bridge
   ros-safe-stop
@@ -274,6 +295,17 @@ export HIDE_DOCKER_OBSERVATION_BIND_HOST
 # constrained proxy below is the only Docker-visible route, so Compose must
 # never point control-api directly at the loopback-only 8796 endpoint.
 export SIMULATION_ROBOT_AGENT_DIAGNOSTICS_URL="http://host.docker.internal:8797"
+# Resolve the gesture-proxy token before Compose creates the containers.  The
+# proxy unit and Control API therefore receive the same value even when an
+# operator overrides it in the H-IDE .env file.
+HIDE_DEMO_GESTURE_PROXY_TOKEN="${HIDE_LEADER_DEMO_GESTURE_PROXY_TOKEN:-}"
+if [[ -z "${HIDE_DEMO_GESTURE_PROXY_TOKEN}" ]]; then
+  HIDE_DEMO_GESTURE_PROXY_TOKEN="$(sed -n 's/^HIDE_LEADER_DEMO_GESTURE_PROXY_TOKEN=//p' "${HIDE_DEMO_H_IDE_ROOT}/.env" | tail -n 1)"
+fi
+if [[ -z "${HIDE_DEMO_GESTURE_PROXY_TOKEN}" ]]; then
+  HIDE_DEMO_GESTURE_PROXY_TOKEN="dev-leader-demo-gesture-token"
+fi
+export HIDE_DEMO_GESTURE_PROXY_TOKEN HIDE_LEADER_DEMO_GESTURE_PROXY_TOKEN="${HIDE_DEMO_GESTURE_PROXY_TOKEN}"
 
 # Runtime evidence contains process/session identities and must not be writable
 # by another account.  Older launchers created this directory using the user's
@@ -325,6 +357,12 @@ env_value() {
 
 HIDE_DEMO_GATEWAY_TOKEN="$(env_value SIMULATION_ROBOT_AGENT_GATEWAY_TOKEN dev-sim-gateway-token)"
 export HIDE_DEMO_GATEWAY_TOKEN
+HIDE_DEMO_GESTURE_PROXY_TOKEN="$(env_value HIDE_LEADER_DEMO_GESTURE_PROXY_TOKEN dev-leader-demo-gesture-token)"
+if [[ -z "${HIDE_DEMO_GESTURE_PROXY_TOKEN}" ]]; then
+  printf '%s\n' 'leader-demo gesture proxy token must not be empty' >&2
+  exit 2
+fi
+export HIDE_DEMO_GESTURE_PROXY_TOKEN
 
 start_process() {
   local name="$1"
@@ -395,8 +433,12 @@ start_process() {
     --setenv="HIDE_DEMO_OBSERVATION_CONFIG=${HIDE_DEMO_OBSERVATION_CONFIG}" \
     --setenv="HIDE_DEMO_CYCLONE=${HIDE_DEMO_CYCLONE}" \
     --setenv="HIDE_DEMO_GATEWAY_TOKEN=${HIDE_DEMO_GATEWAY_TOKEN}" \
+    --setenv="HIDE_DEMO_GESTURE_PROXY_TOKEN=${HIDE_DEMO_GESTURE_PROXY_TOKEN}" \
+    --setenv="HIDE_LEADER_DEMO_GESTURE_PROXY_TOKEN=${HIDE_DEMO_GESTURE_PROXY_TOKEN}" \
     --setenv="HIDE_DOCKER_OBSERVATION_BIND_HOST=${HIDE_DOCKER_OBSERVATION_BIND_HOST}" \
     --setenv="HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT=${HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT}" \
+    --setenv="HIDE_DEMO_CONTINUOUS_DRIVE_HANDOFF=${HIDE_DEMO_CONTINUOUS_DRIVE_HANDOFF}" \
+    --setenv="HIDE_DEMO_FULL_STRAIGHT_DRIVE=${HIDE_DEMO_FULL_STRAIGHT_DRIVE}" \
     /bin/bash -lc "${command}" >/dev/null
 
   for _ in {1..30}; do
@@ -1039,6 +1081,20 @@ start_process \
 # IDLE consumer has sustained the authoritative 50 Hz simulation cadence, and
 # the driver explicitly opens its motion gate.
 wait_for_sonic_motion_ready 120
+
+# Keep the raw SONIC command socket host-loopback-only.  Control API reaches
+# this fixed, allow-listed proxy through Docker's validated bridge address; the
+# proxy accepts only the g1-sim wave payload and forwards no generic command.
+start_process \
+  leader-demo-gesture-proxy \
+  '-m hide_mujoco_sonic.leader_demo_gesture_proxy' \
+  "${HIDE_DEMO_SIM_ROOT}" \
+  'exec "$HIDE_DEMO_SIM_ROOT/.venv/bin/python" -u -m hide_mujoco_sonic.leader_demo_gesture_proxy --bind-host "$HIDE_DOCKER_OBSERVATION_BIND_HOST"'
+wait_for_http \
+  'Leader-demo gesture proxy' \
+  "http://${HIDE_DOCKER_OBSERVATION_BIND_HOST}:8798/healthz" \
+  30
+
 trigger_native_viewer
 wait_for_native_viewer
 if [[ "${HIDE_MUJOCO_ONSCREEN_VIEWER}" == "1" ]]; then
@@ -1118,11 +1174,23 @@ fi
 # motion owner that passed motion-core acceptance.  Start this adapter after
 # Nav2 lifecycle activation and before any component capable of acquiring a
 # RobotAgent lease.  NavigateToPose / FollowPath output remains quarantined.
+# In continuous handoff mode open DriveOnHeading checkpoints may use the
+# reviewed 2 m planner limit. In full-straight mode a map-proven straight
+# segment may use the full map-bounded residual. Both modes still publish the
+# endpoint zero, revalidate fresh odometry/clearance, and gate final or
+# direction-changing stops. The default remains the frozen 0.50 m profile.
+strict_navigation_command='source /opt/ros/jazzy/setup.bash; source "$HIDE_DEMO_ROBOT_ROOT/tools/activate-local-nav2-jazzy.bash"; export ROS_DOMAIN_ID=232 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp CYCLONEDDS_URI="$HIDE_DEMO_CYCLONE"; export PYTHONPATH="$HIDE_DEMO_SIM_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"; exec /usr/bin/python3 -u "$HIDE_DEMO_SIM_ROOT/tools/strict_navigation_adapter.py" --command-timeout-seconds 2400'
+if [[ "${HIDE_DEMO_CONTINUOUS_DRIVE_HANDOFF}" == "1" ]]; then
+  strict_navigation_command+=' --continuous-drive-handoff'
+fi
+if [[ "${HIDE_DEMO_FULL_STRAIGHT_DRIVE}" == "1" ]]; then
+  strict_navigation_command+=' --full-straight-drive'
+fi
 start_process \
   strict-navigation-adapter \
   'tools/strict_navigation_adapter.py' \
   "${HIDE_DEMO_SIM_ROOT}" \
-  'source /opt/ros/jazzy/setup.bash; source "$HIDE_DEMO_ROBOT_ROOT/tools/activate-local-nav2-jazzy.bash"; export ROS_DOMAIN_ID=232 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp CYCLONEDDS_URI="$HIDE_DEMO_CYCLONE"; export PYTHONPATH="$HIDE_DEMO_SIM_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"; exec /usr/bin/python3 -u "$HIDE_DEMO_SIM_ROOT/tools/strict_navigation_adapter.py" --command-timeout-seconds 2400'
+  "${strict_navigation_command}"
 
 if ! wait_for_strict_navigation_adapter 30; then
   exit 1

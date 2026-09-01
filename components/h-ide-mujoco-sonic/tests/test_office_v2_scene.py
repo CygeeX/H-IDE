@@ -37,14 +37,15 @@ from hide_mujoco_sonic.scene_runtime import load_runtime_scene
 ROOT = Path(__file__).resolve().parents[1]
 SCENE_ROOT = ROOT / "scenes" / "office_v2"
 SCENE_SOURCE = SCENE_ROOT / "scene.yaml"
+HANGING_G1_MANIFEST = SCENE_ROOT / "hanging_g1_visual.json"
 GENERATED = SCENE_ROOT / "generated"
 EVALUATION = SCENE_ROOT / "evaluation" / "manifest.json"
 G1_MODEL = ROOT / "models" / "unitree-g1-mujoco" / "assets" / "g1_29dof_no_hand.xml"
 OFFICE_V2_COLLISION_CONTRACT_SHA256 = (
-    "cda5508f7404334e7fcd33f8921a8081b30d7c03b24abfeabebdfce7fab9c313"
+    "a6cd8aad3e8d45a69fba204f80465dcdd02509f78711a234b63967d1f833985d"
 )
 OFFICE_V2_PGM_SHA256 = (
-    "47b2ddd54d9f0aa2a220d5b79afcee367cbaa7a57068e4809189f24ab207360d"
+    "c76ec21602efe452ea42695ec29f00f16ff11b4fbdc49182a93652ff32fc5a57"
 )
 
 
@@ -281,7 +282,7 @@ def test_visual_dressing_is_collision_free_and_all_room_signs_are_present() -> N
         for mesh in xml.findall("./asset/mesh")
         if mesh.attrib["name"].endswith("_sign_surface")
     ]
-    assert len(sign_meshes) == 6
+    assert len(sign_meshes) == len(signs) + 1  # the added corridor notice board
     assert all("texcoord" in mesh.attrib for mesh in sign_meshes)
 
     imported_mesh_geoms = [
@@ -290,6 +291,28 @@ def test_visual_dressing_is_collision_free_and_all_room_signs_are_present() -> N
     assert imported_mesh_geoms
     assert all(geom.attrib["contype"] == "0" for geom in imported_mesh_geoms)
     assert all(geom.attrib["conaffinity"] == "0" for geom in imported_mesh_geoms)
+    hanging_bodies = [
+        body for body in xml.findall(".//body")
+        if body.attrib.get("name", "").endswith("_g1_static")
+    ]
+    assert len(hanging_bodies) == 3
+    hanging_geoms = [
+        geom for geom in geoms.values()
+        if any(
+            geom.attrib.get("name", "").startswith(f"office_decor_{index:03d}_g1_")
+            for index in (7, 8, 9)
+        )
+    ]
+    hanging_manifest = json.loads(HANGING_G1_MANIFEST.read_text(encoding="utf-8"))
+    # The display copy now retains the source body hierarchy.  Each instance
+    # has one static root plus nested link bodies; count visual geoms from the
+    # manifest tree instead of assuming a flat mesh list.
+    def manifest_geom_count(body: dict) -> int:
+        return len(body["geoms"]) + sum(manifest_geom_count(child) for child in body["children"])
+
+    expected_display_geoms = manifest_geom_count(hanging_manifest["staticBody"])
+    assert len(hanging_geoms) == 3 * expected_display_geoms
+    assert all(geom.attrib["contype"] == "0" and geom.attrib["conaffinity"] == "0" for geom in hanging_geoms)
 
 
 def test_product_inspection_catalog_is_complete_safe_and_map_bound() -> None:
@@ -456,9 +479,23 @@ def test_generated_preview_loads_with_mujoco() -> None:
     mujoco = pytest.importorskip("mujoco")
     model = mujoco.MjModel.from_xml_path(str(GENERATED / "mujoco" / "office_v2.preview.xml"))
     scene = yaml.safe_load(SCENE_SOURCE.read_text(encoding="utf-8"))
-    assert model.nbody == 1 + len(scene["structures"]) + len(scene["objects"])
+    hanging = json.loads(HANGING_G1_MANIFEST.read_text(encoding="utf-8"))
+
+    def manifest_body_count(body: dict) -> int:
+        return 1 + sum(manifest_body_count(child) for child in body["children"])
+
+    display_count = sum(
+        item.get("kind") in {"display_robot", "hanging_robot"}
+        for item in scene["visual_decor"]
+    )
+    assert model.nbody == (
+        1
+        + len(scene["structures"])
+        + len(scene["objects"])
+        + display_count * manifest_body_count(hanging["staticBody"])
+    )
     assert model.ngeom > len(scene["objects"]) * 2
-    assert model.ntex == 1 + len(scene["textures"])
+    assert model.ntex == 2 + len(scene["textures"])  # skybox + built-in checker
     expected_office_meshes = sum(
         1
         for item in scene["objects"]
@@ -467,8 +504,67 @@ def test_generated_preview_loads_with_mujoco() -> None:
         )
         is not None
     ) + sum(item["visual"]["template"] == "sign" for item in scene["objects"])
-    assert model.nmesh == expected_office_meshes
+    assert model.nmesh == expected_office_meshes + len(hanging["meshes"])
     assert model.ncam == len(scene["render"]["cameras"])
+
+
+def test_display_g1_copies_keep_link_hierarchy_and_touch_the_floor() -> None:
+    """Guard against reintroducing the old compiler-offset double transform."""
+
+    mujoco = pytest.importorskip("mujoco")
+    model = mujoco.MjModel.from_xml_path(str(GENERATED / "mujoco" / "office_v2.preview.xml"))
+    data = mujoco.MjData(model)
+    mujoco.mj_forward(model, data)
+    scene = yaml.safe_load(SCENE_SOURCE.read_text(encoding="utf-8"))
+    display_indices = [
+        index
+        for index, item in enumerate(scene["visual_decor"], start=1)
+        if item.get("kind") in {"display_robot", "hanging_robot"}
+    ]
+    assert display_indices == [7, 8, 9]
+    for index in display_indices:
+        prefix = f"office_decor_{index:03d}_g1_"
+        body_ids = {
+            body_id
+            for body_id in range(model.nbody)
+            if (model.body(body_id).name or "").startswith(prefix)
+        }
+        # 32 bodies is the official G1 link tree (including the root), with
+        # every nominal joint baked into a fixed quaternion and no DOFs.
+        assert len(body_ids) == 32
+        assert any((model.body(body_id).name or "").endswith("_torso_link") for body_id in body_ids)
+        assert any((model.body(body_id).name or "").endswith("_left_knee_link") for body_id in body_ids)
+        geom_ids = [
+            geom_id
+            for geom_id in range(model.ngeom)
+            if int(model.geom_bodyid[geom_id]) in body_ids
+        ]
+        assert len(geom_ids) == 42
+        points: list[tuple[float, float, float]] = []
+        for geom_id in geom_ids:
+            rotation = data.geom_xmat[geom_id].reshape(3, 3)
+            center = data.geom_xpos[geom_id]
+            geom_type = int(model.geom_type[geom_id])
+            if geom_type == int(mujoco.mjtGeom.mjGEOM_MESH):
+                mesh_id = int(model.geom_dataid[geom_id])
+                vertices = model.mesh_vert[
+                    model.mesh_vertadr[mesh_id] : model.mesh_vertadr[mesh_id] + model.mesh_vertnum[mesh_id]
+                ].reshape(-1, 3)
+                points.extend((center + vertices @ rotation.T).tolist())
+            elif geom_type == int(mujoco.mjtGeom.mjGEOM_BOX):
+                half = model.geom_size[geom_id]
+                points.extend(
+                    (center + rotation @ [sx * half[0], sy * half[1], sz * half[2]]).tolist()
+                    for sx in (-1, 1)
+                    for sy in (-1, 1)
+                    for sz in (-1, 1)
+                )
+        assert points
+        minimum_z = min(point[2] for point in points)
+        maximum_z = max(point[2] for point in points)
+        assert minimum_z >= -1e-5
+        assert maximum_z - minimum_z > 0.80
+
 
 
 def test_runtime_g1_uses_official_deployment_full_sole_contact_geometry() -> None:
@@ -670,7 +766,7 @@ def test_runtime_loader_hashes_every_included_office_asset_and_fails_closed(
     scene = yaml.safe_load(SCENE_SOURCE.read_text(encoding="utf-8"))
     assert len(runtime.model_render_assets) == len(scene["textures"]) + len(
         scene["mesh_assets"]
-    )
+    ) + 1  # pinned static G1 hierarchy manifest
     assert runtime.inspection_catalog.name == "inspection_catalog.json"
 
     runtime.model_office_include.write_text(

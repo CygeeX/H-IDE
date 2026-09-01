@@ -13,6 +13,7 @@ from hide_mujoco_sonic.ros_bridge import (
     _create_safety_timers,
     _global_goal_progress_active,
     _resident_policy_reentry_generation,
+    _retained_static_idle_reentry_generation,
     _suppress_for_correlated_stop,
     BridgeRuntimeHealth,
 )
@@ -120,6 +121,41 @@ def test_physical_safe_hold_still_uses_new_generation_rearm_path() -> None:
         )
         is None
     )
+
+
+def test_relaxed_simulation_reuses_exact_armed_static_generation() -> None:
+    health = replace(
+        ready_sonic_health(),
+        plant_support_mode="idle",
+        plant_support_safety_latched=False,
+        static_hold_active=True,
+        motion_authorized=True,
+    )
+
+    assert health.confirmed_armed_static_idle is True
+    assert (
+        _retained_static_idle_reentry_generation(
+            health=health,
+            gait_state=GaitState.IDLE,
+            bridge_generation=51,
+            gait_generation=51,
+            observation_generation=51,
+        )
+        == 51
+    )
+
+    try:
+        _retained_static_idle_reentry_generation(
+            health=health,
+            gait_state=GaitState.IDLE,
+            bridge_generation=51,
+            gait_generation=52,
+            observation_generation=51,
+        )
+    except ValueError as exc:
+        assert "generation identity mismatch" in str(exc)
+    else:
+        raise AssertionError("split retained-static identity must fail closed")
 
 
 def bridge_health_snapshot(
