@@ -294,10 +294,14 @@ the `*_last_over_threshold_gap_s`,
 `*_over_threshold_gc_overlap_count`, and
 `*_over_threshold_non_gc_residual_count` suffixes. SONIC performs one full
 collection and freezes the warmed long-lived Python object graph before arming
-its strict control clock. It then disables process-global automatic cyclic GC
-so a request thread cannot stop the 50 Hz actuator owner; ordinary CPython
-reference counting remains active, and the applied/error state is explicit in
-telemetry. The
+its simulation-time 50 Hz control clock. A finite forward callback/control
+interval gap (including a gap greater than the nominal 20 ms period) is
+recorded in SONIC telemetry and consumed as one nominal 20 ms step; it no
+longer stops a healthy Plant. Duplicate/backwards ticks, invalid values and
+actual MuJoCo numerical faults remain fail-closed. SONIC then disables
+process-global automatic cyclic GC so a request thread cannot stop the 50 Hz
+actuator owner; ordinary CPython reference counting remains active, and the
+applied/error state is explicit in telemetry. The
 LowState-only hot update mutates scalar telemetry in place; the ordinary update
 API retains its isolated-snapshot return contract, and HTTP readers also
 receive isolated copies.

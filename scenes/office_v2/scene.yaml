@@ -85,8 +85,11 @@ navigation:
   # These values are also asserted against the Nav2 local/global costmap
   # configuration. They define the minimum full-body clearance required by
   # every generated navigation target.
-  robot_radius_m: 0.35
-  footprint_padding_m: 0.02
+  # Simulation-only integration profile: keep only a small centre-point buffer.
+  # MuJoCo contact evidence remains visible, but touching furniture must not
+  # abort an Office inspection or revoke SONIC authority.
+  robot_radius_m: 0.25
+  footprint_padding_m: 0.0
 
 # Product-safe semantic navigation and observation stations.  This catalog is
 # deliberately separate from evaluator-only object labels and target answers:
