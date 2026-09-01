@@ -227,7 +227,15 @@ fi
 
 if [[ "${FETCH_SONIC}" == true ]]; then
   configured_sonic_cache="$(env_value SONIC_HF_CACHE)"
-  sonic_cache="${SONIC_HF_CACHE:-${configured_sonic_cache:-${XDG_CACHE_HOME:-${HOME}/.cache}/huggingface/hub}}"
+  default_sonic_cache="${XDG_CACHE_HOME:-${HOME}/.cache}/huggingface/hub"
+  requested_sonic_cache="${SONIC_HF_CACHE:-${configured_sonic_cache:-}}"
+  if [[ -n "${requested_sonic_cache}" \
+    && "${requested_sonic_cache}" != "${default_sonic_cache}" ]]; then
+    printf '%s\n' \
+      'SONIC_HF_CACHE must be empty (or the exact default Hugging Face hub cache) in this release because the runtime lock records that path.' >&2
+    exit 2
+  fi
+  sonic_cache="${default_sonic_cache}"
   mkdir -p "${sonic_cache}"
   bootstrap_tools="${EXTERNAL_ROOT}/bootstrap-tools"
   bootstrap_python="${bootstrap_tools}/bin/python"
