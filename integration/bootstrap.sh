@@ -152,10 +152,13 @@ if [[ "${FETCH_GROOT}" == true ]]; then
   if [[ -e "${groot_target}" || -L "${groot_target}" ]]; then
     test -d "${groot_target}"
   else
-    git clone "${GROOT_URL}" "${groot_target}"
+    # This release needs the pinned controller source for provenance only.
+    # The upstream repository also references a large LFS training corpus that
+    # is neither executed nor licensed for redistribution by this workspace.
+    GIT_LFS_SKIP_SMUDGE=1 git clone "${GROOT_URL}" "${groot_target}"
   fi
-  git -C "${groot_target}" fetch --depth 1 origin "${GROOT_REVISION}"
-  git -C "${groot_target}" checkout --detach "${GROOT_REVISION}"
+  GIT_LFS_SKIP_SMUDGE=1 git -C "${groot_target}" fetch --depth 1 origin "${GROOT_REVISION}"
+  GIT_LFS_SKIP_SMUDGE=1 git -C "${groot_target}" checkout --detach "${GROOT_REVISION}"
   test "$(git -C "${groot_target}" rev-parse HEAD)" = "${GROOT_REVISION}"
 fi
 
