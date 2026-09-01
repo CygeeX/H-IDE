@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import logging
 import math
+import os
 import re
 import threading
 import time
@@ -100,6 +101,7 @@ from robot_agent.ros_adapter import (
 from robot_agent.session import (
     ControlState,
     LeaseError,
+    RetryableControlArmError,
     SafeStopState,
     SessionController,
     SessionStateError,
@@ -112,6 +114,16 @@ _PREEMPTION_TIMEOUT_SECONDS = 0.5
 _MAX_IN_FLIGHT_COMMANDS = 64
 _TaskResult = TypeVar("_TaskResult")
 LOGGER = logging.getLogger(__name__)
+
+_RETAIN_SONIC_ON_AUTOMATIC_FAULT_ENV = (
+    "HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT"
+)
+_RETRYABLE_SIM_CONTROL_ARM_DETAILS = (
+    "control arm rejected while the measured base is moving",
+    "control arm rejected while a gait is active or stopping",
+    "control acquisition requires a confirmed settled safety hold or resident balanced policy idle",
+    "retained static generation",
+)
 
 
 class RuntimeErrorBase(RuntimeError):
@@ -1139,6 +1151,17 @@ class RobotAgentRuntime:
             if result is not None
             else "local control arm returned no result"
         )
+        if (
+            self.config.robot_id == "g1-sim"
+            and os.getenv(_RETAIN_SONIC_ON_AUTOMATIC_FAULT_ENV, "0") == "1"
+            and any(
+                marker in detail.casefold()
+                for marker in _RETRYABLE_SIM_CONTROL_ARM_DETAILS
+            )
+        ):
+            raise RetryableControlArmError(
+                f"control arm failed closed: {detail}"
+            )
         raise SessionStateError(f"control arm failed closed: {detail}")
 
     def _on_ros_state(self, path: str, value: Any, observed_at: datetime) -> None:

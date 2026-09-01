@@ -31,6 +31,10 @@ class LeaseError(SessionStateError):
     """Raised when a lease renewal is invalid."""
 
 
+class RetryableControlArmError(SessionStateError):
+    """A bounded control-arm precondition failed without granting authority."""
+
+
 @dataclass(frozen=True)
 class SessionSnapshot:
     state: ControlState
@@ -133,6 +137,15 @@ class SessionController:
                     # race SAFE_HOLD -> ACTIVE between the decision to arm and
                     # the final state transition.
                     await before_activate()
+                except RetryableControlArmError as exc:
+                    # The callback explicitly proved that it did not grant
+                    # actuator authority.  Keep the already-confirmed logical
+                    # hold reusable so the gateway can retry the same acquire
+                    # after the measured simulator state settles.
+                    self._relinquish_control(
+                        f"control activation deferred: {exc}"[:256]
+                    )
+                    raise
                 except Exception as exc:
                     self._latch_control_fault(
                         f"control activation failed closed: {exc}"
