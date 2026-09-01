@@ -36,7 +36,7 @@ const GREETING_PATTERN = /^(?:你(?:好|好呀|好啊)|您好|嗨|哈(?:喽|啰|
 const THANKS_PATTERN = /^(?:谢谢|多谢|感谢(?:你)?|thanks|thank\s+you)[\s!！,.，。?？~～]*$/iu;
 const GOODBYE_PATTERN = /^(?:再见|拜拜|回头见|bye|goodbye|see\s+you)[\s!！,.，。?？~～]*$/iu;
 const PERSONAL_PREFERENCE_PATTERN = /(?:我(?:很)?(?:喜欢|偏好|习惯)|我的(?:名字|称呼|昵称|偏好|喜好|习惯)|(?:以后)?(?:叫|称呼)我(?:为|做)?|i\s+(?:like|prefer)|my\s+(?:name|nickname|preference)|call\s+me)/iu;
-const ROBOT_REQUEST_CUE_PATTERN = /(?:机器人|向前|后退|转身|旋转|移动|导航|前往|进入|进去|去(?:那里|那边|这里|这边|会议室|开放办公区|独立办公室|茶水间|储物间|走廊|open\s+office|meeting\s+room)|走(?:到|去|进|两|几|\d)|抓取|拿起|放下|打开|关闭|观察|robot|walk|move|turn|rotate|navigate|enter|approach|grab|pick\s+up|put\s+down)/iu;
+const ROBOT_REQUEST_CUE_PATTERN = /(?:机器人|向前|后退|转身|旋转|移动|导航|前往|进入|进去|巡检|巡查|检查|依次|去(?:那里|那边|这里|这边|会议室|开放办公区|独立办公室|茶水间|储物间|走廊|open\s+office|meeting\s+room)|走(?:到|去|进|两|几|\d)|抓取|拿起|放下|打开|关闭|观察|robot|walk|move|turn|rotate|navigate|enter|approach|inspect|patrol|grab|pick\s+up|put\s+down)/iu;
 
 // The classifier may choose only one top-level intent.  A motion request that
 // also asks to observe must never be downgraded to the read-only current-frame
@@ -49,16 +49,126 @@ const PHYSICAL_ACTION_CUE_PATTERNS = [
   /(?:去|走到|移动到).{0,30}(?:旁边|前面|跟前|附近|边上)(?:站着|站住|停下|停住)?/u,
   /(?:寻找|找到|搜索|搜寻|环顾|巡视|转一圈|全面观察).{0,40}(?:电脑|椅子|架子|桌子|物体|目标|办公室|房间|区域|computer|chair|shelf|rack|desk|object|office|room)/iu,
   /(?:观察|查看|看看).{0,30}(?:并|来|以便)?(?:寻找|找到|搜索|搜寻)/u,
+  /(?:巡检|巡查|检查|巡视|依次).{0,80}(?:办公室|办公区|会议室|房间|区域|office|room)/iu,
   /(?:^|[\s，,。；;！!？?])(?:请\s*)?(?:去)(?=\s*(?:那里|那边|这里|这边|会议室|开放办公区|独立办公室|茶水间|储物间|走廊|前台|接待区|open[\s_-]*office|meeting[\s_-]*room|focus[\s_-]*office|pantry|storage|corridor|reception))/iu,
   /\b(?:go|walk|move|navigate|enter|approach|return)\b/iu,
 ];
 const EXPLICIT_STATIONARY_OBSERVATION_PATTERN = /(?:(?:只|仅)(?:观察|查看|看).{0,16}(?:当前|现在|眼前)(?:画面|视野|环境)?|(?:当前|现在|眼前)(?:画面|视野|环境).{0,20}(?:不要|不再|无需|不用|禁止).{0,6}(?:移动|导航|转动|旋转)|原地(?:观察|查看|看)|保持静止|(?:observe|inspect|look).{0,32}(?:current\s+(?:view|scene)|in\s+place|without\s+moving|do\s+not\s+move))/iu;
+
+const HISTORICAL_REFERENCE_PATTERN = /(?:刚刚|刚才|之前|上次|先前|earlier|previously|last\s+time)/iu;
+const HISTORICAL_OBSERVATION_QUESTION_PATTERN = /(?:看到|看见|观察到|有没有|是否|哪(?:里|个|间)|什么地方|电脑|计算机|笔记本|显示器|屏幕|桌子|椅子|柜子|架子|computer|laptop|monitor|screen|desk|chair|shelf)/iu;
+const NEGATED_OBSERVATION_PATTERN = /(?:未(?:看到|见|发现|确认)|没有(?:看到|发现|确认)?|没看到|未见|不存在|not\s+seen|not\s+found|no\s+)/iu;
+const HISTORICAL_REPORT_MARKER_PATTERN = /(?:巡检报告|定向巡检|Office\s+V2|观察报告|当前画面可见|inspection\s+report)/iu;
+const HISTORICAL_REGION_HEADERS: ReadonlyArray<readonly [string, RegExp]> = [
+  ["开放办公区", /(?:开放办公区|开放办公室|open[\s_-]*office)/iu],
+  ["会议室", /(?:会议室|meeting[\s_-]*room)/iu],
+  ["独立办公室", /(?:独立办公室|专用办公室|focus[\s_-]*office)/iu],
+  ["茶水间", /(?:茶水间|pantry)/iu],
+  ["储物间", /(?:储物间|storage\s+room)/iu],
+  ["走廊", /(?:走廊|corridor)/iu],
+];
+const HISTORICAL_OBJECT_ALIASES: ReadonlyArray<readonly [string, RegExp]> = [
+  ["电脑", /(?:电脑|计算机|笔记本(?:电脑)?|laptop|computer)/iu],
+  ["显示器", /(?:显示器|屏幕|monitor|screen)/iu],
+  ["桌子", /(?:桌子|办公桌|会议桌|desk|table)/iu],
+  ["椅子", /(?:椅子|chair)/iu],
+  ["柜子", /(?:柜子|橱柜|cabinet)/iu],
+  ["架子", /(?:架子|货架|shelf|rack)/iu],
+];
+
+/**
+ * Reports are persisted with readable line breaks, but the H-IDE memory
+ * projection intentionally normalizes whitespace while redacting spatial
+ * claims.  Parse room headings independently of line breaks so historical
+ * questions work with either representation.
+ */
+function historicalReportSegments(
+  report: string,
+): Array<{ location: string; content: string }> {
+  const headerPattern = /(?:^|[\r\n]|[-•]|[;；])\s*(?:\*\*)?([^：:\n]{2,30}?)(?:\*\*)?\s*[：:]/gimu;
+  const matches = [...report.matchAll(headerPattern)].flatMap((match) => {
+    const rawLabel = match[1]?.trim();
+    if (!rawLabel) return [];
+    const known = HISTORICAL_REGION_HEADERS.find(([, pattern]) => pattern.test(rawLabel));
+    if (!known) return [];
+    return [{
+      location: known[0],
+      start: (match.index ?? 0) + match[0].length,
+    }];
+  });
+  return matches.map((match, index) => ({
+    location: match.location,
+    content: report.slice(match.start, matches[index + 1]?.start ?? report.length),
+  }));
+}
+
+function historicalObjectConfirmed(content: string, objectPattern: RegExp): boolean {
+  const objectMatch = content.match(objectPattern);
+  if (!objectMatch || objectMatch.index == null) return false;
+  // A future report may contain both positive and negative observations in a
+  // single room.  Only reject a match when the negation is immediately tied
+  // to the object, rather than discarding the whole room segment.
+  const prefix = content.slice(Math.max(0, objectMatch.index - 24), objectMatch.index);
+  return !/(?:未(?:看到|见|发现|确认)|没有(?:看到|发现|确认)?|没看到|未见|不存在)\s*$/u.test(prefix)
+    && !/(?:not\s+(?:seen|found)|no)\s*$/iu.test(prefix);
+}
 
 function requiresPhysicalAction(text: string): boolean {
   const normalized = text.trim();
   return normalized.length > 0
     && !EXPLICIT_STATIONARY_OBSERVATION_PATTERN.test(normalized)
     && PHYSICAL_ACTION_CUE_PATTERNS.some((pattern) => pattern.test(normalized));
+}
+
+function historicalInspectionFastPath(
+  input: ConversationTurnRequest,
+  context: PreparedConversationContext,
+): ConversationRouterModelOutput | undefined {
+  const text = input.text.trim();
+  if (
+    !HISTORICAL_REFERENCE_PATTERN.test(text)
+    || !HISTORICAL_OBSERVATION_QUESTION_PATTERN.test(text)
+    || requiresPhysicalAction(text)
+  ) return undefined;
+
+  const sources: Array<{ role: string; content: string }> = [
+    ...context.recentMessages,
+    ...context.relevantMemories.map((item) => ({ role: "assistant", content: item.text })),
+    ...(context.durableSummary
+      ? [{ role: "assistant", content: context.durableSummary.text }]
+      : []),
+  ];
+  const assistantText = sources
+    .filter((item) => item.role === "assistant")
+    .map((item) => item.content)
+    .filter((item) => HISTORICAL_REPORT_MARKER_PATTERN.test(item))
+    .join("\n");
+  const objectEntry = HISTORICAL_OBJECT_ALIASES.find(([, pattern]) => pattern.test(text));
+  if (!objectEntry) return undefined;
+  const [objectName, objectPattern] = objectEntry;
+  const segments = historicalReportSegments(assistantText);
+  const locations = segments
+    .filter((segment) => historicalObjectConfirmed(segment.content, objectPattern))
+    .map((segment) => segment.location)
+    .filter((value, index, values) => values.indexOf(value) === index);
+  if (!isChineseLocale(input.locale)) {
+    return {
+      intent: "GENERAL_QA",
+      assistantMessage: locations.length
+        ? `Yes. The last inspection report mentions ${objectName} in ${locations.join(" and ")}.`
+        : `The last inspection report did not confirm a ${objectName}.`,
+      clarification: null,
+    };
+  }
+  return {
+    intent: "GENERAL_QA",
+    assistantMessage: locations.length
+      ? `有。根据刚才的巡检记录，${objectName}出现在${locations.join("和")}。`
+      : assistantText
+        ? `刚才的巡检记录中没有确认看到${objectName}。`
+        : `我暂时没有拿到上一轮巡检的完整报告，无法确认是否看到${objectName}。`,
+    clarification: null,
+  };
 }
 
 function enforcePhysicalIntent(
@@ -295,6 +405,8 @@ const ROUTER_INSTRUCTIONS = [
   "A request to remember the user's name, preferred form of address, likes, dislikes, habits, or other personal preferences is SOCIAL_CHAT, never SCENE_TEACH, and does not require a robot.",
   "ADMIN_DEV is developer/admin configuration, diagnostics, protocol, interface, or system-maintenance work; never pretend to have changed the system.",
   "For SOCIAL_CHAT and GENERAL_QA, answer the user naturally and directly in the requested locale.",
+  "A question referring to a completed earlier inspection (for example, '刚才/刚刚看到什么') is GENERAL_QA when it does not request new movement; answer from the bounded conversation report and do not trigger current-frame sensing.",
+  "When skillId is assistant.voice, keep a non-motion answer concise and suitable for browser speech synthesis.",
   "For robot intents, provide only a short spoken transition. Never claim execution started, succeeded, or completed; never output commands, coordinates, paths, velocities, ROS details, or an executable plan.",
   "ROBOT_OBSERVE must never imply movement. ROBOT_ACTION cannot directly execute and cannot bypass Mission/PlanDraft review.",
   "Conversation memory may resolve pronouns, user preferences, prior decisions, and semantic target names only.",
@@ -312,6 +424,7 @@ function contextPrompt(input: ConversationTurnRequest, context: PreparedConversa
     JSON.stringify({
       conversationId: input.conversationId,
       robotId: input.robotId ?? null,
+      skillId: input.skillId ?? null,
       locale: input.locale,
       durableSummary: context.durableSummary ?? null,
       recentMessages: context.recentMessages,
@@ -376,6 +489,12 @@ export class ConversationRouter {
     }
 
     const context = await this.prepareContext(input);
+    const historicalFastPath = historicalInspectionFastPath(input, context);
+    if (historicalFastPath) {
+      const response = buildResponse(input, historicalFastPath);
+      await this.recordTurn(input, response, context);
+      return response;
+    }
 
     const output = await withInferenceRetry(async () => {
       const value = await this.agent.generate(

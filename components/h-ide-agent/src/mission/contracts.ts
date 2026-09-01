@@ -449,6 +449,11 @@ export const missionCapabilitySchema = z.object({
   riskLevel: riskLevelSchema,
   executor: z.enum(["nav2", "behavior_tree", "ros_action", "ros_service", "local"]),
   executorProfile: id,
+  // The executor is the orchestration boundary, while baseMotionOwner is the
+  // authority boundary. A workstation composite (for example the reviewed
+  // Office V2 station scan) may be dispatched by a local behavior tree while
+  // its physical navigation/rotation children remain owned by Nav2.
+  baseMotionOwner: z.literal("nav2").optional(),
   requiredSensorIds: z.array(id).max(16).default([]),
 }).strict();
 

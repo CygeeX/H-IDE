@@ -61,6 +61,66 @@ describe("Assistant V2 conversation router", () => {
     expect(conversationRouterInternals.evaluateArithmetic("10 / 0")).toBeUndefined();
   });
 
+  it("answers a voice follow-up from the previous inspection report without sensing or motion", async () => {
+    const agent = { generate: vi.fn() };
+    const result = await new ConversationRouter(agent as never).route({
+      conversationId: "conversation-inspection-follow-up",
+      robotId: "g1-sim",
+      skillId: "assistant.voice",
+      locale: "zh-CN",
+      history: [
+        {
+          role: "assistant",
+          content: "Office V2 定向巡检报告\n- 开放办公区：看到电脑、椅子和白板\n- 会议室：看到会议桌和显示屏",
+        },
+      ],
+      text: "刚刚又看到电脑吗？",
+    }, signal());
+
+    expect(result).toMatchObject({
+      intent: "GENERAL_QA",
+      needsRobot: false,
+      shouldCreateMission: false,
+    });
+    expect(result.assistantMessage).toContain("开放办公区");
+    expect(result.assistantMessage).toContain("电脑");
+    expect(agent.generate).not.toHaveBeenCalled();
+  });
+
+  it("recalls English VLM labels from a whitespace-normalized multi-room report", async () => {
+    const agent = { generate: vi.fn() };
+    const flattenedReport = [
+      "Office V2 定向巡检报告",
+      "- 开放办公区：当前画面可见：table、plant、chair、doorframe；当前画面可见：desk、monitor。",
+      "- 会议室：当前画面可见：desk、chair；当前画面可见：tv、laptop、mug。",
+    ].join(" ");
+
+    const computer = await new ConversationRouter(agent as never).route({
+      conversationId: "conversation-inspection-flat-computer",
+      robotId: "g1-sim",
+      skillId: "assistant.voice",
+      locale: "zh-CN",
+      history: [{ role: "assistant", content: flattenedReport }],
+      text: "刚刚有看到电脑吗？",
+    }, signal());
+    expect(computer.assistantMessage).toContain("会议室");
+    expect(computer.assistantMessage).toContain("电脑");
+    expect(computer.intent).toBe("GENERAL_QA");
+
+    const chair = await new ConversationRouter(agent as never).route({
+      conversationId: "conversation-inspection-flat-chair",
+      robotId: "g1-sim",
+      skillId: "assistant.voice",
+      locale: "zh-CN",
+      history: [{ role: "assistant", content: flattenedReport }],
+      text: "刚刚又看到chair吗？",
+    }, signal());
+    expect(chair.assistantMessage).toContain("开放办公区");
+    expect(chair.assistantMessage).toContain("会议室");
+    expect(chair.assistantMessage).toContain("椅子");
+    expect(agent.generate).not.toHaveBeenCalled();
+  });
+
   it("stores explicit personal preferences as chat without requiring a robot", async () => {
     const agent = { generate: vi.fn() };
     const memory = { prepare: vi.fn(), record: vi.fn().mockResolvedValue(undefined) };
@@ -346,6 +406,7 @@ describe("Assistant V2 conversation router", () => {
     "去会议室里观察,看到了什么东西告诉我",
     "去会议室里看",
     "去会议室里面站着",
+    "请依次巡检开放办公区和会议室",
     "去open office里面站着",
     "去椅子旁边站着",
     "走出开放办公室",
@@ -463,6 +524,9 @@ describe("Assistant V2 conversation router", () => {
     expect(conversationRouterInternals.requiresPhysicalAction(
       "只观察当前画面",
     )).toBe(false);
+    expect(conversationRouterInternals.requiresPhysicalAction(
+      "今天巡检开放办公室和会议室",
+    )).toBe(true);
   });
 
   it.each([

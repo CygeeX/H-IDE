@@ -241,6 +241,92 @@ describe("Mission V2 planning", () => {
     expect(JSON.stringify(draft.nodes)).not.toMatch(/goalPose|cmd_vel|waypoints|rosAction/iu);
   });
 
+  it("accepts a workstation scan composite only when Nav2 ownership is explicit", async () => {
+    const scanCapability = {
+      skillId: "inspection.scan_station",
+      skillVersion: "1.0.0",
+      description: "Orchestrate reviewed Nav2 rotations and RGB-D captures",
+      kind: "motion" as const,
+      riskLevel: "medium" as const,
+      executor: "behavior_tree" as const,
+      executorProfile: "office_v2.station_scan.v1",
+      baseMotionOwner: "nav2" as const,
+      requiredSensorIds: ["head_rgbd"],
+    };
+    const scanNode: MissionNode = {
+      nodeId: "scan-open-office",
+      skillId: scanCapability.skillId,
+      skillVersion: scanCapability.skillVersion,
+      purpose: "在开放办公区内部多方向观察",
+      intent: {
+        stationId: "open_office_west",
+        regionId: "open_office",
+        scanPurpose: "location_observation",
+      },
+      dependsOn: [],
+      preconditionIds: [],
+      postconditionIds: [],
+      riskLevel: "medium",
+    };
+    const scanBrief = missionBriefSchema.parse({
+      ...brief(),
+      envelope: {
+        ...envelope(),
+        allowedSkillIds: [
+          ...envelope().allowedSkillIds,
+          scanCapability.skillId,
+        ],
+      },
+      capabilities: [...capabilities(), scanCapability],
+    });
+    const acceptedRuntime = {
+      draftMission: vi.fn().mockResolvedValue({
+        objective: scanBrief.objective,
+        nodes: [scanNode],
+        assumptions: [],
+        warnings: [],
+      }),
+      replanMission: vi.fn(),
+    };
+
+    const draft = await new MissionEngine(acceptedRuntime).createDraft(
+      scanBrief,
+      new AbortController().signal,
+    );
+    expect(draft.nodes[0]?.skillId).toBe("inspection.scan_station");
+
+    const unownedBrief = {
+      ...scanBrief,
+      capabilities: scanBrief.capabilities.map((capability) => (
+        capability.skillId === scanCapability.skillId
+          ? {
+              skillId: capability.skillId,
+              skillVersion: capability.skillVersion,
+              description: capability.description,
+              kind: capability.kind,
+              riskLevel: capability.riskLevel,
+              executor: capability.executor,
+              executorProfile: capability.executorProfile,
+              requiredSensorIds: capability.requiredSensorIds,
+            }
+          : capability
+      )),
+    };
+    const rejectedRuntime = {
+      draftMission: vi.fn().mockResolvedValue({
+        objective: scanBrief.objective,
+        nodes: [scanNode],
+        assumptions: [],
+        warnings: [],
+      }),
+      replanMission: vi.fn(),
+    };
+    await expect(new MissionEngine(rejectedRuntime).createDraft(
+      unownedBrief,
+      new AbortController().signal,
+    )).rejects.toThrow(/not owned by Nav2/iu);
+  });
+
   it("rejects approval placeholders disguised as executable skills", async () => {
     const runtime = {
       draftMission: vi.fn().mockResolvedValue({

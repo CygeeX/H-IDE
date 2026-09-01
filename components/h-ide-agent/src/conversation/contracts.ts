@@ -150,6 +150,10 @@ export const conversationTurnRequestSchema = z
     schemaVersion: z.literal("h-ide.conversation-turn/2").default("h-ide.conversation-turn/2"),
     conversationId: idSchema,
     robotId: idSchema.nullable().optional(),
+    // Advisory UI context only. H-IDE derives all executable semantics from
+    // its deterministic scene/capability boundary; this field carries no
+    // coordinates and must not be treated as an authority grant.
+    skillId: z.enum(["inspection.office", "assistant.voice"]).nullable().optional(),
     locale: z.string().trim().min(2).max(35).default("zh-CN"),
     text: messageSchema,
     history: z.array(conversationHistoryMessageSchema).max(20).default([]),
