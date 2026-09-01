@@ -106,6 +106,7 @@ for path in [
     root / "manifests/sbom/skillstore-office-v2-e2e-20260901-r1.spdx.json",
     root / "manifests/ros/jazzy-user-prefix-amd64.json",
     root / "manifests/python/simulation-runtime.json",
+    root / "manifests/python/vision-runtime.json",
     root / "components/h-ide-mujoco-sonic/config/sonic-models.lock.json",
     root / "manifests/vendor/g1-model.json",
     root / "manifests/vendor/groot-wbc.json",

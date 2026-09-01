@@ -18,7 +18,7 @@ components:
   - id: h-ide
     path: components/h-ide
     source_commit: 6af81007bf5f5edcbc12030a80e0565ce60e2468
-    distribution_tree: 4381a494da836eb4a0bac01966efe883ce5eb75b
+    distribution_tree: 516211afa2aa0a72951e85add2abb33948857249
     role: control-api-pwa-scene-api-mission-v2
   - id: h-ide-agent
     path: components/h-ide-agent
@@ -106,6 +106,7 @@ runtime:
   primary_os: Ubuntu 24.04
   ros_distribution: jazzy
   simulation_python_manifest: manifests/python/simulation-runtime.json
+  vision_python_manifest: manifests/python/vision-runtime.json
   bootstrap_huggingface_hub: "1.29.0"
   ros_user_prefix_manifest: manifests/ros/jazzy-user-prefix-amd64.json
   ros_user_prefix_provisioner: integration/provision-ros-prefixes.sh

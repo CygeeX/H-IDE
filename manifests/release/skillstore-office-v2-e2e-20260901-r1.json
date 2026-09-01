@@ -14,7 +14,7 @@
       "id": "h-ide",
       "path": "components/h-ide",
       "sourceCommit": "6af81007bf5f5edcbc12030a80e0565ce60e2468",
-      "distributionTree": "4381a494da836eb4a0bac01966efe883ce5eb75b",
+      "distributionTree": "516211afa2aa0a72951e85add2abb33948857249",
       "runtimeDefault": true
     },
     {
@@ -106,6 +106,7 @@
     "integrationLock": "integration/integration.lock.yaml",
     "sourceComponentSbom": "manifests/sbom/skillstore-office-v2-e2e-20260901-r1.spdx.json",
     "simulationPythonRuntime": "manifests/python/simulation-runtime.json",
+    "visionPythonRuntime": "manifests/python/vision-runtime.json",
     "rosUserPrefixes": "manifests/ros/jazzy-user-prefix-amd64.json",
     "rosUserPrefixManifest": "manifests/ros/jazzy-user-prefix-amd64.json",
     "rosUserPrefixProvisioner": "integration/provision-ros-prefixes.sh",

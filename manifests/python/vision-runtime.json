@@ -1,0 +1,18 @@
+{
+  "schemaVersion": "skillstore.python-runtime/1",
+  "python": "3.11",
+  "profile": "h-ide-vision-cu130",
+  "lockFile": "components/h-ide-vision/requirements/gpu.lock",
+  "lockFileSha256": "ef856d86d98d131d38c4b40b33a8e3218bb5b5d008ebd72289db9b555ac1082a",
+  "packages": {
+    "torch": "2.12.1+cu130",
+    "torchvision": "0.27.1+cu130",
+    "sam-2": "1.0"
+  },
+  "validation": [
+    "torch.cuda.is_available()",
+    "torch.version.cuda == 13.0",
+    "import sam2",
+    "SAM2 checkpoint SHA-256 and smoke test"
+  ]
+}

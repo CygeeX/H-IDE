@@ -91,7 +91,17 @@ if actual != expected or torch.version.cuda != "12.8":
 print("simulation Python/CUDA runtime: OK")
 PY
 
-(cd "${COMPONENTS}/h-ide-vision" && uv sync --locked --extra dev)
+(
+  cd "${COMPONENTS}/h-ide-vision"
+  uv sync --locked --extra dev
+  # gpu.lock intentionally mixes the official PyTorch CUDA index with PyPI.
+  # Every package is exact-version locked; allow resolution across both
+  # reviewed indexes instead of treating the first matching project name as
+  # the only source.
+  uv pip install --python .venv/bin/python \
+    --index-strategy unsafe-best-match \
+    -r requirements/gpu.lock
+)
 
 robot="${COMPONENTS}/robotagent"
 if [[ ! -x "${robot}/.venv/bin/python" ]]; then

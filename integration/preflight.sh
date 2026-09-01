@@ -306,6 +306,7 @@ paths = [
     root / "manifests/sbom/skillstore-office-v2-e2e-20260901-r1.spdx.json",
     root / "manifests/ros/jazzy-user-prefix-amd64.json",
     root / "manifests/python/simulation-runtime.json",
+    root / "manifests/python/vision-runtime.json",
     root / "manifests/vendor/g1-model.json",
     root / "manifests/vendor/groot-wbc.json",
     root / "manifests/vendor/lerobot.json",
@@ -380,6 +381,16 @@ if (
     or python_runtime.get("profile") != "mujoco-sonic-cu128"
 ):
     raise SystemExit("unexpected simulation Python runtime contract")
+vision_runtime = json.loads(paths[5].read_text(encoding="utf-8"))
+if (
+    vision_runtime.get("schemaVersion") != "skillstore.python-runtime/1"
+    or vision_runtime.get("python") != "3.11"
+    or vision_runtime.get("profile") != "h-ide-vision-cu130"
+):
+    raise SystemExit("unexpected Vision Python runtime contract")
+vision_lock = root / vision_runtime["lockFile"]
+if hashlib.sha256(vision_lock.read_bytes()).hexdigest() != vision_runtime["lockFileSha256"]:
+    raise SystemExit("Vision GPU lock SHA-256 does not match its runtime manifest")
 lock = json.loads(paths[-1].read_text(encoding="utf-8"))
 if lock.get("schema_version") != "h-ide.sonic-model-lock/1":
     raise SystemExit("unexpected SONIC lock schema")
@@ -505,6 +516,33 @@ PY
     fi
   else
     fail 'MuJoCo Python environment is absent; run integration/setup-environments.sh'
+  fi
+  vision="${COMPONENTS}/h-ide-vision"
+  if [[ -x "${vision}/.venv/bin/python" ]]; then
+    if ! "${vision}/.venv/bin/python" - "${ROOT}/manifests/python/vision-runtime.json" <<'PY'
+import importlib.metadata
+import json
+from pathlib import Path
+import sys
+import torch
+import torchvision  # noqa: F401
+import sam2  # noqa: F401
+
+manifest = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+expected = manifest["packages"]
+actual = {
+    name: importlib.metadata.version(name)
+    for name in ("torch", "torchvision", "sam-2")
+}
+if actual != expected or torch.version.cuda != "13.0" or not torch.cuda.is_available():
+    raise SystemExit(f"Vision GPU runtime mismatch: {actual}, CUDA={torch.version.cuda}")
+print("Vision Python/CUDA/SAM2 runtime: manifest locked")
+PY
+    then
+      fail 'Vision Python/CUDA/SAM2 runtime does not match its manifest'
+    fi
+  else
+    fail 'H-IDE Vision environment is absent; run integration/setup-environments.sh'
   fi
   [[ -L "${g1_path}" && -f "${g1_path}/assets/h_ide_office_29dof.xml" ]] \
     || fail 'G1 model overlay is not installed; run bootstrap.sh --fetch-g1-model'
