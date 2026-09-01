@@ -68,7 +68,7 @@
     {
       "name": "h-ide-mujoco-sonic",
       "SPDXID": "SPDXRef-Package-h-ide-mujoco-sonic",
-      "versionInfo": "6c888673aaab2aa387b1dd02e2beac5a3dd4989a",
+      "versionInfo": "22ca5c18bcbbbc4648e5ea8816b8654b24daedea",
       "downloadLocation": "NOASSERTION",
       "filesAnalyzed": false,
       "licenseConcluded": "LicenseRef-H-IDE-Source-Available-Evaluation-1.0",

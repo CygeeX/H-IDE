@@ -15,7 +15,7 @@
 | H-IDE Agent | `d2534880b3213494953981e082dd3147629a9f4f` | 会话分类、planning-only Mission Architect；Mastra 高危依赖修复 |
 | H-IDE Vision | `072a49f9741bed54805656c0358dde54fc998a0f` | Qwen3-VL-Plus、SAM2、RGB-D/TF 和 Evidence |
 | Robot Agent | `f544f40c9c4ea7e1b6a35105918d12aa3a24900a` | 能力、租约、命令账本、ROS/观察边界 |
-| H-IDE MuJoCo SONIC | `6c888673aaab2aa387b1dd02e2beac5a3dd4989a` | Office V2、Nav2、SONIC、MuJoCo、展示动作 |
+| H-IDE MuJoCo SONIC | `22ca5c18bcbbbc4648e5ea8816b8654b24daedea` | Office V2、Nav2、SONIC、MuJoCo、展示动作；完整测试依赖声明 |
 | DAAAM（可选） | `ebd6e3b89763849eb7bce7f75e8d08550ea7344a` | post-Mission、observation-only importer |
 
 H-IDE Vision 本轮沿用已冻结 source commit。FARM 不属于本发行版 runtime；它只出现在

@@ -41,8 +41,8 @@
     {
       "id": "h-ide-mujoco-sonic",
       "path": "components/h-ide-mujoco-sonic",
-      "sourceCommit": "6c888673aaab2aa387b1dd02e2beac5a3dd4989a",
-      "distributionTree": "651d9c5179b2edf43eb3736303a150439c329353",
+      "sourceCommit": "22ca5c18bcbbbc4648e5ea8816b8654b24daedea",
+      "distributionTree": "efde2fc7f540ee928be75cc2d81e25acc152a6d5",
       "runtimeDefault": true
     }
   ],
