@@ -28,7 +28,7 @@
     {
       "name": "h-ide",
       "SPDXID": "SPDXRef-Package-h-ide",
-      "versionInfo": "da1b83ab9793301250c6830ca23562f4a1f0b8d5",
+      "versionInfo": "6af81007bf5f5edcbc12030a80e0565ce60e2468",
       "downloadLocation": "NOASSERTION",
       "filesAnalyzed": false,
       "licenseConcluded": "LicenseRef-H-IDE-Source-Available-Evaluation-1.0",

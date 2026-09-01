@@ -11,7 +11,7 @@
 
 | 组件 | Source commit | 角色 |
 | --- | --- | --- |
-| H-IDE | `da1b83ab9793301250c6830ca23562f4a1f0b8d5` | PWA、Control API、Mission V2、Scene API |
+| H-IDE | `6af81007bf5f5edcbc12030a80e0565ce60e2468` | PWA、Control API、Mission V2、Scene API；含 nanoid 3.3.18 安全修复 |
 | H-IDE Agent | `09c727678f249c11efadac48f727f7c8d103a22e` | 会话分类、planning-only Mission Architect |
 | H-IDE Vision | `072a49f9741bed54805656c0358dde54fc998a0f` | Qwen3-VL-Plus、SAM2、RGB-D/TF 和 Evidence |
 | Robot Agent | `f544f40c9c4ea7e1b6a35105918d12aa3a24900a` | 能力、租约、命令账本、ROS/观察边界 |
