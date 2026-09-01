@@ -14,35 +14,55 @@
       "id": "h-ide",
       "path": "components/h-ide",
       "sourceCommit": "6af81007bf5f5edcbc12030a80e0565ce60e2468",
-      "distributionTree": "516211afa2aa0a72951e85add2abb33948857249",
+      "sourceTree": "9823f5012205626a116601ec4c161ff8974a9aed",
+      "distributionTree": "6edc4f023162e196f5e9ca51e2e174ce510d2787",
+      "distributionDeltaSha256": "5378cafecdfa9655706cc9dc94cdb4e36a9117d6b84559746ea123180350641c",
+      "distributionDeltaPathCount": 12,
+      "distributionAdaptation": "monorepo portability, release authentication documentation and integration packaging",
       "runtimeDefault": true
     },
     {
       "id": "h-ide-agent",
       "path": "components/h-ide-agent",
       "sourceCommit": "d2534880b3213494953981e082dd3147629a9f4f",
+      "sourceTree": "75c197b4e79f9dfb0d2a51d95387759f150be22a",
       "distributionTree": "88c38df767bd17f3f7c5a9c5de39564632318c3f",
+      "distributionDeltaSha256": "421fd94aafce84336c6b194b9a2213b737dd69c5c54db9fb104062000c9a9930",
+      "distributionDeltaPathCount": 1,
+      "distributionAdaptation": "monorepo portability and release packaging",
       "runtimeDefault": true
     },
     {
       "id": "h-ide-vision",
       "path": "components/h-ide-vision",
       "sourceCommit": "072a49f9741bed54805656c0358dde54fc998a0f",
+      "sourceTree": "52b00894311866c6cc9ada99a58cd1a5023bc022",
       "distributionTree": "e235567979ec707290423f0f064b95913b916e6b",
+      "distributionDeltaSha256": "1d4671ede06a48ef6da0ebc465217960c8d27fa9608a862ddfe9c43b455555d2",
+      "distributionDeltaPathCount": 3,
+      "distributionAdaptation": "monorepo portability and release packaging",
       "runtimeDefault": true
     },
     {
       "id": "robotagent",
       "path": "components/robotagent",
       "sourceCommit": "f544f40c9c4ea7e1b6a35105918d12aa3a24900a",
+      "sourceTree": "d6bc492ff05a2bd125ff634f3645063295ba0cd3",
       "distributionTree": "e125316ce8b8ca51df5fbb8176263a608837f1a8",
+      "distributionDeltaSha256": "0c34c5ca20de5f5e3ac49bdc609efbc1f81aedbafe6e5cf662f4897da315c33b",
+      "distributionDeltaPathCount": 2,
+      "distributionAdaptation": "monorepo portability and release packaging",
       "runtimeDefault": true
     },
     {
       "id": "h-ide-mujoco-sonic",
       "path": "components/h-ide-mujoco-sonic",
       "sourceCommit": "8c6f3e6375b3f2c4f00e721f885a5a93c56dada3",
+      "sourceTree": "3758b0c281958820d2fed29ada16093bd7eeb2f2",
       "distributionTree": "8dc02f85af2bda09087d1281a065d269c4b5953a",
+      "distributionDeltaSha256": "92ad9590afdec644e5dfee8237969041c5d74a5865911e6c8059c9ba4d6cf39a",
+      "distributionDeltaPathCount": 17,
+      "distributionAdaptation": "monorepo external-asset boundary, portable dependency locks and release packaging",
       "runtimeDefault": true
     }
   ],
@@ -78,6 +98,18 @@
       "replacement of Office V2 hard-coded trusted coordinates"
     ]
   },
+  "knownIssues": [
+    {
+      "id": "SIM-PLANNER-REFERENCE-DEADLINE-001",
+      "status": "accepted-for-r1-demo",
+      "scope": "MuJoCo simulation",
+      "trigger": "a pure-rotation SONIC planner candidate is rejected for insufficient root-yaw evidence and no accepted replacement arrives within the 1.000 second MuJoCo-time deadline",
+      "impact": "SONIC escalates the deadline to a terminal Plant physics fault; MuJoCo Plant exits and the active Mission requires a complete cold restart",
+      "reproducibilityStatement": "R1 intentionally preserves the observed local behavior; no record-and-retry mitigation is included",
+      "recovery": "integration/stop-e2e.sh followed by integration/start-e2e.sh --rebuild --viewer --full-straight-drive",
+      "fixedInThisRelease": false
+    }
+  ],
   "validation": {
     "contract": "L0-L1-L2-L3",
     "L0": "pending-on-release-commit",
@@ -107,6 +139,7 @@
     "sourceComponentSbom": "manifests/sbom/skillstore-office-v2-e2e-20260901-r1.spdx.json",
     "simulationPythonRuntime": "manifests/python/simulation-runtime.json",
     "visionPythonRuntime": "manifests/python/vision-runtime.json",
+    "sam2CheckpointManifest": "manifests/vendor/sam2-checkpoint.json",
     "rosUserPrefixes": "manifests/ros/jazzy-user-prefix-amd64.json",
     "rosUserPrefixManifest": "manifests/ros/jazzy-user-prefix-amd64.json",
     "rosUserPrefixProvisioner": "integration/provision-ros-prefixes.sh",

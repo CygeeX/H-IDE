@@ -21,6 +21,9 @@
 H-IDE Vision 本轮沿用已冻结 source commit。FARM 不属于本发行版 runtime；它只出现在
 后续 Shadow Provider 路线中。Skillstore 根 commit 在正式 tag 创建时由
 `integration/integration.lock.yaml` 记录，不能预填一个尚未包含本发布说明的中间 commit。
+每个 source commit 与仓库内实际发行目录之间的 monorepo portability/package adaptation
+均以 `sourceTree`、`distributionTree`、canonical Git binary diff SHA-256 和变更路径数记录在
+Release Manifest，并由 L0 重新计算；不能只凭 source commit 推断发行目录内容。
 
 ## 2. 本轮功能
 

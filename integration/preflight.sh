@@ -327,18 +327,41 @@ for component in release.get("components", []):
     component_id = component.get("id")
     source_commit = component.get("sourceCommit")
     component_path = component.get("path")
+    source_tree = component.get("sourceTree")
     distribution_tree = component.get("distributionTree")
+    distribution_delta_sha256 = component.get("distributionDeltaSha256")
+    distribution_delta_path_count = component.get("distributionDeltaPathCount")
     if not all(
         isinstance(value, str) and value
-        for value in (component_id, source_commit, component_path, distribution_tree)
+        for value in (
+            component_id,
+            source_commit,
+            component_path,
+            source_tree,
+            distribution_tree,
+            distribution_delta_sha256,
+        )
     ):
         raise SystemExit("release manifest component identity is incomplete")
+    if (
+        not re.fullmatch(r"[0-9a-f]{64}", distribution_delta_sha256)
+        or isinstance(distribution_delta_path_count, bool)
+        or not isinstance(distribution_delta_path_count, int)
+        or distribution_delta_path_count < 0
+    ):
+        raise SystemExit("release manifest distribution adaptation is invalid")
     subprocess.run(
         ["git", "-C", str(root), "cat-file", "-e", f"{source_commit}^{{commit}}"],
         check=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    actual_source_tree = subprocess.check_output(
+        ["git", "-C", str(root), "rev-parse", f"{source_commit}^{{tree}}"],
+        text=True,
+    ).strip()
+    if actual_source_tree != source_tree:
+        raise SystemExit(f"source tree mismatch for {component_id}")
     actual_tree = subprocess.check_output(
         ["git", "-C", str(root), "rev-parse", f"HEAD:{component_path}"],
         text=True,
@@ -347,6 +370,18 @@ for component in release.get("components", []):
         raise SystemExit(
             f"distribution tree mismatch for {component_id}: update the release lock"
         )
+    distribution_delta = subprocess.check_output(
+        ["git", "-C", str(root), "diff", "--binary", source_tree, distribution_tree]
+    )
+    actual_delta_sha256 = hashlib.sha256(distribution_delta).hexdigest()
+    if actual_delta_sha256 != distribution_delta_sha256:
+        raise SystemExit(f"distribution delta digest mismatch for {component_id}")
+    actual_delta_paths = subprocess.check_output(
+        ["git", "-C", str(root), "diff", "--name-only", source_tree, distribution_tree],
+        text=True,
+    ).splitlines()
+    if len(actual_delta_paths) != distribution_delta_path_count:
+        raise SystemExit(f"distribution delta path count mismatch for {component_id}")
 ros_prefix = json.loads(paths[3].read_text(encoding="utf-8"))
 if ros_prefix.get("schemaVersion") != "skillstore.ros-user-prefix/1":
     raise SystemExit("unexpected ROS user-prefix manifest schema")

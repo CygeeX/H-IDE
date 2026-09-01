@@ -18,27 +18,37 @@ components:
   - id: h-ide
     path: components/h-ide
     source_commit: 6af81007bf5f5edcbc12030a80e0565ce60e2468
-    distribution_tree: 516211afa2aa0a72951e85add2abb33948857249
+    source_tree: 9823f5012205626a116601ec4c161ff8974a9aed
+    distribution_tree: 6edc4f023162e196f5e9ca51e2e174ce510d2787
+    distribution_delta_sha256: 5378cafecdfa9655706cc9dc94cdb4e36a9117d6b84559746ea123180350641c
     role: control-api-pwa-scene-api-mission-v2
   - id: h-ide-agent
     path: components/h-ide-agent
     source_commit: d2534880b3213494953981e082dd3147629a9f4f
+    source_tree: 75c197b4e79f9dfb0d2a51d95387759f150be22a
     distribution_tree: 88c38df767bd17f3f7c5a9c5de39564632318c3f
+    distribution_delta_sha256: 421fd94aafce84336c6b194b9a2213b737dd69c5c54db9fb104062000c9a9930
     role: mission-architect-planning-only
   - id: h-ide-vision
     path: components/h-ide-vision
     source_commit: 072a49f9741bed54805656c0358dde54fc998a0f
+    source_tree: 52b00894311866c6cc9ada99a58cd1a5023bc022
     distribution_tree: e235567979ec707290423f0f064b95913b916e6b
+    distribution_delta_sha256: 1d4671ede06a48ef6da0ebc465217960c8d27fa9608a862ddfe9c43b455555d2
     role: qwen-sam2-visual-grounding
   - id: robotagent
     path: components/robotagent
     source_commit: f544f40c9c4ea7e1b6a35105918d12aa3a24900a
+    source_tree: d6bc492ff05a2bd125ff634f3645063295ba0cd3
     distribution_tree: e125316ce8b8ca51df5fbb8176263a608837f1a8
+    distribution_delta_sha256: 0c34c5ca20de5f5e3ac49bdc609efbc1f81aedbafe6e5cf662f4897da315c33b
     role: robot-agent-observation-and-command-boundary
   - id: h-ide-mujoco-sonic
     path: components/h-ide-mujoco-sonic
     source_commit: 8c6f3e6375b3f2c4f00e721f885a5a93c56dada3
+    source_tree: 3758b0c281958820d2fed29ada16093bd7eeb2f2
     distribution_tree: 8dc02f85af2bda09087d1281a065d269c4b5953a
+    distribution_delta_sha256: 92ad9590afdec644e5dfee8237969041c5d74a5865911e6c8059c9ba4d6cf39a
     role: mujoco-office-v2-sonic-nav2-adapter
   - id: daaam
     path: optional/DAAAM
@@ -107,6 +117,7 @@ runtime:
   ros_distribution: jazzy
   simulation_python_manifest: manifests/python/simulation-runtime.json
   vision_python_manifest: manifests/python/vision-runtime.json
+  sam2_checkpoint_manifest: manifests/vendor/sam2-checkpoint.json
   bootstrap_huggingface_hub: "1.29.0"
   ros_user_prefix_manifest: manifests/ros/jazzy-user-prefix-amd64.json
   ros_user_prefix_provisioner: integration/provision-ros-prefixes.sh
@@ -121,6 +132,14 @@ runtime:
     - NVIDIA driver/CUDA for Qwen/SAM2 and SONIC
     - systemd --user (workstation launcher)
     - X11 only when --viewer is selected
+
+known_issues:
+  - id: SIM-PLANNER-REFERENCE-DEADLINE-001
+    status: accepted-for-r1-demo
+    fixed_in_release: false
+    scope: MuJoCo simulation
+    impact: pure-rotation planner reference timeout can terminalize the Plant and requires a complete cold restart
+    reproducibility: R1 intentionally preserves the observed local behavior
 
 acceptance:
   l0: repository hygiene, manifests, paths, shell and JSON syntax
