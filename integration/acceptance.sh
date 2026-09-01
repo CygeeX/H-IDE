@@ -170,7 +170,10 @@ printf '%s\n' 'Acceptance: live service health (read-only; no motion command is 
 curl --noproxy '*' -fsS --max-time 5 http://127.0.0.1:8794/healthz >/dev/null
 curl --noproxy '*' -fsS --max-time 5 http://127.0.0.1:8792/healthz >/dev/null
 curl --noproxy '*' -fsS --max-time 5 http://127.0.0.1:8092/healthz >/dev/null
-curl --noproxy '*' -fsS --max-time 5 http://127.0.0.1:8080/readyz >/dev/null
+# Control API serves the built PWA at root and currently has no generic
+# /readyz route. Compose already gates its Postgres/Redis dependencies; a 200
+# root response proves the same process and gateway path used by operators.
+curl --noproxy '*' -fsS --max-time 5 http://127.0.0.1:8080/ >/dev/null
 
 if [[ "${LEVEL}" == L2 ]]; then
   printf '%s\n' 'acceptance L2: OK (runtime health only; no Mission or motion was executed)'
