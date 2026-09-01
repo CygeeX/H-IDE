@@ -470,6 +470,47 @@ describe("Mission visual result summary", () => {
     fireEvent.click(button);
     expect(onSelect).not.toHaveBeenCalled();
   });
+
+  it("renders numbered candidate boxes and crops from the same evidence image", async () => {
+    const onLoadEvidence = vi.fn().mockResolvedValue("blob:candidate-evidence");
+    render(<MissionVisualCandidateSelection
+      result={result({
+        status: "needs_input",
+        ambiguityCandidates: [
+          {
+            candidateId: "candidate-left",
+            label: "左侧椅子",
+            box: [80, 100, 220, 420],
+            score: 0.93,
+          },
+          {
+            candidateId: "candidate-right",
+            label: "右侧椅子",
+            box: [360, 100, 520, 420],
+            score: 0.88,
+          },
+        ],
+        evidence: [{
+          kind: "input_rgb",
+          sha256: "f".repeat(64),
+          mediaType: "image/jpeg",
+        }],
+      })}
+      busy={false}
+      missionId="mission-candidates"
+      onLoadEvidence={onLoadEvidence}
+      onSelect={vi.fn()}
+    />);
+
+    expect(await screen.findByRole("img", { name: "视觉候选编号图" })).toBeInTheDocument();
+    expect(screen.getByLabelText("带编号候选框的视觉凭证")).toHaveTextContent("12");
+    expect(document.querySelectorAll(".candidate-crop")).toHaveLength(2);
+    expect(onLoadEvidence).toHaveBeenCalledWith(
+      "mission-candidates",
+      "analysis-1",
+      "f".repeat(64),
+    );
+  });
 });
 
 describe("Mission visual ambiguity binding", () => {

@@ -1,4 +1,4 @@
-const CACHE_NAME = "h-ide-shell-v7-css-avatar-picker-modal";
+const CACHE_NAME = "h-ide-shell-v8-demo-robot-binding";
 const APP_SHELL = ["/", "/manifest.webmanifest", "/icons/h-ide.svg"];
 
 self.addEventListener("install", (event) => {

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type CSSProperties } from "react";
 import type { MissionRecordV2 } from "./contracts";
 
 interface EvidenceRef {
@@ -110,21 +110,78 @@ export function MissionVisualCandidateSelection({
   result,
   busy,
   onSelect,
+  missionId,
+  onLoadEvidence,
 }: {
   result: MissionVisualResult;
   busy: boolean;
   onSelect: (candidateId: string, analysisId: string, label: string) => void;
+  missionId?: string;
+  onLoadEvidence?: (
+    missionId: string,
+    analysisId: string,
+    sha256: string,
+  ) => Promise<string>;
 }) {
+  const [imageUrl, setImageUrl] = useState<string | null>(null);
+  const [imageError, setImageError] = useState(false);
+  const imageEvidence = result.evidence.find((item) => item.mediaType.startsWith("image/"));
+  useEffect(() => {
+    let disposed = false;
+    let loadedUrl: string | null = null;
+    setImageUrl(null);
+    setImageError(false);
+    if (!missionId || !onLoadEvidence || !imageEvidence) return () => undefined;
+    void onLoadEvidence(missionId, result.analysisId, imageEvidence.sha256)
+      .then((url) => {
+        if (disposed) {
+          if (typeof URL.revokeObjectURL === "function") {
+            URL.revokeObjectURL(url);
+          }
+          return;
+        }
+        loadedUrl = url;
+        setImageUrl(url);
+      })
+      .catch(() => {
+        if (!disposed) setImageError(true);
+      });
+    return () => {
+      disposed = true;
+      if (loadedUrl && typeof URL.revokeObjectURL === "function") {
+        URL.revokeObjectURL(loadedUrl);
+      }
+    };
+  }, [imageEvidence?.sha256, missionId, onLoadEvidence, result.analysisId]);
   if (!result.ambiguityCandidates.length) return null;
+  const colors = ["#8b5cf6", "#0ea5e9", "#f59e0b", "#10b981", "#ef4444"];
   return <section className="visual-candidate-selection" aria-label="选择 Mission 视觉候选">
     <strong>请选择你指的是哪一个目标</strong>
-    <p>候选来自本次 Qwen 视觉分析；选择后会对同一目标再观察一次，不会直接触发移动。</p>
+    <p>候选编号与视觉凭证中的同色框一一对应；选择后会对同一目标再观察一次，不会直接触发移动。</p>
+    {imageUrl ? <div className="candidate-evidence-stage" aria-label="带编号候选框的视觉凭证">
+      <svg viewBox="0 0 640 480" role="img" aria-label="视觉候选编号图">
+        <image href={imageUrl} x="0" y="0" width="640" height="480" preserveAspectRatio="xMidYMid slice" />
+        {result.ambiguityCandidates.map((candidate, index) => {
+          const [x1, y1, x2, y2] = candidate.box;
+          const color = colors[index % colors.length];
+          return <g key={candidate.candidateId}>
+            <rect x={x1} y={y1} width={x2 - x1} height={y2 - y1} fill="none" stroke={color} strokeWidth="5" />
+            <circle cx={x1 + 15} cy={Math.max(18, y1 - 15)} r="16" fill={color} />
+            <text x={x1 + 15} y={Math.max(18, y1 - 15) + 6} textAnchor="middle" fill="white" fontSize="18" fontWeight="700">{index + 1}</text>
+          </g>;
+        })}
+      </svg>
+    </div> : imageError ? <p className="candidate-evidence-error">视觉凭证暂时未能加载；不会允许盲选，请重试加载。</p> : onLoadEvidence ? <p className="candidate-evidence-loading">正在加载带编号的视觉凭证…</p> : null}
     <div>{result.ambiguityCandidates.map((candidate, index) => <button
       key={candidate.candidateId}
       type="button"
-      disabled={busy}
+      disabled={busy || Boolean(onLoadEvidence && !imageUrl)}
+      style={{ "--candidate-color": colors[index % colors.length] } as CSSProperties}
       onClick={() => onSelect(candidate.candidateId, result.analysisId, candidate.label)}
     >
+      {imageUrl ? <svg className="candidate-crop" viewBox={`${candidate.box[0]} ${candidate.box[1]} ${candidate.box[2] - candidate.box[0]} ${candidate.box[3] - candidate.box[1]}`} aria-hidden="true">
+        <image href={imageUrl} x="0" y="0" width="640" height="480" preserveAspectRatio="xMidYMid slice" />
+      </svg> : null}
       <span>{index + 1}</span>
       <strong>{candidate.label}</strong>
       <small>{candidate.score == null ? "置信度未知" : `置信度 ${(candidate.score * 100).toFixed(0)}%`}</small>

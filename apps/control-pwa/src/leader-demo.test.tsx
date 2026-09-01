@@ -1,5 +1,5 @@
-import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   LEADER_SKILLS,
   ROBOT_DISPLAY_OPTIONS,
@@ -10,6 +10,8 @@ import {
 } from "./leader-demo";
 
 describe("leader demo entry points", () => {
+  afterEach(cleanup);
+
   it("exposes inspection and voice skills with the agreed greeting prompts", () => {
     const onSelect = vi.fn();
     render(<SkillSelection selected={null} onSelect={onSelect} />);
@@ -43,6 +45,25 @@ describe("leader demo entry points", () => {
       "agibot",
       "deeprobotics",
     ]);
+  });
+
+  it("switches an unbound developer record to g1-sim when Unitree is chosen", () => {
+    const onRobotChange = vi.fn();
+    render(
+      <RobotPicker
+        robots={[
+          { robotId: "g1-dev", status: "unknown", connected: false } as never,
+          { robotId: "g1-sim", name: "G1 仿真", status: "online", connected: true } as never,
+        ]}
+        selectedRobotId="g1-dev"
+        selectedDisplayId="unitree"
+        onRobotChange={onRobotChange}
+        onDisplayChange={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "选择机器人" }));
+    fireEvent.click(screen.getByRole("button", { name: /宇树 Unitree/ }));
+    expect(onRobotChange).toHaveBeenCalledWith("g1-sim");
   });
 
   it("uses the CSS avatar without a GLB canvas", () => {

@@ -5,6 +5,7 @@ import {
   App,
   isDraftExpired,
   isDraftReviewableForRobot,
+  preferredDemoRobotId,
   preferredRobotId,
   shouldReconcileMission,
 } from "./main";
@@ -564,6 +565,16 @@ describe("control console", () => {
     expect(preferredRobotId(robots, "g1-dev")).toBe("g1-dev");
   });
 
+  it("selects the connected simulation robot when a stale demo record is selected", () => {
+    const robots = [
+      { robotId: "g1-dev", status: "unknown", connected: false, safetyMode: "normal" },
+      { robotId: "g1-sim", status: "online", connected: true, safetyMode: "normal" },
+    ] as Parameters<typeof preferredDemoRobotId>[0];
+
+    expect(preferredDemoRobotId(robots, "g1-dev")).toBe("g1-sim");
+    expect(preferredDemoRobotId(robots, "g1-sim")).toBe("g1-sim");
+  });
+
   it("keeps reconciling a failed skill while the Mission enters planning", () => {
     expect(shouldReconcileMission("executing")).toBe(true);
     expect(shouldReconcileMission("planning")).toBe(true);
@@ -875,6 +886,7 @@ describe("control console", () => {
 
     render(<App />);
     const input = await screen.findByLabelText("任务描述");
+    await screen.findByText("工作站在线");
     fireEvent.change(input, { target: { value: "介绍一下当前系统" } });
     fireEvent.submit(input.closest("form")!);
 

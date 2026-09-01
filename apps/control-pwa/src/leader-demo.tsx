@@ -142,6 +142,14 @@ export function RobotPicker({
   const [open, setOpen] = useState(false);
   const selected = ROBOT_DISPLAY_OPTIONS.find((item) => item.id === selectedDisplayId) ?? ROBOT_DISPLAY_OPTIONS[0];
   const boundRobot = robots.find((item) => item.robotId === selectedRobotId);
+  const readyRobot = robots.find(
+    (item) => item.connected && (item.status === "online" || item.status === "degraded"),
+  );
+  const simulationRobot = robots.find(
+    (item) => item.robotId === "g1-sim"
+      && item.connected
+      && (item.status === "online" || item.status === "degraded"),
+  );
   useEffect(() => {
     if (!open) return undefined;
     const onKeyDown = (event: KeyboardEvent) => {
@@ -154,8 +162,15 @@ export function RobotPicker({
     onDisplayChange(option.id);
     // Only Unitree is wired to the live/simulation backend in this demo.
     if (option.control === "active") {
-      const preferred = robots.find((item) => item.robotId === selectedRobotId)
-        ?? robots.find((item) => item.connected)
+      const current = robots.find((item) => item.robotId === selectedRobotId);
+      const preferred = (
+        current?.connected
+        && (current.status === "online" || current.status === "degraded")
+          ? current
+          : simulationRobot
+            ?? readyRobot
+      )
+        ?? current
         ?? robots[0];
       if (preferred) onRobotChange(preferred.robotId);
     }

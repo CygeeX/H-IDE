@@ -167,4 +167,41 @@ describe("Mission Office report", () => {
     expect(screen.getByText("会议室")).toBeTruthy();
     expect(screen.getByText(/Office V2 巡检报告/)).toBeTruthy();
   });
+
+  it("parses and labels a current-location report separately from a full tour", () => {
+    const report = parseMissionOfficeReport(rawReport({
+      reportScope: "current_location",
+      locationId: "meeting_room",
+      stationId: "meeting_south",
+      regions: [rawReport().regions[0]],
+      narrativeZhCN: "会议室观察报告\n- 看到会议桌和显示屏",
+    }), "mission-office-1");
+
+    expect(report?.reportScope).toBe("current_location");
+    expect(report?.locationId).toBe("meeting_room");
+    render(<MissionOfficeReportCard report={report!} />);
+    expect(screen.getByText("目标区域观察完成")).toBeTruthy();
+    expect(screen.queryByText("全部区域已完成")).toBeNull();
+  });
+
+  it("parses a completed report limited to selected rooms", () => {
+    const invalid = parseMissionOfficeReport(rawReport({
+      reportScope: "selected_locations",
+      regionIds: ["meeting_room", "corridor"],
+      stationIds: ["meeting_south", "corridor_west"],
+      regions: [rawReport().regions[0]],
+      narrativeZhCN: "定向巡检报告\n- 会议室：看到电脑\n- 走廊：可通行",
+    }), "mission-office-1");
+    expect(invalid).toBeNull();
+
+    const valid = parseMissionOfficeReport(rawReport({
+      reportScope: "selected_locations",
+      regionIds: ["meeting_room", "corridor"],
+      stationIds: ["meeting_south", "corridor_west"],
+      narrativeZhCN: "定向巡检报告\n- 会议室：看到电脑\n- 走廊：可通行",
+    }), "mission-office-1");
+    expect(valid?.reportScope).toBe("selected_locations");
+    expect(valid?.regionIds).toEqual(["meeting_room", "corridor"]);
+    expect(valid?.stationIds).toEqual(["meeting_south", "corridor_west"]);
+  });
 });

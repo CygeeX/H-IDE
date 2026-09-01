@@ -456,6 +456,23 @@ function preferredRobotId(robots: RobotState[], current: string): string {
   return preferred?.robotId ?? "";
 }
 
+function robotReadyForDemo(robot: RobotState | undefined): boolean {
+  return Boolean(
+    robot
+    && robot.connected
+    && (robot.status === "online" || robot.status === "degraded"),
+  );
+}
+
+function preferredDemoRobotId(robots: RobotState[], current: string): string {
+  const selected = robots.find((robot) => robot.robotId === current);
+  if (robotReadyForDemo(selected)) return selected!.robotId;
+  const simulation = robots.find(
+    (robot) => robot.robotId === "g1-sim" && robotReadyForDemo(robot),
+  );
+  return simulation?.robotId ?? preferredRobotId(robots, "");
+}
+
 function navigationGoal(payload: Record<string, unknown>): { x: number; y: number; z: number; yaw: number } | null {
   const value = payload.goalPose;
   if (!value || typeof value !== "object") return null;
@@ -726,6 +743,7 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
   assistantConversationRef.current = assistantConversation;
   const selectedRobotRef = useRef(selectedRobotId);
   selectedRobotRef.current = selectedRobotId;
+  const selectedRobotManualRef = useRef(false);
 
   useEffect(() => {
     if (route.shell === "developer" && !canDevelop) navigate("/app", { replace: true });
@@ -739,7 +757,15 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
   const loadRobots = useCallback(async () => {
     const list = await apiFetch<RobotState[]>("/api/v1/robots");
     setRobots(list);
-    setSelectedRobotId((current) => preferredRobotId(list, current));
+    setSelectedRobotId((current) => {
+      // A first discovery response can contain only the stale g1-dev record;
+      // once the simulation record arrives, prefer the connected g1-sim for
+      // the leader demo unless the operator explicitly chose a robot.
+      if (!selectedRobotManualRef.current) {
+        return preferredDemoRobotId(list, current);
+      }
+      return preferredRobotId(list, current);
+    });
   }, []);
 
   const loadMappings = useCallback(async () => {
@@ -1080,6 +1106,15 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
   }, [selectedDisplayRobotId]);
 
   const selectLeaderSkill = useCallback((skill: LeaderSkillDefinition) => {
+    if (skill.id === "inspection.office" && !assistantConversation && !missionDraft && !missionRecord) {
+      const current = robots.find((item) => item.robotId === selectedRobotId);
+      const demoRobotId = preferredDemoRobotId(robots, selectedRobotId);
+      if (demoRobotId && demoRobotId !== selectedRobotId && !robotReadyForDemo(current)) {
+        selectedRobotManualRef.current = false;
+        setSelectedRobotId(demoRobotId);
+        setNotice("已切换到在线仿真机器人 G1");
+      }
+    }
     setSelectedSkill(skill.id);
     setSkillGreeting(skill.prompt);
     setAssistantInlineError("");
@@ -1089,7 +1124,7 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
       // service is not configured.
       setVoiceReplyEnabled(true);
     }
-  }, []);
+  }, [assistantConversation, missionDraft, missionRecord, robots, selectedRobotId]);
 
   const clearLeaderSkill = useCallback(() => {
     setSelectedSkill(null);
@@ -1343,7 +1378,28 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
     setAssistantRetryRequest({ text, modality, transcriptionId: sourceTranscriptionId, route: "conversation" });
     setError("");
     try {
-      const robotId = selectedRobotId;
+      let robotId = selectedRobotId;
+      if (selectedSkillRef.current === "inspection.office") {
+        const selected = robots.find((item) => item.robotId === robotId);
+        const demoRobotId = preferredDemoRobotId(robots, robotId);
+        // A stale g1-dev record can survive a previous developer session. Do
+        // not send a known Office inspection to an unbound robot; transparently
+        // create the next conversation on the connected simulation G1.
+        if (
+          demoRobotId
+          && demoRobotId !== robotId
+          && !robotReadyForDemo(selected)
+        ) {
+          robotId = demoRobotId;
+          selectedRobotManualRef.current = false;
+          selectedRobotRef.current = robotId;
+          setSelectedRobotId(robotId);
+          setAssistantConversation(null);
+          setAssistantTurn(null);
+          setAssistantInlineError("");
+          setNotice("已切换到在线仿真机器人 G1");
+        }
+      }
       const conversation = await ensureAssistantConversation(robotId);
       if (selectedRobotRef.current !== robotId) {
         throw new Error("机器人选择已变化，请重新提交任务");
@@ -2268,6 +2324,7 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
   }, [navigate, route.shell, selectedRobotId]);
 
   const selectRobotForNewTask = useCallback((robotId: string) => {
+    selectedRobotManualRef.current = true;
     if (robotId === selectedRobotId) return;
     startNewTask(robotId);
     setNotice(`已为 ${robotId} 打开新的任务会话；原会话上下文未被修改`);
@@ -3974,4 +4031,12 @@ if (import.meta.env.PROD && "serviceWorker" in navigator) {
   });
 }
 
-export { App, apiFetch, ApiFailure, isDraftExpired, isDraftReviewableForRobot, preferredRobotId };
+export {
+  App,
+  apiFetch,
+  ApiFailure,
+  isDraftExpired,
+  isDraftReviewableForRobot,
+  preferredDemoRobotId,
+  preferredRobotId,
+};

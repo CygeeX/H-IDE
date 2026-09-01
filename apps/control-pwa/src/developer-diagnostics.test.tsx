@@ -272,4 +272,23 @@ describe("DeveloperDiagnostics", () => {
     expect(screen.getByText("diagnostics timeout")).toBeInTheDocument();
     expect(screen.getByText("Robot Agent Gateway")).toBeInTheDocument();
   });
+
+  it("shows the raw PWA Assistant failure only in developer diagnostics", async () => {
+    const apiFetch = vi.fn().mockResolvedValue(standbySnapshot());
+    render(<DeveloperDiagnostics
+      apiFetch={apiFetch}
+      robotId="g1-sim"
+      pollIntervalMs={60_000}
+      clientIssue={{
+        occurredAt: "2026-08-20T12:00:00Z",
+        operation: "assistant.submit",
+        detail: "planning-agent returned 502 Bad Gateway",
+        taskId: "task-client-failure-1",
+      }}
+    />);
+
+    expect(await screen.findByText("最近一次客户端请求故障")).toBeInTheDocument();
+    expect(screen.getByText("planning-agent returned 502 Bad Gateway")).toBeInTheDocument();
+    expect(screen.getByText("task-client-failure-1")).toBeInTheDocument();
+  });
 });
