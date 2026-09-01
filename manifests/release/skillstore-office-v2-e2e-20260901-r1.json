@@ -20,8 +20,8 @@
     {
       "id": "h-ide-agent",
       "path": "components/h-ide-agent",
-      "sourceCommit": "09c727678f249c11efadac48f727f7c8d103a22e",
-      "distributionTree": "4bc00322d1815ab8f316a286ead48ff1b1b0d6aa",
+      "sourceCommit": "d2534880b3213494953981e082dd3147629a9f4f",
+      "distributionTree": "88c38df767bd17f3f7c5a9c5de39564632318c3f",
       "runtimeDefault": true
     },
     {

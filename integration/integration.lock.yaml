@@ -22,8 +22,8 @@ components:
     role: control-api-pwa-scene-api-mission-v2
   - id: h-ide-agent
     path: components/h-ide-agent
-    source_commit: 09c727678f249c11efadac48f727f7c8d103a22e
-    distribution_tree: 4bc00322d1815ab8f316a286ead48ff1b1b0d6aa
+    source_commit: d2534880b3213494953981e082dd3147629a9f4f
+    distribution_tree: 88c38df767bd17f3f7c5a9c5de39564632318c3f
     role: mission-architect-planning-only
   - id: h-ide-vision
     path: components/h-ide-vision
