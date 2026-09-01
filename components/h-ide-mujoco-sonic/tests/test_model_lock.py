@@ -438,6 +438,24 @@ def test_repository_lock_separates_complete_bundles_from_executable_runtime() ->
         assert all(entry["size"] and entry["sha256"] for entry in profile["files"])
 
 
+def test_vendored_tree_hash_ignores_generated_python_metadata(tmp_path: Path) -> None:
+    vendor = tmp_path / "vendor"
+    vendor.mkdir()
+    (vendor / "runtime.py").write_text("VALUE = 1\n", encoding="utf-8")
+    baseline = verify_model_lock._directory_sha256(vendor)
+
+    cache = vendor / "__pycache__"
+    cache.mkdir()
+    (cache / "runtime.cpython-312.pyc").write_bytes(b"generated")
+    egg_info = vendor / "runtime.egg-info"
+    egg_info.mkdir()
+    (egg_info / "PKG-INFO").write_text("generated\n", encoding="utf-8")
+    assert verify_model_lock._directory_sha256(vendor) == baseline
+
+    (vendor / "runtime.py").write_text("VALUE = 2\n", encoding="utf-8")
+    assert verify_model_lock._directory_sha256(vendor) != baseline
+
+
 def test_repository_runtime_source_lock_matches_every_runtime_selector() -> None:
     lock = json.loads(
         (ROOT / "config" / "sonic-models.lock.json").read_text(encoding="utf-8")

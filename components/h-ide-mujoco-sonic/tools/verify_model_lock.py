@@ -26,6 +26,13 @@ import yaml
 SCHEMA_VERSION = "h-ide.sonic-model-lock/1"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 REQUIRED_ROLES = {"planner", "encoder", "decoder", "controller", "observation_config"}
+GENERATED_TREE_DIRECTORIES = {
+    ".git",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    "__pycache__",
+}
 
 
 @dataclass(frozen=True)
@@ -90,7 +97,13 @@ def _directory_sha256(path: Path) -> str:
     if not root.is_dir():
         raise ValueError(f"vendored source path is not a directory: {root}")
     for item in sorted(root.rglob("*"), key=lambda value: value.relative_to(root).as_posix()):
-        relative = item.relative_to(root).as_posix()
+        relative_path = item.relative_to(root)
+        if any(
+            part in GENERATED_TREE_DIRECTORIES or part.endswith(".egg-info")
+            for part in relative_path.parts
+        ):
+            continue
+        relative = relative_path.as_posix()
         if item.is_dir() and not item.is_symlink():
             continue
         digest.update(relative.encode("utf-8"))
