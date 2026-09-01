@@ -100,12 +100,17 @@ fi
 (cd "${robot}" && uv sync --locked --python .venv/bin/python --all-groups)
 (
   cd "${robot}"
+  # ROS generated setup files read optional variables before defining them and
+  # are not nounset-safe. Restore the release script's strict mode immediately
+  # after sourcing the three reviewed setup files.
+  set +u
   # shellcheck disable=SC1091
   source /opt/ros/jazzy/setup.bash
   # shellcheck disable=SC1091
   source tools/activate-local-nav2-jazzy.bash
   # shellcheck disable=SC1091
   source tools/activate-local-realsense-jazzy.bash
+  set -u
   /usr/bin/python3 /usr/bin/colcon build --symlink-install
 )
 
