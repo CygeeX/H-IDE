@@ -143,15 +143,45 @@ def test_plant_control_clock_accepts_long_running_rounded_4ms_mujoco_tick_stream
     [
         ((1_000, 1_000), "duplicate"),
         ((1_000, 996), "backwards"),
-        ((1_000, 1_024), "source jumped"),
-        ((1_000, 1_004, 1_008, 1_012, 1_016, 1_025), "interval jumped"),
     ],
 )
-def test_plant_control_clock_fails_closed_on_discontinuous_ticks(ticks, message):
+def test_plant_control_clock_fails_closed_on_invalid_ticks(ticks, message):
     clock = PlantControlClock(control_hz=50)
     with pytest.raises(PlantControlClockFault, match=message):
         for tick in ticks:
             clock.observe(tick)
+
+
+def test_plant_control_clock_records_forward_source_gap_and_continues() -> None:
+    clock = PlantControlClock(control_hz=50)
+
+    assert clock.observe(1_000) is not None
+    step = clock.observe(1_080)
+
+    assert step is not None
+    assert step.tick_ms == 1_080
+    # A delayed callback must not pass a large integration dt into SONIC.
+    assert step.dt_s == pytest.approx(0.02)
+    assert clock.stall_count == 2
+    assert clock.source_gap_count == 1
+    assert clock.control_interval_gap_count == 1
+    assert clock.last_stall_ms == 80
+    assert clock.max_stall_ms == 80
+    assert clock.diagnostics()["control_clock_last_stall_kind"] == (
+        "control_interval"
+    )
+
+
+def test_plant_control_clock_keeps_small_jitter_dt_and_records_only_large_gap() -> None:
+    clock = PlantControlClock(control_hz=50)
+
+    clock.observe(1_000)
+    assert clock.observe(1_004) is None
+    step = clock.observe(1_024)
+
+    assert step is not None
+    assert step.dt_s == pytest.approx(0.024)
+    assert clock.stall_count == 0
 
 
 def test_motion_direction_guard_latches_opposite_map_displacement_and_requires_idle():

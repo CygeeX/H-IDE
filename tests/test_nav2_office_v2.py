@@ -123,13 +123,13 @@ def test_both_nav2_costmaps_use_the_office_v2_static_geometry() -> None:
             "subscribe_to_updates": False,
         }
         assert costmap["resolution"] == scene["map"]["resolution"]
-        # Nav2 uses the collision-observed physical footprint to escape a
-        # scan-drifted but collision-free start.  The independent static
-        # primitive planner retains scene.navigation's stricter 0.35 m radius
-        # plus padding and clearance for every normal path segment.
+        # Match the planner to G1's measured swept body envelope. MuJoCo
+        # contacts trigger replanning in the relaxed profile, never Mission
+        # failure or SONIC authority revocation.
         assert costmap["robot_radius"] == 0.25
-        assert navigation["robot_radius_m"] == 0.35
+        assert navigation["robot_radius_m"] == 0.25
         assert costmap["footprint_padding"] == navigation["footprint_padding_m"]
+        assert costmap["inflation_layer"]["inflation_radius"] == 0.45
 
 
 def test_evaluation_only_grid_keeps_the_central_corridor_open_for_the_demo() -> None:

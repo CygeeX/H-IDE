@@ -138,15 +138,18 @@ def test_driver_observes_lowstate_and_successful_publish_gaps() -> None:
     assert driver._last_control_step_wall_s == 10.0
 
 
-def test_driver_fails_closed_instead_of_catching_up_pending_policy_steps() -> None:
+def test_driver_replaces_overrun_pending_sample_instead_of_stopping() -> None:
     driver = _bare_driver()
     driver._on_lowstate(SimpleNamespace(tick=1_000))
     for tick in (1_004, 1_008, 1_012, 1_016, 1_020):
         driver._on_lowstate(SimpleNamespace(tick=tick))
 
-    assert driver._fault_latched.is_set()
-    assert driver.guard.stops == ["terminal_fault"]
-    assert "control sample overrun" in str(driver.telemetry.values["last_error"])
+    assert driver._fault_latched.is_set() is False
+    assert driver.guard.stops == []
+    assert driver._pending_control_sample is not None
+    assert driver._pending_control_sample[1].tick_ms == 1_020
+    assert driver._control_sample_overrun_count == 1
+    assert driver.telemetry.values["control_sample_overrun_count"] == 1
 
 
 def test_driver_fails_closed_on_duplicate_simulation_tick() -> None:
@@ -302,11 +305,14 @@ def test_startup_qualification_latest_only_syncs_without_policy_catchup() -> Non
     assert driver._startup_qualifying is False
     assert driver.telemetry.values["motion_ready"] is True
 
-    # Once ready, precisely the same pending-sample condition is terminal.
+    # Once ready, precisely the same pending-sample condition remains
+    # latest-only and is recorded instead of becoming terminal.
     driver._on_lowstate(SimpleNamespace(tick=1_100))
     driver._on_lowstate(SimpleNamespace(tick=1_120))
-    assert driver._fault_latched.is_set() is True
-    assert "control sample overrun" in str(driver.telemetry.values["last_error"])
+    assert driver._fault_latched.is_set() is False
+    assert driver._pending_control_sample is not None
+    assert driver._pending_control_sample[1].tick_ms == 1_120
+    assert driver._control_sample_overrun_count == 1
 
 
 def test_startup_qualification_rebases_forward_gap_then_requires_fresh_window() -> None:
@@ -347,13 +353,13 @@ def test_startup_qualification_rebases_forward_gap_then_requires_fresh_window() 
     assert driver._startup_qualifying is False
 
     # Once the first control-arm transaction commits, the exact same
-    # discontinuity is terminal for the lifetime of the process.
+    # discontinuity is recorded and the latest step remains available.
     driver._runtime_clock_committed = True
     driver._on_lowstate(SimpleNamespace(tick=4_712))
-    assert driver._fault_latched.is_set() is True
-    assert "control clock source jumped 1836ms" in str(
-        driver.telemetry.values["last_error"]
-    )
+    assert driver._fault_latched.is_set() is False
+    assert driver._pending_control_sample is not None
+    assert driver._pending_control_sample[1].tick_ms == 4_712
+    assert driver.telemetry.values["control_clock_source_gap_count"] >= 1
 
 
 def test_pre_authority_idle_gap_revokes_readiness_and_requalifies() -> None:

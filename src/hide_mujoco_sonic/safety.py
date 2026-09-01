@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 import math
 import time
 from collections.abc import Sequence
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -79,7 +83,7 @@ class PlantControlStep:
 
 
 class PlantControlClock:
-    """Down-sample strict ``LowState.tick`` time to one SONIC step at 50 Hz.
+    """Down-sample ``LowState.tick`` time to one SONIC step at 50 Hz.
 
     ``LowState.tick`` is elapsed MuJoCo time in milliseconds.  The simulation
     can run slower than wall time when RGB-D rendering is enabled, so a wall
@@ -87,11 +91,12 @@ class PlantControlClock:
     joint slew guards.  This gate admits exactly one control step after one
     simulation-time period and never emits catch-up steps.
 
-    Duplicate/backwards observations, a missing source interval, or a control
-    interval larger than the configured tolerance are terminal faults.  A
-    caller must likewise fault if an admitted step is still pending when the
-    next one arrives; buffering/catching up learned-policy steps would replay
-    stale observations into the plant.
+    Duplicate/backwards observations are still invalid because they indicate a
+    broken or restarted source.  A *forward* gap, however, is ordinary host
+    scheduling/rendering jitter in this workstation simulation.  It is recorded
+    as evidence and the clock is rebased to the newest observation; it must not
+    stop a healthy robot or terminate the process.  Only one current control
+    step is emitted after a gap (there are never catch-up steps).
     """
 
     def __init__(
@@ -116,6 +121,16 @@ class PlantControlClock:
         self.control_tolerance_ms = int(control_tolerance_ms)
         self.last_observed_tick_ms: int | None = None
         self.last_control_tick_ms: int | None = None
+        # Forward timing gaps are diagnostics, not actuator interlocks.  Keep
+        # scalar counters so the PWA/telemetry endpoint can show exactly what
+        # happened without putting a large evidence object on the 50 Hz path.
+        self.stall_count = 0
+        self.source_gap_count = 0
+        self.control_interval_gap_count = 0
+        self.last_stall_ms: int | None = None
+        self.max_stall_ms = 0
+        self.last_stall_kind: str | None = None
+        self.last_stall_message: str | None = None
 
     @staticmethod
     def _tick(value: int) -> int:
@@ -144,6 +159,62 @@ class PlantControlClock:
         self.last_observed_tick_ms = current
         self.last_control_tick_ms = current
 
+    def _record_forward_gap(
+        self,
+        *,
+        kind: str,
+        gap_ms: int,
+        message: str,
+    ) -> None:
+        """Record a finite forward gap without changing control authority."""
+
+        gap = int(gap_ms)
+        self.stall_count += 1
+        if kind == "source":
+            self.source_gap_count += 1
+        elif kind == "control_interval":
+            self.control_interval_gap_count += 1
+        else:
+            raise ValueError(f"unknown control-clock gap kind: {kind}")
+        self.last_stall_ms = gap
+        self.max_stall_ms = max(self.max_stall_ms, gap)
+        self.last_stall_kind = kind
+        self.last_stall_message = str(message)
+        logger.warning("%s; continuing with the latest simulation sample", message)
+
+    def note_source_gap(self, gap_ms: int) -> None:
+        """Record a source gap detected while startup is being rebased.
+
+        Startup qualification has a separate, policy-free rebase path in the
+        driver.  Calling this method keeps that path visible in the same
+        diagnostics as runtime gaps while preserving the non-fatal policy.
+        """
+
+        if isinstance(gap_ms, bool) or not isinstance(gap_ms, int) or gap_ms <= 0:
+            raise ValueError("control-clock source gap must be a positive integer")
+        if gap_ms > self.max_source_gap_ms:
+            self._record_forward_gap(
+                kind="source",
+                gap_ms=gap_ms,
+                message=(
+                    "MuJoCo control clock source gap "
+                    f"{gap_ms}ms exceeded nominal {self.max_source_gap_ms}ms"
+                ),
+            )
+
+    def diagnostics(self) -> dict[str, object]:
+        """Return scalar timing evidence for telemetry and support tooling."""
+
+        return {
+            "control_clock_stall_count": self.stall_count,
+            "control_clock_source_gap_count": self.source_gap_count,
+            "control_clock_interval_gap_count": self.control_interval_gap_count,
+            "control_clock_last_stall_ms": self.last_stall_ms,
+            "control_clock_max_stall_ms": self.max_stall_ms,
+            "control_clock_last_stall_kind": self.last_stall_kind,
+            "control_clock_last_stall_message": self.last_stall_message,
+        }
+
     def observe(self, tick_ms: int) -> PlantControlStep | None:
         current = self._tick(tick_ms)
         previous_observed = self.last_observed_tick_ms
@@ -155,9 +226,13 @@ class PlantControlClock:
                     f"MuJoCo control clock {kind}: {previous_observed}ms -> {current}ms"
                 )
             if source_gap > self.max_source_gap_ms:
-                raise PlantControlClockFault(
-                    "MuJoCo control clock source jumped "
-                    f"{source_gap}ms (limit {self.max_source_gap_ms}ms)"
+                self._record_forward_gap(
+                    kind="source",
+                    gap_ms=source_gap,
+                    message=(
+                        "MuJoCo control clock source gap "
+                        f"{source_gap}ms exceeded nominal {self.max_source_gap_ms}ms"
+                    ),
                 )
         self.last_observed_tick_ms = current
 
@@ -170,13 +245,26 @@ class PlantControlClock:
         if elapsed_ms < self.period_ms:
             return None
         if elapsed_ms > self.period_ms + self.control_tolerance_ms:
-            raise PlantControlClockFault(
-                "MuJoCo control interval jumped "
-                f"{elapsed_ms}ms (expected {self.period_ms}ms, "
-                f"tolerance {self.control_tolerance_ms}ms)"
+            self._record_forward_gap(
+                kind="control_interval",
+                gap_ms=elapsed_ms,
+                message=(
+                    "MuJoCo control interval gap "
+                    f"{elapsed_ms}ms exceeded expected {self.period_ms}ms "
+                    f"(tolerance {self.control_tolerance_ms}ms)"
+                ),
             )
         self.last_control_tick_ms = current
-        return PlantControlStep(current, elapsed_ms / 1_000.0)
+        # The learned controller and CmdVelGuard are tuned for a 50 Hz step and
+        # reject a large integration dt.  After a host stall, consume exactly
+        # one nominal step and rebase to ``current`` instead of integrating the
+        # whole wall/scheduler gap or replaying missed policy steps.
+        dt_s = (
+            self.period_ms / 1_000.0
+            if elapsed_ms > self.period_ms + self.control_tolerance_ms
+            else elapsed_ms / 1_000.0
+        )
+        return PlantControlStep(current, dt_s)
 
 
 class MotionDirectionGuard:

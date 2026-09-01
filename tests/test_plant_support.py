@@ -27,12 +27,16 @@ def test_lowstate_publish_cadence_downsamples_physics_to_control_rate() -> None:
     assert cadence.physics_step_ms == 4
 
 
-def test_lowstate_publish_cadence_rejects_skipped_control_boundary() -> None:
+def test_lowstate_publish_cadence_records_skipped_control_boundary() -> None:
     cadence = PlantLowStatePublishCadence(control_hz=50, physics_dt_s=0.004)
     assert cadence.admit(0) is True
 
-    with pytest.raises(PlantPhysicsFault, match="skipped a control period"):
-        cadence.admit(40)
+    assert cadence.admit(40) is True
+    assert cadence.last_published_tick_ms == 40
+    assert cadence.skipped_control_period_count == 1
+    assert cadence.last_skipped_period_gap_ms == 40
+    assert cadence.max_skipped_period_gap_ms == 40
+    assert cadence.diagnostics()["lowstate_cadence_skipped_control_period_count"] == 1
 
 
 @pytest.mark.parametrize(

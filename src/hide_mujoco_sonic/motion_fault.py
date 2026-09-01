@@ -525,6 +525,35 @@ class SonicHealth:
             and self.reference_authority_state == "GRANTED"
         )
 
+    @property
+    def confirmed_armed_static_idle(self) -> bool:
+        """Whether an armed generation is stationary before policy grant.
+
+        A Nav2 action may abort before its first locomotion primitive.  SONIC
+        has then accepted the control generation, but no learned-policy
+        reference has crossed DDS yet: the exact last actuator target remains
+        frozen, Plant support is already idle, and every motion command is
+        zero.  This is distinct from both a physical safety hold and resident
+        balanced-policy IDLE.  It is exposed so the explicit relaxed
+        simulation profile can re-authorize that *same* generation instead of
+        forcing an impossible new normal-stop/rearm transaction.
+        """
+
+        return (
+            self.plant_support_mode == "idle"
+            and not self.plant_support_safety_latched
+            and not self.plant_support_stop_pending
+            and self.static_hold_active
+            and not self.navigation_task_active
+            and self.motion_authorized
+            and self.nav2_command_zero
+            and not self.controlled_policy_stop_active
+            and not self.matched_reference_actuator_authority
+            and self.reference_authority_state == "REVOKED"
+            and self.reference_authority_generation is None
+            and self.reference_authority_source_sequence is None
+        )
+
     @classmethod
     def from_response(
         cls,
@@ -1144,6 +1173,28 @@ class SonicHealthTransportGate:
             self._recovered_timeout_count += 1
             return self._decision("recovered")
 
+    def reopen_for_retained_experiment(self) -> HealthTransportDecision:
+        """Reopen a confirmed fence for the explicit uninterrupted-SONIC demo.
+
+        The normal profile intentionally keeps a confirmed transport timeout
+        latched until the operator performs the documented fault-reset
+        transaction. The workstation opt-in
+        HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT=1 profile suppresses that
+        automatic actuator cutoff, so leaving the same gate permanently
+        confirmed would make every later control_arm fail even after the
+        socket has recovered. Clear only the transport-fence bookkeeping; the
+        caller must immediately issue a fresh, correlated probe before
+        authorizing motion.
+        """
+
+        with self._lock:
+            if self._confirmed_cause is None:
+                return self._decision()
+            self._confirmed_cause = None
+            self._pending = None
+            self._pending_request_ids.clear()
+            return self._decision("reopened")
+
 
 class SonicHealthFaultGate:
     """Confirm age-only health faults without delaying hard fault classes.
@@ -1319,6 +1370,7 @@ def require_fresh_motion_health(
     *,
     plant_lowstate_stale_s: float,
     sonic_control_step_stale_s: float,
+    allow_armed_static_idle: bool = False,
 ) -> None:
     """Reject control acquisition unless the current motion path is fresh.
 
@@ -1336,6 +1388,10 @@ def require_fresh_motion_health(
     if not (
         health.confirmed_safe_hold
         or health.confirmed_balanced_policy_idle
+        or (
+            allow_armed_static_idle
+            and health.confirmed_armed_static_idle
+        )
     ):
         raise ValueError(
             "SONIC control acquisition requires a confirmed settled safety "

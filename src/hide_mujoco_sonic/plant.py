@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass, replace
 import json
+import logging
 import math
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
@@ -41,6 +42,9 @@ from .render_workers import (
 from .runtime_diagnostics import PlantRuntimeDiagnostics
 from .scene_runtime import RuntimeScene
 from .unitree_dds import initialize_unitree_control_channel
+
+
+logger = logging.getLogger(__name__)
 
 
 class PlantPhysicsFault(RuntimeError):
@@ -915,6 +919,9 @@ class PlantLowStatePublishCadence:
         self.period_ms = period_ms
         self.physics_step_ms = step_ms
         self.last_published_tick_ms: int | None = None
+        self.skipped_control_period_count = 0
+        self.last_skipped_period_gap_ms: int | None = None
+        self.max_skipped_period_gap_ms = 0
 
     def admit(self, tick_ms: int) -> bool:
         if isinstance(tick_ms, bool) or not isinstance(tick_ms, int) or tick_ms < 0:
@@ -927,12 +934,37 @@ class PlantLowStatePublishCadence:
         if tick_ms % self.period_ms != 0 or tick_ms == previous:
             return False
         if previous is not None and tick_ms - previous != self.period_ms:
-            raise PlantPhysicsFault(
+            gap_ms = tick_ms - previous
+            self.skipped_control_period_count += 1
+            self.last_skipped_period_gap_ms = gap_ms
+            self.max_skipped_period_gap_ms = max(
+                self.max_skipped_period_gap_ms,
+                gap_ms,
+            )
+            logger.warning(
                 "LowState publish cadence skipped a control period: "
-                f"{previous}ms -> {tick_ms}ms"
+                "%sms -> %sms (gap=%sms); continuing with latest boundary",
+                previous,
+                tick_ms,
+                gap_ms,
             )
         self.last_published_tick_ms = tick_ms
         return True
+
+    def diagnostics(self) -> dict[str, object]:
+        """Return non-fatal cadence-gap evidence for support tooling."""
+
+        return {
+            "lowstate_cadence_skipped_control_period_count": (
+                self.skipped_control_period_count
+            ),
+            "lowstate_cadence_last_skipped_period_gap_ms": (
+                self.last_skipped_period_gap_ms
+            ),
+            "lowstate_cadence_max_skipped_period_gap_ms": (
+                self.max_skipped_period_gap_ms
+            ),
+        }
 
 
 def stabilized_support_wrench(

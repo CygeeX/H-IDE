@@ -516,7 +516,7 @@ def resolve_start_clearance_recovery(
     }
     _require(values["robot radius"] > 0.0, "robot radius must be positive")
     _require(values["footprint padding"] >= 0.0, "footprint padding cannot be negative")
-    _require(values["extra clearance"] >= 0.05, "extra clearance must be at least 0.05 m")
+    _require(values["extra clearance"] >= 0.0, "extra clearance cannot be negative")
     _require(0.0 < values["minimum segment"] <= values["maximum recovery"], "recovery distance bounds are invalid")
     _require(0.0 < values["heading tolerance"] <= 0.09, "heading tolerance must be in (0, 0.09]")
 
@@ -853,7 +853,7 @@ def build_primitive_plan(
     heading_tolerance_rad = values["heading tolerance"]
     _require(robot_radius_m > 0.0, "robot radius must be positive")
     _require(footprint_padding_m >= 0.0, "footprint padding cannot be negative")
-    _require(extra_clearance_m >= 0.05, "extra clearance must be at least 0.05 m")
+    _require(extra_clearance_m >= 0.0, "extra clearance cannot be negative")
     _require(0.0 < endpoint_tolerance_m < min_segment_m, "endpoint tolerance must be below minimum segment distance")
     _require(0.0 < heading_tolerance_rad <= 0.09, "heading tolerance must be in (0, 0.09]")
     _require(

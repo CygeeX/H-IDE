@@ -151,6 +151,43 @@ def _resident_policy_reentry_generation(
     return authority_generation
 
 
+def _retained_static_idle_reentry_generation(
+    *,
+    health: SonicHealth,
+    gait_state: GaitState,
+    bridge_generation: int | None,
+    gait_generation: int | None,
+    observation_generation: int | None,
+) -> int | None:
+    """Return one already-armed pre-policy generation for relaxed simulation.
+
+    This boundary exists when control was armed but a navigation action
+    aborted before the first locomotion primitive.  No policy reference or
+    non-zero command was published, so reacquisition must reuse the exact
+    bridge/gait/observation identity rather than attempting a second physical
+    rearm against a Plant that is already idle.
+    """
+
+    if not health.confirmed_armed_static_idle:
+        return None
+    if gait_state is not GaitState.IDLE:
+        raise ValueError("retained static generation requires bridge gait IDLE")
+    identities = (
+        bridge_generation,
+        gait_generation,
+        observation_generation,
+    )
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in identities
+    ):
+        raise ValueError("retained static generation identity is incomplete")
+    assert bridge_generation is not None
+    if any(value != bridge_generation for value in identities[1:]):
+        raise ValueError("retained static generation identity mismatch")
+    return bridge_generation
+
+
 class BridgeRuntimeHealth:
     """Read-only evidence backed only by successful SONIC probe work.
 
@@ -1035,6 +1072,18 @@ def run_ros_bridge(config: SimConfig) -> None:
                 )
         return True
 
+    def reopen_retained_health_transport(*, context: str) -> None:
+        """Retry a transient health fence only in the explicit demo profile."""
+
+        if not retain_sonic_on_automatic_fault:
+            return
+        decision = health_transport_gate.reopen_for_retained_experiment()
+        if decision.transition == "reopened":
+            node.get_logger().warning(
+                "retained-SONIC experiment reopening the confirmed health "
+                f"transport fence for a fresh probe context={context}"
+            )
+
     def check_health_transport_fence(*, context: str) -> bool:
         decision = health_transport_gate.check_deadline(
             now_s=time.monotonic()
@@ -1545,6 +1594,11 @@ def run_ros_bridge(config: SimConfig) -> None:
                 "reset is required before control can be acquired again"
             )
             return response
+        # In the explicit uninterrupted-SONIC experiment a transient timeout
+        # is a retryable observation, not a permanent bridge fault. Reopen the
+        # fence before the mandatory fresh probe below; the normal profile
+        # never takes this path.
+        reopen_retained_health_transport(context="control_arm")
         if check_health_transport_fence(context="control_arm_admission"):
             response.success = False
             response.message = (
@@ -1612,6 +1666,7 @@ def run_ros_bridge(config: SimConfig) -> None:
                 health,
                 plant_lowstate_stale_s=config.plant_lowstate_stale_s,
                 sonic_control_step_stale_s=config.sonic_control_step_stale_s,
+                allow_armed_static_idle=retain_sonic_on_automatic_fault,
             )
         except ValueError as exc:
             # Age-only degradation is recoverable while the exact safety hold
@@ -1633,6 +1688,30 @@ def run_ros_bridge(config: SimConfig) -> None:
         if not gait._is_stationary(measured):
             response.success = False
             response.message = "control arm rejected while the measured base is moving"
+            return response
+
+        try:
+            retained_static_generation = (
+                _retained_static_idle_reentry_generation(
+                    health=health,
+                    gait_state=gait.state,
+                    bridge_generation=generation["value"],
+                    gait_generation=gait.generation,
+                    observation_generation=measured.generation,
+                )
+                if retain_sonic_on_automatic_fault
+                else None
+            )
+        except ValueError as exc:
+            response.success = False
+            response.message = f"control arm rejected: {exc}"
+            return response
+        if retained_static_generation is not None:
+            response.success = True
+            response.message = (
+                "retained static IDLE generation "
+                f"{retained_static_generation} re-authorized before policy start"
+            )
             return response
 
         try:
@@ -1958,6 +2037,10 @@ def run_ros_bridge(config: SimConfig) -> None:
     def health_probe():
         if bridge_fault["reason"] is not None:
             return
+        # A retained experiment must not let one confirmed timeout suppress
+        # all future probes. The next request is still parsed/correlated
+        # strictly before any control-arm decision can succeed.
+        reopen_retained_health_transport(context="periodic_health")
         request_id = uuid4()
         try:
             attempt = attempt_sonic_health(request_id)

@@ -468,11 +468,11 @@ class SonicDriver:
         self._control_clock_armed = False
         # Controller construction and the isolated first inference can starve
         # the Python DDS callback while MuJoCo continues publishing a held
-        # robot.  Track callback progress independently from the strict clock
+        # robot.  Track callback progress independently from the control clock
         # so startup can drain that cold-path backlog before choosing its
-        # baseline.  Once the first control-arm transaction commits,
-        # ``_runtime_clock_committed`` never becomes false again: identical
-        # gaps during or after motion remain terminal.
+        # baseline.  ``_runtime_clock_committed`` remains a provenance marker;
+        # later finite forward gaps are recorded and resynchronized, never
+        # terminalized.
         self._lowstate_sequence = 0
         self._runtime_clock_committed = False
         # ``_control_consumer_ready`` is only the callback/consumer handshake.
@@ -490,6 +490,12 @@ class SonicDriver:
         self._pending_control_sample: (
             tuple[Any, PlantControlStep, int] | None
         ) = None
+        # A late consumer must not turn a healthy simulator into a terminal
+        # fault.  Keep the latest sample and expose the number of replaced
+        # pending samples as diagnostics instead.
+        self._control_sample_overrun_count = 0
+        self._control_sample_overrun_last_tick_ms: int | None = None
+        self._control_clock_diagnostic_signature: tuple[int, int, int] | None = None
         self._wall_clock = time.monotonic
         self._control_clock_armed_at_wall_s: float | None = None
         self._last_lowstate_wall_s: float | None = None
@@ -768,8 +774,10 @@ class SonicDriver:
                     # Before the first successful control-arm transaction no
                     # controller state, policy cursor, or actuator motion is
                     # authorized, so invalidate all pending credit and require
-                    # a fresh consecutive 50 Hz window.  The identical gap
-                    # after that authority boundary remains terminal.
+                    # a fresh consecutive simulation window.  The same gap
+                    # after that authority boundary is merely recorded by the
+                    # runtime control clock and does not stop the process.
+                    self._control_clock.note_source_gap(tick - previous_tick)
                     self._control_clock.rebase_stationary_qualification(tick)
                     self._pending_control_sample = None
                     self._startup_qualification_dropped_samples += 1
@@ -808,11 +816,38 @@ class SonicDriver:
                                 self._control_condition.notify_all()
                             else:
                                 pending_tick = self._pending_control_sample[1].tick_ms
-                                clock_fault = (
-                                    "MuJoCo control sample overrun: "
-                                    f"{pending_tick}ms was not consumed before "
-                                    f"{control_step.tick_ms}ms; catch-up is forbidden"
+                                # The producer/consumer boundary is latest-only:
+                                # a stale pending observation has no authority
+                                # once a newer simulation sample is available.
+                                # Replacing it preserves forward progress and
+                                # avoids converting ordinary inference/render
+                                # jitter into a process exit.
+                                self._control_sample_overrun_count = (
+                                    int(
+                                        getattr(
+                                            self,
+                                            "_control_sample_overrun_count",
+                                            0,
+                                        )
+                                    )
+                                    + 1
                                 )
+                                self._control_sample_overrun_last_tick_ms = (
+                                    pending_tick
+                                )
+                                logger.warning(
+                                    "SONIC control sample overrun: replacing "
+                                    "pending tick %sms with latest tick %sms; "
+                                    "continuing without catch-up",
+                                    pending_tick,
+                                    control_step.tick_ms,
+                                )
+                                self._pending_control_sample = (
+                                    message,
+                                    control_step,
+                                    self._startup_qualification_drop_generation,
+                                )
+                                self._control_condition.notify_all()
                         else:
                             self._pending_control_sample = (
                                 message,
@@ -835,14 +870,11 @@ class SonicDriver:
                 self._startup_qualification_consecutive_steps
             ),
         )
+        self._publish_control_clock_diagnostics()
         if clock_fault is not None:
-            # Any clock discontinuity invalidates policy history and actuator
-            # continuity.  Never rebuild history or replay missed policy ticks.
-            if clock_fault.startswith("MuJoCo control sample overrun:"):
-                logger.error(
-                    "capturing all SONIC thread stacks at control-sample overrun"
-                )
-                faulthandler.dump_traceback(all_threads=True)
+            # Only an invalid/backwards clock reaches this branch.  Forward
+            # gaps and pending-sample overruns are handled as latest-only
+            # diagnostics above and never revoke actuator authority.
             self._latch_terminal_fault(clock_fault)
 
     def _run_lowstate_reader(self) -> None:
@@ -930,10 +962,10 @@ class SonicDriver:
         remain held while those sessions load.  A long GIL/ORT scheduling
         pause can nevertheless leave ``_lowstate`` older than the first
         callback delivered after warm-up.  Arming against that stale sample
-        manufactures a multi-second source jump even though no motion was
-        possible.  Require a fresh, bounded-gap callback window while the
-        strict clock is still disarmed; no sample earns policy or startup
-        qualification credit here.
+        manufactures a multi-second source gap even though no motion was
+        possible.  Require a fresh callback window while the clock is still
+        disarmed; a large positive gap is recorded but does not invalidate the
+        window or terminate the process.
         """
 
         if not math.isfinite(float(timeout_s)) or float(timeout_s) <= 0.0:
@@ -957,7 +989,9 @@ class SonicDriver:
                         raise RuntimeError("post-warm LowState callback lost its sample")
                     tick = int(self._lowstate.tick)
                     gap = None if previous_tick is None else tick - previous_tick
-                    if gap is not None and 0 < gap <= self._control_clock.max_source_gap_ms:
+                    if gap is not None and gap > 0:
+                        if gap > self._control_clock.max_source_gap_ms:
+                            self._control_clock.note_source_gap(gap)
                         consecutive += 1
                     else:
                         consecutive = 1
@@ -1140,7 +1174,7 @@ class SonicDriver:
         )
 
     def _prepare_idle_startup(self) -> None:
-        """Hold the plant and warm inference before strict clock handoff."""
+        """Hold the plant and warm inference before control-clock handoff."""
 
         lowstate = self._wait_for_initial_lowstate()
         if self._fault_latched.is_set():
@@ -1626,6 +1660,31 @@ class SonicDriver:
         runtime_diagnostics = getattr(self, "_runtime_diagnostics", None)
         if runtime_diagnostics is not None:
             runtime_diagnostics.observe_control_publish(published_at)
+
+    def _publish_control_clock_diagnostics(self) -> None:
+        """Expose non-fatal clock jitter without changing motion state."""
+
+        clock = getattr(self, "_control_clock", None)
+        diagnostics = getattr(clock, "diagnostics", None)
+        if not callable(diagnostics):
+            return
+        values = diagnostics()
+        overrun_count = int(getattr(self, "_control_sample_overrun_count", 0))
+        signature = (
+            int(values.get("control_clock_stall_count", 0)),
+            int(values.get("control_clock_interval_gap_count", 0)),
+            overrun_count,
+        )
+        if signature == getattr(self, "_control_clock_diagnostic_signature", None):
+            return
+        self._control_clock_diagnostic_signature = signature
+        values.update(
+            control_sample_overrun_count=overrun_count,
+            control_sample_overrun_last_tick_ms=getattr(
+                self, "_control_sample_overrun_last_tick_ms", None
+            ),
+        )
+        self._update_telemetry_hot(**values)
 
     def _arm_control_stall_diagnostic(self) -> None:
         """Enable one pre-fault stack capture for the current motion task."""
