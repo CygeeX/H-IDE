@@ -434,8 +434,11 @@ def _validate_scene(scene: Mapping[str, Any]) -> None:
             if not name or name in mesh_names or relative.is_absolute() or relative.parts[:3] != ("models", "unitree-g1-mujoco", "assets"):
                 raise SceneBuildError("hanging G1 visual mesh identity/path is invalid")
             source_path = (REPO_ROOT / relative).resolve()
+            model_asset_boundary = (
+                REPO_ROOT / "models" / "unitree-g1-mujoco" / "assets"
+            ).resolve()
             try:
-                source_path.relative_to(REPO_ROOT / "models" / "unitree-g1-mujoco" / "assets")
+                source_path.relative_to(model_asset_boundary)
             except ValueError as exc:
                 raise SceneBuildError("hanging G1 visual mesh path escapes the model asset boundary") from exc
             if not source_path.is_file():
