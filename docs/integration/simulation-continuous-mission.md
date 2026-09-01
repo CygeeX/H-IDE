@@ -24,6 +24,9 @@
 
 ## 启动与状态检查
 
+完整的一键启动、底层逐项启动、日志检查与安全关闭命令见
+[H-IDE 工作站端到端联调启动与关闭手册](../operations/workstation-integration-startup.md)。
+
 ```bash
 cd /home/phi/learn-projects/h-ide-mujoco-sonic
 scripts/start-workstation-demo.sh

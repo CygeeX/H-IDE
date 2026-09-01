@@ -90,8 +90,8 @@ def test_exact_pwa_intent_selects_the_long_office_envelope() -> None:
         "maximumCumulativeDistanceM": 100.0,
         "maximumSpeedMps": 0.40,
         "maximumDurationSeconds": 7200,
-        "maximumAutoRevisions": 3,
-        "maximumStageAttempts": 3,
+        "maximumAutoRevisions": 8,
+        "maximumStageAttempts": 8,
         "maximumScanYawRad": 40.0 * math.pi,
     }
 
@@ -252,6 +252,76 @@ def test_report_is_evidence_bound_and_marks_missing_stations() -> None:
         "mediaType": "image/jpeg",
     }
     assert "看到清晰门牌" in report["narrativeZhCN"]
+
+
+def test_selected_report_keeps_partial_scan_and_marks_missing_heading() -> None:
+    source = catalog()
+    station_id = "meeting_south"
+    station = station_index(source)[station_id]
+    headings = []
+    for index, heading in enumerate(station["scanHeadingsRad"], start=1):
+        if index == 3:
+            headings.append(
+                {
+                    "headingRad": heading,
+                    "status": "missing",
+                    "missingReason": "rotation: relaxed retries exhausted",
+                    "visualResult": None,
+                }
+            )
+            continue
+        headings.append(
+            {
+                "headingRad": heading,
+                "status": "observed",
+                "visualResult": {
+                    "schemaVersion": "h-ide.visual-result/2",
+                    "status": "succeeded",
+                    "mode": "scene_description",
+                    "analysisId": f"analysis-partial-{index}",
+                    "observationSummary": f"会议室方向 {index} 的可靠观察",
+                    "hypotheses": [],
+                    "warnings": [],
+                    "evidence": [
+                        {"sha256": f"{index:x}" * 64, "mediaType": "image/jpeg"}
+                    ],
+                },
+            }
+        )
+    report = build_report(
+        {
+            "missionId": "mission-partial-selected-inspection",
+            "skillExecutions": [
+                {
+                    "request": {"skillId": OFFICE_INSPECTION_SKILL},
+                    "result": {
+                        "status": "succeeded",
+                        "result": {
+                            "inspectionResult": {
+                                "schemaVersion": "h-ide.office-inspection/1",
+                                "stationId": station_id,
+                                "regionId": "meeting_room",
+                                "headings": headings,
+                            }
+                        },
+                    },
+                }
+            ],
+        },
+        inspection_catalog=source,
+        region_ids=["meeting_room"],
+        station_ids=[station_id],
+    )
+
+    assert report["status"] == "completed_with_gaps"
+    assert report["fullChainAccepted"] is False
+    assert report["missingStations"] == []
+    assert len(report["headingGaps"]) == 1
+    assert len(report["evidence"]) == 3
+    assert report["regions"][0]["status"] == "observed_with_gaps"
+    assert report["regions"][0]["stations"][0]["status"] == (
+        "observed_with_gaps"
+    )
 
 
 def _location_report_mission(*, captured_before_arrival: bool = False) -> dict:
@@ -474,6 +544,74 @@ def test_report_merges_bound_source_and_continuation_scans() -> None:
     )
 
     assert report["missionId"] == "mission-office-continuation"
+    assert report["status"] == "completed"
+    assert report["fullChainAccepted"] is True
+    assert report["missingStations"] == []
+
+
+def test_report_can_be_limited_to_the_requested_room_sequence() -> None:
+    source = catalog()
+    stations = station_index(source)
+
+    def execution(station_id: str) -> dict:
+        station = stations[station_id]
+        return {
+            "request": {"skillId": OFFICE_INSPECTION_SKILL},
+            "result": {
+                "status": "succeeded",
+                "result": {
+                    "inspectionResult": {
+                        "schemaVersion": "h-ide.office-inspection/1",
+                        "stationId": station_id,
+                        "regionId": station["regionId"],
+                        "headings": [
+                            {
+                                "headingRad": heading,
+                                "visualResult": {
+                                    "schemaVersion": "h-ide.visual-result/2",
+                                    "status": "succeeded",
+                                    "mode": "scene_description",
+                                    "analysisId": f"analysis-selected-{station_id}-{index}",
+                                    "observationSummary": f"{station['regionName']} 方向 {index} 的观察结果",
+                                    "hypotheses": [],
+                                    "warnings": [],
+                                    "evidence": [
+                                        {
+                                            "sha256": f"{index:x}" * 64,
+                                            "mediaType": "image/jpeg",
+                                        }
+                                    ],
+                                },
+                            }
+                            for index, heading in enumerate(
+                                station["scanHeadingsRad"], start=1
+                            )
+                        ],
+                    }
+                },
+            },
+        }
+
+    report = build_report(
+        {
+            "missionId": "mission-selected-rooms",
+            "skillExecutions": [
+                execution("open_office_west"),
+                execution("meeting_south"),
+            ],
+        },
+        inspection_catalog=source,
+        region_ids=["open_office", "meeting_room"],
+        station_ids=["open_office_west", "meeting_south"],
+    )
+
+    assert report["reportScope"] == "selected_locations"
+    assert report["regionIds"] == ["open_office", "meeting_room"]
+    assert report["stationIds"] == ["open_office_west", "meeting_south"]
+    assert [item["regionId"] for item in report["regions"]] == [
+        "open_office",
+        "meeting_room",
+    ]
     assert report["status"] == "completed"
     assert report["fullChainAccepted"] is True
     assert report["missingStations"] == []

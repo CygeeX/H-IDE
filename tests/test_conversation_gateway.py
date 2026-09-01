@@ -22,6 +22,7 @@ from services.control_api.conversation_client import (
 )
 from services.control_api.conversation_gateway import ConversationGateway
 from services.control_api.main import create_app
+from services.control_api.mission_policy import MissionPolicyDenied
 
 
 TOKEN = "conversation-v2-test-token"
@@ -87,9 +88,30 @@ class VisualFixture:
             "attempt": 1,
             "mode": "scene_description",
             "status": "succeeded",
-            "source": "qwen",
+            "source": {
+                "robotId": payload["robotId"],
+                "robotBootId": "boot-readonly-1",
+                "localizationEpochId": "epoch-readonly-1",
+                "observationSessionId": "observation-readonly-1",
+                "capturedAt": "2026-08-27T00:00:00Z",
+            },
             "versions": {},
-            "hypotheses": [],
+            "hypotheses": [
+                {
+                    "hypothesisId": "hypothesis-chair-readonly-1",
+                    "source": "qwen",
+                    "label": "chair",
+                    "pixelBox": [10, 20, 110, 220],
+                    "score": 0.95,
+                },
+                {
+                    "hypothesisId": "hypothesis-shelf-readonly-1",
+                    "source": "qwen",
+                    "label": "shelf",
+                    "pixelBox": [130, 20, 300, 240],
+                    "score": 0.91,
+                },
+            ],
             "geometryCandidates": [],
             "observationSummary": "我看到一张会议桌和两把椅子。",
             "evidence": [
@@ -97,6 +119,7 @@ class VisualFixture:
                     "evidenceId": "evidence-rgb-1",
                     "kind": "input_rgb",
                     "sha256": "b" * 64,
+                    "mediaType": "image/jpeg",
                 }
             ],
             "warnings": [],
@@ -181,6 +204,8 @@ def test_exact_office_inspection_bypasses_remote_conversation_router() -> None:
     assert result.missionDraftId == "mission-office-deterministic-1"
     assert briefs == [
         {
+            "conversationId": "conversation-office-deterministic-1",
+            "sourceTaskId": "task-office-deterministic-1",
             "robotId": "g1-sim",
             "requestedBy": "operator-test",
             "objective": "走遍所有办公室，并把所有办公室里面的信息和路上的信息都给我",
@@ -188,6 +213,124 @@ def test_exact_office_inspection_bypasses_remote_conversation_router() -> None:
             "modality": "text",
             "history": [],
         }
+    ]
+
+
+def test_ordered_room_inspection_phrases_bypass_remote_router_and_share_intent() -> None:
+    briefs: list[dict[str, Any]] = []
+    gateway = ConversationGateway(
+        FailingConversationClient(),
+        mission_draft_creator=lambda brief: briefs.append(dict(brief))
+        or {"draftId": f"mission-office-sequence-{len(briefs)}"},
+    )
+    phrases = [
+        "今天巡检开放办公室和会议室",
+        "请依次进入开放办公区和会议室，分别在房间内部停稳后进行多方向观察，记录房间内及沿途看到的信息，最后按房间分别汇总",
+    ]
+
+    results = []
+    for index, text in enumerate(phrases, start=1):
+        results.append(
+            gateway.handle(
+                task_id=f"task-office-sequence-{index}",
+                request=ConversationTurnRequest(
+                    conversationId=f"conversation-office-sequence-{index}",
+                    robotId="g1-sim",
+                    locale="zh-CN",
+                    text=text,
+                ),
+                requested_by="operator-test",
+                modality="text",
+                mission_history=[],
+            )
+        )
+
+    assert all(item.intent is ConversationIntent.ROBOT_ACTION for item in results)
+    assert all(item.routeStatus == "review" for item in results)
+    assert [item["objective"] for item in briefs] == phrases
+
+
+def test_selected_inspection_skill_routes_single_room_without_remote_llm() -> None:
+    briefs: list[dict[str, Any]] = []
+    result = ConversationGateway(
+        FailingConversationClient(),
+        mission_draft_creator=lambda brief: briefs.append(dict(brief))
+        or {"draftId": "mission-inspection-skill-single-room"},
+    ).handle(
+        task_id="task-inspection-skill-single-room",
+        request=ConversationTurnRequest(
+            conversationId="conversation-inspection-skill-single-room",
+            robotId="g1-sim",
+            skillId="inspection.office",
+            locale="zh-CN",
+            text="今天巡检会议室",
+        ),
+        requested_by="operator-test",
+        modality="text",
+        mission_history=[],
+    )
+
+    assert result.routeStatus == "review"
+    assert result.missionDraftId == "mission-inspection-skill-single-room"
+    assert briefs[0]["skillId"] == "inspection.office"
+    assert briefs[0]["objective"] == "今天巡检会议室"
+
+
+def test_unbound_robot_returns_selection_guidance_instead_of_service_failure() -> None:
+    def reject(_brief):
+        raise MissionPolicyDenied("robot has no immutable site/execution-target binding")
+
+    gateway = ConversationGateway(
+        RoutedConversationClient(),
+        mission_draft_creator=reject,
+    )
+
+    result = gateway.handle(
+        task_id="task-unbound-robot",
+        request=ConversationTurnRequest(
+            conversationId="conversation-unbound-robot",
+            robotId="g1-dev",
+            locale="zh-CN",
+            text="今天巡检开放办公室和会议室",
+        ),
+        requested_by="operator-test",
+        modality="text",
+        mission_history=[],
+    )
+
+    assert result.routeStatus == "needs_robot"
+    assert "在线的仿真 G1" in result.assistantMessage
+
+
+def test_known_object_and_exit_actions_override_a_misclassified_router_result() -> None:
+    calls: list[dict[str, Any]] = []
+    router = RoutedConversationClient(
+        lambda request: (ConversationIntent.ROBOT_OBSERVE, "我只看看。")
+    )
+    gateway = ConversationGateway(
+        router,
+        mission_draft_creator=lambda brief: calls.append(dict(brief))
+        or {"draftId": f"mission-known-{len(calls) + 1}"},
+    )
+
+    for index, text in enumerate(("去椅子旁边站着", "走出开放办公室"), start=1):
+        result = gateway.handle(
+            task_id=f"task-known-{index}",
+            request=ConversationTurnRequest(
+                conversationId=f"conversation-known-{index}",
+                robotId="g1-sim",
+                text=text,
+            ),
+            requested_by="operator-test",
+            modality="text",
+            mission_history=[],
+        )
+        assert result.intent is ConversationIntent.ROBOT_ACTION
+        assert result.routeStatus == "review"
+
+    assert [item["objective"] for item in calls] == [
+        "去椅子旁边站着",
+        "走出开放办公室",
     ]
 
 
@@ -337,6 +480,8 @@ def test_gateway_only_robot_action_can_create_a_mission_draft():
     assert result.missionDraftId == "mission-1"
     assert calls == [
         {
+            "conversationId": "conversation-1",
+            "sourceTaskId": "task-1",
             "robotId": "robot-1",
             "requestedBy": "user-1",
             "objective": "向前走一米",
@@ -459,6 +604,11 @@ def test_observe_is_read_only_visual_task_and_scene_teach_stays_pending():
         assert visual.requests[0]["authorizationId"].startswith("assistant-readonly-")
         assert app.state.store.list_mission_drafts() == []
         assert client.get("/api/v1/commands", headers=auth()).json() == []
+        referents = app.state.store.list_assistant_semantic_referents(
+            conversation["conversationId"]
+        )
+        assert {item["label"] for item in referents} == {"chair", "shelf"}
+        assert all(item["executionEligible"] is False for item in referents)
 
         teaching = client.post(
             f"/api/v1/assistant/conversations/{conversation['conversationId']}/messages",

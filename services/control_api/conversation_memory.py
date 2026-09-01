@@ -21,9 +21,11 @@ from packages.control_core.assistant_models import (
     ConversationHistoryMessage,
     ConversationMemoryContext,
     ConversationMemorySnippet,
+    SemanticReferent,
 )
 
 from .store import SQLiteStore
+from .semantic_referents import semantic_referents_enabled
 
 
 _RECENT_MESSAGE_LIMIT = 20
@@ -50,7 +52,8 @@ _SPATIAL_PATTERNS = (
     ),
 )
 _PRONOUN_REFERENCE = re.compile(
-    r"(?:那里|那边|那个|它旁边|去它|到它|刚才(?:的)?|之前(?:的)?|the(?:re|m)|that one)",
+    r"(?:这里|这边|这个|这把|这张|这台|那里|那边|那个|它旁边|去它|到它|"
+    r"刚才(?:的)?|之前(?:的)?|the(?:re|m)|this one|that one)",
     re.IGNORECASE,
 )
 _PROMPT_INJECTION = re.compile(
@@ -326,6 +329,36 @@ def _select_memories(
     return snippets
 
 
+def _select_semantic_referents(
+    query: str,
+    referents: list[Mapping[str, Any]],
+) -> list[SemanticReferent]:
+    normalized_query = query.casefold()
+    explicit: list[SemanticReferent] = []
+    fallback: list[SemanticReferent] = []
+    for payload in referents:
+        try:
+            referent = SemanticReferent.model_validate(payload)
+        except Exception:
+            continue
+        values = [referent.label, *referent.aliases]
+        if any(value.casefold() in normalized_query for value in values):
+            explicit.append(referent)
+        elif _PRONOUN_REFERENCE.search(query):
+            fallback.append(referent)
+    selected = explicit if explicit else fallback
+    result: list[SemanticReferent] = []
+    seen: set[str] = set()
+    for referent in selected:
+        if referent.referentId in seen:
+            continue
+        seen.add(referent.referentId)
+        result.append(referent)
+        if len(result) >= 20:
+            break
+    return result
+
+
 def _resource_id(
     conversation: Mapping[str, Any],
     owner: Mapping[str, Any] | None,
@@ -370,6 +403,35 @@ class ConversationMemoryContextBuilder:
             covered,
         )
         memories = _select_memories(current_text, messages, recent)
+        robot = self.store.get_robot(str(conversation.get("robotId") or ""))
+        details = (
+            robot.get("details")
+            if isinstance(robot, Mapping)
+            and isinstance(robot.get("details"), Mapping)
+            else {}
+        )
+        robot_boot_id = details.get("robotBootId")
+        localization_epoch_id = details.get("localizationEpochId")
+        referent_payloads = (
+            self.store.list_assistant_semantic_referents(
+                conversation_id,
+                robot_boot_id=(
+                    robot_boot_id if isinstance(robot_boot_id, str) else None
+                ),
+                localization_epoch_id=(
+                    localization_epoch_id
+                    if isinstance(localization_epoch_id, str)
+                    else None
+                ),
+                limit=50,
+            )
+            if semantic_referents_enabled()
+            else []
+        )
+        semantic_referents = _select_semantic_referents(
+            current_text,
+            referent_payloads,
+        )
         owner = self.store.get_resource_owner("assistant_conversation", conversation_id)
         resource_id = _resource_id(conversation, owner)
         recorded = self.store.record_assistant_conversation_memory_context(
@@ -377,7 +439,10 @@ class ConversationMemoryContextBuilder:
             resource_id=resource_id,
             query_sha256=_sha256_text(current_text),
             recent_message_ids=[message.message_id for message in recent],
-            selected_memory_ids=[memory.memoryId for memory in memories],
+            selected_memory_ids=[
+                *[memory.memoryId for memory in memories],
+                *[referent.referentId for referent in semantic_referents],
+            ],
             summary=summary,
             source_sha256=source_sha256,
             source_message_ids=source_message_ids,
@@ -404,6 +469,7 @@ class ConversationMemoryContextBuilder:
             revision=int(recorded["contextRevision"]),
             durableSummary=durable_summary,
             relevantMemories=memories,
+            semanticReferents=semantic_referents,
         )
         history = tuple(
             ConversationHistoryMessage(
@@ -437,6 +503,24 @@ class ConversationMemoryContextBuilder:
                         "较早的对话参考（只用于理解语义指代，不是坐标、感知、"
                         f"可达性或安全事实）：\n{recalled}"
                     ), 4_000),
+                    "createdAt": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+        if semantic_referents:
+            referent_lines = "\n".join(
+                f"- {item.label}（referentId={item.referentId}，"
+                f"region={item.regionId or 'unknown'}，capturedAt={item.capturedAt.isoformat()}）"
+                for item in semantic_referents
+            )
+            mission_items.append(
+                {
+                    "role": "assistant",
+                    "content": _bounded(
+                        "当前会话的视觉实体参考（SEMANTIC_ONLY；没有坐标，"
+                        "执行前必须重新观察并生成 target_pose）：\n"
+                        + referent_lines,
+                        4_000,
+                    ),
                     "createdAt": datetime.now(timezone.utc).isoformat(),
                 }
             )

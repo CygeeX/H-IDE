@@ -176,6 +176,16 @@ class SemanticRegion(SceneModel):
     locationId: str
     name: str
     aliases: list[str] = Field(default_factory=list, validate_default=True)
+    parentLocationId: str | None = None
+    anchorRoles: list[
+        Literal["region", "entry", "interior", "observation_vantage"]
+    ] = Field(default_factory=lambda: ["region"], validate_default=True)
+    purpose: str | None = None
+    scanHeadingsRad: list[float] = Field(
+        default_factory=list,
+        max_length=16,
+        validate_default=True,
+    )
     polygonXY: list[Point2D] = Field(min_length=3)
     zMin: float = Field(allow_inf_nan=False)
     zMax: float = Field(allow_inf_nan=False)
@@ -195,6 +205,26 @@ class SemanticRegion(SceneModel):
     @classmethod
     def _aliases(cls, values: list[str]):
         return _FrozenList(_display_label(value, "alias") for value in values)
+
+    @field_validator("parentLocationId", "purpose")
+    @classmethod
+    def _optional_labels(cls, value: str | None, info):
+        return None if value is None else _display_label(value, info.field_name)
+
+    @field_validator("anchorRoles")
+    @classmethod
+    def _anchor_roles(cls, values: list[str]):
+        if not values or len(values) != len(set(values)):
+            raise ValueError("anchorRoles must be non-empty and unique")
+        return _FrozenList(values)
+
+    @field_validator("scanHeadingsRad")
+    @classmethod
+    def _scan_headings(cls, values: list[float]):
+        normalized = [float(value) for value in values]
+        if any(not math.isfinite(value) for value in normalized):
+            raise ValueError("scanHeadingsRad must contain finite angles")
+        return _FrozenList(normalized)
 
     @field_validator("polygonXY")
     @classmethod

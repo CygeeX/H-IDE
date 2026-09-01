@@ -18,7 +18,7 @@
     ],
     "resolution": 0.05,
     "widthCells": 320,
-    "yamlSha256": "2601597bc5557849e715565a3040f5cb5c5b5f9d227ac83d54bf37ad2faaa5e6"
+    "yamlSha256": "d5994271f5cbd42989c19cb9dafde95d22ffc8bd8b644428711810dd50cb8f62"
   },
   "regions": [
     {
@@ -620,6 +620,6 @@
     "corridor_east"
   ],
   "sceneId": "office_v2",
-  "sceneSourceSha256": "0b3368f15295bf14ad163c13ed58f458aa8812bb391c7cf070bb007931ffa0ec",
+  "sceneSourceSha256": "b7db4504b1fd82d095ca8abde2d5cf6ff1a6f8780d810625f5fd6340664fec3e",
   "schemaVersion": "h-ide.office-inspection/1"
 }

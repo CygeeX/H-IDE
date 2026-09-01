@@ -61,7 +61,26 @@ from .office_inspection import (
     is_full_office_inspection,
     station_index as office_inspection_station_index,
 )
+from .office_semantic_navigation import (
+    SCENE_VERIFY_INSIDE_SKILL,
+    compile_plan as compile_office_place_plan,
+    compile_inspection_sequence_plan,
+    current_office_region_id,
+    envelope_defaults as office_place_envelope_defaults,
+    parse_office_inspection_sequence_request,
+    parse_office_place_request,
+    parse_place_navigation_intent,
+)
+from .object_semantic_navigation import (
+    compile_plan as compile_object_semantic_plan,
+    envelope_defaults as object_semantic_envelope_defaults,
+    parse_object_semantic_request,
+)
 from .mission_policy import MissionPolicy, MissionPolicyDenied, PolicyActor
+from .semantic_referents import (
+    extract_semantic_referents,
+    semantic_referents_enabled,
+)
 from .store import SQLiteStore
 from .visual_task_client import VisualTaskUnavailable
 
@@ -104,6 +123,17 @@ def _id(value: Any, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise MissionServiceError(f"{field} is required")
     return value.strip()
+
+
+def _semantic_actions_enabled() -> bool:
+    value = os.getenv(
+        "HIDE_OBJECT_SEMANTIC_ACTIONS_ENABLED", "true"
+    ).strip().lower()
+    if value not in {"true", "false"}:
+        raise MissionServiceError(
+            "HIDE_OBJECT_SEMANTIC_ACTIONS_ENABLED must be exactly true or false"
+        )
+    return value == "true"
 
 
 class MissionService:
@@ -208,6 +238,57 @@ class MissionService:
                 metadata={"authority": "workstation", "provider": "qwen3-vl-plus"},
             ),
             CapabilityDescriptor(
+                skillId=SCENE_VERIFY_INSIDE_SKILL,
+                skillVersion="1.0.0",
+                description=(
+                    "Verify from a fresh Robot Agent map pose that the robot is "
+                    "inside the reviewed semantic region and near the selected "
+                    "interior anchor"
+                ),
+                kind=CapabilityKind.OBSERVATION,
+                riskLevel=RiskLevel.LOW,
+                inputSchema={
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": [
+                        "regionId",
+                        "regionRecordId",
+                        "stationId",
+                        "targetRecordId",
+                        "anchorRole",
+                        "minimumClearanceM",
+                        "maximumAnchorDistanceM",
+                    ],
+                    "properties": {
+                        "regionId": {"type": "string", "minLength": 1},
+                        "regionRecordId": {"type": "string", "minLength": 1},
+                        "stationId": {"type": "string", "minLength": 1},
+                        "targetRecordId": {"type": "string", "minLength": 1},
+                        "anchorRole": {
+                            "enum": ["interior", "observation_vantage"]
+                        },
+                        "minimumClearanceM": {
+                            "type": "number",
+                            "minimum": 0,
+                            "maximum": 2,
+                        },
+                        "maximumAnchorDistanceM": {
+                            "type": "number",
+                            "exclusiveMinimum": 0,
+                            "maximum": 2,
+                        },
+                    },
+                },
+                resources=["scene_context", "robot_agent_pose"],
+                cancellable=False,
+                interruptible=False,
+                timeoutMs=10_000,
+                requiredSensorIds=[],
+                executor="local",
+                executorProfile="h-ide-scene.inside-region-v1",
+                metadata={"authority": "workstation", "provider": "deterministic_scene"},
+            ),
+            CapabilityDescriptor(
                 skillId=OFFICE_INSPECTION_SKILL,
                 skillVersion="1.0.0",
                 description=(
@@ -264,8 +345,8 @@ class MissionService:
                 skillId=MISSION_REPORT_SKILL,
                 skillVersion="1.0.0",
                 description=(
-                    "Aggregate this Mission's immutable station observations into "
-                    "a persistent Chinese office and corridor report"
+                    "Aggregate immutable station observations into either the "
+                    "reviewed current-location report or the full Office V2 report"
                 ),
                 kind=CapabilityKind.NON_MOTION,
                 riskLevel=RiskLevel.LOW,
@@ -275,9 +356,31 @@ class MissionService:
                     "required": ["reportScope", "locale"],
                     "properties": {
                         "reportScope": {
-                            "const": "all_office_regions_and_corridor"
+                            "enum": [
+                                "all_office_regions_and_corridor",
+                                "current_location",
+                                "selected_locations",
+                                "object_search",
+                            ]
                         },
                         "locale": {"const": "zh-CN"},
+                        "regionId": {"type": "string", "minLength": 1},
+                        "regionIds": {
+                            "type": "array",
+                            "minItems": 2,
+                            "maxItems": 8,
+                            "uniqueItems": True,
+                            "items": {"type": "string", "minLength": 1},
+                        },
+                        "stationId": {"type": "string", "minLength": 1},
+                        "stationIds": {
+                            "type": "array",
+                            "minItems": 2,
+                            "maxItems": 8,
+                            "uniqueItems": True,
+                            "items": {"type": "string", "minLength": 1},
+                        },
+                        "targetDescription": {"type": "string", "minLength": 1},
                         "sourceMissionIds": {
                             "type": "array",
                             "minItems": 1,
@@ -292,7 +395,7 @@ class MissionService:
                 interruptible=False,
                 timeoutMs=120_000,
                 executor="local",
-                executorProfile="office_v2.report.v1",
+                executorProfile="office_v2.report.v2",
                 metadata={
                     "authority": "workstation",
                     "provider": "deterministic_mission_report",
@@ -302,8 +405,14 @@ class MissionService:
 
     @staticmethod
     def _capability_catalog(descriptors) -> list[dict[str, Any]]:
-        return [
-            {
+        catalog: list[dict[str, Any]] = []
+        for item in descriptors:
+            workstation_composite = (
+                item.executor == "behavior_tree"
+                and item.metadata.get("authority") == "workstation"
+                and item.metadata.get("containsPhysicalChildren") is True
+            )
+            payload = {
                 "skillId": item.skillId,
                 "skillVersion": item.skillVersion,
                 "description": item.description,
@@ -313,8 +422,15 @@ class MissionService:
                 "executorProfile": item.executorProfile,
                 "requiredSensorIds": list(item.requiredSensorIds),
             }
-            for item in descriptors
-        ]
+            # Keep execution and physical authority separate. A workstation
+            # behavior tree may orchestrate a reviewed composite scan, but
+            # every base rotation/translation child remains Nav2-owned.
+            if item.kind is CapabilityKind.MOTION and (
+                item.executor == "nav2" or workstation_composite
+            ):
+                payload["baseMotionOwner"] = "nav2"
+            catalog.append(payload)
+        return catalog
 
     @staticmethod
     def _manifest_from_details(robot_id: str, details: Mapping[str, Any]) -> tuple[RobotProfile, CapabilityManifest] | None:
@@ -855,10 +971,44 @@ class MissionService:
             scene_refs = []
         if not isinstance(scene_refs, list):
             raise MissionServiceError("sceneRefs must be a list")
+        conversation_id = body.get("conversationId")
+        semantic_referents: list[dict[str, Any]] = []
+        if isinstance(conversation_id, str) and conversation_id.strip():
+            semantic_referents = self.store.list_assistant_semantic_referents(
+                conversation_id,
+                robot_boot_id=robot_boot_id,
+                localization_epoch_id=epoch_id,
+                limit=50,
+            )
+        place_defaults = office_place_envelope_defaults(objective)
+        object_defaults = (
+            object_semantic_envelope_defaults(
+                objective,
+                semantic_referents=semantic_referents,
+            )
+            if _semantic_actions_enabled()
+            else {}
+        )
         inspection_defaults = office_inspection_envelope_defaults(objective)
+        if body.get("skillId") == "inspection.office":
+            inspection_defaults = {
+                "maximumGoalDistanceM": 20.0,
+                "maximumCumulativeDistanceM": 80.0,
+                "maximumSpeedMps": 0.40,
+                "maximumDurationSeconds": 4_800,
+                "maximumAutoRevisions": 8,
+                "maximumStageAttempts": 8,
+                "maximumScanYawRad": 40.0 * math.pi,
+                **inspection_defaults,
+            }
+        envelope_defaults = {
+            **place_defaults,
+            **object_defaults,
+            **inspection_defaults,
+        }
 
         def envelope_value(name: str, ordinary: Any) -> Any:
-            return body.get(name, inspection_defaults.get(name, ordinary))
+            return body.get(name, envelope_defaults.get(name, ordinary))
 
         duration_seconds = int(envelope_value("maximumDurationSeconds", 600))
         envelope = MissionEnvelope(
@@ -932,6 +1082,9 @@ class MissionService:
                 [*manifest.capabilities, *workstation_descriptors]
             ),
             "history": history[-20:],
+            "conversationId": conversation_id,
+            "sourceTaskId": body.get("sourceTaskId"),
+            "semanticReferents": semantic_referents,
             "worldRecords": [item.model_dump(mode="json") for item in world_records],
         }
 
@@ -948,7 +1101,50 @@ class MissionService:
         if actor is not None:
             self.policy.require_robot_access(robot_id, actor)
         brief = self.build_brief(body, actor=actor)
-        if is_full_office_inspection(brief.get("objective")):
+        robot_payload = self.store.get_robot(robot_id) or {}
+        raw_current_pose = robot_payload.get("pose")
+        current_pose = (
+            PoseMap.model_validate(raw_current_pose)
+            if isinstance(raw_current_pose, Mapping)
+            else None
+        )
+        inspection_mode = body.get("skillId") == "inspection.office"
+        current_region_id = current_office_region_id(current_pose)
+        if inspection_mode and current_region_id in {None, "corridor"}:
+            # Elliptical follow-ups such as "再观察一下" inherit only the last
+            # named room identity from the server-owned conversation history.
+            # The current Robot Agent pose still supplies all executable
+            # geometry, so remembered text can never become a coordinate.
+            for history_item in reversed(brief.get("history", [])):
+                if not isinstance(history_item, Mapping):
+                    continue
+                prior = parse_office_inspection_sequence_request(
+                    history_item.get("content")
+                )
+                if prior is not None:
+                    current_region_id = prior.places[-1].location_id
+                    break
+        sequence_request = parse_office_inspection_sequence_request(
+            brief.get("objective"),
+            default_location_id=current_region_id,
+            inspection_mode=inspection_mode,
+        )
+        if inspection_mode and sequence_request is None:
+            raise MissionServiceError(
+                "巡检 Skill 需要一个明确办公室，或可从当前房间/本会话上一次巡检恢复"
+            )
+        if sequence_request is not None:
+            try:
+                plan = compile_inspection_sequence_plan(
+                    sequence_request,
+                    brief,
+                    current_pose=current_pose,
+                )
+            except Exception as exc:
+                raise MissionServiceError(
+                    f"Office inspection sequence plan compilation failed: {exc}"
+                ) from exc
+        elif is_full_office_inspection(brief.get("objective")):
             try:
                 resume_from = body.get("resumeFromMissionId")
                 if resume_from is not None:
@@ -1017,6 +1213,50 @@ class MissionService:
                 raise MissionServiceError(
                     f"Office inspection plan compilation failed: {exc}"
                 ) from exc
+        elif _semantic_actions_enabled() and (
+            object_request := parse_object_semantic_request(
+                brief.get("objective"),
+                semantic_referents=brief.get("semanticReferents", []),
+                semantic_priors=brief.get("worldRecords", []),
+            )
+        ) is not None:
+            try:
+                robot_payload = self.store.get_robot(robot_id) or {}
+                raw_current_pose = robot_payload.get("pose")
+                current_pose = (
+                    PoseMap.model_validate(raw_current_pose)
+                    if isinstance(raw_current_pose, Mapping)
+                    else None
+                )
+                plan = compile_object_semantic_plan(
+                    object_request,
+                    brief,
+                    current_pose=current_pose,
+                )
+            except Exception as exc:
+                raise MissionServiceError(
+                    f"Object semantic plan compilation failed: {exc}"
+                ) from exc
+        elif (
+            place_request := parse_office_place_request(brief.get("objective"))
+        ) is not None:
+            try:
+                robot_payload = self.store.get_robot(robot_id) or {}
+                raw_current_pose = robot_payload.get("pose")
+                current_pose = (
+                    PoseMap.model_validate(raw_current_pose)
+                    if isinstance(raw_current_pose, Mapping)
+                    else None
+                )
+                plan = compile_office_place_plan(
+                    place_request,
+                    brief,
+                    current_pose=current_pose,
+                )
+            except Exception as exc:
+                raise MissionServiceError(
+                    f"Office place plan compilation failed: {exc}"
+                ) from exc
         else:
             raw = self.planner.create_draft(brief)
             payload = raw.get("plan") if isinstance(raw.get("plan"), Mapping) else raw
@@ -1026,6 +1266,14 @@ class MissionService:
                 raise MissionServiceError(
                     f"Mission planner returned an invalid draft: {exc}"
                 ) from exc
+        self._validate_navigation_plan_bindings(
+            plan,
+            [
+                item
+                for item in brief.get("worldRecords", [])
+                if isinstance(item, Mapping)
+            ],
+        )
         if min(plan.expiresAt, plan.envelope.expiresAt) <= utc_now():
             raise MissionServiceError("Mission planner returned an expired draft")
         if plan.robotId != brief["robotId"]:
@@ -1092,6 +1340,23 @@ class MissionService:
         draft = self.get_draft(draft_id)
         if draft["status"] != "draft":
             raise MissionServiceError(f"mission draft is not confirmable (status={draft['status']})")
+        plan = MissionPlanDraft.model_validate(draft["plan"])
+        blocking = next(
+            (
+                item
+                for item in self.runtime.list(limit=500)
+                if item.get("missionId") != draft_id
+                and item.get("robotId") == plan.robotId
+                and item.get("snapshot", {}).get("status")
+                not in {"completed", "failed", "cancelled"}
+            ),
+            None,
+        )
+        if isinstance(blocking, Mapping):
+            raise MissionServiceError(
+                "ROBOT_MISSION_BUSY: another reviewed Mission must finish or "
+                f"be cancelled first ({blocking.get('missionId')})"
+            )
         if not self.store.set_mission_draft_status(
             draft_id, "approving", expected_status="draft"
         ):
@@ -1174,6 +1439,10 @@ class MissionService:
             autonomy_decision=prepared.decision,
             autonomy_grant=prepared.grant,
         )
+        # Mission identity is equal to the approved draft identity today, but
+        # keep the relation explicit so conversation history does not have to
+        # infer product threads from coincidentally matching IDs.
+        self.store.bind_approved_mission_to_conversation(draft_id, draft_id)
         if isinstance(pose, Mapping):
             details = robot.get("details") if isinstance(robot.get("details"), Mapping) else {}
             mission = self.runtime.record_world(
@@ -1804,9 +2073,74 @@ class MissionService:
         record: Mapping[str, Any],
         node: MissionNode,
     ) -> WorldRecord:
+        intent = dict(node.intent)
+        legacy_keys = {
+            "target_region",
+            "target_description",
+            "entry_pose",
+        }.intersection(intent)
+        if legacy_keys:
+            raise MissionInputRequired(
+                "LEGACY_PLACE_INTENT_REPLAN_REQUIRED",
+                "地点导航计划使用旧版自由字段，必须基于当前场景重新规划",
+            )
         analysis_ids = self._dependency_analysis_ids(record, node)
-        expected_subject = self._semantic_text(dict(node.intent), "targetDescription")
-        expected_record_id = self._semantic_text(dict(node.intent), "targetRecordId")
+        expected_subject = self._semantic_text(intent, "targetDescription")
+        expected_record_id = self._semantic_text(intent, "targetRecordId")
+        raw_place = intent.get("place")
+        typed_place_intent = None
+        if raw_place is not None:
+            try:
+                typed_place_intent = parse_place_navigation_intent(intent)
+            except Exception as exc:
+                raise MissionInputRequired(
+                    "PLACE_INTENT_INVALID",
+                    f"地点导航节点缺少有效的强类型目标：{exc}",
+                ) from exc
+            candidate_ids = typed_place_intent.place.candidateTargetRecordIds
+            aborted_attempts = 0
+            for execution in record.get("skillExecutions", []):
+                if not isinstance(execution, Mapping) or execution.get("nodeId") != node.nodeId:
+                    continue
+                result = execution.get("result")
+                result_body = result.get("result") if isinstance(result, Mapping) else None
+                receipt = (
+                    result_body.get("commandReceipt")
+                    if isinstance(result_body, Mapping)
+                    else None
+                )
+                if (
+                    isinstance(result, Mapping)
+                    and result.get("status") == "failed"
+                    and result.get("errorCode") == "ROBOT_AGENT_FAILED"
+                    and isinstance(receipt, Mapping)
+                    and str(receipt.get("error") or "").strip().casefold()
+                    == "action finished with status aborted"
+                ):
+                    aborted_attempts += 1
+            # A strict Nav2 ABORTED result is not proof that a reviewed scene
+            # anchor is permanently unreachable.  The controller can stop a
+            # few decimetres short after a long gait segment, as happens at
+            # narrow Office V2 entrances.  Retry the primary anchor once,
+            # then move to the next reviewed same-region candidate when one
+            # exists and keep the final candidate selected for any remaining
+            # bounded stage attempts.
+            # ``maximumStageAttempts`` remains the hard retry limit in the
+            # runtime; this selector never invents a pose or widens the plan.
+            # Give the primary anchor one fresh-odometry retry before moving
+            # to an alternate.  In practice a long learned-gait segment often
+            # ends a few decimetres short once, while immediately selecting a
+            # farther point can create a needless route around furniture.
+            # With the default three stage attempts this yields primary,
+            # primary, alternate; the runtime still owns the hard limit.
+            expected_record_id = candidate_ids[
+                min(aborted_attempts // 2, len(candidate_ids) - 1)
+            ]
+        if not analysis_ids and expected_record_id is None and expected_subject is None:
+            raise MissionInputRequired(
+                "TRUSTED_TARGET_SELECTOR_REQUIRED",
+                "导航节点没有绑定精确场景目标或可信视觉分析",
+            )
         now = utc_now()
         candidates: list[WorldRecord] = []
         for payload in record.get("worldRecords", []):
@@ -1821,7 +2155,11 @@ class MissionService:
                 or (item.validUntil is not None and item.validUntil <= now)
             ):
                 continue
-            if analysis_ids and item.sourceRef not in analysis_ids:
+            if (
+                analysis_ids
+                and expected_record_id is None
+                and item.sourceRef not in analysis_ids
+            ):
                 continue
             if expected_record_id is not None and item.recordId != expected_record_id:
                 continue
@@ -1840,11 +2178,142 @@ class MissionService:
                 continue
             candidates.append(item)
         if not candidates:
+            if analysis_ids and self._semantic_text(
+                intent, "searchTargetDescription"
+            ) is not None:
+                raise MissionInputRequired(
+                    "TARGET_NOT_FOUND",
+                    "已完成当前区域的审核观察点搜索，但没有形成目标的安全接近点",
+                )
             raise MissionInputRequired(
                 "TRUSTED_TARGET_POSE_REQUIRED",
                 "没有找到与当前节点绑定、经几何或场景验证的 map 目标点",
             )
         return max(candidates, key=lambda item: item.observedAt)
+
+    def _validate_navigation_plan_bindings(
+        self,
+        plan: MissionPlanDraft,
+        world_records: list[Mapping[str, Any]],
+    ) -> None:
+        """Reject unresolved place navigation before a draft reaches review."""
+
+        target_records = {
+            str(item.get("recordId")): item
+            for item in world_records
+            if isinstance(item, Mapping)
+            and item.get("kind") == "fact"
+            and item.get("predicate") == "target_pose"
+        }
+        scene_bound = bool(plan.envelope.sceneRefs)
+        nodes = {node.nodeId: node for node in plan.nodes}
+        stations = office_inspection_station_index()
+        for node in plan.nodes:
+            if node.skillId != "navigation.navigate_to_pose":
+                continue
+            intent = dict(node.intent)
+            legacy_keys = {
+                "target_region",
+                "target_description",
+                "entry_pose",
+            }.intersection(intent)
+            if legacy_keys:
+                raise MissionServiceError(
+                    "Mission navigation intent uses retired fields: "
+                    + ", ".join(sorted(legacy_keys))
+                )
+            if not scene_bound:
+                # Protocol/fake profiles without a published Scene keep their
+                # existing visual/relative test boundary. Product Office V2
+                # always binds one immutable SceneRef and is fully preflighted.
+                continue
+            if self._relative_translation_intent(intent, node) is not None:
+                continue
+            raw_place = intent.get("place")
+            if raw_place is not None:
+                try:
+                    typed = parse_place_navigation_intent(intent)
+                except Exception as exc:
+                    raise MissionServiceError(
+                        f"Mission place intent is invalid for {node.nodeId}: {exc}"
+                    ) from exc
+                if typed.task != "navigate_to_place":
+                    raise MissionServiceError(
+                        f"Mission navigation node {node.nodeId} has the wrong place task"
+                    )
+                station = stations.get(typed.place.stationId)
+                if (
+                    station is None
+                    or station.get("regionId") != typed.place.locationId
+                ):
+                    raise MissionServiceError(
+                        f"Mission place station does not belong to {typed.place.locationId}"
+                    )
+                for record_id in typed.place.candidateTargetRecordIds:
+                    if record_id not in target_records:
+                        raise MissionServiceError(
+                            f"Mission place candidate is absent from the bound Scene: {record_id}"
+                        )
+                continue
+            expected_record_id = self._semantic_text(intent, "targetRecordId")
+            if expected_record_id is not None:
+                if expected_record_id not in target_records:
+                    raise MissionServiceError(
+                        f"Mission targetRecordId is absent from the bound Scene: {expected_record_id}"
+                    )
+                continue
+            dependency_nodes = [
+                nodes[item]
+                for item in node.dependsOn
+                if item in nodes
+            ]
+            visual_dependencies = [
+                item for item in dependency_nodes if item.skillId == "vision.observe"
+            ]
+            if visual_dependencies:
+                invalid_dependency = next(
+                    (
+                        item
+                        for item in visual_dependencies
+                        if (
+                            str(
+                                item.intent.get("visualTaskMode")
+                                or item.intent.get("mode")
+                                or ""
+                            ).casefold()
+                            not in {"", "object_approach"}
+                            or str(item.intent.get("producesPredicate") or "")
+                            not in {"", "target_pose"}
+                            or str(item.intent.get("task") or "").casefold()
+                            in {
+                                "describe_and_ground",
+                                "ground_landmark",
+                                "locate_landmark",
+                            }
+                        )
+                    ),
+                    None,
+                )
+                if invalid_dependency is not None:
+                    raise MissionServiceError(
+                        "Mission navigation visual dependency does not promise "
+                        f"a target_pose: {invalid_dependency.nodeId}"
+                    )
+                # Only object-approach grounding may defer exact target_pose
+                # creation until runtime. Landmark-only observations cannot.
+                continue
+            expected_subject = self._semantic_text(intent, "targetDescription")
+            matching_subjects = [
+                item
+                for item in target_records.values()
+                if expected_subject is not None
+                and str(item.get("subject", "")).casefold()
+                == expected_subject.casefold()
+            ]
+            if len(matching_subjects) != 1:
+                raise MissionServiceError(
+                    f"Mission navigation node {node.nodeId} has no unique trusted target"
+                )
 
     @staticmethod
     def _pose_xy(pose: Mapping[str, Any], field: str) -> tuple[float, float]:
@@ -2065,7 +2534,43 @@ class MissionService:
         node: MissionNode,
     ) -> dict[str, Any]:
         intent = dict(node.intent)
-        target_yaw = self._rotation_yaw_from_intent(intent)
+        # Object approach plans add an explicit post-arrival facing checkpoint.
+        # Resolve it from the latest successful Nav2 goal and a fresh Robot
+        # Agent pose. This keeps the yaw semantic and auditable while making
+        # the correction closed-loop; no client can inject an executable yaw.
+        if intent.get("targetYawFromExecutedGoal") is True:
+            target_pose = self._latest_executed_goal(record)
+            if target_pose is None:
+                raise MissionInputRequired(
+                    "TARGET_YAW_REQUIRED",
+                    "目标朝向缺少已执行的接近点位姿",
+                )
+            raw_target_yaw = target_pose.get("yaw")
+            if (
+                isinstance(raw_target_yaw, bool)
+                or not isinstance(raw_target_yaw, (int, float))
+                or not math.isfinite(float(raw_target_yaw))
+            ):
+                raise MissionInputRequired(
+                    "TARGET_YAW_REQUIRED",
+                    "目标接近点缺少有效朝向",
+                )
+            current = self._current_robot_pose(record["robotId"])
+            delta = math.atan2(
+                math.sin(float(raw_target_yaw) - current.yaw),
+                math.cos(float(raw_target_yaw) - current.yaw),
+            )
+            # A zero Spin is forbidden by the Robot Agent contract. Treat an
+            # already aligned target as a durable conditional skip instead of
+            # manufacturing a tiny motion or surfacing a false user error.
+            if abs(delta) <= 0.09:
+                raise MissionInputRequired(
+                    "ROTATION_ALREADY_ALIGNED",
+                    "机器人已在目标朝向范围内，无需再次转向",
+                )
+            target_yaw = delta
+        else:
+            target_yaw = self._rotation_yaw_from_intent(intent)
         plan = MissionPlanDraft.model_validate(record["plan"])
         reserved_yaw = self._estimated_cumulative_scan_yaw(record, target_yaw)
         if (
@@ -2085,6 +2590,256 @@ class MissionService:
             "timeAllowanceMs": max(100, min(allowance, 60_000)),
         }
 
+    def _build_inside_region_input(
+        self,
+        record: Mapping[str, Any],
+        node: MissionNode,
+    ) -> dict[str, Any]:
+        try:
+            typed = parse_place_navigation_intent(dict(node.intent))
+        except Exception as exc:
+            raise MissionInputRequired(
+                "PLACE_INTENT_INVALID",
+                f"区域验证节点缺少有效的强类型地点目标：{exc}",
+            ) from exc
+        if typed.task != "verify_inside_region":
+            raise MissionInputRequired(
+                "PLACE_VERIFICATION_TASK_INVALID",
+                "区域验证节点的任务类型无效",
+            )
+        if typed.completion.predicate != "inside_region":
+            raise MissionInputRequired(
+                "PLACE_COMPLETION_INVALID",
+                "区域验证节点没有 inside_region 完成条件",
+            )
+        actual_target_record_id = typed.place.targetRecordId
+        candidate_ids = set(typed.place.candidateTargetRecordIds)
+        for execution in reversed(record.get("skillExecutions", [])):
+            if (
+                not isinstance(execution, Mapping)
+                or execution.get("nodeId") not in set(node.dependsOn)
+            ):
+                continue
+            request = execution.get("request")
+            terminal = execution.get("result")
+            if (
+                not isinstance(request, Mapping)
+                or request.get("skillId") != "navigation.navigate_to_pose"
+                or not isinstance(terminal, Mapping)
+                or terminal.get("status") != "succeeded"
+            ):
+                continue
+            skill_input = request.get("input")
+            resolution_id = (
+                skill_input.get("spatialResolutionId")
+                if isinstance(skill_input, Mapping)
+                else None
+            )
+            matched = next(
+                (
+                    item
+                    for item in record.get("worldRecords", [])
+                    if isinstance(item, Mapping)
+                    and item.get("recordId") in candidate_ids
+                    and item.get("sourceRef") == resolution_id
+                ),
+                None,
+            )
+            if isinstance(matched, Mapping):
+                actual_target_record_id = str(matched["recordId"])
+            break
+        if not any(
+            isinstance(item, Mapping)
+            and item.get("recordId") == actual_target_record_id
+            and item.get("kind") == "fact"
+            and item.get("predicate") == "target_pose"
+            for item in record.get("worldRecords", [])
+        ):
+            raise MissionInputRequired(
+                "TRUSTED_TARGET_POSE_REQUIRED",
+                "区域验证缺少实际执行目标对应的可信 map 点",
+            )
+        region_record_id = (
+            f"world-{record['missionId']}-scene-{typed.place.locationId}"
+        )
+        if not any(
+            isinstance(item, Mapping)
+            and item.get("recordId") == region_record_id
+            and item.get("kind") == "fact"
+            and item.get("predicate") == "semantic_region"
+            for item in record.get("worldRecords", [])
+        ):
+            raise MissionInputRequired(
+                "TRUSTED_REGION_REQUIRED",
+                "区域验证缺少与当前 SceneRef 绑定的可信房间多边形",
+            )
+        return {
+            "regionId": typed.place.locationId,
+            "regionRecordId": region_record_id,
+            "stationId": typed.place.stationId,
+            "targetRecordId": actual_target_record_id,
+            "anchorRole": typed.place.anchorRole,
+            "minimumClearanceM": typed.completion.minimumClearanceM,
+            "maximumAnchorDistanceM": typed.completion.maximumAnchorDistanceM,
+        }
+
+    @staticmethod
+    def _point_in_polygon(
+        x: float,
+        y: float,
+        polygon: list[Mapping[str, Any]],
+    ) -> bool:
+        inside = False
+        previous = polygon[-1]
+        for current in polygon:
+            current_x, current_y = float(current["x"]), float(current["y"])
+            previous_x, previous_y = float(previous["x"]), float(previous["y"])
+            if (current_y > y) != (previous_y > y):
+                crossing_x = (
+                    (previous_x - current_x)
+                    * (y - current_y)
+                    / (previous_y - current_y)
+                    + current_x
+                )
+                if x < crossing_x:
+                    inside = not inside
+            previous = current
+        return inside
+
+    @staticmethod
+    def _point_segment_distance(
+        px: float,
+        py: float,
+        ax: float,
+        ay: float,
+        bx: float,
+        by: float,
+    ) -> float:
+        dx, dy = bx - ax, by - ay
+        denominator = dx * dx + dy * dy
+        if denominator == 0:
+            return math.hypot(px - ax, py - ay)
+        ratio = max(
+            0.0,
+            min(1.0, ((px - ax) * dx + (py - ay) * dy) / denominator),
+        )
+        return math.hypot(px - (ax + ratio * dx), py - (ay + ratio * dy))
+
+    def verify_inside_region(self, request: SkillRequest) -> dict[str, Any]:
+        """Verify semantic arrival from a fresh pose, never from Nav2 status."""
+
+        if request.skillId != SCENE_VERIFY_INSIDE_SKILL:
+            raise MissionServiceError("inside-region verifier received another skill")
+        mission = self.runtime.get(request.missionId)
+        if (
+            mission.get("snapshot", {}).get("activeSkillRequestId")
+            != request.requestId
+        ):
+            raise MissionServiceError(
+                "inside-region verifier no longer owns the active Mission request"
+            )
+        region_record_id = _id(request.input.get("regionRecordId"), "regionRecordId")
+        target_record_id = _id(request.input.get("targetRecordId"), "targetRecordId")
+        region_record = next(
+            (
+                item
+                for item in mission.get("worldRecords", [])
+                if item.get("recordId") == region_record_id
+                and item.get("kind") == "fact"
+                and item.get("predicate") == "semantic_region"
+                and item.get("source") == "scene"
+            ),
+            None,
+        )
+        target_record = next(
+            (
+                item
+                for item in mission.get("worldRecords", [])
+                if item.get("recordId") == target_record_id
+                and item.get("kind") == "fact"
+                and item.get("predicate") == "target_pose"
+                and item.get("source") == "scene"
+            ),
+            None,
+        )
+        if not isinstance(region_record, Mapping) or not isinstance(
+            target_record, Mapping
+        ):
+            raise MissionServiceError(
+                "inside-region verifier lost its trusted Scene binding"
+            )
+        region_value = region_record.get("value")
+        target_value = target_record.get("value")
+        polygon = (
+            region_value.get("polygonXY")
+            if isinstance(region_value, Mapping)
+            else None
+        )
+        target_pose = (
+            target_value.get("targetPose")
+            if isinstance(target_value, Mapping)
+            else None
+        )
+        if (
+            not isinstance(polygon, list)
+            or len(polygon) < 3
+            or any(not isinstance(item, Mapping) for item in polygon)
+            or not isinstance(target_pose, Mapping)
+        ):
+            raise MissionServiceError(
+                "inside-region verifier received invalid Scene geometry"
+            )
+        pose = self._current_robot_pose(request.robotId)
+        x, y = float(pose.x), float(pose.y)
+        inside = self._point_in_polygon(x, y, polygon)
+        edge_distances = [
+            self._point_segment_distance(
+                x,
+                y,
+                float(polygon[index]["x"]),
+                float(polygon[index]["y"]),
+                float(polygon[(index + 1) % len(polygon)]["x"]),
+                float(polygon[(index + 1) % len(polygon)]["y"]),
+            )
+            for index in range(len(polygon))
+        ]
+        clearance = min(edge_distances)
+        target_x, target_y = self._pose_xy(target_pose, "targetPose")
+        anchor_distance = math.hypot(x - target_x, y - target_y)
+        minimum_clearance = float(request.input["minimumClearanceM"])
+        maximum_anchor_distance = float(request.input["maximumAnchorDistanceM"])
+        verified = (
+            inside
+            and clearance >= minimum_clearance
+            and anchor_distance <= maximum_anchor_distance
+        )
+        verified_at = utc_now()
+        result = {
+            "schemaVersion": "h-ide.inside-region/1",
+            "missionId": request.missionId,
+            "requestId": request.requestId,
+            "regionId": request.input["regionId"],
+            "stationId": request.input["stationId"],
+            "targetRecordId": target_record_id,
+            "anchorRole": request.input["anchorRole"],
+            "inside": inside,
+            "verified": verified,
+            "minimumClearanceM": minimum_clearance,
+            "measuredClearanceM": clearance,
+            "maximumAnchorDistanceM": maximum_anchor_distance,
+            "measuredAnchorDistanceM": anchor_distance,
+            "poseObservedAt": (
+                pose.observedAt.isoformat()
+                if pose.observedAt is not None
+                else None
+            ),
+            "verifiedAt": verified_at.isoformat(),
+        }
+        return {
+            "mode": "inside_region_verification",
+            "insideRegionResult": result,
+        }
+
     def _build_node_input(
         self,
         record: Mapping[str, Any],
@@ -2096,6 +2851,8 @@ class MissionService:
             return self._build_navigation_input(record, node)
         if node.skillId == "navigation.rotate":
             return self._build_rotation_input(record, node)
+        if node.skillId == SCENE_VERIFY_INSIDE_SKILL:
+            return self._build_inside_region_input(record, node)
         if node.skillId == OFFICE_INSPECTION_SKILL:
             station_id = self._semantic_text(dict(node.intent), "stationId")
             region_id = self._semantic_text(dict(node.intent), "regionId")
@@ -2127,10 +2884,102 @@ class MissionService:
                 "maximumCumulativeYawRad": math.tau,
             }
         if node.skillId == MISSION_REPORT_SKILL:
+            report_scope = self._semantic_text(
+                dict(node.intent),
+                "reportScope",
+            ) or "all_office_regions_and_corridor"
             payload: dict[str, Any] = {
-                "reportScope": "all_office_regions_and_corridor",
-                "locale": "zh-CN",
+                "reportScope": report_scope,
+                "locale": self._semantic_text(dict(node.intent), "locale")
+                or "zh-CN",
             }
+            if report_scope == "current_location":
+                region_id = self._semantic_text(dict(node.intent), "regionId")
+                station_id = self._semantic_text(dict(node.intent), "stationId")
+                station = (
+                    office_inspection_station_index().get(station_id)
+                    if station_id is not None
+                    else None
+                )
+                if (
+                    region_id is None
+                    or station_id is None
+                    or station is None
+                    or station.get("regionId") != region_id
+                ):
+                    raise MissionInputRequired(
+                        "LOCATION_REPORT_BINDING_REQUIRED",
+                        "地点报告缺少经审核的区域或观察站绑定",
+                    )
+                payload.update(regionId=region_id, stationId=station_id)
+            elif report_scope == "selected_locations":
+                raw_region_ids = node.intent.get("regionIds")
+                raw_station_ids = node.intent.get("stationIds")
+                if (
+                    not isinstance(raw_region_ids, list)
+                    or not isinstance(raw_station_ids, list)
+                    or not 1 <= len(raw_region_ids) <= 8
+                    or not 1 <= len(raw_station_ids) <= 8
+                    or any(
+                        not isinstance(item, str) or not item.strip()
+                        for item in [*raw_region_ids, *raw_station_ids]
+                    )
+                    or len(set(raw_region_ids)) != len(raw_region_ids)
+                    or len(set(raw_station_ids)) != len(raw_station_ids)
+                ):
+                    raise MissionInputRequired(
+                        "SELECTED_LOCATION_REPORT_BINDING_REQUIRED",
+                        "定向巡检报告缺少有效的区域或观察站绑定",
+                    )
+                region_ids = [str(item).strip() for item in raw_region_ids]
+                station_ids = [str(item).strip() for item in raw_station_ids]
+                region_catalog = {
+                    str(item.get("regionId")): item
+                    for item in office_inspection_catalog().get("regions", [])
+                    if isinstance(item, Mapping) and item.get("regionId")
+                }
+                stations = office_inspection_station_index()
+                if any(item not in region_catalog for item in region_ids):
+                    raise MissionInputRequired(
+                        "SELECTED_LOCATION_REPORT_BINDING_INVALID",
+                        "定向巡检报告包含未发布的区域",
+                    )
+                if any(
+                    item not in stations
+                    or stations[item].get("regionId") not in set(region_ids)
+                    for item in station_ids
+                ):
+                    raise MissionInputRequired(
+                        "SELECTED_LOCATION_REPORT_BINDING_INVALID",
+                        "定向巡检报告观察站不属于所选区域",
+                    )
+                if any(
+                    not any(stations[station_id].get("regionId") == region_id for station_id in station_ids)
+                    for region_id in region_ids
+                ):
+                    raise MissionInputRequired(
+                        "SELECTED_LOCATION_REPORT_BINDING_INVALID",
+                        "定向巡检报告必须覆盖每个所选区域",
+                    )
+                payload.update(regionIds=region_ids, stationIds=station_ids)
+            elif report_scope == "object_search":
+                target_description = self._semantic_text(
+                    dict(node.intent), "targetDescription"
+                )
+                if target_description is None:
+                    raise MissionInputRequired(
+                        "OBJECT_SEARCH_TARGET_REQUIRED",
+                        "主动搜索报告缺少目标名称",
+                    )
+                payload["targetDescription"] = target_description
+                region_id = self._semantic_text(dict(node.intent), "regionId")
+                if region_id is not None:
+                    payload["regionId"] = region_id
+            elif report_scope != "all_office_regions_and_corridor":
+                raise MissionInputRequired(
+                    "MISSION_REPORT_SCOPE_INVALID",
+                    "Mission 报告范围无效",
+                )
             raw_sources = node.intent.get("sourceMissionIds")
             if raw_sources is not None:
                 if (
@@ -2350,12 +3199,20 @@ class MissionService:
         pending_event: Mapping[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         execution = self._office_navigation_retry_execution(record)
+        place_retry = False
+        if execution is None:
+            execution = self._place_navigation_retry_execution(record)
+            place_retry = execution is not None
         if execution is None:
             return None
         request_id = str(execution["requestId"])
         result = execution.get("result")
         error_code = result.get("errorCode") if isinstance(result, Mapping) else None
         reason = (
+            "The selected Office place anchor was not reached; retry within "
+            "the reviewed anchors for the same semantic region"
+            if place_retry and error_code == "ROBOT_AGENT_FAILED"
+            else
             "Office V2 route lease expired before arrival; continue the same "
             "reviewed node from the fresh robot pose"
             if error_code == "ROBOT_AGENT_EXPIRED"
@@ -2380,6 +3237,139 @@ class MissionService:
             source_intervention=intervention,
             source_request_sha256=request_sha256,
         )
+
+    @staticmethod
+    def _place_navigation_retry_execution(
+        record: Mapping[str, Any],
+    ) -> Mapping[str, Any] | None:
+        plan_payload = record.get("plan")
+        revision_payload = record.get("activeRevision")
+        snapshot = record.get("snapshot")
+        authorization_payload = record.get("authorization")
+        if (
+            not isinstance(plan_payload, Mapping)
+            or not isinstance(revision_payload, Mapping)
+            or not isinstance(snapshot, Mapping)
+            or not isinstance(authorization_payload, Mapping)
+            or snapshot.get("activeSkillRequestId") is not None
+        ):
+            return None
+        try:
+            plan = MissionPlanDraft.model_validate(plan_payload)
+            revision = PlanRevision.model_validate(revision_payload)
+            authorization = MissionAuthorization.model_validate(authorization_payload)
+        except (TypeError, ValueError):
+            return None
+        if min(plan.expiresAt, plan.envelope.expiresAt, authorization.expiresAt) <= utc_now():
+            return None
+        node_id = snapshot.get("activeNodeId")
+        node = next(
+            (
+                item
+                for item in revision.nodes
+                if isinstance(node_id, str) and item.nodeId == node_id
+            ),
+            None,
+        )
+        if node is None or node.skillId != "navigation.navigate_to_pose":
+            return None
+        try:
+            typed = parse_place_navigation_intent(dict(node.intent))
+        except Exception:
+            return None
+        if typed.task != "navigate_to_place":
+            return None
+        state = next(
+            (
+                item
+                for item in record.get("nodeStates", [])
+                if isinstance(item, Mapping)
+                and item.get("revisionId") == revision.revisionId
+                and item.get("nodeId") == node.nodeId
+            ),
+            None,
+        )
+        state_payload = state.get("state") if isinstance(state, Mapping) else None
+        request_id = (
+            state_payload.get("skillRequestId")
+            if isinstance(state_payload, Mapping)
+            else None
+        )
+        if (
+            not isinstance(state, Mapping)
+            or state.get("status") not in {"timed_out", "failed", "unknown"}
+            or int(state.get("attempt", 0)) >= plan.envelope.maximumStageAttempts
+            or not isinstance(request_id, str)
+        ):
+            return None
+        execution = next(
+            (
+                item
+                for item in record.get("skillExecutions", [])
+                if isinstance(item, Mapping) and item.get("requestId") == request_id
+            ),
+            None,
+        )
+        request = execution.get("request") if isinstance(execution, Mapping) else None
+        result = execution.get("result") if isinstance(execution, Mapping) else None
+        result_body = result.get("result") if isinstance(result, Mapping) else None
+        receipt = (
+            result_body.get("commandReceipt")
+            if isinstance(result_body, Mapping)
+            else None
+        )
+        if (
+            not isinstance(request, Mapping)
+            or request.get("missionId") != record.get("missionId")
+            or request.get("revisionId") != revision.revisionId
+            or request.get("nodeId") != node.nodeId
+            or request.get("skillId") != "navigation.navigate_to_pose"
+            or not isinstance(result, Mapping)
+            or result.get("requestId") != request_id
+            or not isinstance(receipt, Mapping)
+        ):
+            return None
+        error = str(receipt.get("error") or "").strip().casefold()
+        timed_out = (
+            result.get("status") == "timed_out"
+            and result.get("errorCode") == "ROBOT_AGENT_EXPIRED"
+            and receipt.get("status") == "expired"
+            and error == "motion lease expired"
+        )
+        aborted = (
+            result.get("status") == "failed"
+            and result.get("errorCode") == "ROBOT_AGENT_FAILED"
+            and receipt.get("status") == "failed"
+            and error == "action finished with status aborted"
+        )
+        cancellation_pending = (
+            result.get("status") == "unknown"
+            and result.get("errorCode") == "ROBOT_AGENT_UNKNOWN"
+            and receipt.get("status") == "unknown"
+            and error == "cancellation confirmation pending"
+        )
+        simulation_control_unavailable = (
+            plan.robotId == "g1-sim"
+            and result.get("status") == "failed"
+            and result.get("errorCode") == "ROBOT_AGENT_FAILED"
+            and receipt.get("status") == "failed"
+            and (
+                error.startswith(
+                    "robot agent control acquisition unavailable:"
+                )
+                or error.startswith(
+                    "robot agent gateway request failed:"
+                )
+            )
+        )
+        if not (
+            timed_out
+            or aborted
+            or cancellation_pending
+            or simulation_control_unavailable
+        ):
+            return None
+        return execution
 
     def _evaluate_failed_skill(self, record: Mapping[str, Any]) -> dict[str, Any]:
         deterministic_retry = self._retry_office_navigation_failure(record)
@@ -2442,6 +3432,404 @@ class MissionService:
             )
         return evaluated["mission"]
 
+    def _semantic_place_arrival_after_nav_abort(
+        self,
+        record: Mapping[str, Any],
+        request: SkillRequest,
+        receipt: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        """Accept only a geometrically verified near-goal Nav2 abort.
+
+        Nav2's transport terminal is intentionally not the semantic completion
+        authority for typed Office place tasks.  A learned-gait controller can
+        return ``ABORTED`` after settling inside the reviewed tolerance.  This
+        method checks a fresh Robot Agent pose against the exact Scene-bound
+        target (and, for interior goals, the room polygon and clearance) before
+        allowing the Mission to continue to its independent verification node.
+        Any missing, stale, mismatched, or unhealthy evidence returns ``None``
+        and preserves the normal fail/retry path.
+        """
+
+        if (
+            request.skillId != "navigation.navigate_to_pose"
+            or str(receipt.get("status") or "").strip().casefold() != "failed"
+            or str(receipt.get("error") or "").strip().casefold()
+            != "action finished with status aborted"
+        ):
+            return None
+        try:
+            revision = PlanRevision.model_validate(record["activeRevision"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        node = next(
+            (
+                item
+                for item in revision.nodes
+                if item.nodeId == request.nodeId
+                and item.skillId == request.skillId
+            ),
+            None,
+        )
+        if node is None:
+            return None
+        try:
+            typed = parse_place_navigation_intent(dict(node.intent))
+        except Exception:
+            return None
+        if typed.task != "navigate_to_place":
+            return None
+        skill_input = request.input
+        resolution_id = skill_input.get("spatialResolutionId")
+        goal_pose = skill_input.get("goalPose")
+        if (
+            skill_input.get("payloadType") != "spatial_resolution"
+            or not isinstance(resolution_id, str)
+            or not resolution_id
+            or not isinstance(goal_pose, Mapping)
+        ):
+            return None
+        candidate_ids = set(typed.place.candidateTargetRecordIds)
+        target_record = next(
+            (
+                item
+                for item in record.get("worldRecords", [])
+                if isinstance(item, Mapping)
+                and item.get("recordId") in candidate_ids
+                and item.get("kind") == "fact"
+                and item.get("predicate") == "target_pose"
+                and item.get("source") == "scene"
+                and item.get("sourceRef") == resolution_id
+            ),
+            None,
+        )
+        target_value = (
+            target_record.get("value")
+            if isinstance(target_record, Mapping)
+            else None
+        )
+        target_pose = (
+            target_value.get("targetPose")
+            if isinstance(target_value, Mapping)
+            else None
+        )
+        if not isinstance(target_pose, Mapping):
+            return None
+        try:
+            target_x, target_y = self._pose_xy(target_pose, "targetPose")
+            requested_x, requested_y = self._pose_xy(goal_pose, "goalPose")
+        except MissionInputRequired:
+            return None
+        if not (
+            math.isclose(target_x, requested_x, rel_tol=0.0, abs_tol=1e-9)
+            and math.isclose(target_y, requested_y, rel_tol=0.0, abs_tol=1e-9)
+        ):
+            return None
+        try:
+            pose = self._current_robot_pose(request.robotId)
+        except MissionServiceError:
+            return None
+        robot = self.store.get_robot(request.robotId)
+        if (
+            not isinstance(robot, Mapping)
+            or robot.get("connected") is not True
+            or robot.get("status") not in {"online", "degraded"}
+            or robot.get("safetyMode") != "normal"
+        ):
+            return None
+        anchor_distance = math.hypot(pose.x - target_x, pose.y - target_y)
+        maximum_anchor_distance = typed.completion.maximumAnchorDistanceM
+        if anchor_distance > maximum_anchor_distance:
+            return None
+
+        inside: bool | None = None
+        clearance: float | None = None
+        if typed.completion.predicate == "inside_region":
+            region_record_id = (
+                f"world-{record.get('missionId')}-scene-{typed.place.locationId}"
+            )
+            region_record = next(
+                (
+                    item
+                    for item in record.get("worldRecords", [])
+                    if isinstance(item, Mapping)
+                    and item.get("recordId") == region_record_id
+                    and item.get("kind") == "fact"
+                    and item.get("predicate") == "semantic_region"
+                    and item.get("source") == "scene"
+                ),
+                None,
+            )
+            region_value = (
+                region_record.get("value")
+                if isinstance(region_record, Mapping)
+                else None
+            )
+            polygon = (
+                region_value.get("polygonXY")
+                if isinstance(region_value, Mapping)
+                else None
+            )
+            if (
+                not isinstance(polygon, list)
+                or len(polygon) < 3
+                or any(not isinstance(item, Mapping) for item in polygon)
+            ):
+                return None
+            try:
+                inside = self._point_in_polygon(pose.x, pose.y, polygon)
+                clearance = min(
+                    self._point_segment_distance(
+                        pose.x,
+                        pose.y,
+                        float(left["x"]),
+                        float(left["y"]),
+                        float(right["x"]),
+                        float(right["y"]),
+                    )
+                    for left, right in zip(polygon, [*polygon[1:], polygon[0]])
+                )
+            except (KeyError, TypeError, ValueError, OverflowError):
+                return None
+            if (
+                not inside
+                or clearance < typed.completion.minimumClearanceM
+            ):
+                return None
+        elif typed.completion.predicate != "at_anchor":
+            return None
+
+        actual_station_id = typed.place.stationId
+        candidate_station = (
+            target_value.get("locationId")
+            if isinstance(target_value, Mapping)
+            else None
+        )
+        station = (
+            office_inspection_station_index().get(candidate_station)
+            if isinstance(candidate_station, str)
+            else None
+        )
+        if (
+            isinstance(station, Mapping)
+            and station.get("regionId") == typed.place.locationId
+        ):
+            actual_station_id = candidate_station
+        verified_at = utc_now()
+        return {
+            "schemaVersion": "h-ide.semantic-arrival/1",
+            "missionId": request.missionId,
+            "requestId": request.requestId,
+            "regionId": typed.place.locationId,
+            "stationId": actual_station_id,
+            "targetRecordId": str(target_record["recordId"]),
+            "predicate": typed.completion.predicate,
+            "accepted": True,
+            "measuredAnchorDistanceM": anchor_distance,
+            "maximumAnchorDistanceM": maximum_anchor_distance,
+            "inside": inside,
+            "measuredClearanceM": clearance,
+            "minimumClearanceM": typed.completion.minimumClearanceM,
+            "poseObservedAt": (
+                pose.observedAt.isoformat()
+                if pose.observedAt is not None
+                else None
+            ),
+            "verifiedAt": verified_at.isoformat(),
+            "transportStatus": "failed",
+            "transportError": str(receipt.get("error") or ""),
+        }
+
+    def _robot_agent_terminal_skill_result(
+        self,
+        record: Mapping[str, Any],
+        request: SkillRequest,
+        receipt: Mapping[str, Any],
+    ) -> SkillResult:
+        receipt_status = str(receipt.get("status") or "").lower()
+        if receipt_status == "succeeded":
+            return SkillResult(
+                requestId=request.requestId,
+                status="succeeded",
+                completedAt=utc_now(),
+                result={"commandReceipt": dict(receipt)},
+                evidenceIds=[f"command:{request.requestId}"],
+            )
+        semantic_arrival = self._semantic_place_arrival_after_nav_abort(
+            record,
+            request,
+            receipt,
+        )
+        if semantic_arrival is not None:
+            return SkillResult(
+                requestId=request.requestId,
+                status="succeeded",
+                completedAt=utc_now(),
+                result={
+                    "commandReceipt": dict(receipt),
+                    "semanticArrival": semantic_arrival,
+                },
+                evidenceIds=[f"command:{request.requestId}"],
+            )
+        result_status = {
+            "expired": "timed_out",
+            "unknown": "unknown",
+        }.get(receipt_status, receipt_status)
+        if result_status not in {
+            "failed",
+            "cancelled",
+            "rejected",
+            "timed_out",
+            "unknown",
+        }:
+            result_status = "unknown"
+        return SkillResult(
+            requestId=request.requestId,
+            status=result_status,
+            completedAt=utc_now(),
+            result={"commandReceipt": dict(receipt)},
+            errorCode=f"ROBOT_AGENT_{receipt_status.upper() or 'UNKNOWN'}",
+            detail=str(
+                receipt.get("error")
+                or f"Robot Agent command {receipt_status or 'unknown'}"
+            ),
+        )
+
+    def _project_mission_conversation_artifacts(
+        self,
+        record: Mapping[str, Any],
+    ) -> None:
+        """Project coordinate-free observations and terminal text to its turn."""
+
+        mission_id = record.get("missionId")
+        robot_id = record.get("robotId")
+        if not isinstance(mission_id, str) or not isinstance(robot_id, str):
+            return
+        link = self.store.get_assistant_conversation_mission_link_by_mission(
+            mission_id
+        )
+        if link is None:
+            return
+        conversation_id = str(link["conversationId"])
+        task_id = str(link["taskId"])
+        default_region_id: str | None = None
+        visual_results: list[tuple[Mapping[str, Any], str | None]] = []
+        seen_analyses: set[str] = set()
+        for execution in record.get("skillExecutions", []):
+            if not isinstance(execution, Mapping):
+                continue
+            request = execution.get("request")
+            request_input = (
+                request.get("input") if isinstance(request, Mapping) else None
+            )
+            region_id = (
+                request_input.get("regionId")
+                if isinstance(request_input, Mapping)
+                and isinstance(request_input.get("regionId"), str)
+                else default_region_id
+            )
+            terminal = execution.get("result")
+            body = terminal.get("result") if isinstance(terminal, Mapping) else None
+            if not isinstance(body, Mapping):
+                continue
+            inside_result = body.get("insideRegionResult")
+            if (
+                isinstance(inside_result, Mapping)
+                and inside_result.get("verified") is True
+                and isinstance(inside_result.get("regionId"), str)
+            ):
+                default_region_id = str(inside_result["regionId"])
+                region_id = default_region_id
+            direct = body.get("visualResult")
+            if isinstance(direct, Mapping):
+                visual_results.append((direct, region_id))
+            inspection = body.get("inspectionResult")
+            headings = (
+                inspection.get("headings")
+                if isinstance(inspection, Mapping)
+                else None
+            )
+            inspection_region = (
+                inspection.get("regionId")
+                if isinstance(inspection, Mapping)
+                and isinstance(inspection.get("regionId"), str)
+                else region_id
+            )
+            if isinstance(headings, list):
+                for heading in headings:
+                    visual = (
+                        heading.get("visualResult")
+                        if isinstance(heading, Mapping)
+                        else None
+                    )
+                    if isinstance(visual, Mapping):
+                        visual_results.append((visual, inspection_region))
+        for visual, region_id in (
+            visual_results if semantic_referents_enabled() else []
+        ):
+            analysis_id = visual.get("analysisId")
+            if not isinstance(analysis_id, str) or analysis_id in seen_analyses:
+                continue
+            seen_analyses.add(analysis_id)
+            try:
+                referents = extract_semantic_referents(
+                    conversation_id=conversation_id,
+                    task_id=task_id,
+                    robot_id=robot_id,
+                    visual_result=visual,
+                    mission_id=mission_id,
+                    region_id=region_id or default_region_id,
+                )
+                self.store.record_assistant_semantic_referents(
+                    conversation_id=conversation_id,
+                    robot_id=robot_id,
+                    referents=[
+                        item.model_dump(mode="json") for item in referents
+                    ],
+                )
+            except Exception:
+                # Mission execution is authoritative; this optional semantic
+                # projection is deliberately availability-neutral.
+                continue
+
+        snapshot = record.get("snapshot")
+        status = snapshot.get("status") if isinstance(snapshot, Mapping) else None
+        if status not in {"completed", "failed", "cancelled"}:
+            return
+        narrative = None
+        for execution in reversed(record.get("skillExecutions", [])):
+            terminal = (
+                execution.get("result")
+                if isinstance(execution, Mapping)
+                else None
+            )
+            body = terminal.get("result") if isinstance(terminal, Mapping) else None
+            report = body.get("missionReport") if isinstance(body, Mapping) else None
+            candidate = (
+                report.get("narrativeZhCN")
+                if isinstance(report, Mapping)
+                else None
+            )
+            if isinstance(candidate, str) and candidate.strip():
+                narrative = candidate.strip()
+                break
+        if narrative is None:
+            detail = snapshot.get("detail") if isinstance(snapshot, Mapping) else None
+            narrative = {
+                "completed": "任务已完成。",
+                "cancelled": "任务已取消；机器人已停止当前行动。",
+                "failed": (
+                    f"任务未完成：{detail}"
+                    if isinstance(detail, str) and detail.strip()
+                    else "任务未完成，机器人已停止继续执行。"
+                ),
+            }[str(status)]
+        self.store.append_assistant_mission_message(
+            mission_id=mission_id,
+            message_id=f"message-mission-result-{mission_id}",
+            content=narrative,
+            conversation_status=("idle" if status == "completed" else str(status)),
+        )
+
     def _reconcile_active_skill(self, record: Mapping[str, Any]) -> dict[str, Any]:
         request_id = record.get("snapshot", {}).get("activeSkillRequestId")
         execution = next(
@@ -2486,42 +3874,9 @@ class MissionService:
         receipt_status = str(receipt.get("status") or "").lower()
         if receipt_status in {"accepted", "running", "pending"}:
             return record
-        if receipt_status == "succeeded":
-            return self.runtime.record_result(
-                record["missionId"],
-                SkillResult(
-                    requestId=request.requestId,
-                    status="succeeded",
-                    completedAt=utc_now(),
-                    result={"commandReceipt": dict(receipt)},
-                    evidenceIds=[f"command:{request.requestId}"],
-                ),
-            )
-        result_status = {
-            "expired": "timed_out",
-            "unknown": "unknown",
-        }.get(receipt_status, receipt_status)
-        if result_status not in {
-            "failed",
-            "cancelled",
-            "rejected",
-            "timed_out",
-            "unknown",
-        }:
-            result_status = "unknown"
         return self.runtime.record_result(
             record["missionId"],
-            SkillResult(
-                requestId=request.requestId,
-                status=result_status,
-                completedAt=utc_now(),
-                result={"commandReceipt": dict(receipt)},
-                errorCode=f"ROBOT_AGENT_{receipt_status.upper() or 'UNKNOWN'}",
-                detail=str(
-                    receipt.get("error")
-                    or f"Robot Agent command {receipt_status or 'unknown'}"
-                ),
-            ),
+            self._robot_agent_terminal_skill_result(record, request, receipt),
         )
 
     def advance(
@@ -2589,11 +3944,35 @@ class MissionService:
                 continue
             if status is not MissionStatus.READY:
                 break
+            node: MissionNode | None = None
             try:
                 node = self._active_node(record)
                 skill_input = self._build_node_input(record, node)
                 issue_binding = self._skill_issue_binding(record)
             except MissionInputRequired as exc:
+                if (
+                    exc.code == "ROTATION_ALREADY_ALIGNED"
+                    and node is not None
+                    and node.skillId == "navigation.rotate"
+                    and node.intent.get("targetYawFromExecutedGoal") is True
+                ):
+                    record = self.runtime.skip_nodes(
+                        mission_id,
+                        [node.nodeId],
+                        reason="target_heading_already_aligned",
+                        causation_id=(
+                            f"skip-{mission_id}-{node.nodeId}-"
+                            f"{record['snapshot']['lastSequence']}"
+                        ),
+                    )
+                    actions.append(
+                        {
+                            "kind": "skill_skipped",
+                            "nodeId": node.nodeId,
+                            "reason": "target_heading_already_aligned",
+                        }
+                    )
+                    continue
                 record = self.runtime.request_input(
                     mission_id,
                     node_id=(
@@ -2641,6 +4020,11 @@ class MissionService:
                 MissionStatus.EXECUTING.value,
             }:
                 break
+        try:
+            self._project_mission_conversation_artifacts(record)
+        except Exception:
+            # Conversation projection cannot change Mission convergence.
+            pass
         return {
             "mission": record,
             "actions": actions,
@@ -3484,6 +4868,24 @@ class MissionService:
             raise MissionServiceError(
                 "H-IDE Vision result attempt is not bound to the active skill request"
             )
+        mission_before = self.runtime.get(request.missionId)
+        revision_before = PlanRevision.model_validate(
+            mission_before["activeRevision"]
+        )
+        active_node = next(
+            (item for item in revision_before.nodes if item.nodeId == request.nodeId),
+            None,
+        )
+        search_optional = (
+            active_node is not None
+            and active_node.intent.get("searchOptional") is True
+        )
+        search_group_id = (
+            active_node.intent.get("searchGroupId")
+            if active_node is not None
+            and isinstance(active_node.intent.get("searchGroupId"), str)
+            else None
+        )
         expected_candidate_id = request.input.get("candidateId")
         expected_selection_id = request.input.get("selectionSourceAnalysisId")
         if (expected_candidate_id is None) != (expected_selection_id is None):
@@ -3615,12 +5017,19 @@ class MissionService:
                 )
         if visual_status == "needs_input" and not visual.get("ambiguityCandidates"):
             raise MissionServiceError("visual needs_input result has no ambiguity candidates")
+        search_miss = (
+            search_optional
+            and visual_status in {"rejected", "failed"}
+            and not visual.get("ambiguityCandidates")
+        )
         result_status = {
             "succeeded": "succeeded",
             "needs_input": "rejected",
             "rejected": "rejected",
             "failed": "failed",
         }.get(visual_status, "unknown")
+        if search_miss:
+            result_status = "succeeded"
         evidence_ids = [
             str(item["sha256"])
             for item in visual.get("evidence", [])
@@ -3632,16 +5041,19 @@ class MissionService:
                 requestId=request.requestId,
                 status=result_status,
                 completedAt=utc_now(),
-                result={"visualResult": dict(visual)},
+                result={
+                    "visualResult": dict(visual),
+                    **({"searchMiss": True} if search_miss else {}),
+                },
                 evidenceIds=evidence_ids,
                 errorCode=(
                     None
-                    if visual_status == "succeeded"
+                    if visual_status == "succeeded" or search_miss
                     else f"VISUAL_{visual_status.upper()}"
                 ),
                 detail=(
                     None
-                    if visual_status == "succeeded"
+                    if visual_status == "succeeded" or search_miss
                     else str(visual.get("rejectionReason") or "visual task did not succeed")
                 ),
             ),
@@ -3666,6 +5078,34 @@ class MissionService:
                     request.missionId,
                     skipped_navigation,
                     reason="directional_clearance_insufficient",
+                    causation_id=request.requestId,
+                )
+        if (
+            search_optional
+            and visual_status == "succeeded"
+            and verified_geometry
+            and isinstance(search_group_id, str)
+        ):
+            refreshed = self.runtime.get(request.missionId)
+            states = {
+                str(item.get("nodeId")): str(item.get("status"))
+                for item in refreshed.get("nodeStates", [])
+                if isinstance(item, Mapping)
+                and item.get("revisionId") == revision_before.revisionId
+            }
+            prefix = f"object-search-{search_group_id}-"
+            skip_ids = [
+                item.nodeId
+                for item in revision_before.nodes
+                if item.nodeId != request.nodeId
+                and item.nodeId.startswith(prefix)
+                and states.get(item.nodeId, "pending") in {"pending", "ready"}
+            ]
+            if skip_ids:
+                completed = self.runtime.skip_nodes(
+                    request.missionId,
+                    skip_ids,
+                    reason="object_search_target_grounded",
                     causation_id=request.requestId,
                 )
         return completed
@@ -3864,6 +5304,47 @@ class MissionService:
                     "dispatch": dispatch,
                     "mission": self.runtime.get(request.missionId),
                 }
+            if mode == "inside_region_verification":
+                verification = dispatch.get("insideRegionResult")
+                if not isinstance(verification, Mapping):
+                    self._raise_workstation_dispatch_failure(
+                        request,
+                        error_code=_WORKSTATION_RESULT_PROCESSING_FAILED,
+                        detail="Inside-region verification returned no result",
+                        cause=MissionServiceError(
+                            "inside-region dispatcher returned no verification"
+                        ),
+                    )
+                    raise AssertionError("unreachable")
+                verified = verification.get("verified") is True
+                try:
+                    updated_mission = self.runtime.record_result(
+                        request.missionId,
+                        SkillResult(
+                            requestId=request.requestId,
+                            status="succeeded" if verified else "failed",
+                            completedAt=utc_now(),
+                            result={"insideRegionResult": dict(verification)},
+                            evidenceIds=[],
+                            errorCode=(
+                                None if verified else "INSIDE_REGION_REQUIRED"
+                            ),
+                            detail=(
+                                None
+                                if verified
+                                else "机器人尚未完整进入目标区域的内部可信点"
+                            ),
+                        ),
+                    )
+                except Exception as exc:
+                    self._raise_workstation_dispatch_failure(
+                        request,
+                        error_code=_WORKSTATION_RESULT_PROCESSING_FAILED,
+                        detail="Inside-region verification could not be recorded",
+                        cause=exc,
+                    )
+                    raise AssertionError("unreachable")
+                return {**base, "dispatch": dispatch, "mission": updated_mission}
             if mode == "office_mission_report":
                 report = dispatch.get("missionReport")
                 if not isinstance(report, Mapping):
@@ -3951,40 +5432,19 @@ class MissionService:
         receipt_status = str(receipt.get("status", "")).lower()
         updated_mission: dict[str, Any] | None = None
         try:
-            if receipt_status == "succeeded":
-                updated_mission = self.runtime.record_result(
-                    request.missionId,
-                    SkillResult(
-                        requestId=request.requestId,
-                        status="succeeded",
-                        completedAt=utc_now(),
-                        result={"commandReceipt": dict(receipt)},
-                        evidenceIds=[f"command:{request.requestId}"],
-                    ),
-                )
-            elif receipt_status in {
+            if receipt_status == "succeeded" or receipt_status in {
                 "failed",
                 "rejected",
                 "cancelled",
                 "expired",
                 "unknown",
             }:
-                result_status = {
-                    "expired": "timed_out",
-                    "unknown": "unknown",
-                }.get(receipt_status, receipt_status)
                 updated_mission = self.runtime.record_result(
                     request.missionId,
-                    SkillResult(
-                        requestId=request.requestId,
-                        status=result_status,
-                        completedAt=utc_now(),
-                        result={"commandReceipt": dict(receipt)},
-                        errorCode=f"ROBOT_AGENT_{receipt_status.upper()}",
-                        detail=(
-                            receipt.get("error")
-                            or f"Robot Agent command {receipt_status}"
-                        ),
+                    self._robot_agent_terminal_skill_result(
+                        self.runtime.get(request.missionId),
+                        request,
+                        receipt,
                     ),
                 )
             elif receipt_status in {"accepted", "running", "pending"}:
@@ -4166,6 +5626,103 @@ class MissionService:
         payload.setdefault("missionId", mission_id)
         return self.runtime.intervene(MissionIntervention.model_validate(payload))
 
+    @staticmethod
+    def _stateful_inspection_retry_revision(
+        record: Mapping[str, Any],
+        active: PlanRevision,
+        *,
+        reason: str,
+    ) -> PlanRevision | None:
+        """Retry only the failed inspection node and preserve completed work.
+
+        ``inspection.scan_station`` already performs its own multi-heading
+        VisualTasks.  Letting a text planner rewrite this DAG introduced a
+        second ``vision.observe`` node, dropped required report nodes, and
+        changed otherwise successful node definitions so MissionRuntime could
+        no longer carry their succeeded state forward.  A typed inspection
+        therefore receives a deterministic retry revision: every successful
+        node remains byte-for-byte identical, while only the failed node gets a
+        new identity (and a fresh attempt budget).
+        """
+
+        skill_ids = [node.skillId for node in active.nodes]
+        if (
+            OFFICE_INSPECTION_SKILL not in skill_ids
+            or MISSION_REPORT_SKILL not in skill_ids
+            or "vision.observe" in skill_ids
+        ):
+            return None
+        states = {
+            str(item.get("nodeId")): item
+            for item in record.get("nodeStates", [])
+            if isinstance(item, Mapping)
+            and item.get("revisionId") == active.revisionId
+        }
+        snapshot = record.get("snapshot")
+        active_node_id = (
+            snapshot.get("activeNodeId") if isinstance(snapshot, Mapping) else None
+        )
+        failed_node = next(
+            (
+                node
+                for node in active.nodes
+                if node.nodeId == active_node_id
+                and states.get(node.nodeId, {}).get("status")
+                in {"failed", "timed_out", "unknown"}
+            ),
+            None,
+        )
+        if failed_node is None:
+            failed_node = next(
+                (
+                    node
+                    for node in active.nodes
+                    if states.get(node.nodeId, {}).get("status")
+                    in {"failed", "timed_out", "unknown"}
+                ),
+                None,
+            )
+        if failed_node is None:
+            return None
+
+        retry_id = f"{failed_node.nodeId}-retry-r{active.sequence + 1}"
+        nodes: list[MissionNode] = []
+        for node in active.nodes:
+            dependencies = [
+                retry_id if item == failed_node.nodeId else item
+                for item in node.dependsOn
+            ]
+            nodes.append(
+                node.model_copy(
+                    update={
+                        "nodeId": retry_id if node.nodeId == failed_node.nodeId else node.nodeId,
+                        "dependsOn": dependencies,
+                    }
+                )
+            )
+        return PlanRevision(
+            revisionId=f"revision-{record['missionId']}-inspection-retry-{active.sequence + 1}",
+            missionId=str(record["missionId"]),
+            sequence=active.sequence + 1,
+            parentRevisionId=active.revisionId,
+            objective=active.objective,
+            nodes=nodes,
+            reasonCode="inspection_stateful_retry",
+            reason=(
+                "Deterministic inspection retry preserves every succeeded node: "
+                + reason
+            )[:1_000],
+            changeSummary=[
+                f"Retry only {failed_node.nodeId} as {retry_id}",
+                "Preserve completed navigation, verification and scan nodes",
+                "Retain the mandatory final inspection report",
+            ],
+            disposition="human_required",
+            authorizationId=None,
+            createdBy="h-ide-inspection-compiler",
+            createdAt=utc_now(),
+        )
+
     def request_revision(self, mission_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
         with self._planned_response_lock(mission_id):
             record = self.runtime.get(mission_id)
@@ -4278,23 +5835,34 @@ class MissionService:
                 "autoRevisionCount": snapshot.autoRevisionCount,
             }
             request.pop("operation", None)
-            raw = self.planner.create_revision(request)
-            if not isinstance(raw, Mapping):
-                raise MissionServiceError(
-                    "Mission planner returned an invalid revision"
-                )
-            payload = raw.get("revision")
-            revision_payload = dict(payload) if isinstance(payload, Mapping) else dict(raw)
-            proposed_nodes = revision_payload.get("nodes")
-            has_physical = isinstance(proposed_nodes, list) and any(
-                isinstance(item, Mapping)
-                and item.get("skillId") in _BASE_NAVIGATION_SKILLS
-                for item in proposed_nodes
+            revision = self._stateful_inspection_retry_revision(
+                record,
+                active,
+                reason=trigger_detail,
             )
-            if has_physical or revision_payload.get("disposition") == "human_approved":
-                revision_payload["disposition"] = "human_required"
-                revision_payload["authorizationId"] = None
-            revision = PlanRevision.model_validate(revision_payload)
+            if revision is None:
+                raw = self.planner.create_revision(request)
+                if not isinstance(raw, Mapping):
+                    raise MissionServiceError(
+                        "Mission planner returned an invalid revision"
+                    )
+                payload = raw.get("revision")
+                revision_payload = (
+                    dict(payload) if isinstance(payload, Mapping) else dict(raw)
+                )
+                proposed_nodes = revision_payload.get("nodes")
+                has_physical = isinstance(proposed_nodes, list) and any(
+                    isinstance(item, Mapping)
+                    and item.get("skillId") in _BASE_NAVIGATION_SKILLS
+                    for item in proposed_nodes
+                )
+                if (
+                    has_physical
+                    or revision_payload.get("disposition") == "human_approved"
+                ):
+                    revision_payload["disposition"] = "human_required"
+                    revision_payload["authorizationId"] = None
+                revision = PlanRevision.model_validate(revision_payload)
             completed = self.runtime.finalize_planned_intervention(
                 intervention,
                 request_sha256=request_sha256,
@@ -4499,11 +6067,28 @@ class MissionService:
                 record,
                 canonical_event,
             )
-            raw = self.planner.evaluate_event(payload, context)
-            if not isinstance(raw, Mapping):
-                raise MissionServiceError(
-                    "Mission planner returned an invalid event decision"
-                )
+            active = PlanRevision.model_validate(record["activeRevision"])
+            deterministic_revision = self._stateful_inspection_retry_revision(
+                record,
+                active,
+                reason=str(
+                    canonical_event.get("payload", {}).get("detail")
+                    if isinstance(canonical_event.get("payload"), Mapping)
+                    else canonical_event.get("eventType")
+                ),
+            )
+            if deterministic_revision is not None:
+                raw: Mapping[str, Any] = {
+                    "kind": "replan",
+                    "reason": "Typed inspection retry retained completed Mission state",
+                    "revision": deterministic_revision.model_dump(mode="json"),
+                }
+            else:
+                raw = self.planner.evaluate_event(payload, context)
+                if not isinstance(raw, Mapping):
+                    raise MissionServiceError(
+                        "Mission planner returned an invalid event decision"
+                    )
             decision = self._normalize_event_decision(
                 raw,
                 force_human_review=force_human_review,

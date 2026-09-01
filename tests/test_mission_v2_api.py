@@ -66,6 +66,22 @@ def test_rotation_intent_preserves_explicit_degrees_instead_of_using_direction_d
     ) == pytest.approx(-0.2)
 
 
+def test_workstation_scan_catalog_keeps_behavior_tree_execution_and_nav2_motion_ownership() -> None:
+    catalog = {
+        item["skillId"]: item
+        for item in MissionService._capability_catalog(
+            MissionService._workstation_descriptors()
+        )
+    }
+
+    scan = catalog["inspection.scan_station"]
+    assert scan["executor"] == "behavior_tree"
+    assert scan["executorProfile"] == "office_v2.station_scan.v1"
+    assert scan["baseMotionOwner"] == "nav2"
+    assert "baseMotionOwner" not in catalog["vision.observe"]
+    assert "baseMotionOwner" not in catalog["mission.report"]
+
+
 def test_rotation_budget_accumulates_all_previously_issued_turns() -> None:
     record = {
         "skillExecutions": [
@@ -1261,7 +1277,11 @@ def test_mission_v2_publishes_pcd_semantic_region_as_static_scene_target_fact() 
             headers=headers(),
             json={"maximumSteps": 4},
         )
-        assert advanced.status_code == 200, advanced.text
+        assert advanced.status_code == 200, (
+            advanced.text,
+            app.state.runtime.diagnostics[-5:],
+            app.state.mission.runtime.get(mission_id),
+        )
         result = advanced.json()
         assert result["stoppedBecause"] == "dispatching"
         request = result["mission"]["skillExecutions"][0]["request"]
@@ -1344,11 +1364,12 @@ def test_mission_v2_operator_message_creates_a_reviewed_plan_revision() -> None:
             },
         ).json()
         mission_id = draft["draftId"]
-        assert client.post(
+        approved = client.post(
             f"/api/v2/missions/drafts/{mission_id}/approve",
             headers=headers(),
             json={"approvedBy": "operator-test"},
-        ).status_code == 200
+        )
+        assert approved.status_code == 200, approved.text
 
         intervention_id = "intervention-reviewed-replan-1"
         message = {
@@ -2927,6 +2948,236 @@ def test_mission_v2_advance_runs_visual_geometry_to_nav2_as_one_continuous_missi
     assert command.payload["goalPose"]["x"] == 1.25
     assert "path" not in command.payload
     assert "cmd_vel" not in command.payload
+
+
+def test_deterministic_object_search_skips_remaining_views_and_dispatches_nav2(
+    monkeypatch,
+) -> None:
+    from services.control_api.mission_client import UnavailableMissionPlanningClient
+
+    monkeypatch.setenv("ROBOT_AGENT_ID", "robot-1")
+    monkeypatch.setenv("ROBOT_AGENT_LOCALIZATION_EPOCH_ID", "epoch-live-1")
+    monkeypatch.setenv("HIDE_VISION_SOURCE_MODE", "synthetic")
+    class SequentialVisualTaskClient(FakeVisualTaskClient):
+        def analyze(self, request: Mapping[str, Any]) -> Mapping[str, Any]:
+            result = dict(super().analyze(request))
+            sequence = len(self.requests)
+            hypothesis_id = f"hypothesis-chair-{sequence}"
+            result["analysisId"] = f"analysis-chair-{sequence}"
+            result["hypotheses"] = [
+                {
+                    **dict(result["hypotheses"][0]),
+                    "hypothesisId": hypothesis_id,
+                    "label": "chair",
+                }
+            ]
+            result["geometryCandidates"] = [
+                {
+                    **dict(result["geometryCandidates"][0]),
+                    "geometryCandidateId": f"geometry-chair-{sequence}",
+                    "hypothesisId": hypothesis_id,
+                }
+            ]
+            return result
+
+    driver = OfficeInspectionMissionRobotDriver()
+    visual = SequentialVisualTaskClient()
+    app = create_app(
+        auth_token=TOKEN,
+        adapters={"robot_agent": RobotAgentAdapter(driver=driver)},
+        mission_planning_client=UnavailableMissionPlanningClient(
+            "object approach must not call the text planner"
+        ),
+        visual_task_client=visual,
+        mission_supervisor_interval=3600,
+    )
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v2/missions/drafts",
+            headers=headers(),
+            json={
+                "requestId": "request-chair-search-1",
+                "missionId": "mission-chair-search-1",
+                "robotId": "robot-1",
+                "objective": "去椅子旁边站着",
+                "requestedBy": "operator-test",
+                "maximumGoalDistanceM": 3.0,
+                "maximumCumulativeDistanceM": 10.0,
+            },
+        )
+        assert created.status_code == 201, created.text
+        mission_id = created.json()["draftId"]
+        approved = client.post(
+            f"/api/v2/missions/drafts/{mission_id}/approve",
+            headers=headers(),
+            json={"approvedBy": "operator-test"},
+        )
+        assert approved.status_code == 200, approved.text
+
+        advanced = client.post(
+            f"/api/v2/missions/{mission_id}/advance",
+            headers=headers(),
+            json={"maximumSteps": 50},
+        )
+        assert advanced.status_code == 200, (
+            advanced.text,
+            app.state.runtime.diagnostics[-5:],
+        )
+        mission = advanced.json()["mission"]
+        assert mission["snapshot"]["status"] == "completed"
+        skipped = {
+            item["nodeId"]
+            for item in mission["nodeStates"]
+            if item["status"] == "skipped"
+        }
+        assert any("view-02" in item for item in skipped)
+        # The fake Robot Agent projects the achieved Nav2 goal exactly, so the
+        # new post-approach facing checkpoint must be durably skipped instead
+        # of dispatching an invalid zero Spin or pausing for user input.
+        assert "object-approach-align" in skipped
+        assert any(
+            item.get("kind") == "skill_skipped"
+            and item.get("nodeId") == "object-approach-align"
+            for item in advanced.json()["actions"]
+        )
+        assert len(visual.requests) == 2  # target grounding + arrival verification
+        assert visual.requests[0]["mode"] == "object_approach"
+        assert visual.requests[1]["mode"] == "arrival_verification"
+
+    navigation_dispatches = [
+        request
+        for request, _ in driver.dispatches
+        if request.commandKey == NAVIGATION_COMMAND_KEY
+    ]
+    assert len(navigation_dispatches) == 1
+    assert navigation_dispatches[0].payload["goalPose"]["x"] == 1.25
+
+
+def test_deterministic_active_search_rotates_and_reports_not_found(
+    monkeypatch,
+) -> None:
+    from services.control_api.mission_client import UnavailableMissionPlanningClient
+
+    class MissingObjectVisualTaskClient(FakeVisualTaskClient):
+        def analyze(self, request: Mapping[str, Any]) -> Mapping[str, Any]:
+            result = dict(super().analyze(request))
+            sequence = len(self.requests)
+            result.update(
+                analysisId=f"analysis-missing-computer-{sequence}",
+                status="rejected",
+                hypotheses=[],
+                geometryCandidates=[],
+                ambiguityCandidates=[],
+                rejectionReason="target_not_found",
+            )
+            return result
+
+    monkeypatch.setenv("ROBOT_AGENT_ID", "robot-1")
+    monkeypatch.setenv("ROBOT_AGENT_LOCALIZATION_EPOCH_ID", "epoch-live-1")
+    monkeypatch.setenv("HIDE_VISION_SOURCE_MODE", "synthetic")
+    driver = OfficeInspectionMissionRobotDriver()
+    visual = MissingObjectVisualTaskClient()
+    app = create_app(
+        auth_token=TOKEN,
+        adapters={"robot_agent": RobotAgentAdapter(driver=driver)},
+        mission_planning_client=UnavailableMissionPlanningClient(
+            "active search must not call the text planner"
+        ),
+        visual_task_client=visual,
+        mission_supervisor_interval=3600,
+    )
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v2/missions/drafts",
+            headers=headers(),
+            json={
+                "requestId": "request-computer-search-miss-1",
+                "missionId": "mission-computer-search-miss-1",
+                "robotId": "robot-1",
+                "objective": "搜索并找到电脑",
+                "requestedBy": "operator-test",
+            },
+        )
+        assert created.status_code == 201, created.text
+        mission_id = created.json()["draftId"]
+        approved = client.post(
+            f"/api/v2/missions/drafts/{mission_id}/approve",
+            headers=headers(),
+            json={"approvedBy": "operator-test"},
+        )
+        assert approved.status_code == 200, approved.text
+        advanced = client.post(
+            f"/api/v2/missions/{mission_id}/advance",
+            headers=headers(),
+            json={"maximumSteps": 50},
+        )
+        assert advanced.status_code == 200, advanced.text
+        mission = advanced.json()["mission"]
+        assert mission["snapshot"]["status"] == "completed"
+        report = next(
+            execution["result"]["result"]["missionReport"]
+            for execution in mission["skillExecutions"]
+            if execution["request"]["skillId"] == "mission.report"
+        )
+        assert report["found"] is False
+        assert "没有找到" in report["narrativeZhCN"]
+
+    assert len(visual.requests) == 4
+    assert sum(
+        1
+        for request, _ in driver.dispatches
+        if request.commandKey == "navigation.rotate"
+    ) == 3
+
+
+def test_second_robot_mission_stays_reviewable_but_cannot_start_concurrently() -> None:
+    app = create_app(
+        auth_token=TOKEN,
+        mission_planning_client=FakeMissionPlanningClient(),
+        mission_supervisor_interval=3600,
+    )
+    with TestClient(app) as client:
+        first = client.post(
+            "/api/v2/missions/drafts",
+            headers=headers(),
+            json={
+                "requestId": "request-queue-first",
+                "missionId": "mission-queue-first",
+                "robotId": "robot-1",
+                "objective": "向前移动",
+            },
+        )
+        assert first.status_code == 201, first.text
+        first_id = first.json()["draftId"]
+        approved = client.post(
+            f"/api/v2/missions/drafts/{first_id}/approve",
+            headers=headers(),
+            json={"approvedBy": "operator-test"},
+        )
+        assert approved.status_code == 200, approved.text
+
+        second = client.post(
+            "/api/v2/missions/drafts",
+            headers=headers(),
+            json={
+                "requestId": "request-queue-second",
+                "missionId": "mission-queue-second",
+                "robotId": "robot-1",
+                "objective": "向后移动",
+            },
+        )
+        assert second.status_code == 201, second.text
+        second_id = second.json()["draftId"]
+        blocked = client.post(
+            f"/api/v2/missions/drafts/{second_id}/approve",
+            headers=headers(),
+            json={"approvedBy": "operator-test"},
+        )
+        assert blocked.status_code == 422, blocked.text
+        assert "ROBOT_MISSION_BUSY" in blocked.json()["detail"]
+        assert client.get(
+            f"/api/v2/missions/drafts/{second_id}", headers=headers()
+        ).json()["status"] == "draft"
 
 
 def test_mission_v2_advance_reconciles_running_robot_agent_without_replay(

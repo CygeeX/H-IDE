@@ -118,11 +118,26 @@ def test_auth_migration_is_expand_only_versioned_and_idempotent(tmp_path) -> Non
             "name": "daaam_observation_only_semantic_memory",
             "appliedAt": migrations[7]["appliedAt"],
         },
+        {
+            "version": 9,
+            "name": "assistant_v2_conversation_mission_history",
+            "appliedAt": migrations[8]["appliedAt"],
+        },
+        {
+            "version": 10,
+            "name": "assistant_v2_turn_ordering",
+            "appliedAt": migrations[9]["appliedAt"],
+        },
+        {
+            "version": 11,
+            "name": "assistant_v2_semantic_referents",
+            "appliedAt": migrations[10]["appliedAt"],
+        },
     ]
     first.close()
 
     reopened = SQLiteStore(str(db_path))
-    assert len(reopened.schema_migrations()) == 8
+    assert len(reopened.schema_migrations()) == 11
     assert reopened.get_robot("legacy-robot")["sentinel"] == "preserved"
     tables = {
         row[0]
@@ -150,6 +165,8 @@ def test_auth_migration_is_expand_only_versioned_and_idempotent(tmp_path) -> Non
         "robot_site_bindings",
         "daaam_memory_imports",
         "daaam_memory_entities",
+        "assistant_conversation_missions",
+        "assistant_semantic_referents",
     } <= tables
     reopened.close()
 

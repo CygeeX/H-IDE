@@ -64,8 +64,8 @@ def envelope_defaults(objective: object) -> dict[str, Any]:
         ),
         "maximumSpeedMps": 0.40,
         "maximumDurationSeconds": OFFICE_INSPECTION_MAXIMUM_DURATION_SECONDS,
-        "maximumAutoRevisions": 3,
-        "maximumStageAttempts": 3,
+        "maximumAutoRevisions": 8,
+        "maximumStageAttempts": 8,
         "maximumScanYawRad": OFFICE_INSPECTION_MAXIMUM_SCAN_YAW_RAD,
     }
 
@@ -245,11 +245,59 @@ def build_report(
     *,
     inspection_catalog: Mapping[str, Any] | None = None,
     source_missions: Sequence[Mapping[str, Any]] | None = None,
+    region_ids: Sequence[str] | None = None,
+    station_ids: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Aggregate only immutable scan outputs; never consult object truth."""
 
     source = catalog() if inspection_catalog is None else dict(inspection_catalog)
     stations = station_index(source)
+    selected_region_ids: list[str] | None = None
+    if region_ids is not None:
+        if isinstance(region_ids, (str, bytes)):
+            raise ValueError("report region_ids must be a sequence of region IDs")
+        selected_region_ids = [str(item).strip() for item in region_ids]
+        if (
+            not selected_region_ids
+            or any(not item for item in selected_region_ids)
+            or len(selected_region_ids) != len(set(selected_region_ids))
+        ):
+            raise ValueError("report region_ids are invalid")
+    selected_station_ids: list[str] | None = None
+    if station_ids is not None:
+        if isinstance(station_ids, (str, bytes)):
+            raise ValueError("report station_ids must be a sequence of station IDs")
+        selected_station_ids = [str(item).strip() for item in station_ids]
+        if (
+            not selected_station_ids
+            or any(not item for item in selected_station_ids)
+            or len(selected_station_ids) != len(set(selected_station_ids))
+            or any(item not in stations for item in selected_station_ids)
+        ):
+            raise ValueError("report station_ids are invalid")
+    region_by_id = {
+        str(item.get("regionId")): item
+        for item in source.get("regions", [])
+        if isinstance(item, Mapping) and item.get("regionId")
+    }
+    if selected_region_ids is not None:
+        if any(item not in region_by_id for item in selected_region_ids):
+            raise ValueError("report region_ids contain an unknown Office V2 region")
+    if selected_station_ids is not None:
+        if selected_region_ids is not None and any(
+            stations[item].get("regionId") not in set(selected_region_ids)
+            for item in selected_station_ids
+        ):
+            raise ValueError("report station_ids do not belong to the selected regions")
+        if selected_region_ids is None:
+            selected_region_ids = []
+            for station_id in selected_station_ids:
+                region_id = str(stations[station_id].get("regionId") or "")
+                if region_id and region_id not in selected_region_ids:
+                    selected_region_ids.append(region_id)
+    selected_station_set = (
+        set(selected_station_ids) if selected_station_ids is not None else None
+    )
     observations: dict[str, dict[str, Any]] = {}
     for mission_record in [*(source_missions or ()), mission]:
         for execution in mission_record.get("skillExecutions", []):
@@ -282,6 +330,8 @@ def build_report(
                 continue
             observed_headings: list[float] = []
             valid = True
+            reliable_visual_count = 0
+            heading_gaps: list[dict[str, Any]] = []
             for heading in raw_headings:
                 if not isinstance(heading, Mapping):
                     valid = False
@@ -292,7 +342,22 @@ def build_report(
                     isinstance(raw_yaw, bool)
                     or not isinstance(raw_yaw, (int, float))
                     or not math.isfinite(float(raw_yaw))
-                    or not isinstance(visual, Mapping)
+                ):
+                    valid = False
+                    break
+                observed_headings.append(float(raw_yaw))
+                if heading.get("status") == "missing" and visual is None:
+                    heading_gaps.append(
+                        {
+                            "headingRad": float(raw_yaw),
+                            "reason": str(
+                                heading.get("missingReason") or "未取得可靠观察"
+                            )[:512],
+                        }
+                    )
+                    continue
+                if (
+                    not isinstance(visual, Mapping)
                     or visual.get("schemaVersion") != "h-ide.visual-result/2"
                     or visual.get("status") != "succeeded"
                     or visual.get("mode") != "scene_description"
@@ -301,21 +366,44 @@ def build_report(
                 ):
                     valid = False
                     break
-                observed_headings.append(float(raw_yaw))
+                reliable_visual_count += 1
             if not valid or any(
                 abs(actual - float(expected)) > 1e-9
                 for actual, expected in zip(observed_headings, expected_headings, strict=True)
-            ):
+            ) or reliable_visual_count == 0:
                 continue
-            observations[station_id] = dict(scan)
+            observations[station_id] = {
+                **dict(scan),
+                "headingGaps": heading_gaps,
+            }
 
+    if selected_region_ids is None:
+        regions_to_report = [
+            item for item in source["regions"] if isinstance(item, Mapping)
+        ]
+    else:
+        regions_to_report = [region_by_id[item] for item in selected_region_ids]
     regions: list[dict[str, Any]] = []
     evidence: list[dict[str, Any]] = []
     missing_stations: list[str] = []
-    for region in source["regions"]:
+    heading_gaps: list[dict[str, Any]] = []
+    for region in regions_to_report:
         station_reports: list[dict[str, Any]] = []
         summaries: list[str] = []
-        for station in region["stations"]:
+        report_stations = [
+            station
+            for station in region["stations"]
+            if selected_station_set is None
+            or station.get("stationId") in selected_station_set
+        ]
+        if not report_stations:
+            # A selected region must have at least one selected station.  This
+            # is checked here as well as at the input boundary so the report
+            # cannot claim completion for an empty room selection.
+            raise ValueError(
+                f"report selection contains no station for region {region['regionId']}"
+            )
+        for station in report_stations:
             station_id = station["stationId"]
             scan = observations.get(station_id)
             if scan is None:
@@ -330,6 +418,15 @@ def build_report(
                     continue
                 visual = heading.get("visualResult")
                 if not isinstance(visual, Mapping):
+                    heading_gaps.append(
+                        {
+                            "stationId": station_id,
+                            "headingRad": heading.get("headingRad"),
+                            "reason": str(
+                                heading.get("missingReason") or "未取得可靠观察"
+                            )[:512],
+                        }
+                    )
                     continue
                 summary = str(visual.get("observationSummary") or "").strip()
                 if summary:
@@ -363,8 +460,13 @@ def build_report(
             station_reports.append(
                 {
                     "stationId": station_id,
-                    "status": "observed" if heading_reports else "missing",
+                    "status": (
+                        "observed_with_gaps"
+                        if scan.get("headingGaps")
+                        else "observed"
+                    ) if heading_reports else "missing",
                     "headings": heading_reports,
+                    "headingGaps": list(scan.get("headingGaps", [])),
                 }
             )
             if not heading_reports:
@@ -377,6 +479,8 @@ def build_report(
                 "status": (
                     "observed"
                     if all(item["status"] == "observed" for item in station_reports)
+                    else "observed_with_gaps"
+                    if all(item["status"] != "missing" for item in station_reports)
                     else "partial"
                 ),
                 "summaries": summaries,
@@ -384,8 +488,13 @@ def build_report(
             }
         )
     missing_stations = list(dict.fromkeys(missing_stations))
-    status = "completed" if not missing_stations else "completed_with_gaps"
-    lines = ["Office V2 巡检报告"]
+    status = (
+        "completed"
+        if not missing_stations and not heading_gaps
+        else "completed_with_gaps"
+    )
+    selected = selected_region_ids is not None or selected_station_ids is not None
+    lines = ["Office V2 定向巡检报告" if selected else "Office V2 巡检报告"]
     for region in regions:
         summaries = region["summaries"]
         lines.append(
@@ -394,16 +503,36 @@ def build_report(
         )
     if missing_stations:
         lines.append("- 信息缺口：" + "、".join(missing_stations))
-    return {
+    if heading_gaps:
+        lines.append(
+            "- 未确认方向："
+            + "、".join(
+                f"{item['stationId']}@{float(item['headingRad']):.2f}rad"
+                for item in heading_gaps
+                if isinstance(item.get("headingRad"), (int, float))
+            )
+        )
+    report: dict[str, Any] = {
         "schemaVersion": "h-ide.office-report/1",
         "missionId": mission.get("missionId") or mission.get("snapshot", {}).get("missionId"),
+        "reportScope": (
+            "selected_locations"
+            if selected
+            else "all_office_regions_and_corridor"
+        ),
         "status": status,
         "fullChainAccepted": status == "completed",
         "regions": regions,
         "missingStations": missing_stations,
+        "headingGaps": heading_gaps,
         "evidence": evidence,
         "narrativeZhCN": "\n".join(lines),
     }
+    if selected_region_ids is not None:
+        report["regionIds"] = list(selected_region_ids)
+    if selected_station_ids is not None:
+        report["stationIds"] = list(selected_station_ids)
+    return report
 
 
 def build_location_report(

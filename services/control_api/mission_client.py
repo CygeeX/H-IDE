@@ -19,6 +19,40 @@ class MissionPlanningUnavailable(RuntimeError):
     pass
 
 
+_MISSION_BRIEF_WIRE_FIELDS = frozenset(
+    {
+        "requestId",
+        "missionId",
+        "robotId",
+        "requestedBy",
+        "objective",
+        "locale",
+        "modality",
+        "contextVersion",
+        "envelope",
+        "capabilities",
+        "history",
+        "worldRecords",
+    }
+)
+
+
+def _mission_brief_wire_payload(brief: Mapping[str, Any]) -> dict[str, Any]:
+    """Project H-IDE bookkeeping out of the strict Agent Mission contract.
+
+    Conversation and semantic-referent IDs are used by H-IDE's deterministic
+    compilers, but are not part of the planning-agent MissionBrief schema.
+    Keeping this projection at the HTTP boundary prevents an internal
+    implementation detail from turning a valid fallback plan into a 422.
+    """
+
+    return {
+        key: brief[key]
+        for key in _MISSION_BRIEF_WIRE_FIELDS
+        if key in brief
+    }
+
+
 class UnavailableMissionPlanningClient:
     def __init__(self, reason: str = "Mission V2 planning service is not configured") -> None:
         self.reason = reason
@@ -81,6 +115,30 @@ class MastraMissionPlanningClient:
                 )
             response.raise_for_status()
             value = response.json()
+        except httpx.HTTPStatusError as exc:
+            # Keep the planner's bounded validation detail in the durable
+            # diagnostic without exposing the request body.  A bare 4xx/5xx
+            # made every semantic miss look like a generic outage and hid
+            # whether the planner rejected a schema or was unavailable.
+            response = exc.response
+            detail: str | None = None
+            try:
+                decoded = response.json()
+            except ValueError:
+                decoded = None
+            if isinstance(decoded, Mapping):
+                raw_detail = decoded.get("detail") or decoded.get("error")
+                if isinstance(raw_detail, str) and raw_detail.strip():
+                    detail = raw_detail.strip()
+            if detail is None:
+                raw_text = response.text.strip()
+                detail = raw_text or None
+            if detail is not None:
+                detail = detail[:1_000]
+            suffix = f": {detail}" if detail else ""
+            raise MissionPlanningUnavailable(
+                f"Mission V2 planning request failed ({response.status_code}){suffix}"
+            ) from exc
         except (httpx.HTTPError, ValueError) as exc:
             raise MissionPlanningUnavailable(f"Mission V2 planning request failed: {exc}") from exc
         if not isinstance(value, Mapping):
@@ -88,7 +146,10 @@ class MastraMissionPlanningClient:
         return value
 
     def create_draft(self, brief: Mapping[str, Any]) -> Mapping[str, Any]:
-        return self._post("/internal/v2/mission-plans", brief)
+        return self._post(
+            "/internal/v2/mission-plans",
+            _mission_brief_wire_payload(brief),
+        )
 
     def create_revision(self, request: Mapping[str, Any]) -> Mapping[str, Any]:
         return self._post("/internal/v2/mission-revisions", request)
@@ -121,4 +182,3 @@ __all__ = [
     "UnavailableMissionPlanningClient",
     "mission_planning_client_from_env",
 ]
-

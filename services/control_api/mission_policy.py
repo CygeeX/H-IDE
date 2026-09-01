@@ -327,7 +327,7 @@ class MissionPolicy:
 
     @staticmethod
     def _capability(skill_id: str) -> Capability:
-        if skill_id == "vision.observe":
+        if skill_id in {"vision.observe", "scene.verify_inside_region"}:
             return Capability.OBSERVATION
         if skill_id in _PHYSICAL_SKILLS:
             return Capability.NAV2
