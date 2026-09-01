@@ -305,6 +305,7 @@ paths = [
     root / "manifests/release/l3-mission-result.schema.json",
     root / "manifests/sbom/skillstore-office-v2-e2e-20260901-r1.spdx.json",
     root / "manifests/ros/jazzy-user-prefix-amd64.json",
+    root / "manifests/python/simulation-runtime.json",
     root / "manifests/vendor/g1-model.json",
     root / "manifests/vendor/groot-wbc.json",
     root / "manifests/vendor/lerobot.json",
@@ -372,6 +373,13 @@ for prefix in ros_prefix.get("prefixes", []):
             for key in ("name", "version", "sha256")
         ) or not re.fullmatch(r"[0-9a-f]{64}", package["sha256"]):
             raise SystemExit(f"invalid ROS package lock in prefix: {prefix_id}")
+python_runtime = json.loads(paths[4].read_text(encoding="utf-8"))
+if (
+    python_runtime.get("schemaVersion") != "skillstore.python-runtime/1"
+    or python_runtime.get("python") != "3.12"
+    or python_runtime.get("profile") != "mujoco-sonic-cu128"
+):
+    raise SystemExit("unexpected simulation Python runtime contract")
 lock = json.loads(paths[-1].read_text(encoding="utf-8"))
 if lock.get("schema_version") != "h-ide.sonic-model-lock/1":
     raise SystemExit("unexpected SONIC lock schema")
@@ -469,6 +477,34 @@ print("ROS Jazzy user prefixes: manifest, platform, payloads and required paths 
 PY
   then
     fail 'ROS Jazzy user-prefix validation failed'
+  fi
+  if [[ -x "${sim}/.venv/bin/python" ]]; then
+    if ! "${sim}/.venv/bin/python" - "${ROOT}/manifests/python/simulation-runtime.json" <<'PY'
+import importlib.metadata
+import json
+from pathlib import Path
+import sys
+import torch
+import torchvision  # noqa: F401
+import cyclonedds  # noqa: F401
+import lerobot  # noqa: F401
+import unitree_sdk2py  # noqa: F401
+
+manifest = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+expected = manifest["packages"]
+actual = {
+    name: importlib.metadata.version(name)
+    for name in ("torch", "torchvision", "cyclonedds", "lerobot", "unitree-sdk2py")
+}
+if actual != expected or torch.version.cuda != "12.8":
+    raise SystemExit(f"simulation Python runtime mismatch: {actual}, CUDA={torch.version.cuda}")
+print("Simulation Python/CUDA runtime: manifest locked")
+PY
+    then
+      fail 'simulation Python/CUDA runtime does not match its manifest'
+    fi
+  else
+    fail 'MuJoCo Python environment is absent; run integration/setup-environments.sh'
   fi
   [[ -L "${g1_path}" && -f "${g1_path}/assets/h_ide_office_29dof.xml" ]] \
     || fail 'G1 model overlay is not installed; run bootstrap.sh --fetch-g1-model'

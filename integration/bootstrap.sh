@@ -309,4 +309,4 @@ if [[ -e "${g1_component_path}" ]]; then
 else
   printf '%s\n' '- G1 model: missing (required for L2)'
 fi
-printf '%s\n' 'Next: run integration/preflight.sh --level L0, then configure external keys and assets for L1/L2.'
+printf '%s\n' 'Next: run integration/setup-environments.sh, then preflight L0 and configure external keys/assets for L2.'

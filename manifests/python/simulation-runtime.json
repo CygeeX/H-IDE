@@ -1,0 +1,28 @@
+{
+  "schemaVersion": "skillstore.python-runtime/1",
+  "python": "3.12",
+  "profile": "mujoco-sonic-cu128",
+  "pytorchIndexUrl": "https://download.pytorch.org/whl/cu128",
+  "packages": {
+    "torch": "2.11.0+cu128",
+    "torchvision": "0.26.0+cu128",
+    "cyclonedds": "11.0.1",
+    "lerobot": "0.6.1",
+    "unitree-sdk2py": "1.0.1"
+  },
+  "localSources": {
+    "lerobot": "third_party/lerobot",
+    "unitree-sdk2py": "third_party/unitree_sdk2_python"
+  },
+  "unitreeDependencyOverride": {
+    "upstreamRequirement": "cyclonedds==0.10.2 and opencv-python",
+    "releaseRuntime": "cyclonedds==11.0.1 and opencv-python-headless via LeRobot",
+    "reason": "The upstream 0.10.2 sdist cannot build in the frozen Python 3.12 environment. The H-IDE simulation API usage is covered by Unitree bridge and motion regressions with CycloneDDS 11.0.1."
+  },
+  "validation": [
+    "import torch, torchvision, lerobot, unitree_sdk2py, cyclonedds",
+    "torch.version.cuda == 12.8",
+    "Office V2 scene check",
+    "MuJoCo/Nav2/SONIC regression suite"
+  ]
+}

@@ -54,25 +54,12 @@ uv --version
 
 ```bash
 ./integration/provision-ros-prefixes.sh
-
-python3.12 -m venv "$ROOT/components/h-ide/.venv"
-"$ROOT/components/h-ide/.venv/bin/pip" install \
-  -e "$ROOT/components/h-ide[test,daaam]"
-
-python3.12 -m venv "$ROOT/components/h-ide-mujoco-sonic/.venv"
-"$ROOT/components/h-ide-mujoco-sonic/.venv/bin/pip" install \
-  -e "$ROOT/components/h-ide-mujoco-sonic[runtime,test]"
-
-(cd "$ROOT/components/h-ide-vision" && uv sync --locked --extra dev)
-
-(cd "$ROOT/components/robotagent" && \
-  uv venv --python /usr/bin/python3.12 --system-site-packages .venv && \
-  uv sync --python .venv/bin/python --all-groups && \
-  bash -lc 'source /opt/ros/jazzy/setup.bash && /usr/bin/python3 /usr/bin/colcon build --symlink-install')
-
-(cd "$ROOT/components/h-ide-agent" && npm ci)
-(cd "$ROOT/components/h-ide/apps/control-pwa" && npm ci)
+./integration/setup-environments.sh
 ```
+
+安装脚本从 `manifests/python/simulation-runtime.json` 固定 PyTorch CUDA 12.8、
+TorchVision、CycloneDDS、LeRobot 与 Unitree bridge 组合；它不会使用 sibling repo、系统中
+已有的虚拟环境或浮动 CUDA wheel。
 
 预期存在：
 
@@ -100,7 +87,8 @@ PWA `dist` 或 `node_modules` 提交到发行仓库。
 ## 4. 创建秘密与获取外部资产
 
 ```bash
-./integration/bootstrap.sh --install-agent --provision-ros-prefixes
+./integration/bootstrap.sh --provision-ros-prefixes
+./integration/setup-environments.sh
 chmod 600 "$ROOT/.env"
 ```
 

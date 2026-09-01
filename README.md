@@ -64,6 +64,7 @@ cd skillstore
 git checkout --detach integration/office-v2-e2e-20260901-r1
 ROOT="$(pwd -P)"
 ./integration/bootstrap.sh
+./integration/setup-environments.sh
 ```
 
 随后按[快速开始](docs/quickstart/README.md)配置隔离环境、供应商凭据和外部资产，运行：

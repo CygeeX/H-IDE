@@ -41,8 +41,8 @@
     {
       "id": "h-ide-mujoco-sonic",
       "path": "components/h-ide-mujoco-sonic",
-      "sourceCommit": "22ca5c18bcbbbc4648e5ea8816b8654b24daedea",
-      "distributionTree": "efde2fc7f540ee928be75cc2d81e25acc152a6d5",
+      "sourceCommit": "8c6f3e6375b3f2c4f00e721f885a5a93c56dada3",
+      "distributionTree": "8dc02f85af2bda09087d1281a065d269c4b5953a",
       "runtimeDefault": true
     }
   ],
@@ -105,6 +105,8 @@
   "artifacts": {
     "integrationLock": "integration/integration.lock.yaml",
     "sourceComponentSbom": "manifests/sbom/skillstore-office-v2-e2e-20260901-r1.spdx.json",
+    "simulationPythonRuntime": "manifests/python/simulation-runtime.json",
+    "rosUserPrefixes": "manifests/ros/jazzy-user-prefix-amd64.json",
     "rosUserPrefixManifest": "manifests/ros/jazzy-user-prefix-amd64.json",
     "rosUserPrefixProvisioner": "integration/provision-ros-prefixes.sh",
     "runtimeWeightsAndModelsDistributed": false,

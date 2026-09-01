@@ -62,28 +62,17 @@ ROOT="$(pwd -P)"
 
 ## 4. 创建隔离环境
 
-`bootstrap.sh` 默认只创建本地 `.env`、内部随机令牌和外部资产链接。它不会替你创建
-全部 Python/ROS 环境，因此首次复刻还需执行：
+`bootstrap.sh` 创建本地 `.env`、内部随机令牌、外部资产链接和锁定 ROS prefix；
+`setup-environments.sh` 根据发布 manifest 创建全部 Python/Node/ROS 环境：
 
 ```bash
-./integration/bootstrap.sh --install-agent --provision-ros-prefixes
-
-python3.12 -m venv components/h-ide/.venv
-components/h-ide/.venv/bin/pip install -e 'components/h-ide[test,daaam]'
-
-python3.12 -m venv components/h-ide-mujoco-sonic/.venv
-components/h-ide-mujoco-sonic/.venv/bin/pip install \
-  -e 'components/h-ide-mujoco-sonic[runtime,test]'
-
-(cd components/h-ide-vision && uv sync --locked --extra dev)
-
-(cd components/robotagent && \
-  uv venv --python /usr/bin/python3.12 --system-site-packages .venv && \
-  uv sync --python .venv/bin/python --all-groups && \
-  bash -lc 'source /opt/ros/jazzy/setup.bash && /usr/bin/python3 /usr/bin/colcon build --symlink-install')
-
-(cd components/h-ide/apps/control-pwa && npm ci)
+./integration/bootstrap.sh --provision-ros-prefixes
+./integration/setup-environments.sh
 ```
+
+仿真环境严格安装 `torch 2.11.0+cu128`、`torchvision 0.26.0+cu128` 和
+`cyclonedds 11.0.1`；Unitree 上游旧 CycloneDDS 要求的兼容覆盖及原因记录在
+`manifests/python/simulation-runtime.json`。不要改用浮动 PyPI CUDA 13 wheel。
 
 launcher 要求以下两个 operator-local ROS prefix：
 

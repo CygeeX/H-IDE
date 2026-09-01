@@ -37,8 +37,8 @@ components:
     role: robot-agent-observation-and-command-boundary
   - id: h-ide-mujoco-sonic
     path: components/h-ide-mujoco-sonic
-    source_commit: 22ca5c18bcbbbc4648e5ea8816b8654b24daedea
-    distribution_tree: efde2fc7f540ee928be75cc2d81e25acc152a6d5
+    source_commit: 8c6f3e6375b3f2c4f00e721f885a5a93c56dada3
+    distribution_tree: 8dc02f85af2bda09087d1281a065d269c4b5953a
     role: mujoco-office-v2-sonic-nav2-adapter
   - id: daaam
     path: optional/DAAAM
@@ -105,6 +105,8 @@ external_sources:
 runtime:
   primary_os: Ubuntu 24.04
   ros_distribution: jazzy
+  simulation_python_manifest: manifests/python/simulation-runtime.json
+  bootstrap_huggingface_hub: "1.29.0"
   ros_user_prefix_manifest: manifests/ros/jazzy-user-prefix-amd64.json
   ros_user_prefix_provisioner: integration/provision-ros-prefixes.sh
   python:
