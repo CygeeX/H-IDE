@@ -259,6 +259,8 @@ _CONTROL_PWA_DEEP_LINKS = (
     "/app/scene-memory",
     "/developer",
     "/developer/tasks/{conversation_id}",
+    "/developer/robots",
+    "/developer/diagnostics",
     "/developer/simulation",
     "/developer/interfaces",
     "/developer/scene-memory",
