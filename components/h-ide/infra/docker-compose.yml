@@ -6,7 +6,8 @@ services:
       context: ..
       dockerfile: infra/Dockerfile.control-api
     environment:
-      CONTROL_API_TOKEN: ${CONTROL_API_TOKEN:-dev-token}
+      # Fail before recreating the service if the operator omitted the env file.
+      CONTROL_API_TOKEN: ${CONTROL_API_TOKEN:?set CONTROL_API_TOKEN via --env-file components/h-ide/.env}
       CONTROL_DB_PATH: /data/control.db
       REDIS_URL: redis://redis:6379/0
       DATABASE_URL: postgresql://control:control@postgres:5432/control
