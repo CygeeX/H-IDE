@@ -3175,6 +3175,7 @@ def test_second_robot_mission_stays_reviewable_but_cannot_start_concurrently() -
         )
         assert blocked.status_code == 422, blocked.text
         assert "ROBOT_MISSION_BUSY" in blocked.json()["detail"]
+        assert "该机器人已有一个已审核的任务，必须先完成或取消该任务" in blocked.json()["detail"]
         assert client.get(
             f"/api/v2/missions/drafts/{second_id}", headers=headers()
         ).json()["status"] == "draft"
