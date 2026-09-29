@@ -28,10 +28,15 @@ const DEEPSEEK_FAST_PROVIDER_OPTIONS = {
 const missionDraftStructuredOutputSchema = missionDraftModelOutputSchema.strip();
 const missionRevisionStructuredOutputSchema = missionRevisionModelOutputSchema.strip();
 
-function missionMemory(input: { missionId: string; requestedBy: string }) {
+function missionMemory(input: { missionId: string }) {
   return {
-    thread: `mission:${input.missionId}`,
-    resource: `h-ide:${input.requestedBy}`,
+    // A Mission can be created by a user and later replanned by the runtime.
+    // requestedBy identifies the actor for one operation, so it must not own
+    // the durable Mastra thread.  Scope both identifiers to the immutable
+    // Mission identity instead.  The v2 namespace also lets existing Missions
+    // recover from legacy threads that were already bound to a user resource.
+    thread: `mission:v2:${input.missionId}`,
+    resource: `h-ide:mission:${input.missionId}`,
   };
 }
 
