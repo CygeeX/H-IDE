@@ -15,9 +15,9 @@
       "path": "components/h-ide",
       "sourceCommit": "6af81007bf5f5edcbc12030a80e0565ce60e2468",
       "sourceTree": "9823f5012205626a116601ec4c161ff8974a9aed",
-      "distributionTree": "6edc4f023162e196f5e9ca51e2e174ce510d2787",
-      "distributionDeltaSha256": "5378cafecdfa9655706cc9dc94cdb4e36a9117d6b84559746ea123180350641c",
-      "distributionDeltaPathCount": 12,
+      "distributionTree": "06a2beab27289bc8421fe772846e6f5fd741a554",
+      "distributionDeltaSha256": "8cb7a17451bf8909f29d55e39ddb7ff59449c5885e8838a24093abc1ce511b88",
+      "distributionDeltaPathCount": 23,
       "distributionAdaptation": "monorepo portability, release authentication documentation and integration packaging",
       "runtimeDefault": true
     },
@@ -59,9 +59,9 @@
       "path": "components/h-ide-mujoco-sonic",
       "sourceCommit": "8c6f3e6375b3f2c4f00e721f885a5a93c56dada3",
       "sourceTree": "3758b0c281958820d2fed29ada16093bd7eeb2f2",
-      "distributionTree": "8dc02f85af2bda09087d1281a065d269c4b5953a",
-      "distributionDeltaSha256": "92ad9590afdec644e5dfee8237969041c5d74a5865911e6c8059c9ba4d6cf39a",
-      "distributionDeltaPathCount": 17,
+      "distributionTree": "8d257545dc2ece363668ff5c07a9362d206c2279",
+      "distributionDeltaSha256": "cdbd738ec40d95c3739d1739f5028eb7dcc029cde601967aacee5df81bcf4712",
+      "distributionDeltaPathCount": 19,
       "distributionAdaptation": "monorepo external-asset boundary, portable dependency locks and release packaging",
       "runtimeDefault": true
     }
