@@ -2897,12 +2897,19 @@ def create_app(
                 raise ValueError("persisted Mission command receipt is invalid")
             if not isinstance(persisted_request, Mapping):
                 raise ValueError("persisted Mission command request is invalid")
-            command = CommandRequest.model_validate(persisted_request)
+            # Reconciliation uses the original immutable identity only. The
+            # request's authorization TTL may have expired while the process
+            # was down, so reparsing it as a dispatchable CommandRequest would
+            # reject the very cancellation/query needed to close that request.
+            command_id = persisted_request.get("commandId")
+            command_robot_id = persisted_request.get("robotId")
+            command_key = persisted_request.get("commandKey")
+            command_transport = persisted_request.get("transport")
             if (
-                command.commandId != skill.requestId
-                or command.robotId != skill.robotId
-                or command.commandKey != skill.skillId
-                or command.transport is not Transport.ROBOT_AGENT
+                command_id != skill.requestId
+                or command_robot_id != skill.robotId
+                or command_key != skill.skillId
+                or command_transport != Transport.ROBOT_AGENT.value
             ):
                 raise ValueError("persisted Mission command identity is invalid")
             adapter = context.adapters.get(Transport.ROBOT_AGENT.value)
@@ -2914,8 +2921,8 @@ def create_app(
                 None,
             )
             if callable(restore_route):
-                restore_route(command.commandId, command.robotId)
-            outcome = adapter.query(command.commandId)
+                restore_route(command_id, command_robot_id)
+            outcome = adapter.query(command_id)
             outcome_status = str(outcome.status).strip().lower()
             if outcome_status in {"unavailable", "running", "accepted", "pending"}:
                 return {"mode": "robot_agent", "receipt": dict(persisted)}
@@ -2938,10 +2945,20 @@ def create_app(
                 and not isinstance(release_epoch, bool)
                 and release_epoch >= 1
             )
-            # A Gateway restart may answer "command not found" even though
-            # the old Robot Agent outcome is unknown. Only its fresh release
-            # proof permits a recovered physical terminal to escape.
-            if not release_confirmed:
+            # If the Gateway has lost its command ledger, an operator cancel
+            # can still establish a durable pre-dispatch tombstone. The Robot
+            # Agent rejects the exact derived command ID when it has never
+            # owned that command; the Gateway then reports CANCELLED with
+            # dispatchSuppressed=true. That correlated result is terminal for
+            # this request and prevents a delayed retry from moving the robot.
+            # Other recovered outcomes still require fresh physical safe-stop
+            # proof before they can be treated as terminal.
+            dispatch_suppressed_cancel = (
+                outcome_status in {"cancelled", "canceled"}
+                and isinstance(outcome.result, Mapping)
+                and outcome.result.get("dispatchSuppressed") is True
+            )
+            if not release_confirmed and not dispatch_suppressed_cancel:
                 return {"mode": "robot_agent", "receipt": dict(persisted)}
             terminal_status = {
                 "succeeded": CommandStatus.SUCCEEDED,
@@ -3009,9 +3026,43 @@ def create_app(
             skill.requestId not in context.runtime._requests
             or skill.requestId not in context.runtime._receipts
         ):
+            # Control API may have restarted after dispatch.  In that case the
+            # in-memory owner is gone, but the Robot Agent gateway keeps the
+            # immutable command ledger.  Reconcile through that ledger first;
+            # it is allowed to produce a terminal receipt only when the
+            # gateway proves the correlated safe-stop (see
+            # reconcile_mission_skill).  Never redispatch the old command.
+            try:
+                reconciled = reconcile_mission_skill(skill)
+            except (ValueError, MissionServiceError) as exc:
+                raise MissionServiceError(
+                    "physical command ownership is unavailable after restart; "
+                    f"explicit Robot Agent reconciliation is required ({exc})"
+                ) from exc
+            reconciled_receipt = (
+                reconciled.get("receipt")
+                if isinstance(reconciled, Mapping)
+                else None
+            )
+            reconciled_status = (
+                str(reconciled_receipt.get("status") or "").lower()
+                if isinstance(reconciled_receipt, Mapping)
+                else ""
+            )
+            if reconciled_status in {
+                "succeeded",
+                "failed",
+                "cancelled",
+                "canceled",
+                "expired",
+                "rejected",
+                "unknown",
+            }:
+                return {"mode": "robot_agent", "receipt": dict(reconciled_receipt)}
             raise MissionServiceError(
                 "physical command ownership is unavailable after restart; "
-                "explicit Robot Agent reconciliation is required"
+                "explicit Robot Agent reconciliation is required "
+                f"(reconciled status: {reconciled_status or 'missing'})"
             )
         try:
             receipt = context.runtime.cancel(skill.requestId)
