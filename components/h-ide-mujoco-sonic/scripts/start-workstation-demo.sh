@@ -50,9 +50,9 @@ HIDE_DEMO_FULL_STRAIGHT_DRIVE="${HIDE_FULL_STRAIGHT_DRIVE:-0}"
 HIDE_MUJOCO_ONSCREEN_VIEWER=0
 # Reversible simulation experiment: keep the learned SONIC whole-body policy
 # in control through automatic gait/navigation/health observations. Explicit
-# operator cancel and correlated safe-stop remain authoritative. Set this to 0
-# before launch to restore the reviewed fail-closed behavior.
-HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT="${HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT:-1}"
+# operator cancel and correlated safe-stop remain authoritative. This is
+# opt-in only: ordinary navigation must stop when measured motion diverges.
+HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT="${HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT:-0}"
 
 if [[ "${HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT}" != "0" \
   && "${HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT}" != "1" ]]; then
