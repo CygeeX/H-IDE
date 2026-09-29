@@ -758,13 +758,13 @@ def test_pre_agent_gate_requires_complete_structure_for_a_support_latch() -> Non
     assert _run_pre_agent_predicate(telemetry) == 1
 
 
-def test_launcher_enables_reversible_uninterrupted_sonic_experiment() -> None:
+def test_launcher_requires_opt_in_for_uninterrupted_sonic_experiment() -> None:
     launcher = (ROOT / "scripts" / "start-workstation-demo.sh").read_text(
         encoding="utf-8"
     )
 
     assert (
-        'HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT="${HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT:-1}"'
+        'HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT="${HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT:-0}"'
         in launcher
     )
     assert (
