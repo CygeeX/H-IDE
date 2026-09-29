@@ -973,6 +973,52 @@ def test_inbound_handshake_and_reconnect_accept_additive_control_truth() -> None
             assert second_session != first_session
 
 
+@pytest.mark.parametrize("update_pose", [False, True])
+def test_terminal_success_requires_measured_settlement(monkeypatch, update_pose) -> None:
+    peer = RobotAgentInboundPeer(
+        robot_id="g1-dev",
+        expected_capabilities_digest=CAPABILITY_DIGEST,
+        capabilities=CAPABILITIES,
+        allow_plaintext_loopback=True,
+        heartbeat=False,
+    )
+    clock = [10.0]
+    monkeypatch.setattr(ws_inbound.time, "monotonic", lambda: clock[0])
+    command_id = str(uuid4())
+    peer._commands[command_id] = command(command_id)
+    peer._record_message({
+        "type": "command.status",
+        "payload": {
+            "command_id": command_id, "state": "SUCCEEDED",
+            "detail": "Nav2 reached goal", "progress": 1.0,
+            "result": {"goalReached": True},
+        },
+    })
+    assert peer.query(command_id).state == "RUNNING"
+    clock[0] += peer.terminal_pose_max_wait_seconds + 0.1
+    if update_pose:
+        # A late first pose cannot prove a stable interval either.
+        peer._record_message({
+            "type": "state.snapshot",
+            "payload": {
+                "sequence": 1, "observed_at": datetime.now(UTC).isoformat(),
+                "state": {
+                    "localization": {
+                        "frame_id": "map", "stamp": {"sec": 1, "nanosec": 0},
+                        "position": {"x": 1.0, "y": 2.0, "z": 0.0},
+                        "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+                    },
+                },
+            },
+        })
+        assert peer._statuses[command_id].state == "FAILED"
+    result = peer.query(command_id)
+    assert result.state == "FAILED"
+    assert result.result["finalPoseRelation"] == "settlement_timeout"
+    assert result.result["errorCode"] == "TERMINAL_POSE_NOT_SETTLED"
+    assert command_id not in peer._terminal_pose_pending
+
+
 def test_inbound_gateway_accepts_agent_client_and_tracks_terminal_status() -> None:
     peer = RobotAgentInboundPeer(
         robot_id="g1-dev",
