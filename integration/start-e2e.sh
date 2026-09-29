@@ -13,8 +13,9 @@ if [[ "${1:-}" == "--help" ]]; then
 usage: integration/start-e2e.sh [--rebuild] [--viewer] [--motion-core]
                                 [--continuous-drive-handoff|--full-straight-drive]
 
-Start the frozen Office V2 H-IDE/Mission/Vision/Robot Agent/Nav2/SONIC chain.
-Use --rebuild for every clean-clone release audit.
+Start the Office V2 H-IDE/Mission/Vision/Robot Agent/Nav2/SONIC chain.
+Development starts skip the frozen release-lock comparison; use
+integration/preflight.sh --level L1 for a release audit.
 
 This workstation profile intentionally uses fixed topology identities:
   Compose project: skillstore-e2e
@@ -48,5 +49,8 @@ export HIDE_DEMO_CONFIG="${HIDE_DEMO_CONFIG:-${HIDE_DEMO_SIM_ROOT}/config/ros-he
 export HIDE_DEMO_ROBOT_CONFIG="${HIDE_DEMO_ROBOT_CONFIG:-${HIDE_DEMO_ROBOT_ROOT}/src/robot_agent/config/robot_agent.mujoco.yaml}"
 export HIDE_DEMO_OBSERVATION_CONFIG="${HIDE_DEMO_OBSERVATION_CONFIG:-${HIDE_DEMO_ROBOT_ROOT}/src/robot_observation_gateway/config/robot_observation_gateway.mujoco.yaml}"
 
-"${SCRIPT_DIR}/preflight.sh" --level L1
+# Development starts validate the working runtime and generated scene, but do
+# not require the frozen release manifest to match every local code change.
+# Release/acceptance jobs should invoke preflight without this flag.
+"${SCRIPT_DIR}/preflight.sh" --level L1 --skip-release-lock
 exec "${HIDE_DEMO_SIM_ROOT}/scripts/start-workstation-demo.sh" "$@"
