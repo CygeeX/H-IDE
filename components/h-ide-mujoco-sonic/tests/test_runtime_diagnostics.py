@@ -192,6 +192,20 @@ def test_mixed_stall_persists_gc_and_non_gc_evidence_after_healthy_sample():
     diagnostics.close()
 
 
+def test_health_snapshots_do_not_walk_the_frozen_object_graph(monkeypatch):
+    fake_gc = FakeGc()
+    diagnostics = SonicRuntimeDiagnostics(stall_threshold_s=0.1, gc_module=fake_gc)
+    diagnostics.freeze_warm_runtime()
+
+    def forbidden_walk():
+        raise AssertionError("health polling must not walk frozen objects")
+
+    monkeypatch.setattr(fake_gc, "get_freeze_count", forbidden_walk)
+    for _ in range(20):
+        assert diagnostics.snapshot()["python_gc_frozen_objects"] == 123
+    diagnostics.close()
+
+
 def test_freeze_warm_runtime_disables_automatic_gc_and_is_observable():
     monotonic = FakeClock()
     fake_gc = FakeGc()
