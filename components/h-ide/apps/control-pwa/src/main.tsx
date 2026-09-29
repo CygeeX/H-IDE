@@ -738,6 +738,9 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
   selectedSkillRef.current = selectedSkill;
   const finalTranscriptRef = useRef(new Set<string>());
   const pendingMissionInterventionRef = useRef(new Map<string, string>());
+  // A poll that was already in flight when the user pressed cancel must not
+  // resurrect the old running state after the cancellation response arrives.
+  const cancelledAssistantTasksRef = useRef(new Set<string>());
   const deletedConversationUndoTimerRef = useRef<number | undefined>(undefined);
   const restoredConversationRef = useRef(false);
   const restoredMissionRef = useRef(false);
@@ -1278,6 +1281,7 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
         throw reason;
       }
       if (selectedRobotRef.current !== robotId) return turn;
+      if (cancelledAssistantTasksRef.current.has(taskId)) return turn;
       setAssistantTurn(turn);
       if (isAssistantTurnTerminal(turn.status)) {
         if (turn.result?.missionDraftId) {
@@ -1882,10 +1886,12 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
 
   const cancelAssistantTurn = useCallback(() => {
     if (!assistantTurn || !["queued", "running"].includes(assistantTurn.status)) return;
+    const taskId = assistantTurn.taskId;
+    cancelledAssistantTasksRef.current.add(taskId);
     void (async () => {
       try {
         const turn = await apiFetch<AssistantTurn>(
-          `/api/v1/assistant/turns/${encodeURIComponent(assistantTurn.taskId)}/cancel`,
+          `/api/v1/assistant/turns/${encodeURIComponent(taskId)}/cancel`,
           { method: "POST" },
         );
         setAssistantTurn(turn);
