@@ -1365,6 +1365,24 @@ describe("control console", () => {
       String(input).includes("/speech/transcriptions"))).toBe(true));
   });
 
+  it("shows the chat sprite only while its tool setting is enabled", async () => {
+    render(<App />);
+    await screen.findAllByText("robot-1");
+
+    expect(screen.queryByLabelText("H-IDE 机器人助手")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "打开工具" }));
+    const toggle = screen.getByRole("checkbox", { name: /右上角对话精灵/ });
+    expect(toggle).not.toBeChecked();
+
+    fireEvent.click(toggle);
+    expect(screen.getByLabelText("H-IDE 机器人助手")).toBeInTheDocument();
+    expect(window.localStorage.getItem("h-ide-chat-sprite-enabled")).toBe("true");
+
+    fireEvent.click(toggle);
+    expect(screen.queryByLabelText("H-IDE 机器人助手")).not.toBeInTheDocument();
+    expect(window.localStorage.getItem("h-ide-chat-sprite-enabled")).toBe("false");
+  });
+
   it("restores a durable Mission V2 from history after page reload", async () => {
     const fallback = vi.mocked(fetch).getMockImplementation();
     vi.mocked(fetch).mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
