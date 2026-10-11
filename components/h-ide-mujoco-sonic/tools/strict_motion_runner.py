@@ -120,6 +120,9 @@ FIRST_PERSON_STATUS_SCHEMA = "h-ide.first-person-viewer-health/1"
 NAV2_HEALTH_SCHEMA = "h-ide.nav2-runtime-health/v1"
 BRIDGE_HEALTH_SCHEMA = "h-ide.ros-bridge-health/v1"
 TRACE_SCHEMA_VERSION = "h-ide.strict-motion-trace/2"
+# Keep this in sync with the locked Jazzy user-prefix manifest.  The current
+# workstation prefix contains nav2_msgs 1.3.13; refusing it left the strict
+# adapter dead before the Robot Agent services could be started.
 PINNED_NAV2_MSGS_VERSION = "1.3.13"
 MAX_JSON_BYTES = 32 * 1024 * 1024
 # The first-person evidence source is intentionally capped at 5 Hz.  Give one

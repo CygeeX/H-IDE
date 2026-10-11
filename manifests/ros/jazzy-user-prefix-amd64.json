@@ -12,13 +12,13 @@
       "packages": [
         {
           "name": "ros-jazzy-geographic-msgs",
-          "version": "1.0.6-2noble.20260615.111621",
-          "sha256": "4bff69e7e3bc7d13ec3c6a429e44944131635e17626556673ac1070e6653174f"
+          "version": "1.0.6-2noble.20260902.041337",
+          "sha256": "27ab11d98460b9a7c3796930f12f73690ad6c4ff250bffea56946e656aea786a"
         },
         {
           "name": "ros-jazzy-nav2-msgs",
-          "version": "1.3.12-1noble.20260615.145957",
-          "sha256": "945996295a466b111dd3f39dc6cfb028e3ef9f2e1410c6ad35ccc4224a1f5628"
+          "version": "1.3.13-1noble.20260902.082014",
+          "sha256": "baf0a2c1e09159b1c1a61feb7e7b170f7f8af0987b15c2f630653fcbb39be79c"
         }
       ]
     },
@@ -29,23 +29,23 @@
       "packages": [
         {
           "name": "ros-jazzy-diagnostic-updater",
-          "version": "4.2.7-1noble.20260615.135857",
-          "sha256": "169267e17048cd4db1c8e7e86fc6d9ab2bc1e269986ef19f4c3651dc83583263"
+          "version": "4.2.7-1noble.20260902.061455",
+          "sha256": "cd1831b714a777e36ccea787c906d492f20ed120b4150651c85bf87ffd55f12e"
         },
         {
           "name": "ros-jazzy-librealsense2",
-          "version": "2.58.1-1noble.20260524.190754",
-          "sha256": "e5c93397c4a29d31ece80754e73e27fd4a144e1af7efffb425151e31e5a22fe7"
+          "version": "2.58.4-1noble.20260831.015923",
+          "sha256": "48a4e3aae790c6055bba4b64420e858c089f09cc0ff3860aa2efcd805ac19a6b"
         },
         {
           "name": "ros-jazzy-realsense2-camera-msgs",
-          "version": "4.58.1-1noble.20260615.113224",
-          "sha256": "6315281474769e614352998569b947294b833e61029bb5d2ae6dcc4d3ce4c6c9"
+          "version": "4.58.4-1noble.20260902.042822",
+          "sha256": "998b0254fe0dcbc1eb38fc9b2a6714add6129b63d617da943e1144849301b4da"
         },
         {
           "name": "ros-jazzy-realsense2-camera",
-          "version": "4.58.1-1noble.20260615.150439",
-          "sha256": "5e1bd05820a4aa60e55700ac9fc120c4870092248b26fa31a9bea5a6a0bfd403"
+          "version": "4.58.4-1noble.20260903.072830",
+          "sha256": "f0270efa0d8ee1e837fa137f9230043b54879ac6bf6419fff0a916563464cb51"
         }
       ]
     }
