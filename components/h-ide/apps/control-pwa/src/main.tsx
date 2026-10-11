@@ -3206,10 +3206,21 @@ function ThinkingIndicator({ canCancel, onCancel }: { canCancel: boolean; onCanc
   </div>;
 }
 
-function AssistantInlineFailure({ message, onRetry }: { message: string; onRetry: () => void }) {
+function AssistantInlineFailure({
+  message,
+  rawDetail,
+  developerMode,
+  onRetry,
+}: {
+  message: string;
+  rawDetail?: string | null;
+  developerMode: boolean;
+  onRetry: () => void;
+}) {
+  const visibleMessage = developerMode && rawDetail?.trim() ? rawDetail.trim() : message;
   return <div className="assistant-inline-failure" role="alert">
     <Icon name="warning" />
-    <span>{message}</span>
+    <span>{developerMode && rawDetail?.trim() ? <><small>后台原始错误</small>{visibleMessage}</> : visibleMessage}</span>
     <button type="button" onClick={onRetry}>重试</button>
   </div>;
 }
@@ -3472,7 +3483,12 @@ function ChatWorkspace({
           {(activityTaskId !== null
             ? item.taskId === activityTaskId
             : item.key === "turn:legacy-orphans") && !thinking && inlineError
-            ? <AssistantInlineFailure message={inlineError} onRetry={onRetry} />
+            ? <AssistantInlineFailure
+              message={inlineError}
+              rawDetail={item.turn?.error ?? (turn?.taskId === item.taskId ? turn.error : null)}
+              developerMode={developerMode}
+              onRetry={onRetry}
+            />
             : null}
           {item.turn?.result?.assistantMessage && !item.messages.some((message) => message.role === "assistant") ? <article className="chat-message message-assistant"><div className="message-author"><span className="agent-avatar"><Icon name="spark" /></span>H-IDE</div><div className="message-body">{item.turn.result.assistantMessage}</div></article> : null}
           {item.turn && Boolean(item.turn.result?.evidence?.length || item.turn.result?.visualResult) ? <ConversationVisualEvidence turn={item.turn} developerMode={developerMode} /> : null}

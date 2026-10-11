@@ -1692,6 +1692,52 @@ describe("control console", () => {
     expect(screen.getByRole("combobox", { name: "对话机器人" })).toHaveTextContent("机器人 1");
   });
 
+  it("shows the backend raw Assistant error inline only in developer mode", async () => {
+    const fallback = vi.mocked(fetch).getMockImplementation();
+    const rawError = "Mission navigation visual dependency does not promise a target_pose: n3-observe-office";
+    const failedTurn = {
+      taskId: "task-ui",
+      conversationId: "conversation-ui",
+      status: "failed",
+      error: rawError,
+      failure: {
+        errorCode: "INTERNAL_TURN_FAILURE",
+        category: "internal",
+        recoverable: true,
+        dependencyUnavailable: false,
+        userMessage: "本轮没有完成，机器人没有移动。错误已保留供诊断，可以安全重试。",
+      },
+    };
+    vi.mocked(fetch).mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/assistant/turns/task-ui")) {
+        return Promise.resolve(response(failedTurn));
+      }
+      if (url.endsWith("/assistant/conversations/conversation-ui")) {
+        return Promise.resolve(response({
+          conversationId: "conversation-ui",
+          robotId: "robot-1",
+          requestedBy: "developer-ui",
+          locale: "zh-CN",
+          status: "failed",
+          messages: [],
+          turns: [failedTurn],
+          drafts: [],
+        }));
+      }
+      return fallback!(input, init) as Promise<Response>;
+    });
+
+    render(<App />);
+    await screen.findAllByText("robot-1");
+    fireEvent.change(screen.getByLabelText("任务描述"), { target: { value: "进入办公室" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送给 H-IDE" }));
+
+    expect(await screen.findByText(rawError)).toBeInTheDocument();
+    expect(screen.getByText("后台原始错误")).toBeInTheDocument();
+    expect(screen.queryByText("本轮没有完成，机器人没有移动。错误已保留供诊断，可以安全重试。")).not.toBeInTheDocument();
+  });
+
   it("opens scene teaching from the scoped user tool drawer without exposing developer tools", async () => {
     const fallback = vi.mocked(fetch).getMockImplementation();
     window.history.replaceState({}, "", "/app");
