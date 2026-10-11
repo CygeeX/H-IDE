@@ -1074,7 +1074,7 @@ start_process \
   sonic-driver \
   '-m hide_mujoco_sonic sonic --config' \
   "${HIDE_DEMO_SIM_ROOT}" \
-  'exec "$HIDE_DEMO_SIM_ROOT/.venv/bin/python" -u -m hide_mujoco_sonic sonic --config "$HIDE_DEMO_CONFIG"'
+  'export LD_LIBRARY_PATH="$HIDE_DEMO_SIM_ROOT/.venv/lib/python3.12/site-packages/nvidia/cublas/lib:$HIDE_DEMO_SIM_ROOT/.venv/lib/python3.12/site-packages/nvidia/cudnn/lib:$HIDE_DEMO_SIM_ROOT/.venv/lib/python3.12/site-packages/nvidia/cuda_runtime/lib:$HIDE_DEMO_SIM_ROOT/.venv/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib:$HIDE_DEMO_SIM_ROOT/.venv/lib/python3.12/site-packages/nvidia/cusparse/lib:$HIDE_DEMO_SIM_ROOT/.venv/lib/python3.12/site-packages/nvidia/curand/lib:$HIDE_DEMO_SIM_ROOT/.venv/lib/python3.12/site-packages/nvidia/cufft/lib:${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"; exec "$HIDE_DEMO_SIM_ROOT/.venv/bin/python" -u -m hide_mujoco_sonic sonic --config "$HIDE_DEMO_CONFIG"'
 
 # A listening telemetry port only proves that the Python process exists.  Keep
 # Nav2 and Robot Agent offline until the full controller path has warmed, the

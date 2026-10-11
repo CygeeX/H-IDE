@@ -16,7 +16,15 @@ dependencies = [
 [project.optional-dependencies]
 runtime = [
   "mujoco>=3.3,<4",
-  "onnxruntime>=1.16,<2",
+  # SONIC must keep the 50 Hz encoder/decoder loop on CUDA on a workstation
+  # that has a supported NVIDIA GPU.  The CPU wheel can import successfully
+  # while silently missing the 20 ms control deadline and producing unsafe
+  # stale locomotion output.  CPU-only contract tests may still install the
+  # package with ``SONIC_FORCE_CPU=1`` in an isolated environment.
+  # 1.22 is the CUDA 12 build used with the bundled cuBLAS/cuDNN runtime.
+  # Newer wheels may target CUDA 13 and silently fall back when those shared
+  # libraries are unavailable on the host.
+  "onnxruntime-gpu==1.22.0",
   "onnx>=1.16,<2",
   "pyzmq>=26,<28",
   "cyclonedds==11.0.1",
