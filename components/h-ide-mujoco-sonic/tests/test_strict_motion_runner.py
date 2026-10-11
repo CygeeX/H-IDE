@@ -501,7 +501,7 @@ def test_nav2_action_contracts_are_version_and_field_pinned() -> None:
         drive,
         spin,
         compute,
-        installed_version="1.3.12",
+        installed_version="1.3.13",
     )
 
     with pytest.raises(runner.StrictMotionRunnerError, match="not pinned"):
@@ -509,7 +509,7 @@ def test_nav2_action_contracts_are_version_and_field_pinned() -> None:
             drive,
             spin,
             compute,
-            installed_version="1.3.13",
+            installed_version="1.3.12",
         )
     broken = action({"target": "geometry_msgs/Point"})
     with pytest.raises(runner.StrictMotionRunnerError, match="contracts drifted"):
@@ -517,7 +517,7 @@ def test_nav2_action_contracts_are_version_and_field_pinned() -> None:
             broken,
             spin,
             compute,
-            installed_version="1.3.12",
+            installed_version="1.3.13",
         )
 
 

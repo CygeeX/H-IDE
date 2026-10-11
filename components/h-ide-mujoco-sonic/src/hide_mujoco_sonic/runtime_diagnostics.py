@@ -124,6 +124,7 @@ class SonicRuntimeDiagnostics:
         self._gc_warmup_collected_objects = 0
         self._gc_freeze_applied = False
         self._gc_automatic_disabled = False
+        self._gc_frozen_objects = 0
         self._gc_freeze_error: str | None = None
         self._gc_callback = self._observe_gc
         self._registered = False
@@ -196,6 +197,10 @@ class SonicRuntimeDiagnostics:
                 self._gc.enable()
             self._gc_warmup_collected_objects = int(self._gc.collect())
             self._gc.freeze()
+            # Counting the frozen generation walks its entire object list
+            # while holding the GIL. Do it once during warm-up, never on a
+            # health request competing with the 50 Hz actuator loop.
+            self._gc_frozen_objects = int(self._gc.get_freeze_count())
             self._gc.disable()
             if self._gc.isenabled():
                 raise RuntimeError("automatic cyclic GC remained enabled")
@@ -212,10 +217,6 @@ class SonicRuntimeDiagnostics:
             gc_enabled = bool(self._gc.isenabled())
         except Exception:
             gc_enabled = False
-        try:
-            frozen_objects = int(self._gc.get_freeze_count())
-        except Exception:
-            frozen_objects = 0
         result: dict[str, Any] = {
             "runtime_stall_threshold_s": self.stall_threshold_s,
             "python_gc_enabled": gc_enabled,
@@ -233,7 +234,7 @@ class SonicRuntimeDiagnostics:
             ),
             "python_gc_freeze_applied": self._gc_freeze_applied,
             "python_gc_automatic_disabled": self._gc_automatic_disabled,
-            "python_gc_frozen_objects": frozen_objects,
+            "python_gc_frozen_objects": self._gc_frozen_objects,
             "python_gc_freeze_error": self._gc_freeze_error,
         }
         result.update(self._lowstate.snapshot("lowstate_callback"))

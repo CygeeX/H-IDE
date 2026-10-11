@@ -1354,8 +1354,8 @@ class MissionService:
         )
         if isinstance(blocking, Mapping):
             raise MissionServiceError(
-                "ROBOT_MISSION_BUSY: another reviewed Mission must finish or "
-                f"be cancelled first ({blocking.get('missionId')})"
+                "ROBOT_MISSION_BUSY: 该机器人已有一个已审核的任务，必须先完成或取消该任务 "
+                f"({blocking.get('missionId')})"
             )
         if not self.store.set_mission_draft_status(
             draft_id, "approving", expected_status="draft"

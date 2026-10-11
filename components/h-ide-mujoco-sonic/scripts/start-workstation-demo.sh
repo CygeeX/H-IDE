@@ -50,9 +50,9 @@ HIDE_DEMO_FULL_STRAIGHT_DRIVE="${HIDE_FULL_STRAIGHT_DRIVE:-0}"
 HIDE_MUJOCO_ONSCREEN_VIEWER=0
 # Reversible simulation experiment: keep the learned SONIC whole-body policy
 # in control through automatic gait/navigation/health observations. Explicit
-# operator cancel and correlated safe-stop remain authoritative. Set this to 0
-# before launch to restore the reviewed fail-closed behavior.
-HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT="${HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT:-1}"
+# operator cancel and correlated safe-stop remain authoritative. This is
+# opt-in only: ordinary navigation must stop when measured motion diverges.
+HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT="${HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT:-0}"
 
 if [[ "${HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT}" != "0" \
   && "${HIDE_SIM_RETAIN_SONIC_ON_AUTOMATIC_FAULT}" != "1" ]]; then
@@ -1074,7 +1074,7 @@ start_process \
   sonic-driver \
   '-m hide_mujoco_sonic sonic --config' \
   "${HIDE_DEMO_SIM_ROOT}" \
-  'exec "$HIDE_DEMO_SIM_ROOT/.venv/bin/python" -u -m hide_mujoco_sonic sonic --config "$HIDE_DEMO_CONFIG"'
+  'export LD_LIBRARY_PATH="$HIDE_DEMO_SIM_ROOT/.venv/lib/python3.12/site-packages/nvidia/cublas/lib:$HIDE_DEMO_SIM_ROOT/.venv/lib/python3.12/site-packages/nvidia/cudnn/lib:$HIDE_DEMO_SIM_ROOT/.venv/lib/python3.12/site-packages/nvidia/cuda_runtime/lib:$HIDE_DEMO_SIM_ROOT/.venv/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib:$HIDE_DEMO_SIM_ROOT/.venv/lib/python3.12/site-packages/nvidia/cusparse/lib:$HIDE_DEMO_SIM_ROOT/.venv/lib/python3.12/site-packages/nvidia/curand/lib:$HIDE_DEMO_SIM_ROOT/.venv/lib/python3.12/site-packages/nvidia/cufft/lib:${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"; exec "$HIDE_DEMO_SIM_ROOT/.venv/bin/python" -u -m hide_mujoco_sonic sonic --config "$HIDE_DEMO_CONFIG"'
 
 # A listening telemetry port only proves that the Python process exists.  Keep
 # Nav2 and Robot Agent offline until the full controller path has warmed, the
