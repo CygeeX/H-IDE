@@ -38,22 +38,28 @@ const GOODBYE_PATTERN = /^(?:再见|拜拜|回头见|bye|goodbye|see\s+you)[\s!�
 const PERSONAL_PREFERENCE_PATTERN = /(?:我(?:很)?(?:喜欢|偏好|习惯)|我的(?:名字|称呼|昵称|偏好|喜好|习惯)|(?:以后)?(?:叫|称呼)我(?:为|做)?|i\s+(?:like|prefer)|my\s+(?:name|nickname|preference)|call\s+me)/iu;
 const ROBOT_REQUEST_CUE_PATTERN = /(?:机器人|向前|后退|转身|旋转|移动|导航|前往|进入|进去|巡检|巡查|检查|依次|去(?:那里|那边|这里|这边|会议室|开放办公区|独立办公室|茶水间|储物间|走廊|open\s+office|meeting\s+room)|走(?:到|去|进|两|几|\d)|抓取|拿起|放下|打开|关闭|观察|robot|walk|move|turn|rotate|navigate|enter|approach|inspect|patrol|grab|pick\s+up|put\s+down)/iu;
 
-// The classifier may choose only one top-level intent.  A motion request that
-// also asks to observe must never be downgraded to the read-only current-frame
-// route merely because words such as "看" or "观察" are prominent.  This is a
-// one-way authority guard: it can require Mission review, but can never turn a
-// harmless observation into direct execution.
-const PHYSICAL_ACTION_CUE_PATTERNS = [
-  /(?:请|让|叫|使)?(?:机器人)?\s*(?:向前|后退|左转|右转|转身|旋转|移动|导航|前往|进入|进去|走进|走到|走去|驶入|回到|返回到|靠近|到达)/u,
+// The classifier may choose only one top-level intent. A command that combines
+// motion and observation must not be downgraded merely because words such as
+// "看" or "观察" are prominent. The guard protects only explicit commands:
+// mentioning an action while explaining it is not a request to perform it.
+const EXPLICIT_PHYSICAL_ACTION_COMMAND_PATTERNS = [
+  /(?:^|[\s，,。；;！!？?]|(?:然后|但|并且|接着|之后))(?:请|麻烦|帮我|让(?:机器人)?|请让(?:机器人)?|机器人)?\s*(?:向前|后退|左转|右转|转身|旋转|移动(?:到)?|导航(?:到)?|前往|进入|进去|走进|走到|走去|驶入|回到|返回到|靠近|到达)/u,
   /(?:走出|离开|出去|退出)(?:当前|这个|这间|开放|会议|独立|办公室|房间|区域|open|office|room)?/iu,
   /(?:去|走到|移动到).{0,30}(?:旁边|前面|跟前|附近|边上)(?:站着|站住|停下|停住)?/u,
   /(?:寻找|找到|搜索|搜寻|环顾|巡视|转一圈|全面观察).{0,40}(?:电脑|椅子|架子|桌子|物体|目标|办公室|房间|区域|computer|chair|shelf|rack|desk|object|office|room)/iu,
   /(?:观察|查看|看看).{0,30}(?:并|来|以便)?(?:寻找|找到|搜索|搜寻)/u,
   /(?:巡检|巡查|检查|巡视|依次).{0,80}(?:办公室|办公区|会议室|房间|区域|office|room)/iu,
   /(?:^|[\s，,。；;！!？?])(?:请\s*)?(?:去)(?=\s*(?:那里|那边|这里|这边|会议室|开放办公区|独立办公室|茶水间|储物间|走廊|前台|接待区|open[\s_-]*office|meeting[\s_-]*room|focus[\s_-]*office|pantry|storage|corridor|reception))/iu,
-  /\b(?:go|walk|move|navigate|enter|approach|return)\b/iu,
+  /(?:^|[,.;!?]\s*)(?:please\s+)?(?:go|walk|move|navigate|enter|approach|return)\b/iu,
 ];
 const EXPLICIT_STATIONARY_OBSERVATION_PATTERN = /(?:(?:只|仅)(?:观察|查看|看).{0,16}(?:当前|现在|眼前)(?:画面|视野|环境)?|(?:当前|现在|眼前)(?:画面|视野|环境).{0,20}(?:不要|不再|无需|不用|禁止).{0,6}(?:移动|导航|转动|旋转)|原地(?:观察|查看|看)|保持静止|(?:observe|inspect|look).{0,32}(?:current\s+(?:view|scene)|in\s+place|without\s+moving|do\s+not\s+move))/iu;
+const NON_EXECUTING_ACTION_CONSTRAINT_PATTERN = /(?:(?:不要|别|不必|无需|不用|禁止|不得|不需要)(?:真的|实际|直接|立刻|马上)?[\s\S]{0,24}(?:移动|导航|行走|走动|转身|转动|旋转|执行|操作|控制|启动|出发)|(?:do\s+not|don't|without)\s+(?:actually\s+)?(?:move|navigate|walk|turn|rotate|execute|operate|start))/iu;
+
+type PhysicalActionRequestAssessment =
+  | "explicit_request"
+  | "explicitly_declined"
+  | "conflicting_request"
+  | "not_requested";
 
 const HISTORICAL_REFERENCE_PATTERN = /(?:刚刚|刚才|之前|上次|先前|earlier|previously|last\s+time)/iu;
 const HISTORICAL_OBSERVATION_QUESTION_PATTERN = /(?:看到|看见|观察到|有没有|是否|哪(?:里|个|间)|什么地方|电脑|计算机|笔记本|显示器|屏幕|桌子|椅子|柜子|架子|computer|laptop|monitor|screen|desk|chair|shelf)/iu;
@@ -113,11 +119,27 @@ function historicalObjectConfirmed(content: string, objectPattern: RegExp): bool
     && !/(?:not\s+(?:seen|found)|no)\s*$/iu.test(prefix);
 }
 
-function requiresPhysicalAction(text: string): boolean {
+function assessPhysicalActionRequest(text: string): PhysicalActionRequestAssessment {
   const normalized = text.trim();
-  return normalized.length > 0
-    && !EXPLICIT_STATIONARY_OBSERVATION_PATTERN.test(normalized)
-    && PHYSICAL_ACTION_CUE_PATTERNS.some((pattern) => pattern.test(normalized));
+  if (!normalized) return "not_requested";
+  if (NON_EXECUTING_ACTION_CONSTRAINT_PATTERN.test(normalized)) {
+    return EXPLICIT_PHYSICAL_ACTION_COMMAND_PATTERNS.some((pattern) => pattern.test(normalized))
+      ? "conflicting_request"
+      : "explicitly_declined";
+  }
+  return EXPLICIT_PHYSICAL_ACTION_COMMAND_PATTERNS.some((pattern) => pattern.test(normalized))
+    ? "explicit_request"
+    : "not_requested";
+}
+
+function requiresPhysicalAction(text: string): boolean {
+  return assessPhysicalActionRequest(text) === "explicit_request";
+}
+
+function nonExecutingFallbackMessage(locale: string): string {
+  return isChineseLocale(locale)
+    ? "我可以解释相关功能；按照你的要求，不会创建行动方案或移动机器人。"
+    : "I can explain the feature; as requested, I will not create an action plan or move the robot.";
 }
 
 function historicalInspectionFastPath(
@@ -175,7 +197,28 @@ function enforcePhysicalIntent(
   input: ConversationTurnRequest,
   output: ConversationRouterModelOutput,
 ): ConversationRouterModelOutput {
-  if (!requiresPhysicalAction(input.text) || output.intent === "ROBOT_ACTION") {
+  const actionAssessment = assessPhysicalActionRequest(input.text);
+  if (actionAssessment === "explicitly_declined" && output.intent === "ROBOT_ACTION") {
+    return {
+      intent: EXPLICIT_STATIONARY_OBSERVATION_PATTERN.test(input.text)
+        ? "ROBOT_OBSERVE"
+        : "GENERAL_QA",
+      assistantMessage: nonExecutingFallbackMessage(input.locale),
+      clarification: null,
+    };
+  }
+  if (actionAssessment === "conflicting_request") {
+    return {
+      intent: "ROBOT_ACTION",
+      assistantMessage: isChineseLocale(input.locale)
+        ? "我需要先确认：你希望禁止哪项动作，以及是否仍要执行其余行动？"
+        : "I need to confirm which action is prohibited and whether the remaining action should still be performed.",
+      clarification: isChineseLocale(input.locale)
+        ? "请明确要禁止的动作，以及是否仍要执行其余行动。"
+        : "Please specify the prohibited action and whether the remaining action should still be performed.",
+    };
+  }
+  if (actionAssessment !== "explicit_request" || output.intent === "ROBOT_ACTION") {
     return output;
   }
   return {
@@ -398,6 +441,7 @@ const ROUTER_INSTRUCTIONS = [
   "Classify and answer one H-IDE assistant turn.",
   "SOCIAL_CHAT is greeting, thanks, casual conversation, or harmless banter.",
   "GENERAL_QA is a knowledge, explanation, or calculation request that does not require a robot or current sensor data.",
+  "A request to explain, describe, compare, teach, or document a robot action is GENERAL_QA when it explicitly says not to perform that action. For example, '解释导航功能，不要真的移动' must not create a Mission.",
   "ROBOT_OBSERVE uses current robot sensors but must not translate, rotate, change pose, or perform another physical action.",
   "ROBOT_ACTION is any requested physical robot action, including walking, base rotation, navigation, manipulation, or a sequence containing one.",
   "Active visual search such as finding/searching for an object in a room is ROBOT_ACTION because it may rotate or move between reviewed observation points.",
@@ -521,6 +565,7 @@ export class ConversationRouter {
 }
 
 export const conversationRouterInternals = {
+  assessPhysicalActionRequest,
   arithmeticExpression,
   contextPrompt,
   evaluateArithmetic,

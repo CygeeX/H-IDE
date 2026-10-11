@@ -12,6 +12,7 @@ from pydantic import ValidationError
 from packages.control_core.assistant_models import (
     ConversationGatewayResult,
     ConversationIntent,
+    ConversationRoute,
     ConversationMemoryContext,
     ConversationTurnRequest,
     ConversationTurnResponse,
@@ -332,6 +333,72 @@ def test_known_object_and_exit_actions_override_a_misclassified_router_result() 
         "去椅子旁边站着",
         "走出开放办公室",
     ]
+
+
+def test_non_executing_navigation_explanation_cannot_create_a_mission_draft() -> None:
+    drafts: list[dict[str, Any]] = []
+    router = RoutedConversationClient(
+        # Reproduce a stale or faulty upstream router. The gateway must retain
+        # the user's explicit no-motion constraint as the admission boundary.
+        lambda request: (ConversationIntent.ROBOT_ACTION, "我会创建行动方案。")
+    )
+    result = ConversationGateway(
+        router,
+        mission_draft_creator=lambda brief: drafts.append(dict(brief))
+        or {"draftId": "must-not-be-created"},
+    ).handle(
+        task_id="task-explain-navigation-no-motion",
+        request=ConversationTurnRequest(
+            conversationId="conversation-explain-navigation-no-motion",
+            robotId="g1-sim",
+            locale="zh-CN",
+            # This also mentions a known Office place, proving the
+            # deterministic place-template shortcut observes the same guard.
+            text="解释一下如何导航到会议室，不要真的移动",
+        ),
+        requested_by="operator-test",
+        modality="text",
+        mission_history=[],
+    )
+
+    assert result.intent is ConversationIntent.GENERAL_QA
+    assert result.route is ConversationRoute.REPLY
+    assert result.routeStatus == "completed"
+    assert result.missionDraftId is None
+    assert "不会创建行动方案" in result.assistantMessage
+    assert drafts == []
+    assert len(router.requests) == 1
+
+
+def test_conflicting_motion_constraints_require_input_without_a_mission_draft() -> None:
+    drafts: list[dict[str, Any]] = []
+    router = RoutedConversationClient(
+        lambda request: (ConversationIntent.ROBOT_ACTION, "我会执行。")
+    )
+    result = ConversationGateway(
+        router,
+        mission_draft_creator=lambda brief: drafts.append(dict(brief))
+        or {"draftId": "must-not-be-created"},
+    ).handle(
+        task_id="task-conflicting-motion",
+        request=ConversationTurnRequest(
+            conversationId="conversation-conflicting-motion",
+            robotId="g1-sim",
+            locale="zh-CN",
+            text="不要旋转，但向前走一米",
+        ),
+        requested_by="operator-test",
+        modality="text",
+        mission_history=[],
+    )
+
+    assert result.intent is ConversationIntent.ROBOT_ACTION
+    assert result.route is ConversationRoute.MISSION_REVIEW
+    assert result.routeStatus == "needs_input"
+    assert result.clarification is not None
+    assert result.missionDraftId is None
+    assert drafts == []
+    assert router.requests == []
 
 
 def test_typed_http_client_falls_back_once_for_pre_memory_agent(monkeypatch):

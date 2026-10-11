@@ -124,6 +124,12 @@ turn 发送；不得创建半完整 Mission。
 Mission V2 → PlanDraft → 权限/人工审核流程；`ROBOT_OBSERVE` 进入无运动的视觉任务，
 不能隐式加入转向或导航。
 
+Mission 准入不能根据是否出现“导航”“移动”等词判断，而是区分三种语义：明确的物理
+命令才可进入 `ROBOT_ACTION` 的 Mission 路径；明确声明“不执行/不移动”的解释、介绍或
+比较请求保持为非执行对话；若同一句同时禁止一个动作又要求另一动作，系统只追问动作
+范围，`shouldCreateMission=false`。Control API 对确定性 Office 模板也执行相同约束，避免
+路由模型版本不一致时重新创建草案。
+
 ## Model and latency profile
 
 路由 Agent 复用 `SUPERVISOR_MODEL` 及其供应商凭据。Alibaba/Qwen 调用设置

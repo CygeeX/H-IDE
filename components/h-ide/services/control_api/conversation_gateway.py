@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import inspect
+import re
 from typing import Any, Mapping
 
 from packages.control_core.assistant_models import (
@@ -26,6 +27,43 @@ from .office_semantic_navigation import (
 
 MissionDraftCreator = Callable[[Mapping[str, Any]], Mapping[str, Any]]
 VisualObserver = Callable[[Mapping[str, Any]], Mapping[str, Any]]
+
+
+# A deterministic template is allowed to protect a clearly stated operation
+# from an LLM down-classification. It is not allowed to treat a discussion of
+# an operation as consent to perform one. This guard is deliberately shared by
+# every template shortcut in this gateway so an older router cannot reopen a
+# Mission path after the user explicitly ruled physical execution out.
+_NON_EXECUTING_PHYSICAL_CONSTRAINT = re.compile(
+    r"(?:"
+    r"(?:不要|别|不必|无需|不用|禁止|不得|不需要)(?:真的|实际|直接|立刻|马上)?[\s\S]{0,24}"
+    r"(?:移动|导航|行走|走动|转身|转动|旋转|执行|操作|控制|启动|出发)"
+    r"|(?:do\s+not|don't|without)\s+(?:actually\s+)?"
+    r"(?:move|navigate|walk|turn|rotate|execute|operate|start)"
+    r")",
+    re.IGNORECASE,
+)
+_EXPLICIT_PHYSICAL_COMMAND = re.compile(
+    r"(?:^|[\s，,。；;！!？?]|(?:然后|但|并且|接着|之后))"
+    r"(?:请|麻烦|帮我|让(?:机器人)?|请让(?:机器人)?|机器人)?\s*"
+    r"(?:向前|后退|左转|右转|转身|旋转|移动(?:到)?|导航(?:到)?|前往|进入|进去|"
+    r"走进|走到|走去|驶入|回到|返回到|靠近|到达)",
+    re.IGNORECASE,
+)
+
+
+def _declines_physical_execution(text: str) -> bool:
+    return _NON_EXECUTING_PHYSICAL_CONSTRAINT.search(text) is not None
+
+
+def _has_conflicting_physical_request(text: str) -> bool:
+    return _declines_physical_execution(text) and _EXPLICIT_PHYSICAL_COMMAND.search(text) is not None
+
+
+def _non_executing_reply(locale: str) -> str:
+    if locale.casefold().startswith("zh"):
+        return "我可以解释相关功能；按照你的要求，不会创建行动方案或移动机器人。"
+    return "I can explain the feature; as requested, I will not create an action plan or move the robot."
 
 
 class ConversationGatewayError(RuntimeError):
@@ -112,13 +150,24 @@ class ConversationGateway:
         mission_history: list[Mapping[str, Any]],
         mission_actor: PolicyActor | None = None,
     ) -> ConversationGatewayResult:
+        declines_physical_execution = _declines_physical_execution(request.text)
+        if _has_conflicting_physical_request(request.text):
+            return self._result(
+                task_id=task_id,
+                request=request,
+                intent=ConversationIntent.ROBOT_ACTION,
+                route=ConversationRoute.MISSION_REVIEW,
+                route_status="needs_input",
+                assistant_message="我需要先确认动作范围，不会创建行动方案。",
+                clarification="请明确要禁止的动作，以及是否仍要执行其余行动。",
+            )
         # This reviewed product intent has a deterministic, SceneRef-bound
         # compiler downstream.  Routing it through a remote text classifier
         # adds no authority check and makes the fixed acceptance flow depend
         # on an unrelated model/network timeout.  The shortcut still creates
         # only a reviewable Mission draft; it cannot dispatch motion.
         sequence_request = parse_office_inspection_sequence_request(request.text)
-        if (
+        if not declines_physical_execution and (
             is_full_office_inspection(request.text)
             or sequence_request is not None
             or request.skillId == "inspection.office"
@@ -155,7 +204,7 @@ class ConversationGateway:
             request.text,
             semantic_referents=semantic_referents,
         )
-        known_physical_action = (
+        known_physical_action = not declines_physical_execution and (
             known_sequence is not None
             or known_place is not None
             or known_object is not None
@@ -192,6 +241,23 @@ class ConversationGateway:
             raise ConversationGatewayError("conversation router changed conversationId")
         if routed.robotId != request.robotId:
             raise ConversationGatewayError("conversation router changed robotId")
+
+        # Defense in depth for router/model rollout skew. The router should
+        # already classify an explanation with an explicit non-execution
+        # constraint as GENERAL_QA, but a stale or faulty response must never
+        # become a Mission merely because it says ROBOT_ACTION.
+        if (
+            declines_physical_execution
+            and routed.intent is ConversationIntent.ROBOT_ACTION
+        ):
+            return self._result(
+                task_id=task_id,
+                request=request,
+                intent=ConversationIntent.GENERAL_QA,
+                route=ConversationRoute.REPLY,
+                route_status="completed",
+                assistant_message=_non_executing_reply(request.locale),
+            )
 
         # The classifier supplies language, not execution semantics.  Once a
         # known Office place/object action is recognized deterministically,

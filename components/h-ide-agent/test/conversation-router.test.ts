@@ -530,6 +530,67 @@ describe("Assistant V2 conversation router", () => {
   });
 
   it.each([
+    "给我解释一下导航功能，不要真的移动",
+    "介绍一下机器人如何旋转，但不要执行",
+    "Explain navigation, but do not actually move.",
+  ])("does not turn a non-executing action explanation into a Mission: %s", async (text) => {
+    const agent = {
+      generate: vi.fn().mockResolvedValue({
+        object: {
+          // A provider regression must not override the user's explicit
+          // non-execution constraint.
+          intent: "ROBOT_ACTION",
+          assistantMessage: "我会生成行动方案。",
+          clarification: null,
+        },
+      }),
+    };
+    const result = await new ConversationRouter(agent as never).route({
+      conversationId: `conversation-explain-no-motion-${text}`,
+      robotId: "g1-sim",
+      locale: text.startsWith("Explain") ? "en-US" : "zh-CN",
+      text,
+    }, signal());
+
+    expect(result).toMatchObject({
+      intent: "GENERAL_QA",
+      needsRobot: false,
+      shouldCreateMission: false,
+    });
+    expect(result.assistantMessage).toMatch(/不会创建行动方案|will not create an action plan/);
+    expect(conversationRouterInternals.requiresPhysicalAction(text)).toBe(false);
+    expect(conversationRouterInternals.assessPhysicalActionRequest(text)).toBe("explicitly_declined");
+  });
+
+  it("asks for clarification when a physical command conflicts with a no-motion constraint", async () => {
+    const agent = {
+      generate: vi.fn().mockResolvedValue({
+        object: {
+          intent: "ROBOT_ACTION",
+          assistantMessage: "我会处理。",
+          clarification: null,
+        },
+      }),
+    };
+    const result = await new ConversationRouter(agent as never).route({
+      conversationId: "conversation-conflicting-motion",
+      robotId: "g1-sim",
+      locale: "zh-CN",
+      text: "不要旋转，但向前走一米",
+    }, signal());
+
+    expect(result).toMatchObject({
+      intent: "ROBOT_ACTION",
+      needsRobot: true,
+      shouldCreateMission: false,
+      clarification: expect.stringContaining("禁止"),
+    });
+    expect(conversationRouterInternals.assessPhysicalActionRequest(
+      "不要旋转，但向前走一米",
+    )).toBe("conflicting_request");
+  });
+
+  it.each([
     ["SOCIAL_CHAT", false, false],
     ["GENERAL_QA", false, false],
     ["ROBOT_OBSERVE", true, false],
