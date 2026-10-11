@@ -650,6 +650,9 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
   });
   const [selectedSkill, setSelectedSkill] = useState<LeaderSkillId | null>(null);
   const [skillGreeting, setSkillGreeting] = useState("");
+  const [chatSpriteEnabled, setChatSpriteEnabled] = useState(() => {
+    try { return window.localStorage.getItem("h-ide-chat-sprite-enabled") === "true"; } catch { return false; }
+  });
   const [capabilities, setCapabilities] = useState<CapabilitySnapshot | null>(null);
   const [events, setEvents] = useState<ControlEvent[]>([]);
   const [mappings, setMappings] = useState<MappingSnapshot[]>([]);
@@ -1105,6 +1108,12 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
       // Local preferences are optional in private browsing.
     }
   }, [selectedDisplayRobotId]);
+
+  useEffect(() => {
+    try { window.localStorage.setItem("h-ide-chat-sprite-enabled", String(chatSpriteEnabled)); } catch {
+      // Local preferences are optional in private browsing.
+    }
+  }, [chatSpriteEnabled]);
 
   const selectLeaderSkill = useCallback((skill: LeaderSkillDefinition) => {
     if (skill.id === "inspection.office" && !assistantConversation && !missionDraft && !missionRecord) {
@@ -2606,6 +2615,7 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
         mission={missionRecord}
         selectedSkill={selectedSkill}
         skillGreeting={skillGreeting}
+        chatSpriteEnabled={chatSpriteEnabled}
         selectedDisplayId={selectedDisplayRobotId}
         busy={assistantBusy}
         thinking={assistantThinking}
@@ -2723,8 +2733,10 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
         canUseSceneMemory={canUseSceneMemory}
         advancedMode={advancedMode}
         offlineVoiceFallback={voiceCaptureMode === "offline_wav"}
+        chatSpriteEnabled={chatSpriteEnabled}
         onAdvancedModeChange={setAdvancedMode}
         onOfflineVoiceFallbackChange={toggleOfflineVoiceFallback}
+        onChatSpriteEnabledChange={setChatSpriteEnabled}
         onClose={() => setToolMenuOpen(false)}
         onSceneMemory={() => {
           setToolMenuOpen(false);
@@ -2940,8 +2952,10 @@ function ToolMenu({
   canUseSceneMemory,
   advancedMode,
   offlineVoiceFallback,
+  chatSpriteEnabled,
   onAdvancedModeChange,
   onOfflineVoiceFallbackChange,
+  onChatSpriteEnabledChange,
   onClose,
   onSceneMemory,
   onControl,
@@ -2956,8 +2970,10 @@ function ToolMenu({
   canUseSceneMemory: boolean;
   advancedMode: boolean;
   offlineVoiceFallback: boolean;
+  chatSpriteEnabled: boolean;
   onAdvancedModeChange: (value: boolean) => void;
   onOfflineVoiceFallbackChange: (value: boolean) => void;
+  onChatSpriteEnabledChange: (value: boolean) => void;
   onClose: () => void;
   onSceneMemory: () => void;
   onControl: () => void;
@@ -2979,6 +2995,7 @@ function ToolMenu({
     {developerMode ? <button type="button" onClick={onRefresh}><span className="tool-icon"><Icon name="refresh" /></span><span><strong>刷新状态</strong><small>重新读取机器人与接口快照</small></span><Icon name="chevron" /></button> : null}
     <div className="tool-separator" />
     <label className="advanced-toggle"><span><strong>离线 WAV 转写降级</strong><small>显式启用批量 Whisper；默认使用低延迟流式语音</small></span><input type="checkbox" checked={offlineVoiceFallback} onChange={(event) => onOfflineVoiceFallbackChange(event.target.checked)} /><i /></label>
+    <label className="advanced-toggle"><span><strong>右上角对话精灵</strong><small>开启后在对话页面右上角显示精灵</small></span><input type="checkbox" checked={chatSpriteEnabled} onChange={(event) => onChatSpriteEnabledChange(event.target.checked)} /><i /></label>
     {developerMode ? <label className="advanced-toggle"><span><strong>工程模式</strong><small>显示接口与调试工具</small></span><input type="checkbox" checked={advancedMode} onChange={(event) => onAdvancedModeChange(event.target.checked)} /><i /></label> : null}
     {developerMode && advancedMode ? <button type="button" onClick={onInterfaces}><span className="tool-icon"><Icon name="interface" /></span><span><strong>接口中心</strong><small>映射版本、探测与回滚</small></span><Icon name="chevron" /></button> : null}
   </aside></>;
@@ -3244,6 +3261,7 @@ function ChatWorkspace({
   mission,
   selectedSkill,
   skillGreeting,
+  chatSpriteEnabled,
   selectedDisplayId,
   busy,
   thinking,
@@ -3299,6 +3317,7 @@ function ChatWorkspace({
   mission: MissionRecordV2 | null;
   selectedSkill: LeaderSkillId | null;
   skillGreeting: string;
+  chatSpriteEnabled: boolean;
   selectedDisplayId: RobotDisplayOption["id"];
   busy: boolean;
   thinking: boolean;
@@ -3455,9 +3474,9 @@ function ChatWorkspace({
     </div>
   );
   return <main className="chat-workspace">
-    <aside className="leader-avatar-rail" aria-label="H-IDE 机器人助手">
+    {chatSpriteEnabled ? <aside className="leader-avatar-rail" aria-label="H-IDE 机器人助手">
       <RobotAvatar compact speech={selectedSkill ? latestAssistantSpeech : undefined} />
-    </aside>
+    </aside> : null}
     <div className="chat-timeline" ref={timelineRef} aria-live="polite">
       <div className="chat-thread">
         {empty ? <section className="chat-empty-state">
