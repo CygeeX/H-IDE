@@ -15,9 +15,9 @@
       "path": "components/h-ide",
       "sourceCommit": "6af81007bf5f5edcbc12030a80e0565ce60e2468",
       "sourceTree": "9823f5012205626a116601ec4c161ff8974a9aed",
-      "distributionTree": "06a2beab27289bc8421fe772846e6f5fd741a554",
-      "distributionDeltaSha256": "8cb7a17451bf8909f29d55e39ddb7ff59449c5885e8838a24093abc1ce511b88",
-      "distributionDeltaPathCount": 23,
+      "distributionTree": "212f9ef0406a08eaaacd6a3cc779c90308ed6be1",
+      "distributionDeltaSha256": "340c35d68b4166a47ebf9c0c0e8282055b5f06ffd4f2724cc63babeca575e360",
+      "distributionDeltaPathCount": 26,
       "distributionAdaptation": "monorepo portability, release authentication documentation and integration packaging",
       "runtimeDefault": true
     },
@@ -26,9 +26,9 @@
       "path": "components/h-ide-agent",
       "sourceCommit": "d2534880b3213494953981e082dd3147629a9f4f",
       "sourceTree": "75c197b4e79f9dfb0d2a51d95387759f150be22a",
-      "distributionTree": "88c38df767bd17f3f7c5a9c5de39564632318c3f",
-      "distributionDeltaSha256": "421fd94aafce84336c6b194b9a2213b737dd69c5c54db9fb104062000c9a9930",
-      "distributionDeltaPathCount": 1,
+      "distributionTree": "211d2af12dd0ae7b1fb83e5c9806b43d2eb28d2b",
+      "distributionDeltaSha256": "815d9573374490bf1c47fe82838bebdd0d2dec55fbc020dcd6d4e387c573df00",
+      "distributionDeltaPathCount": 3,
       "distributionAdaptation": "monorepo portability and release packaging",
       "runtimeDefault": true
     },
@@ -59,9 +59,9 @@
       "path": "components/h-ide-mujoco-sonic",
       "sourceCommit": "8c6f3e6375b3f2c4f00e721f885a5a93c56dada3",
       "sourceTree": "3758b0c281958820d2fed29ada16093bd7eeb2f2",
-      "distributionTree": "8d257545dc2ece363668ff5c07a9362d206c2279",
-      "distributionDeltaSha256": "cdbd738ec40d95c3739d1739f5028eb7dcc029cde601967aacee5df81bcf4712",
-      "distributionDeltaPathCount": 19,
+      "distributionTree": "138cd2706855e4d9d82fcafbf2c4fe495a02f135",
+      "distributionDeltaSha256": "33b104cc8008cdcc6a741878b79d9dc9b40d218d833b847a123962c0a0bb5a91",
+      "distributionDeltaPathCount": 23,
       "distributionAdaptation": "monorepo external-asset boundary, portable dependency locks and release packaging",
       "runtimeDefault": true
     }

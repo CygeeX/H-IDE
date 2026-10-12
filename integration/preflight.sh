@@ -394,6 +394,17 @@ for component in components:
 ros_prefix = json.loads(paths[3].read_text(encoding="utf-8"))
 if ros_prefix.get("schemaVersion") != "skillstore.ros-user-prefix/1":
     raise SystemExit("unexpected ROS user-prefix manifest schema")
+ros_source = ros_prefix.get("source")
+snapshot = ros_source.get("snapshot") if isinstance(ros_source, dict) else None
+expected_snapshot_url = f"http://snapshots.ros.org/jazzy/{snapshot}/ubuntu"
+if (
+    not isinstance(ros_source, dict)
+    or ros_source.get("type") != "ros-buildfarm-snapshot"
+    or not isinstance(snapshot, str)
+    or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", snapshot)
+    or ros_source.get("baseUrl") != expected_snapshot_url
+):
+    raise SystemExit("unexpected ROS buildfarm snapshot source")
 if (
     ros_prefix.get("os") != "ubuntu-24.04"
     or ros_prefix.get("architecture") != "amd64"
