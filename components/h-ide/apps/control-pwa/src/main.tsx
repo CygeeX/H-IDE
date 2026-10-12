@@ -34,6 +34,7 @@ import type { ActiveSceneContext } from "./scene-workspace";
 import { VisualMissionCard } from "./visual-mission-card";
 import { SimulationWorkspace } from "./simulation-workspace";
 import { DeveloperDiagnostics } from "./developer-diagnostics";
+import { RobotMonitor } from "./robot-monitor";
 import { SceneMemoryWorkspace } from "./scene-memory-workspace";
 import {
   currentMissionVisualAmbiguity,
@@ -96,6 +97,7 @@ type AppRoute =
   | { kind: "scene-memory"; shell: "user" | "developer" }
   | { kind: "simulation"; shell: "developer" }
   | { kind: "diagnostics"; shell: "developer" }
+  | { kind: "robot-monitor"; shell: "developer" }
   | { kind: "interfaces"; shell: "developer" };
 
 const API_BASE = (import.meta.env.VITE_CONTROL_API_URL as string | undefined)?.replace(/\/$/, "") ?? "";
@@ -506,6 +508,7 @@ function parseAppRoute(pathname: string): AppRoute {
   if (pathname === "/developer/scene-memory" || pathname.startsWith("/developer/scene-memory/")) return { kind: "scene-memory", shell: "developer" };
   if (pathname === "/app/scene-memory" || pathname.startsWith("/app/scene-memory/")) return { kind: "scene-memory", shell: "user" };
   if (pathname === "/developer/diagnostics" || pathname.startsWith("/developer/diagnostics/")) return { kind: "diagnostics", shell: "developer" };
+  if (pathname === "/developer/robots" || pathname.startsWith("/developer/robots/")) return { kind: "robot-monitor", shell: "developer" };
   if (pathname === "/developer/simulation" || pathname.startsWith("/developer/simulation/")) return { kind: "simulation", shell: "developer" };
   if (pathname === "/developer/interfaces" || pathname.startsWith("/developer/interfaces/")) return { kind: "interfaces", shell: "developer" };
   const developerTask = pathname.match(/^\/developer\/tasks\/([^/]+)$/);
@@ -625,7 +628,6 @@ function App() {
   if (checking) return <div className="auth-loading" role="status"><span className="planning-pulse" />正在连接 H-IDE…</div>;
   if (!principal) return <AuthScreen onAuthenticated={(session) => {
     setPrincipal(session.principal);
-    window.history.replaceState({}, "", "/app");
   }} />;
   return <WorkspaceApp principal={principal} onLogout={logout} />;
 }
@@ -636,6 +638,11 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
   const canDevelop = (principal.role === "DEVELOPER" || principal.role === "ADMIN")
     && principal.scopes.includes("diagnostics:read");
   const developerMode = canDevelop && route.shell === "developer";
+  useEffect(() => {
+    if (route.shell === "developer" && !canDevelop) {
+      navigate("/app", { replace: true });
+    }
+  }, [canDevelop, navigate, route.shell]);
   const [robots, setRobots] = useState<RobotState[]>([]);
   const [selectedRobotId, setSelectedRobotId] = useState("");
   const [selectedDisplayRobotId, setSelectedDisplayRobotId] = useState<RobotDisplayOption["id"]>(() => {
@@ -648,6 +655,9 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
   });
   const [selectedSkill, setSelectedSkill] = useState<LeaderSkillId | null>(null);
   const [skillGreeting, setSkillGreeting] = useState("");
+  const [chatSpriteEnabled, setChatSpriteEnabled] = useState(() => {
+    try { return window.localStorage.getItem("h-ide-chat-sprite-enabled") === "true"; } catch { return false; }
+  });
   const [capabilities, setCapabilities] = useState<CapabilitySnapshot | null>(null);
   const [events, setEvents] = useState<ControlEvent[]>([]);
   const [mappings, setMappings] = useState<MappingSnapshot[]>([]);
@@ -736,6 +746,9 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
   selectedSkillRef.current = selectedSkill;
   const finalTranscriptRef = useRef(new Set<string>());
   const pendingMissionInterventionRef = useRef(new Map<string, string>());
+  // A poll that was already in flight when the user pressed cancel must not
+  // resurrect the old running state after the cancellation response arrives.
+  const cancelledAssistantTasksRef = useRef(new Set<string>());
   const deletedConversationUndoTimerRef = useRef<number | undefined>(undefined);
   const restoredConversationRef = useRef(false);
   const restoredMissionRef = useRef(false);
@@ -744,10 +757,6 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
   const selectedRobotRef = useRef(selectedRobotId);
   selectedRobotRef.current = selectedRobotId;
   const selectedRobotManualRef = useRef(false);
-
-  useEffect(() => {
-    if (route.shell === "developer" && !canDevelop) navigate("/app", { replace: true });
-  }, [canDevelop, navigate, route.shell]);
 
   const selectedRobot = useMemo(
     () => robots.find((robot) => robot.robotId === selectedRobotId) ?? null,
@@ -1105,6 +1114,12 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
     }
   }, [selectedDisplayRobotId]);
 
+  useEffect(() => {
+    try { window.localStorage.setItem("h-ide-chat-sprite-enabled", String(chatSpriteEnabled)); } catch {
+      // Local preferences are optional in private browsing.
+    }
+  }, [chatSpriteEnabled]);
+
   const selectLeaderSkill = useCallback((skill: LeaderSkillDefinition) => {
     if (skill.id === "inspection.office" && !assistantConversation && !missionDraft && !missionRecord) {
       const current = robots.find((item) => item.robotId === selectedRobotId);
@@ -1263,9 +1278,24 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
   }, []);
 
   const monitorAssistantTurn = useCallback(async (taskId: string, robotId: string) => {
+    let transientFailures = 0;
     for (let attempt = 0; attempt < 250; attempt += 1) {
-      const turn = await apiFetch<AssistantTurn>(`/api/v1/assistant/turns/${encodeURIComponent(taskId)}`);
+      let turn: AssistantTurn;
+      try {
+        turn = await apiFetch<AssistantTurn>(`/api/v1/assistant/turns/${encodeURIComponent(taskId)}`);
+        transientFailures = 0;
+      } catch (reason) {
+        const status = reason instanceof ApiFailure ? reason.status : undefined;
+        if (status !== 401 && status !== 403 && status !== 404 && transientFailures < 5) {
+          transientFailures += 1;
+          await new Promise((resolve) => window.setTimeout(resolve, 400 * transientFailures));
+          attempt -= 1;
+          continue;
+        }
+        throw reason;
+      }
       if (selectedRobotRef.current !== robotId) return turn;
+      if (cancelledAssistantTasksRef.current.has(taskId)) return turn;
       setAssistantTurn(turn);
       if (isAssistantTurnTerminal(turn.status)) {
         if (turn.result?.missionDraftId) {
@@ -1870,10 +1900,12 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
 
   const cancelAssistantTurn = useCallback(() => {
     if (!assistantTurn || !["queued", "running"].includes(assistantTurn.status)) return;
+    const taskId = assistantTurn.taskId;
+    cancelledAssistantTasksRef.current.add(taskId);
     void (async () => {
       try {
         const turn = await apiFetch<AssistantTurn>(
-          `/api/v1/assistant/turns/${encodeURIComponent(assistantTurn.taskId)}/cancel`,
+          `/api/v1/assistant/turns/${encodeURIComponent(taskId)}/cancel`,
           { method: "POST" },
         );
         setAssistantTurn(turn);
@@ -2536,30 +2568,35 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
         ? lastReceipt.status
         : draft?.status ?? assistantTurn?.status ?? assistantConversation?.status ?? "idle");
 
+  if (route.shell === "developer" && !canDevelop) {
+    return <main className="full-workspace"><div className="workspace-content"><section className="robot-monitor" role="alert">
+      <h2>当前账号无开发者权限</h2>
+      <p>机器人监控台需要开发者或管理员账号，以及诊断读取权限。请使用有权限的账号登录。</p>
+      <button type="button" onClick={() => navigate("/app", { replace: true })}>返回普通对话</button>
+    </section></div></main>;
+  }
+
   return (
-    <div className={`hide-app-shell shell-${developerMode ? "developer" : "user"}`}>
+    <div className={`hide-app-shell shell-${developerMode ? "developer" : "user"} ${historyOpen ? "history-drawer-open" : ""}`}>
       <AppTitlebar
-        conversations={allConversationEntries}
         current={currentConversationEntry}
         route={route}
-        onNew={() => startNewTask()}
+        onBackToWorkspace={() => navigate(conversationPath)}
         onOpenConversation={openConversation}
-        onOpenHistory={() => setHistoryOpen(true)}
+        onOpenHistory={() => setHistoryOpen((value) => !value)}
         onOpenTools={() => setToolMenuOpen((value) => !value)}
         principal={principal}
         developerMode={developerMode}
         canDevelop={canDevelop}
         canUseTools={developerMode || canUseSceneMemory}
-        onModeChange={(mode) => navigate(chatPath(mode, currentConversationEntry?.conversationId))}
-        onLogout={onLogout}
-      />
-      {developerMode ? <StatusBar
         robot={selectedRobot}
         connection={connection}
         taskStatus={activeTaskStatus}
         onStop={() => submitCommand("stop", {})}
         stopDisabled={!selectedRobot || connection !== "live" || busy || !capabilities?.capabilities.includes("stop")}
-      /> : null}
+        onModeChange={(mode) => navigate(chatPath(mode, currentConversationEntry?.conversationId))}
+        onLogout={onLogout}
+      />
 
       {connection === "offline" ? <div className="global-connection-banner" role="alert">工作站连接已中断。离线期间不会排队发送规划、审核或控制命令。</div> : null}
       {error ? <div className="global-error-banner" role="alert"><Icon name="warning" /><span><strong>操作未完成</strong>{error}</span><button type="button" onClick={() => setError("")} aria-label="关闭错误"><Icon name="close" /></button></div> : null}
@@ -2583,6 +2620,7 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
         mission={missionRecord}
         selectedSkill={selectedSkill}
         skillGreeting={skillGreeting}
+        chatSpriteEnabled={chatSpriteEnabled}
         selectedDisplayId={selectedDisplayRobotId}
         busy={assistantBusy}
         thinking={assistantThinking}
@@ -2687,13 +2725,23 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
         <DeveloperDiagnostics apiFetch={apiFetch} robotId={selectedRobotId || undefined} clientIssue={assistantClientIssue} />
       </WorkspacePage> : null}
 
+      {developerMode && route.kind === "robot-monitor" ? <WorkspacePage
+        title="机器人监控台"
+        subtitle="所有已注册机器人配置的只读可用性检查"
+        onBack={() => navigate(conversationPath)}
+      >
+        <RobotMonitor apiFetch={apiFetch} />
+      </WorkspacePage> : null}
+
       {toolMenuOpen && (developerMode || canUseSceneMemory) ? <ToolMenu
         developerMode={developerMode}
         canUseSceneMemory={canUseSceneMemory}
         advancedMode={advancedMode}
         offlineVoiceFallback={voiceCaptureMode === "offline_wav"}
+        chatSpriteEnabled={chatSpriteEnabled}
         onAdvancedModeChange={setAdvancedMode}
         onOfflineVoiceFallbackChange={toggleOfflineVoiceFallback}
+        onChatSpriteEnabledChange={setChatSpriteEnabled}
         onClose={() => setToolMenuOpen(false)}
         onSceneMemory={() => {
           setToolMenuOpen(false);
@@ -2702,6 +2750,7 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
         onControl={() => { setToolMenuOpen(false); setControlPanelOpen(true); }}
         onSimulation={() => { setToolMenuOpen(false); navigate("/developer/simulation"); }}
         onDiagnostics={() => { setToolMenuOpen(false); navigate("/developer/diagnostics"); }}
+        onRobotMonitor={() => { setToolMenuOpen(false); navigate("/developer/robots"); }}
         onHistory={() => { setToolMenuOpen(false); setHistoryOpen(true); }}
         onInterfaces={() => { setToolMenuOpen(false); navigate("/developer/interfaces"); }}
         onRefresh={() => { setToolMenuOpen(false); refresh(); }}
@@ -2721,12 +2770,12 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
         />
       </SidePanel> : null}
 
-      {historyOpen ? <SidePanel title="任务历史" subtitle={`${historyConversations.length} 个会话${historyNextCursor ? " · 还有更多" : ""}`} onClose={() => setHistoryOpen(false)} side="left">
+      {historyOpen ? <SidePanel title="任务历史" subtitle={`${historyConversations.length} 个会话${historyNextCursor ? " · 还有更多" : ""}`} onClose={() => setHistoryOpen(false)} side="left" showClose={false}>
         <HistoryPanel
           conversations={historyConversations}
           currentId={currentConversationEntry?.conversationId}
           onOpen={openConversation}
-          onNew={() => { setHistoryOpen(false); startNewTask(); }}
+          onNew={() => { startNewTask(); }}
           onRename={renameConversation}
           onArchive={archiveConversation}
           onDelete={deleteConversation}
@@ -2757,7 +2806,7 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
 }
 
 type IconName =
-  | "logo" | "plus" | "history" | "tools" | "robot" | "map" | "stop"
+  | "logo" | "home" | "plus" | "history" | "tools" | "robot" | "map" | "stop"
   | "close" | "warning" | "check" | "mic" | "send" | "attach" | "control"
   | "interface" | "refresh" | "back" | "spark" | "chevron" | "activity" | "volume";
 
@@ -2765,6 +2814,7 @@ function Icon({ name }: { name: IconName }) {
   const common = { fill: "none", stroke: "currentColor", strokeWidth: 1.8, strokeLinecap: "round" as const, strokeLinejoin: "round" as const };
   const paths: Record<IconName, React.ReactNode> = {
     logo: <><path d="M6 7.5 12 4l6 3.5v7L12 18l-6-3.5z" /><path d="m9 9 3-1.7L15 9v3.5L12 14l-3-1.5z" /></>,
+    home: <><path d="m3.5 10.5 8.5-7 8.5 7" /><path d="M5.5 9.5V20h13V9.5M9.5 20v-6h5v6" /></>,
     plus: <><path d="M12 5v14M5 12h14" /></>,
     history: <><path d="M4.8 8A8 8 0 1 1 4 12" /><path d="M4 4v4h4M12 8v4l2.8 1.8" /></>,
     tools: <><circle cx="12" cy="12" r="3" /><path d="M19 13.5v-3l-2-.7-.8-1.8.9-1.9L15 4l-1.9.9-1.9-.8-.7-2h-3l-.7 2-1.9.8L3 4 1 6.1 1.9 8l-.8 1.8-2 .7v3l2 .7.8 1.8L1 18l2 2 1.9-.9 1.9.8.7 2h3l.7-2 1.9-.8L15 20l2.1-2-.9-2 .8-1.8z" transform="translate(2.5 0) scale(.8)" /></>,
@@ -2799,10 +2849,9 @@ function conversationLabel(conversation: AssistantConversation, current: Assista
 }
 
 function AppTitlebar({
-  conversations,
   current,
   route,
-  onNew,
+  onBackToWorkspace,
   onOpenConversation,
   onOpenHistory,
   onOpenTools,
@@ -2810,13 +2859,17 @@ function AppTitlebar({
   developerMode,
   canDevelop,
   canUseTools,
+  robot,
+  connection,
+  taskStatus,
+  onStop,
+  stopDisabled,
   onModeChange,
   onLogout,
 }: {
-  conversations: AssistantConversation[];
   current: AssistantConversation | null;
   route: AppRoute;
-  onNew: () => void;
+  onBackToWorkspace: () => void;
   onOpenConversation: (conversationId: string) => void;
   onOpenHistory: () => void;
   onOpenTools: () => void;
@@ -2824,30 +2877,55 @@ function AppTitlebar({
   developerMode: boolean;
   canDevelop: boolean;
   canUseTools: boolean;
+  robot: RobotState | null;
+  connection: ConnectionState;
+  taskStatus: string;
+  onStop: () => void;
+  stopDisabled: boolean;
   onModeChange: (mode: "user" | "developer") => void;
   onLogout: () => void;
 }) {
-  const tabs = [current, ...conversations]
-    .filter((item): item is AssistantConversation => Boolean(item))
-    .filter((item, index, list) => list.findIndex((candidate) => candidate.conversationId === item.conversationId) === index)
-    .slice(0, 5);
+  const pose = poseFreshness(robot);
+  const [routeTitleLeaving, setRouteTitleLeaving] = useState(false);
+  const workspaceTitles: Partial<Record<AppRoute["kind"], [string, string]>> = {
+    "scene-memory": ["巡检与记忆", "用纯 Qwen VLM 观察环境，由人确认后保存场景记忆"],
+    simulation: ["仿真观测台", "MuJoCo + SONIC、Nav2 联调与连续任务回放"],
+    interfaces: ["接口中心", "逻辑动作与代理接口的版本化映射"],
+    diagnostics: ["系统诊断", "只读检查 H-IDE、Agent、Vision、Robot Agent、Nav2 与仿真执行链"],
+    "robot-monitor": ["机器人监控台", "所有已注册机器人配置的只读可用性检查"],
+  };
+  const workspaceTitle = workspaceTitles[route.kind];
+  useEffect(() => {
+    setRouteTitleLeaving(false);
+  }, [route.kind]);
+  const leaveWorkspace = () => {
+    if (routeTitleLeaving) return;
+    setRouteTitleLeaving(true);
+    window.setTimeout(onBackToWorkspace, 180);
+  };
   return <header className="app-titlebar">
-    <button className="brand-button" type="button" onClick={onNew} aria-label="H-IDE 新任务"><img className="brand-logo-image" src="/assets/leader-demo/brand/h-ide-logo.png" alt="" /><span>H-IDE</span></button>
-    <nav className="mission-tabs" aria-label="活动任务">
-      {tabs.map((conversation) => <button
-        key={conversation.conversationId}
-        className={route.kind === "chat" && current?.conversationId === conversation.conversationId ? "active" : ""}
+    <button className="brand-button" type="button" onClick={onOpenHistory} aria-label="切换任务历史" title="切换任务历史"><Icon name="home" /></button>
+    {workspaceTitle ? <div className={`route-titlebar${routeTitleLeaving ? " is-leaving" : ""}`}>
+      <button className="icon-button" type="button" onClick={leaveWorkspace} aria-label="返回会话"><Icon name="back" /></button>
+      <div><strong>{workspaceTitle[0]}</strong></div>
+    </div> : <nav className="mission-tabs" aria-label="活动任务">
+      {current ? <button
+        className={route.kind === "chat" ? "active" : ""}
         type="button"
-        onClick={() => onOpenConversation(conversation.conversationId)}
-      ><span className={`tab-state tab-${conversation.status}`} />{conversationLabel(conversation, current)}</button>)}
-      <button className={`new-mission-tab ${route.kind === "chat" && !current ? "active" : ""}`} type="button" onClick={onNew}><Icon name="plus" />新任务</button>
-    </nav>
+        onClick={() => onOpenConversation(current.conversationId)}
+      ><span className={`tab-state tab-${current.status}`} />{conversationLabel(current, current)}</button> : null}
+    </nav>}
+    {developerMode ? <div className="titlebar-contexts" aria-label="当前控制上下文">
+      <span className={`titlebar-context connection-${connection}`}><span className="context-dot" />{connection === "live" ? "工作站在线" : connection === "connecting" ? "正在连接" : "工作站离线"}</span>
+      <span className={`titlebar-context ${pose.stale ? "stale" : "ready"}`}><Icon name="activity" />{pose.label}</span>
+      <span className="titlebar-context task-context">任务 <StatusPill value={taskStatus} /></span>
+      <button className="global-stop-button titlebar-stop-button" type="button" onClick={onStop} disabled={stopDisabled}><Icon name="stop" />停止机器人</button>
+    </div> : null}
     <div className="titlebar-actions">
       {canDevelop ? <div className="shell-switch" aria-label="界面模式">
         <button className={!developerMode ? "active" : ""} type="button" onClick={() => onModeChange("user")}>用户</button>
         <button className={developerMode ? "active" : ""} type="button" onClick={() => onModeChange("developer")}>开发者</button>
       </div> : null}
-      <button className="icon-button" type="button" onClick={onOpenHistory} aria-label="任务历史"><Icon name="history" /></button>
       {canUseTools ? <button className="icon-button titlebar-tools-button" type="button" onClick={onOpenTools} aria-label="打开工具" title="工具">
         <Icon name="tools" /><span>工具</span>
       </button> : null}
@@ -2868,31 +2946,8 @@ function poseFreshness(robot: RobotState | null): { label: string; stale: boolea
   return { label: `位姿 ${Math.floor(seconds / 60)} 分钟前`, stale: true };
 }
 
-function StatusBar({
-  robot,
-  connection,
-  taskStatus,
-  onStop,
-  stopDisabled,
-}: {
-  robot: RobotState | null;
-  connection: ConnectionState;
-  taskStatus: string;
-  onStop: () => void;
-  stopDisabled: boolean;
-}) {
-  const pose = poseFreshness(robot);
-  return <div className="global-statusbar" aria-label="当前控制上下文">
-    <span className={`status-context connection-${connection}`}><span className="context-dot" />{connection === "live" ? "工作站在线" : connection === "connecting" ? "正在连接" : "工作站离线"}</span>
-    <span className={`status-context ${pose.stale ? "stale" : "ready"}`}><Icon name="activity" />{pose.label}</span>
-    <span className="status-context task-context">任务 <StatusPill value={taskStatus} /></span>
-    <button className="global-stop-button" type="button" onClick={onStop} disabled={stopDisabled}><Icon name="stop" />停止机器人</button>
-  </div>;
-}
-
 function WorkspacePage({ title, subtitle, onBack, children }: { title: string; subtitle: string; onBack: () => void; children: React.ReactNode }) {
   return <main className="full-workspace">
-    <header className="workspace-header"><button className="icon-button" type="button" onClick={onBack} aria-label="返回会话"><Icon name="back" /></button><div><h1>{title}</h1><p>{subtitle}</p></div></header>
     <div className="workspace-content">{children}</div>
   </main>;
 }
@@ -2902,13 +2957,16 @@ function ToolMenu({
   canUseSceneMemory,
   advancedMode,
   offlineVoiceFallback,
+  chatSpriteEnabled,
   onAdvancedModeChange,
   onOfflineVoiceFallbackChange,
+  onChatSpriteEnabledChange,
   onClose,
   onSceneMemory,
   onControl,
   onSimulation,
   onDiagnostics,
+  onRobotMonitor,
   onHistory,
   onInterfaces,
   onRefresh,
@@ -2917,13 +2975,16 @@ function ToolMenu({
   canUseSceneMemory: boolean;
   advancedMode: boolean;
   offlineVoiceFallback: boolean;
+  chatSpriteEnabled: boolean;
   onAdvancedModeChange: (value: boolean) => void;
   onOfflineVoiceFallbackChange: (value: boolean) => void;
+  onChatSpriteEnabledChange: (value: boolean) => void;
   onClose: () => void;
   onSceneMemory: () => void;
   onControl: () => void;
   onSimulation: () => void;
   onDiagnostics: () => void;
+  onRobotMonitor: () => void;
   onHistory: () => void;
   onInterfaces: () => void;
   onRefresh: () => void;
@@ -2934,18 +2995,20 @@ function ToolMenu({
     {developerMode ? <button type="button" onClick={onControl}><span className="tool-icon"><Icon name="control" /></span><span><strong>手动控制</strong><small>测试高层动作与停止</small></span><Icon name="chevron" /></button> : null}
     {developerMode ? <button type="button" onClick={onSimulation}><span className="tool-icon"><Icon name="activity" /></span><span><strong>仿真观测台</strong><small>连续任务、障碍与回放</small></span><Icon name="chevron" /></button> : null}
     {developerMode ? <button type="button" onClick={onDiagnostics}><span className="tool-icon"><Icon name="activity" /></span><span><strong>系统诊断</strong><small>执行链存活、就绪度与具体故障</small></span><Icon name="chevron" /></button> : null}
+    {developerMode ? <button type="button" onClick={onRobotMonitor}><span className="tool-icon"><Icon name="activity" /></span><span><strong>机器人监控台</strong><small>查看所有机器人配置与可用状态</small></span><Icon name="chevron" /></button> : null}
     <button type="button" onClick={onHistory}><span className="tool-icon"><Icon name="history" /></span><span><strong>任务历史</strong><small>恢复规划、审核和执行记录</small></span><Icon name="chevron" /></button>
     {developerMode ? <button type="button" onClick={onRefresh}><span className="tool-icon"><Icon name="refresh" /></span><span><strong>刷新状态</strong><small>重新读取机器人与接口快照</small></span><Icon name="chevron" /></button> : null}
     <div className="tool-separator" />
     <label className="advanced-toggle"><span><strong>离线 WAV 转写降级</strong><small>显式启用批量 Whisper；默认使用低延迟流式语音</small></span><input type="checkbox" checked={offlineVoiceFallback} onChange={(event) => onOfflineVoiceFallbackChange(event.target.checked)} /><i /></label>
+    <label className="advanced-toggle"><span><strong>右上角对话精灵</strong><small>开启后在对话页面右上角显示精灵</small></span><input type="checkbox" checked={chatSpriteEnabled} onChange={(event) => onChatSpriteEnabledChange(event.target.checked)} /><i /></label>
     {developerMode ? <label className="advanced-toggle"><span><strong>工程模式</strong><small>显示接口与调试工具</small></span><input type="checkbox" checked={advancedMode} onChange={(event) => onAdvancedModeChange(event.target.checked)} /><i /></label> : null}
     {developerMode && advancedMode ? <button type="button" onClick={onInterfaces}><span className="tool-icon"><Icon name="interface" /></span><span><strong>接口中心</strong><small>映射版本、探测与回滚</small></span><Icon name="chevron" /></button> : null}
   </aside></>;
 }
 
-function SidePanel({ title, subtitle, onClose, side = "right", children }: { title: string; subtitle: string; onClose: () => void; side?: "left" | "right"; children: React.ReactNode }) {
+function SidePanel({ title, subtitle, onClose, side = "right", showClose = true, children }: { title: string; subtitle: string; onClose: () => void; side?: "left" | "right"; showClose?: boolean; children: React.ReactNode }) {
   return <div className="side-panel-layer"><button className="side-panel-scrim" type="button" onClick={onClose} aria-label={`关闭${title}`} /><aside className={`side-panel side-${side}`} aria-label={title}>
-    <header><div><h2>{title}</h2><p>{subtitle}</p></div><button className="icon-button" type="button" onClick={onClose} aria-label="关闭"><Icon name="close" /></button></header>
+    <header><div><h2>{title}</h2><p>{subtitle}</p></div>{showClose ? <button className="icon-button" type="button" onClick={onClose} aria-label="关闭"><Icon name="close" /></button> : null}</header>
     <div className="side-panel-content">{children}</div>
   </aside></div>;
 }
@@ -3165,10 +3228,21 @@ function ThinkingIndicator({ canCancel, onCancel }: { canCancel: boolean; onCanc
   </div>;
 }
 
-function AssistantInlineFailure({ message, onRetry }: { message: string; onRetry: () => void }) {
+function AssistantInlineFailure({
+  message,
+  rawDetail,
+  developerMode,
+  onRetry,
+}: {
+  message: string;
+  rawDetail?: string | null;
+  developerMode: boolean;
+  onRetry: () => void;
+}) {
+  const visibleMessage = developerMode && rawDetail?.trim() ? rawDetail.trim() : message;
   return <div className="assistant-inline-failure" role="alert">
     <Icon name="warning" />
-    <span>{message}</span>
+    <span>{developerMode && rawDetail?.trim() ? <><small>后台原始错误</small>{visibleMessage}</> : visibleMessage}</span>
     <button type="button" onClick={onRetry}>重试</button>
   </div>;
 }
@@ -3192,6 +3266,7 @@ function ChatWorkspace({
   mission,
   selectedSkill,
   skillGreeting,
+  chatSpriteEnabled,
   selectedDisplayId,
   busy,
   thinking,
@@ -3247,6 +3322,7 @@ function ChatWorkspace({
   mission: MissionRecordV2 | null;
   selectedSkill: LeaderSkillId | null;
   skillGreeting: string;
+  chatSpriteEnabled: boolean;
   selectedDisplayId: RobotDisplayOption["id"];
   busy: boolean;
   thinking: boolean;
@@ -3391,7 +3467,7 @@ function ChatWorkspace({
   </> : null;
   const renderLeaderRobotPicker = () => (
     <div className="leader-skill-robot-selector">
-      <span className="leader-skill-robot-label">当前演示机器人</span>
+      <span className="leader-skill-robot-label">选择机器人</span>
       <RobotPicker
         robots={robots}
         selectedRobotId={selectedRobotId}
@@ -3403,13 +3479,12 @@ function ChatWorkspace({
     </div>
   );
   return <main className="chat-workspace">
-    <aside className="leader-avatar-rail" aria-label="H-IDE 机器人助手">
+    {chatSpriteEnabled ? <aside className="leader-avatar-rail" aria-label="H-IDE 机器人助手">
       <RobotAvatar compact speech={selectedSkill ? latestAssistantSpeech : undefined} />
-    </aside>
+    </aside> : null}
     <div className="chat-timeline" ref={timelineRef} aria-live="polite">
       <div className="chat-thread">
         {empty ? <section className="chat-empty-state">
-          <span className="empty-logo"><img src="/assets/leader-demo/brand/h-ide-logo.png" alt="H-IDE" /></span>
           <h1>今天想和我做什么？</h1>
           <span className="sr-only">今天想和机器人做什么？</span>
           <p>先选择一个 Skill，再用中文告诉我目标。巡检会进入办公室并汇总信息；语音助手会直接用声音回应。</p>
@@ -3432,7 +3507,12 @@ function ChatWorkspace({
           {(activityTaskId !== null
             ? item.taskId === activityTaskId
             : item.key === "turn:legacy-orphans") && !thinking && inlineError
-            ? <AssistantInlineFailure message={inlineError} onRetry={onRetry} />
+            ? <AssistantInlineFailure
+              message={inlineError}
+              rawDetail={item.turn?.error ?? (turn?.taskId === item.taskId ? turn.error : null)}
+              developerMode={developerMode}
+              onRetry={onRetry}
+            />
             : null}
           {item.turn?.result?.assistantMessage && !item.messages.some((message) => message.role === "assistant") ? <article className="chat-message message-assistant"><div className="message-author"><span className="agent-avatar"><Icon name="spark" /></span>H-IDE</div><div className="message-body">{item.turn.result.assistantMessage}</div></article> : null}
           {item.turn && Boolean(item.turn.result?.evidence?.length || item.turn.result?.visualResult) ? <ConversationVisualEvidence turn={item.turn} developerMode={developerMode} /> : null}

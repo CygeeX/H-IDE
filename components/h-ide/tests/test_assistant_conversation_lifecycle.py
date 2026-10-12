@@ -181,6 +181,8 @@ def test_control_pwa_production_deep_links_fall_back_to_index(tmp_path) -> None:
             "/app/tasks/conversation-1",
             "/developer",
             "/developer/tasks/conversation-2",
+            "/developer/robots",
+            "/developer/diagnostics",
             "/developer/simulation",
             "/developer/interfaces",
             "/developer/scene-memory",

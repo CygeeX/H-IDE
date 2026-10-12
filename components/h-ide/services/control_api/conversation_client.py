@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Any, Mapping, Protocol
 
 import httpx
@@ -76,7 +77,21 @@ class MastraConversationClient:
             )
 
         try:
-            response = post(payload)
+            response = None
+            for attempt in range(3):
+                try:
+                    response = post(payload)
+                except httpx.TransportError:
+                    if attempt == 2:
+                        raise
+                    time.sleep(0.2 * (2**attempt))
+                    continue
+                # A router restart/load spike is recoverable.  Do not retry
+                # auth, schema, or other deterministic client errors.
+                if response.status_code not in {429, 500, 502, 503, 504} or attempt == 2:
+                    break
+                time.sleep(0.2 * (2**attempt))
+            assert response is not None
             # Expand-only deployment compatibility: an older Agent has a
             # strict schema and returns 422 for the new memoryContext field.
             # Retry once with the server-generated digest-checked summary in

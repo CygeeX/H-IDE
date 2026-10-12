@@ -6,9 +6,10 @@ ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
 COMPONENTS="${ROOT}/components"
 ENV_FILE="${SKILLSTORE_ENV_FILE:-${ROOT}/.env}"
 LEVEL=L0
+SKIP_RELEASE_LOCK=0
 
 usage() {
-  printf '%s\n' 'usage: integration/preflight.sh [--level L0|L1|L2]'
+  printf '%s\n' 'usage: integration/preflight.sh [--level L0|L1|L2] [--skip-release-lock]'
   printf '%s\n' '  L0: repository, secret and manifest checks (no runtime assets required)'
   printf '%s\n' '  L1: additionally validate Docker/scene/build configuration'
   printf '%s\n' '  L2: additionally require ROS/GPU, runtime health prerequisites and external artifacts'
@@ -21,6 +22,10 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || { usage >&2; exit 2; }
       LEVEL="$2"
       shift 2
+      ;;
+    --skip-release-lock)
+      SKIP_RELEASE_LOCK=1
+      shift
       ;;
     --help)
       usage
@@ -51,7 +56,7 @@ for component in h-ide h-ide-agent h-ide-vision robotagent h-ide-mujoco-sonic; d
   [[ -d "${COMPONENTS}/${component}" ]] || fail "missing component: ${component}"
 done
 
-if [[ ! -d "${ROOT}/.git" ]]; then
+if [[ "$(git -C "${ROOT}" rev-parse --is-inside-work-tree 2>/dev/null || true)" != "true" ]]; then
   fail 'repository is not a Git worktree'
 else
   if git -C "${ROOT}" ls-files -s | awk '$1 == 160000 {print; found=1} END {exit found ? 0 : 1}'; then
@@ -297,7 +302,7 @@ if absolute_path_matches="$(rg -n '/home/phi/learn-projects|systemed_study' \
   fail 'critical runtime files still contain developer-machine absolute paths'
 fi
 
-if ! python3 - "${ROOT}" <<'PY'
+if ! SKILLSTORE_SKIP_RELEASE_LOCK="${SKIP_RELEASE_LOCK}" python3 - "${ROOT}" <<'PY'
 import hashlib
 import json
 from pathlib import Path
@@ -323,7 +328,11 @@ paths = [
 for path in paths:
     json.loads(path.read_text(encoding="utf-8"))
 release = json.loads(paths[0].read_text(encoding="utf-8"))
-for component in release.get("components", []):
+if __import__("os").environ.get("SKILLSTORE_SKIP_RELEASE_LOCK") != "1":
+  components = release.get("components", [])
+else:
+  components = []
+for component in components:
     component_id = component.get("id")
     source_commit = component.get("sourceCommit")
     component_path = component.get("path")

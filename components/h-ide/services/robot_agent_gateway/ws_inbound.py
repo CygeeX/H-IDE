@@ -735,13 +735,14 @@ class RobotAgentInboundPeer:
                         )
                     result = dict(status.result or {})
                     result["finalPoseRelation"] = "settlement_timeout"
+                    result["errorCode"] = "TERMINAL_POSE_NOT_SETTLED"
                     result["terminalSettleDurationMs"] = round(
                         elapsed * 1000.0, 3
                     )
                     status = ProtocolCommandStatus(
                         command_id=status.command_id,
-                        state=status.state,
-                        detail=status.detail,
+                        state="FAILED",
+                        detail="Robot did not stop within the terminal pose settlement deadline",
                         progress=status.progress,
                         result=result,
                     )
@@ -1118,13 +1119,22 @@ class RobotAgentInboundPeer:
                         finished = True
                     elif elapsed >= self.terminal_pose_max_wait_seconds:
                         result["finalPoseRelation"] = "settlement_timeout"
+                        result["errorCode"] = "TERMINAL_POSE_NOT_SETTLED"
                         finished = True
                     else:
                         result["finalPoseRelation"] = "settling_after_terminal"
                     self._statuses[command_id] = ProtocolCommandStatus(
                         command_id=status.command_id,
-                        state=status.state,
-                        detail=status.detail,
+                        state=(
+                            "FAILED"
+                            if result["finalPoseRelation"] == "settlement_timeout"
+                            else status.state
+                        ),
+                        detail=(
+                            "Robot did not stop within the terminal pose settlement deadline"
+                            if result["finalPoseRelation"] == "settlement_timeout"
+                            else status.detail
+                        ),
                         progress=status.progress,
                         result=result,
                     )
