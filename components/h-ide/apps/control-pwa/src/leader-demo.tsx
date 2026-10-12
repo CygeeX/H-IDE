@@ -73,7 +73,7 @@ export function SkillSelection({
 }) {
   return (
     <section className="leader-skill-selection" aria-label="选择 Skill">
-      <div className="leader-skill-heading">       
+      <div className="leader-skill-heading">
         <strong>先选择今天要使用的能力</strong>
         <small>选择后，下面的对话会沿着对应能力继续；机器人行动仍由当前 Mission 审核链负责。</small>
       </div>

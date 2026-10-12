@@ -638,6 +638,11 @@ function WorkspaceApp({ principal, onLogout }: { principal: AuthPrincipal; onLog
   const canDevelop = (principal.role === "DEVELOPER" || principal.role === "ADMIN")
     && principal.scopes.includes("diagnostics:read");
   const developerMode = canDevelop && route.shell === "developer";
+  useEffect(() => {
+    if (route.shell === "developer" && !canDevelop) {
+      navigate("/app", { replace: true });
+    }
+  }, [canDevelop, navigate, route.shell]);
   const [robots, setRobots] = useState<RobotState[]>([]);
   const [selectedRobotId, setSelectedRobotId] = useState("");
   const [selectedDisplayRobotId, setSelectedDisplayRobotId] = useState<RobotDisplayOption["id"]>(() => {

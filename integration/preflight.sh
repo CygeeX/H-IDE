@@ -56,7 +56,7 @@ for component in h-ide h-ide-agent h-ide-vision robotagent h-ide-mujoco-sonic; d
   [[ -d "${COMPONENTS}/${component}" ]] || fail "missing component: ${component}"
 done
 
-if [[ ! -d "${ROOT}/.git" ]]; then
+if [[ "$(git -C "${ROOT}" rev-parse --is-inside-work-tree 2>/dev/null || true)" != "true" ]]; then
   fail 'repository is not a Git worktree'
 else
   if git -C "${ROOT}" ls-files -s | awk '$1 == 160000 {print; found=1} END {exit found ? 0 : 1}'; then

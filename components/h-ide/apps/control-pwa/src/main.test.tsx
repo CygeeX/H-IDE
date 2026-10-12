@@ -834,7 +834,7 @@ describe("control console", () => {
 
     render(<App />);
     await screen.findAllByText("robot-1");
-    fireEvent.click(screen.getByRole("button", { name: "任务历史" }));
+    fireEvent.click(screen.getByRole("button", { name: "切换任务历史" }));
     expect((await screen.findAllByText("巡检会话")).length).toBeGreaterThan(0);
     fireEvent.click(screen.getByRole("button", { name: "重命名" }));
 
@@ -950,7 +950,7 @@ describe("control console", () => {
 
     render(<App />);
     await screen.findAllByText("robot-1");
-    fireEvent.click(screen.getByRole("button", { name: "任务历史" }));
+    fireEvent.click(screen.getByRole("button", { name: "切换任务历史" }));
     expect((await screen.findAllByText("办公室完整巡检")).length).toBeGreaterThan(0);
     expect(Array.from(document.querySelectorAll(".history-open strong")).filter(
       (element) => element.textContent === "办公室完整巡检",
