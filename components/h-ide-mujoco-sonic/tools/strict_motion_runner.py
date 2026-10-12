@@ -690,7 +690,7 @@ class RosLiveBackend:
             from std_srvs.srv import Trigger
         except ImportError as exc:  # pragma: no cover - depends on ROS installation
             raise StrictMotionRunnerError(
-                "strict runner requires Jazzy rclpy and pinned nav2_msgs 1.3.12"
+                "strict runner requires Jazzy rclpy and pinned nav2_msgs 1.3.13"
             ) from exc
 
         _require_nav2_action_contracts(DriveOnHeading, Spin, ComputePathToPose)

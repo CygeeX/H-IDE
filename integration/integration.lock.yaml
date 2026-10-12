@@ -49,8 +49,8 @@ components:
     path: components/h-ide-mujoco-sonic
     source_commit: 8c6f3e6375b3f2c4f00e721f885a5a93c56dada3
     source_tree: 3758b0c281958820d2fed29ada16093bd7eeb2f2
-    distribution_tree: 8dc02f85af2bda09087d1281a065d269c4b5953a
-    distribution_delta_sha256: 92ad9590afdec644e5dfee8237969041c5d74a5865911e6c8059c9ba4d6cf39a
+    distribution_tree: 4fc35f690cd766dd3edc6dec3b1b5111a15a5de1
+    distribution_delta_sha256: ad140f42c40003f9a86bd6d50682efd43c7e9fa89a4c84a625798e15f08d62f9
     role: mujoco-office-v2-sonic-nav2-adapter
   - id: daaam
     path: optional/DAAAM

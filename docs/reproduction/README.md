@@ -101,9 +101,9 @@ components/robotagent/.local/ros-jazzy-realsense/root/opt/ros/jazzy
 ```
 
 这些 prefix 由 `integration/provision-ros-prefixes.sh` 根据
-`manifests/ros/jazzy-user-prefix-amd64.json` 从零生成：脚本固定 package version、核对 deb
-SHA-256，并在无 sudo 情况下解包。禁止复制原工作站 `.local` 或注释掉 launcher 的
-activation gate。
+`manifests/ros/jazzy-user-prefix-amd64.json` 从零生成：脚本从锁定的 ROS buildfarm 不可变
+快照下载固定 package version、核对 deb SHA-256，并在无 sudo 情况下解包。禁止复制原
+工作站 `.local` 或注释掉 launcher 的 activation gate。
 
 不同 Python minor 版本不能共用 `.venv`。不得把生成的环境、ROS `build/install/log`、
 PWA `dist` 或 `node_modules` 提交到发行仓库。

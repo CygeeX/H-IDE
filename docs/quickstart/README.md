@@ -108,8 +108,8 @@ components/robotagent/.local/ros-jazzy-realsense/root/opt/ros/jazzy
 
 它们不在 Git 中，也不能从另一名开发者的工作区复制。`bootstrap` 的
 `--provision-ros-prefixes` 会读取
-`manifests/ros/jazzy-user-prefix-amd64.json`，下载精确 ROS deb、核对 SHA-256，并在无 sudo
-情况下解包到上述目录。也可以单独运行：
+`manifests/ros/jazzy-user-prefix-amd64.json`，从清单锁定的 ROS buildfarm 不可变快照下载
+精确 ROS deb、核对 SHA-256，并在无 sudo 情况下解包到上述目录。也可以单独运行：
 
 ```bash
 ./integration/provision-ros-prefixes.sh

@@ -3,7 +3,11 @@
   "os": "ubuntu-24.04",
   "architecture": "amd64",
   "rosDistribution": "jazzy",
-  "source": "operator-configured ROS 2 apt repository",
+  "source": {
+    "type": "ros-buildfarm-snapshot",
+    "snapshot": "2026-09-11",
+    "baseUrl": "http://snapshots.ros.org/jazzy/2026-09-11/ubuntu"
+  },
   "prefixes": [
     {
       "id": "nav2-msgs",
