@@ -7,6 +7,7 @@ import {
 } from "./contracts.js";
 import type { MissionPlanningRuntime } from "./engine.js";
 import { withInferenceRetry } from "../resilience/inference-retry.js";
+import { SkillRetriever } from "./skill-retriever.js";
 
 type StructuredAgent = Pick<Agent, "generate">;
 
@@ -54,9 +55,13 @@ const AUTHORITY_BOUNDARY = [
 ].join("\n");
 
 export class MastraMissionRuntime implements MissionPlanningRuntime {
-  constructor(private readonly missionExecutive: StructuredAgent) {}
+  constructor(
+    private readonly missionExecutive: StructuredAgent,
+    private readonly skillRetriever = new SkillRetriever(),
+  ) {}
 
   async draftMission(input: MissionBrief, signal: AbortSignal) {
+    const modelInput = this.modelDraftInput(input);
     const output = await withInferenceRetry(async () => {
       const value = await this.missionExecutive.generate(
         [
@@ -68,7 +73,7 @@ export class MastraMissionRuntime implements MissionPlanningRuntime {
           "Every node riskLevel must be exactly one lowercase token: low, medium, high, or critical, and must exactly match the capability riskLevel for that skill.",
           "Keep intent semantic only. For a relative base move, use fields such as motion=translate_forward, distance_m, and reference=base_link; never use x, y, z, pose, goalPose, relative_translation, path, waypoint, cmd_vel, or ROS fields.",
           "Every dependency must reference another returned nodeId and the graph must be acyclic.",
-          `Mission brief: ${JSON.stringify(input)}`,
+          `Mission brief: ${JSON.stringify(modelInput)}`,
         ].join("\n"),
         {
           structuredOutput: { schema: missionDraftStructuredOutputSchema },
@@ -85,6 +90,7 @@ export class MastraMissionRuntime implements MissionPlanningRuntime {
   }
 
   async replanMission(input: MissionReplanRequest, signal: AbortSignal) {
+    const modelInput = this.modelReplanInput(input);
     const output = await withInferenceRetry(async () => {
       const value = await this.missionExecutive.generate(
         [
@@ -97,7 +103,7 @@ export class MastraMissionRuntime implements MissionPlanningRuntime {
           "Every node riskLevel must be exactly one lowercase token: low, medium, high, or critical, and must exactly match the capability riskLevel for that skill.",
           "Keep intent semantic only. Never use x, y, z, pose, goalPose, relative_translation, path, waypoint, cmd_vel, or ROS fields.",
           "The reasonCode and changeSummary must identify the actual trigger and changed semantic nodes.",
-          `Replan request: ${JSON.stringify(input)}`,
+          `Replan request: ${JSON.stringify(modelInput)}`,
         ].join("\n"),
         {
           structuredOutput: { schema: missionRevisionStructuredOutputSchema },
@@ -111,5 +117,39 @@ export class MastraMissionRuntime implements MissionPlanningRuntime {
       return value;
     }, signal);
     return missionRevisionModelOutputSchema.parse(output.object);
+  }
+
+  private modelDraftInput(input: MissionBrief): MissionBrief {
+    const selection = this.skillRetriever.select(
+      input.objective,
+      input.capabilities,
+      input.envelope,
+    );
+    return this.withCandidateCapabilities(input, selection.capabilities);
+  }
+
+  private modelReplanInput(input: MissionReplanRequest): MissionReplanRequest {
+    const currentSkillIds = input.activeRevision.nodes.map((node) => node.skillId);
+    const selection = this.skillRetriever.select(
+      `${input.objective}\n${input.triggerDetail}`,
+      input.capabilities,
+      input.envelope,
+      currentSkillIds,
+    );
+    return this.withCandidateCapabilities(input, selection.capabilities);
+  }
+
+  private withCandidateCapabilities<T extends MissionBrief | MissionReplanRequest>(
+    input: T,
+    capabilities: T["capabilities"],
+  ): T {
+    return {
+      ...input,
+      envelope: {
+        ...input.envelope,
+        allowedSkillIds: capabilities.map((capability) => capability.skillId),
+      },
+      capabilities,
+    };
   }
 }
